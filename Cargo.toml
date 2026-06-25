@@ -1,0 +1,11 @@
+[package]
+name = "rtx"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "rtx"
+crate-type = ["cdylib"]
+
+[dependencies]
+glam = "0.32"
