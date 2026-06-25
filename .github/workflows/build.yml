@@ -1,0 +1,42 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+            built: librtx.so
+            artifact: qwprogs.so
+          - os: macos-latest
+            target: macos-arm64
+            built: librtx.dylib
+            artifact: qwprogs.dylib
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Stage mvdsv module
+        run: cp "target/release/${{ matrix.built }}" "${{ matrix.artifact }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwprogs-${{ matrix.target }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
