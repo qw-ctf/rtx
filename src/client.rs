@@ -3,19 +3,19 @@
 //! (QuakeWorld player physics) once the player entity is set up; combat, water, weapon
 //! frames and powerups arrive in later milestones.
 
-use std::ffi::CString;
+use core::ffi::CStr;
 
 use glam::Vec3;
 
 use crate::defs::*;
-use crate::entity::EntId;
+use crate::entity::{Die, EntId, Pain};
 use crate::game::GameState;
 
 impl GameState {
     /// `ClientConnect` — announce a joining player and record their name.
     pub(crate) fn client_connect(&mut self, player: EntId) {
         let name = self.read_netname(player);
-        let ent = &mut self.entities[player.index()];
+        let ent = &mut self.entities[player];
         ent.in_use = true;
         ent.classname = Some("player".into());
         ent.netname = Some(name.as_str().into());
@@ -24,7 +24,7 @@ impl GameState {
 
     /// `ClientDisconnect` — announce a leaving player.
     pub(crate) fn client_disconnect(&mut self, player: EntId) {
-        let ent = &self.entities[player.index()];
+        let ent = &self.entities[player];
         let name = ent.netname.as_deref().unwrap_or("");
         let frags = ent.v.frags as i32;
         let message = format!("{name} left the game with {frags} frags\n");
@@ -36,28 +36,27 @@ impl GameState {
     /// `SetNewParms` — default spawn parameters for a fresh player.
     pub(crate) fn set_new_parms(&mut self) {
         let p = &mut self.globals.parm;
-        p[0] = IT_SHOTGUN + IT_AXE; // items
+        p[0] = (Items::SHOTGUN | Items::AXE).as_f32(); // items
         p[1] = 100.0; // health
         p[2] = 0.0; // armor value
         p[3] = 25.0; // shells
         p[4] = 0.0; // nails
         p[5] = 0.0; // rockets
         p[6] = 0.0; // cells
-        p[7] = 1.0; // weapon = IT_SHOTGUN
+        p[7] = 1.0; // weapon = Items::SHOTGUN.as_f32()
         p[8] = 0.0; // armor type
     }
 
     /// `SetChangeParms` — persist a surviving player's state across a level change.
     pub(crate) fn set_change_parms(&mut self, player: EntId) {
-        let v = &self.entities[player.index()].v;
+        let v = &self.entities[player].v;
         if v.health <= 0.0 {
             self.set_new_parms();
             return;
         }
 
-        let keep_mask =
-            (IT_KEY1 + IT_KEY2 + IT_INVISIBILITY + IT_INVULNERABILITY + IT_SUIT + IT_QUAD) as i32;
-        let items = (v.items as i32 & !keep_mask) as f32;
+        let items = v.items
+            .without(Items::KEY1 | Items::KEY2 | Items::INVISIBILITY | Items::INVULNERABILITY | Items::SUIT | Items::QUAD);
         let health = v.health.clamp(50.0, 100.0);
         let armorvalue = v.armorvalue;
         let shells = v.ammo_shells.max(25.0);
@@ -82,7 +81,7 @@ impl GameState {
     /// `DecodeLevelParms` — load a player's fields from the spawn parameters.
     fn decode_level_parms(&mut self, player: EntId) {
         let p = self.globals.parm;
-        let v = &mut self.entities[player.index()].v;
+        let v = &mut self.entities[player].v;
         v.items = p[0];
         v.health = p[1];
         v.armorvalue = p[2];
@@ -98,7 +97,7 @@ impl GameState {
     pub(crate) fn put_client_in_server(&mut self, player: EntId) {
         let time = self.globals.time;
         {
-            let ent = &mut self.entities[player.index()];
+            let ent = &mut self.entities[player];
             ent.in_use = true;
             ent.classname = Some("player".into());
             ent.v.health = 100.0;
@@ -106,20 +105,33 @@ impl GameState {
             ent.v.solid = SOLID_SLIDEBOX;
             ent.v.movetype = MOVETYPE_WALK;
             ent.v.max_health = 100.0;
-            ent.v.flags = FL_CLIENT;
+            ent.v.flags = Flags::CLIENT.as_f32();
             ent.v.effects = 0.0;
             ent.v.deadflag = DEAD_NO;
+            ent.show_hostile = 0.0;
+            ent.air_finished = time + 12.0;
+            ent.dmg = 2.0; // initial water damage
+            ent.super_damage_finished = 0.0;
+            ent.radsuit_finished = 0.0;
+            ent.invisible_finished = 0.0;
+            ent.invincible_finished = 0.0;
+            ent.invincible_time = 0.0;
+            ent.pausetime = 0.0;
             ent.attack_finished = time;
+            ent.th_pain = Pain::Player;
+            ent.th_die = Die::Player;
         }
 
         self.decode_level_parms(player);
         self.w_set_current_ammo(player);
 
+
+
         let spot = self.select_spawn_point();
-        let origin = self.entities[spot.index()].v.origin + Vec3::new(0.0, 0.0, 1.0);
-        let angles = self.entities[spot.index()].v.angles;
+        let origin = self.entities[spot].v.origin + Vec3::new(0.0, 0.0, 1.0);
+        let angles = self.entities[spot].v.angles;
         {
-            let ent = &mut self.entities[player.index()];
+            let ent = &mut self.entities[player];
             ent.v.origin = origin;
             ent.v.angles = angles;
             ent.v.fixangle = 1.0; // snap the client's view immediately
@@ -127,58 +139,461 @@ impl GameState {
             ent.v.velocity = Vec3::ZERO;
         }
 
-        // Assign the player model and bounding box; both relink the entity in the engine
-        // at its current origin.
+        // Assign the player model and bounding box, then explicitly relink at the spawn
+        // origin via setorigin (the engine warns that a direct origin write does not fix
+        // internal links — this is what makes the player visible/collidable to others).
+        // The "eyes" model is set first purely to capture its modelindex (QuakeC's hack for
+        // the Ring of Shadows), then the real player model.
+        self.host.set_model(player.0 as i32, c"progs/eyes.mdl");
+        self.level.modelindex_eyes = self.entities[player].v.modelindex;
         self.host.set_model(player.0 as i32, c"progs/player.mdl");
+        self.level.modelindex_player = self.entities[player].v.modelindex;
         self.host
             .set_size(player.0 as i32, VEC_HULL_MIN, VEC_HULL_MAX);
+        self.host.set_origin(player.0 as i32, origin);
 
-        // Kick off the idle/run animation think loop.
+        // Telefrag anyone already standing here, then kick off the idle animation loop.
+        self.spawn_tdeath(origin, player);
         self.player_stand1(player);
     }
 
-    /// `PlayerPreThink` — runs before engine physics. Minimal for now (movement is engine
-    /// side); combat/water/jump/weapon logic lands in M3.
-    pub(crate) fn player_pre_think(&mut self, player: EntId) {
-        let v_angle = self.entities[player.index()].v.v_angle;
+    /// `PlayerPreThink` — runs before engine physics: rules, water, death/respawn, jump.
+    pub(crate) fn player_pre_think(&mut self, e: EntId) {
+        if self.intermission_running {
+            self.intermission_think();
+            return;
+        }
+        if self.entities[e].v.view_ofs == Vec3::ZERO {
+            return; // intermission or finale
+        }
+        let v_angle = self.entities[e].v.v_angle;
         self.host.make_vectors(v_angle);
+        self.entities[e].deathtype = None;
+
+        self.check_rules(e);
+        self.water_move(e);
+
+        let deadflag = self.entities[e].v.deadflag;
+        if deadflag >= DEAD_DEAD {
+            self.player_death_think(e);
+            return;
+        }
+        if deadflag == DEAD_DYING {
+            return;
+        }
+
+        if self.entities[e].v.button2 != 0.0 {
+            self.player_jump(e);
+        } else {
+            let ent = &mut self.entities[e];
+            ent.v.flags = ent.v.flags.with(Flags::JUMPRELEASED);
+        }
+
+        // Teleporters can force a pause.
+        if self.time() < self.entities[e].pausetime {
+            self.entities[e].v.velocity = Vec3::ZERO;
+        }
+
+        let v = &self.entities[e].v;
+        if self.time() > self.entities[e].attack_finished
+            && v.currentammo == 0.0
+            && v.weapon != Items::AXE.as_f32()
+        {
+            let best = self.w_best_weapon(e);
+            self.entities[e].v.weapon = best.as_f32();
+            self.w_set_current_ammo(e);
+        }
     }
 
-    /// `PlayerPostThink` — runs after engine physics. Drives the weapon loop (impulse
-    /// switching now; firing and landing/powerup logic in later slices).
-    pub(crate) fn player_post_think(&mut self, player: EntId) {
-        self.w_weapon_frame(player);
+    /// `PlayerPostThink` — runs after engine physics: landing damage, powerups, weapon loop.
+    pub(crate) fn player_post_think(&mut self, e: EntId) {
+        if self.entities[e].v.view_ofs == Vec3::ZERO || self.entities[e].v.deadflag != 0.0
+        {
+            return;
+        }
+
+        // Landing sound / falling damage.
+        let (jump_flag, on_ground, watertype) = {
+            let ent = &self.entities[e];
+            (
+                ent.jump_flag,
+                ent.v.flags.has(Flags::ONGROUND),
+                ent.v.watertype,
+            )
+        };
+        if jump_flag < -300.0 && on_ground {
+            if watertype == CONTENT_WATER {
+                self.host
+                    .sound(e.0 as i32, CHAN_BODY, c"player/h2ojump.wav", 1.0, ATTN_NORM);
+            } else if jump_flag < -650.0 {
+                self.entities[e].deathtype = Some("falling".into());
+                self.t_damage(e, EntId::WORLD, EntId::WORLD, 5.0);
+                self.host
+                    .sound(e.0 as i32, CHAN_VOICE, c"player/land2.wav", 1.0, ATTN_NORM);
+            } else {
+                self.host
+                    .sound(e.0 as i32, CHAN_VOICE, c"player/land.wav", 1.0, ATTN_NORM);
+            }
+        }
+        self.entities[e].jump_flag = self.entities[e].v.velocity.z;
+
+        self.check_powerups(e);
+        self.w_weapon_frame(e);
     }
+
+    /// `GAME_CLIENT_COMMAND` — handle a client console command; returns whether we consumed
+    /// it (the engine runs its own handler otherwise).
+    pub(crate) fn client_command(&mut self, e: EntId) -> isize {
+        let mut buf = [0u8; 64];
+        let cmd = self.host.cmd_argv(0, &mut buf).to_owned();
+        match cmd.as_str() {
+            "kill" => {
+                self.client_kill(e);
+                1
+            }
+            _ => 0,
+        }
+    }
+
+    /// `ClientKill` — the `kill` suicide command.
+    fn client_kill(&mut self, e: EntId) {
+        let name = self.netname_of(e);
+        self.broadcast(PRINT_MEDIUM, &format!("{name} suicides\n"));
+        self.set_suicide_frame(e);
+        self.entities[e].v.modelindex = self.level.modelindex_player;
+        self.host.logfrag(e.0 as i32, e.0 as i32);
+        self.entities[e].v.frags -= 2.0;
+        self.respawn(e);
+    }
+
+    /// `respawn` — copy the corpse, reset parms, re-enter the server.
+    pub(crate) fn respawn(&mut self, e: EntId) {
+        self.copy_to_body_que(e);
+        self.set_new_parms();
+        self.put_client_in_server(e);
+    }
+
+    /// `CheckRules` — end the level on time/frag limit.
+    fn check_rules(&mut self, e: EntId) {
+        let frags = self.entities[e].v.frags;
+        let tl = self.level.timelimit;
+        let fl = self.level.fraglimit;
+        if (tl != 0 && self.time() as i32 >= tl) || (fl != 0 && frags as i32 >= fl) {
+            self.next_level();
+        }
+    }
+
+    /// `PlayerDeathThink` — slow the corpse, then respawn on a button press.
+    fn player_death_think(&mut self, e: EntId) {
+        if self.entities[e].v.flags.has(Flags::ONGROUND) {
+            let vel = self.entities[e].v.velocity;
+            let forward = vel.length() - 20.0;
+            self.entities[e].v.velocity = if forward <= 0.0 {
+                Vec3::ZERO
+            } else {
+                forward * vel.normalize_or_zero()
+            };
+        }
+
+        let (deadflag, b0, b1, b2) = {
+            let v = &self.entities[e].v;
+            (
+                self.entities[e].v.deadflag,
+                v.button0,
+                v.button1,
+                v.button2,
+            )
+        };
+        if deadflag == DEAD_DEAD {
+            if b0 != 0.0 || b1 != 0.0 || b2 != 0.0 {
+                return;
+            }
+            self.entities[e].v.deadflag = DEAD_RESPAWNABLE;
+            return;
+        }
+        if b0 == 0.0 && b1 == 0.0 && b2 == 0.0 {
+            return;
+        }
+        {
+            let v = &mut self.entities[e].v;
+            v.button0 = 0.0;
+            v.button1 = 0.0;
+            v.button2 = 0.0;
+        }
+        self.respawn(e);
+    }
+
+    /// `PlayerJump`.
+    fn player_jump(&mut self, e: EntId) {
+        let time = self.time();
+        let (flags, waterlevel, swim_flag) = {
+            let ent = &self.entities[e];
+            (ent.v.flags, ent.v.waterlevel, ent.swim_flag)
+        };
+        if flags.has(Flags::WATERJUMP) {
+            return;
+        }
+        if waterlevel >= 2.0 {
+            if swim_flag < time {
+                self.entities[e].swim_flag = time + 1.0;
+                let s = if self.random() < 0.5 { c"misc/water1.wav" } else { c"misc/water2.wav" };
+                self.host.sound(e.0 as i32, CHAN_BODY, s, 1.0, ATTN_NORM);
+            }
+            return;
+        }
+        if !flags.has(Flags::ONGROUND) || !flags.has(Flags::JUMPRELEASED) {
+            return;
+        }
+        {
+            let v = &mut self.entities[e].v;
+            v.flags = flags.without(Flags::JUMPRELEASED);
+            v.button2 = 0.0;
+        }
+        self.host
+            .sound(e.0 as i32, CHAN_BODY, c"player/plyrjmp8.wav", 1.0, ATTN_NORM);
+    }
+
+    /// `WaterMove` — drowning and lava/slime damage and enter/leave sounds.
+    fn water_move(&mut self, e: EntId) {
+        let time = self.time();
+        let (movetype, health, waterlevel, watertype, air_finished) = {
+            let ent = &self.entities[e];
+            (ent.v.movetype, ent.v.health, ent.v.waterlevel, ent.v.watertype, ent.air_finished)
+        };
+        if movetype == MOVETYPE_NOCLIP || health < 0.0 {
+            return;
+        }
+
+        if waterlevel != 3.0 {
+            if air_finished < time {
+                self.host
+                    .sound(e.0 as i32, CHAN_VOICE, c"player/gasp2.wav", 1.0, ATTN_NORM);
+            } else if air_finished < time + 9.0 {
+                self.host
+                    .sound(e.0 as i32, CHAN_VOICE, c"player/gasp1.wav", 1.0, ATTN_NORM);
+            }
+            let ent = &mut self.entities[e];
+            ent.air_finished = time + 12.0;
+            ent.dmg = 2.0;
+        } else if air_finished < time && self.entities[e].pain_finished < time {
+            let ent = &mut self.entities[e];
+            ent.dmg += 2.0;
+            if ent.dmg > 15.0 {
+                ent.dmg = 10.0;
+            }
+            let dmg = ent.dmg;
+            ent.pain_finished = time + 1.0;
+            self.t_damage(e, EntId::WORLD, EntId::WORLD, dmg);
+        }
+
+        if waterlevel == 0.0 {
+            if self.entities[e].v.flags.has(Flags::INWATER) {
+                self.host
+                    .sound(e.0 as i32, CHAN_BODY, c"misc/outwater.wav", 1.0, ATTN_NORM);
+                let ent = &mut self.entities[e];
+                ent.v.flags = ent.v.flags.without(Flags::INWATER);
+            }
+            return;
+        }
+
+        // Lava/slime contact damage.
+        let (dmgtime, radsuit) = {
+            let ent = &self.entities[e];
+            (ent.dmgtime, ent.radsuit_finished)
+        };
+        if watertype == CONTENT_LAVA && dmgtime < time {
+            self.entities[e].dmgtime = if radsuit > time { time + 1.0 } else { time + 0.2 };
+            self.t_damage(e, EntId::WORLD, EntId::WORLD, 10.0 * waterlevel);
+        } else if watertype == CONTENT_SLIME && dmgtime < time && radsuit < time {
+            self.entities[e].dmgtime = time + 1.0;
+            self.t_damage(e, EntId::WORLD, EntId::WORLD, 4.0 * waterlevel);
+        }
+
+        if !self.entities[e].v.flags.has(Flags::INWATER) {
+            let s = match watertype {
+                w if w == CONTENT_LAVA => Some(c"player/inlava.wav"),
+                w if w == CONTENT_WATER => Some(c"player/inh2o.wav"),
+                w if w == CONTENT_SLIME => Some(c"player/slimbrn2.wav"),
+                _ => None,
+            };
+            if let Some(s) = s {
+                self.host.sound(e.0 as i32, CHAN_BODY, s, 1.0, ATTN_NORM);
+            }
+            let ent = &mut self.entities[e];
+            ent.v.flags = ent.v.flags.with(Flags::INWATER);
+            ent.dmgtime = 0.0;
+        }
+    }
+
+    /// `CheckPowerups` — expire powerups, flash warnings, and drive their lighting effects.
+    fn check_powerups(&mut self, e: EntId) {
+        let time = self.time();
+        if self.entities[e].v.health <= 0.0 {
+            return;
+        }
+
+        // Invisibility (Ring of Shadows) — swap to the eyes model.
+        if self.entities[e].invisible_finished != 0.0 {
+            if self.entities[e].invisible_sound < time {
+                self.host
+                    .sound(e.0 as i32, CHAN_AUTO, c"items/inv3.wav", 0.5, ATTN_IDLE);
+                let r = (self.random() * 3.0) + 1.0;
+                self.entities[e].invisible_sound = time + r;
+            }
+            if self.entities[e].invisible_finished < time + 3.0 {
+                self.powerup_warn(e, "invisible", c"Ring of Shadows magic is fading\n", c"items/inv2.wav");
+            }
+            if self.entities[e].invisible_finished < time {
+                let ent = &mut self.entities[e];
+                ent.v.items = ent.v.items.without(Items::INVISIBILITY);
+                ent.invisible_finished = 0.0;
+                ent.invisible_time = 0.0;
+            }
+            let eyes = self.level.modelindex_eyes;
+            let ent = &mut self.entities[e];
+            ent.v.frame = 0.0;
+            ent.v.modelindex = eyes;
+        } else {
+            self.entities[e].v.modelindex = self.level.modelindex_player;
+        }
+
+        // Invincibility (Pentagram) — red glow.
+        if self.entities[e].invincible_finished != 0.0 {
+            if self.entities[e].invincible_finished < time + 3.0 {
+                self.powerup_warn(e, "invincible", c"Protection is almost burned out\n", c"items/protect2.wav");
+            }
+            if self.entities[e].invincible_finished < time {
+                let ent = &mut self.entities[e];
+                ent.v.items = ent.v.items.without(Items::INVULNERABILITY);
+                ent.invincible_time = 0.0;
+                ent.invincible_finished = 0.0;
+            }
+            self.set_powerup_glow(e, self.entities[e].invincible_finished > time, Effects::RED);
+        }
+
+        // Quad Damage — blue glow.
+        if self.entities[e].super_damage_finished != 0.0 {
+            if self.entities[e].super_damage_finished < time + 3.0 {
+                let msg = if self.level.deathmatch == 4 {
+                    c"OctaPower is wearing off\n"
+                } else {
+                    c"Quad Damage is wearing off\n"
+                };
+                self.powerup_warn(e, "super", msg, c"items/damage2.wav");
+            }
+            if self.entities[e].super_damage_finished < time {
+                let dm4 = self.level.deathmatch == 4;
+                let ent = &mut self.entities[e];
+                ent.v.items = ent.v.items.without(Items::QUAD);
+                if dm4 {
+                    ent.v.ammo_cells = 255.0;
+                    ent.v.armorvalue = 1.0;
+                    ent.v.armortype = 0.8;
+                    ent.v.health = 100.0;
+                }
+                ent.super_damage_finished = 0.0;
+                ent.super_time = 0.0;
+            }
+            self.set_powerup_glow(e, self.entities[e].super_damage_finished > time, Effects::BLUE);
+        }
+
+        // Biosuit — refresh air, expire quietly.
+        if self.entities[e].radsuit_finished != 0.0 {
+            self.entities[e].air_finished = time + 12.0;
+            if self.entities[e].radsuit_finished < time + 3.0 {
+                self.powerup_warn(e, "rad", c"Air supply in Biosuit expiring\n", c"items/suit2.wav");
+            }
+            if self.entities[e].radsuit_finished < time {
+                let ent = &mut self.entities[e];
+                ent.v.items = ent.v.items.without(Items::SUIT);
+                ent.rad_time = 0.0;
+                ent.radsuit_finished = 0.0;
+            }
+        }
+    }
+
+    /// Shared "powerup almost out" flash/sound bookkeeping for [`Self::check_powerups`].
+    /// `which` selects the per-powerup `*_time` latch.
+    fn powerup_warn(&mut self, e: EntId, which: &str, msg: &CStr, sound: &CStr) {
+        let time = self.time();
+        let latch = match which {
+            "invisible" => self.entities[e].invisible_time,
+            "invincible" => self.entities[e].invincible_time,
+            "super" => self.entities[e].super_time,
+            _ => self.entities[e].rad_time,
+        };
+        if latch == 1.0 {
+            self.host.sprint(e.0 as i32, PRINT_HIGH, msg);
+            self.host.stuffcmd(e.0 as i32, c"bf\n");
+            self.host.sound(e.0 as i32, CHAN_AUTO, sound, 1.0, ATTN_NORM);
+            self.set_powerup_time(e, which, time + 1.0);
+        } else if latch < time {
+            self.set_powerup_time(e, which, time + 1.0);
+            self.host.stuffcmd(e.0 as i32, c"bf\n");
+        }
+    }
+
+    fn set_powerup_time(&mut self, e: EntId, which: &str, t: f32) {
+        let ent = &mut self.entities[e];
+        match which {
+            "invisible" => ent.invisible_time = t,
+            "invincible" => ent.invincible_time = t,
+            "super" => ent.super_time = t,
+            _ => ent.rad_time = t,
+        }
+    }
+
+    /// Toggle a powerup's dim-light + colour glow effect bits.
+    fn set_powerup_glow(&mut self, e: EntId, on: bool, color: Effects) {
+        let glow = Effects::DIMLIGHT | color;
+        let fx = self.entities[e].v.effects;
+        self.entities[e].v.effects = if on { fx.with(glow) } else { fx.without(glow) };
+    }
+
+    /// `CopyToBodyQue` — leave a corpse copy behind on respawn. (Cosmetic body queue is
+    /// deferred; the live entity is simply re-used.)
+    fn copy_to_body_que(&mut self, _e: EntId) {}
 
     /// `W_SetCurrentAmmo` — sync `currentammo`/`weaponmodel`/ammo item bits to the active
-    /// weapon. (The weapon view model is recorded but not yet networked — vwep is M3.)
+    /// weapon, and network the first-person viewmodel.
     pub(crate) fn w_set_current_ammo(&mut self, player: EntId) {
-        let ent = &mut self.entities[player.index()];
-        let mut items = ent.v.items as i32 & !((IT_SHELLS + IT_NAILS + IT_ROCKETS + IT_CELLS) as i32);
+        self.player_run(player); // get out of any weapon-firing animation state
 
-        let (ammo, model, ammo_bit): (f32, Option<&str>, f32) = match ent.v.weapon {
-            w if w == IT_AXE => (0.0, Some("progs/v_axe.mdl"), 0.0),
-            w if w == IT_SHOTGUN => (ent.v.ammo_shells, Some("progs/v_shot.mdl"), IT_SHELLS),
-            w if w == IT_SUPER_SHOTGUN => (ent.v.ammo_shells, Some("progs/v_shot2.mdl"), IT_SHELLS),
-            w if w == IT_NAILGUN => (ent.v.ammo_nails, Some("progs/v_nail.mdl"), IT_NAILS),
-            w if w == IT_SUPER_NAILGUN => (ent.v.ammo_nails, Some("progs/v_nail2.mdl"), IT_NAILS),
-            w if w == IT_GRENADE_LAUNCHER => {
-                (ent.v.ammo_rockets, Some("progs/v_rock.mdl"), IT_ROCKETS)
+        let (ammo, model, ammo_bit): (f32, Option<&'static CStr>, Items) = {
+            let v = &self.entities[player].v;
+            match Items::from_f32(v.weapon) {
+                w if w == Items::AXE => (0.0, Some(c"progs/v_axe.mdl"), Items::empty()),
+                w if w == Items::SHOTGUN => (v.ammo_shells, Some(c"progs/v_shot.mdl"), Items::SHELLS),
+                w if w == Items::SUPER_SHOTGUN => {
+                    (v.ammo_shells, Some(c"progs/v_shot2.mdl"), Items::SHELLS)
+                }
+                w if w == Items::NAILGUN => (v.ammo_nails, Some(c"progs/v_nail.mdl"), Items::NAILS),
+                w if w == Items::SUPER_NAILGUN => {
+                    (v.ammo_nails, Some(c"progs/v_nail2.mdl"), Items::NAILS)
+                }
+                w if w == Items::GRENADE_LAUNCHER => {
+                    (v.ammo_rockets, Some(c"progs/v_rock.mdl"), Items::ROCKETS)
+                }
+                w if w == Items::ROCKET_LAUNCHER => {
+                    (v.ammo_rockets, Some(c"progs/v_rock2.mdl"), Items::ROCKETS)
+                }
+                w if w == Items::LIGHTNING => (v.ammo_cells, Some(c"progs/v_light.mdl"), Items::CELLS),
+                _ => (0.0, None, Items::empty()),
             }
-            w if w == IT_ROCKET_LAUNCHER => {
-                (ent.v.ammo_rockets, Some("progs/v_rock2.mdl"), IT_ROCKETS)
-            }
-            w if w == IT_LIGHTNING => (ent.v.ammo_cells, Some("progs/v_light.mdl"), IT_CELLS),
-            _ => (0.0, None, 0.0),
         };
 
-        if ammo_bit != 0.0 {
-            items |= ammo_bit as i32;
+        {
+            let ent = &mut self.entities[player];
+            ent.v.items = ent
+                .v
+                .items
+                .without(Items::SHELLS | Items::NAILS | Items::ROCKETS | Items::CELLS)
+                .with(ammo_bit);
+            ent.v.currentammo = ammo;
+            ent.v.weaponframe = 0.0;
+            ent.weaponmodel = model.and_then(|m| m.to_str().ok()).map(Into::into);
         }
-        ent.v.currentammo = ammo;
-        ent.v.weaponframe = 0.0;
-        ent.v.items = items as f32;
-        ent.weaponmodel = model.map(Into::into);
+        self.set_weaponmodel(player, model);
     }
 
     /// `SelectSpawnPoint` — pick a deathmatch spawn (preferring unoccupied ones), falling
@@ -205,25 +620,19 @@ impl GameState {
 
     /// Whether any player stands within 84 units of a spawn point.
     fn spot_occupied(&self, spot: EntId) -> bool {
-        let origin = self.entities[spot.index()].v.origin;
+        let origin = self.entities[spot].v.origin;
         self.find_by_classname("player")
-            .any(|p| (self.entities[p.index()].v.origin - origin).length() < 84.0)
+            .any(|p| (self.entities[p].v.origin - origin).length() < 84.0)
     }
 
     // --- small helpers ---
 
     /// Read the player's `name` userinfo key.
-    fn read_netname(&self, player: EntId) -> String {
+    pub(crate) fn read_netname(&self, player: EntId) -> String {
         let mut buf = [0u8; 64];
         self.host
             .infokey(player.0 as i32, c"name", &mut buf)
             .to_owned()
     }
 
-    /// `bprint` of a dynamic message to every client.
-    fn broadcast(&self, level: i32, message: &str) {
-        if let Ok(c) = CString::new(message) {
-            self.host.bprint(level, &c);
-        }
-    }
 }
