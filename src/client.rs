@@ -116,12 +116,6 @@ impl GameState {
         let spot = self.select_spawn_point();
         let origin = self.entities[spot.index()].v.origin + Vec3::new(0.0, 0.0, 1.0);
         let angles = self.entities[spot.index()].v.angles;
-        self.dlog(&format!(
-            "[rtx] put_client_in_server player={} spot={} origin={origin:?} dm={}",
-            player.index(),
-            spot.index(),
-            self.level.deathmatch,
-        ));
         {
             let ent = &mut self.entities[player.index()];
             ent.v.origin = origin;

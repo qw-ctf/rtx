@@ -91,36 +91,6 @@ impl GameState {
     pub fn dispatch(&mut self, cmd: GameCommand, arg0: i32, arg1: i32, _arg2: i32) -> isize {
         let player = self.self_ent();
         let is_spectator = arg0 != 0;
-
-        // TEMP M2 diagnostics: trace the client lifecycle on the server console.
-        if matches!(
-            cmd,
-            GameCommand::ClientConnect
-                | GameCommand::PutClientInServer
-                | GameCommand::ClientDisconnect
-                | GameCommand::SetNewParams
-                | GameCommand::SetChangeParams
-        ) {
-            self.dlog(&format!(
-                "[rtx] {cmd:?} arg0={arg0} self_off={} self_idx={} sizeofent={}",
-                self.globals.self_,
-                player.index(),
-                core::mem::size_of::<Entity>(),
-            ));
-        }
-        if matches!(cmd, GameCommand::ClientConnect) {
-            let e = player.0 as i32;
-            let (mut b1, mut b2, mut b3, mut b4) = ([0u8; 64], [0u8; 64], [0u8; 64], [0u8; 64]);
-            let name = self.host.infokey(e, c"name", &mut b1).to_owned();
-            let spec = self.host.infokey(e, c"spectator", &mut b2).to_owned();
-            let sspec = self.host.infokey(e, c"*spectator", &mut b3).to_owned();
-            let zext = self.host.infokey(e, c"*z_ext", &mut b4).to_owned();
-            // Z_EXT_JOIN_OBSERVE = 1<<5 = 32.
-            self.dlog(&format!(
-                "[rtx] connect userinfo: name='{name}' spectator='{spec}' *spectator='{sspec}' *z_ext='{zext}' (join/observe bit32)"
-            ));
-        }
-
         match cmd {
             GameCommand::Init => self.init(arg0, arg1),
             GameCommand::LoadEntities => self.load_entities(),
@@ -223,15 +193,6 @@ impl GameState {
         for fields in blocks {
             self.spawn_entity(&fields);
         }
-
-        // TEMP M2 diagnostics.
-        let live = self.entities.iter().filter(|e| e.in_use).count();
-        let dm_spots = self.find_by_classname("info_player_deathmatch").count();
-        let starts = self.find_by_classname("info_player_start").count();
-        self.dlog(&format!(
-            "[rtx] load_entities: live={live} dm_spawns={dm_spots} starts={starts} dm_cvar={}",
-            self.level.deathmatch,
-        ));
         1
     }
 
@@ -378,14 +339,6 @@ impl GameState {
     #[inline]
     pub fn host(&self) -> &HostApi {
         &self.host
-    }
-
-    /// Print a formatted line to the server console (`G_conprint`, unconditional —
-    /// unlike `dprint`, which is developer-gated).
-    pub(crate) fn dlog(&self, msg: &str) {
-        if let Ok(c) = std::ffi::CString::new(format!("{msg}\n")) {
-            self.host.conprint(&c);
-        }
     }
 
     /// QuakeC `random()` — a float in `[0, 1)` from our xorshift PRNG.
