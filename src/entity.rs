@@ -5,7 +5,11 @@
 //! that prefix directly. Everything after `v` is the *private tail*: ordinary Rust state
 //! the engine never touches, so it may use any types (enums, `Option`, etc.).
 
-use crate::abi::EntVars;
+use std::ffi::CString;
+
+use glam::Vec3;
+
+use crate::abi::{EntVars, STRING_REF_COUNT};
 
 /// A `Copy` index handle into the entity array. Never a borrow, so holding one across a
 /// trap call is fine — this is what keeps the safe API free of aliasing hazards.
@@ -21,21 +25,186 @@ impl EntId {
     pub fn index(self) -> usize {
         self.0 as usize
     }
+
+    /// `EDICT_TO_PROG` — the byte offset the engine stores in entvars `.entity` fields.
+    #[inline]
+    pub fn to_prog(self) -> i32 {
+        (self.index() * core::mem::size_of::<Entity>()) as i32
+    }
+
+    /// `PROG_TO_EDICT` — recover an index from an entvars `.entity` byte offset.
+    #[inline]
+    pub fn from_prog(prog: i32) -> EntId {
+        EntId((prog as usize / core::mem::size_of::<Entity>()) as u32)
+    }
+
+    /// Whether this is a real (non-world) entity reference.
+    #[inline]
+    pub fn is_some(self) -> bool {
+        self.0 != 0
+    }
 }
 
 /// A scheduled `think` behaviour. Modeled as a data enum (not a fn pointer) so it is
-/// `Debug`/`Eq`/serializable and the central dispatcher's `match` is exhaustiveness-checked.
-/// Animation chains will be added as table-driven variants (e.g. `PlayerAnim(AnimId)`)
-/// rather than one variant per QC frame function.
+/// `Debug`/`Eq` and the central dispatcher's `match` is exhaustiveness-checked. QuakeC's
+/// think-chains map to a variant per chain entry; animation cursors live in `walkframe`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Think {
     #[default]
     None,
-    /// Player standing-idle animation loop (`player_stand1`).
+    // --- subs.qc movement machinery ---
+    /// `SUB_CalcMoveDone` — snap to `finaldest`, then run `think1`.
+    SubCalcMoveDone,
+    /// `SUB_Remove` — free this entity.
+    SubRemove,
+    /// `DelayThink` — fire a delayed `SUB_UseTargets`.
+    DelayedUse,
+
+    // --- player animation loops (player.qc) ---
     PlayerStand,
-    /// Player running animation loop (`player_run`).
     PlayerRun,
+    /// One-shot body-frame run from the current frame to `anim_end`, then `anim_after`
+    /// (used for pain and death sequences).
+    PlayerAnim,
+    /// Terminal of a death sequence (`PlayerDead`: freeze, mark `DEAD_DEAD`).
+    PlayerDead,
+    /// Cosmetic weapon firing animation (shotgun/rocket/axe), parameterized by the
+    /// `anim_*` tail fields; fires `W_FireAxe` at `anim_fire` if set, then `player_run`.
+    PlayerWeaponAnim,
+    /// Looping nailgun fire (alternating left/right spikes) while attack is held.
+    PlayerNail,
+    /// Looping lightning fire while attack is held.
+    PlayerLight,
+
+    // --- projectiles (weapons.qc) ---
+    /// Grenade timed explosion (rockets/spikes are touch-driven and need no think).
+    GrenadeExplode,
+
+    // --- items.qc ---
+    /// `SUB_regen` — re-show a picked-up item after its respawn delay.
+    SubRegen,
+    /// `PlaceItem` — drop an item to the floor after spawn.
+    PlaceItem,
+    /// `item_megahealth_rot` — rot a megahealth recipient back to max health.
+    MegaHealthRot,
+
+    // --- doors.qc ---
+    DoorLink,
+    DoorGoDown,
+    DoorHitTop,
+    DoorHitBottom,
+
+    // --- plats.qc ---
+    PlatGoDown,
+    PlatHitTop,
+    PlatHitBottom,
+    TrainNext,
+    TrainWait,
+    FuncTrainFind,
+
+    // --- buttons.qc ---
+    ButtonWait,
+    ButtonReturn,
+    ButtonDone,
+
+    // --- triggers.qc ---
+    MultiWait,
+    HurtOn,
+    PlayTeleport,
+    ExecuteChangelevel,
 }
+
+/// A `.touch` behaviour (`GAME_EDICT_TOUCH`). The dispatcher reads `self`/`other` and
+/// matches on this. Mirrors the structure of [`Think`].
+// Variant names mirror their QuakeC `*_touch` functions.
+#[allow(clippy::enum_variant_names)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Touch {
+    #[default]
+    None,
+    // projectiles
+    Spike,
+    SuperSpike,
+    Grenade,
+    Missile,
+    // items.qc
+    ItemHealth,
+    ItemArmor,
+    ItemWeapon,
+    ItemAmmo,
+    ItemPowerup,
+    Backpack,
+    // map entities
+    DoorTriggerField,
+    DoorTouch,
+    PlatCenter,
+    ButtonTouch,
+    Multi,
+    Teleport,
+    Hurt,
+    Push,
+    TriggerMonsterjump,
+    Tdeath,
+    Changelevel,
+}
+
+/// A `.use` behaviour, fired by `SUB_UseTargets` / button presses.
+// Variant names mirror their QuakeC `*_use` functions, hence the shared `Use` suffix.
+#[allow(clippy::enum_variant_names)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Use {
+    #[default]
+    None,
+    DoorUse,
+    PlatTrigger,
+    PlatUse,
+    TrainUse,
+    ButtonUse,
+    MultiUse,
+    TeleportUse,
+    TriggerRelay,
+    CounterUse,
+    LightUse,
+    FuncWallUse,
+}
+
+/// A `.blocked` behaviour for `MOVETYPE_PUSH` movers (`GAME_EDICT_BLOCKED`).
+#[allow(clippy::enum_variant_names)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Blocked {
+    #[default]
+    None,
+    DoorBlocked,
+    PlatBlocked,
+    TrainBlocked,
+}
+
+/// A `.th_pain` behaviour, invoked by `T_Damage`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Pain {
+    #[default]
+    None,
+    Player,
+}
+
+/// A `.th_die` behaviour, invoked by `Killed`.
+#[allow(clippy::enum_variant_names)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Die {
+    #[default]
+    None,
+    Player,
+    DoorKilled,
+    ButtonKilled,
+    TriggerKilled,
+    ExploBoxDie,
+}
+
+/// `state` for door/plat/button movers (QuakeC `STATE_*`).
+pub const STATE_TOP: f32 = 0.0;
+pub const STATE_BOTTOM: f32 = 1.0;
+pub const STATE_UP: f32 = 2.0;
+pub const STATE_DOWN: f32 = 3.0;
 
 /// One game entity: the engine-shared `v`, followed by the private Rust tail.
 ///
@@ -48,16 +217,43 @@ pub struct Entity {
     /// Engine-shared fields (offset 0). See [`EntVars`].
     pub v: EntVars,
 
+    /// Backing cells for the native string ABI (see [`EntVars::link_string_refs`]). The
+    /// engine stores each `.string` field's resolved `char*` here. They sit first in the tail
+    /// so they live *inside* the entity array, which the engine's offset arithmetic requires.
+    pub string_refs: [u64; STRING_REF_COUNT],
+
     // --- private tail: engine never addresses these ---
     /// Whether this slot is currently a live entity.
     pub in_use: bool,
-    /// Scheduled think behaviour, resolved by the central dispatcher.
+
+    // callbacks (QuakeC `.think`/`.touch`/`.use`/`.blocked`/`.th_pain`/`.th_die`)
     pub think: Think,
-    /// Walk/idle animation cursor for the player movement loops.
+    /// Secondary think (`think1`): the function `SUB_CalcMove*` runs once the move finishes.
+    pub think1: Think,
+    pub touch: Touch,
+    pub use_: Use,
+    pub blocked: Blocked,
+    pub th_pain: Pain,
+    pub th_die: Die,
+
+    /// Walk/idle animation cursor for player movement loops; also a generic frame cursor.
     pub walkframe: i32,
-    /// Time until which weapon actions are locked out (`attack_finished`).
-    pub attack_finished: f32,
-    /// Classname, for spawn dispatch and `find`.
+    /// One-shot body animation: final frame for [`Think::PlayerAnim`].
+    pub anim_end: i32,
+    /// What to do after a one-shot player animation completes.
+    pub anim_after: Think,
+    /// Cosmetic weapon-animation parameters (see [`Think::PlayerWeaponAnim`]): body-frame
+    /// base, weaponframe base, frame count, and the cursor index that fires the axe (-1 = no
+    /// in-animation fire, e.g. shotgun/rocket which fire from `W_Attack` directly).
+    pub anim_base: i32,
+    pub anim_wf_base: i32,
+    pub anim_len: i32,
+    pub anim_fire: i32,
+    pub anim_muzzle: i32,
+    /// Anti-double-fire latch for projectiles (`voided`).
+    pub voided: f32,
+
+    // strings (owned on our side; engine sees them only via traps)
     pub classname: Option<Box<str>>,
     pub model: Option<Box<str>>,
     pub weaponmodel: Option<Box<str>>,
@@ -66,7 +262,92 @@ pub struct Entity {
     pub killtarget: Option<Box<str>>,
     pub message: Option<Box<str>>,
     pub netname: Option<Box<str>>,
+    pub noise: Option<Box<str>>,
+    pub noise1: Option<Box<str>>,
+    pub noise2: Option<Box<str>>,
+    pub noise3: Option<Box<str>>,
+    pub noise4: Option<Box<str>>,
+    pub deathtype: Option<Box<str>>,
+    pub mdl: Option<Box<str>>,
+    /// `trigger_changelevel`'s destination map name.
+    pub map: Option<Box<str>>,
+    /// The item's model as a `'static` C string, kept so a respawned item can be re-shown
+    /// (the engine stores the raw pointer, so it must outlive the entity — see the native
+    /// string ABI notes in `abi.rs`). Item models are all string literals, so this is sound.
+    pub model_cstr: Option<&'static core::ffi::CStr>,
+    /// Owned C string backing a brush model (`*N`) passed to `setmodel`. The engine keeps the
+    /// raw pointer, so this must live as long as the entity references the model.
+    pub model_cs: Option<CString>,
+
+    // movement / mover scratch (subs.qc, doors, plats, buttons, trains)
+    pub finaldest: Vec3,
+    pub finalangle: Vec3,
+    pub dest: Vec3,
+    pub dest1: Vec3,
+    pub dest2: Vec3,
+    pub pos1: Vec3,
+    pub pos2: Vec3,
+    pub mangle: Vec3,
+    pub speed: f32,
+    pub wait: f32,
+    pub delay: f32,
+    pub lip: f32,
+    pub height: f32,
+    pub state: f32,
+    pub dmg: f32,
+    pub count: f32,
+    pub cnt: f32,
+    pub t_length: f32,
+    pub t_width: f32,
+    pub pausetime: f32,
+    pub aflag: f32,
+
+    // entity references not present in entvars (custom QC `.entity` fields), as indices.
+    // (Standard entvars refs — enemy/owner/goalentity/groundentity/aiment/chain — live in
+    // `v` as byte offsets; use `EntId::to_prog`/`from_prog` and the `GameState` ref helpers.)
+    pub oldenemy: u32,
+    pub trigger_field: u32,
+    pub movetarget: u32,
+
+    // combat / player timers (player.qc, weapons.qc, items.qc)
+    pub attack_finished: f32,
+    pub pain_finished: f32,
+    pub super_damage_finished: f32,
+    pub invincible_finished: f32,
+    pub invincible_sound: f32,
+    pub invincible_time: f32,
+    pub invisible_finished: f32,
+    pub invisible_time: f32,
+    pub invisible_sound: f32,
+    pub super_time: f32,
+    pub super_sound: f32,
+    pub rad_time: f32,
+    pub radsuit_finished: f32,
+    pub air_finished: f32,
+    pub bubble_count: f32,
+    pub dmgtime: f32,
+    pub deathtime: f32,
+    pub jump_flag: f32,
+    pub swim_flag: f32,
+    pub fly_sound: f32,
+    pub axhitme: f32,
+    pub show_hostile: f32,
+
+    // item scratch (items.qc)
+    pub healamount: f32,
+    pub healtype: f32,
+    pub items2: f32,
+    pub aflag2: f32,
+    pub last_pickup_msg: f32,
 }
+
+// The engine writes 8-byte native pointers into `string_refs` via unaligned-looking but
+// actually-aligned `*(quintptr_t*)(array_base + offset)` stores. Guarantee those land on an
+// 8-byte boundary: the array base is 8-aligned (Box of an 8-aligned type), the stride is a
+// multiple of 8, and the slots themselves are 8-aligned within the entity.
+const _: () = assert!(align_of::<Entity>() >= 8);
+const _: () = assert!(size_of::<Entity>().is_multiple_of(8));
+const _: () = assert!(core::mem::offset_of!(Entity, string_refs).is_multiple_of(8));
 
 impl Entity {
     /// Reset a slot to a pristine spawned state, mirroring QuakeC's freshly-spawned edict
@@ -79,5 +360,85 @@ impl Entity {
     /// Borrow the classname as `&str`, if set.
     pub fn classname(&self) -> Option<&str> {
         self.classname.as_deref()
+    }
+
+    // --- entvars entity-reference accessors (stored as byte offsets) ---
+    pub fn enemy(&self) -> EntId {
+        EntId::from_prog(self.v.enemy)
+    }
+    pub fn set_enemy(&mut self, t: EntId) {
+        self.v.enemy = t.to_prog();
+    }
+    pub fn owner(&self) -> EntId {
+        EntId::from_prog(self.v.owner)
+    }
+    pub fn set_owner(&mut self, t: EntId) {
+        self.v.owner = t.to_prog();
+    }
+    pub fn goalentity(&self) -> EntId {
+        EntId::from_prog(self.v.goalentity)
+    }
+    pub fn set_goalentity(&mut self, t: EntId) {
+        self.v.goalentity = t.to_prog();
+    }
+}
+
+/// The entity array, indexable by a typed [`EntId`] handle (`entities[e]`) and transparently
+/// usable as the underlying `[Entity]` slice for iteration, `len`, and the raw base pointer
+/// the engine strides. Zero-cost: a newtype over the heap `Box<[Entity]>`, so the data
+/// pointer the engine receives never moves.
+pub struct Entities(Box<[Entity]>);
+
+impl Entities {
+    /// Allocate `count` cleared entity slots.
+    pub fn new(count: usize) -> Self {
+        Entities((0..count).map(|_| Entity::default()).collect())
+    }
+}
+
+impl core::ops::Deref for Entities {
+    type Target = [Entity];
+    #[inline]
+    fn deref(&self) -> &[Entity] {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for Entities {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [Entity] {
+        &mut self.0
+    }
+}
+
+impl core::ops::Index<EntId> for Entities {
+    type Output = Entity;
+    #[inline]
+    fn index(&self, e: EntId) -> &Entity {
+        &self.0[e.index()]
+    }
+}
+
+impl core::ops::IndexMut<EntId> for Entities {
+    #[inline]
+    fn index_mut(&mut self, e: EntId) -> &mut Entity {
+        &mut self.0[e.index()]
+    }
+}
+
+// Raw `usize` indexing for the few index-range scans (`next_door`, the spectator spawn
+// cycle); `EntId` is the typed handle everywhere else.
+impl core::ops::Index<usize> for Entities {
+    type Output = Entity;
+    #[inline]
+    fn index(&self, i: usize) -> &Entity {
+        &self.0[i]
+    }
+}
+
+impl core::ops::IndexMut<usize> for Entities {
+    #[inline]
+    fn index_mut(&mut self, i: usize) -> &mut Entity {
+        &mut self.0[i]
     }
 }

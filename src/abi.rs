@@ -108,6 +108,47 @@ pub struct EntVars {
     pub noise3: StringRef,
 }
 
+/// The number of engine-visible `.string` fields in [`EntVars`] — one native-ABI scratch
+/// slot is needed per field (see [`EntVars::link_string_refs`] and `Entity::string_refs`).
+pub const STRING_REF_COUNT: usize = 11;
+
+/// Scratch-cell index of `weaponmodel` (its position in [`EntVars::link_string_refs`]).
+/// `weaponmodel` has no `setmodel`-style trap — QuakeC sets it by plain string assignment —
+/// so we write the resolved `char*` into this cell ourselves (see `GameState::set_weaponmodel`).
+pub const STRING_REF_WEAPONMODEL: usize = 2;
+
+impl EntVars {
+    /// Wire up the native 64-bit string ABI (fteqw API ≥ 15, mvdsv `sv_pr2references`).
+    ///
+    /// In that ABI the engine does not read a `.string` slot as the string itself: the 4-byte
+    /// slot holds a byte offset into the entity array pointing at an 8-byte cell, and the
+    /// engine writes the resolved native `char*` there (e.g. on `setmodel`). This points each
+    /// string field at its scratch cell; `slot(i)` returns the byte offset of the `i`-th cell,
+    /// which the caller owns (`Entity::string_refs`). A field left at `0` makes the engine
+    /// silently drop the string, so this must run for every edict the engine clears.
+    ///
+    /// The array length is checked against [`STRING_REF_COUNT`] at compile time, so adding a
+    /// string field to `EntVars` without updating the count (or vice versa) fails to build.
+    pub fn link_string_refs(&mut self, slot: impl Fn(usize) -> StringRef) {
+        let fields: [&mut StringRef; STRING_REF_COUNT] = [
+            &mut self.classname,
+            &mut self.model,
+            &mut self.weaponmodel,
+            &mut self.netname,
+            &mut self.target,
+            &mut self.targetname,
+            &mut self.message,
+            &mut self.noise,
+            &mut self.noise1,
+            &mut self.noise2,
+            &mut self.noise3,
+        ];
+        for (i, field) in fields.into_iter().enumerate() {
+            *field = slot(i);
+        }
+    }
+}
+
 /// The engine-shared globals — `globalvars_t` from `ktx/include/progdefs.h`.
 /// The engine populates `self`/`other`/`time`/`frametime` and the `trace_*`/`v_*`
 /// blocks; we read them. The trailing `*_cb` function-reference fields are legacy QC

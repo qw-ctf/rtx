@@ -14,13 +14,24 @@ use std::cell::UnsafeCell;
 use std::sync::OnceLock;
 
 mod abi;
+mod buttons;
 mod client;
+mod combat;
 mod defs;
+mod dispatch;
+mod doors;
 mod entity;
 mod game;
 mod game_command;
 mod host;
+mod items;
+mod misc;
+mod plats;
 mod player;
+mod server;
+mod spectate;
+mod subs;
+mod triggers;
 mod weapons;
 mod world;
 

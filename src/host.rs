@@ -14,7 +14,7 @@ pub type SyscallFn = unsafe extern "C" fn(arg: isize, ...) -> isize;
 
 /// `gameImport_t` from `g_public.h` — builtin/syscall numbers. Order is load-bearing.
 #[repr(isize)]
-#[allow(dead_code)]
+#[allow(dead_code, clippy::enum_variant_names)]
 enum B {
     GetApiVersion,
     DPrint,
@@ -208,6 +208,13 @@ impl HostApi {
         unsafe { (self.syscall)(B::LightStyle as isize, style as isize, value.as_ptr() as isize) };
     }
 
+    /// `G_FlushSignon` — commit the current signon block (precaches + baselines) and start a
+    /// new one. Must be called per entity during `GAME_LOADENTS` or the signon overflows and
+    /// later entities never reach clients (matches ktx's spawn loop).
+    pub fn flush_signon(&self) {
+        unsafe { (self.syscall)(B::FlushSignon as isize) };
+    }
+
     /// `G_SPAWN_ENT` — allocate an entity, returning its index.
     pub fn spawn(&self) -> i32 {
         unsafe { (self.syscall)(B::SpawnEnt as isize) as i32 }
@@ -252,6 +259,20 @@ impl HostApi {
         };
     }
 
+    /// `G_VISIBLETO` — fill `buf` (one byte per entity in `[first, first+count)`) with
+    /// whether each is in `viewer`'s PVS. Returns the count visible.
+    pub fn visible_to(&self, viewer: i32, first: i32, count: i32, buf: &mut [u8]) -> i32 {
+        unsafe {
+            (self.syscall)(
+                B::VisibleTo as isize,
+                viewer as isize,
+                first as isize,
+                count as isize,
+                buf.as_mut_ptr() as isize,
+            ) as i32
+        }
+    }
+
     /// `G_SOUND` — play `sample` from `ent` on `channel` (see `defs::CHAN_*`).
     pub fn sound(&self, ent: i32, channel: i32, sample: &CStr, volume: f32, attenuation: f32) {
         unsafe {
@@ -272,6 +293,37 @@ impl HostApi {
         unsafe { (self.syscall)(B::MakeVectors as isize, v.as_ptr() as isize) };
     }
 
+    /// `G_CMD_ARGC` — number of tokens in the current client/console command.
+    pub fn cmd_argc(&self) -> i32 {
+        unsafe { (self.syscall)(B::CmdArgc as isize) as i32 }
+    }
+
+    /// `G_CMD_ARGV` — token `n` of the current command, into `buf`, as a borrowed `&str`.
+    pub fn cmd_argv<'b>(&self, n: i32, buf: &'b mut [u8]) -> &'b str {
+        unsafe {
+            (self.syscall)(
+                B::CmdArgv as isize,
+                n as isize,
+                buf.as_mut_ptr() as isize,
+                buf.len() as isize,
+            )
+        };
+        cstr_from_buf(buf)
+    }
+
+    /// `G_CVAR_STRING` — a cvar's string value into `buf`, as a borrowed `&str`.
+    pub fn cvar_string<'b>(&self, name: &CStr, buf: &'b mut [u8]) -> &'b str {
+        unsafe {
+            (self.syscall)(
+                B::CvarString as isize,
+                name.as_ptr() as isize,
+                buf.as_mut_ptr() as isize,
+                buf.len() as isize,
+            )
+        };
+        cstr_from_buf(buf)
+    }
+
     /// `G_GETINFOKEY` — read a userinfo/serverinfo key into `buf`, returning the value
     /// as a borrowed `&str` (up to the first NUL, lossily decoded). `ent` 0 = serverinfo.
     pub fn infokey<'b>(&self, ent: i32, key: &CStr, buf: &'b mut [u8]) -> &'b str {
@@ -285,6 +337,127 @@ impl HostApi {
             )
         };
         cstr_from_buf(buf)
+    }
+
+    /// `G_TRACELINE` — trace a line, writing results into the engine globals (the caller
+    /// reads `trace_*` afterwards). `nomonsters` follows QuakeC (`TRUE` skips monsters).
+    pub fn traceline(&self, start: Vec3, end: Vec3, nomonsters: bool, ignore: i32) {
+        unsafe {
+            (self.syscall)(
+                B::TraceLine as isize,
+                pf(start.x),
+                pf(start.y),
+                pf(start.z),
+                pf(end.x),
+                pf(end.y),
+                pf(end.z),
+                nomonsters as isize,
+                ignore as isize,
+            )
+        };
+    }
+
+    /// `G_DROPTOFLOOR` — drop an entity straight down onto the floor; returns whether it
+    /// landed on a valid surface.
+    pub fn droptofloor(&self, ent: i32) -> bool {
+        unsafe { (self.syscall)(B::DropToFloor as isize, ent as isize) != 0 }
+    }
+
+    /// `G_POINTCONTENTS` — the `CONTENT_*` value at a point.
+    pub fn pointcontents(&self, p: Vec3) -> f32 {
+        unsafe {
+            (self.syscall)(B::PointContents as isize, pf(p.x), pf(p.y), pf(p.z)) as i32 as f32
+        }
+    }
+
+    /// `G_CENTERPRINT` — center-screen message to one client.
+    pub fn centerprint(&self, ent: i32, msg: &CStr) {
+        unsafe { (self.syscall)(B::CenterPrint as isize, ent as isize, msg.as_ptr() as isize) };
+    }
+
+    /// `G_CHANGELEVEL` — request a map change.
+    pub fn changelevel(&self, name: &CStr) {
+        unsafe { (self.syscall)(B::ChangeLevel as isize, name.as_ptr() as isize, 0) };
+    }
+
+    /// `G_SETSPAWNPARAMS` — persist a client's spawn parameters.
+    pub fn set_spawn_params(&self, ent: i32) {
+        unsafe { (self.syscall)(B::SetSpawnParams as isize, ent as isize) };
+    }
+
+    /// `G_LOGFRAG` — record a frag for stats/MVD.
+    pub fn logfrag(&self, killer: i32, killee: i32) {
+        unsafe { (self.syscall)(B::LogFrag as isize, killer as isize, killee as isize) };
+    }
+
+    /// `G_STUFFCMD` — send a command to a client's console.
+    pub fn stuffcmd(&self, ent: i32, cmd: &CStr) {
+        unsafe { (self.syscall)(B::StuffCmd as isize, ent as isize, cmd.as_ptr() as isize, 0) };
+    }
+
+    /// `G_MAKESTATIC` — turn an entity into a static (client-side only) entity and remove it.
+    pub fn makestatic(&self, ent: i32) {
+        unsafe { (self.syscall)(B::MakeStatic as isize, ent as isize) };
+    }
+
+    /// `G_SETPAUSE`.
+    pub fn set_pause(&self, paused: bool) {
+        unsafe { (self.syscall)(B::SetPause as isize, paused as isize) };
+    }
+
+    /// `G_AMBIENTSOUND` — attach a looping ambient sound at a point.
+    pub fn ambient_sound(&self, pos: Vec3, sample: &CStr, volume: f32, attenuation: f32) {
+        unsafe {
+            (self.syscall)(
+                B::AmbientSound as isize,
+                pf(pos.x),
+                pf(pos.y),
+                pf(pos.z),
+                sample.as_ptr() as isize,
+                pf(volume),
+                pf(attenuation),
+            )
+        };
+    }
+
+    // --- network message writing (multicast / temp entities / kicks) ---
+
+    /// `G_MULTICAST` — set the destination for the buffered `write_*` message.
+    pub fn multicast(&self, origin: Vec3, to: i32) {
+        unsafe {
+            (self.syscall)(
+                B::Multicast as isize,
+                pf(origin.x),
+                pf(origin.y),
+                pf(origin.z),
+                to as isize,
+            )
+        };
+    }
+
+    pub fn write_byte(&self, to: i32, v: i32) {
+        unsafe { (self.syscall)(B::WriteByte as isize, to as isize, v as isize) };
+    }
+    pub fn write_char(&self, to: i32, v: i32) {
+        unsafe { (self.syscall)(B::WriteChar as isize, to as isize, v as isize) };
+    }
+    pub fn write_short(&self, to: i32, v: i32) {
+        unsafe { (self.syscall)(B::WriteShort as isize, to as isize, v as isize) };
+    }
+    pub fn write_long(&self, to: i32, v: i32) {
+        unsafe { (self.syscall)(B::WriteLong as isize, to as isize, v as isize) };
+    }
+    pub fn write_coord(&self, to: i32, v: f32) {
+        unsafe { (self.syscall)(B::WriteCoord as isize, to as isize, pf(v)) };
+    }
+    pub fn write_angle(&self, to: i32, v: f32) {
+        unsafe { (self.syscall)(B::WriteAngle as isize, to as isize, pf(v)) };
+    }
+    pub fn write_string(&self, to: i32, s: &CStr) {
+        unsafe { (self.syscall)(B::WriteString as isize, to as isize, s.as_ptr() as isize) };
+    }
+    pub fn write_entity(&self, to: i32, ent: i32) {
+        unsafe { (self.syscall)(B::WriteEntity as isize, to as isize, ent as isize) };
     }
 
     /// `G_GetEntityToken` — fetch the next token from the map's entity string into `buf`.

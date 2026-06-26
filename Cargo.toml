@@ -8,4 +8,5 @@ name = "rtx"
 crate-type = ["cdylib"]
 
 [dependencies]
+bitflags = "2"
 glam = "0.32"
