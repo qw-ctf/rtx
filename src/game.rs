@@ -124,6 +124,11 @@ impl GameState {
                 self.set_change_parms(player);
                 1
             }
+            GameCommand::EdictThink => {
+                // `player` here is just the engine's current `self` entity.
+                self.run_think(player);
+                1
+            }
             // Spectator paths and remaining callbacks land in later milestones.
             GameCommand::ClientConnect
             | GameCommand::PutClientInServer
@@ -132,7 +137,6 @@ impl GameState {
             | GameCommand::ClientThink
             | GameCommand::ClientPostThink
             | GameCommand::EdictTouch
-            | GameCommand::EdictThink
             | GameCommand::EdictBlocked
             | GameCommand::ClientSay => 1,
             GameCommand::ClientUserInfoChanged

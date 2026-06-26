@@ -31,6 +31,10 @@ impl EntId {
 pub enum Think {
     #[default]
     None,
+    /// Player standing-idle animation loop (`player_stand1`).
+    PlayerStand,
+    /// Player running animation loop (`player_run`).
+    PlayerRun,
 }
 
 /// One game entity: the engine-shared `v`, followed by the private Rust tail.
@@ -49,6 +53,8 @@ pub struct Entity {
     pub in_use: bool,
     /// Scheduled think behaviour, resolved by the central dispatcher.
     pub think: Think,
+    /// Walk/idle animation cursor for the player movement loops.
+    pub walkframe: i32,
     /// Classname, for spawn dispatch and `find`.
     pub classname: Option<Box<str>>,
     pub model: Option<Box<str>>,

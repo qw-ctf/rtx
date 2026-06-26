@@ -20,6 +20,7 @@ mod entity;
 mod game;
 mod game_command;
 mod host;
+mod player;
 mod world;
 
 use game::GameState;

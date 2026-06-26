@@ -123,7 +123,6 @@ impl GameState {
             ent.v.fixangle = 1.0; // snap the client's view immediately
             ent.v.view_ofs = VEC_VIEW_OFS;
             ent.v.velocity = Vec3::ZERO;
-            ent.v.frame = 0.0; // stand frame (animation tables arrive in M3)
         }
 
         // Assign the player model and bounding box; both relink the entity in the engine
@@ -131,6 +130,9 @@ impl GameState {
         self.host.set_model(player.0 as i32, c"progs/player.mdl");
         self.host
             .set_size(player.0 as i32, VEC_HULL_MIN, VEC_HULL_MAX);
+
+        // Kick off the idle/run animation think loop.
+        self.player_stand1(player);
     }
 
     /// `PlayerPreThink` — runs before engine physics. Minimal for now (movement is engine
