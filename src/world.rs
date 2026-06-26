@@ -8,9 +8,20 @@ use crate::host::HostApi;
 pub fn worldspawn(game: &mut GameState) {
     let host = *game.host();
 
+    // worldtype was parked in the world entity's skin during field parsing.
+    game.level.worldtype = game.ent(crate::entity::EntId::WORLD).v.skin;
+
     // Custom map gravity (qw-qc special-cases e1m8).
     let mut buf = [0u8; 64];
-    let is_e1m8 = host.infokey(0, c"modelname", &mut buf) == "maps/e1m8.bsp";
+    let modelname = host.infokey(0, c"modelname", &mut buf);
+    // Strip "maps/" and ".bsp" to recover the bare map name.
+    game.level.mapname = modelname
+        .strip_prefix("maps/")
+        .unwrap_or(modelname)
+        .strip_suffix(".bsp")
+        .unwrap_or(modelname)
+        .to_owned();
+    let is_e1m8 = modelname == "maps/e1m8.bsp";
     host.cvar_set(c"sv_gravity", if is_e1m8 { c"100" } else { c"800" });
 
     // Weapon precaches.
