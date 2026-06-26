@@ -21,6 +21,7 @@ mod game;
 mod game_command;
 mod host;
 mod player;
+mod weapons;
 mod world;
 
 use game::GameState;

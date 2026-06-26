@@ -55,6 +55,8 @@ pub struct Entity {
     pub think: Think,
     /// Walk/idle animation cursor for the player movement loops.
     pub walkframe: i32,
+    /// Time until which weapon actions are locked out (`attack_finished`).
+    pub attack_finished: f32,
     /// Classname, for spawn dispatch and `find`.
     pub classname: Option<Box<str>>,
     pub model: Option<Box<str>>,

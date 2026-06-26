@@ -96,6 +96,7 @@ impl GameState {
 
     /// `PutClientInServer` — set up (or respawn) the player entity at a spawn point.
     pub(crate) fn put_client_in_server(&mut self, player: EntId) {
+        let time = self.globals.time;
         {
             let ent = &mut self.entities[player.index()];
             ent.in_use = true;
@@ -108,6 +109,7 @@ impl GameState {
             ent.v.flags = FL_CLIENT;
             ent.v.effects = 0.0;
             ent.v.deadflag = DEAD_NO;
+            ent.attack_finished = time;
         }
 
         self.decode_level_parms(player);
@@ -142,12 +144,15 @@ impl GameState {
         self.host.make_vectors(v_angle);
     }
 
-    /// `PlayerPostThink` — runs after engine physics. Minimal for now.
-    pub(crate) fn player_post_think(&mut self, _player: EntId) {}
+    /// `PlayerPostThink` — runs after engine physics. Drives the weapon loop (impulse
+    /// switching now; firing and landing/powerup logic in later slices).
+    pub(crate) fn player_post_think(&mut self, player: EntId) {
+        self.w_weapon_frame(player);
+    }
 
     /// `W_SetCurrentAmmo` — sync `currentammo`/`weaponmodel`/ammo item bits to the active
     /// weapon. (The weapon view model is recorded but not yet networked — vwep is M3.)
-    fn w_set_current_ammo(&mut self, player: EntId) {
+    pub(crate) fn w_set_current_ammo(&mut self, player: EntId) {
         let ent = &mut self.entities[player.index()];
         let mut items = ent.v.items as i32 & !((IT_SHELLS + IT_NAILS + IT_ROCKETS + IT_CELLS) as i32);
 

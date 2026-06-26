@@ -163,6 +163,19 @@ impl HostApi {
         unsafe { (self.syscall)(B::BPrint as isize, level as isize, msg.as_ptr() as isize, 0) };
     }
 
+    /// `G_SPRINT` — print to a single client at `level`.
+    pub fn sprint(&self, ent: i32, level: i32, msg: &CStr) {
+        unsafe {
+            (self.syscall)(
+                B::SPrint as isize,
+                ent as isize,
+                level as isize,
+                msg.as_ptr() as isize,
+                0,
+            )
+        };
+    }
+
     /// `G_CVAR` — read a cvar's float value.
     pub fn cvar(&self, name: &CStr) -> f32 {
         unsafe { rf((self.syscall)(B::Cvar as isize, name.as_ptr() as isize)) }
