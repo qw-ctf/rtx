@@ -100,6 +100,14 @@ impl PlayerParms {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PowerupKind {
+    Invisibility,
+    Invulnerability,
+    Quad,
+    Biosuit,
+}
+
 impl GameState {
     /// `ClientConnect` — announce a joining player and record their name.
     pub(crate) fn client_connect(&mut self, player: EntId) {
@@ -570,7 +578,12 @@ impl GameState {
                 self.entities[e].invisible_sound = time + r;
             }
             if self.entities[e].invisible_finished < time + 3.0 {
-                self.powerup_warn(e, "invisible", c"Ring of Shadows magic is fading\n", c"items/inv2.wav");
+                self.powerup_warn(
+                    e,
+                    PowerupKind::Invisibility,
+                    c"Ring of Shadows magic is fading\n",
+                    c"items/inv2.wav",
+                );
             }
             if self.entities[e].invisible_finished < time {
                 let ent = &mut self.entities[e];
@@ -589,7 +602,12 @@ impl GameState {
         // Invincibility (Pentagram) — red glow.
         if self.entities[e].invincible_finished != 0.0 {
             if self.entities[e].invincible_finished < time + 3.0 {
-                self.powerup_warn(e, "invincible", c"Protection is almost burned out\n", c"items/protect2.wav");
+                self.powerup_warn(
+                    e,
+                    PowerupKind::Invulnerability,
+                    c"Protection is almost burned out\n",
+                    c"items/protect2.wav",
+                );
             }
             if self.entities[e].invincible_finished < time {
                 let ent = &mut self.entities[e];
@@ -608,7 +626,7 @@ impl GameState {
                 } else {
                     c"Quad Damage is wearing off\n"
                 };
-                self.powerup_warn(e, "super", msg, c"items/damage2.wav");
+                self.powerup_warn(e, PowerupKind::Quad, msg, c"items/damage2.wav");
             }
             if self.entities[e].super_damage_finished < time {
                 let dm4 = self.level.deathmatch == 4;
@@ -630,7 +648,12 @@ impl GameState {
         if self.entities[e].radsuit_finished != 0.0 {
             self.entities[e].air_finished = time + 12.0;
             if self.entities[e].radsuit_finished < time + 3.0 {
-                self.powerup_warn(e, "rad", c"Air supply in Biosuit expiring\n", c"items/suit2.wav");
+                self.powerup_warn(
+                    e,
+                    PowerupKind::Biosuit,
+                    c"Air supply in Biosuit expiring\n",
+                    c"items/suit2.wav",
+                );
             }
             if self.entities[e].radsuit_finished < time {
                 let ent = &mut self.entities[e];
@@ -642,33 +665,33 @@ impl GameState {
     }
 
     /// Shared "powerup almost out" flash/sound bookkeeping for [`Self::check_powerups`].
-    /// `which` selects the per-powerup `*_time` latch.
-    fn powerup_warn(&mut self, e: EntId, which: &str, msg: &CStr, sound: &CStr) {
+    /// `kind` selects the per-powerup `*_time` latch.
+    fn powerup_warn(&mut self, e: EntId, kind: PowerupKind, msg: &CStr, sound: &CStr) {
         let time = self.time();
-        let latch = match which {
-            "invisible" => self.entities[e].invisible_time,
-            "invincible" => self.entities[e].invincible_time,
-            "super" => self.entities[e].super_time,
-            _ => self.entities[e].rad_time,
+        let latch = match kind {
+            PowerupKind::Invisibility => self.entities[e].invisible_time,
+            PowerupKind::Invulnerability => self.entities[e].invincible_time,
+            PowerupKind::Quad => self.entities[e].super_time,
+            PowerupKind::Biosuit => self.entities[e].rad_time,
         };
         if latch == 1.0 {
             self.host.sprint(e.0 as i32, PrintLevel::High, msg);
             self.host.stuffcmd(e.0 as i32, c"bf\n");
             self.host.sound(e.0 as i32, Channel::Auto, sound, 1.0, Attenuation::Norm);
-            self.set_powerup_time(e, which, time + 1.0);
+            self.set_powerup_time(e, kind, time + 1.0);
         } else if latch < time {
-            self.set_powerup_time(e, which, time + 1.0);
+            self.set_powerup_time(e, kind, time + 1.0);
             self.host.stuffcmd(e.0 as i32, c"bf\n");
         }
     }
 
-    fn set_powerup_time(&mut self, e: EntId, which: &str, t: f32) {
+    fn set_powerup_time(&mut self, e: EntId, kind: PowerupKind, t: f32) {
         let ent = &mut self.entities[e];
-        match which {
-            "invisible" => ent.invisible_time = t,
-            "invincible" => ent.invincible_time = t,
-            "super" => ent.super_time = t,
-            _ => ent.rad_time = t,
+        match kind {
+            PowerupKind::Invisibility => ent.invisible_time = t,
+            PowerupKind::Invulnerability => ent.invincible_time = t,
+            PowerupKind::Quad => ent.super_time = t,
+            PowerupKind::Biosuit => ent.rad_time = t,
         }
     }
 
