@@ -7,9 +7,98 @@ use core::ffi::CStr;
 
 use glam::Vec3;
 
+use crate::abi::EntVars;
 use crate::defs::*;
 use crate::entity::{Die, EntId, Pain};
 use crate::game::GameState;
+
+#[derive(Clone, Copy)]
+struct PlayerParms {
+    items: f32,
+    health: f32,
+    armorvalue: f32,
+    shells: f32,
+    nails: f32,
+    rockets: f32,
+    cells: f32,
+    weapon: f32,
+    armortype: f32,
+}
+
+impl PlayerParms {
+    fn fresh() -> Self {
+        Self {
+            items: (Items::SHOTGUN | Items::AXE).as_f32(),
+            health: 100.0,
+            armorvalue: 0.0,
+            shells: 25.0,
+            nails: 0.0,
+            rockets: 0.0,
+            cells: 0.0,
+            weapon: Items::SHOTGUN.as_f32(),
+            armortype: 0.0,
+        }
+    }
+
+    fn from_survivor(v: &EntVars) -> Self {
+        Self {
+            items: v.items.without(
+                Items::KEY1
+                    | Items::KEY2
+                    | Items::INVISIBILITY
+                    | Items::INVULNERABILITY
+                    | Items::SUIT
+                    | Items::QUAD,
+            ),
+            health: v.health.clamp(50.0, 100.0),
+            armorvalue: v.armorvalue,
+            shells: v.ammo_shells.max(25.0),
+            nails: v.ammo_nails,
+            rockets: v.ammo_rockets,
+            cells: v.ammo_cells,
+            weapon: v.weapon,
+            armortype: v.armortype,
+        }
+    }
+
+    fn read(parm: [f32; 16]) -> Self {
+        Self {
+            items: parm[0],
+            health: parm[1],
+            armorvalue: parm[2],
+            shells: parm[3],
+            nails: parm[4],
+            rockets: parm[5],
+            cells: parm[6],
+            weapon: parm[7],
+            armortype: parm[8] * 0.01,
+        }
+    }
+
+    fn write(self, parm: &mut [f32; 16]) {
+        parm[0] = self.items;
+        parm[1] = self.health;
+        parm[2] = self.armorvalue;
+        parm[3] = self.shells;
+        parm[4] = self.nails;
+        parm[5] = self.rockets;
+        parm[6] = self.cells;
+        parm[7] = self.weapon;
+        parm[8] = self.armortype * 100.0;
+    }
+
+    fn apply_to(self, v: &mut EntVars) {
+        v.items = self.items;
+        v.health = self.health;
+        v.armorvalue = self.armorvalue;
+        v.ammo_shells = self.shells;
+        v.ammo_nails = self.nails;
+        v.ammo_rockets = self.rockets;
+        v.ammo_cells = self.cells;
+        v.weapon = self.weapon;
+        v.armortype = self.armortype;
+    }
+}
 
 impl GameState {
     /// `ClientConnect` — announce a joining player and record their name.
@@ -35,16 +124,7 @@ impl GameState {
 
     /// `SetNewParms` — default spawn parameters for a fresh player.
     pub(crate) fn set_new_parms(&mut self) {
-        let p = &mut self.globals.parm;
-        p[0] = (Items::SHOTGUN | Items::AXE).as_f32(); // items
-        p[1] = 100.0; // health
-        p[2] = 0.0; // armor value
-        p[3] = 25.0; // shells
-        p[4] = 0.0; // nails
-        p[5] = 0.0; // rockets
-        p[6] = 0.0; // cells
-        p[7] = 1.0; // weapon = Items::SHOTGUN.as_f32()
-        p[8] = 0.0; // armor type
+        PlayerParms::fresh().write(&mut self.globals.parm);
     }
 
     /// `SetChangeParms` — persist a surviving player's state across a level change.
@@ -55,42 +135,14 @@ impl GameState {
             return;
         }
 
-        let items = v.items
-            .without(Items::KEY1 | Items::KEY2 | Items::INVISIBILITY | Items::INVULNERABILITY | Items::SUIT | Items::QUAD);
-        let health = v.health.clamp(50.0, 100.0);
-        let armorvalue = v.armorvalue;
-        let shells = v.ammo_shells.max(25.0);
-        let nails = v.ammo_nails;
-        let rockets = v.ammo_rockets;
-        let cells = v.ammo_cells;
-        let weapon = v.weapon;
-        let armortype = v.armortype;
-
-        let p = &mut self.globals.parm;
-        p[0] = items;
-        p[1] = health;
-        p[2] = armorvalue;
-        p[3] = shells;
-        p[4] = nails;
-        p[5] = rockets;
-        p[6] = cells;
-        p[7] = weapon;
-        p[8] = armortype * 100.0;
+        PlayerParms::from_survivor(v).write(&mut self.globals.parm);
     }
 
     /// `DecodeLevelParms` — load a player's fields from the spawn parameters.
     fn decode_level_parms(&mut self, player: EntId) {
-        let p = self.globals.parm;
+        let parms = PlayerParms::read(self.globals.parm);
         let v = &mut self.entities[player].v;
-        v.items = p[0];
-        v.health = p[1];
-        v.armorvalue = p[2];
-        v.ammo_shells = p[3];
-        v.ammo_nails = p[4];
-        v.ammo_rockets = p[5];
-        v.ammo_cells = p[6];
-        v.weapon = p[7];
-        v.armortype = p[8] * 0.01;
+        parms.apply_to(v);
     }
 
     /// `PutClientInServer` — set up (or respawn) the player entity at a spawn point.
