@@ -711,28 +711,7 @@ impl GameState {
     pub(crate) fn w_set_current_ammo(&mut self, player: EntId) {
         self.player_run(player); // get out of any weapon-firing animation state
 
-        let (ammo, model, ammo_bit): (f32, Option<&'static CStr>, Items) = {
-            let v = &self.entities[player].v;
-            match Items::from_f32(v.weapon) {
-                w if w == Items::AXE => (0.0, Some(c"progs/v_axe.mdl"), Items::empty()),
-                w if w == Items::SHOTGUN => (v.ammo_shells, Some(c"progs/v_shot.mdl"), Items::SHELLS),
-                w if w == Items::SUPER_SHOTGUN => {
-                    (v.ammo_shells, Some(c"progs/v_shot2.mdl"), Items::SHELLS)
-                }
-                w if w == Items::NAILGUN => (v.ammo_nails, Some(c"progs/v_nail.mdl"), Items::NAILS),
-                w if w == Items::SUPER_NAILGUN => {
-                    (v.ammo_nails, Some(c"progs/v_nail2.mdl"), Items::NAILS)
-                }
-                w if w == Items::GRENADE_LAUNCHER => {
-                    (v.ammo_rockets, Some(c"progs/v_rock.mdl"), Items::ROCKETS)
-                }
-                w if w == Items::ROCKET_LAUNCHER => {
-                    (v.ammo_rockets, Some(c"progs/v_rock2.mdl"), Items::ROCKETS)
-                }
-                w if w == Items::LIGHTNING => (v.ammo_cells, Some(c"progs/v_light.mdl"), Items::CELLS),
-                _ => (0.0, None, Items::empty()),
-            }
-        };
+        let (ammo, model, ammo_bit) = self.current_weapon_ammo_state(player);
 
         {
             let ent = &mut self.entities[player];

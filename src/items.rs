@@ -10,6 +10,151 @@ use crate::defs::*;
 use crate::entity::{EntId, Think, Touch};
 use crate::game::GameState;
 
+/// The four ammo pools.
+#[derive(Clone, Copy)]
+enum AmmoKind {
+    Shells,
+    Nails,
+    Rockets,
+    Cells,
+}
+
+#[derive(Clone, Copy)]
+struct WeaponSpec {
+    item: Items,
+    classname: Option<&'static str>,
+    pickup_model: Option<&'static CStr>,
+    pickup_name: &'static str,
+    backpack_name: &'static str,
+    ammo_kind: Option<AmmoKind>,
+    pickup_ammo: f32,
+    view_model: Option<&'static CStr>,
+    ammo_bit: Items,
+    rank: i32,
+    switch_code: f32,
+}
+
+const WEAPON_SPECS: &[WeaponSpec] = &[
+    WeaponSpec {
+        item: Items::AXE,
+        classname: None,
+        pickup_model: None,
+        pickup_name: "Axe",
+        backpack_name: "Axe",
+        ammo_kind: None,
+        pickup_ammo: 0.0,
+        view_model: Some(c"progs/v_axe.mdl"),
+        ammo_bit: Items::empty(),
+        rank: 7,
+        switch_code: 1.0,
+    },
+    WeaponSpec {
+        item: Items::SHOTGUN,
+        classname: None,
+        pickup_model: None,
+        pickup_name: "Shotgun",
+        backpack_name: "Shotgun",
+        ammo_kind: Some(AmmoKind::Shells),
+        pickup_ammo: 0.0,
+        view_model: Some(c"progs/v_shot.mdl"),
+        ammo_bit: Items::SHELLS,
+        rank: 7,
+        switch_code: 1.0,
+    },
+    WeaponSpec {
+        item: Items::SUPER_SHOTGUN,
+        classname: Some("weapon_supershotgun"),
+        pickup_model: Some(c"progs/g_shot.mdl"),
+        pickup_name: "Double-barrelled Shotgun",
+        backpack_name: "Double-barrelled Shotgun",
+        ammo_kind: Some(AmmoKind::Shells),
+        pickup_ammo: 5.0,
+        view_model: Some(c"progs/v_shot2.mdl"),
+        ammo_bit: Items::SHELLS,
+        rank: 5,
+        switch_code: 3.0,
+    },
+    WeaponSpec {
+        item: Items::NAILGUN,
+        classname: Some("weapon_nailgun"),
+        pickup_model: Some(c"progs/g_nail.mdl"),
+        pickup_name: "nailgun",
+        backpack_name: "Nailgun",
+        ammo_kind: Some(AmmoKind::Nails),
+        pickup_ammo: 30.0,
+        view_model: Some(c"progs/v_nail.mdl"),
+        ammo_bit: Items::NAILS,
+        rank: 6,
+        switch_code: 4.0,
+    },
+    WeaponSpec {
+        item: Items::SUPER_NAILGUN,
+        classname: Some("weapon_supernailgun"),
+        pickup_model: Some(c"progs/g_nail2.mdl"),
+        pickup_name: "Super Nailgun",
+        backpack_name: "Super Nailgun",
+        ammo_kind: Some(AmmoKind::Nails),
+        pickup_ammo: 30.0,
+        view_model: Some(c"progs/v_nail2.mdl"),
+        ammo_bit: Items::NAILS,
+        rank: 3,
+        switch_code: 5.0,
+    },
+    WeaponSpec {
+        item: Items::GRENADE_LAUNCHER,
+        classname: Some("weapon_grenadelauncher"),
+        pickup_model: Some(c"progs/g_rock.mdl"),
+        pickup_name: "Grenade Launcher",
+        backpack_name: "Grenade Launcher",
+        ammo_kind: Some(AmmoKind::Rockets),
+        pickup_ammo: 5.0,
+        view_model: Some(c"progs/v_rock.mdl"),
+        ammo_bit: Items::ROCKETS,
+        rank: 4,
+        switch_code: 6.0,
+    },
+    WeaponSpec {
+        item: Items::ROCKET_LAUNCHER,
+        classname: Some("weapon_rocketlauncher"),
+        pickup_model: Some(c"progs/g_rock2.mdl"),
+        pickup_name: "Rocket Launcher",
+        backpack_name: "Rocket Launcher",
+        ammo_kind: Some(AmmoKind::Rockets),
+        pickup_ammo: 5.0,
+        view_model: Some(c"progs/v_rock2.mdl"),
+        ammo_bit: Items::ROCKETS,
+        rank: 2,
+        switch_code: 7.0,
+    },
+    WeaponSpec {
+        item: Items::LIGHTNING,
+        classname: Some("weapon_lightning"),
+        pickup_model: Some(c"progs/g_light.mdl"),
+        pickup_name: "Thunderbolt",
+        backpack_name: "Thunderbolt",
+        ammo_kind: Some(AmmoKind::Cells),
+        pickup_ammo: 15.0,
+        view_model: Some(c"progs/v_light.mdl"),
+        ammo_bit: Items::CELLS,
+        rank: 1,
+        switch_code: 8.0,
+    },
+];
+
+fn weapon_spec(item: Items) -> Option<&'static WeaponSpec> {
+    WEAPON_SPECS.iter().find(|spec| spec.item == item)
+}
+
+fn weapon_spec_from_f32(item: f32) -> Option<&'static WeaponSpec> {
+    weapon_spec(Items::from_f32(item))
+}
+
+fn weapon_spec_for_classname(classname: &str) -> Option<&'static WeaponSpec> {
+    WEAPON_SPECS
+        .iter()
+        .find(|spec| spec.classname == Some(classname))
+}
+
 impl GameState {
     // --- placement & respawn ---
 
@@ -207,20 +352,22 @@ impl GameState {
         let dm = self.level.deathmatch;
         let leave = dm == 2 || dm == 3 || dm == 5;
 
-        let (new, ammo_field, ammo_add): (f32, AmmoKind, f32) = match self.entities[e].classname() {
-            Some("weapon_nailgun") => (Items::NAILGUN.as_f32(), AmmoKind::Nails, 30.0),
-            Some("weapon_supernailgun") => (Items::SUPER_NAILGUN.as_f32(), AmmoKind::Nails, 30.0),
-            Some("weapon_supershotgun") => (Items::SUPER_SHOTGUN.as_f32(), AmmoKind::Shells, 5.0),
-            Some("weapon_rocketlauncher") => (Items::ROCKET_LAUNCHER.as_f32(), AmmoKind::Rockets, 5.0),
-            Some("weapon_grenadelauncher") => (Items::GRENADE_LAUNCHER.as_f32(), AmmoKind::Rockets, 5.0),
-            Some("weapon_lightning") => (Items::LIGHTNING.as_f32(), AmmoKind::Cells, 15.0),
-            _ => return,
+        let Some(spec) = self
+            .entities[e]
+            .classname()
+            .and_then(weapon_spec_for_classname)
+        else {
+            return;
         };
+        let Some(ammo_field) = spec.ammo_kind else {
+            return;
+        };
+        let new = spec.item.as_f32();
 
         if leave && self.entities[other].v.items.has(new) {
             return;
         }
-        self.add_ammo(other, ammo_field, ammo_add);
+        self.add_ammo(other, ammo_field, spec.pickup_ammo);
 
         let netname = self.netname_of(e);
         self.sprint_low(other, &format!("You got the {netname}\n"));
@@ -409,17 +556,7 @@ impl GameState {
         if shells + nails + rockets + cells == 0.0 {
             return;
         }
-        let netname = match weapon {
-            w if w.is(Items::AXE) => "Axe",
-            w if w.is(Items::SHOTGUN) => "Shotgun",
-            w if w.is(Items::SUPER_SHOTGUN) => "Double-barrelled Shotgun",
-            w if w.is(Items::NAILGUN) => "Nailgun",
-            w if w.is(Items::SUPER_NAILGUN) => "Super Nailgun",
-            w if w.is(Items::GRENADE_LAUNCHER) => "Grenade Launcher",
-            w if w.is(Items::ROCKET_LAUNCHER) => "Rocket Launcher",
-            w if w.is(Items::LIGHTNING) => "Thunderbolt",
-            _ => "",
-        };
+        let netname = weapon_spec_from_f32(weapon).map_or("", |spec| spec.backpack_name);
         let vx = -100.0 + self.random() * 200.0;
         let vy = -100.0 + self.random() * 200.0;
         let time = self.time();
@@ -478,28 +615,12 @@ impl GameState {
 
     /// `RankForWeapon` (lower is better).
     fn rank_for_weapon(&self, w: f32) -> i32 {
-        match w {
-            x if x.is(Items::LIGHTNING) => 1,
-            x if x.is(Items::ROCKET_LAUNCHER) => 2,
-            x if x.is(Items::SUPER_NAILGUN) => 3,
-            x if x.is(Items::GRENADE_LAUNCHER) => 4,
-            x if x.is(Items::SUPER_SHOTGUN) => 5,
-            x if x.is(Items::NAILGUN) => 6,
-            _ => 7,
-        }
+        weapon_spec_from_f32(w).map_or(7, |spec| spec.rank)
     }
 
     /// `WeaponCode` — the `w_switch`/`b_switch` index of a weapon.
     fn weapon_code(&self, w: f32) -> f32 {
-        match w {
-            x if x.is(Items::SUPER_SHOTGUN) => 3.0,
-            x if x.is(Items::NAILGUN) => 4.0,
-            x if x.is(Items::SUPER_NAILGUN) => 5.0,
-            x if x.is(Items::GRENADE_LAUNCHER) => 6.0,
-            x if x.is(Items::ROCKET_LAUNCHER) => 7.0,
-            x if x.is(Items::LIGHTNING) => 8.0,
-            _ => 1.0,
-        }
+        weapon_spec_from_f32(w).map_or(1.0, |spec| spec.switch_code)
     }
 
     /// `Deathmatch_Weapon` — switch up to `new` if it outranks the current weapon.
@@ -542,15 +663,6 @@ impl GameState {
             v
         }
     }
-}
-
-/// The four ammo pools.
-#[derive(Clone, Copy)]
-enum AmmoKind {
-    Shells,
-    Nails,
-    Rockets,
-    Cells,
 }
 
 // Spawnflags for items.
@@ -611,19 +723,24 @@ impl GameState {
         true
     }
 
-    pub(crate) fn spawn_weapon(
-        &mut self,
-        e: EntId,
-        model: &'static CStr,
-        netname: &'static str,
-    ) -> bool {
+    pub(crate) fn spawn_weapon_by_classname(&mut self, e: EntId, classname: &str) -> bool {
+        let Some(spec) = weapon_spec_for_classname(classname) else {
+            return false;
+        };
+        self.spawn_weapon(e, spec)
+    }
+
+    fn spawn_weapon(&mut self, e: EntId, spec: &WeaponSpec) -> bool {
         if self.level.deathmatch > 3 {
             return false;
         }
+        let Some(model) = spec.pickup_model else {
+            return false;
+        };
         self.host.precache_model(model);
         self.set_item_model(e, model);
         self.entities[e].set_touch(Touch::ItemWeapon);
-        self.entities[e].netname = Some(netname.into());
+        self.entities[e].netname = Some(spec.pickup_name.into());
         self.host
             .set_size(e.0 as i32, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
         self.start_item(e);
@@ -689,5 +806,19 @@ impl GameState {
             .set_size(e.0 as i32, Vec3::new(-16.0, -16.0, -24.0), Vec3::new(16.0, 16.0, 32.0));
         self.start_item(e);
         true
+    }
+
+    pub(crate) fn current_weapon_ammo_state(
+        &self,
+        player: EntId,
+    ) -> (f32, Option<&'static CStr>, Items) {
+        let v = &self.entities[player].v;
+        let Some(spec) = weapon_spec_from_f32(v.weapon) else {
+            return (0.0, None, Items::empty());
+        };
+        let ammo = spec
+            .ammo_kind
+            .map_or(0.0, |kind| self.ammo_of(player, kind));
+        (ammo, spec.view_model, spec.ammo_bit)
     }
 }

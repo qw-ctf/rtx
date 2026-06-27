@@ -467,18 +467,10 @@ impl GameState {
             "item_armor1" => self.spawn_item_armor(id, 0.0),
             "item_armor2" => self.spawn_item_armor(id, 1.0),
             "item_armorInv" => self.spawn_item_armor(id, 2.0),
-            "weapon_supershotgun" => {
-                self.spawn_weapon(id, c"progs/g_shot.mdl", "Double-barrelled Shotgun")
+            "weapon_supershotgun" | "weapon_nailgun" | "weapon_supernailgun"
+            | "weapon_grenadelauncher" | "weapon_rocketlauncher" | "weapon_lightning" => {
+                self.spawn_weapon_by_classname(id, class.as_str())
             }
-            "weapon_nailgun" => self.spawn_weapon(id, c"progs/g_nail.mdl", "nailgun"),
-            "weapon_supernailgun" => self.spawn_weapon(id, c"progs/g_nail2.mdl", "Super Nailgun"),
-            "weapon_grenadelauncher" => {
-                self.spawn_weapon(id, c"progs/g_rock.mdl", "Grenade Launcher")
-            }
-            "weapon_rocketlauncher" => {
-                self.spawn_weapon(id, c"progs/g_rock2.mdl", "Rocket Launcher")
-            }
-            "weapon_lightning" => self.spawn_weapon(id, c"progs/g_light.mdl", "Thunderbolt"),
             "item_shells" => self.spawn_ammo(
                 id, 1.0, "shells", c"maps/b_shell0.bsp", 20.0, c"maps/b_shell1.bsp", 40.0,
             ),
