@@ -11,7 +11,7 @@ use std::ffi::CString;
 
 use glam::Vec3;
 
-use crate::assets::Sound;
+use crate::assets::{Model, Sound};
 use crate::abi::{Field, GameData, GlobalVars, STRING_REF_COUNT, STRING_REF_WEAPONMODEL};
 use crate::defs;
 use crate::entity::{EntId, Entities, Entity};
@@ -38,25 +38,25 @@ enum SpawnAction {
     Ammo {
         weapon_code: f32,
         netname: &'static str,
-        small: &'static CStr,
+        small: Model,
         small_amt: f32,
-        big: &'static CStr,
+        big: Model,
         big_amt: f32,
     },
     Powerup {
-        model: &'static CStr,
-        noise: crate::assets::Sound,
+        model: Model,
+        noise: Sound,
         netname: &'static str,
         item_bit: defs::Items,
         effect: defs::Effects,
     },
     Flame {
-        model: &'static CStr,
+        model: Model,
         skin: f32,
         frame: bool,
     },
     Explobox {
-        model: &'static CStr,
+        model: Model,
         size: Vec3,
     },
 }
@@ -267,8 +267,8 @@ impl GameState {
     /// QuakeC just assigns the string — so we write the `'static` `char*` straight into its
     /// indirection scratch cell (native `VM_MemoryBase` is 0, so a raw pointer is correct).
     /// `None` clears the viewmodel.
-    pub(crate) fn set_weaponmodel(&mut self, e: EntId, model: Option<&'static CStr>) {
-        let ptr = model.map_or(0, |m| m.as_ptr() as u64);
+    pub(crate) fn set_weaponmodel(&mut self, e: EntId, model: Option<crate::assets::Model>) {
+        let ptr = model.map_or(0, |m| m.path().as_ptr() as u64);
         self.entities[e].string_refs[STRING_REF_WEAPONMODEL] = ptr;
     }
 
@@ -333,7 +333,7 @@ impl GameState {
         self.entities[e].model_cs = Some(cstring(&m));
         let host = self.host;
         let ptr = self.entities[e].model_cs.as_deref().unwrap();
-        host.set_model(e.0 as i32, ptr);
+        host.set_model_brush(e.0 as i32, ptr);
     }
 
     /// The entity's `message` string as an owned `CString`, for `centerprint`.
@@ -561,58 +561,58 @@ impl GameState {
             "item_shells" => SpawnAction::Ammo {
                 weapon_code: 1.0,
                 netname: "shells",
-                small: c"maps/b_shell0.bsp",
+                small: Model::MAPS_B_SHELL0,
                 small_amt: 20.0,
-                big: c"maps/b_shell1.bsp",
+                big: Model::MAPS_B_SHELL1,
                 big_amt: 40.0,
             },
             "item_spikes" => SpawnAction::Ammo {
                 weapon_code: 2.0,
                 netname: "nails",
-                small: c"maps/b_nail0.bsp",
+                small: Model::MAPS_B_NAIL0,
                 small_amt: 25.0,
-                big: c"maps/b_nail1.bsp",
+                big: Model::MAPS_B_NAIL1,
                 big_amt: 50.0,
             },
             "item_rockets" => SpawnAction::Ammo {
                 weapon_code: 3.0,
                 netname: "rockets",
-                small: c"maps/b_rock0.bsp",
+                small: Model::MAPS_B_ROCK0,
                 small_amt: 5.0,
-                big: c"maps/b_rock1.bsp",
+                big: Model::MAPS_B_ROCK1,
                 big_amt: 10.0,
             },
             "item_cells" => SpawnAction::Ammo {
                 weapon_code: 4.0,
                 netname: "cells",
-                small: c"maps/b_batt0.bsp",
+                small: Model::MAPS_B_BATT0,
                 small_amt: 6.0,
-                big: c"maps/b_batt1.bsp",
+                big: Model::MAPS_B_BATT1,
                 big_amt: 12.0,
             },
             "item_artifact_invulnerability" => SpawnAction::Powerup {
-                model: c"progs/invulner.mdl",
+                model: Model::PROGS_INVULNER,
                 noise: Sound::ITEMS_PROTECT,
                 netname: "Pentagram of Protection",
                 item_bit: defs::Items::INVULNERABILITY,
                 effect: defs::Effects::RED,
             },
             "item_artifact_envirosuit" => SpawnAction::Powerup {
-                model: c"progs/suit.mdl",
+                model: Model::PROGS_SUIT,
                 noise: Sound::ITEMS_SUIT,
                 netname: "Biosuit",
                 item_bit: defs::Items::SUIT,
                 effect: defs::Effects::empty(),
             },
             "item_artifact_invisibility" => SpawnAction::Powerup {
-                model: c"progs/invisibl.mdl",
+                model: Model::PROGS_INVISIBL,
                 noise: Sound::ITEMS_INV1,
                 netname: "Ring of Shadows",
                 item_bit: defs::Items::INVISIBILITY,
                 effect: defs::Effects::empty(),
             },
             "item_artifact_super_damage" => SpawnAction::Powerup {
-                model: c"progs/quaddama.mdl",
+                model: Model::PROGS_QUADDAMA,
                 noise: Sound::ITEMS_DAMAGE,
                 netname: "Quad Damage",
                 item_bit: defs::Items::QUAD,
@@ -655,23 +655,23 @@ impl GameState {
             "light_fluoro" => SpawnAction::Spawn(GameState::spawn_light_fluoro),
             "light_fluorospark" => SpawnAction::Spawn(GameState::spawn_light_fluorospark),
             "light_globe" => SpawnAction::Flame {
-                model: c"progs/s_light.spr",
+                model: Model::PROGS_S_LIGHT,
                 skin: 0.0,
                 frame: false,
             },
             "light_torch_small_walltorch" => SpawnAction::Flame {
-                model: c"progs/flame.mdl",
+                model: Model::PROGS_FLAME,
                 skin: 0.0,
                 frame: true,
             },
             "light_flame_large_yellow" => SpawnAction::Flame {
-                model: c"progs/flame2.mdl",
+                model: Model::PROGS_FLAME2,
                 skin: 1.0,
                 frame: true,
             },
             "light_flame_small_yellow" | "light_flame_small_white" => {
                 SpawnAction::Flame {
-                    model: c"progs/flame2.mdl",
+                    model: Model::PROGS_FLAME2,
                     skin: 0.0,
                     frame: true,
                 }
@@ -681,11 +681,11 @@ impl GameState {
             }
             "func_illusionary" => SpawnAction::Spawn(GameState::spawn_func_illusionary),
             "misc_explobox" => SpawnAction::Explobox {
-                model: c"maps/b_explob.bsp",
+                model: Model::MAPS_B_EXPLOB,
                 size: Vec3::new(32.0, 32.0, 64.0),
             },
             "misc_explobox2" => SpawnAction::Explobox {
-                model: c"maps/b_exbox2.bsp",
+                model: Model::MAPS_B_EXBOX2,
                 size: Vec3::new(32.0, 32.0, 32.0),
             },
 

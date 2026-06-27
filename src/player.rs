@@ -6,11 +6,10 @@
 //! `GAME_EDICT_THINK` callback (the engine ignores the entvars `think` funcref for native
 //! modules and re-enters us whenever `nextthink` elapses).
 
-use core::ffi::CStr;
 
 use glam::Vec3;
 
-use crate::assets::Sound;
+use crate::assets::{Model, Sound};
 use crate::anim::{Anim, frames};
 use crate::defs::*;
 use crate::entity::{EntId, Think};
@@ -479,7 +478,7 @@ impl GameState {
     }
 
     /// `ThrowGib` — spawn a tumbling gib model.
-    fn throw_gib(&mut self, e: EntId, gibname: &CStr, dm: f32) {
+    fn throw_gib(&mut self, e: EntId, gibname: Model, dm: f32) {
         let origin = self.entities[e].v.origin;
         let vel = self.velocity_for_damage(e, dm);
         let time = self.time();
@@ -505,7 +504,7 @@ impl GameState {
     }
 
     /// `ThrowHead` — turn the player entity itself into a flying head gib.
-    fn throw_head(&mut self, e: EntId, gibname: &CStr, dm: f32) {
+    fn throw_head(&mut self, e: EntId, gibname: Model, dm: f32) {
         let vel = self.velocity_for_damage(e, dm);
         let avel = self.rng_unit() * Vec3::new(0.0, 600.0, 0.0);
         self.host.set_model(e.0 as i32, gibname);
@@ -531,10 +530,10 @@ impl GameState {
     /// `GibPlayer`.
     fn gib_player(&mut self, e: EntId) {
         let health = self.entities[e].v.health;
-        self.throw_head(e, c"progs/h_player.mdl", health);
-        self.throw_gib(e, c"progs/gib1.mdl", health);
-        self.throw_gib(e, c"progs/gib2.mdl", health);
-        self.throw_gib(e, c"progs/gib3.mdl", health);
+        self.throw_head(e, Model::PROGS_H_PLAYER, health);
+        self.throw_gib(e, Model::PROGS_GIB1, health);
+        self.throw_gib(e, Model::PROGS_GIB2, health);
+        self.throw_gib(e, Model::PROGS_GIB3, health);
         self.entities[e].v.deadflag = DeadFlag::Dead.as_f32();
         if self.entities[self.damage_attacker].classname() == Some("teledeath") {
             self.host

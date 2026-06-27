@@ -8,7 +8,7 @@ use core::ffi::CStr;
 
 use glam::Vec3;
 
-use crate::assets::Sound;
+use crate::assets::{Model, Sound};
 use crate::defs::*;
 use crate::entity::{Die, EntId, Think, Touch};
 use crate::game::GameState;
@@ -379,7 +379,7 @@ impl GameState {
             mis.think = Think::SubRemove;
             mis.classname = Some("rocket".into());
         }
-        self.host.set_model(m.0 as i32, c"progs/missile.mdl");
+        self.host.set_model(m.0 as i32, Model::PROGS_MISSILE);
         self.host.set_size(m.0 as i32, Vec3::ZERO, Vec3::ZERO);
         self.host
             .set_origin(m.0 as i32, origin + v_forward * 8.0 + Vec3::new(0.0, 0.0, 16.0));
@@ -576,7 +576,7 @@ impl GameState {
                 mis.th_die = Die::GrenadeExplode;
             }
         }
-        self.host.set_model(m.0 as i32, c"progs/grenade.mdl");
+        self.host.set_model(m.0 as i32, Model::PROGS_GRENADE);
         if shootable {
             self.host
                 .set_size(m.0 as i32, SHOOTABLE_GRENADE_MINS, SHOOTABLE_GRENADE_MAXS);
@@ -605,7 +605,7 @@ impl GameState {
             mis.v.nextthink = time + 6.0;
             mis.v.velocity = dir * 1000.0;
         }
-        self.host.set_model(m.0 as i32, c"progs/spike.mdl");
+        self.host.set_model(m.0 as i32, Model::PROGS_SPIKE);
         self.host.set_size(m.0 as i32, Vec3::ZERO, Vec3::ZERO);
         self.host.set_origin(m.0 as i32, org);
         m
@@ -626,7 +626,7 @@ impl GameState {
         let org = self.entities[e].v.origin + Vec3::new(0.0, 0.0, 16.0);
         let m = self.launch_spike(e, org, dir);
         self.entities[m].set_touch(Touch::SuperSpike);
-        self.host.set_model(m.0 as i32, c"progs/s_spike.mdl");
+        self.host.set_model(m.0 as i32, Model::PROGS_S_SPIKE);
         self.host.set_size(m.0 as i32, Vec3::ZERO, Vec3::ZERO);
         self.small_kick(e);
     }

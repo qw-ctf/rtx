@@ -1,42 +1,43 @@
 //! Type-safe asset handles, so a missing precache is unrepresentable.
 //!
-//! A [`Sound`] can only be obtained from something that precached it: the registry below
-//! (every `Sound::*` const is precached by [`precache_sounds`]) or the runtime escape hatch
-//! [`DynAssets::sound`] (which precaches the path before handing back a handle). Since
-//! `host.sound` accepts only a `Sound`, you cannot play a sound that was never precached.
+//! A [`Sound`]/[`Model`] can only be obtained from something that precached it: the registries
+//! below (every const is precached by `precache_sounds`/`precache_models`) or the runtime escape
+//! hatch [`DynAssets`] (which precaches a path before handing back a handle). Since `host.sound`
+//! and `host.set_model` accept only these handles, you cannot use an asset that was never
+//! precached. (Inline brush models — map `*N` submodels — are engine-managed and bypass this via
+//! `host.set_model_brush`; they need no precache.)
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 
 use crate::host::HostApi;
 
-/// A precached sound. Mint one only via the `Sound::*` registry consts or [`DynAssets::sound`]
-/// — never the (private) constructor directly; that is what ties "usable" to "precached".
-#[derive(Clone, Copy)]
-pub struct Sound(&'static CStr);
+/// Declare an asset-handle type `$ty` (a `'static` path), its `Ty::NAME` registry consts, and
+/// a `$precache_all` that precaches every one via `host.$host_precache`. The single source of
+/// truth: one line both names an asset and guarantees its precache.
+macro_rules! asset_registry {
+    ($ty:ident, $precache_all:ident, $host_precache:ident, { $($name:ident = $path:expr;)* }) => {
+        /// A precached asset handle. Mint one only via the `'static` registry consts or
+        /// [`DynAssets`] — never the private constructor; that is what ties "usable" to "precached".
+        #[derive(Clone, Copy)]
+        pub struct $ty(&'static CStr);
 
-impl Sound {
-    /// The wire path, for the host layer to hand to the engine.
-    pub(crate) const fn path(self) -> &'static CStr {
-        self.0
-    }
-}
-
-/// Declare the sound registry: a `Sound::NAME` const per line plus [`precache_sounds`], which
-/// precaches them all. One line is the single source of truth for both naming and precaching.
-macro_rules! sounds {
-    ($($name:ident = $path:expr;)*) => {
-        impl Sound {
-            $(pub const $name: Sound = Sound($path);)*
+        impl $ty {
+            /// The wire path, for the host layer to hand to the engine.
+            pub(crate) const fn path(self) -> &'static CStr {
+                self.0
+            }
+            $(pub const $name: $ty = $ty($path);)*
         }
-        /// Precache every registered sound. Called once at worldspawn.
-        pub fn precache_sounds(host: &HostApi) {
-            $(host.precache_sound(Sound::$name.path());)*
+
+        /// Precache every registered asset of this kind. Called once at worldspawn.
+        pub fn $precache_all(host: &HostApi) {
+            $(host.$host_precache($ty::$name.path());)*
         }
     };
 }
 
-sounds! {
+asset_registry!(Sound, precache_sounds, precache_sound, {
     // ambience
     AMBIENCE_BUZZ1 = c"ambience/buzz1.wav";
     AMBIENCE_FIRE1 = c"ambience/fire1.wav";
@@ -156,27 +157,100 @@ sounds! {
     WEAPONS_SHOTGN2 = c"weapons/shotgn2.wav";
     WEAPONS_SPIKE2 = c"weapons/spike2.wav";
     WEAPONS_TINK1 = c"weapons/tink1.wav";
-}
+});
 
-/// Escape hatch for string-declared (runtime / map-supplied) sounds: paths not known at
-/// compile time, so absent from the registry. Precaches each on first sight and interns it,
-/// keeping it `'static` and deduping repeats — so the "usable implies precached" rule still
-/// holds. Lives in `GameState`; precache (and thus registration) must happen at load time.
+asset_registry!(Model, precache_models, precache_model, {
+    // maps
+    MAPS_B_BATT0 = c"maps/b_batt0.bsp";
+    MAPS_B_BATT1 = c"maps/b_batt1.bsp";
+    MAPS_B_BH10 = c"maps/b_bh10.bsp";
+    MAPS_B_BH100 = c"maps/b_bh100.bsp";
+    MAPS_B_BH25 = c"maps/b_bh25.bsp";
+    MAPS_B_EXBOX2 = c"maps/b_exbox2.bsp";
+    MAPS_B_EXPLOB = c"maps/b_explob.bsp";
+    MAPS_B_NAIL0 = c"maps/b_nail0.bsp";
+    MAPS_B_NAIL1 = c"maps/b_nail1.bsp";
+    MAPS_B_ROCK0 = c"maps/b_rock0.bsp";
+    MAPS_B_ROCK1 = c"maps/b_rock1.bsp";
+    MAPS_B_SHELL0 = c"maps/b_shell0.bsp";
+    MAPS_B_SHELL1 = c"maps/b_shell1.bsp";
+    // progs
+    PROGS_ARMOR = c"progs/armor.mdl";
+    PROGS_BACKPACK = c"progs/backpack.mdl";
+    PROGS_BOLT = c"progs/bolt.mdl";
+    PROGS_BOLT2 = c"progs/bolt2.mdl";
+    PROGS_BOLT3 = c"progs/bolt3.mdl";
+    PROGS_EYES = c"progs/eyes.mdl";
+    PROGS_FLAME = c"progs/flame.mdl";
+    PROGS_FLAME2 = c"progs/flame2.mdl";
+    PROGS_G_LIGHT = c"progs/g_light.mdl";
+    PROGS_G_NAIL = c"progs/g_nail.mdl";
+    PROGS_G_NAIL2 = c"progs/g_nail2.mdl";
+    PROGS_G_ROCK = c"progs/g_rock.mdl";
+    PROGS_G_ROCK2 = c"progs/g_rock2.mdl";
+    PROGS_G_SHOT = c"progs/g_shot.mdl";
+    PROGS_GIB1 = c"progs/gib1.mdl";
+    PROGS_GIB2 = c"progs/gib2.mdl";
+    PROGS_GIB3 = c"progs/gib3.mdl";
+    PROGS_GRENADE = c"progs/grenade.mdl";
+    PROGS_H_PLAYER = c"progs/h_player.mdl";
+    PROGS_INVISIBL = c"progs/invisibl.mdl";
+    PROGS_INVULNER = c"progs/invulner.mdl";
+    PROGS_LAVABALL = c"progs/lavaball.mdl";
+    PROGS_MISSILE = c"progs/missile.mdl";
+    PROGS_PLAYER = c"progs/player.mdl";
+    PROGS_QUADDAMA = c"progs/quaddama.mdl";
+    PROGS_S_BUBBLE = c"progs/s_bubble.spr";
+    PROGS_S_EXPLOD = c"progs/s_explod.spr";
+    PROGS_S_LIGHT = c"progs/s_light.spr";
+    PROGS_S_SPIKE = c"progs/s_spike.mdl";
+    PROGS_SPIKE = c"progs/spike.mdl";
+    PROGS_SUIT = c"progs/suit.mdl";
+    PROGS_V_AXE = c"progs/v_axe.mdl";
+    PROGS_V_LIGHT = c"progs/v_light.mdl";
+    PROGS_V_NAIL = c"progs/v_nail.mdl";
+    PROGS_V_NAIL2 = c"progs/v_nail2.mdl";
+    PROGS_V_ROCK = c"progs/v_rock.mdl";
+    PROGS_V_ROCK2 = c"progs/v_rock2.mdl";
+    PROGS_V_SHOT = c"progs/v_shot.mdl";
+    PROGS_V_SHOT2 = c"progs/v_shot2.mdl";
+    PROGS_ZOM_GIB = c"progs/zom_gib.mdl";
+});
+
+/// Escape hatch for string-declared (runtime / map-supplied) assets absent from the registries:
+/// precaches each on first sight and interns it, keeping it `'static` and deduping repeats — so
+/// "usable implies precached" still holds. Lives in `GameState`; registration must happen at load
+/// time. (No string-declared assets in the port yet; here for when one appears.)
 #[derive(Default)]
 pub struct DynAssets {
     sounds: HashMap<CString, &'static CStr>,
+    models: HashMap<CString, &'static CStr>,
 }
 
 impl DynAssets {
-    /// Precache `path` (idempotently) and return its handle.
-    #[allow(dead_code)] // escape hatch: no string-declared sounds in the port yet
+    /// Precache a runtime sound path (idempotently) and return its handle.
+    #[allow(dead_code)]
     pub fn sound(&mut self, host: &HostApi, path: &CStr) -> Sound {
-        if let Some(&p) = self.sounds.get(path) {
-            return Sound(p);
-        }
-        host.precache_sound(path);
-        let leaked: &'static CStr = Box::leak(path.to_owned().into_boxed_c_str());
-        self.sounds.insert(path.to_owned(), leaked);
-        Sound(leaked)
+        Sound(intern(&mut self.sounds, path, || host.precache_sound(path)))
     }
+    /// Precache a runtime model path (idempotently) and return its handle.
+    #[allow(dead_code)]
+    pub fn model(&mut self, host: &HostApi, path: &CStr) -> Model {
+        Model(intern(&mut self.models, path, || host.precache_model(path)))
+    }
+}
+
+/// Return the interned `'static` copy of `path`, precaching (via `precache`) on first insertion.
+fn intern(
+    map: &mut HashMap<CString, &'static CStr>,
+    path: &CStr,
+    precache: impl FnOnce(),
+) -> &'static CStr {
+    if let Some(&p) = map.get(path) {
+        return p;
+    }
+    precache();
+    let leaked: &'static CStr = Box::leak(path.to_owned().into_boxed_c_str());
+    map.insert(path.to_owned(), leaked);
+    leaked
 }

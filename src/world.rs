@@ -26,41 +26,16 @@ pub fn worldspawn(game: &mut GameState) {
     // Every sound, from the single registry (`assets.rs`): the set of nameable sounds *is* the
     // set of precached sounds, so a missing precache is unrepresentable.
     crate::assets::precache_sounds(&host);
+    crate::assets::precache_models(&host);
 
     // Models.
-    host.precache_model(c"progs/player.mdl");
-    host.precache_model(c"progs/eyes.mdl");
-    host.precache_model(c"progs/h_player.mdl");
-    host.precache_model(c"progs/gib1.mdl");
-    host.precache_model(c"progs/gib2.mdl");
-    host.precache_model(c"progs/gib3.mdl");
 
-    host.precache_model(c"progs/s_bubble.spr"); // drowning bubbles
-    host.precache_model(c"progs/s_explod.spr"); // sprite explosion
 
-    host.precache_model(c"progs/v_axe.mdl");
-    host.precache_model(c"progs/v_shot.mdl");
-    host.precache_model(c"progs/v_nail.mdl");
-    host.precache_model(c"progs/v_rock.mdl");
-    host.precache_model(c"progs/v_shot2.mdl");
-    host.precache_model(c"progs/v_nail2.mdl");
-    host.precache_model(c"progs/v_rock2.mdl");
 
-    host.precache_model(c"progs/bolt.mdl"); // lightning gun
-    host.precache_model(c"progs/bolt2.mdl"); // lightning gun
-    host.precache_model(c"progs/bolt3.mdl"); // boss shock
-    host.precache_model(c"progs/lavaball.mdl");
 
-    host.precache_model(c"progs/missile.mdl");
-    host.precache_model(c"progs/grenade.mdl");
-    host.precache_model(c"progs/spike.mdl");
-    host.precache_model(c"progs/s_spike.mdl");
 
-    host.precache_model(c"progs/backpack.mdl");
 
-    host.precache_model(c"progs/zom_gib.mdl");
 
-    host.precache_model(c"progs/v_light.mdl");
 
     // Light animation tables. 'a' is total darkness, 'z' is maxbright.
     host.lightstyle(0, c"m"); // 0 normal

@@ -3,11 +3,10 @@
 //! ordinary still entities rather than via `makestatic`, which keeps edict bookkeeping
 //! simple; rarely-used set pieces are spawned inert.)
 
-use core::ffi::CStr;
 
 use glam::Vec3;
 
-use crate::assets::Sound;
+use crate::assets::{Model, Sound};
 use crate::defs::*;
 use crate::entity::{Die, EntId, Use};
 use crate::game::GameState;
@@ -48,8 +47,7 @@ impl GameState {
     }
 
     /// A flame/torch/globe decoration: precache, show the model, attach ambient fire.
-    pub(crate) fn spawn_flame(&mut self, e: EntId, model: &'static CStr, frame: f32, fire: bool) -> bool {
-        self.host.precache_model(model);
+    pub(crate) fn spawn_flame(&mut self, e: EntId, model: Model, frame: f32, fire: bool) -> bool {
         self.entities[e].model_cstr = Some(model);
         self.host.set_model(e.0 as i32, model);
         self.entities[e].v.frame = frame;
@@ -141,13 +139,12 @@ impl GameState {
     }
 
     /// `misc_explobox` / `misc_explobox2` — a shootable barrel.
-    pub(crate) fn spawn_misc_explobox(&mut self, e: EntId, model: &'static CStr, size: Vec3) -> bool {
+    pub(crate) fn spawn_misc_explobox(&mut self, e: EntId, model: Model, size: Vec3) -> bool {
         {
             let ent = &mut self.entities[e];
             ent.v.solid = Solid::BBox.as_f32();
             ent.v.movetype = MoveType::None.as_f32();
         }
-        self.host.precache_model(model);
         self.entities[e].model_cstr = Some(model);
         self.host.set_model(e.0 as i32, model);
         self.host.set_size(e.0 as i32, Vec3::ZERO, size);

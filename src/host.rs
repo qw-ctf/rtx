@@ -10,7 +10,7 @@ use core::ffi::CStr;
 
 use glam::Vec3;
 
-use crate::assets::Sound;
+use crate::assets::{Model, Sound};
 use crate::defs::{Attenuation, Channel, MsgDest, Multicast, PrintLevel, Svc, Te};
 
 /// The host-provided dispatcher. Variadic, C ABI; calling it is `unsafe`.
@@ -229,8 +229,19 @@ impl HostApi {
         unsafe { (self.syscall)(B::RemoveEnt as isize, ent as isize) };
     }
 
-    /// `G_SETMODEL` — assign a model (also sets `modelindex`, `mins`/`maxs` for bmodels).
-    pub fn set_model(&self, ent: i32, model: &CStr) {
+    /// `G_SETMODEL` — assign an external [`Model`] (also sets `modelindex`, `mins`/`maxs`). Takes
+    /// a handle, which only comes from a precached source — so the model is provably precached.
+    pub fn set_model(&self, ent: i32, model: Model) {
+        self.set_model_raw(ent, model.path());
+    }
+
+    /// `G_SETMODEL` for an inline brush submodel (`*N`) supplied by the map. These are part of
+    /// the level BSP and engine-managed (no precache), so they take a raw name, not a [`Model`].
+    pub fn set_model_brush(&self, ent: i32, name: &CStr) {
+        self.set_model_raw(ent, name);
+    }
+
+    fn set_model_raw(&self, ent: i32, model: &CStr) {
         unsafe { (self.syscall)(B::SetModel as isize, ent as isize, model.as_ptr() as isize) };
     }
 

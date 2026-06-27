@@ -7,7 +7,7 @@ use core::ffi::CStr;
 
 use glam::Vec3;
 
-use crate::assets::Sound;
+use crate::assets::{Model, Sound};
 use crate::abi::EntVars;
 use crate::defs::*;
 use crate::entity::{Die, EntId, Pain};
@@ -205,9 +205,9 @@ impl GameState {
         // internal links — this is what makes the player visible/collidable to others).
         // The "eyes" model is set first purely to capture its modelindex (QuakeC's hack for
         // the Ring of Shadows), then the real player model.
-        self.host.set_model(player.0 as i32, c"progs/eyes.mdl");
+        self.host.set_model(player.0 as i32, Model::PROGS_EYES);
         self.level.modelindex_eyes = self.entities[player].v.modelindex;
-        self.host.set_model(player.0 as i32, c"progs/player.mdl");
+        self.host.set_model(player.0 as i32, Model::PROGS_PLAYER);
         self.level.modelindex_player = self.entities[player].v.modelindex;
         self.host
             .set_size(player.0 as i32, VEC_HULL_MIN, VEC_HULL_MAX);
@@ -807,7 +807,7 @@ impl GameState {
                 .with(ammo_bit);
             ent.v.currentammo = ammo;
             ent.v.weaponframe = 0.0;
-            ent.weaponmodel = model.and_then(|m| m.to_str().ok()).map(Into::into);
+            ent.weaponmodel = model.and_then(|m| m.path().to_str().ok()).map(Into::into);
         }
         self.set_weaponmodel(player, model);
     }

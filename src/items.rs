@@ -6,7 +6,7 @@ use core::ffi::CStr;
 
 use glam::Vec3;
 
-use crate::assets::Sound;
+use crate::assets::{Model, Sound};
 use crate::defs::*;
 use crate::entity::{EntId, Think, Touch};
 use crate::game::GameState;
@@ -24,12 +24,12 @@ enum AmmoKind {
 struct WeaponSpec {
     item: Items,
     classname: Option<&'static str>,
-    pickup_model: Option<&'static CStr>,
+    pickup_model: Option<Model>,
     pickup_name: &'static str,
     backpack_name: &'static str,
     ammo_kind: Option<AmmoKind>,
     pickup_ammo: f32,
-    view_model: Option<&'static CStr>,
+    view_model: Option<Model>,
     ammo_bit: Items,
     rank: i32,
     switch_code: f32,
@@ -44,7 +44,7 @@ const WEAPON_SPECS: &[WeaponSpec] = &[
         backpack_name: "Axe",
         ammo_kind: None,
         pickup_ammo: 0.0,
-        view_model: Some(c"progs/v_axe.mdl"),
+        view_model: Some(Model::PROGS_V_AXE),
         ammo_bit: Items::empty(),
         rank: 7,
         switch_code: 1.0,
@@ -57,7 +57,7 @@ const WEAPON_SPECS: &[WeaponSpec] = &[
         backpack_name: "Shotgun",
         ammo_kind: Some(AmmoKind::Shells),
         pickup_ammo: 0.0,
-        view_model: Some(c"progs/v_shot.mdl"),
+        view_model: Some(Model::PROGS_V_SHOT),
         ammo_bit: Items::SHELLS,
         rank: 7,
         switch_code: 1.0,
@@ -65,12 +65,12 @@ const WEAPON_SPECS: &[WeaponSpec] = &[
     WeaponSpec {
         item: Items::SUPER_SHOTGUN,
         classname: Some("weapon_supershotgun"),
-        pickup_model: Some(c"progs/g_shot.mdl"),
+        pickup_model: Some(Model::PROGS_G_SHOT),
         pickup_name: "Double-barrelled Shotgun",
         backpack_name: "Double-barrelled Shotgun",
         ammo_kind: Some(AmmoKind::Shells),
         pickup_ammo: 5.0,
-        view_model: Some(c"progs/v_shot2.mdl"),
+        view_model: Some(Model::PROGS_V_SHOT2),
         ammo_bit: Items::SHELLS,
         rank: 5,
         switch_code: 3.0,
@@ -78,12 +78,12 @@ const WEAPON_SPECS: &[WeaponSpec] = &[
     WeaponSpec {
         item: Items::NAILGUN,
         classname: Some("weapon_nailgun"),
-        pickup_model: Some(c"progs/g_nail.mdl"),
+        pickup_model: Some(Model::PROGS_G_NAIL),
         pickup_name: "nailgun",
         backpack_name: "Nailgun",
         ammo_kind: Some(AmmoKind::Nails),
         pickup_ammo: 30.0,
-        view_model: Some(c"progs/v_nail.mdl"),
+        view_model: Some(Model::PROGS_V_NAIL),
         ammo_bit: Items::NAILS,
         rank: 6,
         switch_code: 4.0,
@@ -91,12 +91,12 @@ const WEAPON_SPECS: &[WeaponSpec] = &[
     WeaponSpec {
         item: Items::SUPER_NAILGUN,
         classname: Some("weapon_supernailgun"),
-        pickup_model: Some(c"progs/g_nail2.mdl"),
+        pickup_model: Some(Model::PROGS_G_NAIL2),
         pickup_name: "Super Nailgun",
         backpack_name: "Super Nailgun",
         ammo_kind: Some(AmmoKind::Nails),
         pickup_ammo: 30.0,
-        view_model: Some(c"progs/v_nail2.mdl"),
+        view_model: Some(Model::PROGS_V_NAIL2),
         ammo_bit: Items::NAILS,
         rank: 3,
         switch_code: 5.0,
@@ -104,12 +104,12 @@ const WEAPON_SPECS: &[WeaponSpec] = &[
     WeaponSpec {
         item: Items::GRENADE_LAUNCHER,
         classname: Some("weapon_grenadelauncher"),
-        pickup_model: Some(c"progs/g_rock.mdl"),
+        pickup_model: Some(Model::PROGS_G_ROCK),
         pickup_name: "Grenade Launcher",
         backpack_name: "Grenade Launcher",
         ammo_kind: Some(AmmoKind::Rockets),
         pickup_ammo: 5.0,
-        view_model: Some(c"progs/v_rock.mdl"),
+        view_model: Some(Model::PROGS_V_ROCK),
         ammo_bit: Items::ROCKETS,
         rank: 4,
         switch_code: 6.0,
@@ -117,12 +117,12 @@ const WEAPON_SPECS: &[WeaponSpec] = &[
     WeaponSpec {
         item: Items::ROCKET_LAUNCHER,
         classname: Some("weapon_rocketlauncher"),
-        pickup_model: Some(c"progs/g_rock2.mdl"),
+        pickup_model: Some(Model::PROGS_G_ROCK2),
         pickup_name: "Rocket Launcher",
         backpack_name: "Rocket Launcher",
         ammo_kind: Some(AmmoKind::Rockets),
         pickup_ammo: 5.0,
-        view_model: Some(c"progs/v_rock2.mdl"),
+        view_model: Some(Model::PROGS_V_ROCK2),
         ammo_bit: Items::ROCKETS,
         rank: 2,
         switch_code: 7.0,
@@ -130,12 +130,12 @@ const WEAPON_SPECS: &[WeaponSpec] = &[
     WeaponSpec {
         item: Items::LIGHTNING,
         classname: Some("weapon_lightning"),
-        pickup_model: Some(c"progs/g_light.mdl"),
+        pickup_model: Some(Model::PROGS_G_LIGHT),
         pickup_name: "Thunderbolt",
         backpack_name: "Thunderbolt",
         ammo_kind: Some(AmmoKind::Cells),
         pickup_ammo: 15.0,
-        view_model: Some(c"progs/v_light.mdl"),
+        view_model: Some(Model::PROGS_V_LIGHT),
         ammo_bit: Items::CELLS,
         rank: 1,
         switch_code: 8.0,
@@ -159,8 +159,8 @@ fn weapon_spec_for_classname(classname: &str) -> Option<&'static WeaponSpec> {
 impl GameState {
     // --- placement & respawn ---
 
-    /// Set an item's model from a `'static` literal (kept for respawn — see `entity.rs`).
-    fn set_item_model(&mut self, e: EntId, model: &'static CStr) {
+    /// Set an item's model handle (kept for respawn — see `entity.rs`).
+    fn set_item_model(&mut self, e: EntId, model: Model) {
         self.entities[e].model_cstr = Some(model);
         self.host.set_model(e.0 as i32, model);
     }
@@ -579,7 +579,7 @@ impl GameState {
             it.v.nextthink = time + 120.0;
             it.think = Think::SubRemove;
         }
-        self.host.set_model(item.0 as i32, c"progs/backpack.mdl");
+        self.host.set_model(item.0 as i32, Model::PROGS_BACKPACK);
         self.host
             .set_size(item.0 as i32, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
     }
@@ -681,22 +681,19 @@ impl GameState {
         self.entities[e].set_touch(Touch::ItemHealth);
         let flags = self.spawnflags(e);
         if flags.has(HealthFlags::ROTTEN) {
-            self.host.precache_model(c"maps/b_bh10.bsp");
-            self.set_item_model(e, c"maps/b_bh10.bsp");
+            self.set_item_model(e, Model::MAPS_B_BH10);
             self.set_noise(e, Sound::ITEMS_R_ITEM1);
             let ent = &mut self.entities[e];
             ent.item.healamount = 15.0;
             ent.item.healtype = 0.0;
         } else if flags.has(HealthFlags::MEGA) {
-            self.host.precache_model(c"maps/b_bh100.bsp");
-            self.set_item_model(e, c"maps/b_bh100.bsp");
+            self.set_item_model(e, Model::MAPS_B_BH100);
             self.set_noise(e, Sound::ITEMS_R_ITEM2);
             let ent = &mut self.entities[e];
             ent.item.healamount = 100.0;
             ent.item.healtype = 2.0;
         } else {
-            self.host.precache_model(c"maps/b_bh25.bsp");
-            self.set_item_model(e, c"maps/b_bh25.bsp");
+            self.set_item_model(e, Model::MAPS_B_BH25);
             self.set_noise(e, Sound::ITEMS_HEALTH1);
             let ent = &mut self.entities[e];
             ent.item.healamount = 25.0;
@@ -710,8 +707,7 @@ impl GameState {
 
     pub(crate) fn spawn_item_armor(&mut self, e: EntId, skin: f32) -> bool {
         self.entities[e].set_touch(Touch::ItemArmor);
-        self.host.precache_model(c"progs/armor.mdl");
-        self.set_item_model(e, c"progs/armor.mdl");
+        self.set_item_model(e, Model::PROGS_ARMOR);
         self.entities[e].v.skin = skin;
         self.host
             .set_size(e.0 as i32, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
@@ -733,7 +729,6 @@ impl GameState {
         let Some(model) = spec.pickup_model else {
             return false;
         };
-        self.host.precache_model(model);
         self.set_item_model(e, model);
         self.entities[e].set_touch(Touch::ItemWeapon);
         self.entities[e].netname = Some(spec.pickup_name.into());
@@ -749,9 +744,9 @@ impl GameState {
         e: EntId,
         weapon_code: f32,
         netname: &'static str,
-        small: &'static CStr,
+        small: Model,
         small_amt: f32,
-        big: &'static CStr,
+        big: Model,
         big_amt: f32,
     ) -> bool {
         if self.level.deathmatch == 4 {
@@ -763,7 +758,6 @@ impl GameState {
         } else {
             (small, small_amt)
         };
-        self.host.precache_model(model);
         self.set_item_model(e, model);
         {
             let ent = &mut self.entities[e];
@@ -780,13 +774,12 @@ impl GameState {
     pub(crate) fn spawn_powerup(
         &mut self,
         e: EntId,
-        model: &'static CStr,
+        model: Model,
         noise: Sound,
         netname: &'static str,
         item_bit: Items,
         effect: Effects,
     ) -> bool {
-        self.host.precache_model(model);
         self.entities[e].set_touch(Touch::ItemPowerup);
         self.set_item_model(e, model);
         self.set_noise(e, noise);
@@ -805,7 +798,7 @@ impl GameState {
     pub(crate) fn current_weapon_ammo_state(
         &self,
         player: EntId,
-    ) -> (f32, Option<&'static CStr>, Items) {
+    ) -> (f32, Option<Model>, Items) {
         let v = &self.entities[player].v;
         let Some(spec) = weapon_spec_from_f32(v.weapon) else {
             return (0.0, None, Items::empty());

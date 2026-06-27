@@ -260,7 +260,7 @@ pub struct Entity {
     /// The item's model as a `'static` C string, kept so a respawned item can be re-shown
     /// (the engine stores the raw pointer, so it must outlive the entity — see the native
     /// string ABI notes in `abi.rs`). Item models are all string literals, so this is sound.
-    pub model_cstr: Option<&'static core::ffi::CStr>,
+    pub model_cstr: Option<crate::assets::Model>,
     /// Owned C string backing a brush model (`*N`) passed to `setmodel`. The engine keeps the
     /// raw pointer, so this must live as long as the entity references the model.
     pub model_cs: Option<CString>,
