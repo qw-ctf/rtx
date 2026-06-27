@@ -349,14 +349,17 @@ impl GameState {
             return;
         }
         if !flags.has(Flags::ONGROUND) {
-            // Mid-air double jump (`rtx_doublejump`): at most once per air travel. The ground
-            // jump's impulse is applied by the engine's pmove; nothing lifts us mid-air, so set
-            // the upward velocity ourselves.
-            if self.entities[e].air_jumped || self.host.cvar(c"rtx_doublejump") == 0.0 {
-                return;
+            // Mid-air. A wall jump (kicking off a wall we're moving into) takes priority and is
+            // limited only by geometry; failing that, the once-per-air-travel double jump. The
+            // ground jump's impulse is applied by the engine's pmove, but nothing lifts us
+            // mid-air, so both set velocity themselves.
+            if !self.try_wall_jump(e) {
+                if self.entities[e].air_jumped || self.host.cvar(c"rtx_doublejump") == 0.0 {
+                    return;
+                }
+                self.entities[e].air_jumped = true;
+                self.entities[e].v.velocity.z = 270.0;
             }
-            self.entities[e].air_jumped = true;
-            self.entities[e].v.velocity.z = 270.0;
         }
         {
             let v = &mut self.entities[e].v;
@@ -365,6 +368,66 @@ impl GameState {
         }
         self.host
             .sound(e.0 as i32, Channel::Body, c"player/plyrjmp8.wav", 1.0, Attenuation::Norm);
+    }
+
+    /// `rtx_walljump` — kick off a nearby wall mid-air. Because the engine clips a player's
+    /// velocity *parallel* to a wall on contact, by the time you're at the wall you're sliding
+    /// along it — so we probe ahead **and to both sides** to find it. The kick keeps the
+    /// along-wall momentum, launches out along the wall normal (reflecting an into-wall approach,
+    /// but always at least `KICK` so a parallel slide still pushes off), and jumps up — so you
+    /// leave at an outward angle set by your slide speed vs. the kick. Returns whether it fired.
+    fn try_wall_jump(&mut self, e: EntId) -> bool {
+        /// Trace reach from the player's center — half-width (16) plus a margin.
+        const REACH: f32 = 32.0;
+        /// Minimum horizontal speed to orient the probes (and to count as a moving wall jump).
+        const MIN_SPEED: f32 = 30.0;
+        /// `|normal.z|` above this is a floor/ceiling, not a wall (Quake's walkable cutoff is 0.7).
+        const MAX_FLOORNESS: f32 = 0.7;
+        /// Minimum outward launch speed off the wall (a parallel slide gets at least this).
+        const KICK: f32 = 270.0;
+        /// Upward velocity imparted by the kick.
+        const UP: f32 = 270.0;
+
+        if self.host.cvar(c"rtx_walljump") == 0.0 {
+            return false;
+        }
+        let (origin, vel) = {
+            let v = &self.entities[e].v;
+            (v.origin, v.velocity)
+        };
+        let horiz = Vec3::new(vel.x, vel.y, 0.0);
+        let speed = horiz.length();
+        if speed < MIN_SPEED {
+            return false;
+        }
+        let fwd = horiz / speed;
+        let side = Vec3::new(-fwd.y, fwd.x, 0.0); // horizontal perpendicular
+
+        // Nearest near-vertical surface among forward / left / right.
+        let mut wall = None;
+        let mut best = 1.0;
+        for d in [fwd, side, -side] {
+            let tr = self.traceline(origin, origin + d * REACH, true, e);
+            if tr.fraction < best && tr.plane_normal.z.abs() <= MAX_FLOORNESS {
+                best = tr.fraction;
+                wall = Some(tr.plane_normal);
+            }
+        }
+        let Some(pn) = wall else {
+            return false;
+        };
+        let n = Vec3::new(pn.x, pn.y, 0.0).normalize_or_zero();
+        if n == Vec3::ZERO {
+            return false;
+        }
+
+        // Keep along-wall momentum, launch out along the normal, jump up.
+        let into = horiz.dot(n); // < 0 moving into the wall, ~0 sliding along it
+        let tangential = horiz - into * n;
+        let outward = (-into).max(KICK);
+        let launch = tangential + outward * n;
+        self.entities[e].v.velocity = Vec3::new(launch.x, launch.y, UP);
+        true
     }
 
     /// `WaterMove` — drowning and lava/slime damage and enter/leave sounds.
