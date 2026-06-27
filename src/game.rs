@@ -727,6 +727,16 @@ impl GameState {
             "team" => ent.v.team = parse_f32(value),
             "items" => ent.v.items = parse_f32(value),
             "sounds" => ent.v.sounds = parse_f32(value),
+            // Mover/trigger tuning keys (doors, plats, trains, trigger_push, trigger_hurt, …).
+            // Without these, movers fall back to their spawn defaults — e.g. trigger_push's
+            // default speed of 1000 launches at 10000 ups (`speed * movedir * 10`).
+            "speed" => ent.mover.speed = parse_f32(value),
+            "wait" => ent.mover.wait = parse_f32(value),
+            "delay" => ent.mover.delay = parse_f32(value),
+            "lip" => ent.mover.lip = parse_f32(value),
+            "height" => ent.mover.height = parse_f32(value),
+            "dmg" => ent.mover.dmg = parse_f32(value),
+            "count" => ent.mover.count = parse_f32(value),
             _ => {}
         }
     }
