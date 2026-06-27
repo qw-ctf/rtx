@@ -162,7 +162,7 @@ impl GameState {
     /// Set an item's model handle (kept for respawn — see `entity.rs`).
     fn set_item_model(&mut self, e: EntId, model: Model) {
         self.entities[e].model_cstr = Some(model);
-        self.host.set_model(e.0 as i32, model);
+        self.host.set_model(e, model);
     }
 
     /// `StartItem` — schedule the item to drop to the floor after other solids settle.
@@ -183,7 +183,7 @@ impl GameState {
             ent.v.velocity = Vec3::ZERO;
             ent.v.origin.z += 6.0;
         }
-        if !self.host.droptofloor(e.0 as i32) {
+        if !self.host.droptofloor(e) {
             self.free(e);
         }
     }
@@ -191,13 +191,13 @@ impl GameState {
     /// `SUB_regen` — re-show a picked-up item after its respawn delay.
     pub(crate) fn sub_regen(&mut self, e: EntId) {
         if let Some(model) = self.entities[e].model_cstr {
-            self.host.set_model(e.0 as i32, model);
+            self.host.set_model(e, model);
         }
         self.entities[e].v.solid = Solid::Trigger.as_f32();
         self.host
-            .sound(e.0 as i32, Channel::Voice, Sound::ITEMS_ITEMBK2, 1.0, Attenuation::Norm);
+            .sound(e, Channel::Voice, Sound::ITEMS_ITEMBK2, 1.0, Attenuation::Norm);
         let origin = self.entities[e].v.origin;
-        self.host.set_origin(e.0 as i32, origin);
+        self.host.set_origin(e, origin);
     }
 
     /// Hide a just-taken item (the native ABI hides via `modelindex`, not the model string).
@@ -335,8 +335,8 @@ impl GameState {
         }
         self.sprint_low(other, "You got armor\n");
         self.host
-            .sound(other.0 as i32, Channel::Item, Sound::ITEMS_ARMOR1, 1.0, Attenuation::Norm);
-        self.host.stuffcmd(other.0 as i32, c"bf\n");
+            .sound(other, Channel::Item, Sound::ITEMS_ARMOR1, 1.0, Attenuation::Norm);
+        self.host.stuffcmd(other, c"bf\n");
         let delay = if self.level.deathmatch != 2 { Some(20.0) } else { None };
         self.pickup_finish(e, other, delay);
     }
@@ -373,8 +373,8 @@ impl GameState {
         let netname = self.netname_of(e);
         self.sprint_low(other, &format!("You got the {netname}\n"));
         self.host
-            .sound(other.0 as i32, Channel::Item, Sound::WEAPONS_PKUP, 1.0, Attenuation::Norm);
-        self.host.stuffcmd(other.0 as i32, c"bf\n");
+            .sound(other, Channel::Item, Sound::WEAPONS_PKUP, 1.0, Attenuation::Norm);
+        self.host.stuffcmd(other, c"bf\n");
 
         self.bound_other_ammo(other);
         let old = self.entities[other].v.items;
@@ -423,8 +423,8 @@ impl GameState {
         let netname = self.netname_of(e);
         self.sprint_low(other, &format!("You got the {netname}\n"));
         self.host
-            .sound(other.0 as i32, Channel::Item, Sound::WEAPONS_LOCK4, 1.0, Attenuation::Norm);
-        self.host.stuffcmd(other.0 as i32, c"bf\n");
+            .sound(other, Channel::Item, Sound::WEAPONS_LOCK4, 1.0, Attenuation::Norm);
+        self.host.stuffcmd(other, c"bf\n");
 
         // Switch up to a better weapon if we were already on our best.
         if self.entities[other].v.weapon == best.as_f32() {
@@ -533,8 +533,8 @@ impl GameState {
         let netname = self.netname_of(e);
         self.sprint_low(other, &format!("You get {netname}\n"));
         self.host
-            .sound(other.0 as i32, Channel::Item, Sound::WEAPONS_LOCK4, 1.0, Attenuation::Norm);
-        self.host.stuffcmd(other.0 as i32, c"bf\n");
+            .sound(other, Channel::Item, Sound::WEAPONS_LOCK4, 1.0, Attenuation::Norm);
+        self.host.stuffcmd(other, c"bf\n");
 
         self.free(e);
 
@@ -579,9 +579,9 @@ impl GameState {
             it.v.nextthink = time + 120.0;
             it.think = Think::SubRemove;
         }
-        self.host.set_model(item.0 as i32, Model::PROGS_BACKPACK);
+        self.host.set_model(item, Model::PROGS_BACKPACK);
         self.host
-            .set_size(item.0 as i32, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
+            .set_size(item, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
     }
 
     // --- ammo/weapon helpers ---
@@ -641,20 +641,20 @@ impl GameState {
 
     fn sprint_low(&self, e: EntId, msg: &str) {
         let c = crate::game::cstring(msg);
-        self.host.sprint(e.0 as i32, PrintLevel::Low, &c);
+        self.host.sprint(e, PrintLevel::Low, &c);
     }
 
     /// Pickup sound on `chan` using the item's `noise`, then a screen flash.
     fn item_pickup_sound(&mut self, e: EntId, other: EntId, chan: Channel) {
         if let Some(noise) = self.entities[e].noise {
-            self.host.sound(other.0 as i32, chan, noise, 1.0, Attenuation::Norm);
+            self.host.sound(other, chan, noise, 1.0, Attenuation::Norm);
         }
-        self.host.stuffcmd(other.0 as i32, c"bf\n");
+        self.host.stuffcmd(other, c"bf\n");
     }
 
     fn infokey_float(&self, e: EntId, key: &CStr, default: f32) -> f32 {
         let mut buf = [0u8; 32];
-        let s = self.host.infokey(e.0 as i32, key, &mut buf);
+        let s = self.host.infokey(e, key, &mut buf);
         let v: f32 = s.trim().parse().unwrap_or(0.0);
         if v == 0.0 {
             default
@@ -700,7 +700,7 @@ impl GameState {
             ent.item.healtype = 1.0;
         }
         self.host
-            .set_size(e.0 as i32, Vec3::ZERO, Vec3::new(32.0, 32.0, 56.0));
+            .set_size(e, Vec3::ZERO, Vec3::new(32.0, 32.0, 56.0));
         self.start_item(e);
         true
     }
@@ -710,7 +710,7 @@ impl GameState {
         self.set_item_model(e, Model::PROGS_ARMOR);
         self.entities[e].v.skin = skin;
         self.host
-            .set_size(e.0 as i32, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
+            .set_size(e, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
         self.start_item(e);
         true
     }
@@ -733,7 +733,7 @@ impl GameState {
         self.entities[e].set_touch(Touch::ItemWeapon);
         self.entities[e].netname = Some(spec.pickup_name.into());
         self.host
-            .set_size(e.0 as i32, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
+            .set_size(e, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
         self.start_item(e);
         true
     }
@@ -766,7 +766,7 @@ impl GameState {
             ent.netname = Some(netname.into());
         }
         self.host
-            .set_size(e.0 as i32, Vec3::ZERO, Vec3::new(32.0, 32.0, 56.0));
+            .set_size(e, Vec3::ZERO, Vec3::new(32.0, 32.0, 56.0));
         self.start_item(e);
         true
     }
@@ -790,7 +790,7 @@ impl GameState {
             ent.v.effects = ent.v.effects.with(effect);
         }
         self.host
-            .set_size(e.0 as i32, Vec3::new(-16.0, -16.0, -24.0), Vec3::new(16.0, 16.0, 32.0));
+            .set_size(e, Vec3::new(-16.0, -16.0, -24.0), Vec3::new(16.0, 16.0, 32.0));
         self.start_item(e);
         true
     }

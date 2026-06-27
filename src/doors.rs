@@ -181,10 +181,10 @@ impl GameState {
 
         if self.entities[owner].message.is_some() {
             if let Some(msg) = self.message_cstring(owner) {
-                self.host.centerprint(other.0 as i32, &msg);
+                self.host.centerprint(other, &msg);
             }
             self.host
-                .sound(other.0 as i32, Channel::Voice, Sound::MISC_TALK, 1.0, Attenuation::Norm);
+                .sound(other, Channel::Voice, Sound::MISC_TALK, 1.0, Attenuation::Norm);
         }
 
         let items = self.entities[e].v.items;
@@ -209,7 +209,7 @@ impl GameState {
                     _ => c"You need the gold key",
                 }
             };
-            self.host.centerprint(other.0 as i32, msg);
+            self.host.centerprint(other, msg);
             self.play_door(e, false, 3);
             return;
         }
@@ -236,7 +236,7 @@ impl GameState {
             trig.set_owner(master);
         }
         let margin = Vec3::new(60.0, 60.0, 8.0);
-        self.host.set_size(t.0 as i32, fmins - margin, fmaxs + margin);
+        self.host.set_size(t, fmins - margin, fmaxs + margin);
         t
     }
 
@@ -341,7 +341,7 @@ impl GameState {
             ent.v.movetype = MoveType::Push.as_f32();
         }
         let origin = self.entities[e].v.origin;
-        self.host.set_origin(e.0 as i32, origin);
+        self.host.set_origin(e, origin);
         self.set_brush_model(e);
         self.entities[e].classname = Some("door".into());
         self.entities[e].use_ = Use::DoorUse;
@@ -376,7 +376,7 @@ impl GameState {
 
         if self.entities[e].v.spawnflags.has(DoorFlags::START_OPEN) {
             let pos2 = self.entities[e].mover.pos2;
-            self.host.set_origin(e.0 as i32, pos2);
+            self.host.set_origin(e, pos2);
             let ent = &mut self.entities[e];
             ent.v.origin = pos2;
             ent.mover.pos2 = ent.mover.pos1;
@@ -444,11 +444,10 @@ impl GameState {
             _ => self.entities[e].noise4,
         };
         if let Some(noise) = noise {
-            let ent = e.0 as i32;
             if no_phs {
-                self.host.sound_no_phs(ent, Channel::Voice, noise, 1.0, Attenuation::Norm);
+                self.host.sound_no_phs(e, Channel::Voice, noise, 1.0, Attenuation::Norm);
             } else {
-                self.host.sound(ent, Channel::Voice, noise, 1.0, Attenuation::Norm);
+                self.host.sound(e, Channel::Voice, noise, 1.0, Attenuation::Norm);
             }
         }
     }

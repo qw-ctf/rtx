@@ -1,7 +1,8 @@
 //! The FFI boundary: safe Rust wrappers over the engine's `syscall` function pointer.
 //!
 //! This is the one module that performs `unsafe` FFI calls. Everything above it speaks
-//! ordinary Rust (`i32` entity indices, `f32`, `glam::Vec3`, `&CStr`). Floats are passed
+//! ordinary Rust ([`EntId`] handles, `f32`, `glam::Vec3`, `&CStr`); this layer does the
+//! index/bit juggling at the boundary (e.g. `ent.0 as isize`). Floats are passed
 //! to the variadic syscall as their IEEE-754 bit pattern, zero-extended to `isize`
 //! (matching ktx's `PASSFLOAT` union trick); the engine reads the low 32 bits back as a
 //! `float`.
@@ -11,6 +12,7 @@ use core::ffi::CStr;
 use glam::Vec3;
 
 use crate::assets::{Model, Sound};
+use crate::entity::EntId;
 use crate::defs::{Attenuation, Channel, MsgDest, Multicast, PrintLevel, Svc, Te};
 
 /// The host-provided dispatcher. Variadic, C ABI; calling it is `unsafe`.
@@ -168,11 +170,11 @@ impl HostApi {
     }
 
     /// `G_SPRINT` — print to a single client at `level`.
-    pub fn sprint(&self, ent: i32, level: PrintLevel, msg: &CStr) {
+    pub fn sprint(&self, ent: EntId, level: PrintLevel, msg: &CStr) {
         unsafe {
             (self.syscall)(
                 B::SPrint as isize,
-                ent as isize,
+                ent.0 as isize,
                 level.as_i32() as isize,
                 msg.as_ptr() as isize,
                 0,
@@ -225,32 +227,32 @@ impl HostApi {
     }
 
     /// `G_REMOVE_ENT` — free an entity by index.
-    pub fn remove(&self, ent: i32) {
-        unsafe { (self.syscall)(B::RemoveEnt as isize, ent as isize) };
+    pub fn remove(&self, ent: EntId) {
+        unsafe { (self.syscall)(B::RemoveEnt as isize, ent.0 as isize) };
     }
 
     /// `G_SETMODEL` — assign an external [`Model`] (also sets `modelindex`, `mins`/`maxs`). Takes
     /// a handle, which only comes from a precached source — so the model is provably precached.
-    pub fn set_model(&self, ent: i32, model: Model) {
+    pub fn set_model(&self, ent: EntId, model: Model) {
         self.set_model_raw(ent, model.path());
     }
 
     /// `G_SETMODEL` for an inline brush submodel (`*N`) supplied by the map. These are part of
     /// the level BSP and engine-managed (no precache), so they take a raw name, not a [`Model`].
-    pub fn set_model_brush(&self, ent: i32, name: &CStr) {
+    pub fn set_model_brush(&self, ent: EntId, name: &CStr) {
         self.set_model_raw(ent, name);
     }
 
-    fn set_model_raw(&self, ent: i32, model: &CStr) {
-        unsafe { (self.syscall)(B::SetModel as isize, ent as isize, model.as_ptr() as isize) };
+    fn set_model_raw(&self, ent: EntId, model: &CStr) {
+        unsafe { (self.syscall)(B::SetModel as isize, ent.0 as isize, model.as_ptr() as isize) };
     }
 
     /// `G_SETORIGIN` — move an entity and relink it.
-    pub fn set_origin(&self, ent: i32, origin: Vec3) {
+    pub fn set_origin(&self, ent: EntId, origin: Vec3) {
         unsafe {
             (self.syscall)(
                 B::SetOrigin as isize,
-                ent as isize,
+                ent.0 as isize,
                 pf(origin.x),
                 pf(origin.y),
                 pf(origin.z),
@@ -259,11 +261,11 @@ impl HostApi {
     }
 
     /// `G_SETSIZE` — set the bounding box and relink.
-    pub fn set_size(&self, ent: i32, min: Vec3, max: Vec3) {
+    pub fn set_size(&self, ent: EntId, min: Vec3, max: Vec3) {
         unsafe {
             (self.syscall)(
                 B::SetSize as isize,
-                ent as isize,
+                ent.0 as isize,
                 pf(min.x),
                 pf(min.y),
                 pf(min.z),
@@ -276,11 +278,11 @@ impl HostApi {
 
     /// `G_VISIBLETO` — fill `buf` (one byte per entity in `[first, first+count)`) with
     /// whether each is in `viewer`'s PVS. Returns the count visible.
-    pub fn visible_to(&self, viewer: i32, first: i32, count: i32, buf: &mut [u8]) -> i32 {
+    pub fn visible_to(&self, viewer: EntId, first: i32, count: i32, buf: &mut [u8]) -> i32 {
         unsafe {
             (self.syscall)(
                 B::VisibleTo as isize,
-                viewer as isize,
+                viewer.0 as isize,
                 first as isize,
                 count as isize,
                 buf.as_mut_ptr() as isize,
@@ -290,21 +292,21 @@ impl HostApi {
 
     /// `G_SOUND` — play `sample` from `ent` on `channel`. Takes a [`Sound`] handle, which can
     /// only come from a precached source — so playing an unprecached sound is unrepresentable.
-    pub fn sound(&self, ent: i32, channel: Channel, sample: Sound, volume: f32, attenuation: Attenuation) {
+    pub fn sound(&self, ent: EntId, channel: Channel, sample: Sound, volume: f32, attenuation: Attenuation) {
         self.sound_raw(ent, channel.as_i32(), sample.path(), volume, attenuation);
     }
 
     /// As [`sound`](Self::sound), but with the `CHAN_NO_PHS_ADD` modifier (channel bit 3) set so
     /// the sound bypasses the PHS cull — used for door/plat movement, audible through walls.
-    pub fn sound_no_phs(&self, ent: i32, channel: Channel, sample: Sound, volume: f32, attenuation: Attenuation) {
+    pub fn sound_no_phs(&self, ent: EntId, channel: Channel, sample: Sound, volume: f32, attenuation: Attenuation) {
         self.sound_raw(ent, channel.as_i32() | 8, sample.path(), volume, attenuation);
     }
 
-    fn sound_raw(&self, ent: i32, channel: i32, sample: &CStr, volume: f32, attenuation: Attenuation) {
+    fn sound_raw(&self, ent: EntId, channel: i32, sample: &CStr, volume: f32, attenuation: Attenuation) {
         unsafe {
             (self.syscall)(
                 B::Sound as isize,
-                ent as isize,
+                ent.0 as isize,
                 channel as isize,
                 sample.as_ptr() as isize,
                 pf(volume),
@@ -352,11 +354,11 @@ impl HostApi {
 
     /// `G_GETINFOKEY` — read a userinfo/serverinfo key into `buf`, returning the value
     /// as a borrowed `&str` (up to the first NUL, lossily decoded). `ent` 0 = serverinfo.
-    pub fn infokey<'b>(&self, ent: i32, key: &CStr, buf: &'b mut [u8]) -> &'b str {
+    pub fn infokey<'b>(&self, ent: EntId, key: &CStr, buf: &'b mut [u8]) -> &'b str {
         unsafe {
             (self.syscall)(
                 B::GetInfoKey as isize,
-                ent as isize,
+                ent.0 as isize,
                 key.as_ptr() as isize,
                 buf.as_mut_ptr() as isize,
                 buf.len() as isize,
@@ -367,7 +369,7 @@ impl HostApi {
 
     /// `G_TRACELINE` — trace a line, writing results into the engine globals (the caller
     /// reads `trace_*` afterwards). `nomonsters` follows QuakeC (`TRUE` skips monsters).
-    pub fn traceline(&self, start: Vec3, end: Vec3, nomonsters: bool, ignore: i32) {
+    pub fn traceline(&self, start: Vec3, end: Vec3, nomonsters: bool, ignore: EntId) {
         unsafe {
             (self.syscall)(
                 B::TraceLine as isize,
@@ -378,15 +380,15 @@ impl HostApi {
                 pf(end.y),
                 pf(end.z),
                 nomonsters as isize,
-                ignore as isize,
+                ignore.0 as isize,
             )
         };
     }
 
     /// `G_DROPTOFLOOR` — drop an entity straight down onto the floor; returns whether it
     /// landed on a valid surface.
-    pub fn droptofloor(&self, ent: i32) -> bool {
-        unsafe { (self.syscall)(B::DropToFloor as isize, ent as isize) != 0 }
+    pub fn droptofloor(&self, ent: EntId) -> bool {
+        unsafe { (self.syscall)(B::DropToFloor as isize, ent.0 as isize) != 0 }
     }
 
     /// `G_POINTCONTENTS` — the `Content` value at a point (compare via `Content::X.as_f32()`).
@@ -397,8 +399,8 @@ impl HostApi {
     }
 
     /// `G_CENTERPRINT` — center-screen message to one client.
-    pub fn centerprint(&self, ent: i32, msg: &CStr) {
-        unsafe { (self.syscall)(B::CenterPrint as isize, ent as isize, msg.as_ptr() as isize) };
+    pub fn centerprint(&self, ent: EntId, msg: &CStr) {
+        unsafe { (self.syscall)(B::CenterPrint as isize, ent.0 as isize, msg.as_ptr() as isize) };
     }
 
     /// `G_CHANGELEVEL` — request a map change.
@@ -407,23 +409,23 @@ impl HostApi {
     }
 
     /// `G_SETSPAWNPARAMS` — persist a client's spawn parameters.
-    pub fn set_spawn_params(&self, ent: i32) {
-        unsafe { (self.syscall)(B::SetSpawnParams as isize, ent as isize) };
+    pub fn set_spawn_params(&self, ent: EntId) {
+        unsafe { (self.syscall)(B::SetSpawnParams as isize, ent.0 as isize) };
     }
 
     /// `G_LOGFRAG` — record a frag for stats/MVD.
-    pub fn logfrag(&self, killer: i32, killee: i32) {
-        unsafe { (self.syscall)(B::LogFrag as isize, killer as isize, killee as isize) };
+    pub fn logfrag(&self, killer: EntId, killee: EntId) {
+        unsafe { (self.syscall)(B::LogFrag as isize, killer.0 as isize, killee.0 as isize) };
     }
 
     /// `G_STUFFCMD` — send a command to a client's console.
-    pub fn stuffcmd(&self, ent: i32, cmd: &CStr) {
-        unsafe { (self.syscall)(B::StuffCmd as isize, ent as isize, cmd.as_ptr() as isize, 0) };
+    pub fn stuffcmd(&self, ent: EntId, cmd: &CStr) {
+        unsafe { (self.syscall)(B::StuffCmd as isize, ent.0 as isize, cmd.as_ptr() as isize, 0) };
     }
 
     /// `G_MAKESTATIC` — turn an entity into a static (client-side only) entity and remove it.
-    pub fn makestatic(&self, ent: i32) {
-        unsafe { (self.syscall)(B::MakeStatic as isize, ent as isize) };
+    pub fn makestatic(&self, ent: EntId) {
+        unsafe { (self.syscall)(B::MakeStatic as isize, ent.0 as isize) };
     }
 
     /// `G_SETPAUSE`.
@@ -482,8 +484,8 @@ impl HostApi {
     pub fn write_string(&self, to: MsgDest, s: &CStr) {
         unsafe { (self.syscall)(B::WriteString as isize, to.as_i32() as isize, s.as_ptr() as isize) };
     }
-    pub fn write_entity(&self, to: MsgDest, ent: i32) {
-        unsafe { (self.syscall)(B::WriteEntity as isize, to.as_i32() as isize, ent as isize) };
+    pub fn write_entity(&self, to: MsgDest, ent: EntId) {
+        unsafe { (self.syscall)(B::WriteEntity as isize, to.as_i32() as isize, ent.0 as isize) };
     }
 
     /// Write a server-to-client opcode byte (`svc_*`).

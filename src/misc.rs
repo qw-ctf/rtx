@@ -49,7 +49,7 @@ impl GameState {
     /// A flame/torch/globe decoration: precache, show the model, attach ambient fire.
     pub(crate) fn spawn_flame(&mut self, e: EntId, model: Model, frame: f32, fire: bool) -> bool {
         self.entities[e].model_cstr = Some(model);
-        self.host.set_model(e.0 as i32, model);
+        self.host.set_model(e, model);
         self.entities[e].v.frame = frame;
         if fire {
             let origin = self.entities[e].v.origin;
@@ -146,8 +146,8 @@ impl GameState {
             ent.v.movetype = MoveType::None.as_f32();
         }
         self.entities[e].model_cstr = Some(model);
-        self.host.set_model(e.0 as i32, model);
-        self.host.set_size(e.0 as i32, Vec3::ZERO, size);
+        self.host.set_model(e, model);
+        self.host.set_size(e, Vec3::ZERO, size);
         {
             let ent = &mut self.entities[e];
             ent.v.health = 20.0;
@@ -155,7 +155,7 @@ impl GameState {
             ent.v.takedamage = TakeDamage::Aim.as_f32();
             ent.v.origin.z += 2.0;
         }
-        if !self.host.droptofloor(e.0 as i32) {
+        if !self.host.droptofloor(e) {
             // Left as-is if it can't settle; matches the QuakeC tolerance.
         }
         true

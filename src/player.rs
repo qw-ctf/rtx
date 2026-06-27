@@ -335,18 +335,18 @@ impl GameState {
         }
         if self.entities[self.damage_attacker].classname() == Some("teledeath") {
             self.host
-                .sound(e.0 as i32, Channel::Voice, Sound::PLAYER_TELEDTH1, 1.0, Attenuation::None);
+                .sound(e, Channel::Voice, Sound::PLAYER_TELEDTH1, 1.0, Attenuation::None);
             return;
         }
         if watertype.is(Content::Water) && waterlevel == 3.0 {
             self.death_bubbles(e, 1.0);
             let s = if self.random() > 0.5 { Sound::PLAYER_DROWN1 } else { Sound::PLAYER_DROWN2 };
-            self.host.sound(e.0 as i32, Channel::Voice, s, 1.0, Attenuation::Norm);
+            self.host.sound(e, Channel::Voice, s, 1.0, Attenuation::Norm);
             return;
         }
         if watertype.is(Content::Slime) || watertype.is(Content::Lava) {
             let s = if self.random() > 0.5 { Sound::PLAYER_LBURN1 } else { Sound::PLAYER_LBURN2 };
-            self.host.sound(e.0 as i32, Channel::Voice, s, 1.0, Attenuation::Norm);
+            self.host.sound(e, Channel::Voice, s, 1.0, Attenuation::Norm);
             return;
         }
         if pain_finished > time {
@@ -357,7 +357,7 @@ impl GameState {
         if axhitme == 1.0 {
             self.entities[e].combat.axhitme = 0.0;
             self.host
-                .sound(e.0 as i32, Channel::Voice, Sound::PLAYER_AXHIT1, 1.0, Attenuation::Norm);
+                .sound(e, Channel::Voice, Sound::PLAYER_AXHIT1, 1.0, Attenuation::Norm);
             return;
         }
         let rs = (self.random() * 5.0).round() as i32 + 1;
@@ -369,7 +369,7 @@ impl GameState {
             5 => Sound::PLAYER_PAIN5,
             _ => Sound::PLAYER_PAIN6,
         };
-        self.host.sound(e.0 as i32, Channel::Voice, noise, 1.0, Attenuation::Norm);
+        self.host.sound(e, Channel::Voice, noise, 1.0, Attenuation::Norm);
     }
 
     /// `DeathSound`.
@@ -377,7 +377,7 @@ impl GameState {
         if self.entities[e].v.waterlevel == 3.0 {
             self.death_bubbles(e, 5.0);
             self.host
-                .sound(e.0 as i32, Channel::Voice, Sound::PLAYER_H2ODEATH, 1.0, Attenuation::None);
+                .sound(e, Channel::Voice, Sound::PLAYER_H2ODEATH, 1.0, Attenuation::None);
             return;
         }
         let rs = (self.random() * 4.0).round() as i32 + 1;
@@ -388,7 +388,7 @@ impl GameState {
             4 => Sound::PLAYER_DEATH4,
             _ => Sound::PLAYER_DEATH5,
         };
-        self.host.sound(e.0 as i32, Channel::Voice, noise, 1.0, Attenuation::None);
+        self.host.sound(e, Channel::Voice, noise, 1.0, Attenuation::None);
     }
 
     /// `PlayerDie` (`th_die`) — drop loot, start the death animation or gib.
@@ -498,16 +498,16 @@ impl GameState {
             gib.v.frame = 0.0;
             gib.v.flags = 0.0;
         }
-        self.host.set_model(g.0 as i32, gibname);
-        self.host.set_size(g.0 as i32, Vec3::ZERO, Vec3::ZERO);
-        self.host.set_origin(g.0 as i32, origin);
+        self.host.set_model(g, gibname);
+        self.host.set_size(g, Vec3::ZERO, Vec3::ZERO);
+        self.host.set_origin(g, origin);
     }
 
     /// `ThrowHead` — turn the player entity itself into a flying head gib.
     fn throw_head(&mut self, e: EntId, gibname: Model, dm: f32) {
         let vel = self.velocity_for_damage(e, dm);
         let avel = self.rng_unit() * Vec3::new(0.0, 600.0, 0.0);
-        self.host.set_model(e.0 as i32, gibname);
+        self.host.set_model(e, gibname);
         {
             let ent = &mut self.entities[e];
             ent.v.frame = 0.0;
@@ -520,10 +520,10 @@ impl GameState {
             ent.v.flags = ent.v.flags.without(Flags::ONGROUND);
             ent.v.avelocity = avel;
         }
-        self.host.set_size(e.0 as i32, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
+        self.host.set_size(e, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
         let mut origin = self.entities[e].v.origin;
         origin.z -= 24.0;
-        self.host.set_origin(e.0 as i32, origin);
+        self.host.set_origin(e, origin);
         self.entities[e].v.origin = origin;
     }
 
@@ -537,11 +537,11 @@ impl GameState {
         self.entities[e].v.deadflag = DeadFlag::Dead.as_f32();
         if self.entities[self.damage_attacker].classname() == Some("teledeath") {
             self.host
-                .sound(e.0 as i32, Channel::Voice, Sound::PLAYER_TELEDTH1, 1.0, Attenuation::None);
+                .sound(e, Channel::Voice, Sound::PLAYER_TELEDTH1, 1.0, Attenuation::None);
             return;
         }
         let s = if self.random() < 0.5 { Sound::PLAYER_GIB } else { Sound::PLAYER_UDEATH };
-        self.host.sound(e.0 as i32, Channel::Voice, s, 1.0, Attenuation::None);
+        self.host.sound(e, Channel::Voice, s, 1.0, Attenuation::None);
     }
 
     /// A random value in `[-1, 1)` (QuakeC `crandom`).

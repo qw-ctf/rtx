@@ -77,7 +77,7 @@ impl GameState {
     /// `SUB_CalcMoveDone` — snap to the exact destination and fire `think1`.
     pub(crate) fn sub_calc_move_done(&mut self, e: EntId) {
         let dest = self.entities[e].mover.finaldest;
-        self.host.set_origin(e.0 as i32, dest);
+        self.host.set_origin(e, dest);
         {
             let ent = &mut self.entities[e];
             ent.v.origin = dest;
@@ -132,11 +132,11 @@ impl GameState {
         let has_message = self.entities[e].message.is_some();
         if has_message && self.entities[activator].classname() == Some("player") {
             if let Some(msg) = self.message_cstring(e) {
-                self.host.centerprint(activator.0 as i32, &msg);
+                self.host.centerprint(activator, &msg);
             }
             if self.entities[e].noise.is_none() {
                 self.host
-                    .sound(activator.0 as i32, Channel::Voice, Sound::MISC_TALK, 1.0, Attenuation::Norm);
+                    .sound(activator, Channel::Voice, Sound::MISC_TALK, 1.0, Attenuation::Norm);
             }
         }
 

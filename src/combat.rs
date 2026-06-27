@@ -145,7 +145,7 @@ impl GameState {
         if self.entities[targ].combat.invincible_finished >= time {
             if self.entities[targ].combat.invincible_sound < time {
                 self.host
-                    .sound(targ.0 as i32, Channel::Item, Sound::ITEMS_PROTECT3, 1.0, Attenuation::Norm);
+                    .sound(targ, Channel::Item, Sound::ITEMS_PROTECT3, 1.0, Attenuation::Norm);
                 self.entities[targ].combat.invincible_sound = time + 2.0;
             }
             return;
@@ -232,12 +232,12 @@ impl GameState {
             if targ == attacker {
                 self.entities[targ].v.frags -= 1.0;
                 self.broadcast(PrintLevel::Medium, &format!("{targ_name} suicides\n"));
-                self.host.logfrag(targ.0 as i32, targ.0 as i32);
+                self.host.logfrag(targ, targ);
                 return;
             }
             let attacker_name = self.netname_of(attacker);
             self.entities[attacker].v.frags += 1.0;
-            self.host.logfrag(attacker.0 as i32, targ.0 as i32);
+            self.host.logfrag(attacker, targ);
             self.broadcast(
                 PrintLevel::Medium,
                 &format!("{targ_name} was killed by {attacker_name}\n"),
@@ -247,7 +247,7 @@ impl GameState {
 
         // Environmental / world death.
         self.entities[targ].v.frags -= 1.0;
-        self.host.logfrag(targ.0 as i32, targ.0 as i32);
+        self.host.logfrag(targ, targ);
         self.broadcast(PrintLevel::Medium, &format!("{targ_name} died\n"));
     }
 
@@ -284,7 +284,7 @@ impl GameState {
     /// The "team" userinfo value for a client.
     fn team_of(&self, ent: EntId) -> String {
         let mut buf = [0u8; 32];
-        self.host.infokey(ent.0 as i32, c"team", &mut buf).to_owned()
+        self.host.infokey(ent, c"team", &mut buf).to_owned()
     }
 
     /// A display name for an entity (its stored netname, else its classname).

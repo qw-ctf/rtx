@@ -108,13 +108,13 @@ impl GameState {
                 } else {
                     c"Only 1 more to go..."
                 };
-                self.host.centerprint(activator.0 as i32, msg);
+                self.host.centerprint(activator, msg);
             }
             return;
         }
         if show {
             self.host
-                .centerprint(activator.0 as i32, c"Sequence completed!");
+                .centerprint(activator, c"Sequence completed!");
         }
         self.entities[e].set_enemy(activator);
         self.multi_trigger(e);
@@ -147,7 +147,7 @@ impl GameState {
             ent.v.takedamage = TakeDamage::Yes.as_f32();
             ent.v.solid = Solid::BBox.as_f32();
             let origin = ent.v.origin;
-            self.host.set_origin(e.0 as i32, origin);
+            self.host.set_origin(e, origin);
         } else if !self.entities[e].v.spawnflags.has(TriggerFlags::NOTOUCH) {
             self.entities[e].set_touch(Touch::Multi);
         }
@@ -210,7 +210,7 @@ impl GameState {
             3 => Sound::MISC_R_TELE4,
             _ => Sound::MISC_R_TELE5,
         };
-        self.host.sound(e.0 as i32, Channel::Voice, s, 1.0, Attenuation::Norm);
+        self.host.sound(e, Channel::Voice, s, 1.0, Attenuation::Norm);
         self.free(e);
     }
 
@@ -281,11 +281,11 @@ impl GameState {
             ent.set_owner(death_owner);
         }
         self.host.set_size(
-            d.0 as i32,
+            d,
             mins - Vec3::ONE,
             maxs + Vec3::ONE,
         );
-        self.host.set_origin(d.0 as i32, org);
+        self.host.set_origin(d, org);
         self.globals.force_retouch = 2.0;
     }
 
@@ -331,7 +331,7 @@ impl GameState {
         self.spawn_tfog(t_org + v_forward * 32.0);
         self.spawn_tdeath(t_org, other);
 
-        self.host.set_origin(other.0 as i32, t_org);
+        self.host.set_origin(other, t_org);
         {
             let o = &mut self.entities[other].v;
             o.origin = t_org;
@@ -435,7 +435,7 @@ impl GameState {
                 if self.entities[other].combat.fly_sound < time {
                     self.entities[other].combat.fly_sound = time + 1.5;
                     self.host
-                        .sound(other.0 as i32, Channel::Auto, Sound::AMBIENCE_WINDFLY, 1.0, Attenuation::Norm);
+                        .sound(other, Channel::Auto, Sound::AMBIENCE_WINDFLY, 1.0, Attenuation::Norm);
                 }
             }
         }

@@ -20,11 +20,10 @@ impl GameState {
             self.entities[e].noise1
         };
         if let Some(noise) = noise {
-            let ent = e.0 as i32;
             if no_phs {
-                self.host.sound_no_phs(ent, Channel::Voice, noise, 1.0, Attenuation::Norm);
+                self.host.sound_no_phs(e, Channel::Voice, noise, 1.0, Attenuation::Norm);
             } else {
-                self.host.sound(ent, Channel::Voice, noise, 1.0, Attenuation::Norm);
+                self.host.sound(e, Channel::Voice, noise, 1.0, Attenuation::Norm);
             }
         }
     }
@@ -138,7 +137,7 @@ impl GameState {
             tmin.y = (mins.y + maxs.y) / 2.0;
             tmax.y = tmin.y + 1.0;
         }
-        self.host.set_size(t.0 as i32, tmin, tmax);
+        self.host.set_size(t, tmin, tmax);
     }
 
     /// `func_plat` spawn.
@@ -175,13 +174,13 @@ impl GameState {
             ent.v.movetype = MoveType::Push.as_f32();
         }
         let origin = self.entities[e].v.origin;
-        self.host.set_origin(e.0 as i32, origin);
+        self.host.set_origin(e, origin);
         self.set_brush_model(e);
         let (mins, maxs) = {
             let v = &self.entities[e].v;
             (v.mins, v.maxs)
         };
-        self.host.set_size(e.0 as i32, mins, maxs);
+        self.host.set_size(e, mins, maxs);
 
         self.entities[e].set_blocked(Blocked::PlatBlocked);
         {
@@ -207,7 +206,7 @@ impl GameState {
             ent.use_ = Use::PlatUse;
         } else {
             let pos2 = self.entities[e].mover.pos2;
-            self.host.set_origin(e.0 as i32, pos2);
+            self.host.set_origin(e, pos2);
             let ent = &mut self.entities[e];
             ent.v.origin = pos2;
             ent.mover.state = STATE_BOTTOM;
@@ -292,7 +291,7 @@ impl GameState {
         };
         self.entities[e].target = next_target;
         let mins = self.entities[e].v.mins;
-        self.host.set_origin(e.0 as i32, targ_origin - mins);
+        self.host.set_origin(e, targ_origin - mins);
         self.entities[e].v.origin = targ_origin - mins;
         if self.entities[e].targetname.is_none() {
             let ltime = self.entities[e].v.ltime;
@@ -340,8 +339,8 @@ impl GameState {
             let v = &self.entities[e].v;
             (v.mins, v.maxs, v.origin)
         };
-        self.host.set_size(e.0 as i32, mins, maxs);
-        self.host.set_origin(e.0 as i32, origin);
+        self.host.set_size(e, mins, maxs);
+        self.host.set_origin(e, origin);
         let ltime = self.entities[e].v.ltime;
         let ent = &mut self.entities[e];
         ent.v.nextthink = ltime + 0.1;

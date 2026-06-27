@@ -12,7 +12,7 @@ pub fn worldspawn(game: &mut GameState) {
 
     // Custom map gravity (qw-qc special-cases e1m8).
     let mut buf = [0u8; 64];
-    let modelname = host.infokey(0, c"modelname", &mut buf);
+    let modelname = host.infokey(crate::entity::EntId::WORLD, c"modelname", &mut buf);
     // Strip "maps/" and ".bsp" to recover the bare map name.
     game.level.mapname = modelname
         .strip_prefix("maps/")

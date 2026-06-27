@@ -131,7 +131,7 @@ impl GameState {
     pub(crate) fn muzzleflash(&self, e: EntId) {
         let origin = self.entities[e].v.origin;
         self.host.write_svc(MsgDest::Multicast, Svc::MuzzleFlash);
-        self.host.write_entity(MsgDest::Multicast, e.0 as i32);
+        self.host.write_entity(MsgDest::Multicast, e);
         self.host.multicast(origin, Multicast::Pvs);
     }
 
@@ -142,7 +142,7 @@ impl GameState {
         if ent.combat.super_damage_finished > time && ent.combat.super_sound < time {
             self.entities[e].combat.super_sound = time + 1.0;
             self.host
-                .sound(e.0 as i32, Channel::Body, Sound::ITEMS_DAMAGE3, 1.0, Attenuation::Norm);
+                .sound(e, Channel::Body, Sound::ITEMS_DAMAGE3, 1.0, Attenuation::Norm);
         }
     }
 
@@ -188,7 +188,7 @@ impl GameState {
             self.t_damage(tr.ent, e, e, dmg);
         } else {
             self.host
-                .sound(e.0 as i32, Channel::Weapon, Sound::PLAYER_AXHIT2, 1.0, Attenuation::Norm);
+                .sound(e, Channel::Weapon, Sound::PLAYER_AXHIT2, 1.0, Attenuation::Norm);
             self.host.write_te(MsgDest::Multicast, Te::Gunshot);
             self.host.write_byte(MsgDest::Multicast, 3);
             self.write_coords(MsgDest::Multicast, org);
@@ -284,7 +284,7 @@ impl GameState {
     /// `W_FireShotgun`.
     fn w_fire_shotgun(&mut self, e: EntId) {
         self.host
-            .sound(e.0 as i32, Channel::Weapon, Sound::WEAPONS_GUNCOCK, 1.0, Attenuation::Norm);
+            .sound(e, Channel::Weapon, Sound::WEAPONS_GUNCOCK, 1.0, Attenuation::Norm);
         self.small_kick(e);
         if self.level.deathmatch != 4 {
             let ent = &mut self.entities[e];
@@ -302,7 +302,7 @@ impl GameState {
             return;
         }
         self.host
-            .sound(e.0 as i32, Channel::Weapon, Sound::WEAPONS_SHOTGN2, 1.0, Attenuation::Norm);
+            .sound(e, Channel::Weapon, Sound::WEAPONS_SHOTGN2, 1.0, Attenuation::Norm);
         self.big_kick(e);
         if self.level.deathmatch != 4 {
             let ent = &mut self.entities[e];
@@ -358,7 +358,7 @@ impl GameState {
             ent.v.currentammo = ent.v.ammo_rockets;
         }
         self.host
-            .sound(e.0 as i32, Channel::Weapon, Sound::WEAPONS_SGUN1, 1.0, Attenuation::Norm);
+            .sound(e, Channel::Weapon, Sound::WEAPONS_SGUN1, 1.0, Attenuation::Norm);
         self.small_kick(e);
 
         let origin = self.entities[e].v.origin;
@@ -379,10 +379,10 @@ impl GameState {
             mis.think = Think::SubRemove;
             mis.classname = Some("rocket".into());
         }
-        self.host.set_model(m.0 as i32, Model::PROGS_MISSILE);
-        self.host.set_size(m.0 as i32, Vec3::ZERO, Vec3::ZERO);
+        self.host.set_model(m, Model::PROGS_MISSILE);
+        self.host.set_size(m, Vec3::ZERO, Vec3::ZERO);
         self.host
-            .set_origin(m.0 as i32, origin + v_forward * 8.0 + Vec3::new(0.0, 0.0, 16.0));
+            .set_origin(m, origin + v_forward * 8.0 + Vec3::new(0.0, 0.0, 16.0));
     }
 
     // --- lightning ---
@@ -463,7 +463,7 @@ impl GameState {
 
         if self.entities[e].mover.t_width < time {
             self.host
-                .sound(e.0 as i32, Channel::Weapon, Sound::WEAPONS_LHIT, 1.0, Attenuation::Norm);
+                .sound(e, Channel::Weapon, Sound::WEAPONS_LHIT, 1.0, Attenuation::Norm);
             self.entities[e].mover.t_width = time + 0.6;
         }
         self.small_kick(e);
@@ -481,7 +481,7 @@ impl GameState {
         let endpos = tr.endpos;
 
         self.host.write_te(MsgDest::Multicast, Te::Lightning2);
-        self.host.write_entity(MsgDest::Multicast, e.0 as i32);
+        self.host.write_entity(MsgDest::Multicast, e);
         self.write_coords(MsgDest::Multicast, org);
         self.write_coords(MsgDest::Multicast, endpos);
         self.host.multicast(org, Multicast::Phs);
@@ -518,7 +518,7 @@ impl GameState {
             return;
         }
         self.host
-            .sound(e.0 as i32, Channel::Weapon, Sound::WEAPONS_BOUNCE, 1.0, Attenuation::Norm);
+            .sound(e, Channel::Weapon, Sound::WEAPONS_BOUNCE, 1.0, Attenuation::Norm);
         if self.entities[e].v.velocity == Vec3::ZERO {
             self.entities[e].v.avelocity = Vec3::ZERO;
         }
@@ -533,7 +533,7 @@ impl GameState {
             ent.v.currentammo = ent.v.ammo_rockets;
         }
         self.host
-            .sound(e.0 as i32, Channel::Weapon, Sound::WEAPONS_GRENADE, 1.0, Attenuation::Norm);
+            .sound(e, Channel::Weapon, Sound::WEAPONS_GRENADE, 1.0, Attenuation::Norm);
         self.small_kick(e);
 
         let (origin, v_angle) = {
@@ -576,14 +576,14 @@ impl GameState {
                 mis.th_die = Die::GrenadeExplode;
             }
         }
-        self.host.set_model(m.0 as i32, Model::PROGS_GRENADE);
+        self.host.set_model(m, Model::PROGS_GRENADE);
         if shootable {
             self.host
-                .set_size(m.0 as i32, SHOOTABLE_GRENADE_MINS, SHOOTABLE_GRENADE_MAXS);
+                .set_size(m, SHOOTABLE_GRENADE_MINS, SHOOTABLE_GRENADE_MAXS);
         } else {
-            self.host.set_size(m.0 as i32, Vec3::ZERO, Vec3::ZERO);
+            self.host.set_size(m, Vec3::ZERO, Vec3::ZERO);
         }
-        self.host.set_origin(m.0 as i32, origin);
+        self.host.set_origin(m, origin);
     }
 
     // --- nails (spikes) ---
@@ -605,9 +605,9 @@ impl GameState {
             mis.v.nextthink = time + 6.0;
             mis.v.velocity = dir * 1000.0;
         }
-        self.host.set_model(m.0 as i32, Model::PROGS_SPIKE);
-        self.host.set_size(m.0 as i32, Vec3::ZERO, Vec3::ZERO);
-        self.host.set_origin(m.0 as i32, org);
+        self.host.set_model(m, Model::PROGS_SPIKE);
+        self.host.set_size(m, Vec3::ZERO, Vec3::ZERO);
+        self.host.set_origin(m, org);
         m
     }
 
@@ -615,7 +615,7 @@ impl GameState {
     fn w_fire_super_spikes(&mut self, e: EntId) {
         let time = self.time();
         self.host
-            .sound(e.0 as i32, Channel::Weapon, Sound::WEAPONS_SPIKE2, 1.0, Attenuation::Norm);
+            .sound(e, Channel::Weapon, Sound::WEAPONS_SPIKE2, 1.0, Attenuation::Norm);
         self.entities[e].combat.attack_finished = time + 0.2;
         if self.level.deathmatch != 4 {
             let ent = &mut self.entities[e];
@@ -626,8 +626,8 @@ impl GameState {
         let org = self.entities[e].v.origin + Vec3::new(0.0, 0.0, 16.0);
         let m = self.launch_spike(e, org, dir);
         self.entities[m].set_touch(Touch::SuperSpike);
-        self.host.set_model(m.0 as i32, Model::PROGS_S_SPIKE);
-        self.host.set_size(m.0 as i32, Vec3::ZERO, Vec3::ZERO);
+        self.host.set_model(m, Model::PROGS_S_SPIKE);
+        self.host.set_size(m, Vec3::ZERO, Vec3::ZERO);
         self.small_kick(e);
     }
 
@@ -653,7 +653,7 @@ impl GameState {
             return;
         }
         self.host
-            .sound(e.0 as i32, Channel::Weapon, Sound::WEAPONS_ROCKET1I, 1.0, Attenuation::Norm);
+            .sound(e, Channel::Weapon, Sound::WEAPONS_ROCKET1I, 1.0, Attenuation::Norm);
         self.entities[e].combat.attack_finished = time + 0.2;
         if self.level.deathmatch != 4 {
             let ent = &mut self.entities[e];
@@ -775,7 +775,7 @@ impl GameState {
             w if w == Items::AXE => {
                 self.entities[e].combat.attack_finished = time + 0.5;
                 self.host
-                    .sound(e.0 as i32, Channel::Weapon, Sound::WEAPONS_AX1, 1.0, Attenuation::Norm);
+                    .sound(e, Channel::Weapon, Sound::WEAPONS_AX1, 1.0, Attenuation::Norm);
                 self.start_axe_anim(e);
             }
             w if w == Items::SHOTGUN => {
@@ -804,7 +804,7 @@ impl GameState {
             w if w == Items::LIGHTNING => {
                 self.entities[e].combat.attack_finished = time + 0.1;
                 self.host
-                    .sound(e.0 as i32, Channel::Auto, Sound::WEAPONS_LSTART, 1.0, Attenuation::Norm);
+                    .sound(e, Channel::Auto, Sound::WEAPONS_LSTART, 1.0, Attenuation::Norm);
                 self.start_light(e);
             }
             _ => {}
@@ -948,6 +948,6 @@ impl GameState {
 
     /// `sprint(self, PrintLevel::High, ...)` to a player.
     fn sprint_to(&self, e: EntId, msg: &CStr) {
-        self.host.sprint(e.0 as i32, PrintLevel::High, msg);
+        self.host.sprint(e, PrintLevel::High, msg);
     }
 }

@@ -13,7 +13,7 @@ impl GameState {
         }
         // Prefer a serverinfo `nextmap`, else replay the current level.
         let mut buf = [0u8; 64];
-        let nextmap = self.host.infokey(0, c"nextmap", &mut buf).to_owned();
+        let nextmap = self.host.infokey(EntId::WORLD, c"nextmap", &mut buf).to_owned();
         self.level.nextmap = if nextmap.is_empty() {
             self.level.mapname.clone()
         } else {

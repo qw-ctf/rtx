@@ -57,7 +57,7 @@ impl GameState {
                     let v = &self.entities[spot].v;
                     (v.origin, v.angles)
                 };
-                self.host.set_origin(e.0 as i32, origin);
+                self.host.set_origin(e, origin);
                 let ent = &mut self.entities[e];
                 ent.v.origin = origin;
                 ent.v.angles = angles;

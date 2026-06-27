@@ -310,7 +310,7 @@ impl GameState {
         // The traceline builtin takes the ignore entity as an edict *index* (it runs
         // `EdictNum(arg)`), unlike entvars `.entity` fields which store byte offsets.
         self.host
-            .traceline(start, end, nomonsters, ignore.0 as i32);
+            .traceline(start, end, nomonsters, ignore);
         let g = &self.globals;
         TraceResult {
             allsolid: g.trace_allsolid != 0.0,
@@ -333,7 +333,7 @@ impl GameState {
         self.entities[e].model_cs = Some(cstring(&m));
         let host = self.host;
         let ptr = self.entities[e].model_cs.as_deref().unwrap();
-        host.set_model_brush(e.0 as i32, ptr);
+        host.set_model_brush(e, ptr);
     }
 
     /// The entity's `message` string as an owned `CString`, for `centerprint`.
@@ -345,7 +345,7 @@ impl GameState {
     pub(crate) fn play_noise(&self, e: EntId, chan: defs::Channel) {
         if let Some(noise) = self.entities[e].noise {
             self.host
-                .sound(e.0 as i32, chan, noise, 1.0, defs::Attenuation::Norm);
+                .sound(e, chan, noise, 1.0, defs::Attenuation::Norm);
         }
     }
 
@@ -732,7 +732,7 @@ impl GameState {
     /// Free an entity slot, both on our side and in the engine.
     pub(crate) fn free(&mut self, id: EntId) {
         self.entities[id].in_use = false;
-        self.host.remove(id.0 as i32);
+        self.host.remove(id);
     }
 
     // --- entity access (index handles only; no references escape) ---

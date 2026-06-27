@@ -128,7 +128,7 @@ impl GameState {
         let message = format!("{name} left the game with {frags} frags\n");
         self.broadcast(PrintLevel::High, &message);
         self.host
-            .sound(player.0 as i32, Channel::Body, Sound::PLAYER_TORNOFF2, 1.0, Attenuation::None);
+            .sound(player, Channel::Body, Sound::PLAYER_TORNOFF2, 1.0, Attenuation::None);
     }
 
     /// `SetNewParms` — default spawn parameters for a fresh player.
@@ -205,13 +205,13 @@ impl GameState {
         // internal links — this is what makes the player visible/collidable to others).
         // The "eyes" model is set first purely to capture its modelindex (QuakeC's hack for
         // the Ring of Shadows), then the real player model.
-        self.host.set_model(player.0 as i32, Model::PROGS_EYES);
+        self.host.set_model(player, Model::PROGS_EYES);
         self.level.modelindex_eyes = self.entities[player].v.modelindex;
-        self.host.set_model(player.0 as i32, Model::PROGS_PLAYER);
+        self.host.set_model(player, Model::PROGS_PLAYER);
         self.level.modelindex_player = self.entities[player].v.modelindex;
         self.host
-            .set_size(player.0 as i32, VEC_HULL_MIN, VEC_HULL_MAX);
-        self.host.set_origin(player.0 as i32, origin);
+            .set_size(player, VEC_HULL_MIN, VEC_HULL_MAX);
+        self.host.set_origin(player, origin);
 
         // Telefrag anyone already standing here, then kick off the idle animation loop.
         self.spawn_tdeath(origin, player);
@@ -289,15 +289,15 @@ impl GameState {
         if jump_flag < -300.0 && on_ground {
             if watertype.is(Content::Water) {
                 self.host
-                    .sound(e.0 as i32, Channel::Body, Sound::PLAYER_H2OJUMP, 1.0, Attenuation::Norm);
+                    .sound(e, Channel::Body, Sound::PLAYER_H2OJUMP, 1.0, Attenuation::Norm);
             } else if jump_flag < -650.0 {
                 self.entities[e].deathtype = Some("falling".into());
                 self.t_damage(e, EntId::WORLD, EntId::WORLD, 5.0);
                 self.host
-                    .sound(e.0 as i32, Channel::Voice, Sound::PLAYER_LAND2, 1.0, Attenuation::Norm);
+                    .sound(e, Channel::Voice, Sound::PLAYER_LAND2, 1.0, Attenuation::Norm);
             } else {
                 self.host
-                    .sound(e.0 as i32, Channel::Voice, Sound::PLAYER_LAND, 1.0, Attenuation::Norm);
+                    .sound(e, Channel::Voice, Sound::PLAYER_LAND, 1.0, Attenuation::Norm);
             }
         }
         self.entities[e].combat.jump_flag = self.entities[e].v.velocity.z;
@@ -326,7 +326,7 @@ impl GameState {
         self.broadcast(PrintLevel::Medium, &format!("{name} suicides\n"));
         self.set_suicide_frame(e);
         self.entities[e].v.modelindex = self.level.modelindex_player;
-        self.host.logfrag(e.0 as i32, e.0 as i32);
+        self.host.logfrag(e, e);
         self.entities[e].v.frags -= 2.0;
         self.respawn(e);
     }
@@ -402,7 +402,7 @@ impl GameState {
             if swim_flag < time {
                 self.entities[e].combat.swim_flag = time + 1.0;
                 let s = if self.random() < 0.5 { Sound::MISC_WATER1 } else { Sound::MISC_WATER2 };
-                self.host.sound(e.0 as i32, Channel::Body, s, 1.0, Attenuation::Norm);
+                self.host.sound(e, Channel::Body, s, 1.0, Attenuation::Norm);
             }
             return;
         }
@@ -441,7 +441,7 @@ impl GameState {
             v.button2 = 0.0;
         }
         self.host
-            .sound(e.0 as i32, Channel::Body, Sound::PLAYER_PLYRJMP8, 1.0, Attenuation::Norm);
+            .sound(e, Channel::Body, Sound::PLAYER_PLYRJMP8, 1.0, Attenuation::Norm);
     }
 
     /// The upward speed of the rising `MoveType::Push` lift the player is standing on, or `0`.
@@ -589,10 +589,10 @@ impl GameState {
         if waterlevel != 3.0 {
             if air_finished < time {
                 self.host
-                    .sound(e.0 as i32, Channel::Voice, Sound::PLAYER_GASP2, 1.0, Attenuation::Norm);
+                    .sound(e, Channel::Voice, Sound::PLAYER_GASP2, 1.0, Attenuation::Norm);
             } else if air_finished < time + 9.0 {
                 self.host
-                    .sound(e.0 as i32, Channel::Voice, Sound::PLAYER_GASP1, 1.0, Attenuation::Norm);
+                    .sound(e, Channel::Voice, Sound::PLAYER_GASP1, 1.0, Attenuation::Norm);
             }
             let ent = &mut self.entities[e];
             ent.combat.air_finished = time + 12.0;
@@ -611,7 +611,7 @@ impl GameState {
         if waterlevel == 0.0 {
             if self.entities[e].v.flags.has(Flags::INWATER) {
                 self.host
-                    .sound(e.0 as i32, Channel::Body, Sound::MISC_OUTWATER, 1.0, Attenuation::Norm);
+                    .sound(e, Channel::Body, Sound::MISC_OUTWATER, 1.0, Attenuation::Norm);
                 let ent = &mut self.entities[e];
                 ent.v.flags = ent.v.flags.without(Flags::INWATER);
             }
@@ -639,7 +639,7 @@ impl GameState {
                 _ => None,
             };
             if let Some(s) = s {
-                self.host.sound(e.0 as i32, Channel::Body, s, 1.0, Attenuation::Norm);
+                self.host.sound(e, Channel::Body, s, 1.0, Attenuation::Norm);
             }
             let ent = &mut self.entities[e];
             ent.v.flags = ent.v.flags.with(Flags::INWATER);
@@ -658,7 +658,7 @@ impl GameState {
         if self.entities[e].combat.invisible_finished != 0.0 {
             if self.entities[e].combat.invisible_sound < time {
                 self.host
-                    .sound(e.0 as i32, Channel::Auto, Sound::ITEMS_INV3, 0.5, Attenuation::Idle);
+                    .sound(e, Channel::Auto, Sound::ITEMS_INV3, 0.5, Attenuation::Idle);
                 let r = (self.random() * 3.0) + 1.0;
                 self.entities[e].combat.invisible_sound = time + r;
             }
@@ -760,13 +760,13 @@ impl GameState {
             PowerupKind::Biosuit => self.entities[e].combat.rad_time,
         };
         if latch == 1.0 {
-            self.host.sprint(e.0 as i32, PrintLevel::High, msg);
-            self.host.stuffcmd(e.0 as i32, c"bf\n");
-            self.host.sound(e.0 as i32, Channel::Auto, sound, 1.0, Attenuation::Norm);
+            self.host.sprint(e, PrintLevel::High, msg);
+            self.host.stuffcmd(e, c"bf\n");
+            self.host.sound(e, Channel::Auto, sound, 1.0, Attenuation::Norm);
             self.set_powerup_time(e, kind, time + 1.0);
         } else if latch < time {
             self.set_powerup_time(e, kind, time + 1.0);
-            self.host.stuffcmd(e.0 as i32, c"bf\n");
+            self.host.stuffcmd(e, c"bf\n");
         }
     }
 
@@ -847,7 +847,7 @@ impl GameState {
     pub(crate) fn read_netname(&self, player: EntId) -> String {
         let mut buf = [0u8; 64];
         self.host
-            .infokey(player.0 as i32, c"name", &mut buf)
+            .infokey(player, c"name", &mut buf)
             .to_owned()
     }
 
