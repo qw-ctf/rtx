@@ -81,6 +81,12 @@ impl GameState {
         if self.entities[targ].v.takedamage == 0.0 {
             return;
         }
+        if self.is_grenade(targ) {
+            if self.is_live_shootable_grenade(targ) {
+                self.grenade_explode(targ);
+            }
+            return;
+        }
 
         let time = self.time();
         self.damage_attacker = attacker;

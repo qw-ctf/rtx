@@ -152,6 +152,7 @@ impl GameState {
         match self.entities[e].th_die {
             None => {}
             Player => self.player_die(e),
+            GrenadeExplode => self.grenade_explode(e),
             TriggerKilled => self.multi_killed(e),
             ButtonKilled => self.button_killed(e),
             DoorKilled => self.door_killed(e),

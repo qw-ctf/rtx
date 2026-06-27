@@ -194,6 +194,7 @@ pub enum Die {
     #[default]
     None,
     Player,
+    GrenadeExplode,
     DoorKilled,
     ButtonKilled,
     TriggerKilled,

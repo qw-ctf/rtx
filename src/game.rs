@@ -382,6 +382,11 @@ impl GameState {
         self.host
             .cvar_set_float(cstr(b"rtx_walljump\0"), 1.0);
 
+        // Shoot live grenades to detonate them early, on by default (`rtx_shootable_grenades 0`
+        // to restore classic non-shootable grenades).
+        self.host
+            .cvar_set_float(cstr(b"rtx_shootable_grenades\0"), 1.0);
+
         self.host.dprint(cstr(b"rtx: QuakeWorld game module loaded\0"));
 
         // `self.game_data` lives inside the OnceLock-pinned GameState, so its address is

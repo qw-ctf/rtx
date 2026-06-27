@@ -9,13 +9,17 @@ use core::ffi::CStr;
 use glam::Vec3;
 
 use crate::defs::*;
-use crate::entity::{EntId, Think, Touch};
+use crate::entity::{Die, EntId, Think, Touch};
 use crate::game::GameState;
 
 /// QuakeC `crandom` — a float in `[-1, 1)`.
 fn crandom(game: &mut GameState) -> f32 {
     2.0 * (game.random() - 0.5)
 }
+
+const SHOOTABLE_GRENADE_HIT_RADIUS: f32 = 8.0;
+const SHOOTABLE_GRENADE_MINS: Vec3 = Vec3::splat(-4.0);
+const SHOOTABLE_GRENADE_MAXS: Vec3 = Vec3::splat(4.0);
 
 /// `vectoangles` — convert a direction to `(pitch, yaw, 0)` Euler angles (degrees).
 pub(crate) fn vectoangles(v: Vec3) -> Vec3 {
@@ -36,6 +40,84 @@ pub(crate) fn vectoangles(v: Vec3) -> Vec3 {
 }
 
 impl GameState {
+    fn shootable_grenades_enabled(&self) -> bool {
+        self.host.cvar(c"rtx_shootable_grenades") != 0.0
+    }
+
+    pub(crate) fn is_grenade(&self, e: EntId) -> bool {
+        self.entities[e].classname() == Some("grenade")
+    }
+
+    pub(crate) fn is_live_shootable_grenade(&self, e: EntId) -> bool {
+        self.shootable_grenades_enabled()
+            && self.is_grenade(e)
+            && self.entities[e].in_use
+            && self.entities[e].combat.voided == 0.0
+    }
+
+    pub(crate) fn try_detonate_shootable_grenade(&mut self, e: EntId) -> bool {
+        if !self.is_live_shootable_grenade(e) {
+            return false;
+        }
+        self.grenade_explode(e);
+        true
+    }
+
+    fn shootable_grenade_on_line(
+        &self,
+        start: Vec3,
+        end: Vec3,
+        max_fraction: f32,
+    ) -> Option<EntId> {
+        // Engine traces can skip entities owned by the ignored player. Grenades keep their
+        // owner for collision filtering and damage credit, so hitscan weapons need this
+        // explicit line check to support shooting your own grenade.
+        let dir = end - start;
+        let len2 = dir.length_squared();
+        if len2 == 0.0 {
+            return None;
+        }
+
+        let mut best = max_fraction;
+        let mut hit = None;
+        for (i, ent) in self.entities.iter().enumerate() {
+            if ent.classname() != Some("grenade")
+                || !ent.in_use
+                || ent.combat.voided != 0.0
+            {
+                continue;
+            }
+            let t = (ent.v.origin - start).dot(dir) / len2;
+            if !(0.0..best).contains(&t) {
+                continue;
+            }
+            let closest = start + dir * t;
+            if (ent.v.origin - closest).length_squared()
+                <= SHOOTABLE_GRENADE_HIT_RADIUS * SHOOTABLE_GRENADE_HIT_RADIUS
+            {
+                best = t;
+                hit = Some(EntId(i as u32));
+            }
+        }
+        hit
+    }
+
+    fn try_detonate_shootable_grenade_on_line(
+        &mut self,
+        start: Vec3,
+        end: Vec3,
+        max_fraction: f32,
+    ) -> bool {
+        if !self.shootable_grenades_enabled() {
+            return false;
+        }
+        let Some(grenade) = self.shootable_grenade_on_line(start, end, max_fraction) else {
+            return false;
+        };
+        self.grenade_explode(grenade);
+        true
+    }
+
     /// `aim` — autoaim direction. QW deathmatch effectively disables vertical autoaim, so we
     /// return straight-ahead `v_forward` (after refreshing the angle vectors).
     fn aim_dir(&mut self, e: EntId) -> Vec3 {
@@ -86,11 +168,18 @@ impl GameState {
         self.host.make_vectors(v_angle);
         let v_forward = self.globals.v_forward;
         let source = self.entities[e].v.origin + Vec3::new(0.0, 0.0, 16.0);
-        let tr = self.traceline(source, source + v_forward * 64.0, false, e);
+        let end = source + v_forward * 64.0;
+        let tr = self.traceline(source, end, false, e);
+        if self.try_detonate_shootable_grenade_on_line(source, end, tr.fraction) {
+            return;
+        }
         if tr.fraction == 1.0 {
             return;
         }
         let org = tr.endpos - v_forward * 4.0;
+        if self.try_detonate_shootable_grenade(tr.ent) {
+            return;
+        }
         if self.entities[tr.ent].v.takedamage != 0.0 {
             self.entities[tr.ent].combat.axhitme = 1.0;
             self.spawn_blood(org, 20);
@@ -124,7 +213,14 @@ impl GameState {
         let mut src = origin + v_forward * 10.0;
         src.z = absmin_z + size_z * 0.7;
 
-        let tr0 = self.traceline(src, src + dir * 2048.0, false, e);
+        let center_end = src + dir * 2048.0;
+        let tr0 = self.traceline(src, center_end, false, e);
+        if self.try_detonate_shootable_grenade_on_line(src, center_end, tr0.fraction) {
+            return;
+        }
+        if self.try_detonate_shootable_grenade(tr0.ent) {
+            return;
+        }
         let puff_org = tr0.endpos - dir * 4.0;
         let mut puff_count = 0;
         let mut blood_count = 0;
@@ -137,11 +233,18 @@ impl GameState {
         for _ in 0..shotcount {
             let direction =
                 dir + crandom(self) * spread.x * v_right + crandom(self) * spread.y * v_up;
-            let tr = self.traceline(src, src + direction * 2048.0, false, e);
+            let end = src + direction * 2048.0;
+            let tr = self.traceline(src, end, false, e);
+            if self.try_detonate_shootable_grenade_on_line(src, end, tr.fraction) {
+                continue;
+            }
             if tr.fraction == 1.0 {
                 continue;
             }
             let org = tr.endpos - direction * 4.0;
+            if self.try_detonate_shootable_grenade(tr.ent) {
+                continue;
+            }
             if self.entities[tr.ent].v.takedamage != 0.0 {
                 blood_count += 1;
                 blood_org = org;
@@ -229,7 +332,9 @@ impl GameState {
 
         let owner = self.entities[e].owner();
         let damg = 100.0 + self.random() * 20.0;
-        if self.entities[other].v.health != 0.0 {
+        if self.try_detonate_shootable_grenade(other) {
+            // The rocket still explodes below; the grenade detonation keeps its own owner credit.
+        } else if self.entities[other].v.health != 0.0 {
             self.entities[other].deathtype = Some("rocket".into());
             self.t_damage(other, e, owner, damg);
         }
@@ -297,18 +402,40 @@ impl GameState {
 
         let tr = self.traceline(p1, p2, false, from);
         let e1 = tr.ent;
+        if self.try_detonate_shootable_grenade_on_line(p1, p2, tr.fraction) {
+            return;
+        }
+        if self.try_detonate_shootable_grenade(e1) {
+            return;
+        }
         if self.entities[e1].v.takedamage != 0.0 {
             self.lightning_hit(from, damage);
         }
 
-        let tr = self.traceline(p1 + f, p2 + f, false, from);
+        let start = p1 + f;
+        let end = p2 + f;
+        let tr = self.traceline(start, end, false, from);
         let e2 = tr.ent;
+        if self.try_detonate_shootable_grenade_on_line(start, end, tr.fraction) {
+            return;
+        }
+        if self.try_detonate_shootable_grenade(e2) {
+            return;
+        }
         if e2 != e1 && self.entities[e2].v.takedamage != 0.0 {
             self.lightning_hit(from, damage);
         }
 
-        let tr = self.traceline(p1 - f, p2 - f, false, from);
+        let start = p1 - f;
+        let end = p2 - f;
+        let tr = self.traceline(start, end, false, from);
         let e3 = tr.ent;
+        if self.try_detonate_shootable_grenade_on_line(start, end, tr.fraction) {
+            return;
+        }
+        if self.try_detonate_shootable_grenade(e3) {
+            return;
+        }
         if e3 != e1 && e3 != e2 && self.entities[e3].v.takedamage != 0.0 {
             self.lightning_hit(from, damage);
         }
@@ -417,6 +544,7 @@ impl GameState {
         let v_right = self.globals.v_right;
         let v_up = self.globals.v_up;
 
+        let shootable = self.shootable_grenades_enabled();
         let m = self.spawn();
         let velocity = if v_angle.x != 0.0 {
             v_forward * 600.0
@@ -441,9 +569,19 @@ impl GameState {
             mis.set_touch(Touch::Grenade);
             mis.v.nextthink = time + 2.5;
             mis.think = Think::GrenadeExplode;
+            if shootable {
+                mis.v.takedamage = TakeDamage::Aim.as_f32();
+                mis.v.health = 1.0;
+                mis.th_die = Die::GrenadeExplode;
+            }
         }
         self.host.set_model(m.0 as i32, c"progs/grenade.mdl");
-        self.host.set_size(m.0 as i32, Vec3::ZERO, Vec3::ZERO);
+        if shootable {
+            self.host
+                .set_size(m.0 as i32, SHOOTABLE_GRENADE_MINS, SHOOTABLE_GRENADE_MAXS);
+        } else {
+            self.host.set_size(m.0 as i32, Vec3::ZERO, Vec3::ZERO);
+        }
         self.host.set_origin(m.0 as i32, origin);
     }
 
@@ -553,6 +691,10 @@ impl GameState {
         };
 
         if self.entities[other].v.takedamage != 0.0 {
+            if self.try_detonate_shootable_grenade(other) {
+                self.free(e);
+                return;
+            }
             self.spawn_touchblood(e, damage);
             self.entities[other].deathtype = Some(dtype.into());
             self.t_damage(other, e, owner, damage);
