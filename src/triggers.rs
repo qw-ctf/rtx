@@ -308,7 +308,7 @@ impl GameState {
         }
         {
             let v = &self.entities[other].v;
-            if v.health <= 0.0 || v.solid != Solid::SlideBox.as_f32() {
+            if v.health <= 0.0 || !v.solid.is(Solid::SlideBox) {
                 return;
             }
         }

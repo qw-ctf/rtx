@@ -197,7 +197,7 @@ impl GameState {
             // Missing key: nag and bail.
             let owner_items = self.entities[owner].v.items;
             let wt = self.level.worldtype;
-            let msg = if owner_items == Items::KEY1.as_f32() {
+            let msg = if owner_items.is(Items::KEY1) {
                 match wt as i32 {
                     2 => c"You need the silver keycard",
                     1 => c"You need the silver runekey",

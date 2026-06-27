@@ -234,7 +234,7 @@ impl GameState {
 
         if self.weapon_code(new) <= w_switch {
             let in_water = self.entities[other].v.flags.has(Flags::INWATER);
-            if !in_water || new != Items::LIGHTNING.as_f32() {
+            if !in_water || !new.is(Items::LIGHTNING) {
                 self.deathmatch_weapon(other, new);
             }
         }
@@ -393,7 +393,7 @@ impl GameState {
         let _ = best;
         if self.weapon_code(new) <= b_switch {
             let in_water = self.entities[other].v.flags.has(Flags::INWATER);
-            if !in_water || new != Items::LIGHTNING.as_f32() {
+            if !in_water || !new.is(Items::LIGHTNING) {
                 self.deathmatch_weapon(other, new);
             }
         }
@@ -410,14 +410,14 @@ impl GameState {
             return;
         }
         let netname = match weapon {
-            w if w == Items::AXE.as_f32() => "Axe",
-            w if w == Items::SHOTGUN.as_f32() => "Shotgun",
-            w if w == Items::SUPER_SHOTGUN.as_f32() => "Double-barrelled Shotgun",
-            w if w == Items::NAILGUN.as_f32() => "Nailgun",
-            w if w == Items::SUPER_NAILGUN.as_f32() => "Super Nailgun",
-            w if w == Items::GRENADE_LAUNCHER.as_f32() => "Grenade Launcher",
-            w if w == Items::ROCKET_LAUNCHER.as_f32() => "Rocket Launcher",
-            w if w == Items::LIGHTNING.as_f32() => "Thunderbolt",
+            w if w.is(Items::AXE) => "Axe",
+            w if w.is(Items::SHOTGUN) => "Shotgun",
+            w if w.is(Items::SUPER_SHOTGUN) => "Double-barrelled Shotgun",
+            w if w.is(Items::NAILGUN) => "Nailgun",
+            w if w.is(Items::SUPER_NAILGUN) => "Super Nailgun",
+            w if w.is(Items::GRENADE_LAUNCHER) => "Grenade Launcher",
+            w if w.is(Items::ROCKET_LAUNCHER) => "Rocket Launcher",
+            w if w.is(Items::LIGHTNING) => "Thunderbolt",
             _ => "",
         };
         let vx = -100.0 + self.random() * 200.0;
@@ -479,12 +479,12 @@ impl GameState {
     /// `RankForWeapon` (lower is better).
     fn rank_for_weapon(&self, w: f32) -> i32 {
         match w {
-            x if x == Items::LIGHTNING.as_f32() => 1,
-            x if x == Items::ROCKET_LAUNCHER.as_f32() => 2,
-            x if x == Items::SUPER_NAILGUN.as_f32() => 3,
-            x if x == Items::GRENADE_LAUNCHER.as_f32() => 4,
-            x if x == Items::SUPER_SHOTGUN.as_f32() => 5,
-            x if x == Items::NAILGUN.as_f32() => 6,
+            x if x.is(Items::LIGHTNING) => 1,
+            x if x.is(Items::ROCKET_LAUNCHER) => 2,
+            x if x.is(Items::SUPER_NAILGUN) => 3,
+            x if x.is(Items::GRENADE_LAUNCHER) => 4,
+            x if x.is(Items::SUPER_SHOTGUN) => 5,
+            x if x.is(Items::NAILGUN) => 6,
             _ => 7,
         }
     }
@@ -492,12 +492,12 @@ impl GameState {
     /// `WeaponCode` — the `w_switch`/`b_switch` index of a weapon.
     fn weapon_code(&self, w: f32) -> f32 {
         match w {
-            x if x == Items::SUPER_SHOTGUN.as_f32() => 3.0,
-            x if x == Items::NAILGUN.as_f32() => 4.0,
-            x if x == Items::SUPER_NAILGUN.as_f32() => 5.0,
-            x if x == Items::GRENADE_LAUNCHER.as_f32() => 6.0,
-            x if x == Items::ROCKET_LAUNCHER.as_f32() => 7.0,
-            x if x == Items::LIGHTNING.as_f32() => 8.0,
+            x if x.is(Items::SUPER_SHOTGUN) => 3.0,
+            x if x.is(Items::NAILGUN) => 4.0,
+            x if x.is(Items::SUPER_NAILGUN) => 5.0,
+            x if x.is(Items::GRENADE_LAUNCHER) => 6.0,
+            x if x.is(Items::ROCKET_LAUNCHER) => 7.0,
+            x if x.is(Items::LIGHTNING) => 8.0,
             _ => 1.0,
         }
     }

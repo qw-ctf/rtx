@@ -102,7 +102,7 @@ impl GameState {
         }
 
         let ent = &mut self.entities[e];
-        let anim = if ent.v.weapon == Items::AXE.as_f32() { AXSTND } else { STAND };
+        let anim = if ent.v.weapon.is(Items::AXE) { AXSTND } else { STAND };
         if ent.walkframe >= anim.len {
             ent.walkframe = 0;
         }
@@ -126,7 +126,7 @@ impl GameState {
         }
 
         let ent = &mut self.entities[e];
-        let anim = if ent.v.weapon == Items::AXE.as_f32() { AXRUN } else { ROCKRUN };
+        let anim = if ent.v.weapon.is(Items::AXE) { AXRUN } else { ROCKRUN };
         if ent.walkframe >= anim.len {
             ent.walkframe = 0;
         }
@@ -319,7 +319,7 @@ impl GameState {
         }
         self.entities[e].v.weaponframe = 0.0;
         self.pain_sound(e);
-        let anim = if weapon == Items::AXE.as_f32() { AXPAIN } else { PAIN };
+        let anim = if weapon.is(Items::AXE) { AXPAIN } else { PAIN };
         self.start_body_anim(e, anim, Think::PlayerRun);
     }
 
@@ -338,13 +338,13 @@ impl GameState {
                 .sound(e.0 as i32, Channel::Voice, c"player/teledth1.wav", 1.0, Attenuation::None);
             return;
         }
-        if watertype == Content::Water.as_f32() && waterlevel == 3.0 {
+        if watertype.is(Content::Water) && waterlevel == 3.0 {
             self.death_bubbles(e, 1.0);
             let s = if self.random() > 0.5 { c"player/drown1.wav" } else { c"player/drown2.wav" };
             self.host.sound(e.0 as i32, Channel::Voice, s, 1.0, Attenuation::Norm);
             return;
         }
-        if watertype == Content::Slime.as_f32() || watertype == Content::Lava.as_f32() {
+        if watertype.is(Content::Slime) || watertype.is(Content::Lava) {
             let s = if self.random() > 0.5 { c"player/lburn1.wav" } else { c"player/lburn2.wav" };
             self.host.sound(e.0 as i32, Channel::Voice, s, 1.0, Attenuation::Norm);
             return;
@@ -428,7 +428,7 @@ impl GameState {
             ent.v.angles.x = 0.0;
             ent.v.angles.z = 0.0;
         }
-        if self.entities[e].v.weapon == Items::AXE.as_f32() {
+        if self.entities[e].v.weapon.is(Items::AXE) {
             self.start_body_anim(e, AXDETH, Think::PlayerDead);
             return;
         }

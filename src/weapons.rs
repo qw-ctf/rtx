@@ -222,7 +222,7 @@ impl GameState {
         self.entities[e].voided = 1.0;
 
         let origin = self.entities[e].v.origin;
-        if self.host.pointcontents(origin) == Content::Sky.as_f32() {
+        if self.host.pointcontents(origin).is(Content::Sky) {
             self.free(e);
             return;
         }
@@ -385,7 +385,7 @@ impl GameState {
         if other == self.entities[e].owner() {
             return;
         }
-        if self.entities[other].v.takedamage == TakeDamage::Aim.as_f32() {
+        if self.entities[other].v.takedamage.is(TakeDamage::Aim) {
             self.grenade_explode(e);
             return;
         }
@@ -503,7 +503,7 @@ impl GameState {
             let v = &self.entities[e].v;
             (v.ammo_nails, v.weapon)
         };
-        if ammo_nails >= 2.0 && weapon == Items::SUPER_NAILGUN.as_f32() {
+        if ammo_nails >= 2.0 && weapon.is(Items::SUPER_NAILGUN) {
             self.w_fire_super_spikes(e);
             return;
         }
@@ -536,11 +536,11 @@ impl GameState {
             return;
         }
         self.entities[e].voided = 1.0;
-        if self.entities[other].v.solid == Solid::Trigger.as_f32() {
+        if self.entities[other].v.solid.is(Solid::Trigger) {
             return;
         }
         let origin = self.entities[e].v.origin;
-        if self.host.pointcontents(origin) == Content::Sky.as_f32() {
+        if self.host.pointcontents(origin).is(Content::Sky) {
             self.free(e);
             return;
         }

@@ -178,7 +178,7 @@ impl GameState {
             self.player_death_think(e);
             return;
         }
-        if deadflag == DeadFlag::Dying.as_f32() {
+        if deadflag.is(DeadFlag::Dying) {
             return;
         }
 
@@ -197,7 +197,7 @@ impl GameState {
         let v = &self.entities[e].v;
         if self.time() > self.entities[e].attack_finished
             && v.currentammo == 0.0
-            && v.weapon != Items::AXE.as_f32()
+            && !v.weapon.is(Items::AXE)
         {
             let best = self.w_best_weapon(e);
             self.entities[e].v.weapon = best.as_f32();
@@ -222,7 +222,7 @@ impl GameState {
             )
         };
         if jump_flag < -300.0 && on_ground {
-            if watertype == Content::Water.as_f32() {
+            if watertype.is(Content::Water) {
                 self.host
                     .sound(e.0 as i32, Channel::Body, c"player/h2ojump.wav", 1.0, Attenuation::Norm);
             } else if jump_flag < -650.0 {
@@ -304,7 +304,7 @@ impl GameState {
                 v.button2,
             )
         };
-        if deadflag == DeadFlag::Dead.as_f32() {
+        if deadflag.is(DeadFlag::Dead) {
             if b0 != 0.0 || b1 != 0.0 || b2 != 0.0 {
                 return;
             }
@@ -360,7 +360,7 @@ impl GameState {
             let ent = &self.entities[e];
             (ent.v.movetype, ent.v.health, ent.v.waterlevel, ent.v.watertype, ent.air_finished)
         };
-        if movetype == MoveType::Noclip.as_f32() || health < 0.0 {
+        if movetype.is(MoveType::Noclip) || health < 0.0 {
             return;
         }
 
@@ -401,19 +401,19 @@ impl GameState {
             let ent = &self.entities[e];
             (ent.dmgtime, ent.radsuit_finished)
         };
-        if watertype == Content::Lava.as_f32() && dmgtime < time {
+        if watertype.is(Content::Lava) && dmgtime < time {
             self.entities[e].dmgtime = if radsuit > time { time + 1.0 } else { time + 0.2 };
             self.t_damage(e, EntId::WORLD, EntId::WORLD, 10.0 * waterlevel);
-        } else if watertype == Content::Slime.as_f32() && dmgtime < time && radsuit < time {
+        } else if watertype.is(Content::Slime) && dmgtime < time && radsuit < time {
             self.entities[e].dmgtime = time + 1.0;
             self.t_damage(e, EntId::WORLD, EntId::WORLD, 4.0 * waterlevel);
         }
 
         if !self.entities[e].v.flags.has(Flags::INWATER) {
             let s = match watertype {
-                w if w == Content::Lava.as_f32() => Some(c"player/inlava.wav"),
-                w if w == Content::Water.as_f32() => Some(c"player/inh2o.wav"),
-                w if w == Content::Slime.as_f32() => Some(c"player/slimbrn2.wav"),
+                w if w.is(Content::Lava) => Some(c"player/inlava.wav"),
+                w if w.is(Content::Water) => Some(c"player/inh2o.wav"),
+                w if w.is(Content::Slime) => Some(c"player/slimbrn2.wav"),
                 _ => None,
             };
             if let Some(s) = s {

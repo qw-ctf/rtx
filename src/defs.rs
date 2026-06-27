@@ -41,6 +41,22 @@ impl Bits for f32 {
     }
 }
 
+/// Equality test for QuakeC's `f32`-encoded *enum* fields (`.weapon`, `.solid`, `.movetype`,
+/// `.deadflag`, `.watertype`, …): `v.weapon.is(Items::AXE)` instead of the noisier
+/// `v.weapon == Items::AXE.as_f32()`. The single-value sibling of [`Bits::has`]; accepts any
+/// [`flag_bits!`] / [`float_enum!`] type via its `impl Into<f32>`.
+pub trait FieldEq {
+    /// Whether this field equals `value`.
+    fn is(self, value: impl Into<f32>) -> bool;
+}
+
+impl FieldEq for f32 {
+    #[inline]
+    fn is(self, value: impl Into<f32>) -> bool {
+        self == value.into()
+    }
+}
+
 /// Declare a `bitflags` type for one of QuakeC's `f32`-encoded bit fields, with the trivial
 /// `f32` bridge the engine-shared fields and the [`Bits`] helpers use. Bit values are written
 /// `1 << N` for readability.
@@ -244,6 +260,12 @@ macro_rules! float_enum {
                     $(x if x == $name::$variant as i32 => Some($name::$variant),)*
                     _ => None,
                 }
+            }
+        }
+        impl From<$name> for f32 {
+            #[inline]
+            fn from(v: $name) -> f32 {
+                v.as_f32()
             }
         }
     };
