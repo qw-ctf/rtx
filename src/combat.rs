@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Damage and death, ported from `qw-qc/combat.qc` (plus a compact `ClientObituary`).
 //!
 //! `T_Damage` is the single chokepoint that reduces health; it handles armor absorption,

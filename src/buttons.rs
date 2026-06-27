@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! `func_button`, ported from `qw-qc/buttons.qc`. A button slides to `pos2` when touched,
 //! shot, or used, fires its targets, waits, then slides back to `pos1`.
 

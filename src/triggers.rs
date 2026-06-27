@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Trigger volumes, ported from `qw-qc/triggers.qc`: multiple/once/relay/secret/counter,
 //! teleporters (with telefrag), hurt, push (jump pads), and monsterjump.
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Raw, `#[repr(C)]` structures shared with the host engine (mvdsv, `pr2` native
 //! game-module API, `GAME_API_VERSION 16`).
 //!

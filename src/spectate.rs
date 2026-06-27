@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Spectator hooks, ported from `qw-qc/spectate.qc`. mvdsv routes the spectator variants of
 //! connect/disconnect/postthink here (selected by the `isSpectator` argument in `game.rs`).
 

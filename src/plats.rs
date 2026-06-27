@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! `func_plat` and `func_train`, ported from `qw-qc/plats.qc`. Plats raise when a player
 //! stands on their inner trigger; trains follow `path_corner` waypoints.
 

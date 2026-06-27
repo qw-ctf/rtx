@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! A small animation framework shared by every animated model.
 //!
 //! It holds only the machinery: the [`Anim`] type (a named run of model frames whose length is

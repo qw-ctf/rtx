@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Type-safe asset handles, so a missing precache is unrepresentable.
 //!
 //! A [`Sound`]/[`Model`] can only be obtained from something that precached it: the registries

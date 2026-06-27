@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Ported from `qw-qc/world.qc` — world setup (`worldspawn`) and per-frame `StartFrame`.
 
 use crate::game::GameState;

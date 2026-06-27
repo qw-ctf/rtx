@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Weapon firing and projectiles, ported from `qw-qc/weapons.qc`.
 //!
 //! Single-shot weapons fire directly from [`GameState::w_attack`]; the nailgun and lightning

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Miscellaneous map entities, ported from `qw-qc/misc.qc`: info markers, lights, solid and
 //! illusionary walls, and exploding boxes. (Cosmetic static decorations are networked as
 //! ordinary still entities rather than via `makestatic`, which keeps edict bookkeeping

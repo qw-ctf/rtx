@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The single owner of all game state.
 //!
 //! `GameState` lives behind the one global (`OnceLock<Game>` in `lib.rs`) and owns the

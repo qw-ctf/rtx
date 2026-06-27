@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Central callback dispatch.
 //!
 //! QuakeC stores behaviour in function-pointer fields (`.think`, `.touch`, `.use`,

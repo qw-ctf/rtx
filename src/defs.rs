@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Constants ported from `qw-qc/defs.qc`. Only the subset needed so far is defined;
 //! more arrives with the gameplay milestones.
 

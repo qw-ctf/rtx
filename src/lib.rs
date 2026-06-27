@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! `rtx` — a native Rust reimplementation of QuakeWorld `qwprogs.dat`, loadable by mvdsv
 //! (the `pr2` native game-module API, `GAME_API_VERSION 16`).
 //!

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Player lifecycle, ported from `qw-qc/client.qc`: connect/disconnect, spawn parameters,
 //! spawn-point selection, and `PutClientInServer`. Movement itself is the engine's job
 //! (QuakeWorld player physics) once the player entity is set up; combat, water, weapon

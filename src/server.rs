@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Level flow, ported from `qw-qc/server.qc` + the changelevel/intermission code in
 //! `client.qc`: rule-limit level changes, the intermission camera, and `trigger_changelevel`.
 

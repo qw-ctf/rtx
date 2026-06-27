@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Movement and target-firing helpers, ported from `qw-qc/subs.qc`.
 //!
 //! QuakeC's `SUB_CalcMove`/`SUB_CalcAngleMove` schedule a constant-velocity move and a

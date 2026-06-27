@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The FFI boundary: safe Rust wrappers over the engine's `syscall` function pointer.
 //!
 //! This is the one module that performs `unsafe` FFI calls. Everything above it speaks

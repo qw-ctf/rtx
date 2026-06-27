@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Items and pickups, ported from `qw-qc/items.qc`: health, armor, ammo, weapons,
 //! powerups, and the death backpack. Map item entities are placed on the floor after spawn,
 //! hide themselves when taken, and (in deathmatch) re-appear via `SUB_regen`.

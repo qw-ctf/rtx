@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The entity type and its handle.
 //!
 //! [`Entity`] is `#[repr(C)]` so that its [`EntVars`] prefix sits at offset 0 — the engine

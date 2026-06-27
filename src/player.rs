@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Player animation, ported from `qw-qc/player.qc`.
 //!
 //! QuakeC drives player animation as a think-chained state machine: each frame function

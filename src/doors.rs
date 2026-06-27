@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! `func_door`, ported from `qw-qc/doors.qc`. Touching doors auto-link into a group with a
 //! shared trigger field; the group opens and closes together. (Secret doors are spawned as
 //! static brushes — they keep the wall in place without the full slide sequence.)

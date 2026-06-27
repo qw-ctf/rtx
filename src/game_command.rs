@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! `gameExport_t` from `ktx/include/g_public.h` — the commands the engine sends to
 //! `vmMain`. Order matches the C enum exactly (0..=20).
 
