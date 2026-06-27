@@ -382,6 +382,11 @@ impl GameState {
         self.host
             .cvar_set_float(cstr(b"rtx_walljump\0"), 1.0);
 
+        // Elevator jump: a rising lift boosts your jump by `lift_speed * rtx_elevator_jump`.
+        // It's a multiplier (0 disables, 1 = add the lift's true speed, 2 = double it, …).
+        self.host
+            .cvar_set_float(cstr(b"rtx_elevator_jump\0"), 2.0);
+
         // Shoot live grenades to detonate them early, on by default (`rtx_shootable_grenades 0`
         // to restore classic non-shootable grenades).
         self.host

@@ -353,6 +353,10 @@ pub struct CombatState {
     /// Whether the one mid-air jump (`rtx_doublejump`) has been spent this air travel. Set on the
     /// air jump, cleared whenever the player is on the ground.
     pub air_jumped: bool,
+    /// Last upward speed of a lift the player was riding, and when (for `rtx_elevator_jump`'s
+    /// grace window — so jumping just as the lift stops still boosts).
+    pub lift_vz: f32,
+    pub lift_time: f32,
     pub fly_sound: f32,
     pub axhitme: f32,
     pub show_hostile: f32,

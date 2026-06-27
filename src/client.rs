@@ -245,6 +245,7 @@ impl GameState {
         if self.entities[e].v.flags.has(Flags::ONGROUND) {
             self.entities[e].combat.air_jumped = false; // rearm the mid-air jump for the next air travel
         }
+        self.track_lift(e); // remember a rising lift for the elevator-jump grace window
         if self.entities[e].v.button2 != 0.0 {
             self.player_jump(e);
         } else {
@@ -408,7 +409,9 @@ impl GameState {
         if !flags.has(Flags::JUMPRELEASED) {
             return;
         }
-        if !flags.has(Flags::ONGROUND) {
+        // An elevator jump (riding a rising lift) takes priority and works whether the lift left
+        // us flagged on-ground or bounced us airborne. Failing that, the mid-air jumps.
+        if !self.try_elevator_jump(e) && !flags.has(Flags::ONGROUND) {
             // Mid-air. A wall jump (kicking off a wall we're moving into) takes priority and is
             // limited only by geometry; failing that, the once-per-air-travel double jump. The
             // ground jump's impulse is applied by the engine's pmove, but nothing lifts us
@@ -416,6 +419,16 @@ impl GameState {
             if !self.try_wall_jump(e) {
                 if self.entities[e].combat.air_jumped || self.host.cvar(c"rtx_doublejump") == 0.0 {
                     return;
+                }
+                // Don't double-jump when about to land (or just after takeoff) — preserves bunny
+                // hopping (jump-on-landing). Trace straight down from the feet; if the floor is
+                // close, bail without consuming the air jump so the intent carries to the landing.
+                const CLEARANCE: f32 = 24.0; // units of air required below the feet
+                let mut feet = self.entities[e].v.origin;
+                feet.z += self.entities[e].v.mins.z; // mins.z = -24 (VEC_HULL_MIN): origin -> feet
+                let tr = self.traceline(feet, feet - Vec3::new(0.0, 0.0, CLEARANCE), true, e);
+                if tr.fraction < 1.0 {
+                    return; // floor close: the landing ground jump happens instead
                 }
                 self.entities[e].combat.air_jumped = true;
                 self.entities[e].v.velocity.z = 270.0;
@@ -428,6 +441,77 @@ impl GameState {
         }
         self.host
             .sound(e.0 as i32, Channel::Body, c"player/plyrjmp8.wav", 1.0, Attenuation::Norm);
+    }
+
+    /// The upward speed of the rising `MoveType::Push` lift the player is standing on, or `0`.
+    /// The engine's ground pick is unreliable for a pusher rider (it often reports the world), so
+    /// we find it geometrically: the fastest-rising mover whose top is at/just below the feet and
+    /// whose horizontal footprint (its half-width margin) contains the player.
+    fn lift_under_player(&self, e: EntId) -> f32 {
+        let (origin, mins) = {
+            let v = &self.entities[e].v;
+            (v.origin, v.mins)
+        };
+        let feet_z = origin.z + mins.z;
+        let mut best = 0.0;
+        for i in 1..self.entities.len() {
+            let id = EntId(i as u32);
+            if id == e || !self.entities[id].in_use {
+                continue;
+            }
+            let m = &self.entities[id].v;
+            if !m.movetype.is(MoveType::Push) || m.velocity.z <= best {
+                continue;
+            }
+            let on_top = (-24.0..=48.0).contains(&(feet_z - m.absmax.z));
+            let over = origin.x >= m.absmin.x - 16.0
+                && origin.x <= m.absmax.x + 16.0
+                && origin.y >= m.absmin.y - 16.0
+                && origin.y <= m.absmax.y + 16.0;
+            if on_top && over {
+                best = m.velocity.z;
+            }
+        }
+        best
+    }
+
+    /// Record the lift the player is riding each frame, so `elevator_boost` has a recent value to
+    /// use even if the lift has just stopped at the moment of the jump.
+    pub(crate) fn track_lift(&mut self, e: EntId) {
+        let vz = self.lift_under_player(e);
+        if vz > 0.0 {
+            let now = self.time();
+            let c = &mut self.entities[e].combat;
+            c.lift_vz = vz;
+            c.lift_time = now;
+        }
+    }
+
+    /// `rtx_elevator_jump` — if the player jumped while (recently) riding a rising lift, launch
+    /// with the whole jump applied ourselves: `lift·mult + 270`. That always exceeds the engine's
+    /// `maxgroundspeed` (180), so pmove treats us as airborne and skips its own `+270` (no
+    /// double-count, full boost regardless of lift speed). Deliberately decoupled from the
+    /// on-ground flag and the exact jump frame — a pusher rider's on-ground state and feet
+    /// alignment both flicker — using the lift speed `track_lift` remembers each frame plus a
+    /// grace window. Consumes that memory so it gives one boost per ride. Returns whether it fired.
+    fn try_elevator_jump(&mut self, e: EntId) -> bool {
+        /// How long after last riding a rising lift a jump still gets the boost.
+        const GRACE: f32 = 0.4;
+        let mult = self.host.cvar(c"rtx_elevator_jump");
+        if mult == 0.0 {
+            return false;
+        }
+        let now = self.time();
+        let (vz, when) = {
+            let c = &self.entities[e].combat;
+            (c.lift_vz, c.lift_time)
+        };
+        if vz <= 0.0 || now - when > GRACE {
+            return false;
+        }
+        self.entities[e].combat.lift_time = 0.0; // consume — one boost per ride
+        self.entities[e].v.velocity.z = vz * mult + 270.0;
+        true
     }
 
     /// `rtx_walljump` — kick off a nearby wall mid-air. Because the engine clips a player's
