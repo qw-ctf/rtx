@@ -244,12 +244,12 @@ impl GameState {
         if !self.is_live_player(other) {
             return;
         }
-        if self.level.deathmatch == 4 && self.entities[other].invincible_time > 0.0 {
+        if self.level.deathmatch == 4 && self.entities[other].combat.invincible_time > 0.0 {
             return;
         }
         let (healamount, healtype) = {
             let s = &self.entities[e];
-            (s.healamount, s.healtype)
+            (s.item.healamount, s.item.healtype)
         };
         let healed = if healtype == 2.0 {
             self.entities[other].v.health < 250.0 && self.t_heal(other, healamount, true)
@@ -312,7 +312,7 @@ impl GameState {
         if !self.is_live_player(other) {
             return;
         }
-        if self.level.deathmatch == 4 && self.entities[other].invincible_time > 0.0 {
+        if self.level.deathmatch == 4 && self.entities[other].combat.invincible_time > 0.0 {
             return;
         }
         let (type_, value, bit) = match self.entities[e].classname() {
@@ -405,7 +405,7 @@ impl GameState {
         let best = self.w_best_weapon(other);
         let (kind, aflag) = {
             let s = &self.entities[e];
-            (s.v.weapon, s.aflag)
+            (s.v.weapon, s.item.aflag)
         };
         let (field, cap) = match kind as i32 {
             1 => (AmmoKind::Shells, 100.0),
@@ -468,18 +468,18 @@ impl GameState {
         match class.as_deref() {
             Some("item_artifact_envirosuit") => {
                 let o = &mut self.entities[other];
-                o.rad_time = 1.0;
-                o.radsuit_finished = time + 30.0;
+                o.combat.rad_time = 1.0;
+                o.combat.radsuit_finished = time + 30.0;
             }
             Some("item_artifact_invulnerability") => {
                 let o = &mut self.entities[other];
-                o.invincible_time = 1.0;
-                o.invincible_finished = time + 30.0;
+                o.combat.invincible_time = 1.0;
+                o.combat.invincible_finished = time + 30.0;
             }
             Some("item_artifact_invisibility") => {
                 let o = &mut self.entities[other];
-                o.invisible_time = 1.0;
-                o.invisible_finished = time + 30.0;
+                o.combat.invisible_time = 1.0;
+                o.combat.invisible_finished = time + 30.0;
             }
             Some("item_artifact_super_damage") => {
                 if self.level.deathmatch == 4 {
@@ -489,8 +489,8 @@ impl GameState {
                     o.v.ammo_cells = 0.0;
                 }
                 let o = &mut self.entities[other];
-                o.super_time = 1.0;
-                o.super_damage_finished = time + 30.0;
+                o.combat.super_time = 1.0;
+                o.combat.super_damage_finished = time + 30.0;
             }
             _ => {}
         }
@@ -687,24 +687,24 @@ impl GameState {
             self.set_item_model(e, c"maps/b_bh10.bsp");
             self.set_noise(e, "items/r_item1.wav");
             let ent = &mut self.entities[e];
-            ent.healamount = 15.0;
-            ent.healtype = 0.0;
+            ent.item.healamount = 15.0;
+            ent.item.healtype = 0.0;
         } else if flags.has(HealthFlags::MEGA) {
             self.host.precache_model(c"maps/b_bh100.bsp");
             self.host.precache_sound(c"items/r_item2.wav");
             self.set_item_model(e, c"maps/b_bh100.bsp");
             self.set_noise(e, "items/r_item2.wav");
             let ent = &mut self.entities[e];
-            ent.healamount = 100.0;
-            ent.healtype = 2.0;
+            ent.item.healamount = 100.0;
+            ent.item.healtype = 2.0;
         } else {
             self.host.precache_model(c"maps/b_bh25.bsp");
             self.host.precache_sound(c"items/health1.wav");
             self.set_item_model(e, c"maps/b_bh25.bsp");
             self.set_noise(e, "items/health1.wav");
             let ent = &mut self.entities[e];
-            ent.healamount = 25.0;
-            ent.healtype = 1.0;
+            ent.item.healamount = 25.0;
+            ent.item.healtype = 1.0;
         }
         self.host
             .set_size(e.0 as i32, Vec3::ZERO, Vec3::new(32.0, 32.0, 56.0));
@@ -771,7 +771,7 @@ impl GameState {
         self.set_item_model(e, model);
         {
             let ent = &mut self.entities[e];
-            ent.aflag = amt;
+            ent.item.aflag = amt;
             ent.v.weapon = weapon_code;
             ent.netname = Some(netname.into());
         }

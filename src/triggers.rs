@@ -39,7 +39,7 @@ impl GameState {
         self.activator = self.entities[e].enemy();
         self.sub_use_targets(e);
 
-        let wait = self.entities[e].wait;
+        let wait = self.entities[e].mover.wait;
         let time = self.time();
         let ent = &mut self.entities[e];
         if wait > 0.0 {
@@ -88,9 +88,9 @@ impl GameState {
         let activator = self.activator;
         let (count, spawnflags) = {
             let ent = &self.entities[e];
-            (ent.count - 1.0, ent.v.spawnflags)
+            (ent.mover.count - 1.0, ent.v.spawnflags)
         };
-        self.entities[e].count = count;
+        self.entities[e].mover.count = count;
         if count < 0.0 {
             return;
         }
@@ -136,8 +136,8 @@ impl GameState {
             }
             _ => {}
         }
-        if self.entities[e].wait == 0.0 {
-            self.entities[e].wait = 0.2;
+        if self.entities[e].mover.wait == 0.0 {
+            self.entities[e].mover.wait = 0.2;
         }
         self.entities[e].use_ = Use::MultiUse;
         self.init_trigger(e);
@@ -157,7 +157,7 @@ impl GameState {
     }
 
     pub(crate) fn spawn_trigger_once(&mut self, e: EntId) -> bool {
-        self.entities[e].wait = -1.0;
+        self.entities[e].mover.wait = -1.0;
         self.spawn_trigger_multiple(e)
     }
 
@@ -170,7 +170,7 @@ impl GameState {
         self.globals.total_secrets += 1.0;
         {
             let ent = &mut self.entities[e];
-            ent.wait = -1.0;
+            ent.mover.wait = -1.0;
             if ent.message.is_none() {
                 ent.message = Some("You found a secret area!".into());
             }
@@ -194,9 +194,9 @@ impl GameState {
 
     pub(crate) fn spawn_trigger_counter(&mut self, e: EntId) -> bool {
         let ent = &mut self.entities[e];
-        ent.wait = -1.0;
-        if ent.count == 0.0 {
-            ent.count = 2.0;
+        ent.mover.wait = -1.0;
+        if ent.mover.count == 0.0 {
+            ent.mover.count = 2.0;
         }
         ent.use_ = Use::CounterUse;
         true
@@ -243,12 +243,12 @@ impl GameState {
         }
         let time = self.time();
         if self.entities[other].classname() == Some("player") {
-            let other_inv = self.entities[other].invincible_finished > time;
-            let owner_inv = self.entities[owner].invincible_finished > time;
+            let other_inv = self.entities[other].combat.invincible_finished > time;
+            let owner_inv = self.entities[owner].combat.invincible_finished > time;
             if other_inv && owner_inv {
                 self.entities[e].classname = Some("teledeath3".into());
-                self.entities[other].invincible_finished = 0.0;
-                self.entities[owner].invincible_finished = 0.0;
+                self.entities[other].combat.invincible_finished = 0.0;
+                self.entities[owner].combat.invincible_finished = 0.0;
                 self.t_damage(other, e, e, 50000.0);
                 self.entities[e].set_owner(other);
                 self.t_damage(owner, e, e, 50000.0);
@@ -328,7 +328,7 @@ impl GameState {
         };
         let (t_org, t_mangle) = {
             let v = &self.entities[dest];
-            (v.v.origin, v.mangle)
+            (v.v.origin, v.mover.mangle)
         };
         self.host.make_vectors(t_mangle);
         let v_forward = self.globals.v_forward;
@@ -353,7 +353,7 @@ impl GameState {
     /// `info_teleport_destination` spawn.
     pub(crate) fn spawn_info_teleport_destination(&mut self, e: EntId) -> bool {
         let ent = &mut self.entities[e];
-        ent.mangle = ent.v.angles;
+        ent.mover.mangle = ent.v.angles;
         ent.v.angles = Vec3::ZERO;
         ent.model = None;
         ent.v.origin.z += 27.0;
@@ -401,7 +401,7 @@ impl GameState {
     /// `hurt_touch`.
     pub(crate) fn hurt_touch(&mut self, e: EntId, other: EntId) {
         if self.entities[other].v.takedamage != 0.0 {
-            let dmg = self.entities[e].dmg;
+            let dmg = self.entities[e].mover.dmg;
             self.entities[e].v.solid = Solid::Not.as_f32();
             self.t_damage(other, e, e, dmg);
             let time = self.time();
@@ -415,8 +415,8 @@ impl GameState {
     pub(crate) fn spawn_trigger_hurt(&mut self, e: EntId) -> bool {
         self.init_trigger(e);
         self.entities[e].set_touch(Touch::Hurt);
-        if self.entities[e].dmg == 0.0 {
-            self.entities[e].dmg = 5.0;
+        if self.entities[e].mover.dmg == 0.0 {
+            self.entities[e].mover.dmg = 5.0;
         }
         true
     }
@@ -427,7 +427,7 @@ impl GameState {
     pub(crate) fn trigger_push_touch(&mut self, e: EntId, other: EntId) {
         let (speed, movedir, spawnflags) = {
             let ent = &self.entities[e];
-            (ent.speed, ent.v.movedir, ent.v.spawnflags)
+            (ent.mover.speed, ent.v.movedir, ent.v.spawnflags)
         };
         let push = speed * movedir * 10.0;
         let is_grenade = self.entities[other].classname() == Some("grenade");
@@ -437,8 +437,8 @@ impl GameState {
             self.entities[other].v.velocity = push;
             if self.entities[other].classname() == Some("player") {
                 let time = self.time();
-                if self.entities[other].fly_sound < time {
-                    self.entities[other].fly_sound = time + 1.5;
+                if self.entities[other].combat.fly_sound < time {
+                    self.entities[other].combat.fly_sound = time + 1.5;
                     self.host
                         .sound(other.0 as i32, Channel::Auto, c"ambience/windfly.wav", 1.0, Attenuation::Norm);
                 }
@@ -454,8 +454,8 @@ impl GameState {
         self.init_trigger(e);
         self.host.precache_sound(c"ambience/windfly.wav");
         self.entities[e].set_touch(Touch::Push);
-        if self.entities[e].speed == 0.0 {
-            self.entities[e].speed = 1000.0;
+        if self.entities[e].mover.speed == 0.0 {
+            self.entities[e].mover.speed = 1000.0;
         }
         true
     }
@@ -464,11 +464,11 @@ impl GameState {
     pub(crate) fn spawn_trigger_monsterjump(&mut self, e: EntId) -> bool {
         {
             let ent = &mut self.entities[e];
-            if ent.speed == 0.0 {
-                ent.speed = 200.0;
+            if ent.mover.speed == 0.0 {
+                ent.mover.speed = 200.0;
             }
-            if ent.height == 0.0 {
-                ent.height = 200.0;
+            if ent.mover.height == 0.0 {
+                ent.mover.height = 200.0;
             }
             if ent.v.angles == Vec3::ZERO {
                 ent.v.angles = Vec3::new(0.0, 360.0, 0.0);

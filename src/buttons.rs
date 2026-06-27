@@ -10,11 +10,11 @@ impl GameState {
     pub(crate) fn button_wait(&mut self, e: EntId) {
         let (wait, ltime) = {
             let v = &self.entities[e];
-            (v.wait, v.v.ltime)
+            (v.mover.wait, v.v.ltime)
         };
         {
             let ent = &mut self.entities[e];
-            ent.state = STATE_TOP;
+            ent.mover.state = STATE_TOP;
             ent.v.nextthink = ltime + wait;
             ent.think = Think::ButtonReturn;
             ent.v.frame = 1.0;
@@ -25,16 +25,16 @@ impl GameState {
 
     /// `button_done`.
     pub(crate) fn button_done(&mut self, e: EntId) {
-        self.entities[e].state = STATE_BOTTOM;
+        self.entities[e].mover.state = STATE_BOTTOM;
     }
 
     /// `button_return`.
     pub(crate) fn button_return(&mut self, e: EntId) {
         let (pos1, speed, health) = {
             let v = &self.entities[e];
-            (v.pos1, v.speed, v.v.health)
+            (v.mover.pos1, v.mover.speed, v.v.health)
         };
-        self.entities[e].state = STATE_DOWN;
+        self.entities[e].mover.state = STATE_DOWN;
         self.sub_calc_move(e, pos1, speed, Think::ButtonDone);
         self.entities[e].v.frame = 0.0;
         if health != 0.0 {
@@ -46,13 +46,13 @@ impl GameState {
     fn button_fire(&mut self, e: EntId) {
         let (state, pos2, speed) = {
             let v = &self.entities[e];
-            (v.state, v.pos2, v.speed)
+            (v.mover.state, v.mover.pos2, v.mover.speed)
         };
         if state == STATE_UP || state == STATE_TOP {
             return;
         }
         self.play_noise(e, Channel::Voice);
-        self.entities[e].state = STATE_UP;
+        self.entities[e].mover.state = STATE_UP;
         self.sub_calc_move(e, pos2, speed, Think::ButtonWait);
     }
 
@@ -116,21 +116,21 @@ impl GameState {
         }
 
         let ent = &mut self.entities[e];
-        if ent.speed == 0.0 {
-            ent.speed = 40.0;
+        if ent.mover.speed == 0.0 {
+            ent.mover.speed = 40.0;
         }
-        if ent.wait == 0.0 {
-            ent.wait = 1.0;
+        if ent.mover.wait == 0.0 {
+            ent.mover.wait = 1.0;
         }
-        if ent.lip == 0.0 {
-            ent.lip = 4.0;
+        if ent.mover.lip == 0.0 {
+            ent.mover.lip = 4.0;
         }
-        ent.state = STATE_BOTTOM;
-        ent.pos1 = ent.v.origin;
+        ent.mover.state = STATE_BOTTOM;
+        ent.mover.pos1 = ent.v.origin;
         let movedir = ent.v.movedir;
         let size = ent.v.size;
-        let lip = ent.lip;
-        ent.pos2 = ent.pos1 + movedir * ((movedir.dot(size)).abs() - lip);
+        let lip = ent.mover.lip;
+        ent.mover.pos2 = ent.mover.pos1 + movedir * ((movedir.dot(size)).abs() - lip);
         true
     }
 }

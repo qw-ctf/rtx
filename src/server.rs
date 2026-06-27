@@ -38,7 +38,7 @@ impl GameState {
         let pos = self.find_intermission();
         let (origin, mangle) = {
             let p = &self.entities[pos];
-            (p.v.origin, p.mangle)
+            (p.v.origin, p.mover.mangle)
         };
 
         self.host.write_svc(MsgDest::All, Svc::CdTrack);

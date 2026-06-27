@@ -168,16 +168,16 @@ impl GameState {
             ent.v.flags = Flags::CLIENT.as_f32();
             ent.v.effects = 0.0;
             ent.v.deadflag = DeadFlag::No.as_f32();
-            ent.show_hostile = 0.0;
-            ent.air_finished = time + 12.0;
-            ent.dmg = 2.0; // initial water damage
-            ent.super_damage_finished = 0.0;
-            ent.radsuit_finished = 0.0;
-            ent.invisible_finished = 0.0;
-            ent.invincible_finished = 0.0;
-            ent.invincible_time = 0.0;
-            ent.pausetime = 0.0;
-            ent.attack_finished = time;
+            ent.combat.show_hostile = 0.0;
+            ent.combat.air_finished = time + 12.0;
+            ent.mover.dmg = 2.0; // initial water damage
+            ent.combat.super_damage_finished = 0.0;
+            ent.combat.radsuit_finished = 0.0;
+            ent.combat.invisible_finished = 0.0;
+            ent.combat.invincible_finished = 0.0;
+            ent.combat.invincible_time = 0.0;
+            ent.mover.pausetime = 0.0;
+            ent.combat.attack_finished = time;
             ent.th_pain = Pain::Player;
             ent.th_die = Die::Player;
         }
@@ -243,7 +243,7 @@ impl GameState {
         }
 
         if self.entities[e].v.flags.has(Flags::ONGROUND) {
-            self.entities[e].air_jumped = false; // rearm the mid-air jump for the next air travel
+            self.entities[e].combat.air_jumped = false; // rearm the mid-air jump for the next air travel
         }
         if self.entities[e].v.button2 != 0.0 {
             self.player_jump(e);
@@ -253,12 +253,12 @@ impl GameState {
         }
 
         // Teleporters can force a pause.
-        if self.time() < self.entities[e].pausetime {
+        if self.time() < self.entities[e].mover.pausetime {
             self.entities[e].v.velocity = Vec3::ZERO;
         }
 
         let v = &self.entities[e].v;
-        if self.time() > self.entities[e].attack_finished
+        if self.time() > self.entities[e].combat.attack_finished
             && v.currentammo == 0.0
             && !v.weapon.is(Items::AXE)
         {
@@ -279,7 +279,7 @@ impl GameState {
         let (jump_flag, on_ground, watertype) = {
             let ent = &self.entities[e];
             (
-                ent.jump_flag,
+                ent.combat.jump_flag,
                 ent.v.flags.has(Flags::ONGROUND),
                 ent.v.watertype,
             )
@@ -298,7 +298,7 @@ impl GameState {
                     .sound(e.0 as i32, Channel::Voice, c"player/land.wav", 1.0, Attenuation::Norm);
             }
         }
-        self.entities[e].jump_flag = self.entities[e].v.velocity.z;
+        self.entities[e].combat.jump_flag = self.entities[e].v.velocity.z;
 
         self.check_powerups(e);
         self.w_weapon_frame(e);
@@ -391,14 +391,14 @@ impl GameState {
         let time = self.time();
         let (flags, waterlevel, swim_flag) = {
             let ent = &self.entities[e];
-            (ent.v.flags, ent.v.waterlevel, ent.swim_flag)
+            (ent.v.flags, ent.v.waterlevel, ent.combat.swim_flag)
         };
         if flags.has(Flags::WATERJUMP) {
             return;
         }
         if waterlevel >= 2.0 {
             if swim_flag < time {
-                self.entities[e].swim_flag = time + 1.0;
+                self.entities[e].combat.swim_flag = time + 1.0;
                 let s = if self.random() < 0.5 { c"misc/water1.wav" } else { c"misc/water2.wav" };
                 self.host.sound(e.0 as i32, Channel::Body, s, 1.0, Attenuation::Norm);
             }
@@ -414,10 +414,10 @@ impl GameState {
             // ground jump's impulse is applied by the engine's pmove, but nothing lifts us
             // mid-air, so both set velocity themselves.
             if !self.try_wall_jump(e) {
-                if self.entities[e].air_jumped || self.host.cvar(c"rtx_doublejump") == 0.0 {
+                if self.entities[e].combat.air_jumped || self.host.cvar(c"rtx_doublejump") == 0.0 {
                     return;
                 }
-                self.entities[e].air_jumped = true;
+                self.entities[e].combat.air_jumped = true;
                 self.entities[e].v.velocity.z = 270.0;
             }
         }
@@ -495,7 +495,7 @@ impl GameState {
         let time = self.time();
         let (movetype, health, waterlevel, watertype, air_finished) = {
             let ent = &self.entities[e];
-            (ent.v.movetype, ent.v.health, ent.v.waterlevel, ent.v.watertype, ent.air_finished)
+            (ent.v.movetype, ent.v.health, ent.v.waterlevel, ent.v.watertype, ent.combat.air_finished)
         };
         if movetype.is(MoveType::Noclip) || health < 0.0 {
             return;
@@ -510,16 +510,16 @@ impl GameState {
                     .sound(e.0 as i32, Channel::Voice, c"player/gasp1.wav", 1.0, Attenuation::Norm);
             }
             let ent = &mut self.entities[e];
-            ent.air_finished = time + 12.0;
-            ent.dmg = 2.0;
-        } else if air_finished < time && self.entities[e].pain_finished < time {
+            ent.combat.air_finished = time + 12.0;
+            ent.mover.dmg = 2.0;
+        } else if air_finished < time && self.entities[e].combat.pain_finished < time {
             let ent = &mut self.entities[e];
-            ent.dmg += 2.0;
-            if ent.dmg > 15.0 {
-                ent.dmg = 10.0;
+            ent.mover.dmg += 2.0;
+            if ent.mover.dmg > 15.0 {
+                ent.mover.dmg = 10.0;
             }
-            let dmg = ent.dmg;
-            ent.pain_finished = time + 1.0;
+            let dmg = ent.mover.dmg;
+            ent.combat.pain_finished = time + 1.0;
             self.t_damage(e, EntId::WORLD, EntId::WORLD, dmg);
         }
 
@@ -536,13 +536,13 @@ impl GameState {
         // Lava/slime contact damage.
         let (dmgtime, radsuit) = {
             let ent = &self.entities[e];
-            (ent.dmgtime, ent.radsuit_finished)
+            (ent.combat.dmgtime, ent.combat.radsuit_finished)
         };
         if watertype.is(Content::Lava) && dmgtime < time {
-            self.entities[e].dmgtime = if radsuit > time { time + 1.0 } else { time + 0.2 };
+            self.entities[e].combat.dmgtime = if radsuit > time { time + 1.0 } else { time + 0.2 };
             self.t_damage(e, EntId::WORLD, EntId::WORLD, 10.0 * waterlevel);
         } else if watertype.is(Content::Slime) && dmgtime < time && radsuit < time {
-            self.entities[e].dmgtime = time + 1.0;
+            self.entities[e].combat.dmgtime = time + 1.0;
             self.t_damage(e, EntId::WORLD, EntId::WORLD, 4.0 * waterlevel);
         }
 
@@ -558,7 +558,7 @@ impl GameState {
             }
             let ent = &mut self.entities[e];
             ent.v.flags = ent.v.flags.with(Flags::INWATER);
-            ent.dmgtime = 0.0;
+            ent.combat.dmgtime = 0.0;
         }
     }
 
@@ -570,14 +570,14 @@ impl GameState {
         }
 
         // Invisibility (Ring of Shadows) — swap to the eyes model.
-        if self.entities[e].invisible_finished != 0.0 {
-            if self.entities[e].invisible_sound < time {
+        if self.entities[e].combat.invisible_finished != 0.0 {
+            if self.entities[e].combat.invisible_sound < time {
                 self.host
                     .sound(e.0 as i32, Channel::Auto, c"items/inv3.wav", 0.5, Attenuation::Idle);
                 let r = (self.random() * 3.0) + 1.0;
-                self.entities[e].invisible_sound = time + r;
+                self.entities[e].combat.invisible_sound = time + r;
             }
-            if self.entities[e].invisible_finished < time + 3.0 {
+            if self.entities[e].combat.invisible_finished < time + 3.0 {
                 self.powerup_warn(
                     e,
                     PowerupKind::Invisibility,
@@ -585,11 +585,11 @@ impl GameState {
                     c"items/inv2.wav",
                 );
             }
-            if self.entities[e].invisible_finished < time {
+            if self.entities[e].combat.invisible_finished < time {
                 let ent = &mut self.entities[e];
                 ent.v.items = ent.v.items.without(Items::INVISIBILITY);
-                ent.invisible_finished = 0.0;
-                ent.invisible_time = 0.0;
+                ent.combat.invisible_finished = 0.0;
+                ent.combat.invisible_time = 0.0;
             }
             let eyes = self.level.modelindex_eyes;
             let ent = &mut self.entities[e];
@@ -600,8 +600,8 @@ impl GameState {
         }
 
         // Invincibility (Pentagram) — red glow.
-        if self.entities[e].invincible_finished != 0.0 {
-            if self.entities[e].invincible_finished < time + 3.0 {
+        if self.entities[e].combat.invincible_finished != 0.0 {
+            if self.entities[e].combat.invincible_finished < time + 3.0 {
                 self.powerup_warn(
                     e,
                     PowerupKind::Invulnerability,
@@ -609,18 +609,18 @@ impl GameState {
                     c"items/protect2.wav",
                 );
             }
-            if self.entities[e].invincible_finished < time {
+            if self.entities[e].combat.invincible_finished < time {
                 let ent = &mut self.entities[e];
                 ent.v.items = ent.v.items.without(Items::INVULNERABILITY);
-                ent.invincible_time = 0.0;
-                ent.invincible_finished = 0.0;
+                ent.combat.invincible_time = 0.0;
+                ent.combat.invincible_finished = 0.0;
             }
-            self.set_powerup_glow(e, self.entities[e].invincible_finished > time, Effects::RED);
+            self.set_powerup_glow(e, self.entities[e].combat.invincible_finished > time, Effects::RED);
         }
 
         // Quad Damage — blue glow.
-        if self.entities[e].super_damage_finished != 0.0 {
-            if self.entities[e].super_damage_finished < time + 3.0 {
+        if self.entities[e].combat.super_damage_finished != 0.0 {
+            if self.entities[e].combat.super_damage_finished < time + 3.0 {
                 let msg = if self.level.deathmatch == 4 {
                     c"OctaPower is wearing off\n"
                 } else {
@@ -628,7 +628,7 @@ impl GameState {
                 };
                 self.powerup_warn(e, PowerupKind::Quad, msg, c"items/damage2.wav");
             }
-            if self.entities[e].super_damage_finished < time {
+            if self.entities[e].combat.super_damage_finished < time {
                 let dm4 = self.level.deathmatch == 4;
                 let ent = &mut self.entities[e];
                 ent.v.items = ent.v.items.without(Items::QUAD);
@@ -638,16 +638,16 @@ impl GameState {
                     ent.v.armortype = 0.8;
                     ent.v.health = 100.0;
                 }
-                ent.super_damage_finished = 0.0;
-                ent.super_time = 0.0;
+                ent.combat.super_damage_finished = 0.0;
+                ent.combat.super_time = 0.0;
             }
-            self.set_powerup_glow(e, self.entities[e].super_damage_finished > time, Effects::BLUE);
+            self.set_powerup_glow(e, self.entities[e].combat.super_damage_finished > time, Effects::BLUE);
         }
 
         // Biosuit — refresh air, expire quietly.
-        if self.entities[e].radsuit_finished != 0.0 {
-            self.entities[e].air_finished = time + 12.0;
-            if self.entities[e].radsuit_finished < time + 3.0 {
+        if self.entities[e].combat.radsuit_finished != 0.0 {
+            self.entities[e].combat.air_finished = time + 12.0;
+            if self.entities[e].combat.radsuit_finished < time + 3.0 {
                 self.powerup_warn(
                     e,
                     PowerupKind::Biosuit,
@@ -655,11 +655,11 @@ impl GameState {
                     c"items/suit2.wav",
                 );
             }
-            if self.entities[e].radsuit_finished < time {
+            if self.entities[e].combat.radsuit_finished < time {
                 let ent = &mut self.entities[e];
                 ent.v.items = ent.v.items.without(Items::SUIT);
-                ent.rad_time = 0.0;
-                ent.radsuit_finished = 0.0;
+                ent.combat.rad_time = 0.0;
+                ent.combat.radsuit_finished = 0.0;
             }
         }
     }
@@ -669,10 +669,10 @@ impl GameState {
     fn powerup_warn(&mut self, e: EntId, kind: PowerupKind, msg: &CStr, sound: &CStr) {
         let time = self.time();
         let latch = match kind {
-            PowerupKind::Invisibility => self.entities[e].invisible_time,
-            PowerupKind::Invulnerability => self.entities[e].invincible_time,
-            PowerupKind::Quad => self.entities[e].super_time,
-            PowerupKind::Biosuit => self.entities[e].rad_time,
+            PowerupKind::Invisibility => self.entities[e].combat.invisible_time,
+            PowerupKind::Invulnerability => self.entities[e].combat.invincible_time,
+            PowerupKind::Quad => self.entities[e].combat.super_time,
+            PowerupKind::Biosuit => self.entities[e].combat.rad_time,
         };
         if latch == 1.0 {
             self.host.sprint(e.0 as i32, PrintLevel::High, msg);
@@ -688,10 +688,10 @@ impl GameState {
     fn set_powerup_time(&mut self, e: EntId, kind: PowerupKind, t: f32) {
         let ent = &mut self.entities[e];
         match kind {
-            PowerupKind::Invisibility => ent.invisible_time = t,
-            PowerupKind::Invulnerability => ent.invincible_time = t,
-            PowerupKind::Quad => ent.super_time = t,
-            PowerupKind::Biosuit => ent.rad_time = t,
+            PowerupKind::Invisibility => ent.combat.invisible_time = t,
+            PowerupKind::Invulnerability => ent.combat.invincible_time = t,
+            PowerupKind::Quad => ent.combat.super_time = t,
+            PowerupKind::Biosuit => ent.combat.rad_time = t,
         }
     }
 

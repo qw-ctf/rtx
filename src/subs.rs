@@ -53,7 +53,7 @@ impl GameState {
         {
             let ent = &mut self.entities[e];
             ent.think1 = func;
-            ent.finaldest = tdest;
+            ent.mover.finaldest = tdest;
             ent.think = Think::SubCalcMoveDone;
         }
 
@@ -75,7 +75,7 @@ impl GameState {
 
     /// `SUB_CalcMoveDone` — snap to the exact destination and fire `think1`.
     pub(crate) fn sub_calc_move_done(&mut self, e: EntId) {
-        let dest = self.entities[e].finaldest;
+        let dest = self.entities[e].mover.finaldest;
         self.host.set_origin(e.0 as i32, dest);
         {
             let ent = &mut self.entities[e];
@@ -106,7 +106,7 @@ impl GameState {
     /// `targetname` matches our `target`. `self.activator` must be set by the caller.
     pub(crate) fn sub_use_targets(&mut self, e: EntId) {
         // Delayed fire: spawn a temp entity that re-runs us after `delay` seconds.
-        let delay = self.entities[e].delay;
+        let delay = self.entities[e].mover.delay;
         if delay != 0.0 {
             let t = self.spawn();
             let time = self.time();

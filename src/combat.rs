@@ -87,7 +87,7 @@ impl GameState {
 
         // Quad damage on the attacker (but not for crushing doors).
         let inflictor_is_door = self.entities[inflictor].classname() == Some("door");
-        if self.entities[attacker].super_damage_finished > time && !inflictor_is_door {
+        if self.entities[attacker].combat.super_damage_finished > time && !inflictor_is_door {
             damage *= if self.level.deathmatch == 4 { 8.0 } else { 4.0 };
         }
 
@@ -135,11 +135,11 @@ impl GameState {
         if self.entities[targ].v.flags.has(Flags::GODMODE) {
             return;
         }
-        if self.entities[targ].invincible_finished >= time {
-            if self.entities[targ].invincible_sound < time {
+        if self.entities[targ].combat.invincible_finished >= time {
+            if self.entities[targ].combat.invincible_sound < time {
                 self.host
                     .sound(targ.0 as i32, Channel::Item, c"items/protect3.wav", 1.0, Attenuation::Norm);
-                self.entities[targ].invincible_sound = time + 2.0;
+                self.entities[targ].combat.invincible_sound = time + 2.0;
             }
             return;
         }

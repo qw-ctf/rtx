@@ -236,23 +236,6 @@ pub struct Entity {
     pub th_pain: Pain,
     pub th_die: Die,
 
-    /// Walk/idle animation cursor for player movement loops; also a generic frame cursor.
-    pub walkframe: i32,
-    /// One-shot body animation: final frame for [`Think::PlayerAnim`].
-    pub anim_end: i32,
-    /// What to do after a one-shot player animation completes.
-    pub anim_after: Think,
-    /// Cosmetic weapon-animation parameters (see [`Think::PlayerWeaponAnim`]): body-frame
-    /// base, weaponframe base, frame count, and the cursor index that fires the axe (-1 = no
-    /// in-animation fire, e.g. shotgun/rocket which fire from `W_Attack` directly).
-    pub anim_base: i32,
-    pub anim_wf_base: i32,
-    pub anim_len: i32,
-    pub anim_fire: i32,
-    pub anim_muzzle: i32,
-    /// Anti-double-fire latch for projectiles (`voided`).
-    pub voided: f32,
-
     // strings (owned on our side; engine sees them only via traps)
     pub classname: Option<Box<str>>,
     pub model: Option<Box<str>>,
@@ -279,6 +262,34 @@ pub struct Entity {
     /// raw pointer, so this must live as long as the entity references the model.
     pub model_cs: Option<CString>,
 
+    pub anim: AnimState,
+    pub mover: MoverState,
+    pub refs: CustomRefs,
+    pub combat: CombatState,
+    pub item: ItemState,
+}
+
+#[derive(Default)]
+pub struct AnimState {
+    /// Walk/idle animation cursor for player movement loops; also a generic frame cursor.
+    pub walkframe: i32,
+    /// One-shot body animation: final frame for [`Think::PlayerAnim`].
+    pub anim_end: i32,
+    /// What to do after a one-shot player animation completes.
+    pub anim_after: Think,
+    /// Cosmetic weapon-animation parameters (see [`Think::PlayerWeaponAnim`]): body-frame
+    /// base, weaponframe base, frame count, and the cursor index that fires the axe (-1 = no
+    /// in-animation fire, e.g. shotgun/rocket which fire from `W_Attack` directly).
+    pub anim_base: i32,
+    pub anim_wf_base: i32,
+    pub anim_len: i32,
+    pub anim_fire: i32,
+    pub anim_muzzle: i32,
+}
+
+#[derive(Default)]
+#[allow(dead_code)]
+pub struct MoverState {
     // movement / mover scratch (subs.qc, doors, plats, buttons, trains)
     pub finaldest: Vec3,
     pub finalangle: Vec3,
@@ -300,15 +311,24 @@ pub struct Entity {
     pub t_length: f32,
     pub t_width: f32,
     pub pausetime: f32,
-    pub aflag: f32,
+}
 
+#[derive(Default)]
+#[allow(dead_code)]
+pub struct CustomRefs {
     // entity references not present in entvars (custom QC `.entity` fields), as indices.
     // (Standard entvars refs — enemy/owner/goalentity/groundentity/aiment/chain — live in
     // `v` as byte offsets; use `EntId::to_prog`/`from_prog` and the `GameState` ref helpers.)
     pub oldenemy: u32,
     pub trigger_field: u32,
     pub movetarget: u32,
+}
 
+#[derive(Default)]
+#[allow(dead_code)]
+pub struct CombatState {
+    /// Anti-double-fire latch for projectiles (`voided`).
+    pub voided: f32,
     // combat / player timers (player.qc, weapons.qc, items.qc)
     pub attack_finished: f32,
     pub pain_finished: f32,
@@ -335,10 +355,15 @@ pub struct Entity {
     pub fly_sound: f32,
     pub axhitme: f32,
     pub show_hostile: f32,
+}
 
+#[derive(Default)]
+#[allow(dead_code)]
+pub struct ItemState {
     // item scratch (items.qc)
     pub healamount: f32,
     pub healtype: f32,
+    pub aflag: f32,
     pub items2: f32,
     pub aflag2: f32,
     pub last_pickup_msg: f32,

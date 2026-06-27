@@ -19,7 +19,7 @@ impl GameState {
     pub(crate) fn door_blocked(&mut self, e: EntId, other: EntId) {
         let (goal, dmg, wait, state) = {
             let v = &self.entities[e];
-            (v.goalentity(), v.dmg, v.wait, v.state)
+            (v.goalentity(), v.mover.dmg, v.mover.wait, v.mover.state)
         };
         self.entities[other].deathtype = Some("squish".into());
         self.t_damage(other, e, goal, dmg);
@@ -35,12 +35,12 @@ impl GameState {
     /// `door_hit_top`.
     pub(crate) fn door_hit_top(&mut self, e: EntId) {
         self.play_door(e, true, 1);
-        self.entities[e].state = STATE_TOP;
+        self.entities[e].mover.state = STATE_TOP;
         if self.entities[e].v.spawnflags.has(DoorFlags::TOGGLE) {
             return;
         }
         let ltime = self.entities[e].v.ltime;
-        let wait = self.entities[e].wait;
+        let wait = self.entities[e].mover.wait;
         let ent = &mut self.entities[e];
         ent.think = Think::DoorGoDown;
         ent.v.nextthink = ltime + wait;
@@ -49,7 +49,7 @@ impl GameState {
     /// `door_hit_bottom`.
     pub(crate) fn door_hit_bottom(&mut self, e: EntId) {
         self.play_door(e, true, 1);
-        self.entities[e].state = STATE_BOTTOM;
+        self.entities[e].mover.state = STATE_BOTTOM;
     }
 
     /// `door_go_down`.
@@ -61,11 +61,11 @@ impl GameState {
                 ent.v.takedamage = TakeDamage::Yes.as_f32();
                 ent.v.health = ent.v.max_health;
             }
-            ent.state = STATE_DOWN;
+            ent.mover.state = STATE_DOWN;
         }
         let (pos1, speed) = {
             let v = &self.entities[e];
-            (v.pos1, v.speed)
+            (v.mover.pos1, v.mover.speed)
         };
         self.sub_calc_move(e, pos1, speed, Think::DoorHitBottom);
     }
@@ -74,7 +74,7 @@ impl GameState {
     pub(crate) fn door_go_up(&mut self, e: EntId) {
         let (state, ltime, wait) = {
             let v = &self.entities[e];
-            (v.state, v.v.ltime, v.wait)
+            (v.mover.state, v.v.ltime, v.mover.wait)
         };
         if state == STATE_UP {
             return;
@@ -84,10 +84,10 @@ impl GameState {
             return;
         }
         self.play_door(e, false, 2);
-        self.entities[e].state = STATE_UP;
+        self.entities[e].mover.state = STATE_UP;
         let (pos2, speed) = {
             let v = &self.entities[e];
-            (v.pos2, v.speed)
+            (v.mover.pos2, v.mover.speed)
         };
         self.sub_calc_move(e, pos2, speed, Think::DoorHitTop);
         self.sub_use_targets(e);
@@ -104,7 +104,7 @@ impl GameState {
 
         let toggled = self.entities[master].v.spawnflags.has(DoorFlags::TOGGLE);
         if toggled {
-            let state = self.entities[master].state;
+            let state = self.entities[master].mover.state;
             if state == STATE_UP || state == STATE_TOP {
                 let mut cur = master;
                 loop {
@@ -148,10 +148,10 @@ impl GameState {
             return;
         }
         let time = self.time();
-        if time < self.entities[e].attack_finished {
+        if time < self.entities[e].combat.attack_finished {
             return;
         }
-        self.entities[e].attack_finished = time + 1.0;
+        self.entities[e].combat.attack_finished = time + 1.0;
         self.activator = other;
         let owner = self.entities[e].owner();
         self.door_use(owner);
@@ -175,10 +175,10 @@ impl GameState {
         }
         let owner = self.entities[e].owner();
         let time = self.time();
-        if self.entities[owner].attack_finished > time {
+        if self.entities[owner].combat.attack_finished > time {
             return;
         }
-        self.entities[owner].attack_finished = time + 2.0;
+        self.entities[owner].combat.attack_finished = time + 2.0;
 
         if self.entities[owner].message.is_some() {
             if let Some(msg) = self.message_cstring(owner) {
@@ -310,7 +310,7 @@ impl GameState {
                         return;
                     }
                     let field = self.spawn_field(master, cmins, cmaxs);
-                    self.entities[master].trigger_field = field.0;
+                    self.entities[master].refs.trigger_field = field.0;
                     return;
                 }
                 Some(next) => {
@@ -357,42 +357,42 @@ impl GameState {
             if sf.has(DoorFlags::GOLD_KEY) {
                 ent.v.items = Items::KEY2.as_f32();
             }
-            if ent.speed == 0.0 {
-                ent.speed = 100.0;
+            if ent.mover.speed == 0.0 {
+                ent.mover.speed = 100.0;
             }
-            if ent.wait == 0.0 {
-                ent.wait = 3.0;
+            if ent.mover.wait == 0.0 {
+                ent.mover.wait = 3.0;
             }
-            if ent.lip == 0.0 {
-                ent.lip = 8.0;
+            if ent.mover.lip == 0.0 {
+                ent.mover.lip = 8.0;
             }
-            if ent.dmg == 0.0 {
-                ent.dmg = 2.0;
+            if ent.mover.dmg == 0.0 {
+                ent.mover.dmg = 2.0;
             }
-            ent.pos1 = ent.v.origin;
+            ent.mover.pos1 = ent.v.origin;
             let movedir = ent.v.movedir;
             let size = ent.v.size;
-            ent.pos2 = ent.pos1 + movedir * ((movedir.dot(size)).abs() - ent.lip);
+            ent.mover.pos2 = ent.mover.pos1 + movedir * ((movedir.dot(size)).abs() - ent.mover.lip);
         }
 
         if self.entities[e].v.spawnflags.has(DoorFlags::START_OPEN) {
-            let pos2 = self.entities[e].pos2;
+            let pos2 = self.entities[e].mover.pos2;
             self.host.set_origin(e.0 as i32, pos2);
             let ent = &mut self.entities[e];
             ent.v.origin = pos2;
-            ent.pos2 = ent.pos1;
-            ent.pos1 = pos2;
+            ent.mover.pos2 = ent.mover.pos1;
+            ent.mover.pos1 = pos2;
         }
 
         {
             let ent = &mut self.entities[e];
-            ent.state = STATE_BOTTOM;
+            ent.mover.state = STATE_BOTTOM;
             if ent.v.health != 0.0 {
                 ent.v.takedamage = TakeDamage::Yes.as_f32();
                 ent.th_die = Die::DoorKilled;
             }
             if ent.v.items != 0.0 {
-                ent.wait = -1.0;
+                ent.mover.wait = -1.0;
             }
             ent.set_touch(Touch::DoorTouch);
             // Link once all doors have spawned.

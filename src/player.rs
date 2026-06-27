@@ -96,18 +96,18 @@ impl GameState {
             ent.v.velocity.x != 0.0 || ent.v.velocity.y != 0.0
         };
         if moving {
-            self.entities[e].walkframe = 0;
+            self.entities[e].anim.walkframe = 0;
             self.player_run(e);
             return;
         }
 
         let ent = &mut self.entities[e];
         let anim = if ent.v.weapon.is(Items::AXE) { AXSTND } else { STAND };
-        if ent.walkframe >= anim.len {
-            ent.walkframe = 0;
+        if ent.anim.walkframe >= anim.len {
+            ent.anim.walkframe = 0;
         }
-        ent.v.frame = anim.frame(ent.walkframe);
-        ent.walkframe += 1;
+        ent.v.frame = anim.frame(ent.anim.walkframe);
+        ent.anim.walkframe += 1;
     }
 
     /// `player_run` — running loop; transitions back to idle when stopped.
@@ -120,18 +120,18 @@ impl GameState {
             ent.v.velocity.x == 0.0 && ent.v.velocity.y == 0.0
         };
         if stopped {
-            self.entities[e].walkframe = 0;
+            self.entities[e].anim.walkframe = 0;
             self.player_stand1(e);
             return;
         }
 
         let ent = &mut self.entities[e];
         let anim = if ent.v.weapon.is(Items::AXE) { AXRUN } else { ROCKRUN };
-        if ent.walkframe >= anim.len {
-            ent.walkframe = 0;
+        if ent.anim.walkframe >= anim.len {
+            ent.anim.walkframe = 0;
         }
-        ent.v.frame = anim.frame(ent.walkframe);
-        ent.walkframe += 1;
+        ent.v.frame = anim.frame(ent.anim.walkframe);
+        ent.anim.walkframe += 1;
     }
 
     // --- weapon firing animations (driven by W_Attack) ---
@@ -141,12 +141,12 @@ impl GameState {
     fn start_weapon_anim(&mut self, e: EntId, anim: Anim, wf_base: i32, fire: i32, muzzle: i32) {
         {
             let ent = &mut self.entities[e];
-            ent.walkframe = 0;
-            ent.anim_base = anim.first;
-            ent.anim_wf_base = wf_base;
-            ent.anim_len = anim.len;
-            ent.anim_fire = fire;
-            ent.anim_muzzle = muzzle;
+            ent.anim.walkframe = 0;
+            ent.anim.anim_base = anim.first;
+            ent.anim.anim_wf_base = wf_base;
+            ent.anim.anim_len = anim.len;
+            ent.anim.anim_fire = fire;
+            ent.anim.anim_muzzle = muzzle;
             ent.think = Think::PlayerWeaponAnim;
         }
         // Run the first frame immediately (as the QuakeC `player_*1` body does).
@@ -176,7 +176,7 @@ impl GameState {
     pub(crate) fn player_weapon_anim(&mut self, e: EntId) {
         let (wf, base, wf_base, len, fire, muzzle) = {
             let ent = &self.entities[e];
-            (ent.walkframe, ent.anim_base, ent.anim_wf_base, ent.anim_len, ent.anim_fire, ent.anim_muzzle)
+            (ent.anim.walkframe, ent.anim.anim_base, ent.anim.anim_wf_base, ent.anim.anim_len, ent.anim.anim_fire, ent.anim.anim_muzzle)
         };
         if wf == muzzle {
             self.muzzleflash(e);
@@ -195,14 +195,14 @@ impl GameState {
         }
         let time = self.time();
         let ent = &mut self.entities[e];
-        ent.walkframe = wf + 1;
+        ent.anim.walkframe = wf + 1;
         ent.think = Think::PlayerWeaponAnim;
         ent.v.nextthink = time + 0.1;
     }
 
     /// Begin the looping nailgun fire.
     pub(crate) fn start_nail(&mut self, e: EntId) {
-        self.entities[e].walkframe = 0;
+        self.entities[e].anim.walkframe = 0;
         self.player_nail(e);
     }
 
@@ -225,21 +225,21 @@ impl GameState {
             }
         }
         self.super_damage_sound(e);
-        let parity = self.entities[e].walkframe & 1;
+        let parity = self.entities[e].anim.walkframe & 1;
         let dir = if parity == 0 { 4.0 } else { -4.0 };
         self.w_fire_spikes(e, dir);
         let time = self.time();
         let ent = &mut self.entities[e];
-        ent.attack_finished = time + 0.2;
+        ent.combat.attack_finished = time + 0.2;
         ent.v.frame = NAILATT.frame(parity);
-        ent.walkframe = parity ^ 1;
+        ent.anim.walkframe = parity ^ 1;
         ent.think = Think::PlayerNail;
         ent.v.nextthink = time + 0.1;
     }
 
     /// Begin the looping lightning fire.
     pub(crate) fn start_light(&mut self, e: EntId) {
-        self.entities[e].walkframe = 0;
+        self.entities[e].anim.walkframe = 0;
         self.player_light(e);
     }
 
@@ -260,12 +260,12 @@ impl GameState {
         }
         self.super_damage_sound(e);
         self.w_fire_lightning(e);
-        let parity = self.entities[e].walkframe & 1;
+        let parity = self.entities[e].anim.walkframe & 1;
         let time = self.time();
         let ent = &mut self.entities[e];
-        ent.attack_finished = time + 0.2;
+        ent.combat.attack_finished = time + 0.2;
         ent.v.frame = LIGHT.frame(parity);
-        ent.walkframe = parity ^ 1;
+        ent.anim.walkframe = parity ^ 1;
         ent.think = Think::PlayerLight;
         ent.v.nextthink = time + 0.1;
     }
@@ -277,8 +277,8 @@ impl GameState {
         let time = self.time();
         let ent = &mut self.entities[e];
         ent.v.frame = anim.frame(0);
-        ent.anim_end = anim.last();
-        ent.anim_after = after;
+        ent.anim.anim_end = anim.last();
+        ent.anim.anim_after = after;
         ent.think = Think::PlayerAnim;
         ent.v.nextthink = time + 0.1;
     }
@@ -287,7 +287,7 @@ impl GameState {
     pub(crate) fn player_anim_tick(&mut self, e: EntId) {
         let (frame, end, after) = {
             let ent = &self.entities[e];
-            (ent.v.frame as i32, ent.anim_end, ent.anim_after)
+            (ent.v.frame as i32, ent.anim.anim_end, ent.anim.anim_after)
         };
         if frame >= end {
             self.run_think_now(e, after);
@@ -312,7 +312,7 @@ impl GameState {
         let time = self.time();
         let (weaponframe, invisible, weapon) = {
             let ent = &self.entities[e];
-            (ent.v.weaponframe, ent.invisible_finished, ent.v.weapon)
+            (ent.v.weaponframe, ent.combat.invisible_finished, ent.v.weapon)
         };
         if weaponframe != 0.0 || invisible > time {
             return;
@@ -328,7 +328,7 @@ impl GameState {
         let time = self.time();
         let (health, watertype, waterlevel, pain_finished, axhitme) = {
             let ent = &self.entities[e];
-            (ent.v.health, ent.v.watertype, ent.v.waterlevel, ent.pain_finished, ent.axhitme)
+            (ent.v.health, ent.v.watertype, ent.v.waterlevel, ent.combat.pain_finished, ent.combat.axhitme)
         };
         if health < 0.0 {
             return;
@@ -350,12 +350,12 @@ impl GameState {
             return;
         }
         if pain_finished > time {
-            self.entities[e].axhitme = 0.0;
+            self.entities[e].combat.axhitme = 0.0;
             return;
         }
-        self.entities[e].pain_finished = time + 0.5;
+        self.entities[e].combat.pain_finished = time + 0.5;
         if axhitme == 1.0 {
-            self.entities[e].axhitme = 0.0;
+            self.entities[e].combat.axhitme = 0.0;
             self.host
                 .sound(e.0 as i32, Channel::Voice, c"player/axhit1.wav", 1.0, Attenuation::Norm);
             return;
@@ -397,10 +397,10 @@ impl GameState {
         {
             let ent = &mut self.entities[e];
             ent.v.items = ent.v.items.without(Items::INVISIBILITY);
-            ent.invisible_finished = 0.0;
-            ent.invincible_finished = 0.0;
-            ent.super_damage_finished = 0.0;
-            ent.radsuit_finished = 0.0;
+            ent.combat.invisible_finished = 0.0;
+            ent.combat.invincible_finished = 0.0;
+            ent.combat.super_damage_finished = 0.0;
+            ent.combat.radsuit_finished = 0.0;
         }
         self.drop_backpack(e);
         let vz = self.entities[e].v.velocity.z;

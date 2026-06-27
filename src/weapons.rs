@@ -56,8 +56,8 @@ impl GameState {
     pub(crate) fn super_damage_sound(&mut self, e: EntId) {
         let time = self.time();
         let ent = &self.entities[e];
-        if ent.super_damage_finished > time && ent.super_sound < time {
-            self.entities[e].super_sound = time + 1.0;
+        if ent.combat.super_damage_finished > time && ent.combat.super_sound < time {
+            self.entities[e].combat.super_sound = time + 1.0;
             self.host
                 .sound(e.0 as i32, Channel::Body, c"items/damage3.wav", 1.0, Attenuation::Norm);
         }
@@ -92,7 +92,7 @@ impl GameState {
         }
         let org = tr.endpos - v_forward * 4.0;
         if self.entities[tr.ent].v.takedamage != 0.0 {
-            self.entities[tr.ent].axhitme = 1.0;
+            self.entities[tr.ent].combat.axhitme = 1.0;
             self.spawn_blood(org, 20);
             let dmg = if self.level.deathmatch > 3 { 75.0 } else { 20.0 };
             self.t_damage(tr.ent, e, e, dmg);
@@ -216,10 +216,10 @@ impl GameState {
         if other == self.entities[e].owner() {
             return;
         }
-        if self.entities[e].voided != 0.0 {
+        if self.entities[e].combat.voided != 0.0 {
             return;
         }
-        self.entities[e].voided = 1.0;
+        self.entities[e].combat.voided = 1.0;
 
         let origin = self.entities[e].v.origin;
         if self.host.pointcontents(origin).is(Content::Sky) {
@@ -268,7 +268,7 @@ impl GameState {
             mis.v.velocity = dir * 1000.0;
             mis.v.angles = vectoangles(mis.v.velocity);
             mis.set_touch(Touch::Missile);
-            mis.voided = 0.0;
+            mis.combat.voided = 0.0;
             mis.v.nextthink = self.globals.time + 5.0;
             mis.think = Think::SubRemove;
             mis.classname = Some("rocket".into());
@@ -333,10 +333,10 @@ impl GameState {
             return;
         }
 
-        if self.entities[e].t_width < time {
+        if self.entities[e].mover.t_width < time {
             self.host
                 .sound(e.0 as i32, Channel::Weapon, c"weapons/lhit.wav", 1.0, Attenuation::Norm);
-            self.entities[e].t_width = time + 0.6;
+            self.entities[e].mover.t_width = time + 0.6;
         }
         self.small_kick(e);
         if self.level.deathmatch != 4 {
@@ -366,10 +366,10 @@ impl GameState {
 
     /// `GrenadeExplode` — timed or impact detonation.
     pub(crate) fn grenade_explode(&mut self, e: EntId) {
-        if self.entities[e].voided != 0.0 {
+        if self.entities[e].combat.voided != 0.0 {
             return;
         }
-        self.entities[e].voided = 1.0;
+        self.entities[e].combat.voided = 1.0;
         let owner = self.entities[e].owner();
         self.t_radius_damage(e, owner, 120.0, EntId::WORLD, "grenade");
 
@@ -430,7 +430,7 @@ impl GameState {
         };
         {
             let mis = &mut self.entities[m];
-            mis.voided = 0.0;
+            mis.combat.voided = 0.0;
             mis.set_owner(e);
             mis.v.movetype = MoveType::Bounce.as_f32();
             mis.v.solid = Solid::BBox.as_f32();
@@ -455,7 +455,7 @@ impl GameState {
         let m = self.spawn();
         {
             let mis = &mut self.entities[m];
-            mis.voided = 0.0;
+            mis.combat.voided = 0.0;
             mis.set_owner(e);
             mis.v.movetype = MoveType::FlyMissile.as_f32();
             mis.v.solid = Solid::BBox.as_f32();
@@ -477,7 +477,7 @@ impl GameState {
         let time = self.time();
         self.host
             .sound(e.0 as i32, Channel::Weapon, c"weapons/spike2.wav", 1.0, Attenuation::Norm);
-        self.entities[e].attack_finished = time + 0.2;
+        self.entities[e].combat.attack_finished = time + 0.2;
         if self.level.deathmatch != 4 {
             let ent = &mut self.entities[e];
             ent.v.ammo_nails -= 2.0;
@@ -515,7 +515,7 @@ impl GameState {
         }
         self.host
             .sound(e.0 as i32, Channel::Weapon, c"weapons/rocket1i.wav", 1.0, Attenuation::Norm);
-        self.entities[e].attack_finished = time + 0.2;
+        self.entities[e].combat.attack_finished = time + 0.2;
         if self.level.deathmatch != 4 {
             let ent = &mut self.entities[e];
             ent.v.ammo_nails -= 1.0;
@@ -532,10 +532,10 @@ impl GameState {
         if other == self.entities[e].owner() {
             return;
         }
-        if self.entities[e].voided != 0.0 {
+        if self.entities[e].combat.voided != 0.0 {
             return;
         }
-        self.entities[e].voided = 1.0;
+        self.entities[e].combat.voided = 1.0;
         if self.entities[other].v.solid.is(Solid::Trigger) {
             return;
         }
@@ -626,23 +626,23 @@ impl GameState {
         let time = self.time();
         let v_angle = self.entities[e].v.v_angle;
         self.host.make_vectors(v_angle);
-        self.entities[e].show_hostile = time + 1.0;
+        self.entities[e].combat.show_hostile = time + 1.0;
 
         match Items::from_f32(self.entities[e].v.weapon) {
             w if w == Items::AXE => {
-                self.entities[e].attack_finished = time + 0.5;
+                self.entities[e].combat.attack_finished = time + 0.5;
                 self.host
                     .sound(e.0 as i32, Channel::Weapon, c"weapons/ax1.wav", 1.0, Attenuation::Norm);
                 self.start_axe_anim(e);
             }
             w if w == Items::SHOTGUN => {
                 self.start_shot_anim(e);
-                self.entities[e].attack_finished = time + 0.5;
+                self.entities[e].combat.attack_finished = time + 0.5;
                 self.w_fire_shotgun(e);
             }
             w if w == Items::SUPER_SHOTGUN => {
                 self.start_shot_anim(e);
-                self.entities[e].attack_finished = time + 0.7;
+                self.entities[e].combat.attack_finished = time + 0.7;
                 self.w_fire_super_shotgun(e);
             }
             w if w == Items::NAILGUN || w == Items::SUPER_NAILGUN => {
@@ -650,16 +650,16 @@ impl GameState {
             }
             w if w == Items::GRENADE_LAUNCHER => {
                 self.start_rocket_anim(e);
-                self.entities[e].attack_finished = time + 0.6;
+                self.entities[e].combat.attack_finished = time + 0.6;
                 self.w_fire_grenade(e);
             }
             w if w == Items::ROCKET_LAUNCHER => {
                 self.start_rocket_anim(e);
-                self.entities[e].attack_finished = time + 0.8;
+                self.entities[e].combat.attack_finished = time + 0.8;
                 self.w_fire_rocket(e);
             }
             w if w == Items::LIGHTNING => {
-                self.entities[e].attack_finished = time + 0.1;
+                self.entities[e].combat.attack_finished = time + 0.1;
                 self.host
                     .sound(e.0 as i32, Channel::Auto, c"weapons/lstart.wav", 1.0, Attenuation::Norm);
                 self.start_light(e);
@@ -779,7 +779,7 @@ impl GameState {
 
     /// `W_WeaponFrame` — once per `PlayerPostThink`: handle impulses and trigger attacks.
     pub(crate) fn w_weapon_frame(&mut self, e: EntId) {
-        if self.time() < self.entities[e].attack_finished {
+        if self.time() < self.entities[e].combat.attack_finished {
             return;
         }
         self.impulse_commands(e);
