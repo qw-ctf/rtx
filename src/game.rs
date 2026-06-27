@@ -11,6 +11,7 @@ use std::ffi::CString;
 
 use glam::Vec3;
 
+use crate::assets::Sound;
 use crate::abi::{Field, GameData, GlobalVars, STRING_REF_COUNT, STRING_REF_WEAPONMODEL};
 use crate::defs;
 use crate::entity::{EntId, Entities, Entity};
@@ -44,7 +45,7 @@ enum SpawnAction {
     },
     Powerup {
         model: &'static CStr,
-        noise: &'static CStr,
+        noise: crate::assets::Sound,
         netname: &'static str,
         item_bit: defs::Items,
         effect: defs::Effects,
@@ -120,6 +121,11 @@ pub struct GameState {
     /// PRNG state (QuakeC `random()` is a VM builtin with no native syscall, so we roll
     /// our own, seeded from `GAME_INIT`'s random seed).
     rng: u32,
+    /// Escape hatch for string-declared sounds (precache-and-intern at load time). Empty for the
+    /// current port — every sound is a registry handle — but here so a runtime path is registered
+    /// through the same precache-guaranteeing door. Use `dyn_assets.sound(&host, path)`.
+    #[allow(dead_code)]
+    pub(crate) dyn_assets: crate::assets::DynAssets,
 }
 
 impl GameState {
@@ -153,6 +159,7 @@ impl GameState {
             intermission_running: false,
             intermission_exit_time: 0.0,
             rng: 0x2545_f491, // nonzero default; reseeded in GAME_INIT
+            dyn_assets: crate::assets::DynAssets::default(),
         }
     }
 
@@ -336,9 +343,9 @@ impl GameState {
 
     /// Play the entity's `.noise` sound on `chan` at full volume (no-op if unset).
     pub(crate) fn play_noise(&self, e: EntId, chan: defs::Channel) {
-        if let Some(noise) = self.entities[e].noise.as_deref() {
+        if let Some(noise) = self.entities[e].noise {
             self.host
-                .sound(e.0 as i32, chan, &cstring(noise), 1.0, defs::Attenuation::Norm);
+                .sound(e.0 as i32, chan, noise, 1.0, defs::Attenuation::Norm);
         }
     }
 
@@ -585,28 +592,28 @@ impl GameState {
             },
             "item_artifact_invulnerability" => SpawnAction::Powerup {
                 model: c"progs/invulner.mdl",
-                noise: c"items/protect.wav",
+                noise: Sound::ITEMS_PROTECT,
                 netname: "Pentagram of Protection",
                 item_bit: defs::Items::INVULNERABILITY,
                 effect: defs::Effects::RED,
             },
             "item_artifact_envirosuit" => SpawnAction::Powerup {
                 model: c"progs/suit.mdl",
-                noise: c"items/suit.wav",
+                noise: Sound::ITEMS_SUIT,
                 netname: "Biosuit",
                 item_bit: defs::Items::SUIT,
                 effect: defs::Effects::empty(),
             },
             "item_artifact_invisibility" => SpawnAction::Powerup {
                 model: c"progs/invisibl.mdl",
-                noise: c"items/inv1.wav",
+                noise: Sound::ITEMS_INV1,
                 netname: "Ring of Shadows",
                 item_bit: defs::Items::INVISIBILITY,
                 effect: defs::Effects::empty(),
             },
             "item_artifact_super_damage" => SpawnAction::Powerup {
                 model: c"progs/quaddama.mdl",
-                noise: c"items/damage.wav",
+                noise: Sound::ITEMS_DAMAGE,
                 netname: "Quad Damage",
                 item_bit: defs::Items::QUAD,
                 effect: defs::Effects::BLUE,

@@ -10,6 +10,7 @@ use core::ffi::CStr;
 
 use glam::Vec3;
 
+use crate::assets::Sound;
 use crate::defs::{Attenuation, Channel, MsgDest, Multicast, PrintLevel, Svc, Te};
 
 /// The host-provided dispatcher. Variadic, C ABI; calling it is `unsafe`.
@@ -276,15 +277,16 @@ impl HostApi {
         }
     }
 
-    /// `G_SOUND` — play `sample` from `ent` on `channel`.
-    pub fn sound(&self, ent: i32, channel: Channel, sample: &CStr, volume: f32, attenuation: Attenuation) {
-        self.sound_raw(ent, channel.as_i32(), sample, volume, attenuation);
+    /// `G_SOUND` — play `sample` from `ent` on `channel`. Takes a [`Sound`] handle, which can
+    /// only come from a precached source — so playing an unprecached sound is unrepresentable.
+    pub fn sound(&self, ent: i32, channel: Channel, sample: Sound, volume: f32, attenuation: Attenuation) {
+        self.sound_raw(ent, channel.as_i32(), sample.path(), volume, attenuation);
     }
 
     /// As [`sound`](Self::sound), but with the `CHAN_NO_PHS_ADD` modifier (channel bit 3) set so
     /// the sound bypasses the PHS cull — used for door/plat movement, audible through walls.
-    pub fn sound_no_phs(&self, ent: i32, channel: Channel, sample: &CStr, volume: f32, attenuation: Attenuation) {
-        self.sound_raw(ent, channel.as_i32() | 8, sample, volume, attenuation);
+    pub fn sound_no_phs(&self, ent: i32, channel: Channel, sample: Sound, volume: f32, attenuation: Attenuation) {
+        self.sound_raw(ent, channel.as_i32() | 8, sample.path(), volume, attenuation);
     }
 
     fn sound_raw(&self, ent: i32, channel: i32, sample: &CStr, volume: f32, attenuation: Attenuation) {
@@ -419,14 +421,14 @@ impl HostApi {
     }
 
     /// `G_AMBIENTSOUND` — attach a looping ambient sound at a point.
-    pub fn ambient_sound(&self, pos: Vec3, sample: &CStr, volume: f32, attenuation: Attenuation) {
+    pub fn ambient_sound(&self, pos: Vec3, sample: Sound, volume: f32, attenuation: Attenuation) {
         unsafe {
             (self.syscall)(
                 B::AmbientSound as isize,
                 pf(pos.x),
                 pf(pos.y),
                 pf(pos.z),
-                sample.as_ptr() as isize,
+                sample.path().as_ptr() as isize,
                 pf(volume),
                 pf(attenuation.as_f32()),
             )

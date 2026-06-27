@@ -2,10 +2,9 @@
 //! shared trigger field; the group opens and closes together. (Secret doors are spawned as
 //! static brushes — they keep the wall in place without the full slide sequence.)
 
-use core::ffi::CStr;
-
 use glam::Vec3;
 
+use crate::assets::Sound;
 use crate::defs::*;
 use crate::entity::{
     Blocked, Die, EntId, Think, Touch, Use, STATE_BOTTOM, STATE_DOWN, STATE_TOP, STATE_UP,
@@ -185,7 +184,7 @@ impl GameState {
                 self.host.centerprint(other.0 as i32, &msg);
             }
             self.host
-                .sound(other.0 as i32, Channel::Voice, c"misc/talk.wav", 1.0, Attenuation::Norm);
+                .sound(other.0 as i32, Channel::Voice, Sound::MISC_TALK, 1.0, Attenuation::Norm);
         }
 
         let items = self.entities[e].v.items;
@@ -415,48 +414,41 @@ impl GameState {
 
     // --- helpers ---
 
-    /// Set the door's `noise1..4` from its `sounds`/worldtype, precaching as we go.
+    /// Set the door's `noise1..4` from its `sounds`/worldtype.
     fn setup_door_sounds(&mut self, e: EntId) {
-        let wt = self.level.worldtype as i32;
-        let (try_s, use_s) = match wt {
-            1 => (c"doors/runetry.wav", c"doors/runeuse.wav"),
-            2 => (c"doors/basetry.wav", c"doors/baseuse.wav"),
-            _ => (c"doors/medtry.wav", c"doors/meduse.wav"),
+        let (try_s, use_s) = match self.level.worldtype as i32 {
+            1 => (Sound::DOORS_RUNETRY, Sound::DOORS_RUNEUSE),
+            2 => (Sound::DOORS_BASETRY, Sound::DOORS_BASEUSE),
+            _ => (Sound::DOORS_MEDTRY, Sound::DOORS_MEDUSE),
         };
-        self.host.precache_sound(try_s);
-        self.host.precache_sound(use_s);
-        self.entities[e].noise3 = Some(try_s.to_str().unwrap().into());
-        self.entities[e].noise4 = Some(use_s.to_str().unwrap().into());
+        self.entities[e].noise3 = Some(try_s);
+        self.entities[e].noise4 = Some(use_s);
 
-        let (n1, n2): (&'static CStr, &'static CStr) = match self.entities[e].v.sounds as i32
-        {
-            1 => (c"doors/drclos4.wav", c"doors/doormv1.wav"),
-            2 => (c"doors/hydro2.wav", c"doors/hydro1.wav"),
-            3 => (c"doors/stndr2.wav", c"doors/stndr1.wav"),
-            4 => (c"doors/ddoor2.wav", c"doors/ddoor1.wav"),
-            _ => (c"misc/null.wav", c"misc/null.wav"),
+        let (n1, n2) = match self.entities[e].v.sounds as i32 {
+            1 => (Sound::DOORS_DRCLOS4, Sound::DOORS_DOORMV1),
+            2 => (Sound::DOORS_HYDRO2, Sound::DOORS_HYDRO1),
+            3 => (Sound::DOORS_STNDR2, Sound::DOORS_STNDR1),
+            4 => (Sound::DOORS_DDOOR2, Sound::DOORS_DDOOR1),
+            _ => (Sound::MISC_NULL, Sound::MISC_NULL),
         };
-        self.host.precache_sound(n1);
-        self.host.precache_sound(n2);
-        self.entities[e].noise1 = Some(n1.to_str().unwrap().into());
-        self.entities[e].noise2 = Some(n2.to_str().unwrap().into());
+        self.entities[e].noise1 = Some(n1);
+        self.entities[e].noise2 = Some(n2);
     }
 
     /// Play the door's `noiseN` (1..4) on `chan`.
     fn play_door(&mut self, e: EntId, no_phs: bool, which: i32) {
         let noise = match which {
-            1 => self.entities[e].noise1.clone(),
-            2 => self.entities[e].noise2.clone(),
-            3 => self.entities[e].noise3.clone(),
-            _ => self.entities[e].noise4.clone(),
+            1 => self.entities[e].noise1,
+            2 => self.entities[e].noise2,
+            3 => self.entities[e].noise3,
+            _ => self.entities[e].noise4,
         };
         if let Some(noise) = noise {
-            let c = crate::game::cstring(&noise);
             let ent = e.0 as i32;
             if no_phs {
-                self.host.sound_no_phs(ent, Channel::Voice, &c, 1.0, Attenuation::Norm);
+                self.host.sound_no_phs(ent, Channel::Voice, noise, 1.0, Attenuation::Norm);
             } else {
-                self.host.sound(ent, Channel::Voice, &c, 1.0, Attenuation::Norm);
+                self.host.sound(ent, Channel::Voice, noise, 1.0, Attenuation::Norm);
             }
         }
     }

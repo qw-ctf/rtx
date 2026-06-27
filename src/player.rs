@@ -10,6 +10,7 @@ use core::ffi::CStr;
 
 use glam::Vec3;
 
+use crate::assets::Sound;
 use crate::anim::{Anim, frames};
 use crate::defs::*;
 use crate::entity::{EntId, Think};
@@ -335,17 +336,17 @@ impl GameState {
         }
         if self.entities[self.damage_attacker].classname() == Some("teledeath") {
             self.host
-                .sound(e.0 as i32, Channel::Voice, c"player/teledth1.wav", 1.0, Attenuation::None);
+                .sound(e.0 as i32, Channel::Voice, Sound::PLAYER_TELEDTH1, 1.0, Attenuation::None);
             return;
         }
         if watertype.is(Content::Water) && waterlevel == 3.0 {
             self.death_bubbles(e, 1.0);
-            let s = if self.random() > 0.5 { c"player/drown1.wav" } else { c"player/drown2.wav" };
+            let s = if self.random() > 0.5 { Sound::PLAYER_DROWN1 } else { Sound::PLAYER_DROWN2 };
             self.host.sound(e.0 as i32, Channel::Voice, s, 1.0, Attenuation::Norm);
             return;
         }
         if watertype.is(Content::Slime) || watertype.is(Content::Lava) {
-            let s = if self.random() > 0.5 { c"player/lburn1.wav" } else { c"player/lburn2.wav" };
+            let s = if self.random() > 0.5 { Sound::PLAYER_LBURN1 } else { Sound::PLAYER_LBURN2 };
             self.host.sound(e.0 as i32, Channel::Voice, s, 1.0, Attenuation::Norm);
             return;
         }
@@ -357,17 +358,17 @@ impl GameState {
         if axhitme == 1.0 {
             self.entities[e].combat.axhitme = 0.0;
             self.host
-                .sound(e.0 as i32, Channel::Voice, c"player/axhit1.wav", 1.0, Attenuation::Norm);
+                .sound(e.0 as i32, Channel::Voice, Sound::PLAYER_AXHIT1, 1.0, Attenuation::Norm);
             return;
         }
         let rs = (self.random() * 5.0).round() as i32 + 1;
         let noise = match rs {
-            1 => c"player/pain1.wav",
-            2 => c"player/pain2.wav",
-            3 => c"player/pain3.wav",
-            4 => c"player/pain4.wav",
-            5 => c"player/pain5.wav",
-            _ => c"player/pain6.wav",
+            1 => Sound::PLAYER_PAIN1,
+            2 => Sound::PLAYER_PAIN2,
+            3 => Sound::PLAYER_PAIN3,
+            4 => Sound::PLAYER_PAIN4,
+            5 => Sound::PLAYER_PAIN5,
+            _ => Sound::PLAYER_PAIN6,
         };
         self.host.sound(e.0 as i32, Channel::Voice, noise, 1.0, Attenuation::Norm);
     }
@@ -377,16 +378,16 @@ impl GameState {
         if self.entities[e].v.waterlevel == 3.0 {
             self.death_bubbles(e, 5.0);
             self.host
-                .sound(e.0 as i32, Channel::Voice, c"player/h2odeath.wav", 1.0, Attenuation::None);
+                .sound(e.0 as i32, Channel::Voice, Sound::PLAYER_H2ODEATH, 1.0, Attenuation::None);
             return;
         }
         let rs = (self.random() * 4.0).round() as i32 + 1;
         let noise = match rs {
-            1 => c"player/death1.wav",
-            2 => c"player/death2.wav",
-            3 => c"player/death3.wav",
-            4 => c"player/death4.wav",
-            _ => c"player/death5.wav",
+            1 => Sound::PLAYER_DEATH1,
+            2 => Sound::PLAYER_DEATH2,
+            3 => Sound::PLAYER_DEATH3,
+            4 => Sound::PLAYER_DEATH4,
+            _ => Sound::PLAYER_DEATH5,
         };
         self.host.sound(e.0 as i32, Channel::Voice, noise, 1.0, Attenuation::None);
     }
@@ -537,10 +538,10 @@ impl GameState {
         self.entities[e].v.deadflag = DeadFlag::Dead.as_f32();
         if self.entities[self.damage_attacker].classname() == Some("teledeath") {
             self.host
-                .sound(e.0 as i32, Channel::Voice, c"player/teledth1.wav", 1.0, Attenuation::None);
+                .sound(e.0 as i32, Channel::Voice, Sound::PLAYER_TELEDTH1, 1.0, Attenuation::None);
             return;
         }
-        let s = if self.random() < 0.5 { c"player/gib.wav" } else { c"player/udeath.wav" };
+        let s = if self.random() < 0.5 { Sound::PLAYER_GIB } else { Sound::PLAYER_UDEATH };
         self.host.sound(e.0 as i32, Channel::Voice, s, 1.0, Attenuation::None);
     }
 

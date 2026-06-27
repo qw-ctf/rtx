@@ -3,6 +3,7 @@
 
 use glam::Vec3;
 
+use crate::assets::Sound;
 use crate::defs::*;
 use crate::entity::{
     Blocked, EntId, Think, Touch, Use, STATE_BOTTOM, STATE_DOWN, STATE_TOP, STATE_UP,
@@ -14,17 +15,16 @@ impl GameState {
 
     fn plat_sound(&mut self, e: EntId, no_phs: bool, which: i32) {
         let noise = if which == 0 {
-            self.entities[e].noise.clone()
+            self.entities[e].noise
         } else {
-            self.entities[e].noise1.clone()
+            self.entities[e].noise1
         };
         if let Some(noise) = noise {
-            let c = crate::game::cstring(&noise);
             let ent = e.0 as i32;
             if no_phs {
-                self.host.sound_no_phs(ent, Channel::Voice, &c, 1.0, Attenuation::Norm);
+                self.host.sound_no_phs(ent, Channel::Voice, noise, 1.0, Attenuation::Norm);
             } else {
-                self.host.sound(ent, Channel::Voice, &c, 1.0, Attenuation::Norm);
+                self.host.sound(ent, Channel::Voice, noise, 1.0, Attenuation::Norm);
             }
         }
     }
@@ -157,16 +157,12 @@ impl GameState {
         }
         match self.entities[e].v.sounds as i32 {
             1 => {
-                self.host.precache_sound(c"plats/plat1.wav");
-                self.host.precache_sound(c"plats/plat2.wav");
-                self.entities[e].noise = Some("plats/plat1.wav".into());
-                self.entities[e].noise1 = Some("plats/plat2.wav".into());
+                self.entities[e].noise = Some(Sound::PLATS_PLAT1);
+                self.entities[e].noise1 = Some(Sound::PLATS_PLAT2);
             }
             _ => {
-                self.host.precache_sound(c"plats/medplat1.wav");
-                self.host.precache_sound(c"plats/medplat2.wav");
-                self.entities[e].noise = Some("plats/medplat1.wav".into());
-                self.entities[e].noise1 = Some("plats/medplat2.wav".into());
+                self.entities[e].noise = Some(Sound::PLATS_MEDPLAT1);
+                self.entities[e].noise1 = Some(Sound::PLATS_MEDPLAT2);
             }
         }
 
@@ -322,15 +318,12 @@ impl GameState {
         }
         match self.entities[e].v.sounds as i32 {
             1 => {
-                self.host.precache_sound(c"plats/train2.wav");
-                self.host.precache_sound(c"plats/train1.wav");
-                self.entities[e].noise = Some("plats/train2.wav".into());
-                self.entities[e].noise1 = Some("plats/train1.wav".into());
+                self.entities[e].noise = Some(Sound::PLATS_TRAIN2);
+                self.entities[e].noise1 = Some(Sound::PLATS_TRAIN1);
             }
             _ => {
-                self.host.precache_sound(c"misc/null.wav");
-                self.entities[e].noise = Some("misc/null.wav".into());
-                self.entities[e].noise1 = Some("misc/null.wav".into());
+                self.entities[e].noise = Some(Sound::MISC_NULL);
+                self.entities[e].noise1 = Some(Sound::MISC_NULL);
             }
         }
         {

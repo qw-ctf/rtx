@@ -6,6 +6,7 @@
 
 use glam::Vec3;
 
+use crate::assets::Sound;
 use crate::defs::*;
 use crate::entity::{EntId, Think, Use};
 use crate::game::GameState;
@@ -135,7 +136,7 @@ impl GameState {
             }
             if self.entities[e].noise.is_none() {
                 self.host
-                    .sound(activator.0 as i32, Channel::Voice, c"misc/talk.wav", 1.0, Attenuation::Norm);
+                    .sound(activator.0 as i32, Channel::Voice, Sound::MISC_TALK, 1.0, Attenuation::Norm);
             }
         }
 

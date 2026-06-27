@@ -246,11 +246,13 @@ pub struct Entity {
     pub killtarget: Option<Box<str>>,
     pub message: Option<Box<str>>,
     pub netname: Option<Box<str>>,
-    pub noise: Option<Box<str>>,
-    pub noise1: Option<Box<str>>,
-    pub noise2: Option<Box<str>>,
-    pub noise3: Option<Box<str>>,
-    pub noise4: Option<Box<str>>,
+    // Mover sound slots (door/plat/button). Typed `Sound` handles so they're provably precached;
+    // these are our own state, distinct from the engine-visible `EntVars.noise*` string slots.
+    pub noise: Option<crate::assets::Sound>,
+    pub noise1: Option<crate::assets::Sound>,
+    pub noise2: Option<crate::assets::Sound>,
+    pub noise3: Option<crate::assets::Sound>,
+    pub noise4: Option<crate::assets::Sound>,
     pub deathtype: Option<Box<str>>,
     pub mdl: Option<Box<str>>,
     /// `trigger_changelevel`'s destination map name.

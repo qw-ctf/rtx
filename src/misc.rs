@@ -7,6 +7,7 @@ use core::ffi::CStr;
 
 use glam::Vec3;
 
+use crate::assets::Sound;
 use crate::defs::*;
 use crate::entity::{Die, EntId, Use};
 use crate::game::GameState;
@@ -53,10 +54,9 @@ impl GameState {
         self.host.set_model(e.0 as i32, model);
         self.entities[e].v.frame = frame;
         if fire {
-            self.host.precache_sound(c"ambience/fire1.wav");
             let origin = self.entities[e].v.origin;
             self.host
-                .ambient_sound(origin, c"ambience/fire1.wav", 0.5, Attenuation::Static);
+                .ambient_sound(origin, Sound::AMBIENCE_FIRE1, 0.5, Attenuation::Static);
         }
         true
     }
@@ -69,10 +69,9 @@ impl GameState {
             let on = !self.entities[e].v.spawnflags.has(LightFlags::START_OFF);
             self.host.lightstyle(style, if on { c"m" } else { c"a" });
         }
-        self.host.precache_sound(c"ambience/fl_hum1.wav");
         let origin = self.entities[e].v.origin;
         self.host
-            .ambient_sound(origin, c"ambience/fl_hum1.wav", 0.5, Attenuation::Static);
+            .ambient_sound(origin, Sound::AMBIENCE_FL_HUM1, 0.5, Attenuation::Static);
         true
     }
 
@@ -81,10 +80,9 @@ impl GameState {
         if self.entities[e].v.skin == 0.0 {
             self.entities[e].v.skin = 10.0;
         }
-        self.host.precache_sound(c"ambience/buzz1.wav");
         let origin = self.entities[e].v.origin;
         self.host
-            .ambient_sound(origin, c"ambience/buzz1.wav", 0.5, Attenuation::Static);
+            .ambient_sound(origin, Sound::AMBIENCE_BUZZ1, 0.5, Attenuation::Static);
         true
     }
 
@@ -153,7 +151,6 @@ impl GameState {
         self.entities[e].model_cstr = Some(model);
         self.host.set_model(e.0 as i32, model);
         self.host.set_size(e.0 as i32, Vec3::ZERO, size);
-        self.host.precache_sound(c"weapons/r_exp3.wav");
         {
             let ent = &mut self.entities[e];
             ent.v.health = 20.0;

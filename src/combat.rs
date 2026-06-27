@@ -6,6 +6,7 @@
 
 use glam::Vec3;
 
+use crate::assets::Sound;
 use crate::defs::*;
 use crate::entity::{EntId, Touch};
 use crate::game::GameState;
@@ -144,7 +145,7 @@ impl GameState {
         if self.entities[targ].combat.invincible_finished >= time {
             if self.entities[targ].combat.invincible_sound < time {
                 self.host
-                    .sound(targ.0 as i32, Channel::Item, c"items/protect3.wav", 1.0, Attenuation::Norm);
+                    .sound(targ.0 as i32, Channel::Item, Sound::ITEMS_PROTECT3, 1.0, Attenuation::Norm);
                 self.entities[targ].combat.invincible_sound = time + 2.0;
             }
             return;

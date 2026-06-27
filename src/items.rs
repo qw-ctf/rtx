@@ -6,6 +6,7 @@ use core::ffi::CStr;
 
 use glam::Vec3;
 
+use crate::assets::Sound;
 use crate::defs::*;
 use crate::entity::{EntId, Think, Touch};
 use crate::game::GameState;
@@ -194,7 +195,7 @@ impl GameState {
         }
         self.entities[e].v.solid = Solid::Trigger.as_f32();
         self.host
-            .sound(e.0 as i32, Channel::Voice, c"items/itembk2.wav", 1.0, Attenuation::Norm);
+            .sound(e.0 as i32, Channel::Voice, Sound::ITEMS_ITEMBK2, 1.0, Attenuation::Norm);
         let origin = self.entities[e].v.origin;
         self.host.set_origin(e.0 as i32, origin);
     }
@@ -334,7 +335,7 @@ impl GameState {
         }
         self.sprint_low(other, "You got armor\n");
         self.host
-            .sound(other.0 as i32, Channel::Item, c"items/armor1.wav", 1.0, Attenuation::Norm);
+            .sound(other.0 as i32, Channel::Item, Sound::ITEMS_ARMOR1, 1.0, Attenuation::Norm);
         self.host.stuffcmd(other.0 as i32, c"bf\n");
         let delay = if self.level.deathmatch != 2 { Some(20.0) } else { None };
         self.pickup_finish(e, other, delay);
@@ -372,7 +373,7 @@ impl GameState {
         let netname = self.netname_of(e);
         self.sprint_low(other, &format!("You got the {netname}\n"));
         self.host
-            .sound(other.0 as i32, Channel::Item, c"weapons/pkup.wav", 1.0, Attenuation::Norm);
+            .sound(other.0 as i32, Channel::Item, Sound::WEAPONS_PKUP, 1.0, Attenuation::Norm);
         self.host.stuffcmd(other.0 as i32, c"bf\n");
 
         self.bound_other_ammo(other);
@@ -422,7 +423,7 @@ impl GameState {
         let netname = self.netname_of(e);
         self.sprint_low(other, &format!("You got the {netname}\n"));
         self.host
-            .sound(other.0 as i32, Channel::Item, c"weapons/lock4.wav", 1.0, Attenuation::Norm);
+            .sound(other.0 as i32, Channel::Item, Sound::WEAPONS_LOCK4, 1.0, Attenuation::Norm);
         self.host.stuffcmd(other.0 as i32, c"bf\n");
 
         // Switch up to a better weapon if we were already on our best.
@@ -532,7 +533,7 @@ impl GameState {
         let netname = self.netname_of(e);
         self.sprint_low(other, &format!("You get {netname}\n"));
         self.host
-            .sound(other.0 as i32, Channel::Item, c"weapons/lock4.wav", 1.0, Attenuation::Norm);
+            .sound(other.0 as i32, Channel::Item, Sound::WEAPONS_LOCK4, 1.0, Attenuation::Norm);
         self.host.stuffcmd(other.0 as i32, c"bf\n");
 
         self.free(e);
@@ -645,10 +646,8 @@ impl GameState {
 
     /// Pickup sound on `chan` using the item's `noise`, then a screen flash.
     fn item_pickup_sound(&mut self, e: EntId, other: EntId, chan: Channel) {
-        let noise = self.entities[e].noise.clone();
-        if let Some(noise) = noise {
-            let c = crate::game::cstring(&noise);
-            self.host.sound(other.0 as i32, chan, &c, 1.0, Attenuation::Norm);
+        if let Some(noise) = self.entities[e].noise {
+            self.host.sound(other.0 as i32, chan, noise, 1.0, Attenuation::Norm);
         }
         self.host.stuffcmd(other.0 as i32, c"bf\n");
     }
@@ -674,8 +673,8 @@ impl GameState {
         self.entities[e].v.spawnflags
     }
 
-    fn set_noise(&mut self, e: EntId, noise: &'static str) {
-        self.entities[e].noise = Some(noise.into());
+    fn set_noise(&mut self, e: EntId, noise: Sound) {
+        self.entities[e].noise = Some(noise);
     }
 
     pub(crate) fn spawn_item_health(&mut self, e: EntId) -> bool {
@@ -683,25 +682,22 @@ impl GameState {
         let flags = self.spawnflags(e);
         if flags.has(HealthFlags::ROTTEN) {
             self.host.precache_model(c"maps/b_bh10.bsp");
-            self.host.precache_sound(c"items/r_item1.wav");
             self.set_item_model(e, c"maps/b_bh10.bsp");
-            self.set_noise(e, "items/r_item1.wav");
+            self.set_noise(e, Sound::ITEMS_R_ITEM1);
             let ent = &mut self.entities[e];
             ent.item.healamount = 15.0;
             ent.item.healtype = 0.0;
         } else if flags.has(HealthFlags::MEGA) {
             self.host.precache_model(c"maps/b_bh100.bsp");
-            self.host.precache_sound(c"items/r_item2.wav");
             self.set_item_model(e, c"maps/b_bh100.bsp");
-            self.set_noise(e, "items/r_item2.wav");
+            self.set_noise(e, Sound::ITEMS_R_ITEM2);
             let ent = &mut self.entities[e];
             ent.item.healamount = 100.0;
             ent.item.healtype = 2.0;
         } else {
             self.host.precache_model(c"maps/b_bh25.bsp");
-            self.host.precache_sound(c"items/health1.wav");
             self.set_item_model(e, c"maps/b_bh25.bsp");
-            self.set_noise(e, "items/health1.wav");
+            self.set_noise(e, Sound::ITEMS_HEALTH1);
             let ent = &mut self.entities[e];
             ent.item.healamount = 25.0;
             ent.item.healtype = 1.0;
@@ -785,17 +781,15 @@ impl GameState {
         &mut self,
         e: EntId,
         model: &'static CStr,
-        noise: &'static CStr,
+        noise: Sound,
         netname: &'static str,
         item_bit: Items,
         effect: Effects,
     ) -> bool {
         self.host.precache_model(model);
-        // `noise` must be `'static`: the engine keeps the precache pointer for the level.
-        self.host.precache_sound(noise);
         self.entities[e].set_touch(Touch::ItemPowerup);
         self.set_item_model(e, model);
-        self.set_noise(e, noise.to_str().unwrap_or(""));
+        self.set_noise(e, noise);
         {
             let ent = &mut self.entities[e];
             ent.netname = Some(netname.into());

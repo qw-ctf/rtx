@@ -1,6 +1,7 @@
 //! `func_button`, ported from `qw-qc/buttons.qc`. A button slides to `pos2` when touched,
 //! shot, or used, fires its targets, waits, then slides back to `pos1`.
 
+use crate::assets::Sound;
 use crate::defs::*;
 use crate::entity::{Die, EntId, Think, Touch, Use, STATE_BOTTOM, STATE_DOWN, STATE_TOP, STATE_UP};
 use crate::game::GameState;
@@ -86,16 +87,12 @@ impl GameState {
 
     /// `func_button` spawn.
     pub(crate) fn spawn_func_button(&mut self, e: EntId) -> bool {
-        let noise = match self.entities[e].v.sounds as i32 {
-            0 => Some(("buttons/airbut1.wav", c"buttons/airbut1.wav")),
-            1 => Some(("buttons/switch21.wav", c"buttons/switch21.wav")),
-            2 => Some(("buttons/switch02.wav", c"buttons/switch02.wav")),
-            _ => Some(("buttons/switch04.wav", c"buttons/switch04.wav")),
-        };
-        if let Some((noise, c)) = noise {
-            self.host.precache_sound(c);
-            self.entities[e].noise = Some(noise.into());
-        }
+        self.entities[e].noise = Some(match self.entities[e].v.sounds as i32 {
+            0 => Sound::BUTTONS_AIRBUT1,
+            1 => Sound::BUTTONS_SWITCH21,
+            2 => Sound::BUTTONS_SWITCH02,
+            _ => Sound::BUTTONS_SWITCH04,
+        });
 
         self.set_movedir(e);
         {

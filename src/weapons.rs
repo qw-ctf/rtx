@@ -8,6 +8,7 @@ use core::ffi::CStr;
 
 use glam::Vec3;
 
+use crate::assets::Sound;
 use crate::defs::*;
 use crate::entity::{Die, EntId, Think, Touch};
 use crate::game::GameState;
@@ -141,7 +142,7 @@ impl GameState {
         if ent.combat.super_damage_finished > time && ent.combat.super_sound < time {
             self.entities[e].combat.super_sound = time + 1.0;
             self.host
-                .sound(e.0 as i32, Channel::Body, c"items/damage3.wav", 1.0, Attenuation::Norm);
+                .sound(e.0 as i32, Channel::Body, Sound::ITEMS_DAMAGE3, 1.0, Attenuation::Norm);
         }
     }
 
@@ -187,7 +188,7 @@ impl GameState {
             self.t_damage(tr.ent, e, e, dmg);
         } else {
             self.host
-                .sound(e.0 as i32, Channel::Weapon, c"player/axhit2.wav", 1.0, Attenuation::Norm);
+                .sound(e.0 as i32, Channel::Weapon, Sound::PLAYER_AXHIT2, 1.0, Attenuation::Norm);
             self.host.write_te(MsgDest::Multicast, Te::Gunshot);
             self.host.write_byte(MsgDest::Multicast, 3);
             self.write_coords(MsgDest::Multicast, org);
@@ -283,7 +284,7 @@ impl GameState {
     /// `W_FireShotgun`.
     fn w_fire_shotgun(&mut self, e: EntId) {
         self.host
-            .sound(e.0 as i32, Channel::Weapon, c"weapons/guncock.wav", 1.0, Attenuation::Norm);
+            .sound(e.0 as i32, Channel::Weapon, Sound::WEAPONS_GUNCOCK, 1.0, Attenuation::Norm);
         self.small_kick(e);
         if self.level.deathmatch != 4 {
             let ent = &mut self.entities[e];
@@ -301,7 +302,7 @@ impl GameState {
             return;
         }
         self.host
-            .sound(e.0 as i32, Channel::Weapon, c"weapons/shotgn2.wav", 1.0, Attenuation::Norm);
+            .sound(e.0 as i32, Channel::Weapon, Sound::WEAPONS_SHOTGN2, 1.0, Attenuation::Norm);
         self.big_kick(e);
         if self.level.deathmatch != 4 {
             let ent = &mut self.entities[e];
@@ -357,7 +358,7 @@ impl GameState {
             ent.v.currentammo = ent.v.ammo_rockets;
         }
         self.host
-            .sound(e.0 as i32, Channel::Weapon, c"weapons/sgun1.wav", 1.0, Attenuation::Norm);
+            .sound(e.0 as i32, Channel::Weapon, Sound::WEAPONS_SGUN1, 1.0, Attenuation::Norm);
         self.small_kick(e);
 
         let origin = self.entities[e].v.origin;
@@ -462,7 +463,7 @@ impl GameState {
 
         if self.entities[e].mover.t_width < time {
             self.host
-                .sound(e.0 as i32, Channel::Weapon, c"weapons/lhit.wav", 1.0, Attenuation::Norm);
+                .sound(e.0 as i32, Channel::Weapon, Sound::WEAPONS_LHIT, 1.0, Attenuation::Norm);
             self.entities[e].mover.t_width = time + 0.6;
         }
         self.small_kick(e);
@@ -517,7 +518,7 @@ impl GameState {
             return;
         }
         self.host
-            .sound(e.0 as i32, Channel::Weapon, c"weapons/bounce.wav", 1.0, Attenuation::Norm);
+            .sound(e.0 as i32, Channel::Weapon, Sound::WEAPONS_BOUNCE, 1.0, Attenuation::Norm);
         if self.entities[e].v.velocity == Vec3::ZERO {
             self.entities[e].v.avelocity = Vec3::ZERO;
         }
@@ -532,7 +533,7 @@ impl GameState {
             ent.v.currentammo = ent.v.ammo_rockets;
         }
         self.host
-            .sound(e.0 as i32, Channel::Weapon, c"weapons/grenade.wav", 1.0, Attenuation::Norm);
+            .sound(e.0 as i32, Channel::Weapon, Sound::WEAPONS_GRENADE, 1.0, Attenuation::Norm);
         self.small_kick(e);
 
         let (origin, v_angle) = {
@@ -614,7 +615,7 @@ impl GameState {
     fn w_fire_super_spikes(&mut self, e: EntId) {
         let time = self.time();
         self.host
-            .sound(e.0 as i32, Channel::Weapon, c"weapons/spike2.wav", 1.0, Attenuation::Norm);
+            .sound(e.0 as i32, Channel::Weapon, Sound::WEAPONS_SPIKE2, 1.0, Attenuation::Norm);
         self.entities[e].combat.attack_finished = time + 0.2;
         if self.level.deathmatch != 4 {
             let ent = &mut self.entities[e];
@@ -652,7 +653,7 @@ impl GameState {
             return;
         }
         self.host
-            .sound(e.0 as i32, Channel::Weapon, c"weapons/rocket1i.wav", 1.0, Attenuation::Norm);
+            .sound(e.0 as i32, Channel::Weapon, Sound::WEAPONS_ROCKET1I, 1.0, Attenuation::Norm);
         self.entities[e].combat.attack_finished = time + 0.2;
         if self.level.deathmatch != 4 {
             let ent = &mut self.entities[e];
@@ -774,7 +775,7 @@ impl GameState {
             w if w == Items::AXE => {
                 self.entities[e].combat.attack_finished = time + 0.5;
                 self.host
-                    .sound(e.0 as i32, Channel::Weapon, c"weapons/ax1.wav", 1.0, Attenuation::Norm);
+                    .sound(e.0 as i32, Channel::Weapon, Sound::WEAPONS_AX1, 1.0, Attenuation::Norm);
                 self.start_axe_anim(e);
             }
             w if w == Items::SHOTGUN => {
@@ -803,7 +804,7 @@ impl GameState {
             w if w == Items::LIGHTNING => {
                 self.entities[e].combat.attack_finished = time + 0.1;
                 self.host
-                    .sound(e.0 as i32, Channel::Auto, c"weapons/lstart.wav", 1.0, Attenuation::Norm);
+                    .sound(e.0 as i32, Channel::Auto, Sound::WEAPONS_LSTART, 1.0, Attenuation::Norm);
                 self.start_light(e);
             }
             _ => {}

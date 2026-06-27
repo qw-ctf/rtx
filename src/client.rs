@@ -7,6 +7,7 @@ use core::ffi::CStr;
 
 use glam::Vec3;
 
+use crate::assets::Sound;
 use crate::abi::EntVars;
 use crate::defs::*;
 use crate::entity::{Die, EntId, Pain};
@@ -127,7 +128,7 @@ impl GameState {
         let message = format!("{name} left the game with {frags} frags\n");
         self.broadcast(PrintLevel::High, &message);
         self.host
-            .sound(player.0 as i32, Channel::Body, c"player/tornoff2.wav", 1.0, Attenuation::None);
+            .sound(player.0 as i32, Channel::Body, Sound::PLAYER_TORNOFF2, 1.0, Attenuation::None);
     }
 
     /// `SetNewParms` — default spawn parameters for a fresh player.
@@ -288,15 +289,15 @@ impl GameState {
         if jump_flag < -300.0 && on_ground {
             if watertype.is(Content::Water) {
                 self.host
-                    .sound(e.0 as i32, Channel::Body, c"player/h2ojump.wav", 1.0, Attenuation::Norm);
+                    .sound(e.0 as i32, Channel::Body, Sound::PLAYER_H2OJUMP, 1.0, Attenuation::Norm);
             } else if jump_flag < -650.0 {
                 self.entities[e].deathtype = Some("falling".into());
                 self.t_damage(e, EntId::WORLD, EntId::WORLD, 5.0);
                 self.host
-                    .sound(e.0 as i32, Channel::Voice, c"player/land2.wav", 1.0, Attenuation::Norm);
+                    .sound(e.0 as i32, Channel::Voice, Sound::PLAYER_LAND2, 1.0, Attenuation::Norm);
             } else {
                 self.host
-                    .sound(e.0 as i32, Channel::Voice, c"player/land.wav", 1.0, Attenuation::Norm);
+                    .sound(e.0 as i32, Channel::Voice, Sound::PLAYER_LAND, 1.0, Attenuation::Norm);
             }
         }
         self.entities[e].combat.jump_flag = self.entities[e].v.velocity.z;
@@ -400,7 +401,7 @@ impl GameState {
         if waterlevel >= 2.0 {
             if swim_flag < time {
                 self.entities[e].combat.swim_flag = time + 1.0;
-                let s = if self.random() < 0.5 { c"misc/water1.wav" } else { c"misc/water2.wav" };
+                let s = if self.random() < 0.5 { Sound::MISC_WATER1 } else { Sound::MISC_WATER2 };
                 self.host.sound(e.0 as i32, Channel::Body, s, 1.0, Attenuation::Norm);
             }
             return;
@@ -440,7 +441,7 @@ impl GameState {
             v.button2 = 0.0;
         }
         self.host
-            .sound(e.0 as i32, Channel::Body, c"player/plyrjmp8.wav", 1.0, Attenuation::Norm);
+            .sound(e.0 as i32, Channel::Body, Sound::PLAYER_PLYRJMP8, 1.0, Attenuation::Norm);
     }
 
     /// The upward speed of the rising `MoveType::Push` lift the player is standing on, or `0`.
@@ -588,10 +589,10 @@ impl GameState {
         if waterlevel != 3.0 {
             if air_finished < time {
                 self.host
-                    .sound(e.0 as i32, Channel::Voice, c"player/gasp2.wav", 1.0, Attenuation::Norm);
+                    .sound(e.0 as i32, Channel::Voice, Sound::PLAYER_GASP2, 1.0, Attenuation::Norm);
             } else if air_finished < time + 9.0 {
                 self.host
-                    .sound(e.0 as i32, Channel::Voice, c"player/gasp1.wav", 1.0, Attenuation::Norm);
+                    .sound(e.0 as i32, Channel::Voice, Sound::PLAYER_GASP1, 1.0, Attenuation::Norm);
             }
             let ent = &mut self.entities[e];
             ent.combat.air_finished = time + 12.0;
@@ -610,7 +611,7 @@ impl GameState {
         if waterlevel == 0.0 {
             if self.entities[e].v.flags.has(Flags::INWATER) {
                 self.host
-                    .sound(e.0 as i32, Channel::Body, c"misc/outwater.wav", 1.0, Attenuation::Norm);
+                    .sound(e.0 as i32, Channel::Body, Sound::MISC_OUTWATER, 1.0, Attenuation::Norm);
                 let ent = &mut self.entities[e];
                 ent.v.flags = ent.v.flags.without(Flags::INWATER);
             }
@@ -632,9 +633,9 @@ impl GameState {
 
         if !self.entities[e].v.flags.has(Flags::INWATER) {
             let s = match watertype {
-                w if w.is(Content::Lava) => Some(c"player/inlava.wav"),
-                w if w.is(Content::Water) => Some(c"player/inh2o.wav"),
-                w if w.is(Content::Slime) => Some(c"player/slimbrn2.wav"),
+                w if w.is(Content::Lava) => Some(Sound::PLAYER_INLAVA),
+                w if w.is(Content::Water) => Some(Sound::PLAYER_INH2O),
+                w if w.is(Content::Slime) => Some(Sound::PLAYER_SLIMBRN2),
                 _ => None,
             };
             if let Some(s) = s {
@@ -657,7 +658,7 @@ impl GameState {
         if self.entities[e].combat.invisible_finished != 0.0 {
             if self.entities[e].combat.invisible_sound < time {
                 self.host
-                    .sound(e.0 as i32, Channel::Auto, c"items/inv3.wav", 0.5, Attenuation::Idle);
+                    .sound(e.0 as i32, Channel::Auto, Sound::ITEMS_INV3, 0.5, Attenuation::Idle);
                 let r = (self.random() * 3.0) + 1.0;
                 self.entities[e].combat.invisible_sound = time + r;
             }
@@ -666,7 +667,7 @@ impl GameState {
                     e,
                     PowerupKind::Invisibility,
                     c"Ring of Shadows magic is fading\n",
-                    c"items/inv2.wav",
+                    Sound::ITEMS_INV2,
                 );
             }
             if self.entities[e].combat.invisible_finished < time {
@@ -690,7 +691,7 @@ impl GameState {
                     e,
                     PowerupKind::Invulnerability,
                     c"Protection is almost burned out\n",
-                    c"items/protect2.wav",
+                    Sound::ITEMS_PROTECT2,
                 );
             }
             if self.entities[e].combat.invincible_finished < time {
@@ -710,7 +711,7 @@ impl GameState {
                 } else {
                     c"Quad Damage is wearing off\n"
                 };
-                self.powerup_warn(e, PowerupKind::Quad, msg, c"items/damage2.wav");
+                self.powerup_warn(e, PowerupKind::Quad, msg, Sound::ITEMS_DAMAGE2);
             }
             if self.entities[e].combat.super_damage_finished < time {
                 let dm4 = self.level.deathmatch == 4;
@@ -736,7 +737,7 @@ impl GameState {
                     e,
                     PowerupKind::Biosuit,
                     c"Air supply in Biosuit expiring\n",
-                    c"items/suit2.wav",
+                    Sound::ITEMS_SUIT2,
                 );
             }
             if self.entities[e].combat.radsuit_finished < time {
@@ -750,7 +751,7 @@ impl GameState {
 
     /// Shared "powerup almost out" flash/sound bookkeeping for [`Self::check_powerups`].
     /// `kind` selects the per-powerup `*_time` latch.
-    fn powerup_warn(&mut self, e: EntId, kind: PowerupKind, msg: &CStr, sound: &CStr) {
+    fn powerup_warn(&mut self, e: EntId, kind: PowerupKind, msg: &CStr, sound: Sound) {
         let time = self.time();
         let latch = match kind {
             PowerupKind::Invisibility => self.entities[e].combat.invisible_time,

@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 
 mod abi;
 mod anim;
+mod assets;
 mod buttons;
 mod client;
 mod combat;

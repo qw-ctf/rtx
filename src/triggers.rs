@@ -3,6 +3,7 @@
 
 use glam::Vec3;
 
+use crate::assets::Sound;
 use crate::defs::*;
 use crate::entity::{Die, EntId, Think, Touch, Use};
 use crate::game::GameState;
@@ -123,16 +124,13 @@ impl GameState {
     pub(crate) fn spawn_trigger_multiple(&mut self, e: EntId) -> bool {
         match self.entities[e].v.sounds as i32 {
             1 => {
-                self.host.precache_sound(c"misc/secret.wav");
-                self.entities[e].noise = Some("misc/secret.wav".into());
+                self.entities[e].noise = Some(Sound::MISC_SECRET);
             }
             2 => {
-                self.host.precache_sound(c"misc/talk.wav");
-                self.entities[e].noise = Some("misc/talk.wav".into());
+                self.entities[e].noise = Some(Sound::MISC_TALK);
             }
             3 => {
-                self.host.precache_sound(c"misc/trigger1.wav");
-                self.entities[e].noise = Some("misc/trigger1.wav".into());
+                self.entities[e].noise = Some(Sound::MISC_TRIGGER1);
             }
             _ => {}
         }
@@ -180,12 +178,10 @@ impl GameState {
         }
         match self.entities[e].v.sounds as i32 {
             1 => {
-                self.host.precache_sound(c"misc/secret.wav");
-                self.entities[e].noise = Some("misc/secret.wav".into());
+                self.entities[e].noise = Some(Sound::MISC_SECRET);
             }
             2 => {
-                self.host.precache_sound(c"misc/talk.wav");
-                self.entities[e].noise = Some("misc/talk.wav".into());
+                self.entities[e].noise = Some(Sound::MISC_TALK);
             }
             _ => {}
         }
@@ -208,11 +204,11 @@ impl GameState {
     pub(crate) fn play_teleport(&mut self, e: EntId) {
         let v = (self.random() * 5.0) as i32;
         let s = match v {
-            0 => c"misc/r_tele1.wav",
-            1 => c"misc/r_tele2.wav",
-            2 => c"misc/r_tele3.wav",
-            3 => c"misc/r_tele4.wav",
-            _ => c"misc/r_tele5.wav",
+            0 => Sound::MISC_R_TELE1,
+            1 => Sound::MISC_R_TELE2,
+            2 => Sound::MISC_R_TELE3,
+            3 => Sound::MISC_R_TELE4,
+            _ => Sound::MISC_R_TELE5,
         };
         self.host.sound(e.0 as i32, Channel::Voice, s, 1.0, Attenuation::Norm);
         self.free(e);
@@ -378,13 +374,12 @@ impl GameState {
         }
         self.entities[e].use_ = Use::TeleportUse;
         if !self.entities[e].v.spawnflags.has(TeleportFlags::SILENT) {
-            self.host.precache_sound(c"ambience/hum1.wav");
             let o = {
                 let v = &self.entities[e].v;
                 (v.mins + v.maxs) * 0.5
             };
             self.host
-                .ambient_sound(o, c"ambience/hum1.wav", 0.5, Attenuation::Static);
+                .ambient_sound(o, Sound::AMBIENCE_HUM1, 0.5, Attenuation::Static);
         }
         true
     }
@@ -440,7 +435,7 @@ impl GameState {
                 if self.entities[other].combat.fly_sound < time {
                     self.entities[other].combat.fly_sound = time + 1.5;
                     self.host
-                        .sound(other.0 as i32, Channel::Auto, c"ambience/windfly.wav", 1.0, Attenuation::Norm);
+                        .sound(other.0 as i32, Channel::Auto, Sound::AMBIENCE_WINDFLY, 1.0, Attenuation::Norm);
                 }
             }
         }
@@ -452,7 +447,6 @@ impl GameState {
     /// `trigger_push` spawn.
     pub(crate) fn spawn_trigger_push(&mut self, e: EntId) -> bool {
         self.init_trigger(e);
-        self.host.precache_sound(c"ambience/windfly.wav");
         self.entities[e].set_touch(Touch::Push);
         if self.entities[e].mover.speed == 0.0 {
             self.entities[e].mover.speed = 1000.0;
