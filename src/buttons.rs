@@ -38,7 +38,7 @@ impl GameState {
         self.sub_calc_move(e, pos1, speed, Think::ButtonDone);
         self.entities[e].v.frame = 0.0;
         if health != 0.0 {
-            self.entities[e].v.takedamage = DAMAGE_YES;
+            self.entities[e].v.takedamage = TakeDamage::Yes.as_f32();
         }
     }
 
@@ -51,7 +51,7 @@ impl GameState {
         if state == STATE_UP || state == STATE_TOP {
             return;
         }
-        self.play_noise(e, CHAN_VOICE);
+        self.play_noise(e, Channel::Voice);
         self.entities[e].state = STATE_UP;
         self.sub_calc_move(e, pos2, speed, Think::ButtonWait);
     }
@@ -79,7 +79,7 @@ impl GameState {
             let ent = &mut self.entities[e];
             ent.set_enemy(attacker);
             ent.v.health = ent.v.max_health;
-            ent.v.takedamage = DAMAGE_NO;
+            ent.v.takedamage = TakeDamage::No.as_f32();
         }
         self.button_fire(e);
     }
@@ -100,8 +100,8 @@ impl GameState {
         self.set_movedir(e);
         {
             let ent = &mut self.entities[e];
-            ent.v.movetype = MOVETYPE_PUSH;
-            ent.v.solid = SOLID_BSP;
+            ent.v.movetype = MoveType::Push.as_f32();
+            ent.v.solid = Solid::Bsp.as_f32();
         }
         self.set_brush_model(e);
         self.entities[e].use_ = Use::ButtonUse;
@@ -110,7 +110,7 @@ impl GameState {
             let ent = &mut self.entities[e];
             ent.v.max_health = ent.v.health;
             ent.th_die = Die::ButtonKilled;
-            ent.v.takedamage = DAMAGE_YES;
+            ent.v.takedamage = TakeDamage::Yes.as_f32();
         } else {
             self.entities[e].touch = Touch::ButtonTouch;
         }

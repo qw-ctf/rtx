@@ -56,7 +56,7 @@ impl GameState {
             self.host.precache_sound(c"ambience/fire1.wav");
             let origin = self.entities[e].v.origin;
             self.host
-                .ambient_sound(origin, c"ambience/fire1.wav", 0.5, ATTN_STATIC);
+                .ambient_sound(origin, c"ambience/fire1.wav", 0.5, Attenuation::Static);
         }
         true
     }
@@ -72,7 +72,7 @@ impl GameState {
         self.host.precache_sound(c"ambience/fl_hum1.wav");
         let origin = self.entities[e].v.origin;
         self.host
-            .ambient_sound(origin, c"ambience/fl_hum1.wav", 0.5, ATTN_STATIC);
+            .ambient_sound(origin, c"ambience/fl_hum1.wav", 0.5, Attenuation::Static);
         true
     }
 
@@ -84,7 +84,7 @@ impl GameState {
         self.host.precache_sound(c"ambience/buzz1.wav");
         let origin = self.entities[e].v.origin;
         self.host
-            .ambient_sound(origin, c"ambience/buzz1.wav", 0.5, ATTN_STATIC);
+            .ambient_sound(origin, c"ambience/buzz1.wav", 0.5, Attenuation::Static);
         true
     }
 
@@ -101,8 +101,8 @@ impl GameState {
         {
             let ent = &mut self.entities[e];
             ent.v.angles = Vec3::ZERO;
-            ent.v.movetype = MOVETYPE_PUSH;
-            ent.v.solid = SOLID_BSP;
+            ent.v.movetype = MoveType::Push.as_f32();
+            ent.v.solid = Solid::Bsp.as_f32();
             ent.use_ = Use::FuncWallUse;
         }
         self.set_brush_model(e);
@@ -114,8 +114,8 @@ impl GameState {
         {
             let ent = &mut self.entities[e];
             ent.v.angles = Vec3::ZERO;
-            ent.v.movetype = MOVETYPE_NONE;
-            ent.v.solid = SOLID_NOT;
+            ent.v.movetype = MoveType::None.as_f32();
+            ent.v.solid = Solid::Not.as_f32();
         }
         self.set_brush_model(e);
         true
@@ -127,19 +127,18 @@ impl GameState {
     pub(crate) fn barrel_explode(&mut self, e: EntId) {
         {
             let ent = &mut self.entities[e];
-            ent.v.takedamage = DAMAGE_NO;
+            ent.v.takedamage = TakeDamage::No.as_f32();
             ent.classname = Some("explo_box".into());
         }
         self.t_radius_damage(e, e, 160.0, EntId::WORLD, "");
         let mut origin = self.entities[e].v.origin;
         origin.z += 32.0;
-        self.host.write_byte(MSG_MULTICAST, SVC_TEMPENTITY);
-        self.host.write_byte(MSG_MULTICAST, TE_EXPLOSION);
-        self.host.write_coord(MSG_MULTICAST, origin.x);
-        self.host.write_coord(MSG_MULTICAST, origin.y);
-        self.host.write_coord(MSG_MULTICAST, origin.z);
+        self.host.write_te(MsgDest::Multicast, Te::Explosion);
+        self.host.write_coord(MsgDest::Multicast, origin.x);
+        self.host.write_coord(MsgDest::Multicast, origin.y);
+        self.host.write_coord(MsgDest::Multicast, origin.z);
         let center = self.entities[e].v.origin;
-        self.host.multicast(center, MULTICAST_PHS);
+        self.host.multicast(center, Multicast::Phs);
         self.free(e);
     }
 
@@ -147,8 +146,8 @@ impl GameState {
     pub(crate) fn spawn_misc_explobox(&mut self, e: EntId, model: &'static CStr, size: Vec3) -> bool {
         {
             let ent = &mut self.entities[e];
-            ent.v.solid = SOLID_BBOX;
-            ent.v.movetype = MOVETYPE_NONE;
+            ent.v.solid = Solid::BBox.as_f32();
+            ent.v.movetype = MoveType::None.as_f32();
         }
         self.host.precache_model(model);
         self.entities[e].model_cstr = Some(model);
@@ -159,7 +158,7 @@ impl GameState {
             let ent = &mut self.entities[e];
             ent.v.health = 20.0;
             ent.th_die = Die::ExploBoxDie;
-            ent.v.takedamage = DAMAGE_AIM;
+            ent.v.takedamage = TakeDamage::Aim.as_f32();
             ent.v.origin.z += 2.0;
         }
         if !self.host.droptofloor(e.0 as i32) {

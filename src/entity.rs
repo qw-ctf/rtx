@@ -66,7 +66,7 @@ pub enum Think {
     /// One-shot body-frame run from the current frame to `anim_end`, then `anim_after`
     /// (used for pain and death sequences).
     PlayerAnim,
-    /// Terminal of a death sequence (`PlayerDead`: freeze, mark `DEAD_DEAD`).
+    /// Terminal of a death sequence (`PlayerDead`: freeze, mark `DeadFlag::Dead.as_f32()`).
     PlayerDead,
     /// Cosmetic weapon firing animation (shotgun/rocket/axe), parameterized by the
     /// `anim_*` tail fields; fires `W_FireAxe` at `anim_fire` if set, then `player_run`.
@@ -168,7 +168,7 @@ pub enum Use {
     FuncWallUse,
 }
 
-/// A `.blocked` behaviour for `MOVETYPE_PUSH` movers (`GAME_EDICT_BLOCKED`).
+/// A `.blocked` behaviour for `MoveType::Push.as_f32()` movers (`GAME_EDICT_BLOCKED`).
 #[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Blocked {

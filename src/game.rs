@@ -301,10 +301,10 @@ impl GameState {
     }
 
     /// Play the entity's `.noise` sound on `chan` at full volume (no-op if unset).
-    pub(crate) fn play_noise(&self, e: EntId, chan: i32) {
+    pub(crate) fn play_noise(&self, e: EntId, chan: defs::Channel) {
         if let Some(noise) = self.entities[e].noise.as_deref() {
             self.host
-                .sound(e.0 as i32, chan, &cstring(noise), 1.0, defs::ATTN_NORM);
+                .sound(e.0 as i32, chan, &cstring(noise), 1.0, defs::Attenuation::Norm);
         }
     }
 
@@ -314,7 +314,7 @@ impl GameState {
     pub(crate) fn find_radius(&self, org: Vec3, rad: f32) -> Vec<EntId> {
         let mut out = Vec::new();
         for (i, e) in self.entities.iter().enumerate() {
-            if !e.in_use || e.v.solid == defs::SOLID_NOT {
+            if !e.in_use || e.v.solid == defs::Solid::Not.as_f32() {
                 continue;
             }
             let center = e.v.origin + (e.v.mins + e.v.maxs) * 0.5;

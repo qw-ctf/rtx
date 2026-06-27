@@ -16,8 +16,8 @@ impl GameState {
         let ent = &mut self.entities[e];
         if ent.v.max_health != 0.0 {
             ent.v.health = ent.v.max_health;
-            ent.v.takedamage = DAMAGE_YES;
-            ent.v.solid = SOLID_BBOX;
+            ent.v.takedamage = TakeDamage::Yes.as_f32();
+            ent.v.solid = Solid::BBox.as_f32();
         }
     }
 
@@ -32,10 +32,10 @@ impl GameState {
                 return;
             }
             self.globals.found_secrets += 1.0;
-            self.host.write_byte(MSG_ALL, SVC_FOUNDSECRET);
+            self.host.write_svc(MsgDest::All, Svc::FoundSecret);
         }
-        self.play_noise(e, CHAN_VOICE);
-        self.entities[e].v.takedamage = DAMAGE_NO;
+        self.play_noise(e, Channel::Voice);
+        self.entities[e].v.takedamage = TakeDamage::No.as_f32();
         self.activator = self.entities[e].enemy();
         self.sub_use_targets(e);
 
@@ -146,8 +146,8 @@ impl GameState {
             let ent = &mut self.entities[e];
             ent.v.max_health = ent.v.health;
             ent.th_die = Die::TriggerKilled;
-            ent.v.takedamage = DAMAGE_YES;
-            ent.v.solid = SOLID_BBOX;
+            ent.v.takedamage = TakeDamage::Yes.as_f32();
+            ent.v.solid = Solid::BBox.as_f32();
             let origin = ent.v.origin;
             self.host.set_origin(e.0 as i32, origin);
         } else if !self.entities[e].v.spawnflags.has(TriggerFlags::NOTOUCH) {
@@ -214,7 +214,7 @@ impl GameState {
             3 => c"misc/r_tele4.wav",
             _ => c"misc/r_tele5.wav",
         };
-        self.host.sound(e.0 as i32, CHAN_VOICE, s, 1.0, ATTN_NORM);
+        self.host.sound(e.0 as i32, Channel::Voice, s, 1.0, Attenuation::Norm);
         self.free(e);
     }
 
@@ -228,12 +228,11 @@ impl GameState {
             ent.v.nextthink = time + 0.2;
             ent.think = Think::PlayTeleport;
         }
-        self.host.write_byte(MSG_MULTICAST, SVC_TEMPENTITY);
-        self.host.write_byte(MSG_MULTICAST, TE_TELEPORT);
-        self.host.write_coord(MSG_MULTICAST, org.x);
-        self.host.write_coord(MSG_MULTICAST, org.y);
-        self.host.write_coord(MSG_MULTICAST, org.z);
-        self.host.multicast(org, MULTICAST_PHS);
+        self.host.write_te(MsgDest::Multicast, Te::Teleport);
+        self.host.write_coord(MsgDest::Multicast, org.x);
+        self.host.write_coord(MsgDest::Multicast, org.y);
+        self.host.write_coord(MsgDest::Multicast, org.z);
+        self.host.multicast(org, Multicast::Phs);
     }
 
     /// `tdeath_touch` — telefrag whoever is at the destination.
@@ -277,8 +276,8 @@ impl GameState {
         {
             let ent = &mut self.entities[d];
             ent.classname = Some("teledeath".into());
-            ent.v.movetype = MOVETYPE_NONE;
-            ent.v.solid = SOLID_TRIGGER;
+            ent.v.movetype = MoveType::None.as_f32();
+            ent.v.solid = Solid::Trigger.as_f32();
             ent.v.angles = Vec3::ZERO;
             ent.touch = Touch::Tdeath;
             ent.v.nextthink = time + 0.2;
@@ -309,7 +308,7 @@ impl GameState {
         }
         {
             let v = &self.entities[other].v;
-            if v.health <= 0.0 || v.solid != SOLID_SLIDEBOX {
+            if v.health <= 0.0 || v.solid != Solid::SlideBox.as_f32() {
                 return;
             }
         }
@@ -385,7 +384,7 @@ impl GameState {
                 (v.mins + v.maxs) * 0.5
             };
             self.host
-                .ambient_sound(o, c"ambience/hum1.wav", 0.5, ATTN_STATIC);
+                .ambient_sound(o, c"ambience/hum1.wav", 0.5, Attenuation::Static);
         }
         true
     }
@@ -395,7 +394,7 @@ impl GameState {
     /// `hurt_on` — re-enable a hurt trigger after its cooldown.
     pub(crate) fn hurt_on(&mut self, e: EntId) {
         let ent = &mut self.entities[e];
-        ent.v.solid = SOLID_TRIGGER;
+        ent.v.solid = Solid::Trigger.as_f32();
         ent.v.nextthink = -1.0;
     }
 
@@ -403,7 +402,7 @@ impl GameState {
     pub(crate) fn hurt_touch(&mut self, e: EntId, other: EntId) {
         if self.entities[other].v.takedamage != 0.0 {
             let dmg = self.entities[e].dmg;
-            self.entities[e].v.solid = SOLID_NOT;
+            self.entities[e].v.solid = Solid::Not.as_f32();
             self.t_damage(other, e, e, dmg);
             let time = self.time();
             let ent = &mut self.entities[e];
@@ -441,7 +440,7 @@ impl GameState {
                 if self.entities[other].fly_sound < time {
                     self.entities[other].fly_sound = time + 1.5;
                     self.host
-                        .sound(other.0 as i32, CHAN_AUTO, c"ambience/windfly.wav", 1.0, ATTN_NORM);
+                        .sound(other.0 as i32, Channel::Auto, c"ambience/windfly.wav", 1.0, Attenuation::Norm);
                 }
             }
         }

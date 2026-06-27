@@ -20,7 +20,7 @@ impl GameState {
             (v.origin, v.absmin, v.absmax, v.movetype)
         };
 
-        if movetype == MOVETYPE_PUSH {
+        if movetype == MoveType::Push.as_f32() {
             let mid = 0.5 * (absmin + absmax);
             let tr = self.traceline(inflictor_org, mid, true, ignore);
             return tr.fraction == 1.0 || tr.ent == targ;
@@ -51,7 +51,7 @@ impl GameState {
             }
         }
         let movetype = self.entities[targ].v.movetype;
-        if movetype == MOVETYPE_PUSH || movetype == MOVETYPE_NONE {
+        if movetype == MoveType::Push.as_f32() || movetype == MoveType::None.as_f32() {
             // doors, triggers, etc.: their th_die does the work directly.
             self.run_die(targ);
             return;
@@ -63,7 +63,7 @@ impl GameState {
 
         {
             let t = &mut self.entities[targ];
-            t.v.takedamage = DAMAGE_NO;
+            t.v.takedamage = TakeDamage::No.as_f32();
             t.touch = Touch::None;
             t.v.effects = 0.0;
         }
@@ -118,7 +118,7 @@ impl GameState {
             (v.absmin + v.absmax) * 0.5
         };
         if inflictor != EntId::WORLD
-            && self.entities[targ].v.movetype == MOVETYPE_WALK
+            && self.entities[targ].v.movetype == MoveType::Walk.as_f32()
         {
             let dir = (self.entities[targ].v.origin - inflictor_org).normalize_or_zero();
             self.entities[targ].v.velocity += dir * damage * 8.0;
@@ -138,7 +138,7 @@ impl GameState {
         if self.entities[targ].invincible_finished >= time {
             if self.entities[targ].invincible_sound < time {
                 self.host
-                    .sound(targ.0 as i32, CHAN_ITEM, c"items/protect3.wav", 1.0, ATTN_NORM);
+                    .sound(targ.0 as i32, Channel::Item, c"items/protect3.wav", 1.0, Attenuation::Norm);
                 self.entities[targ].invincible_sound = time + 2.0;
             }
             return;
@@ -224,7 +224,7 @@ impl GameState {
         if self.entities[attacker].classname() == Some("player") {
             if targ == attacker {
                 self.entities[targ].v.frags -= 1.0;
-                self.broadcast(PRINT_MEDIUM, &format!("{targ_name} suicides\n"));
+                self.broadcast(PrintLevel::Medium, &format!("{targ_name} suicides\n"));
                 self.host.logfrag(targ.0 as i32, targ.0 as i32);
                 return;
             }
@@ -232,7 +232,7 @@ impl GameState {
             self.entities[attacker].v.frags += 1.0;
             self.host.logfrag(attacker.0 as i32, targ.0 as i32);
             self.broadcast(
-                PRINT_MEDIUM,
+                PrintLevel::Medium,
                 &format!("{targ_name} was killed by {attacker_name}\n"),
             );
             return;
@@ -241,7 +241,7 @@ impl GameState {
         // Environmental / world death.
         self.entities[targ].v.frags -= 1.0;
         self.host.logfrag(targ.0 as i32, targ.0 as i32);
-        self.broadcast(PRINT_MEDIUM, &format!("{targ_name} died\n"));
+        self.broadcast(PrintLevel::Medium, &format!("{targ_name} died\n"));
     }
 
     // --- small helpers ---
@@ -293,7 +293,7 @@ impl GameState {
 
 impl GameState {
     /// `bprint` of a dynamic message to every client (shared by combat/items/etc).
-    pub(crate) fn broadcast(&self, level: i32, message: &str) {
+    pub(crate) fn broadcast(&self, level: PrintLevel, message: &str) {
         let c = crate::game::cstring(message);
         self.host.bprint(level, &c);
     }

@@ -47,9 +47,9 @@ impl GameState {
     /// `muzzleflash` — networked muzzle flash for the firing player.
     pub(crate) fn muzzleflash(&self, e: EntId) {
         let origin = self.entities[e].v.origin;
-        self.host.write_byte(MSG_MULTICAST, SVC_MUZZLEFLASH);
-        self.host.write_entity(MSG_MULTICAST, e.0 as i32);
-        self.host.multicast(origin, MULTICAST_PVS);
+        self.host.write_svc(MsgDest::Multicast, Svc::MuzzleFlash);
+        self.host.write_entity(MsgDest::Multicast, e.0 as i32);
+        self.host.multicast(origin, Multicast::Pvs);
     }
 
     /// `SuperDamageSound` — periodic quad-damage hum.
@@ -59,21 +59,20 @@ impl GameState {
         if ent.super_damage_finished > time && ent.super_sound < time {
             self.entities[e].super_sound = time + 1.0;
             self.host
-                .sound(e.0 as i32, CHAN_BODY, c"items/damage3.wav", 1.0, ATTN_NORM);
+                .sound(e.0 as i32, Channel::Body, c"items/damage3.wav", 1.0, Attenuation::Norm);
         }
     }
 
     /// `SpawnBlood` — networked blood puff.
     fn spawn_blood(&self, org: Vec3, count: i32) {
-        self.host.write_byte(MSG_MULTICAST, SVC_TEMPENTITY);
-        self.host.write_byte(MSG_MULTICAST, TE_BLOOD);
-        self.host.write_byte(MSG_MULTICAST, count);
-        self.write_coords(MSG_MULTICAST, org);
-        self.host.multicast(org, MULTICAST_PVS);
+        self.host.write_te(MsgDest::Multicast, Te::Blood);
+        self.host.write_byte(MsgDest::Multicast, count);
+        self.write_coords(MsgDest::Multicast, org);
+        self.host.multicast(org, Multicast::Pvs);
     }
 
     /// Write a vector as three `WriteCoord`s.
-    fn write_coords(&self, to: i32, v: Vec3) {
+    fn write_coords(&self, to: MsgDest, v: Vec3) {
         self.host.write_coord(to, v.x);
         self.host.write_coord(to, v.y);
         self.host.write_coord(to, v.z);
@@ -99,12 +98,11 @@ impl GameState {
             self.t_damage(tr.ent, e, e, dmg);
         } else {
             self.host
-                .sound(e.0 as i32, CHAN_WEAPON, c"player/axhit2.wav", 1.0, ATTN_NORM);
-            self.host.write_byte(MSG_MULTICAST, SVC_TEMPENTITY);
-            self.host.write_byte(MSG_MULTICAST, TE_GUNSHOT);
-            self.host.write_byte(MSG_MULTICAST, 3);
-            self.write_coords(MSG_MULTICAST, org);
-            self.host.multicast(org, MULTICAST_PVS);
+                .sound(e.0 as i32, Channel::Weapon, c"player/axhit2.wav", 1.0, Attenuation::Norm);
+            self.host.write_te(MsgDest::Multicast, Te::Gunshot);
+            self.host.write_byte(MsgDest::Multicast, 3);
+            self.write_coords(MsgDest::Multicast, org);
+            self.host.multicast(org, Multicast::Pvs);
         }
     }
 
@@ -166,25 +164,23 @@ impl GameState {
 
         // Multi_Finish: networked gunshot puffs and blood.
         if puff_count != 0 {
-            self.host.write_byte(MSG_MULTICAST, SVC_TEMPENTITY);
-            self.host.write_byte(MSG_MULTICAST, TE_GUNSHOT);
-            self.host.write_byte(MSG_MULTICAST, puff_count);
-            self.write_coords(MSG_MULTICAST, puff_org);
-            self.host.multicast(puff_org, MULTICAST_PVS);
+            self.host.write_te(MsgDest::Multicast, Te::Gunshot);
+            self.host.write_byte(MsgDest::Multicast, puff_count);
+            self.write_coords(MsgDest::Multicast, puff_org);
+            self.host.multicast(puff_org, Multicast::Pvs);
         }
         if blood_count != 0 {
-            self.host.write_byte(MSG_MULTICAST, SVC_TEMPENTITY);
-            self.host.write_byte(MSG_MULTICAST, TE_BLOOD);
-            self.host.write_byte(MSG_MULTICAST, blood_count);
-            self.write_coords(MSG_MULTICAST, blood_org);
-            self.host.multicast(puff_org, MULTICAST_PVS);
+            self.host.write_te(MsgDest::Multicast, Te::Blood);
+            self.host.write_byte(MsgDest::Multicast, blood_count);
+            self.write_coords(MsgDest::Multicast, blood_org);
+            self.host.multicast(puff_org, Multicast::Pvs);
         }
     }
 
     /// `W_FireShotgun`.
     fn w_fire_shotgun(&mut self, e: EntId) {
         self.host
-            .sound(e.0 as i32, CHAN_WEAPON, c"weapons/guncock.wav", 1.0, ATTN_NORM);
+            .sound(e.0 as i32, Channel::Weapon, c"weapons/guncock.wav", 1.0, Attenuation::Norm);
         self.small_kick(e);
         if self.level.deathmatch != 4 {
             let ent = &mut self.entities[e];
@@ -202,7 +198,7 @@ impl GameState {
             return;
         }
         self.host
-            .sound(e.0 as i32, CHAN_WEAPON, c"weapons/shotgn2.wav", 1.0, ATTN_NORM);
+            .sound(e.0 as i32, Channel::Weapon, c"weapons/shotgn2.wav", 1.0, Attenuation::Norm);
         self.big_kick(e);
         if self.level.deathmatch != 4 {
             let ent = &mut self.entities[e];
@@ -226,7 +222,7 @@ impl GameState {
         self.entities[e].voided = 1.0;
 
         let origin = self.entities[e].v.origin;
-        if self.host.pointcontents(origin) == CONTENT_SKY {
+        if self.host.pointcontents(origin) == Content::Sky.as_f32() {
             self.free(e);
             return;
         }
@@ -242,10 +238,9 @@ impl GameState {
         let velocity = self.entities[e].v.velocity;
         let org = self.entities[e].v.origin - velocity.normalize_or_zero() * 8.0;
         self.entities[e].v.origin = org;
-        self.host.write_byte(MSG_MULTICAST, SVC_TEMPENTITY);
-        self.host.write_byte(MSG_MULTICAST, TE_EXPLOSION);
-        self.write_coords(MSG_MULTICAST, org);
-        self.host.multicast(org, MULTICAST_PHS);
+        self.host.write_te(MsgDest::Multicast, Te::Explosion);
+        self.write_coords(MsgDest::Multicast, org);
+        self.host.multicast(org, Multicast::Phs);
         self.free(e);
     }
 
@@ -257,7 +252,7 @@ impl GameState {
             ent.v.currentammo = ent.v.ammo_rockets;
         }
         self.host
-            .sound(e.0 as i32, CHAN_WEAPON, c"weapons/sgun1.wav", 1.0, ATTN_NORM);
+            .sound(e.0 as i32, Channel::Weapon, c"weapons/sgun1.wav", 1.0, Attenuation::Norm);
         self.small_kick(e);
 
         let origin = self.entities[e].v.origin;
@@ -268,8 +263,8 @@ impl GameState {
         {
             let mis = &mut self.entities[m];
             mis.set_owner(e);
-            mis.v.movetype = MOVETYPE_FLYMISSILE;
-            mis.v.solid = SOLID_BBOX;
+            mis.v.movetype = MoveType::FlyMissile.as_f32();
+            mis.v.solid = Solid::BBox.as_f32();
             mis.v.velocity = dir * 1000.0;
             mis.v.angles = vectoangles(mis.v.velocity);
             mis.touch = Touch::Missile;
@@ -289,10 +284,9 @@ impl GameState {
     fn lightning_hit(&mut self, from: EntId, damage: f32) {
         let endpos = self.globals.trace_endpos;
         let trace_ent = EntId::from_prog(self.globals.trace_ent);
-        self.host.write_byte(MSG_MULTICAST, SVC_TEMPENTITY);
-        self.host.write_byte(MSG_MULTICAST, TE_LIGHTNINGBLOOD);
-        self.write_coords(MSG_MULTICAST, endpos);
-        self.host.multicast(endpos, MULTICAST_PVS);
+        self.host.write_te(MsgDest::Multicast, Te::LightningBlood);
+        self.write_coords(MsgDest::Multicast, endpos);
+        self.host.multicast(endpos, Multicast::Pvs);
         self.t_damage(trace_ent, from, from, damage);
     }
 
@@ -341,7 +335,7 @@ impl GameState {
 
         if self.entities[e].t_width < time {
             self.host
-                .sound(e.0 as i32, CHAN_WEAPON, c"weapons/lhit.wav", 1.0, ATTN_NORM);
+                .sound(e.0 as i32, Channel::Weapon, c"weapons/lhit.wav", 1.0, Attenuation::Norm);
             self.entities[e].t_width = time + 0.6;
         }
         self.small_kick(e);
@@ -358,12 +352,11 @@ impl GameState {
         let tr = self.traceline(org, org + v_forward * 600.0, true, e);
         let endpos = tr.endpos;
 
-        self.host.write_byte(MSG_MULTICAST, SVC_TEMPENTITY);
-        self.host.write_byte(MSG_MULTICAST, TE_LIGHTNING2);
-        self.host.write_entity(MSG_MULTICAST, e.0 as i32);
-        self.write_coords(MSG_MULTICAST, org);
-        self.write_coords(MSG_MULTICAST, endpos);
-        self.host.multicast(org, MULTICAST_PHS);
+        self.host.write_te(MsgDest::Multicast, Te::Lightning2);
+        self.host.write_entity(MsgDest::Multicast, e.0 as i32);
+        self.write_coords(MsgDest::Multicast, org);
+        self.write_coords(MsgDest::Multicast, endpos);
+        self.host.multicast(org, Multicast::Phs);
 
         let origin = self.entities[e].v.origin;
         self.lightning_damage(origin, endpos + v_forward * 4.0, e, 30.0);
@@ -381,10 +374,9 @@ impl GameState {
         self.t_radius_damage(e, owner, 120.0, EntId::WORLD, "grenade");
 
         let origin = self.entities[e].v.origin;
-        self.host.write_byte(MSG_MULTICAST, SVC_TEMPENTITY);
-        self.host.write_byte(MSG_MULTICAST, TE_EXPLOSION);
-        self.write_coords(MSG_MULTICAST, origin);
-        self.host.multicast(origin, MULTICAST_PHS);
+        self.host.write_te(MsgDest::Multicast, Te::Explosion);
+        self.write_coords(MsgDest::Multicast, origin);
+        self.host.multicast(origin, Multicast::Phs);
         self.free(e);
     }
 
@@ -393,12 +385,12 @@ impl GameState {
         if other == self.entities[e].owner() {
             return;
         }
-        if self.entities[other].v.takedamage == DAMAGE_AIM {
+        if self.entities[other].v.takedamage == TakeDamage::Aim.as_f32() {
             self.grenade_explode(e);
             return;
         }
         self.host
-            .sound(e.0 as i32, CHAN_WEAPON, c"weapons/bounce.wav", 1.0, ATTN_NORM);
+            .sound(e.0 as i32, Channel::Weapon, c"weapons/bounce.wav", 1.0, Attenuation::Norm);
         if self.entities[e].v.velocity == Vec3::ZERO {
             self.entities[e].v.avelocity = Vec3::ZERO;
         }
@@ -413,7 +405,7 @@ impl GameState {
             ent.v.currentammo = ent.v.ammo_rockets;
         }
         self.host
-            .sound(e.0 as i32, CHAN_WEAPON, c"weapons/grenade.wav", 1.0, ATTN_NORM);
+            .sound(e.0 as i32, Channel::Weapon, c"weapons/grenade.wav", 1.0, Attenuation::Norm);
         self.small_kick(e);
 
         let (origin, v_angle) = {
@@ -440,8 +432,8 @@ impl GameState {
             let mis = &mut self.entities[m];
             mis.voided = 0.0;
             mis.set_owner(e);
-            mis.v.movetype = MOVETYPE_BOUNCE;
-            mis.v.solid = SOLID_BBOX;
+            mis.v.movetype = MoveType::Bounce.as_f32();
+            mis.v.solid = Solid::BBox.as_f32();
             mis.classname = Some("grenade".into());
             mis.v.velocity = velocity;
             mis.v.avelocity = Vec3::new(300.0, 300.0, 300.0);
@@ -465,8 +457,8 @@ impl GameState {
             let mis = &mut self.entities[m];
             mis.voided = 0.0;
             mis.set_owner(e);
-            mis.v.movetype = MOVETYPE_FLYMISSILE;
-            mis.v.solid = SOLID_BBOX;
+            mis.v.movetype = MoveType::FlyMissile.as_f32();
+            mis.v.solid = Solid::BBox.as_f32();
             mis.v.angles = vectoangles(dir);
             mis.touch = Touch::Spike;
             mis.classname = Some("spike".into());
@@ -484,7 +476,7 @@ impl GameState {
     fn w_fire_super_spikes(&mut self, e: EntId) {
         let time = self.time();
         self.host
-            .sound(e.0 as i32, CHAN_WEAPON, c"weapons/spike2.wav", 1.0, ATTN_NORM);
+            .sound(e.0 as i32, Channel::Weapon, c"weapons/spike2.wav", 1.0, Attenuation::Norm);
         self.entities[e].attack_finished = time + 0.2;
         if self.level.deathmatch != 4 {
             let ent = &mut self.entities[e];
@@ -522,7 +514,7 @@ impl GameState {
             return;
         }
         self.host
-            .sound(e.0 as i32, CHAN_WEAPON, c"weapons/rocket1i.wav", 1.0, ATTN_NORM);
+            .sound(e.0 as i32, Channel::Weapon, c"weapons/rocket1i.wav", 1.0, Attenuation::Norm);
         self.entities[e].attack_finished = time + 0.2;
         if self.level.deathmatch != 4 {
             let ent = &mut self.entities[e];
@@ -544,20 +536,20 @@ impl GameState {
             return;
         }
         self.entities[e].voided = 1.0;
-        if self.entities[other].v.solid == SOLID_TRIGGER {
+        if self.entities[other].v.solid == Solid::Trigger.as_f32() {
             return;
         }
         let origin = self.entities[e].v.origin;
-        if self.host.pointcontents(origin) == CONTENT_SKY {
+        if self.host.pointcontents(origin) == Content::Sky.as_f32() {
             self.free(e);
             return;
         }
 
         let owner = self.entities[e].owner();
         let (damage, dtype, te) = if super_spike {
-            (18.0, "supernail", TE_SUPERSPIKE)
+            (18.0, "supernail", Te::SuperSpike)
         } else {
-            (9.0, "nail", TE_SPIKE)
+            (9.0, "nail", Te::Spike)
         };
 
         if self.entities[other].v.takedamage != 0.0 {
@@ -565,10 +557,9 @@ impl GameState {
             self.entities[other].deathtype = Some(dtype.into());
             self.t_damage(other, e, owner, damage);
         } else {
-            self.host.write_byte(MSG_MULTICAST, SVC_TEMPENTITY);
-            self.host.write_byte(MSG_MULTICAST, te);
-            self.write_coords(MSG_MULTICAST, origin);
-            self.host.multicast(origin, MULTICAST_PHS);
+            self.host.write_te(MsgDest::Multicast, te);
+            self.write_coords(MsgDest::Multicast, origin);
+            self.host.multicast(origin, Multicast::Phs);
         }
         self.free(e);
     }
@@ -641,7 +632,7 @@ impl GameState {
             w if w == Items::AXE => {
                 self.entities[e].attack_finished = time + 0.5;
                 self.host
-                    .sound(e.0 as i32, CHAN_WEAPON, c"weapons/ax1.wav", 1.0, ATTN_NORM);
+                    .sound(e.0 as i32, Channel::Weapon, c"weapons/ax1.wav", 1.0, Attenuation::Norm);
                 self.start_axe_anim(e);
             }
             w if w == Items::SHOTGUN => {
@@ -670,7 +661,7 @@ impl GameState {
             w if w == Items::LIGHTNING => {
                 self.entities[e].attack_finished = time + 0.1;
                 self.host
-                    .sound(e.0 as i32, CHAN_AUTO, c"weapons/lstart.wav", 1.0, ATTN_NORM);
+                    .sound(e.0 as i32, Channel::Auto, c"weapons/lstart.wav", 1.0, Attenuation::Norm);
                 self.start_light(e);
             }
             _ => {}
@@ -800,20 +791,20 @@ impl GameState {
 
     // --- small helpers ---
 
-    /// `SVC_SMALLKICK` view punch to a single client (`msg_entity = e; WriteByte MSG_ONE`).
+    /// `Svc::SmallKick` view punch to a single client (`msg_entity = e; WriteByte MsgDest::One`).
     fn small_kick(&mut self, e: EntId) {
         self.globals.msg_entity = e.to_prog();
-        self.host.write_byte(MSG_ONE, SVC_SMALLKICK);
+        self.host.write_svc(MsgDest::One, Svc::SmallKick);
     }
 
-    /// `SVC_BIGKICK` view punch (super shotgun).
+    /// `Svc::BigKick` view punch (super shotgun).
     fn big_kick(&mut self, e: EntId) {
         self.globals.msg_entity = e.to_prog();
-        self.host.write_byte(MSG_ONE, SVC_BIGKICK);
+        self.host.write_svc(MsgDest::One, Svc::BigKick);
     }
 
-    /// `sprint(self, PRINT_HIGH, ...)` to a player.
+    /// `sprint(self, PrintLevel::High, ...)` to a player.
     fn sprint_to(&self, e: EntId, msg: &CStr) {
-        self.host.sprint(e.0 as i32, PRINT_HIGH, msg);
+        self.host.sprint(e.0 as i32, PrintLevel::High, msg);
     }
 }

@@ -19,7 +19,7 @@ impl GameState {
         ent.in_use = true;
         ent.classname = Some("player".into());
         ent.netname = Some(name.as_str().into());
-        self.broadcast(PRINT_HIGH, &format!("{name} entered the game\n"));
+        self.broadcast(PrintLevel::High, &format!("{name} entered the game\n"));
     }
 
     /// `ClientDisconnect` — announce a leaving player.
@@ -28,9 +28,9 @@ impl GameState {
         let name = ent.netname.as_deref().unwrap_or("");
         let frags = ent.v.frags as i32;
         let message = format!("{name} left the game with {frags} frags\n");
-        self.broadcast(PRINT_HIGH, &message);
+        self.broadcast(PrintLevel::High, &message);
         self.host
-            .sound(player.0 as i32, CHAN_BODY, c"player/tornoff2.wav", 1.0, ATTN_NONE);
+            .sound(player.0 as i32, Channel::Body, c"player/tornoff2.wav", 1.0, Attenuation::None);
     }
 
     /// `SetNewParms` — default spawn parameters for a fresh player.
@@ -101,13 +101,13 @@ impl GameState {
             ent.in_use = true;
             ent.classname = Some("player".into());
             ent.v.health = 100.0;
-            ent.v.takedamage = DAMAGE_AIM;
-            ent.v.solid = SOLID_SLIDEBOX;
-            ent.v.movetype = MOVETYPE_WALK;
+            ent.v.takedamage = TakeDamage::Aim.as_f32();
+            ent.v.solid = Solid::SlideBox.as_f32();
+            ent.v.movetype = MoveType::Walk.as_f32();
             ent.v.max_health = 100.0;
             ent.v.flags = Flags::CLIENT.as_f32();
             ent.v.effects = 0.0;
-            ent.v.deadflag = DEAD_NO;
+            ent.v.deadflag = DeadFlag::No.as_f32();
             ent.show_hostile = 0.0;
             ent.air_finished = time + 12.0;
             ent.dmg = 2.0; // initial water damage
@@ -174,11 +174,11 @@ impl GameState {
         self.water_move(e);
 
         let deadflag = self.entities[e].v.deadflag;
-        if deadflag >= DEAD_DEAD {
+        if deadflag >= DeadFlag::Dead.as_f32() {
             self.player_death_think(e);
             return;
         }
-        if deadflag == DEAD_DYING {
+        if deadflag == DeadFlag::Dying.as_f32() {
             return;
         }
 
@@ -222,17 +222,17 @@ impl GameState {
             )
         };
         if jump_flag < -300.0 && on_ground {
-            if watertype == CONTENT_WATER {
+            if watertype == Content::Water.as_f32() {
                 self.host
-                    .sound(e.0 as i32, CHAN_BODY, c"player/h2ojump.wav", 1.0, ATTN_NORM);
+                    .sound(e.0 as i32, Channel::Body, c"player/h2ojump.wav", 1.0, Attenuation::Norm);
             } else if jump_flag < -650.0 {
                 self.entities[e].deathtype = Some("falling".into());
                 self.t_damage(e, EntId::WORLD, EntId::WORLD, 5.0);
                 self.host
-                    .sound(e.0 as i32, CHAN_VOICE, c"player/land2.wav", 1.0, ATTN_NORM);
+                    .sound(e.0 as i32, Channel::Voice, c"player/land2.wav", 1.0, Attenuation::Norm);
             } else {
                 self.host
-                    .sound(e.0 as i32, CHAN_VOICE, c"player/land.wav", 1.0, ATTN_NORM);
+                    .sound(e.0 as i32, Channel::Voice, c"player/land.wav", 1.0, Attenuation::Norm);
             }
         }
         self.entities[e].jump_flag = self.entities[e].v.velocity.z;
@@ -258,7 +258,7 @@ impl GameState {
     /// `ClientKill` — the `kill` suicide command.
     fn client_kill(&mut self, e: EntId) {
         let name = self.netname_of(e);
-        self.broadcast(PRINT_MEDIUM, &format!("{name} suicides\n"));
+        self.broadcast(PrintLevel::Medium, &format!("{name} suicides\n"));
         self.set_suicide_frame(e);
         self.entities[e].v.modelindex = self.level.modelindex_player;
         self.host.logfrag(e.0 as i32, e.0 as i32);
@@ -304,11 +304,11 @@ impl GameState {
                 v.button2,
             )
         };
-        if deadflag == DEAD_DEAD {
+        if deadflag == DeadFlag::Dead.as_f32() {
             if b0 != 0.0 || b1 != 0.0 || b2 != 0.0 {
                 return;
             }
-            self.entities[e].v.deadflag = DEAD_RESPAWNABLE;
+            self.entities[e].v.deadflag = DeadFlag::Respawnable.as_f32();
             return;
         }
         if b0 == 0.0 && b1 == 0.0 && b2 == 0.0 {
@@ -337,7 +337,7 @@ impl GameState {
             if swim_flag < time {
                 self.entities[e].swim_flag = time + 1.0;
                 let s = if self.random() < 0.5 { c"misc/water1.wav" } else { c"misc/water2.wav" };
-                self.host.sound(e.0 as i32, CHAN_BODY, s, 1.0, ATTN_NORM);
+                self.host.sound(e.0 as i32, Channel::Body, s, 1.0, Attenuation::Norm);
             }
             return;
         }
@@ -350,7 +350,7 @@ impl GameState {
             v.button2 = 0.0;
         }
         self.host
-            .sound(e.0 as i32, CHAN_BODY, c"player/plyrjmp8.wav", 1.0, ATTN_NORM);
+            .sound(e.0 as i32, Channel::Body, c"player/plyrjmp8.wav", 1.0, Attenuation::Norm);
     }
 
     /// `WaterMove` — drowning and lava/slime damage and enter/leave sounds.
@@ -360,17 +360,17 @@ impl GameState {
             let ent = &self.entities[e];
             (ent.v.movetype, ent.v.health, ent.v.waterlevel, ent.v.watertype, ent.air_finished)
         };
-        if movetype == MOVETYPE_NOCLIP || health < 0.0 {
+        if movetype == MoveType::Noclip.as_f32() || health < 0.0 {
             return;
         }
 
         if waterlevel != 3.0 {
             if air_finished < time {
                 self.host
-                    .sound(e.0 as i32, CHAN_VOICE, c"player/gasp2.wav", 1.0, ATTN_NORM);
+                    .sound(e.0 as i32, Channel::Voice, c"player/gasp2.wav", 1.0, Attenuation::Norm);
             } else if air_finished < time + 9.0 {
                 self.host
-                    .sound(e.0 as i32, CHAN_VOICE, c"player/gasp1.wav", 1.0, ATTN_NORM);
+                    .sound(e.0 as i32, Channel::Voice, c"player/gasp1.wav", 1.0, Attenuation::Norm);
             }
             let ent = &mut self.entities[e];
             ent.air_finished = time + 12.0;
@@ -389,7 +389,7 @@ impl GameState {
         if waterlevel == 0.0 {
             if self.entities[e].v.flags.has(Flags::INWATER) {
                 self.host
-                    .sound(e.0 as i32, CHAN_BODY, c"misc/outwater.wav", 1.0, ATTN_NORM);
+                    .sound(e.0 as i32, Channel::Body, c"misc/outwater.wav", 1.0, Attenuation::Norm);
                 let ent = &mut self.entities[e];
                 ent.v.flags = ent.v.flags.without(Flags::INWATER);
             }
@@ -401,23 +401,23 @@ impl GameState {
             let ent = &self.entities[e];
             (ent.dmgtime, ent.radsuit_finished)
         };
-        if watertype == CONTENT_LAVA && dmgtime < time {
+        if watertype == Content::Lava.as_f32() && dmgtime < time {
             self.entities[e].dmgtime = if radsuit > time { time + 1.0 } else { time + 0.2 };
             self.t_damage(e, EntId::WORLD, EntId::WORLD, 10.0 * waterlevel);
-        } else if watertype == CONTENT_SLIME && dmgtime < time && radsuit < time {
+        } else if watertype == Content::Slime.as_f32() && dmgtime < time && radsuit < time {
             self.entities[e].dmgtime = time + 1.0;
             self.t_damage(e, EntId::WORLD, EntId::WORLD, 4.0 * waterlevel);
         }
 
         if !self.entities[e].v.flags.has(Flags::INWATER) {
             let s = match watertype {
-                w if w == CONTENT_LAVA => Some(c"player/inlava.wav"),
-                w if w == CONTENT_WATER => Some(c"player/inh2o.wav"),
-                w if w == CONTENT_SLIME => Some(c"player/slimbrn2.wav"),
+                w if w == Content::Lava.as_f32() => Some(c"player/inlava.wav"),
+                w if w == Content::Water.as_f32() => Some(c"player/inh2o.wav"),
+                w if w == Content::Slime.as_f32() => Some(c"player/slimbrn2.wav"),
                 _ => None,
             };
             if let Some(s) = s {
-                self.host.sound(e.0 as i32, CHAN_BODY, s, 1.0, ATTN_NORM);
+                self.host.sound(e.0 as i32, Channel::Body, s, 1.0, Attenuation::Norm);
             }
             let ent = &mut self.entities[e];
             ent.v.flags = ent.v.flags.with(Flags::INWATER);
@@ -436,7 +436,7 @@ impl GameState {
         if self.entities[e].invisible_finished != 0.0 {
             if self.entities[e].invisible_sound < time {
                 self.host
-                    .sound(e.0 as i32, CHAN_AUTO, c"items/inv3.wav", 0.5, ATTN_IDLE);
+                    .sound(e.0 as i32, Channel::Auto, c"items/inv3.wav", 0.5, Attenuation::Idle);
                 let r = (self.random() * 3.0) + 1.0;
                 self.entities[e].invisible_sound = time + r;
             }
@@ -523,9 +523,9 @@ impl GameState {
             _ => self.entities[e].rad_time,
         };
         if latch == 1.0 {
-            self.host.sprint(e.0 as i32, PRINT_HIGH, msg);
+            self.host.sprint(e.0 as i32, PrintLevel::High, msg);
             self.host.stuffcmd(e.0 as i32, c"bf\n");
-            self.host.sound(e.0 as i32, CHAN_AUTO, sound, 1.0, ATTN_NORM);
+            self.host.sound(e.0 as i32, Channel::Auto, sound, 1.0, Attenuation::Norm);
             self.set_powerup_time(e, which, time + 1.0);
         } else if latch < time {
             self.set_powerup_time(e, which, time + 1.0);

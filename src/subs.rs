@@ -34,10 +34,10 @@ impl GameState {
         if self.entities[e].v.angles != Vec3::ZERO {
             self.set_movedir(e);
         }
-        self.entities[e].v.solid = SOLID_TRIGGER;
+        self.entities[e].v.solid = Solid::Trigger.as_f32();
         self.set_brush_model(e);
         let ent = &mut self.entities[e];
-        ent.v.movetype = MOVETYPE_NONE;
+        ent.v.movetype = MoveType::None.as_f32();
         ent.v.modelindex = 0.0;
         ent.model = None;
     }
@@ -135,7 +135,7 @@ impl GameState {
             }
             if self.entities[e].noise.is_none() {
                 self.host
-                    .sound(activator.0 as i32, CHAN_VOICE, c"misc/talk.wav", 1.0, ATTN_NORM);
+                    .sound(activator.0 as i32, Channel::Voice, c"misc/talk.wav", 1.0, Attenuation::Norm);
             }
         }
 

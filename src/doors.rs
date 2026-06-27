@@ -34,7 +34,7 @@ impl GameState {
 
     /// `door_hit_top`.
     pub(crate) fn door_hit_top(&mut self, e: EntId) {
-        self.play_door(e, CHAN_NO_PHS_ADD + CHAN_VOICE, 1);
+        self.play_door(e, true, 1);
         self.entities[e].state = STATE_TOP;
         if self.entities[e].v.spawnflags.has(DoorFlags::TOGGLE) {
             return;
@@ -48,17 +48,17 @@ impl GameState {
 
     /// `door_hit_bottom`.
     pub(crate) fn door_hit_bottom(&mut self, e: EntId) {
-        self.play_door(e, CHAN_NO_PHS_ADD + CHAN_VOICE, 1);
+        self.play_door(e, true, 1);
         self.entities[e].state = STATE_BOTTOM;
     }
 
     /// `door_go_down`.
     pub(crate) fn door_go_down(&mut self, e: EntId) {
-        self.play_door(e, CHAN_VOICE, 2);
+        self.play_door(e, false, 2);
         {
             let ent = &mut self.entities[e];
             if ent.v.max_health != 0.0 {
-                ent.v.takedamage = DAMAGE_YES;
+                ent.v.takedamage = TakeDamage::Yes.as_f32();
                 ent.v.health = ent.v.max_health;
             }
             ent.state = STATE_DOWN;
@@ -83,7 +83,7 @@ impl GameState {
             self.entities[e].v.nextthink = ltime + wait;
             return;
         }
-        self.play_door(e, CHAN_VOICE, 2);
+        self.play_door(e, false, 2);
         self.entities[e].state = STATE_UP;
         let (pos2, speed) = {
             let v = &self.entities[e];
@@ -98,7 +98,7 @@ impl GameState {
     /// `door_fire` — open (or, when toggled, close) every door in the linked group.
     fn door_fire(&mut self, master: EntId) {
         if self.entities[master].v.items != 0.0 {
-            self.play_door(master, CHAN_VOICE, 4);
+            self.play_door(master, false, 4);
         }
         self.entities[master].message = None;
 
@@ -163,7 +163,7 @@ impl GameState {
         {
             let o = &mut self.entities[owner];
             o.v.health = o.v.max_health;
-            o.v.takedamage = DAMAGE_NO;
+            o.v.takedamage = TakeDamage::No.as_f32();
         }
         self.door_use(owner);
     }
@@ -185,7 +185,7 @@ impl GameState {
                 self.host.centerprint(other.0 as i32, &msg);
             }
             self.host
-                .sound(other.0 as i32, CHAN_VOICE, c"misc/talk.wav", 1.0, ATTN_NORM);
+                .sound(other.0 as i32, Channel::Voice, c"misc/talk.wav", 1.0, Attenuation::Norm);
         }
 
         let items = self.entities[e].v.items;
@@ -211,7 +211,7 @@ impl GameState {
                 }
             };
             self.host.centerprint(other.0 as i32, msg);
-            self.play_door(e, CHAN_VOICE, 3);
+            self.play_door(e, false, 3);
             return;
         }
 
@@ -231,8 +231,8 @@ impl GameState {
         let t = self.spawn();
         {
             let trig = &mut self.entities[t];
-            trig.v.movetype = MOVETYPE_NONE;
-            trig.v.solid = SOLID_TRIGGER;
+            trig.v.movetype = MoveType::None.as_f32();
+            trig.v.solid = Solid::Trigger.as_f32();
             trig.touch = Touch::DoorTriggerField;
             trig.set_owner(master);
         }
@@ -338,8 +338,8 @@ impl GameState {
         {
             let ent = &mut self.entities[e];
             ent.v.max_health = ent.v.health;
-            ent.v.solid = SOLID_BSP;
-            ent.v.movetype = MOVETYPE_PUSH;
+            ent.v.solid = Solid::Bsp.as_f32();
+            ent.v.movetype = MoveType::Push.as_f32();
         }
         let origin = self.entities[e].v.origin;
         self.host.set_origin(e.0 as i32, origin);
@@ -388,7 +388,7 @@ impl GameState {
             let ent = &mut self.entities[e];
             ent.state = STATE_BOTTOM;
             if ent.v.health != 0.0 {
-                ent.v.takedamage = DAMAGE_YES;
+                ent.v.takedamage = TakeDamage::Yes.as_f32();
                 ent.th_die = Die::DoorKilled;
             }
             if ent.v.items != 0.0 {
@@ -406,8 +406,8 @@ impl GameState {
     pub(crate) fn spawn_func_door_secret(&mut self, e: EntId) -> bool {
         {
             let ent = &mut self.entities[e];
-            ent.v.solid = SOLID_BSP;
-            ent.v.movetype = MOVETYPE_PUSH;
+            ent.v.solid = Solid::Bsp.as_f32();
+            ent.v.movetype = MoveType::Push.as_f32();
         }
         self.set_brush_model(e);
         true
@@ -443,7 +443,7 @@ impl GameState {
     }
 
     /// Play the door's `noiseN` (1..4) on `chan`.
-    fn play_door(&mut self, e: EntId, chan: i32, which: i32) {
+    fn play_door(&mut self, e: EntId, no_phs: bool, which: i32) {
         let noise = match which {
             1 => self.entities[e].noise1.clone(),
             2 => self.entities[e].noise2.clone(),
@@ -452,7 +452,12 @@ impl GameState {
         };
         if let Some(noise) = noise {
             let c = crate::game::cstring(&noise);
-            self.host.sound(e.0 as i32, chan, &c, 1.0, ATTN_NORM);
+            let ent = e.0 as i32;
+            if no_phs {
+                self.host.sound_no_phs(ent, Channel::Voice, &c, 1.0, Attenuation::Norm);
+            } else {
+                self.host.sound(ent, Channel::Voice, &c, 1.0, Attenuation::Norm);
+            }
         }
     }
 }

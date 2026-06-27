@@ -7,7 +7,10 @@
 //! `float`.
 
 use core::ffi::CStr;
+
 use glam::Vec3;
+
+use crate::defs::{Attenuation, Channel, MsgDest, Multicast, PrintLevel, Svc, Te};
 
 /// The host-provided dispatcher. Variadic, C ABI; calling it is `unsafe`.
 pub type SyscallFn = unsafe extern "C" fn(arg: isize, ...) -> isize;
@@ -158,18 +161,18 @@ impl HostApi {
         unsafe { (self.syscall)(B::Error as isize, msg.as_ptr() as isize) };
     }
 
-    /// `G_BPRINT` — broadcast print to all clients at `level` (PRINT_LOW..PRINT_CHAT).
-    pub fn bprint(&self, level: i32, msg: &CStr) {
-        unsafe { (self.syscall)(B::BPrint as isize, level as isize, msg.as_ptr() as isize, 0) };
+    /// `G_BPRINT` — broadcast print to all clients at `level` (PrintLevel::Low..PrintLevel::Chat).
+    pub fn bprint(&self, level: PrintLevel, msg: &CStr) {
+        unsafe { (self.syscall)(B::BPrint as isize, level.as_i32() as isize, msg.as_ptr() as isize, 0) };
     }
 
     /// `G_SPRINT` — print to a single client at `level`.
-    pub fn sprint(&self, ent: i32, level: i32, msg: &CStr) {
+    pub fn sprint(&self, ent: i32, level: PrintLevel, msg: &CStr) {
         unsafe {
             (self.syscall)(
                 B::SPrint as isize,
                 ent as isize,
-                level as isize,
+                level.as_i32() as isize,
                 msg.as_ptr() as isize,
                 0,
             )
@@ -273,8 +276,18 @@ impl HostApi {
         }
     }
 
-    /// `G_SOUND` — play `sample` from `ent` on `channel` (see `defs::CHAN_*`).
-    pub fn sound(&self, ent: i32, channel: i32, sample: &CStr, volume: f32, attenuation: f32) {
+    /// `G_SOUND` — play `sample` from `ent` on `channel`.
+    pub fn sound(&self, ent: i32, channel: Channel, sample: &CStr, volume: f32, attenuation: Attenuation) {
+        self.sound_raw(ent, channel.as_i32(), sample, volume, attenuation);
+    }
+
+    /// As [`sound`](Self::sound), but with the `CHAN_NO_PHS_ADD` modifier (channel bit 3) set so
+    /// the sound bypasses the PHS cull — used for door/plat movement, audible through walls.
+    pub fn sound_no_phs(&self, ent: i32, channel: Channel, sample: &CStr, volume: f32, attenuation: Attenuation) {
+        self.sound_raw(ent, channel.as_i32() | 8, sample, volume, attenuation);
+    }
+
+    fn sound_raw(&self, ent: i32, channel: i32, sample: &CStr, volume: f32, attenuation: Attenuation) {
         unsafe {
             (self.syscall)(
                 B::Sound as isize,
@@ -282,7 +295,7 @@ impl HostApi {
                 channel as isize,
                 sample.as_ptr() as isize,
                 pf(volume),
-                pf(attenuation),
+                pf(attenuation.as_f32()),
             )
         };
     }
@@ -363,7 +376,7 @@ impl HostApi {
         unsafe { (self.syscall)(B::DropToFloor as isize, ent as isize) != 0 }
     }
 
-    /// `G_POINTCONTENTS` — the `CONTENT_*` value at a point.
+    /// `G_POINTCONTENTS` — the `Content` value at a point (compare via `Content::X.as_f32()`).
     pub fn pointcontents(&self, p: Vec3) -> f32 {
         unsafe {
             (self.syscall)(B::PointContents as isize, pf(p.x), pf(p.y), pf(p.z)) as i32 as f32
@@ -406,7 +419,7 @@ impl HostApi {
     }
 
     /// `G_AMBIENTSOUND` — attach a looping ambient sound at a point.
-    pub fn ambient_sound(&self, pos: Vec3, sample: &CStr, volume: f32, attenuation: f32) {
+    pub fn ambient_sound(&self, pos: Vec3, sample: &CStr, volume: f32, attenuation: Attenuation) {
         unsafe {
             (self.syscall)(
                 B::AmbientSound as isize,
@@ -415,49 +428,62 @@ impl HostApi {
                 pf(pos.z),
                 sample.as_ptr() as isize,
                 pf(volume),
-                pf(attenuation),
+                pf(attenuation.as_f32()),
             )
         };
     }
 
     // --- network message writing (multicast / temp entities / kicks) ---
 
-    /// `G_MULTICAST` — set the destination for the buffered `write_*` message.
-    pub fn multicast(&self, origin: Vec3, to: i32) {
+    /// `G_MULTICAST` — send the buffered `write_*` message to a recipient set.
+    pub fn multicast(&self, origin: Vec3, to: Multicast) {
         unsafe {
             (self.syscall)(
                 B::Multicast as isize,
                 pf(origin.x),
                 pf(origin.y),
                 pf(origin.z),
-                to as isize,
+                to.as_i32() as isize,
             )
         };
     }
 
-    pub fn write_byte(&self, to: i32, v: i32) {
-        unsafe { (self.syscall)(B::WriteByte as isize, to as isize, v as isize) };
+    pub fn write_byte(&self, to: MsgDest, v: i32) {
+        unsafe { (self.syscall)(B::WriteByte as isize, to.as_i32() as isize, v as isize) };
     }
-    pub fn write_char(&self, to: i32, v: i32) {
-        unsafe { (self.syscall)(B::WriteChar as isize, to as isize, v as isize) };
+    pub fn write_char(&self, to: MsgDest, v: i32) {
+        unsafe { (self.syscall)(B::WriteChar as isize, to.as_i32() as isize, v as isize) };
     }
-    pub fn write_short(&self, to: i32, v: i32) {
-        unsafe { (self.syscall)(B::WriteShort as isize, to as isize, v as isize) };
+    pub fn write_short(&self, to: MsgDest, v: i32) {
+        unsafe { (self.syscall)(B::WriteShort as isize, to.as_i32() as isize, v as isize) };
     }
-    pub fn write_long(&self, to: i32, v: i32) {
-        unsafe { (self.syscall)(B::WriteLong as isize, to as isize, v as isize) };
+    pub fn write_long(&self, to: MsgDest, v: i32) {
+        unsafe { (self.syscall)(B::WriteLong as isize, to.as_i32() as isize, v as isize) };
     }
-    pub fn write_coord(&self, to: i32, v: f32) {
-        unsafe { (self.syscall)(B::WriteCoord as isize, to as isize, pf(v)) };
+    pub fn write_coord(&self, to: MsgDest, v: f32) {
+        unsafe { (self.syscall)(B::WriteCoord as isize, to.as_i32() as isize, pf(v)) };
     }
-    pub fn write_angle(&self, to: i32, v: f32) {
-        unsafe { (self.syscall)(B::WriteAngle as isize, to as isize, pf(v)) };
+    pub fn write_angle(&self, to: MsgDest, v: f32) {
+        unsafe { (self.syscall)(B::WriteAngle as isize, to.as_i32() as isize, pf(v)) };
     }
-    pub fn write_string(&self, to: i32, s: &CStr) {
-        unsafe { (self.syscall)(B::WriteString as isize, to as isize, s.as_ptr() as isize) };
+    pub fn write_string(&self, to: MsgDest, s: &CStr) {
+        unsafe { (self.syscall)(B::WriteString as isize, to.as_i32() as isize, s.as_ptr() as isize) };
     }
-    pub fn write_entity(&self, to: i32, ent: i32) {
-        unsafe { (self.syscall)(B::WriteEntity as isize, to as isize, ent as isize) };
+    pub fn write_entity(&self, to: MsgDest, ent: i32) {
+        unsafe { (self.syscall)(B::WriteEntity as isize, to.as_i32() as isize, ent as isize) };
+    }
+
+    /// Write a server-to-client opcode byte (`svc_*`).
+    pub fn write_svc(&self, to: MsgDest, svc: Svc) {
+        self.write_byte(to, svc.as_i32());
+    }
+
+    /// Begin a temp-entity message: emit the `svc_temp_entity` header and the effect byte.
+    /// The caller follows with the effect's payload (coords / entity / count) and a
+    /// [`multicast`](Self::multicast).
+    pub fn write_te(&self, to: MsgDest, te: Te) {
+        self.write_byte(to, Svc::TempEntity.as_i32());
+        self.write_byte(to, te.as_i32());
     }
 
     /// `G_GetEntityToken` — fetch the next token from the map's entity string into `buf`.

@@ -13,7 +13,7 @@ impl GameState {
         ent.netname = Some(name.as_str().into());
         ent.set_goalentity(EntId::WORLD);
         self.broadcast(
-            crate::defs::PRINT_MEDIUM,
+            crate::defs::PrintLevel::Medium,
             &format!("Spectator {name} entered the game\n"),
         );
     }
@@ -32,7 +32,7 @@ impl GameState {
             .unwrap_or("")
             .to_owned();
         self.broadcast(
-            crate::defs::PRINT_MEDIUM,
+            crate::defs::PrintLevel::Medium,
             &format!("Spectator {name} left the game\n"),
         );
     }

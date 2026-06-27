@@ -269,7 +269,7 @@ impl GameState {
     pub(crate) fn player_dead(&mut self, e: EntId) {
         let ent = &mut self.entities[e];
         ent.v.nextthink = -1.0;
-        ent.v.deadflag = DEAD_DEAD;
+        ent.v.deadflag = DeadFlag::Dead.as_f32();
     }
 
     /// `player_pain` (`th_pain`) — play a pain sequence if not mid-attack.
@@ -303,18 +303,18 @@ impl GameState {
         }
         if self.entities[self.damage_attacker].classname() == Some("teledeath") {
             self.host
-                .sound(e.0 as i32, CHAN_VOICE, c"player/teledth1.wav", 1.0, ATTN_NONE);
+                .sound(e.0 as i32, Channel::Voice, c"player/teledth1.wav", 1.0, Attenuation::None);
             return;
         }
-        if watertype == CONTENT_WATER && waterlevel == 3.0 {
+        if watertype == Content::Water.as_f32() && waterlevel == 3.0 {
             self.death_bubbles(e, 1.0);
             let s = if self.random() > 0.5 { c"player/drown1.wav" } else { c"player/drown2.wav" };
-            self.host.sound(e.0 as i32, CHAN_VOICE, s, 1.0, ATTN_NORM);
+            self.host.sound(e.0 as i32, Channel::Voice, s, 1.0, Attenuation::Norm);
             return;
         }
-        if watertype == CONTENT_SLIME || watertype == CONTENT_LAVA {
+        if watertype == Content::Slime.as_f32() || watertype == Content::Lava.as_f32() {
             let s = if self.random() > 0.5 { c"player/lburn1.wav" } else { c"player/lburn2.wav" };
-            self.host.sound(e.0 as i32, CHAN_VOICE, s, 1.0, ATTN_NORM);
+            self.host.sound(e.0 as i32, Channel::Voice, s, 1.0, Attenuation::Norm);
             return;
         }
         if pain_finished > time {
@@ -325,7 +325,7 @@ impl GameState {
         if axhitme == 1.0 {
             self.entities[e].axhitme = 0.0;
             self.host
-                .sound(e.0 as i32, CHAN_VOICE, c"player/axhit1.wav", 1.0, ATTN_NORM);
+                .sound(e.0 as i32, Channel::Voice, c"player/axhit1.wav", 1.0, Attenuation::Norm);
             return;
         }
         let rs = (self.random() * 5.0).round() as i32 + 1;
@@ -337,7 +337,7 @@ impl GameState {
             5 => c"player/pain5.wav",
             _ => c"player/pain6.wav",
         };
-        self.host.sound(e.0 as i32, CHAN_VOICE, noise, 1.0, ATTN_NORM);
+        self.host.sound(e.0 as i32, Channel::Voice, noise, 1.0, Attenuation::Norm);
     }
 
     /// `DeathSound`.
@@ -345,7 +345,7 @@ impl GameState {
         if self.entities[e].v.waterlevel == 3.0 {
             self.death_bubbles(e, 5.0);
             self.host
-                .sound(e.0 as i32, CHAN_VOICE, c"player/h2odeath.wav", 1.0, ATTN_NONE);
+                .sound(e.0 as i32, Channel::Voice, c"player/h2odeath.wav", 1.0, Attenuation::None);
             return;
         }
         let rs = (self.random() * 4.0).round() as i32 + 1;
@@ -356,7 +356,7 @@ impl GameState {
             4 => c"player/death4.wav",
             _ => c"player/death5.wav",
         };
-        self.host.sound(e.0 as i32, CHAN_VOICE, noise, 1.0, ATTN_NONE);
+        self.host.sound(e.0 as i32, Channel::Voice, noise, 1.0, Attenuation::None);
     }
 
     /// `PlayerDie` (`th_die`) — drop loot, start the death animation or gib.
@@ -377,10 +377,10 @@ impl GameState {
             let ent = &mut self.entities[e];
             ent.weaponmodel = None;
             ent.v.view_ofs = Vec3::new(0.0, 0.0, -8.0);
-            ent.v.deadflag = DEAD_DYING;
-            ent.v.solid = SOLID_NOT;
+            ent.v.deadflag = DeadFlag::Dying.as_f32();
+            ent.v.solid = Solid::Not.as_f32();
             ent.v.flags = ent.v.flags.without(Flags::ONGROUND);
-            ent.v.movetype = MOVETYPE_TOSS;
+            ent.v.movetype = MoveType::Toss.as_f32();
             ent.v.velocity.z += zboost;
         }
         self.set_weaponmodel(e, None); // clear the networked viewmodel
@@ -419,9 +419,9 @@ impl GameState {
         }
         let ent = &mut self.entities[e];
         ent.v.frame = DEATHA11 as f32;
-        ent.v.solid = SOLID_NOT;
-        ent.v.movetype = MOVETYPE_TOSS;
-        ent.v.deadflag = DEAD_DEAD;
+        ent.v.solid = Solid::Not.as_f32();
+        ent.v.movetype = MoveType::Toss.as_f32();
+        ent.v.deadflag = DeadFlag::Dead.as_f32();
         ent.v.nextthink = -1.0;
     }
 
@@ -458,8 +458,8 @@ impl GameState {
             let gib = &mut self.entities[g];
             gib.v.origin = origin;
             gib.v.velocity = vel;
-            gib.v.movetype = MOVETYPE_BOUNCE;
-            gib.v.solid = SOLID_NOT;
+            gib.v.movetype = MoveType::Bounce.as_f32();
+            gib.v.solid = Solid::Not.as_f32();
             gib.v.avelocity = avel;
             gib.think = Think::SubRemove;
             gib.v.ltime = time;
@@ -481,9 +481,9 @@ impl GameState {
             let ent = &mut self.entities[e];
             ent.v.frame = 0.0;
             ent.v.nextthink = -1.0;
-            ent.v.movetype = MOVETYPE_BOUNCE;
-            ent.v.takedamage = DAMAGE_NO;
-            ent.v.solid = SOLID_NOT;
+            ent.v.movetype = MoveType::Bounce.as_f32();
+            ent.v.takedamage = TakeDamage::No.as_f32();
+            ent.v.solid = Solid::Not.as_f32();
             ent.v.view_ofs = Vec3::new(0.0, 0.0, 8.0);
             ent.v.velocity = vel;
             ent.v.flags = ent.v.flags.without(Flags::ONGROUND);
@@ -503,14 +503,14 @@ impl GameState {
         self.throw_gib(e, c"progs/gib1.mdl", health);
         self.throw_gib(e, c"progs/gib2.mdl", health);
         self.throw_gib(e, c"progs/gib3.mdl", health);
-        self.entities[e].v.deadflag = DEAD_DEAD;
+        self.entities[e].v.deadflag = DeadFlag::Dead.as_f32();
         if self.entities[self.damage_attacker].classname() == Some("teledeath") {
             self.host
-                .sound(e.0 as i32, CHAN_VOICE, c"player/teledth1.wav", 1.0, ATTN_NONE);
+                .sound(e.0 as i32, Channel::Voice, c"player/teledth1.wav", 1.0, Attenuation::None);
             return;
         }
         let s = if self.random() < 0.5 { c"player/gib.wav" } else { c"player/udeath.wav" };
-        self.host.sound(e.0 as i32, CHAN_VOICE, s, 1.0, ATTN_NONE);
+        self.host.sound(e.0 as i32, Channel::Voice, s, 1.0, Attenuation::None);
     }
 
     /// A random value in `[-1, 1)` (QuakeC `crandom`).

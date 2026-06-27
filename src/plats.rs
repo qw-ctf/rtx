@@ -12,7 +12,7 @@ use crate::game::GameState;
 impl GameState {
     // --- plats ---
 
-    fn plat_sound(&mut self, e: EntId, chan: i32, which: i32) {
+    fn plat_sound(&mut self, e: EntId, no_phs: bool, which: i32) {
         let noise = if which == 0 {
             self.entities[e].noise.clone()
         } else {
@@ -20,13 +20,18 @@ impl GameState {
         };
         if let Some(noise) = noise {
             let c = crate::game::cstring(&noise);
-            self.host.sound(e.0 as i32, chan, &c, 1.0, ATTN_NORM);
+            let ent = e.0 as i32;
+            if no_phs {
+                self.host.sound_no_phs(ent, Channel::Voice, &c, 1.0, Attenuation::Norm);
+            } else {
+                self.host.sound(ent, Channel::Voice, &c, 1.0, Attenuation::Norm);
+            }
         }
     }
 
     /// `plat_hit_top`.
     pub(crate) fn plat_hit_top(&mut self, e: EntId) {
-        self.plat_sound(e, CHAN_NO_PHS_ADD + CHAN_VOICE, 1);
+        self.plat_sound(e, true, 1);
         let ltime = self.entities[e].v.ltime;
         let ent = &mut self.entities[e];
         ent.state = STATE_TOP;
@@ -36,13 +41,13 @@ impl GameState {
 
     /// `plat_hit_bottom`.
     pub(crate) fn plat_hit_bottom(&mut self, e: EntId) {
-        self.plat_sound(e, CHAN_NO_PHS_ADD + CHAN_VOICE, 1);
+        self.plat_sound(e, true, 1);
         self.entities[e].state = STATE_BOTTOM;
     }
 
     /// `plat_go_down`.
     pub(crate) fn plat_go_down(&mut self, e: EntId) {
-        self.plat_sound(e, CHAN_VOICE, 0);
+        self.plat_sound(e, false, 0);
         self.entities[e].state = STATE_DOWN;
         let (pos2, speed) = {
             let v = &self.entities[e];
@@ -53,7 +58,7 @@ impl GameState {
 
     /// `plat_go_up`.
     pub(crate) fn plat_go_up(&mut self, e: EntId) {
-        self.plat_sound(e, CHAN_VOICE, 0);
+        self.plat_sound(e, false, 0);
         self.entities[e].state = STATE_UP;
         let (pos1, speed) = {
             let v = &self.entities[e];
@@ -115,8 +120,8 @@ impl GameState {
         {
             let trig = &mut self.entities[t];
             trig.touch = Touch::PlatCenter;
-            trig.v.movetype = MOVETYPE_NONE;
-            trig.v.solid = SOLID_TRIGGER;
+            trig.v.movetype = MoveType::None.as_f32();
+            trig.v.solid = Solid::Trigger.as_f32();
             trig.set_enemy(plat);
         }
         let mut tmin = mins + Vec3::new(25.0, 25.0, 0.0);
@@ -170,8 +175,8 @@ impl GameState {
             ent.mangle = ent.v.angles;
             ent.v.angles = Vec3::ZERO;
             ent.classname = Some("plat".into());
-            ent.v.solid = SOLID_BSP;
-            ent.v.movetype = MOVETYPE_PUSH;
+            ent.v.solid = Solid::Bsp.as_f32();
+            ent.v.movetype = MoveType::Push.as_f32();
         }
         let origin = self.entities[e].v.origin;
         self.host.set_origin(e.0 as i32, origin);
@@ -244,7 +249,7 @@ impl GameState {
         };
         if wait != 0.0 {
             self.entities[e].v.nextthink = ltime + wait;
-            self.plat_sound(e, CHAN_NO_PHS_ADD + CHAN_VOICE, 0);
+            self.plat_sound(e, true, 0);
         } else {
             self.entities[e].v.nextthink = ltime + 0.1;
         }
@@ -267,7 +272,7 @@ impl GameState {
         };
         self.entities[e].target = next_target;
         self.entities[e].wait = targ_wait; // 0 if none
-        self.plat_sound(e, CHAN_VOICE, 1);
+        self.plat_sound(e, false, 1);
         let (mins, speed) = {
             let v = &self.entities[e];
             (v.v.mins, v.speed)
@@ -331,8 +336,8 @@ impl GameState {
         {
             let ent = &mut self.entities[e];
             ent.cnt = 1.0;
-            ent.v.solid = SOLID_BSP;
-            ent.v.movetype = MOVETYPE_PUSH;
+            ent.v.solid = Solid::Bsp.as_f32();
+            ent.v.movetype = MoveType::Push.as_f32();
             ent.blocked = Blocked::TrainBlocked;
             ent.use_ = Use::TrainUse;
             ent.classname = Some("train".into());

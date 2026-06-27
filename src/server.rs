@@ -41,22 +41,22 @@ impl GameState {
             (p.v.origin, p.mangle)
         };
 
-        self.host.write_byte(MSG_ALL, SVC_CDTRACK);
-        self.host.write_byte(MSG_ALL, 3);
-        self.host.write_byte(MSG_ALL, SVC_INTERMISSION);
-        self.host.write_coord(MSG_ALL, origin.x);
-        self.host.write_coord(MSG_ALL, origin.y);
-        self.host.write_coord(MSG_ALL, origin.z);
-        self.host.write_angle(MSG_ALL, mangle.x);
-        self.host.write_angle(MSG_ALL, mangle.y);
-        self.host.write_angle(MSG_ALL, mangle.z);
+        self.host.write_svc(MsgDest::All, Svc::CdTrack);
+        self.host.write_byte(MsgDest::All, 3);
+        self.host.write_svc(MsgDest::All, Svc::Intermission);
+        self.host.write_coord(MsgDest::All, origin.x);
+        self.host.write_coord(MsgDest::All, origin.y);
+        self.host.write_coord(MsgDest::All, origin.z);
+        self.host.write_angle(MsgDest::All, mangle.x);
+        self.host.write_angle(MsgDest::All, mangle.y);
+        self.host.write_angle(MsgDest::All, mangle.z);
 
         let players: Vec<EntId> = self.find_by_classname("player").collect();
         for p in players {
             let v = &mut self.entities[p].v;
-            v.takedamage = DAMAGE_NO;
-            v.solid = SOLID_NOT;
-            v.movetype = MOVETYPE_NONE;
+            v.takedamage = TakeDamage::No.as_f32();
+            v.solid = Solid::Not.as_f32();
+            v.movetype = MoveType::None.as_f32();
             v.modelindex = 0.0;
         }
     }
@@ -99,7 +99,7 @@ impl GameState {
             return;
         }
         let name = self.netname_of(other);
-        self.broadcast(PRINT_HIGH, &format!("{name} exited the level\n"));
+        self.broadcast(PrintLevel::High, &format!("{name} exited the level\n"));
         self.level.nextmap = self
             .entities[e]
             .map

@@ -32,8 +32,8 @@ impl GameState {
         {
             let ent = &mut self.entities[e];
             ent.v.flags = Flags::ITEM.as_f32();
-            ent.v.solid = SOLID_TRIGGER;
-            ent.v.movetype = MOVETYPE_TOSS;
+            ent.v.solid = Solid::Trigger.as_f32();
+            ent.v.movetype = MoveType::Toss.as_f32();
             ent.v.velocity = Vec3::ZERO;
             ent.v.origin.z += 6.0;
         }
@@ -47,9 +47,9 @@ impl GameState {
         if let Some(model) = self.entities[e].model_cstr {
             self.host.set_model(e.0 as i32, model);
         }
-        self.entities[e].v.solid = SOLID_TRIGGER;
+        self.entities[e].v.solid = Solid::Trigger.as_f32();
         self.host
-            .sound(e.0 as i32, CHAN_VOICE, c"items/itembk2.wav", 1.0, ATTN_NORM);
+            .sound(e.0 as i32, Channel::Voice, c"items/itembk2.wav", 1.0, Attenuation::Norm);
         let origin = self.entities[e].v.origin;
         self.host.set_origin(e.0 as i32, origin);
     }
@@ -58,7 +58,7 @@ impl GameState {
     fn pickup_hide(&mut self, e: EntId) {
         let ent = &mut self.entities[e];
         ent.v.modelindex = 0.0;
-        ent.v.solid = SOLID_NOT;
+        ent.v.solid = Solid::Not.as_f32();
     }
 
     /// Schedule an item respawn (`SUB_regen`) after `delay`, then fire targets.
@@ -116,7 +116,7 @@ impl GameState {
         }
 
         self.sprint_low(other, &format!("You receive {} health\n", healamount as i32));
-        self.item_pickup_sound(e, other, CHAN_ITEM);
+        self.item_pickup_sound(e, other, Channel::Item);
 
         let time = self.time();
         if healtype == 2.0 {
@@ -189,7 +189,7 @@ impl GameState {
         }
         self.sprint_low(other, "You got armor\n");
         self.host
-            .sound(other.0 as i32, CHAN_ITEM, c"items/armor1.wav", 1.0, ATTN_NORM);
+            .sound(other.0 as i32, Channel::Item, c"items/armor1.wav", 1.0, Attenuation::Norm);
         self.host.stuffcmd(other.0 as i32, c"bf\n");
         let delay = if self.level.deathmatch != 2 { Some(20.0) } else { None };
         self.pickup_finish(e, other, delay);
@@ -225,7 +225,7 @@ impl GameState {
         let netname = self.netname_of(e);
         self.sprint_low(other, &format!("You got the {netname}\n"));
         self.host
-            .sound(other.0 as i32, CHAN_ITEM, c"weapons/pkup.wav", 1.0, ATTN_NORM);
+            .sound(other.0 as i32, Channel::Item, c"weapons/pkup.wav", 1.0, Attenuation::Norm);
         self.host.stuffcmd(other.0 as i32, c"bf\n");
 
         self.bound_other_ammo(other);
@@ -275,7 +275,7 @@ impl GameState {
         let netname = self.netname_of(e);
         self.sprint_low(other, &format!("You got the {netname}\n"));
         self.host
-            .sound(other.0 as i32, CHAN_ITEM, c"weapons/lock4.wav", 1.0, ATTN_NORM);
+            .sound(other.0 as i32, Channel::Item, c"weapons/lock4.wav", 1.0, Attenuation::Norm);
         self.host.stuffcmd(other.0 as i32, c"bf\n");
 
         // Switch up to a better weapon if we were already on our best.
@@ -314,7 +314,7 @@ impl GameState {
         );
         let item_bits = self.entities[e].v.items;
 
-        self.item_pickup_sound(e, other, CHAN_VOICE);
+        self.item_pickup_sound(e, other, Channel::Voice);
         self.entities[other].v.items =
             self.entities[other].v.items.with(item_bits);
 
@@ -385,7 +385,7 @@ impl GameState {
         let netname = self.netname_of(e);
         self.sprint_low(other, &format!("You get {netname}\n"));
         self.host
-            .sound(other.0 as i32, CHAN_ITEM, c"weapons/lock4.wav", 1.0, ATTN_NORM);
+            .sound(other.0 as i32, Channel::Item, c"weapons/lock4.wav", 1.0, Attenuation::Norm);
         self.host.stuffcmd(other.0 as i32, c"bf\n");
 
         self.free(e);
@@ -435,8 +435,8 @@ impl GameState {
             it.v.ammo_cells = cells;
             it.v.velocity = Vec3::new(vx, vy, 300.0);
             it.v.flags = Flags::ITEM.as_f32();
-            it.v.solid = SOLID_TRIGGER;
-            it.v.movetype = MOVETYPE_TOSS;
+            it.v.solid = Solid::Trigger.as_f32();
+            it.v.movetype = MoveType::Toss.as_f32();
             it.touch = Touch::Backpack;
             it.v.nextthink = time + 120.0;
             it.think = Think::SubRemove;
@@ -519,15 +519,15 @@ impl GameState {
 
     fn sprint_low(&self, e: EntId, msg: &str) {
         let c = crate::game::cstring(msg);
-        self.host.sprint(e.0 as i32, PRINT_LOW, &c);
+        self.host.sprint(e.0 as i32, PrintLevel::Low, &c);
     }
 
     /// Pickup sound on `chan` using the item's `noise`, then a screen flash.
-    fn item_pickup_sound(&mut self, e: EntId, other: EntId, chan: i32) {
+    fn item_pickup_sound(&mut self, e: EntId, other: EntId, chan: Channel) {
         let noise = self.entities[e].noise.clone();
         if let Some(noise) = noise {
             let c = crate::game::cstring(&noise);
-            self.host.sound(other.0 as i32, chan, &c, 1.0, ATTN_NORM);
+            self.host.sound(other.0 as i32, chan, &c, 1.0, Attenuation::Norm);
         }
         self.host.stuffcmd(other.0 as i32, c"bf\n");
     }
