@@ -182,6 +182,9 @@ impl GameState {
             return;
         }
 
+        if self.entities[e].v.flags.has(Flags::ONGROUND) {
+            self.entities[e].air_jumped = false; // rearm the mid-air jump for the next air travel
+        }
         if self.entities[e].v.button2 != 0.0 {
             self.player_jump(e);
         } else {
@@ -341,8 +344,19 @@ impl GameState {
             }
             return;
         }
-        if !flags.has(Flags::ONGROUND) || !flags.has(Flags::JUMPRELEASED) {
+        // Must release jump between jumps — stops auto-bouncing and holding into a double jump.
+        if !flags.has(Flags::JUMPRELEASED) {
             return;
+        }
+        if !flags.has(Flags::ONGROUND) {
+            // Mid-air double jump (`rtx_doublejump`): at most once per air travel. The ground
+            // jump's impulse is applied by the engine's pmove; nothing lifts us mid-air, so set
+            // the upward velocity ourselves.
+            if self.entities[e].air_jumped || self.host.cvar(c"rtx_doublejump") == 0.0 {
+                return;
+            }
+            self.entities[e].air_jumped = true;
+            self.entities[e].v.velocity.z = 270.0;
         }
         {
             let v = &mut self.entities[e].v;

@@ -329,6 +329,9 @@ pub struct Entity {
     pub deathtime: f32,
     pub jump_flag: f32,
     pub swim_flag: f32,
+    /// Whether the one mid-air jump (`rtx_doublejump`) has been spent this air travel. Set on the
+    /// air jump, cleared whenever the player is on the ground.
+    pub air_jumped: bool,
     pub fly_sound: f32,
     pub axhitme: f32,
     pub show_hostile: f32,

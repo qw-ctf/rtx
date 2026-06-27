@@ -340,6 +340,10 @@ impl GameState {
         self.host
             .cvar_set_float(cstr(b"sv_pr2references\0"), 1.0);
 
+        // Mid-air double jump, on by default (set `rtx_doublejump 0` to disable).
+        self.host
+            .cvar_set_float(cstr(b"rtx_doublejump\0"), 1.0);
+
         self.host.dprint(cstr(b"rtx: QuakeWorld game module loaded\0"));
 
         // `self.game_data` lives inside the OnceLock-pinned GameState, so its address is
