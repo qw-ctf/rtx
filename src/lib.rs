@@ -25,6 +25,7 @@ mod defs;
 mod dispatch;
 mod doors;
 mod entity;
+mod ext_field;
 mod game;
 mod game_command;
 mod host;

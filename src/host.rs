@@ -14,7 +14,7 @@ use core::ffi::CStr;
 use glam::Vec3;
 
 use crate::assets::{Model, Sound};
-use crate::entity::EntId;
+use crate::entity::{EntId, Entity};
 use crate::defs::{Attenuation, Channel, MsgDest, Multicast, PrintLevel, Svc, Te};
 
 /// The host-provided dispatcher. Variadic, C ABI; calling it is `unsafe`.
@@ -120,6 +120,16 @@ enum B {
     VisibleTo,
 }
 
+/// Extension syscall numbers (`g_local.h`, `G_EXTENSIONS_FIRST = 256`). Unlike the [`B`]
+/// builtins, these are *opt-in*: the module must claim each trap at its number via
+/// `Map_Extension` (a `B::MapExtension` call) before the engine routes `syscall(n)` to its
+/// handler. The numbers must match the ones the module passes to `Map_Extension`.
+#[repr(isize)]
+enum Ext {
+    MapExtFieldPtr = 265,
+    SetExtFieldPtr = 266,
+}
+
 /// Pack an `f32` as the engine expects it on the variadic syscall: its bit pattern,
 /// zero-extended into an `isize`. The engine ignores the upper 32 bits.
 #[inline]
@@ -137,13 +147,16 @@ fn rf(v: isize) -> f32 {
 #[derive(Clone, Copy)]
 pub struct HostApi {
     syscall: SyscallFn,
+    /// Base of the shared entity array, for the few traps that take an entity by *address*
+    /// rather than by index (the map-extension field traps). Stable for the program's life.
+    ents: *const Entity,
 }
 
 // Several wrappers are foundation for M1/M2 and not yet called.
 #[allow(dead_code)]
 impl HostApi {
-    pub fn new(syscall: SyscallFn) -> Self {
-        Self { syscall }
+    pub fn new(syscall: SyscallFn, ents: *const Entity) -> Self {
+        Self { syscall, ents }
     }
 
     /// `G_GETAPIVERSION` — the engine's supported API version.
@@ -501,6 +514,53 @@ impl HostApi {
     pub fn write_te(&self, to: MsgDest, te: Te) {
         self.write_byte(to, Svc::TempEntity.as_i32());
         self.write_byte(to, te.as_i32());
+    }
+
+    // --- map-extension fields (alpha, colormod, …) ---
+
+    /// `G_Map_Extension` — claim extension `name` at syscall number `mapto`, so subsequent
+    /// `syscall(mapto)` calls route to it. Returns `mapto` on success, negative if the server
+    /// doesn't provide the extension. Must be called before invoking the trap.
+    fn map_extension(&self, name: &CStr, mapto: isize) -> isize {
+        unsafe { (self.syscall)(B::MapExtension as isize, name.as_ptr() as isize, mapto) }
+    }
+
+    /// Claim the `MapExtFieldPtr`/`SetExtFieldPtr` traps (used for the `alpha` field) at the
+    /// numbers ktx uses. Returns whether both are available on this server.
+    pub fn register_ext_fields(&self) -> bool {
+        self.map_extension(c"MapExtFieldPtr", Ext::MapExtFieldPtr as isize) >= 0
+            && self.map_extension(c"SetExtFieldPtr", Ext::SetExtFieldPtr as isize) >= 0
+    }
+
+    /// `MapExtFieldPtr` — resolve a named map-extension field (e.g. `"alpha"`) to an opaque
+    /// field reference: a byte offset into the engine's `ext_entvars_t`, tagged with a
+    /// validation cookie. Returns 0 if the field is unknown. Cache the result.
+    pub fn map_ext_field_ptr(&self, name: &CStr) -> u32 {
+        unsafe { (self.syscall)(Ext::MapExtFieldPtr as isize, name.as_ptr() as isize) as u32 }
+    }
+
+    /// `SetExtFieldPtr` — write `value` into entity `ent`'s extension field `field_ref` (from
+    /// [`map_ext_field_ptr`](Self::map_ext_field_ptr)). Generic over the field's value type, so
+    /// the byte size the trap needs is derived from `T` — an `f32` for `alpha`, a `[f32; 3]` for
+    /// `colormod`, and so on. Unlike the index-based builtins, this trap takes the entity by
+    /// *address* (the engine derives the edict from it); that — and the value pointer — stay
+    /// inside this layer rather than leaking to callers.
+    pub fn set_ext_field<T: Copy>(&self, ent: EntId, field_ref: u32, value: &T) {
+        unsafe {
+            (self.syscall)(
+                Ext::SetExtFieldPtr as isize,
+                self.ent_ptr(ent) as isize,
+                field_ref as isize,
+                value as *const T as isize,
+                core::mem::size_of::<T>() as isize,
+            )
+        };
+    }
+
+    /// Address of entity `ent` in the shared array — what the map-extension field traps expect
+    /// in place of an index.
+    fn ent_ptr(&self, ent: EntId) -> *const Entity {
+        self.ents.wrapping_add(ent.0 as usize)
     }
 
     /// `G_GetEntityToken` — fetch the next token from the map's entity string into `buf`.

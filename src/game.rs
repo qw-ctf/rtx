@@ -15,7 +15,7 @@ use glam::Vec3;
 
 use crate::assets::{Model, Sound};
 use crate::abi::{Field, GameData, GlobalVars, STRING_REF_COUNT, STRING_REF_WEAPONMODEL};
-use crate::defs;
+use crate::{defs, ext_field};
 use crate::entity::{EntId, Entities, Entity};
 use crate::game_command::GameCommand;
 use crate::host::{HostApi, SyscallFn};
@@ -123,6 +123,9 @@ pub struct GameState {
     /// PRNG state (QuakeC `random()` is a VM builtin with no native syscall, so we roll
     /// our own, seeded from `GAME_INIT`'s random seed).
     rng: u32,
+    /// Resolved map-extension field references (entity `alpha`, …), looked up once per server.
+    /// See [`Self::set_alpha`].
+    ext_fields: ext_field::ExtFields,
     /// Escape hatch for string-declared sounds (precache-and-intern at load time). Empty for the
     /// current port — every sound is a registry handle — but here so a runtime path is registered
     /// through the same precache-guaranteeing door. Use `dyn_assets.sound(&host, path)`.
@@ -132,8 +135,8 @@ pub struct GameState {
 
 impl GameState {
     pub fn new(syscall: SyscallFn) -> Self {
-        let host = HostApi::new(syscall);
         let mut entities = Entities::new(MAX_EDICTS);
+        let host = HostApi::new(syscall, entities.as_mut_ptr());
         let mut globals = Box::new(GlobalVars::default());
         let fields: Box<[Field]> = Box::new([Field::TERMINATOR]);
 
@@ -161,6 +164,7 @@ impl GameState {
             intermission_running: false,
             intermission_exit_time: 0.0,
             rng: 0x2545_f491, // nonzero default; reseeded in GAME_INIT
+            ext_fields: ext_field::ExtFields::default(),
             dyn_assets: crate::assets::DynAssets::default(),
         }
     }
@@ -706,6 +710,13 @@ impl GameState {
 
     /// Set a single map field on an entity. Unknown keys are ignored.
     fn set_field(&mut self, id: EntId, key: &str, value: &str) {
+        // Map-extension fields (`alpha`, `colormod`) aren't part of our entvars — they live in
+        // the engine's parallel block, set through a trap. Handle them before borrowing `ent`.
+        match key {
+            "alpha" => return self.set_alpha(id, parse_f32(value)),
+            "colormod" => return self.set_colormod(id, parse_vec3(value)),
+            _ => {}
+        }
         let ent = &mut self.entities[id];
         match key {
             "classname" => ent.classname = Some(value.into()),
@@ -739,6 +750,22 @@ impl GameState {
             "count" => ent.mover.count = parse_f32(value),
             _ => {}
         }
+    }
+
+    /// `ExtFieldSetAlpha` (ktx) — set an entity's transparency via the engine's `alpha`
+    /// map-extension field: `0` = invisible, `1` = fully opaque. No-op if the server lacks the
+    /// extension (older engines). The 0..1 bound is alpha's own rule, so it lives here.
+    pub(crate) fn set_alpha(&mut self, id: EntId, alpha: f32) {
+        self.ext_fields
+            .set::<ext_field::Alpha>(&self.host, id, alpha.clamp(0.0, 1.0));
+    }
+
+    /// Set an entity's per-channel RGB colour modulation via the engine's `colormod`
+    /// map-extension field (each component a multiplier around `1.0`). No-op if the server
+    /// lacks the extension.
+    pub(crate) fn set_colormod(&mut self, id: EntId, color: Vec3) {
+        self.ext_fields
+            .set::<ext_field::ColorMod>(&self.host, id, color.to_array());
     }
 
     /// Free an entity slot, both on our side and in the engine.
