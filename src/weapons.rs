@@ -267,7 +267,7 @@ impl GameState {
             mis.v.solid = Solid::BBox.as_f32();
             mis.v.velocity = dir * 1000.0;
             mis.v.angles = vectoangles(mis.v.velocity);
-            mis.touch = Touch::Missile;
+            mis.set_touch(Touch::Missile);
             mis.voided = 0.0;
             mis.v.nextthink = self.globals.time + 5.0;
             mis.think = Think::SubRemove;
@@ -438,7 +438,7 @@ impl GameState {
             mis.v.velocity = velocity;
             mis.v.avelocity = Vec3::new(300.0, 300.0, 300.0);
             mis.v.angles = vectoangles(velocity);
-            mis.touch = Touch::Grenade;
+            mis.set_touch(Touch::Grenade);
             mis.v.nextthink = time + 2.5;
             mis.think = Think::GrenadeExplode;
         }
@@ -460,7 +460,7 @@ impl GameState {
             mis.v.movetype = MoveType::FlyMissile.as_f32();
             mis.v.solid = Solid::BBox.as_f32();
             mis.v.angles = vectoangles(dir);
-            mis.touch = Touch::Spike;
+            mis.set_touch(Touch::Spike);
             mis.classname = Some("spike".into());
             mis.think = Think::SubRemove;
             mis.v.nextthink = time + 6.0;
@@ -486,7 +486,7 @@ impl GameState {
         let dir = self.aim_dir(e);
         let org = self.entities[e].v.origin + Vec3::new(0.0, 0.0, 16.0);
         let m = self.launch_spike(e, org, dir);
-        self.entities[m].touch = Touch::SuperSpike;
+        self.entities[m].set_touch(Touch::SuperSpike);
         self.host.set_model(m.0 as i32, c"progs/s_spike.mdl");
         self.host.set_size(m.0 as i32, Vec3::ZERO, Vec3::ZERO);
         self.small_kick(e);

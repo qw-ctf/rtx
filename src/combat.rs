@@ -64,7 +64,7 @@ impl GameState {
         {
             let t = &mut self.entities[targ];
             t.v.takedamage = TakeDamage::No.as_f32();
-            t.touch = Touch::None;
+            t.set_touch(Touch::None);
             t.v.effects = 0.0;
         }
         self.run_die(targ);

@@ -110,7 +110,7 @@ impl GameState {
         self.sub_use_targets(e);
         let time = self.time();
         let ent = &mut self.entities[e];
-        ent.touch = Touch::None;
+        ent.set_touch(Touch::None);
         ent.think = Think::ExecuteChangelevel;
         ent.v.nextthink = time + 0.1;
     }
@@ -121,7 +121,7 @@ impl GameState {
             return false;
         }
         self.init_trigger(e);
-        self.entities[e].touch = Touch::Changelevel;
+        self.entities[e].set_touch(Touch::Changelevel);
         true
     }
 }

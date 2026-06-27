@@ -381,6 +381,26 @@ impl Entity {
     pub fn set_goalentity(&mut self, t: EntId) {
         self.v.goalentity = t.to_prog();
     }
+
+    // --- engine-gated callbacks ---
+    // The engine fires `GAME_EDICT_TOUCH`/`GAME_EDICT_BLOCKED` only for entities whose
+    // entvars func-ref field is nonzero: its `SV_TouchLinks` skips triggers with `v.touch == 0`,
+    // and `SV_Push` skips a blocked callback when `v.blocked == 0`. Our behaviour lives in the
+    // private-tail enum, so these setters keep the entvars gate in sync (any nonzero marker
+    // suffices — the engine never calls the value, it just dispatches back through `vmMain`).
+    // (`.think` needs no such gate: think is fired on `nextthink` elapsing, not on `v.think`.)
+
+    /// Set the `.touch` behaviour, syncing the engine-visible `v.touch` dispatch gate.
+    pub fn set_touch(&mut self, t: Touch) {
+        self.touch = t;
+        self.v.touch = if t == Touch::None { 0 } else { 1 };
+    }
+
+    /// Set the `.blocked` behaviour, syncing the engine-visible `v.blocked` dispatch gate.
+    pub fn set_blocked(&mut self, b: Blocked) {
+        self.blocked = b;
+        self.v.blocked = if b == Blocked::None { 0 } else { 1 };
+    }
 }
 
 /// The entity array, indexable by a typed [`EntId`] handle (`entities[e]`) and transparently

@@ -46,7 +46,7 @@ impl GameState {
             ent.think = Think::MultiWait;
             ent.v.nextthink = time + wait;
         } else {
-            ent.touch = Touch::None;
+            ent.set_touch(Touch::None);
             ent.v.nextthink = time + 0.1;
             ent.think = Think::SubRemove;
         }
@@ -151,7 +151,7 @@ impl GameState {
             let origin = ent.v.origin;
             self.host.set_origin(e.0 as i32, origin);
         } else if !self.entities[e].v.spawnflags.has(TriggerFlags::NOTOUCH) {
-            self.entities[e].touch = Touch::Multi;
+            self.entities[e].set_touch(Touch::Multi);
         }
         true
     }
@@ -279,7 +279,7 @@ impl GameState {
             ent.v.movetype = MoveType::None.as_f32();
             ent.v.solid = Solid::Trigger.as_f32();
             ent.v.angles = Vec3::ZERO;
-            ent.touch = Touch::Tdeath;
+            ent.set_touch(Touch::Tdeath);
             ent.v.nextthink = time + 0.2;
             ent.think = Think::SubRemove;
             ent.set_owner(death_owner);
@@ -372,7 +372,7 @@ impl GameState {
     /// `trigger_teleport` spawn.
     pub(crate) fn spawn_trigger_teleport(&mut self, e: EntId) -> bool {
         self.init_trigger(e);
-        self.entities[e].touch = Touch::Teleport;
+        self.entities[e].set_touch(Touch::Teleport);
         if self.entities[e].target.is_none() {
             return false;
         }
@@ -414,7 +414,7 @@ impl GameState {
     /// `trigger_hurt` spawn.
     pub(crate) fn spawn_trigger_hurt(&mut self, e: EntId) -> bool {
         self.init_trigger(e);
-        self.entities[e].touch = Touch::Hurt;
+        self.entities[e].set_touch(Touch::Hurt);
         if self.entities[e].dmg == 0.0 {
             self.entities[e].dmg = 5.0;
         }
@@ -453,7 +453,7 @@ impl GameState {
     pub(crate) fn spawn_trigger_push(&mut self, e: EntId) -> bool {
         self.init_trigger(e);
         self.host.precache_sound(c"ambience/windfly.wav");
-        self.entities[e].touch = Touch::Push;
+        self.entities[e].set_touch(Touch::Push);
         if self.entities[e].speed == 0.0 {
             self.entities[e].speed = 1000.0;
         }
@@ -475,7 +475,7 @@ impl GameState {
             }
         }
         self.init_trigger(e);
-        self.entities[e].touch = Touch::TriggerMonsterjump;
+        self.entities[e].set_touch(Touch::TriggerMonsterjump);
         true
     }
 }

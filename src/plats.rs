@@ -119,7 +119,7 @@ impl GameState {
         let t = self.spawn();
         {
             let trig = &mut self.entities[t];
-            trig.touch = Touch::PlatCenter;
+            trig.set_touch(Touch::PlatCenter);
             trig.v.movetype = MoveType::None.as_f32();
             trig.v.solid = Solid::Trigger.as_f32();
             trig.set_enemy(plat);
@@ -187,7 +187,7 @@ impl GameState {
         };
         self.host.set_size(e.0 as i32, mins, maxs);
 
-        self.entities[e].blocked = Blocked::PlatBlocked;
+        self.entities[e].set_blocked(Blocked::PlatBlocked);
         {
             let ent = &mut self.entities[e];
             if ent.speed == 0.0 {
@@ -338,7 +338,7 @@ impl GameState {
             ent.cnt = 1.0;
             ent.v.solid = Solid::Bsp.as_f32();
             ent.v.movetype = MoveType::Push.as_f32();
-            ent.blocked = Blocked::TrainBlocked;
+            ent.set_blocked(Blocked::TrainBlocked);
             ent.use_ = Use::TrainUse;
             ent.classname = Some("train".into());
         }

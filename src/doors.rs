@@ -216,10 +216,10 @@ impl GameState {
         }
 
         self.entities[other].v.items = other_items.without(items);
-        self.entities[e].touch = Touch::None;
+        self.entities[e].set_touch(Touch::None);
         let enemy = self.entities[e].enemy();
         if enemy.is_some() {
-            self.entities[enemy].touch = Touch::None;
+            self.entities[enemy].set_touch(Touch::None);
         }
         self.door_use(e);
     }
@@ -233,7 +233,7 @@ impl GameState {
             let trig = &mut self.entities[t];
             trig.v.movetype = MoveType::None.as_f32();
             trig.v.solid = Solid::Trigger.as_f32();
-            trig.touch = Touch::DoorTriggerField;
+            trig.set_touch(Touch::DoorTriggerField);
             trig.set_owner(master);
         }
         let margin = Vec3::new(60.0, 60.0, 8.0);
@@ -346,7 +346,7 @@ impl GameState {
         self.set_brush_model(e);
         self.entities[e].classname = Some("door".into());
         self.entities[e].use_ = Use::DoorUse;
-        self.entities[e].blocked = Blocked::DoorBlocked;
+        self.entities[e].set_blocked(Blocked::DoorBlocked);
 
         {
             let ent = &mut self.entities[e];
@@ -394,7 +394,7 @@ impl GameState {
             if ent.v.items != 0.0 {
                 ent.wait = -1.0;
             }
-            ent.touch = Touch::DoorTouch;
+            ent.set_touch(Touch::DoorTouch);
             // Link once all doors have spawned.
             ent.think = Think::DoorLink;
             ent.v.nextthink = ent.v.ltime + 0.1;

@@ -112,7 +112,7 @@ impl GameState {
             ent.th_die = Die::ButtonKilled;
             ent.v.takedamage = TakeDamage::Yes.as_f32();
         } else {
-            self.entities[e].touch = Touch::ButtonTouch;
+            self.entities[e].set_touch(Touch::ButtonTouch);
         }
 
         let ent = &mut self.entities[e];

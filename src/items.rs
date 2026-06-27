@@ -437,7 +437,7 @@ impl GameState {
             it.v.flags = Flags::ITEM.as_f32();
             it.v.solid = Solid::Trigger.as_f32();
             it.v.movetype = MoveType::Toss.as_f32();
-            it.touch = Touch::Backpack;
+            it.set_touch(Touch::Backpack);
             it.v.nextthink = time + 120.0;
             it.think = Think::SubRemove;
         }
@@ -567,7 +567,7 @@ impl GameState {
     }
 
     pub(crate) fn spawn_item_health(&mut self, e: EntId) -> bool {
-        self.entities[e].touch = Touch::ItemHealth;
+        self.entities[e].set_touch(Touch::ItemHealth);
         let flags = self.spawnflags(e);
         if flags.has(HealthFlags::ROTTEN) {
             self.host.precache_model(c"maps/b_bh10.bsp");
@@ -601,7 +601,7 @@ impl GameState {
     }
 
     pub(crate) fn spawn_item_armor(&mut self, e: EntId, skin: f32) -> bool {
-        self.entities[e].touch = Touch::ItemArmor;
+        self.entities[e].set_touch(Touch::ItemArmor);
         self.host.precache_model(c"progs/armor.mdl");
         self.set_item_model(e, c"progs/armor.mdl");
         self.entities[e].v.skin = skin;
@@ -622,7 +622,7 @@ impl GameState {
         }
         self.host.precache_model(model);
         self.set_item_model(e, model);
-        self.entities[e].touch = Touch::ItemWeapon;
+        self.entities[e].set_touch(Touch::ItemWeapon);
         self.entities[e].netname = Some(netname.into());
         self.host
             .set_size(e.0 as i32, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
@@ -644,7 +644,7 @@ impl GameState {
         if self.level.deathmatch == 4 {
             return false;
         }
-        self.entities[e].touch = Touch::ItemAmmo;
+        self.entities[e].set_touch(Touch::ItemAmmo);
         let (model, amt) = if self.spawnflags(e).has(AmmoFlags::BIG) {
             (big, big_amt)
         } else {
@@ -676,7 +676,7 @@ impl GameState {
         self.host.precache_model(model);
         // `noise` must be `'static`: the engine keeps the precache pointer for the level.
         self.host.precache_sound(noise);
-        self.entities[e].touch = Touch::ItemPowerup;
+        self.entities[e].set_touch(Touch::ItemPowerup);
         self.set_item_model(e, model);
         self.set_noise(e, noise.to_str().unwrap_or(""));
         {
