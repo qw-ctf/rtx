@@ -25,6 +25,40 @@ pub const GAME_API_VERSION: i32 = 16;
 
 /// A single entity's parsed key/value pairs from the map's entity string.
 type SpawnFields = Vec<(String, String)>;
+type SpawnFn = fn(&mut GameState, EntId) -> bool;
+
+#[derive(Clone, Copy)]
+enum SpawnAction {
+    Keep,
+    Drop,
+    Spawn(SpawnFn),
+    Armor(f32),
+    Weapon,
+    Ammo {
+        weapon_code: f32,
+        netname: &'static str,
+        small: &'static CStr,
+        small_amt: f32,
+        big: &'static CStr,
+        big_amt: f32,
+    },
+    Powerup {
+        model: &'static CStr,
+        noise: &'static CStr,
+        netname: &'static str,
+        item_bit: defs::Items,
+        effect: defs::Effects,
+    },
+    Flame {
+        model: &'static CStr,
+        skin: f32,
+        frame: bool,
+    },
+    Explobox {
+        model: &'static CStr,
+        size: Vec3,
+    },
+}
 
 /// The result of a [`GameState::traceline`], read out of the engine's `trace_*` globals.
 /// (Some fields are not yet consumed by the ported subset but complete the trace contract.)
@@ -454,102 +488,193 @@ impl GameState {
             Some(c) => c.to_owned(),
             None => return false,
         };
-        match class.as_str() {
+        let action = Self::resolve_spawn_class(class.as_str());
+        self.execute_spawn_action(id, class.as_str(), action)
+    }
+
+    fn execute_spawn_action(&mut self, id: EntId, class: &str, action: SpawnAction) -> bool {
+        match action {
+            SpawnAction::Keep => true,
+            SpawnAction::Drop => false,
+            SpawnAction::Spawn(f) => f(self, id),
+            SpawnAction::Armor(skin) => self.spawn_item_armor(id, skin),
+            SpawnAction::Weapon => self.spawn_weapon_by_classname(id, class),
+            SpawnAction::Ammo {
+                weapon_code,
+                netname,
+                small,
+                small_amt,
+                big,
+                big_amt,
+            } => self.spawn_ammo(id, weapon_code, netname, small, small_amt, big, big_amt),
+            SpawnAction::Powerup {
+                model,
+                noise,
+                netname,
+                item_bit,
+                effect,
+            } => self.spawn_powerup(id, model, noise, netname, item_bit, effect),
+            SpawnAction::Flame { model, skin, frame } => {
+                self.spawn_flame(id, model, skin, frame)
+            }
+            SpawnAction::Explobox { model, size } => self.spawn_misc_explobox(id, model, size),
+        }
+    }
+
+    /// Resolve a map classname into a spawn action. The returned action is executed after the
+    /// classname borrow has ended, keeping the dispatch table separate from mutation.
+    fn resolve_spawn_class(class: &str) -> SpawnAction {
+        match class {
             // Positional markers scanned later (spawn points, teleport/intermission
             // destinations): kept in place with no behaviour of their own.
             "info_player_start" | "info_player_start2" | "info_player_deathmatch"
             | "info_player_coop" | "info_player_team1" | "info_player_team2"
             | "info_player_team3" | "info_player_team4" | "info_intermission"
-            | "info_notnull" => true,
+            | "info_notnull" => SpawnAction::Keep,
 
             // items.qc
-            "item_health" => self.spawn_item_health(id),
-            "item_armor1" => self.spawn_item_armor(id, 0.0),
-            "item_armor2" => self.spawn_item_armor(id, 1.0),
-            "item_armorInv" => self.spawn_item_armor(id, 2.0),
+            "item_health" => SpawnAction::Spawn(GameState::spawn_item_health),
+            "item_armor1" => SpawnAction::Armor(0.0),
+            "item_armor2" => SpawnAction::Armor(1.0),
+            "item_armorInv" => SpawnAction::Armor(2.0),
             "weapon_supershotgun" | "weapon_nailgun" | "weapon_supernailgun"
             | "weapon_grenadelauncher" | "weapon_rocketlauncher" | "weapon_lightning" => {
-                self.spawn_weapon_by_classname(id, class.as_str())
+                SpawnAction::Weapon
             }
-            "item_shells" => self.spawn_ammo(
-                id, 1.0, "shells", c"maps/b_shell0.bsp", 20.0, c"maps/b_shell1.bsp", 40.0,
-            ),
-            "item_spikes" => self.spawn_ammo(
-                id, 2.0, "nails", c"maps/b_nail0.bsp", 25.0, c"maps/b_nail1.bsp", 50.0,
-            ),
-            "item_rockets" => self.spawn_ammo(
-                id, 3.0, "rockets", c"maps/b_rock0.bsp", 5.0, c"maps/b_rock1.bsp", 10.0,
-            ),
-            "item_cells" => self.spawn_ammo(
-                id, 4.0, "cells", c"maps/b_batt0.bsp", 6.0, c"maps/b_batt1.bsp", 12.0,
-            ),
-            "item_artifact_invulnerability" => self.spawn_powerup(
-                id, c"progs/invulner.mdl", c"items/protect.wav", "Pentagram of Protection",
-                defs::Items::INVULNERABILITY, defs::Effects::RED,
-            ),
-            "item_artifact_envirosuit" => self.spawn_powerup(
-                id, c"progs/suit.mdl", c"items/suit.wav", "Biosuit", defs::Items::SUIT, defs::Effects::empty(),
-            ),
-            "item_artifact_invisibility" => self.spawn_powerup(
-                id, c"progs/invisibl.mdl", c"items/inv1.wav", "Ring of Shadows",
-                defs::Items::INVISIBILITY, defs::Effects::empty(),
-            ),
-            "item_artifact_super_damage" => self.spawn_powerup(
-                id, c"progs/quaddama.mdl", c"items/damage.wav", "Quad Damage", defs::Items::QUAD,
-                defs::Effects::BLUE,
-            ),
+            "item_shells" => SpawnAction::Ammo {
+                weapon_code: 1.0,
+                netname: "shells",
+                small: c"maps/b_shell0.bsp",
+                small_amt: 20.0,
+                big: c"maps/b_shell1.bsp",
+                big_amt: 40.0,
+            },
+            "item_spikes" => SpawnAction::Ammo {
+                weapon_code: 2.0,
+                netname: "nails",
+                small: c"maps/b_nail0.bsp",
+                small_amt: 25.0,
+                big: c"maps/b_nail1.bsp",
+                big_amt: 50.0,
+            },
+            "item_rockets" => SpawnAction::Ammo {
+                weapon_code: 3.0,
+                netname: "rockets",
+                small: c"maps/b_rock0.bsp",
+                small_amt: 5.0,
+                big: c"maps/b_rock1.bsp",
+                big_amt: 10.0,
+            },
+            "item_cells" => SpawnAction::Ammo {
+                weapon_code: 4.0,
+                netname: "cells",
+                small: c"maps/b_batt0.bsp",
+                small_amt: 6.0,
+                big: c"maps/b_batt1.bsp",
+                big_amt: 12.0,
+            },
+            "item_artifact_invulnerability" => SpawnAction::Powerup {
+                model: c"progs/invulner.mdl",
+                noise: c"items/protect.wav",
+                netname: "Pentagram of Protection",
+                item_bit: defs::Items::INVULNERABILITY,
+                effect: defs::Effects::RED,
+            },
+            "item_artifact_envirosuit" => SpawnAction::Powerup {
+                model: c"progs/suit.mdl",
+                noise: c"items/suit.wav",
+                netname: "Biosuit",
+                item_bit: defs::Items::SUIT,
+                effect: defs::Effects::empty(),
+            },
+            "item_artifact_invisibility" => SpawnAction::Powerup {
+                model: c"progs/invisibl.mdl",
+                noise: c"items/inv1.wav",
+                netname: "Ring of Shadows",
+                item_bit: defs::Items::INVISIBILITY,
+                effect: defs::Effects::empty(),
+            },
+            "item_artifact_super_damage" => SpawnAction::Powerup {
+                model: c"progs/quaddama.mdl",
+                noise: c"items/damage.wav",
+                netname: "Quad Damage",
+                item_bit: defs::Items::QUAD,
+                effect: defs::Effects::BLUE,
+            },
 
             // triggers.qc
-            "trigger_multiple" => self.spawn_trigger_multiple(id),
-            "trigger_once" => self.spawn_trigger_once(id),
-            "trigger_relay" => self.spawn_trigger_relay(id),
-            "trigger_secret" => self.spawn_trigger_secret(id),
-            "trigger_counter" => self.spawn_trigger_counter(id),
-            "trigger_teleport" => self.spawn_trigger_teleport(id),
-            "trigger_hurt" => self.spawn_trigger_hurt(id),
-            "trigger_push" => self.spawn_trigger_push(id),
-            "trigger_monsterjump" => self.spawn_trigger_monsterjump(id),
-            "trigger_changelevel" => self.spawn_trigger_changelevel(id),
-            "info_teleport_destination" => self.spawn_info_teleport_destination(id),
+            "trigger_multiple" => SpawnAction::Spawn(GameState::spawn_trigger_multiple),
+            "trigger_once" => SpawnAction::Spawn(GameState::spawn_trigger_once),
+            "trigger_relay" => SpawnAction::Spawn(GameState::spawn_trigger_relay),
+            "trigger_secret" => SpawnAction::Spawn(GameState::spawn_trigger_secret),
+            "trigger_counter" => SpawnAction::Spawn(GameState::spawn_trigger_counter),
+            "trigger_teleport" => SpawnAction::Spawn(GameState::spawn_trigger_teleport),
+            "trigger_hurt" => SpawnAction::Spawn(GameState::spawn_trigger_hurt),
+            "trigger_push" => SpawnAction::Spawn(GameState::spawn_trigger_push),
+            "trigger_monsterjump" => SpawnAction::Spawn(GameState::spawn_trigger_monsterjump),
+            "trigger_changelevel" => SpawnAction::Spawn(GameState::spawn_trigger_changelevel),
+            "info_teleport_destination" => {
+                SpawnAction::Spawn(GameState::spawn_info_teleport_destination)
+            }
             // setskill/onlyregistered are start-map only: drop them.
-            "trigger_setskill" => false,
+            "trigger_setskill" => SpawnAction::Drop,
 
             // buttons.qc
-            "func_button" => self.spawn_func_button(id),
+            "func_button" => SpawnAction::Spawn(GameState::spawn_func_button),
 
             // doors.qc
-            "func_door" => self.spawn_func_door(id),
-            "func_door_secret" => self.spawn_func_door_secret(id),
+            "func_door" => SpawnAction::Spawn(GameState::spawn_func_door),
+            "func_door_secret" => SpawnAction::Spawn(GameState::spawn_func_door_secret),
 
             // plats.qc
-            "func_plat" => self.spawn_func_plat(id),
-            "func_train" => self.spawn_func_train(id),
+            "func_plat" => SpawnAction::Spawn(GameState::spawn_func_plat),
+            "func_train" => SpawnAction::Spawn(GameState::spawn_func_train),
             // path_corner waypoints are inert markers used by trains.
-            "path_corner" => true,
+            "path_corner" => SpawnAction::Keep,
 
             // misc.qc
-            "info_null" => self.spawn_info_null(id),
-            "light" => self.spawn_light(id),
-            "light_fluoro" => self.spawn_light_fluoro(id),
-            "light_fluorospark" => self.spawn_light_fluorospark(id),
-            "light_globe" => self.spawn_flame(id, c"progs/s_light.spr", 0.0, false),
-            "light_torch_small_walltorch" => self.spawn_flame(id, c"progs/flame.mdl", 0.0, true),
-            "light_flame_large_yellow" => self.spawn_flame(id, c"progs/flame2.mdl", 1.0, true),
+            "info_null" => SpawnAction::Spawn(GameState::spawn_info_null),
+            "light" => SpawnAction::Spawn(GameState::spawn_light),
+            "light_fluoro" => SpawnAction::Spawn(GameState::spawn_light_fluoro),
+            "light_fluorospark" => SpawnAction::Spawn(GameState::spawn_light_fluorospark),
+            "light_globe" => SpawnAction::Flame {
+                model: c"progs/s_light.spr",
+                skin: 0.0,
+                frame: false,
+            },
+            "light_torch_small_walltorch" => SpawnAction::Flame {
+                model: c"progs/flame.mdl",
+                skin: 0.0,
+                frame: true,
+            },
+            "light_flame_large_yellow" => SpawnAction::Flame {
+                model: c"progs/flame2.mdl",
+                skin: 1.0,
+                frame: true,
+            },
             "light_flame_small_yellow" | "light_flame_small_white" => {
-                self.spawn_flame(id, c"progs/flame2.mdl", 0.0, true)
+                SpawnAction::Flame {
+                    model: c"progs/flame2.mdl",
+                    skin: 0.0,
+                    frame: true,
+                }
             }
-            "func_wall" | "func_episodegate" | "func_bossgate" => self.spawn_func_wall(id),
-            "func_illusionary" => self.spawn_func_illusionary(id),
-            "misc_explobox" => {
-                self.spawn_misc_explobox(id, c"maps/b_explob.bsp", Vec3::new(32.0, 32.0, 64.0))
+            "func_wall" | "func_episodegate" | "func_bossgate" => {
+                SpawnAction::Spawn(GameState::spawn_func_wall)
             }
-            "misc_explobox2" => {
-                self.spawn_misc_explobox(id, c"maps/b_exbox2.bsp", Vec3::new(32.0, 32.0, 32.0))
-            }
+            "func_illusionary" => SpawnAction::Spawn(GameState::spawn_func_illusionary),
+            "misc_explobox" => SpawnAction::Explobox {
+                model: c"maps/b_explob.bsp",
+                size: Vec3::new(32.0, 32.0, 64.0),
+            },
+            "misc_explobox2" => SpawnAction::Explobox {
+                model: c"maps/b_exbox2.bsp",
+                size: Vec3::new(32.0, 32.0, 32.0),
+            },
 
             // Other classes (doors/plats/buttons/misc) get spawn functions below; until then
             // they are discarded, matching QuakeC's "no spawn function" path.
-            _ => false,
+            _ => SpawnAction::Drop,
         }
     }
 
