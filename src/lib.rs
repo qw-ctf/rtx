@@ -14,6 +14,7 @@ use std::cell::UnsafeCell;
 use std::sync::OnceLock;
 
 mod abi;
+mod anim;
 mod buttons;
 mod client;
 mod combat;

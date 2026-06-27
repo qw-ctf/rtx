@@ -10,32 +10,72 @@ use core::ffi::CStr;
 
 use glam::Vec3;
 
+use crate::anim::{Anim, frames};
 use crate::defs::*;
 use crate::entity::{EntId, Think};
 use crate::game::GameState;
 
-// player.mdl frame indices (sequential across player.qc's `$frame` declarations).
-const AXRUN1: i32 = 0;
-const ROCKRUN1: i32 = 6;
-const STAND1: i32 = 12;
-const AXSTND1: i32 = 17;
-const AXPAIN1: i32 = 29;
-const PAIN1: i32 = 35;
-const AXDETH1: i32 = 41;
-const DEATHA1: i32 = 50;
-const DEATHB1: i32 = 61;
-const DEATHC1: i32 = 70;
-const DEATHD1: i32 = 85;
-const DEATHE1: i32 = 94;
-const DEATHA11: i32 = 60;
-const NAILATT1: i32 = 103;
-const LIGHT1: i32 = 105;
-const ROCKATT1: i32 = 107;
-const SHOTATT1: i32 = 113;
-const AXATT1: i32 = 119;
-const AXATTB1: i32 = 125;
-const AXATTC1: i32 = 131;
-const AXATTD1: i32 = 137;
+// `player.mdl` frames and the animations built on them. The `frames!` machinery and the `Anim`
+// type live in `crate::anim`; this is just `player.mdl`'s table — QuakeC's two constructs, where
+// `number { … }` is the flat `$frame` numbering and each `anim NAME = FIRST ..= LAST;` is a
+// `player_*` frame-chain (e.g. the axe swing `player_axe1..4` stops at `$axatt4`, so it spans
+// only four of the six declared `$axatt` frames; `$axatt5`/`$axatt6` are numbered but unplayed).
+frames! {
+    number {
+        // running
+        AXRUN1 AXRUN2 AXRUN3 AXRUN4 AXRUN5 AXRUN6
+        ROCKRUN1 ROCKRUN2 ROCKRUN3 ROCKRUN4 ROCKRUN5 ROCKRUN6
+        // standing
+        STAND1 STAND2 STAND3 STAND4 STAND5
+        AXSTND1 AXSTND2 AXSTND3 AXSTND4 AXSTND5 AXSTND6
+        AXSTND7 AXSTND8 AXSTND9 AXSTND10 AXSTND11 AXSTND12
+        // pain
+        AXPAIN1 AXPAIN2 AXPAIN3 AXPAIN4 AXPAIN5 AXPAIN6
+        PAIN1 PAIN2 PAIN3 PAIN4 PAIN5 PAIN6
+        // dying
+        AXDETH1 AXDETH2 AXDETH3 AXDETH4 AXDETH5 AXDETH6 AXDETH7 AXDETH8 AXDETH9
+        DEATHA1 DEATHA2 DEATHA3 DEATHA4 DEATHA5 DEATHA6 DEATHA7 DEATHA8
+        DEATHA9 DEATHA10 DEATHA11
+        DEATHB1 DEATHB2 DEATHB3 DEATHB4 DEATHB5 DEATHB6 DEATHB7 DEATHB8 DEATHB9
+        DEATHC1 DEATHC2 DEATHC3 DEATHC4 DEATHC5 DEATHC6 DEATHC7 DEATHC8
+        DEATHC9 DEATHC10 DEATHC11 DEATHC12 DEATHC13 DEATHC14 DEATHC15
+        DEATHD1 DEATHD2 DEATHD3 DEATHD4 DEATHD5 DEATHD6 DEATHD7 DEATHD8 DEATHD9
+        DEATHE1 DEATHE2 DEATHE3 DEATHE4 DEATHE5 DEATHE6 DEATHE7 DEATHE8 DEATHE9
+        // attacking
+        NAILATT1 NAILATT2
+        LIGHT1 LIGHT2
+        ROCKATT1 ROCKATT2 ROCKATT3 ROCKATT4 ROCKATT5 ROCKATT6
+        SHOTATT1 SHOTATT2 SHOTATT3 SHOTATT4 SHOTATT5 SHOTATT6
+        AXATT1 AXATT2 AXATT3 AXATT4 AXATT5 AXATT6
+        AXATTB1 AXATTB2 AXATTB3 AXATTB4 AXATTB5 AXATTB6
+        AXATTC1 AXATTC2 AXATTC3 AXATTC4 AXATTC5 AXATTC6
+        AXATTD1 AXATTD2 AXATTD3 AXATTD4 AXATTD5 AXATTD6
+    }
+
+    // locomotion (looping)
+    anim AXRUN   = AXRUN1   ..= AXRUN6;
+    anim ROCKRUN = ROCKRUN1 ..= ROCKRUN6;
+    anim STAND   = STAND1   ..= STAND5;
+    anim AXSTND  = AXSTND1  ..= AXSTND12;
+    // pain / death (one-shot)
+    anim AXPAIN  = AXPAIN1  ..= AXPAIN6;
+    anim PAIN    = PAIN1    ..= PAIN6;
+    anim AXDETH  = AXDETH1  ..= AXDETH9;
+    anim DEATHA  = DEATHA1  ..= DEATHA11;
+    anim DEATHB  = DEATHB1  ..= DEATHB9;
+    anim DEATHC  = DEATHC1  ..= DEATHC15;
+    anim DEATHD  = DEATHD1  ..= DEATHD9;
+    anim DEATHE  = DEATHE1  ..= DEATHE9;
+    // weapon fire
+    anim NAILATT = NAILATT1 ..= NAILATT2;
+    anim LIGHT   = LIGHT1   ..= LIGHT2;
+    anim ROCKATT = ROCKATT1 ..= ROCKATT6;
+    anim SHOTATT = SHOTATT1 ..= SHOTATT6;
+    anim AXATT   = AXATT1   ..= AXATT4;   // axe plays 4 of its 6 declared frames
+    anim AXATTB  = AXATTB1  ..= AXATTB4;
+    anim AXATTC  = AXATTC1  ..= AXATTC4;
+    anim AXATTD  = AXATTD1  ..= AXATTD4;
+}
 
 impl GameState {
     /// Re-arm an animation loop: schedule the next think 0.1s out and record which loop.
@@ -62,17 +102,11 @@ impl GameState {
         }
 
         let ent = &mut self.entities[e];
-        if ent.v.weapon == Items::AXE.as_f32() {
-            if ent.walkframe >= 12 {
-                ent.walkframe = 0;
-            }
-            ent.v.frame = (AXSTND1 + ent.walkframe) as f32;
-        } else {
-            if ent.walkframe >= 5 {
-                ent.walkframe = 0;
-            }
-            ent.v.frame = (STAND1 + ent.walkframe) as f32;
+        let anim = if ent.v.weapon == Items::AXE.as_f32() { AXSTND } else { STAND };
+        if ent.walkframe >= anim.len {
+            ent.walkframe = 0;
         }
+        ent.v.frame = anim.frame(ent.walkframe);
         ent.walkframe += 1;
     }
 
@@ -92,24 +126,25 @@ impl GameState {
         }
 
         let ent = &mut self.entities[e];
-        let base = if ent.v.weapon == Items::AXE.as_f32() { AXRUN1 } else { ROCKRUN1 };
-        if ent.walkframe == 6 {
+        let anim = if ent.v.weapon == Items::AXE.as_f32() { AXRUN } else { ROCKRUN };
+        if ent.walkframe >= anim.len {
             ent.walkframe = 0;
         }
-        ent.v.frame = (base + ent.walkframe) as f32;
+        ent.v.frame = anim.frame(ent.walkframe);
         ent.walkframe += 1;
     }
 
     // --- weapon firing animations (driven by W_Attack) ---
 
-    /// Begin a cosmetic weapon animation: `walkframe` is the cursor, `anim_*` the parameters.
-    fn start_weapon_anim(&mut self, e: EntId, base: i32, wf_base: i32, len: i32, fire: i32, muzzle: i32) {
+    /// Begin a cosmetic weapon animation: `walkframe` is the cursor, `anim` supplies the body
+    /// frames (and their count), and `wf_base`/`fire`/`muzzle` are the per-weapon events.
+    fn start_weapon_anim(&mut self, e: EntId, anim: Anim, wf_base: i32, fire: i32, muzzle: i32) {
         {
             let ent = &mut self.entities[e];
             ent.walkframe = 0;
-            ent.anim_base = base;
+            ent.anim_base = anim.first;
             ent.anim_wf_base = wf_base;
-            ent.anim_len = len;
+            ent.anim_len = anim.len;
             ent.anim_fire = fire;
             ent.anim_muzzle = muzzle;
             ent.think = Think::PlayerWeaponAnim;
@@ -119,22 +154,22 @@ impl GameState {
     }
 
     pub(crate) fn start_shot_anim(&mut self, e: EntId) {
-        self.start_weapon_anim(e, SHOTATT1, 1, 6, -1, 0);
+        self.start_weapon_anim(e, SHOTATT, 1, -1, 0);
     }
 
     pub(crate) fn start_rocket_anim(&mut self, e: EntId) {
-        self.start_weapon_anim(e, ROCKATT1, 1, 6, -1, 0);
+        self.start_weapon_anim(e, ROCKATT, 1, -1, 0);
     }
 
     pub(crate) fn start_axe_anim(&mut self, e: EntId) {
         // Four cosmetic variants; all fire the axe on the third frame.
-        let (base, wf_base) = match (self.random() * 4.0) as i32 {
-            0 => (AXATT1, 1),
-            1 => (AXATTB1, 5),
-            2 => (AXATTC1, 1),
-            _ => (AXATTD1, 5),
+        let (anim, wf_base) = match (self.random() * 4.0) as i32 {
+            0 => (AXATT, 1),
+            1 => (AXATTB, 5),
+            2 => (AXATTC, 1),
+            _ => (AXATTD, 5),
         };
-        self.start_weapon_anim(e, base, wf_base, 4, 2, -1);
+        self.start_weapon_anim(e, anim, wf_base, 2, -1);
     }
 
     /// `PlayerWeaponAnim` think — advance one cosmetic weapon frame.
@@ -196,7 +231,7 @@ impl GameState {
         let time = self.time();
         let ent = &mut self.entities[e];
         ent.attack_finished = time + 0.2;
-        ent.v.frame = (NAILATT1 + parity) as f32;
+        ent.v.frame = NAILATT.frame(parity);
         ent.walkframe = parity ^ 1;
         ent.think = Think::PlayerNail;
         ent.v.nextthink = time + 0.1;
@@ -229,7 +264,7 @@ impl GameState {
         let time = self.time();
         let ent = &mut self.entities[e];
         ent.attack_finished = time + 0.2;
-        ent.v.frame = (LIGHT1 + parity) as f32;
+        ent.v.frame = LIGHT.frame(parity);
         ent.walkframe = parity ^ 1;
         ent.think = Think::PlayerLight;
         ent.v.nextthink = time + 0.1;
@@ -237,12 +272,12 @@ impl GameState {
 
     // --- pain & death animations ---
 
-    /// Start a one-shot body animation from `first` to `last`, then run `after`.
-    fn start_body_anim(&mut self, e: EntId, first: i32, last: i32, after: Think) {
+    /// Start a one-shot body `anim`, then run `after` once it reaches its final frame.
+    fn start_body_anim(&mut self, e: EntId, anim: Anim, after: Think) {
         let time = self.time();
         let ent = &mut self.entities[e];
-        ent.v.frame = first as f32;
-        ent.anim_end = last;
+        ent.v.frame = anim.frame(0);
+        ent.anim_end = anim.last();
         ent.anim_after = after;
         ent.think = Think::PlayerAnim;
         ent.v.nextthink = time + 0.1;
@@ -284,11 +319,8 @@ impl GameState {
         }
         self.entities[e].v.weaponframe = 0.0;
         self.pain_sound(e);
-        if weapon == Items::AXE.as_f32() {
-            self.start_body_anim(e, AXPAIN1, AXPAIN1 + 5, Think::PlayerRun);
-        } else {
-            self.start_body_anim(e, PAIN1, PAIN1 + 5, Think::PlayerRun);
-        }
+        let anim = if weapon == Items::AXE.as_f32() { AXPAIN } else { PAIN };
+        self.start_body_anim(e, anim, Think::PlayerRun);
     }
 
     /// `PainSound` — context-sensitive pain/drown/burn vocalisation.
@@ -397,19 +429,18 @@ impl GameState {
             ent.v.angles.z = 0.0;
         }
         if self.entities[e].v.weapon == Items::AXE.as_f32() {
-            self.start_body_anim(e, AXDETH1, AXDETH1 + 8, Think::PlayerDead);
+            self.start_body_anim(e, AXDETH, Think::PlayerDead);
             return;
         }
         let _ = time;
-        let pick = 1 + (self.random() * 6.0).floor() as i32;
-        let (first, count) = match pick {
-            1 => (DEATHA1, 11),
-            2 => (DEATHB1, 9),
-            3 => (DEATHC1, 15),
-            4 => (DEATHD1, 9),
-            _ => (DEATHE1, 9),
+        let anim = match 1 + (self.random() * 6.0).floor() as i32 {
+            1 => DEATHA,
+            2 => DEATHB,
+            3 => DEATHC,
+            4 => DEATHD,
+            _ => DEATHE,
         };
-        self.start_body_anim(e, first, first + count - 1, Think::PlayerDead);
+        self.start_body_anim(e, anim, Think::PlayerDead);
     }
 
     /// `set_suicide_frame` — freeze a fresh corpse (kill/disconnect), unless already gibbed.
@@ -418,7 +449,7 @@ impl GameState {
             return;
         }
         let ent = &mut self.entities[e];
-        ent.v.frame = DEATHA11 as f32;
+        ent.v.frame = DEATHA.last() as f32;
         ent.v.solid = Solid::Not.as_f32();
         ent.v.movetype = MoveType::Toss.as_f32();
         ent.v.deadflag = DeadFlag::Dead.as_f32();
