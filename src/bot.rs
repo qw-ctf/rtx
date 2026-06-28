@@ -89,12 +89,11 @@ fn add_one_bot(game: &mut GameState, index: i32) {
     let host = *game.host();
     let name = cstring(&format!("[rtx]{}", bot_name(index)));
     let (bottom, top) = bot_colors(index);
+    // `add_bot` already sets the bot's name in its userinfo and broadcasts it (the
+    // "[rtx]Grunt entered the game" line) — don't re-set "name" afterwards: doing so renamed the
+    // bot to an empty string and is what kept bots off the scoreboard.
     let client = host.add_bot(&name, bottom, top, c"base");
     if client > 0 {
-        // Re-broadcast the bot's name: `set_bot_userinfo` emits `svc_setinfo` to every client,
-        // which is what lands the bot on their scoreboard (ktx likewise pokes userinfo after
-        // its `add_bot`). Without it the name set inside `add_bot` doesn't reliably show.
-        host.set_bot_userinfo(client, c"name", &name, 0);
         game.entities[EntId(client as u32)].bot = BotState {
             is_bot: true,
             client,

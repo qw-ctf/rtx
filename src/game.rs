@@ -14,7 +14,9 @@ use std::ffi::CString;
 use glam::Vec3;
 
 use crate::assets::{Model, Sound};
-use crate::abi::{Field, GameData, GlobalVars, STRING_REF_COUNT, STRING_REF_WEAPONMODEL};
+use crate::abi::{
+    Field, GameData, GlobalVars, STRING_REF_COUNT, STRING_REF_NETNAME, STRING_REF_WEAPONMODEL,
+};
 use crate::{defs, ext_field};
 use crate::entity::{EntId, Entities, Entity};
 use crate::game_command::GameCommand;
@@ -279,6 +281,18 @@ impl GameState {
     pub(crate) fn set_weaponmodel(&mut self, e: EntId, model: Option<crate::assets::Model>) {
         let ptr = model.map_or(0, |m| m.path().as_ptr() as u64);
         self.entities[e].string_refs[STRING_REF_WEAPONMODEL] = ptr;
+    }
+
+    /// Set the engine-visible `netname` string. The engine (FTEQW) syncs a connected client's
+    /// name *from* `v.netname` every frame, so a client whose edict was cleared with an empty
+    /// netname — notably a bot — gets renamed to an empty string (and vanishes from the
+    /// scoreboard) unless we write it here. Backed by a persistent `CString` on the entity so the
+    /// raw pointer the engine keeps stays valid for the client's lifetime.
+    pub(crate) fn set_netname(&mut self, e: EntId, name: &str) {
+        let ent = &mut self.entities[e];
+        ent.netname_cs = Some(cstring(name));
+        let ptr = ent.netname_cs.as_deref().map_or(0, |c| c.as_ptr() as u64);
+        ent.string_refs[STRING_REF_NETNAME] = ptr;
     }
 
     /// The entity the engine has made "current" (`self`). `globals.self_` is a *byte

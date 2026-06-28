@@ -119,6 +119,10 @@ impl GameState {
         ent.in_use = true;
         ent.classname = Some("player".into());
         ent.netname = Some(name.as_str().into());
+        // Mirror the name into the engine-visible `v.netname` StringRef. The engine (FTEQW) syncs
+        // the client name from it each frame; a bot's edict is cleared with an empty netname, so
+        // without this it gets renamed to "" and disappears from the scoreboard.
+        self.set_netname(player, &name);
         self.broadcast(PrintLevel::High, &format!("{name} entered the game\n"));
     }
 

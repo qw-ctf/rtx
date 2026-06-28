@@ -354,6 +354,9 @@ pub struct Entity {
     /// Owned C string backing a brush model (`*N`) passed to `setmodel`. The engine keeps the
     /// raw pointer, so this must live as long as the entity references the model.
     pub model_cs: Option<CString>,
+    /// Owned C string backing the engine-visible `v.netname` StringRef (the client name the
+    /// engine syncs from). Kept alive as long as the entity references it.
+    pub netname_cs: Option<CString>,
 
     pub anim: AnimState,
     pub mover: MoverState,

@@ -121,6 +121,12 @@ pub const STRING_REF_COUNT: usize = 11;
 /// so we write the resolved `char*` into this cell ourselves (see `GameState::set_weaponmodel`).
 pub const STRING_REF_WEAPONMODEL: usize = 2;
 
+/// Scratch-cell index of `netname` (its position in [`EntVars::link_string_refs`]). The engine
+/// (notably FTEQW) syncs a connected client's name *from* `v.netname` every frame, so a client —
+/// especially a bot, whose edict is cleared with an empty netname — must have this written or it
+/// gets renamed to an empty string (and disappears from the scoreboard). See `set_netname`.
+pub const STRING_REF_NETNAME: usize = 3;
+
 impl EntVars {
     /// Wire up the native 64-bit string ABI (fteqw API ≥ 15, mvdsv `sv_pr2references`).
     ///
