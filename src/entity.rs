@@ -138,6 +138,18 @@ pub enum Think {
     // --- bob.rs ---
     /// `func_bob` sine-bob tick.
     FuncBobThink,
+
+    // --- grapple.rs (grappling hook) ---
+    /// Player viewmodel/body hold animation while a hook is out (`player_hook`/`player_chain`).
+    GrappleAnim,
+    /// Hook follows what it's anchored to (and damages a hooked player).
+    GrappleTrack,
+    /// Hook's deferred spawn of the chain-link entities.
+    BuildChain,
+    /// Lead chain link repositions all three links each frame.
+    UpdateChain,
+    /// Lead chain link removes the whole chain.
+    RemoveChain,
 }
 
 /// A `.touch` behaviour (`GAME_EDICT_TOUCH`). The dispatcher reads `self`/`other` and
@@ -174,6 +186,8 @@ pub enum Touch {
     Changelevel,
     /// `func_movewall` clip brush: damages the player it touches (if armed).
     Movewall,
+    /// Grappling-hook head: anchor to whatever it strikes.
+    Hook,
 }
 
 /// A `.use` behaviour, fired by `SUB_UseTargets` / button presses.
@@ -345,6 +359,7 @@ pub struct Entity {
     pub mover: MoverState,
     pub rot: RotState,
     pub bob: BobState,
+    pub grapple: GrappleState,
     pub refs: CustomRefs,
     pub combat: CombatState,
     pub item: ItemState,
@@ -436,6 +451,21 @@ pub struct BobState {
     pub vel: f32,
     /// Integrated displacement from the anchor along `movedir`.
     pub offset: f32,
+}
+
+/// Per-player grappling-hook state (`grapple.rs`). The hook itself is a separate entity (this
+/// player's `hook`); it stores its target in `enemy` and the chain head in `goalentity`.
+#[derive(Default)]
+pub struct GrappleState {
+    /// The player's live hook entity, or [`EntId::WORLD`] when none is out.
+    pub hook: u32,
+    /// The player is being reeled in (the hook has anchored).
+    pub on_hook: bool,
+    /// A hook has been thrown and not yet reset.
+    pub hook_out: bool,
+    /// One-shot latch: the chain is still up and should be ditched once the reel gets close
+    /// (QuakeC's `lefty`, reused to avoid a dedicated field).
+    pub lefty: bool,
 }
 
 #[derive(Default)]

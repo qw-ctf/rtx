@@ -142,6 +142,21 @@ const WEAPON_SPECS: &[WeaponSpec] = &[
         rank: 1,
         switch_code: 8.0,
     },
+    // Grappling hook (rtx). Not a map pickup — handed out at spawn behind `rtx_grapple` and
+    // selected by impulse, so it has no `classname`/pickup. Uses the hook viewmodel and no ammo.
+    WeaponSpec {
+        item: Items::GRAPPLE,
+        classname: None,
+        pickup_model: None,
+        pickup_name: "Grappling Hook",
+        backpack_name: "Grappling Hook",
+        ammo_kind: None,
+        pickup_ammo: 0.0,
+        view_model: Some(Model::PROGS_V_STAR),
+        ammo_bit: Items::empty(),
+        rank: 8,
+        switch_code: 0.0,
+    },
 ];
 
 fn weapon_spec(item: Items) -> Option<&'static WeaponSpec> {

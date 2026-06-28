@@ -75,6 +75,12 @@ impl GameState {
             MovewallThink => self.movewall_think(e),
             // bob.rs
             FuncBobThink => self.func_bob_think(e),
+            // grapple.rs
+            GrappleAnim => self.grapple_anim(e),
+            GrappleTrack => self.grapple_track(e),
+            BuildChain => self.build_chain(e),
+            UpdateChain => self.update_chain(e),
+            RemoveChain => self.remove_chain(e),
         }
     }
 
@@ -110,6 +116,8 @@ impl GameState {
             PlatCenter => self.plat_center_touch(e, other),
             // rotate.rs
             Movewall => self.movewall_touch(e, other),
+            // grapple.rs
+            Hook => self.anchor_grapple(e, other),
             // server.qc
             Changelevel => self.changelevel_touch(e, other),
             // trigger_monsterjump only affects monsters (absent in this subset).

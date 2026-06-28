@@ -151,6 +151,9 @@ asset_registry!(Sound, precache_sounds, precache_sound, {
     // weapons
     WEAPONS_AX1 = c"weapons/ax1.wav";
     WEAPONS_BOUNCE = c"weapons/bounce.wav";
+    // grappling hook (grapple.rs): just the one-shot release sound — ktx dropped the looping
+    // chain rattle (throw uses weapons/ax1.wav, impacts use player/axhit{1,2}.wav).
+    WEAPONS_BOUNCE2 = c"weapons/bounce2.wav";
     WEAPONS_GRENADE = c"weapons/grenade.wav";
     WEAPONS_GUNCOCK = c"weapons/guncock.wav";
     WEAPONS_LHIT = c"weapons/lhit.wav";
@@ -214,9 +217,13 @@ asset_registry!(Model, precache_models, precache_model, {
     PROGS_S_LIGHT = c"progs/s_light.spr";
     PROGS_S_SPIKE = c"progs/s_spike.mdl";
     PROGS_SPIKE = c"progs/spike.mdl";
+    // grappling hook (grapple.rs): the hook head and its chain links
+    PROGS_STAR = c"progs/star.mdl";
+    PROGS_BIT = c"progs/bit.mdl";
     PROGS_SUIT = c"progs/suit.mdl";
     PROGS_V_AXE = c"progs/v_axe.mdl";
     PROGS_V_LIGHT = c"progs/v_light.mdl";
+    PROGS_V_STAR = c"progs/v_star.mdl"; // grappling-hook viewmodel
     PROGS_V_NAIL = c"progs/v_nail.mdl";
     PROGS_V_NAIL2 = c"progs/v_nail2.mdl";
     PROGS_V_ROCK = c"progs/v_rock.mdl";

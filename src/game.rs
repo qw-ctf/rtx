@@ -410,6 +410,10 @@ impl GameState {
         self.host
             .cvar_set_float(cstr(b"rtx_shootable_grenades\0"), 1.0);
 
+        // Grappling hook (purectf port), on by default — every player spawns with it (impulse 22
+        // to select). `rtx_grapple 0` to disable.
+        self.host.cvar_set_float(cstr(b"rtx_grapple\0"), 1.0);
+
         self.host.dprint(cstr(b"rtx: QuakeWorld game module loaded\0"));
 
         // `self.game_data` lives inside the OnceLock-pinned GameState, so its address is

@@ -92,6 +92,12 @@ const VNAIL_FIRE: Anim = seq(1, 8); // v_nail.mdl / v_nail2.mdl — nailgun, sup
 const VROCK_FIRE: Anim = seq(1, 6); // v_rock.mdl / v_rock2.mdl — grenade & rocket launchers
 const VLIGHT_FIRE: Anim = seq(1, 4); // v_light.mdl — lightning gun (looped)
 
+// v_star.mdl grapple viewmodel poses (not a cycle — a throw windup, then a held pose chosen by
+// reel speed). Frame 0 is idle; the player_hook chain steps weaponframe through these.
+const VSTAR_THROW: f32 = 2.0; // throwing the hook
+const VSTAR_OUT: f32 = 3.0; // hook in flight / reeling slowly
+const VSTAR_PULL: f32 = 4.0; // reeling at full speed
+
 impl GameState {
     /// Re-arm an animation loop: schedule the next think 0.1s out and record which loop.
     fn schedule_anim(&mut self, e: EntId, think: Think) {
@@ -284,6 +290,37 @@ impl GameState {
         ent.v.nextthink = time + 0.1;
     }
 
+    /// `player_hook1` — fire the grapple and start its viewmodel animation. A no-op while a hook is
+    /// already out (the hold loop is running then), so re-fires from the held button don't restart it.
+    pub(crate) fn start_grapple_throw(&mut self, e: EntId) {
+        if self.entities[e].grapple.hook_out {
+            return;
+        }
+        self.throw_grapple(e);
+        let time = self.time();
+        let ent = &mut self.entities[e];
+        ent.v.frame = AXATTD.frame(0); // body: start of the throw
+        ent.v.weaponframe = VSTAR_THROW;
+        ent.think = Think::GrappleAnim;
+        ent.v.nextthink = time + 0.1;
+    }
+
+    /// `player_chain3`/`player_chain4` — hold the grapple pose while the hook is out, swapping the
+    /// `v_star.mdl` frame by reel speed; return to the run/stand loop once the hook is gone.
+    pub(crate) fn grapple_anim(&mut self, e: EntId) {
+        if !self.entities[e].grapple.hook_out {
+            self.player_run(e); // also clears weaponframe
+            return;
+        }
+        let time = self.time();
+        let fast = self.entities[e].v.velocity.length() >= 750.0;
+        let ent = &mut self.entities[e];
+        ent.v.frame = AXATTD.frame(2); // body: hold pose (axattd3)
+        ent.v.weaponframe = if fast { VSTAR_PULL } else { VSTAR_OUT };
+        ent.think = Think::GrappleAnim;
+        ent.v.nextthink = time + 0.1;
+    }
+
     // --- pain & death animations ---
 
     /// Start a one-shot body `anim`, then run `after` once it reaches its final frame.
@@ -414,6 +451,11 @@ impl GameState {
             // Death ends this life's combat state: clear all of it (powerup timers and effects,
             // cooldowns, the air-jump latch, …). Nothing below reads it, and respawn re-inits it.
             ent.combat = CombatState::default();
+        }
+        // Drop the grappling hook if one is out (grapple state lives outside CombatState).
+        if self.entities[e].grapple.hook_out {
+            let hook = EntId(self.entities[e].grapple.hook);
+            self.reset_grapple(hook);
         }
         self.drop_backpack(e);
         let vz = self.entities[e].v.velocity.z;

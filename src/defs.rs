@@ -103,6 +103,7 @@ flag_bits! {
         GRENADE_LAUNCHER = 1 << 4;
         ROCKET_LAUNCHER  = 1 << 5;
         LIGHTNING        = 1 << 6;
+        GRAPPLE          = 1 << 7; // rtx grappling hook (purectf port)
         SHELLS           = 1 << 8;
         NAILS            = 1 << 9;
         ROCKETS          = 1 << 10;

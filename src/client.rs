@@ -183,6 +183,14 @@ impl GameState {
         }
 
         self.decode_level_parms(player);
+        // The grappling hook is handed out at spawn (also selectable via impulse 22 or a double-tap
+        // of impulse 1), gated by a cvar like the other rtx movement features. It carries no ammo,
+        // so it's just an extra item bit — and we spawn holding it by default.
+        if self.host.cvar(c"rtx_grapple") != 0.0 {
+            let ent = &mut self.entities[player];
+            ent.v.items = ent.v.items.with(Items::GRAPPLE);
+            ent.v.weapon = Items::GRAPPLE.as_f32();
+        }
         self.w_set_current_ammo(player);
 
 
@@ -253,6 +261,11 @@ impl GameState {
             ent.v.flags = ent.v.flags.with(Flags::JUMPRELEASED);
         }
 
+        // Reel in the grappling hook before the engine's player move consumes the velocity.
+        if self.entities[e].grapple.on_hook {
+            self.service_grapple(e);
+        }
+
         // Teleporters can force a pause.
         if self.time() < self.entities[e].mover.pausetime {
             self.entities[e].v.velocity = Vec3::ZERO;
@@ -262,6 +275,7 @@ impl GameState {
         if self.time() > self.entities[e].combat.attack_finished
             && v.currentammo == 0.0
             && !v.weapon.is(Items::AXE)
+            && !v.weapon.is(Items::GRAPPLE) // the grapple uses no ammo — don't auto-switch off it
         {
             let best = self.w_best_weapon(e);
             self.entities[e].v.weapon = best.as_f32();

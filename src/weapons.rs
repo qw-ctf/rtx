@@ -149,7 +149,7 @@ impl GameState {
     }
 
     /// `SpawnBlood` — networked blood puff.
-    fn spawn_blood(&self, org: Vec3, count: i32) {
+    pub(crate) fn spawn_blood(&self, org: Vec3, count: i32) {
         self.host.write_te(MsgDest::Multicast, Te::Blood);
         self.host.write_byte(MsgDest::Multicast, count);
         self.write_coords(MsgDest::Multicast, org);
@@ -754,8 +754,9 @@ impl GameState {
     /// `W_CheckNoAmmo` — switch off an empty weapon; returns whether we can fire.
     fn w_check_no_ammo(&mut self, e: EntId) -> bool {
         let v = &self.entities[e].v;
-        if v.currentammo > 0.0 || Items::from_f32(v.weapon) == Items::AXE {
-            return true;
+        let weapon = Items::from_f32(v.weapon);
+        if v.currentammo > 0.0 || weapon == Items::AXE || weapon == Items::GRAPPLE {
+            return true; // axe and grapple use no ammo
         }
         let best = self.w_best_weapon(e);
         self.entities[e].v.weapon = best.as_f32();
@@ -809,12 +810,26 @@ impl GameState {
                     .sound(e, Channel::Auto, Sound::WEAPONS_LSTART, 1.0, Attenuation::Norm);
                 self.start_light(e);
             }
+            w if w == Items::GRAPPLE => {
+                self.entities[e].combat.attack_finished = time + 0.1;
+                // Throws on the first press and animates the viewmodel; a no-op while out.
+                self.start_grapple_throw(e);
+            }
             _ => {}
         }
     }
 
     /// `W_ChangeWeapon` — switch to the impulse-selected weapon if owned and fed.
     fn w_change_weapon(&mut self, e: EntId) {
+        // Impulse 1 toggles axe <-> grapple: from a gun it selects the axe, and a second tap (now
+        // on the axe) reaches the grapple — so double-tapping "1" throws you onto the hook.
+        if self.entities[e].v.impulse as i32 == 1
+            && self.entities[e].v.weapon.is(Items::AXE)
+            && self.entities[e].v.items.has(Items::GRAPPLE)
+        {
+            self.select_grapple(e);
+            return;
+        }
         let (weapon, needs_ammo): (Items, bool) = {
             let v = &self.entities[e].v;
             match v.impulse as i32 {
@@ -840,6 +855,25 @@ impl GameState {
             return;
         }
         self.entities[e].v.weapon = weapon.as_f32();
+        self.w_set_current_ammo(e);
+    }
+
+    /// Select the grappling hook (impulse 22), if the player has it.
+    fn select_grapple(&mut self, e: EntId) {
+        self.entities[e].v.impulse = 0.0;
+        if !self.entities[e].v.items.has(Items::GRAPPLE) {
+            self.sprint_to(e, c"no grapple.\n");
+            return;
+        }
+        if self.entities[e].v.weapon.is(Items::GRAPPLE) {
+            return; // already selected — don't disturb an active hook
+        }
+        // Switching onto the grapple drops any hook already out (a fresh start).
+        if self.entities[e].grapple.hook_out {
+            let hook = EntId(self.entities[e].grapple.hook);
+            self.reset_grapple(hook);
+        }
+        self.entities[e].v.weapon = Items::GRAPPLE.as_f32();
         self.w_set_current_ammo(e);
     }
 
@@ -917,6 +951,7 @@ impl GameState {
             10 => self.cycle_weapon(e, false),
             11 => self.entities[e].v.team += 1.0, // ServerflagsCommand stand-in
             12 => self.cycle_weapon(e, true),
+            22 => self.select_grapple(e), // grappling hook
             _ => {}
         }
         self.entities[e].v.impulse = 0.0;
@@ -937,7 +972,7 @@ impl GameState {
     // --- small helpers ---
 
     /// `Svc::SmallKick` view punch to a single client (`msg_entity = e; WriteByte MsgDest::One`).
-    fn small_kick(&mut self, e: EntId) {
+    pub(crate) fn small_kick(&mut self, e: EntId) {
         self.globals.msg_entity = e.to_prog();
         self.host.write_svc(MsgDest::One, Svc::SmallKick);
     }

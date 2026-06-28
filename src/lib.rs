@@ -28,6 +28,7 @@ mod doors;
 mod entity;
 mod ext_field;
 mod game;
+mod grapple;
 mod game_command;
 mod host;
 mod items;
