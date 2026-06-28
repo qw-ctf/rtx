@@ -387,6 +387,12 @@ impl GameState {
         self.host
             .cvar_set_float(cstr(b"sv_pr2references\0"), 1.0);
 
+        // The engine wipes its extension-trap table on every map load (and the field-reference
+        // cookie is regenerated), so the registration and resolved field refs from a previous map
+        // are stale. `GAME_INIT` runs per map, so re-resolve them lazily by dropping the cache —
+        // matching how ktx re-runs `G_InitExtensions` each `GAME_INIT`.
+        self.ext_fields = ext_field::ExtFields::default();
+
         // Mid-air double jump, on by default (set `rtx_doublejump 0` to disable).
         self.host
             .cvar_set_float(cstr(b"rtx_doublejump\0"), 1.0);
