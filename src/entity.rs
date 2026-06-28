@@ -134,6 +134,10 @@ pub enum Think {
     RotateDoorThink2,
     /// `func_movewall` keep-alive tick (holds `ltime` current for the pusher).
     MovewallThink,
+
+    // --- bob.rs ---
+    /// `func_bob` sine-bob tick.
+    FuncBobThink,
 }
 
 /// A `.touch` behaviour (`GAME_EDICT_TOUCH`). The dispatcher reads `self`/`other` and
@@ -340,6 +344,7 @@ pub struct Entity {
     pub anim: AnimState,
     pub mover: MoverState,
     pub rot: RotState,
+    pub bob: BobState,
     pub refs: CustomRefs,
     pub combat: CombatState,
     pub item: ItemState,
@@ -409,6 +414,28 @@ pub struct RotState {
     pub endtime: f32,
     /// `1 / segment-traveltime`, for the train's origin interpolation.
     pub duration: f32,
+}
+
+/// Scratch for `func_bob` (`bob.rs`): a brush bobbing along `movedir`. It mirrors ktx's
+/// velocity-accumulation (so the bob amplitude matches map tuning — `height` is a per-tick
+/// velocity *intensity*, not the amplitude), but times the cycle off `cycle_t`, reset to 0 each
+/// cycle so every cycle spans the same number of ticks. With identical alternating cycles the
+/// integrated displacement (`offset`) returns exactly to zero each period, so anchoring the brush
+/// at `pos1 + offset·movedir` ([`MoverState::pos1`]) yields no long-term drift — ktx's bug.
+#[derive(Default)]
+pub struct BobState {
+    /// First-half speed-up factor applied to the ramp each tick (`waitmin`, ~1.0+).
+    pub waitmin: f32,
+    /// Second-half slow-down factor applied to the speed each tick (`waitmin2`, 0..1).
+    pub waitmin2: f32,
+    /// Seconds into the current cycle; reset to 0 at each pivot for clean, equal-length cycles.
+    pub cycle_t: f32,
+    /// Signed per-tick velocity ramp (ktx's `t_length`), restarted at `±height` each cycle.
+    pub t_length: f32,
+    /// Current scalar speed along `movedir`.
+    pub vel: f32,
+    /// Integrated displacement from the anchor along `movedir`.
+    pub offset: f32,
 }
 
 #[derive(Default)]

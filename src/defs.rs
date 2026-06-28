@@ -271,6 +271,17 @@ flag_bits! {
     }
 }
 
+flag_bits! {
+    /// `func_bob` `.spawnflags`. `MG_NONSOLID` (Dimension of the Machine) and `NONSOLID`
+    /// (progsdump / Arcane Dimensions) both mean a non-solid bob, which isn't supported.
+    /// `COLLISION` is the progsdump collision bit, kept to document the map-format bit.
+    FuncBobFlags {
+        MG_NONSOLID = 1 << 0;
+        COLLISION   = 1 << 1;
+        NONSOLID    = 1 << 2;
+    }
+}
+
 // --- player bounding box & view offset ---
 pub const VEC_HULL_MIN: Vec3 = Vec3::new(-16.0, -16.0, -24.0);
 pub const VEC_HULL_MAX: Vec3 = Vec3::new(16.0, 16.0, 32.0);

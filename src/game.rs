@@ -669,6 +669,7 @@ impl GameState {
             "rotate_object" => SpawnAction::Spawn(GameState::spawn_rotate_object),
             "path_rotate" => SpawnAction::Spawn(GameState::spawn_path_rotate),
             "info_rotate" => SpawnAction::Spawn(GameState::spawn_info_rotate),
+            "func_bob" => SpawnAction::Spawn(GameState::spawn_func_bob),
 
             // misc.qc
             "info_null" => SpawnAction::Spawn(GameState::spawn_info_null),
@@ -769,6 +770,9 @@ impl GameState {
             "height" => ent.mover.height = parse_f32(value),
             "dmg" => ent.mover.dmg = parse_f32(value),
             "count" => ent.mover.count = parse_f32(value),
+            // func_bob easing knobs (speed-up / slow-down factors).
+            "waitmin" => ent.bob.waitmin = parse_f32(value),
+            "waitmin2" => ent.bob.waitmin2 = parse_f32(value),
             // rotate.rs keys (Hipnotic rotating brushes).
             "rotate" => ent.rot.rotate = parse_vec3(value),
             "path" => ent.path = Some(value.into()),

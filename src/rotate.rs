@@ -177,7 +177,7 @@ impl GameState {
     }
 
     /// `setmodel` + `setsize`: link a brush entity's model and its bounding box.
-    fn link_brush(&mut self, e: EntId) {
+    pub(crate) fn link_brush(&mut self, e: EntId) {
         self.set_brush_model(e);
         let (mins, maxs) = {
             let v = &self.entities[e].v;

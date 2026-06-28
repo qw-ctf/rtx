@@ -73,6 +73,8 @@ impl GameState {
             RotateDoorThink => self.rotate_door_think(e),
             RotateDoorThink2 => self.rotate_door_think2(e),
             MovewallThink => self.movewall_think(e),
+            // bob.rs
+            FuncBobThink => self.func_bob_think(e),
         }
     }
 
