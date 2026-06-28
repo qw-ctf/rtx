@@ -12,7 +12,7 @@
 use glam::Vec3;
 
 use crate::assets::{Model, Sound};
-use crate::anim::{Anim, frames};
+use crate::anim::{seq, Anim, frames};
 use crate::defs::*;
 use crate::entity::{CombatState, EntId, Think};
 use crate::game::GameState;
@@ -79,6 +79,19 @@ frames! {
     anim AXATTD  = AXATTD1  ..= AXATTD4;
 }
 
+// Weapon viewmodel (`v_*.mdl`) firing animations — one per distinct viewmodel sequence. Each
+// viewmodel is its own model with its own frame numbering (independent of the player.mdl body
+// frames above), and we only need each sequence's bounds, so these are plain [`Anim`]s rather than
+// a `frames!` table that would name viewmodel frames nothing else refers to. Weapons that fire with
+// the same sequence (only the model differs) share an entry, so this covers all eight weapons. The
+// looped guns (`.cycle()`) repeat while fire is held; the rest play once via `start_weapon_anim`.
+const VAXE_FIRE_A: Anim = seq(1, 4); // v_axe.mdl swing A — axe (random body variants 1 & 3)
+const VAXE_FIRE_B: Anim = seq(5, 8); // v_axe.mdl swing B — axe (random body variants 2 & 4)
+const VSHOT_FIRE: Anim = seq(1, 6); // v_shot.mdl / v_shot2.mdl — shotgun, super shotgun
+const VNAIL_FIRE: Anim = seq(1, 8); // v_nail.mdl / v_nail2.mdl — nailgun, super nailgun (looped)
+const VROCK_FIRE: Anim = seq(1, 6); // v_rock.mdl / v_rock2.mdl — grenade & rocket launchers
+const VLIGHT_FIRE: Anim = seq(1, 4); // v_light.mdl — lightning gun (looped)
+
 impl GameState {
     /// Re-arm an animation loop: schedule the next think 0.1s out and record which loop.
     fn schedule_anim(&mut self, e: EntId, think: Think) {
@@ -138,15 +151,20 @@ impl GameState {
 
     // --- weapon firing animations (driven by W_Attack) ---
 
-    /// Begin a cosmetic weapon animation: `walkframe` is the cursor, `anim` supplies the body
-    /// frames (and their count), and `wf_base`/`fire`/`muzzle` are the per-weapon events.
-    fn start_weapon_anim(&mut self, e: EntId, anim: Anim, wf_base: i32, fire: i32, muzzle: i32) {
+    /// Begin a play-once weapon animation: `walkframe` is the cursor, `body` supplies the player
+    /// frames (and the shared frame count), `vwep` the matching viewmodel frames, and
+    /// `fire`/`muzzle` are the cursor indices at which the weapon fires / shows a muzzle flash.
+    fn start_weapon_anim(&mut self, e: EntId, body: Anim, vwep: Anim, fire: i32, muzzle: i32) {
+        debug_assert_eq!(
+            body.len, vwep.len,
+            "body and viewmodel fire animations must run the same number of frames"
+        );
         {
             let ent = &mut self.entities[e];
             ent.anim.walkframe = 0;
-            ent.anim.anim_base = anim.first;
-            ent.anim.anim_wf_base = wf_base;
-            ent.anim.anim_len = anim.len;
+            ent.anim.anim_base = body.first;
+            ent.anim.anim_wf_base = vwep.first;
+            ent.anim.anim_len = body.len;
             ent.anim.anim_fire = fire;
             ent.anim.anim_muzzle = muzzle;
             ent.think = Think::PlayerWeaponAnim;
@@ -156,22 +174,22 @@ impl GameState {
     }
 
     pub(crate) fn start_shot_anim(&mut self, e: EntId) {
-        self.start_weapon_anim(e, SHOTATT, 1, -1, 0);
+        self.start_weapon_anim(e, SHOTATT, VSHOT_FIRE, -1, 0);
     }
 
     pub(crate) fn start_rocket_anim(&mut self, e: EntId) {
-        self.start_weapon_anim(e, ROCKATT, 1, -1, 0);
+        self.start_weapon_anim(e, ROCKATT, VROCK_FIRE, -1, 0);
     }
 
     pub(crate) fn start_axe_anim(&mut self, e: EntId) {
-        // Four cosmetic variants; all fire the axe on the third frame.
-        let (anim, wf_base) = match (self.random() * 4.0) as i32 {
-            0 => (AXATT, 1),
-            1 => (AXATTB, 5),
-            2 => (AXATTC, 1),
-            _ => (AXATTD, 5),
+        // Four cosmetic body variants over two viewmodel swings; all fire the axe on the third frame.
+        let (body, vwep) = match (self.random() * 4.0) as i32 {
+            0 => (AXATT, VAXE_FIRE_A),
+            1 => (AXATTB, VAXE_FIRE_B),
+            2 => (AXATTC, VAXE_FIRE_A),
+            _ => (AXATTD, VAXE_FIRE_B),
         };
-        self.start_weapon_anim(e, anim, wf_base, 2, -1);
+        self.start_weapon_anim(e, body, vwep, 2, -1);
     }
 
     /// `PlayerWeaponAnim` think — advance one cosmetic weapon frame.
@@ -221,10 +239,7 @@ impl GameState {
         }
         {
             let ent = &mut self.entities[e];
-            ent.v.weaponframe += 1.0;
-            if ent.v.weaponframe == 9.0 {
-                ent.v.weaponframe = 1.0;
-            }
+            ent.v.weaponframe = VNAIL_FIRE.cycle(ent.v.weaponframe);
         }
         self.super_damage_sound(e);
         let parity = self.entities[e].anim.walkframe & 1;
@@ -255,10 +270,7 @@ impl GameState {
         }
         {
             let ent = &mut self.entities[e];
-            ent.v.weaponframe += 1.0;
-            if ent.v.weaponframe == 5.0 {
-                ent.v.weaponframe = 1.0;
-            }
+            ent.v.weaponframe = VLIGHT_FIRE.cycle(ent.v.weaponframe);
         }
         self.super_damage_sound(e);
         self.w_fire_lightning(e);

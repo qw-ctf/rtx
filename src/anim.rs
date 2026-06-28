@@ -34,6 +34,17 @@ impl Anim {
     pub(crate) const fn last(self) -> i32 {
         self.first + self.len - 1
     }
+    /// Advance a looping cursor one frame, wrapping from `last` back to `first` — for an
+    /// animation that repeats while held (e.g. a weapon viewmodel's `weaponframe` during sustained
+    /// fire). A cursor before the loop (`< first`, e.g. `0` at rest) enters at `first`. Replaces
+    /// QuakeC's `wf += 1; if (wf == last + 1) wf = first`.
+    pub(crate) fn cycle(self, cursor: f32) -> f32 {
+        if cursor >= self.last() as f32 {
+            self.first as f32
+        } else {
+            cursor + 1.0
+        }
+    }
 }
 
 /// Declare a model's frames and the animations built on them — QuakeC's two constructs in one
