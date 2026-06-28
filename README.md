@@ -45,6 +45,9 @@ the old looping chain rattle.
 |------|---------|--------------|
 | `rtx_grapple` | `1` | Every player **spawns holding** a grappling hook (no ammo). Fire to throw it; the hook sticks to walls — or players, who get dragged and lightly damaged — and reels you toward it while you hold fire (a moving anchor carries you along). Select it with **impulse 22** or by **double-tapping impulse 1** (toggles axe ↔ hook). `0` disables it. |
 
+Throw and reel speeds are tunable via `rtx_hook_speed` (default `1.25`) and `rtx_hook_pull`
+(default `1.0`) — purectf's `hookspeed`/`hookpull`, each a multiplier on its base speed.
+
 It reels server-side too, so it shows the same one-frame prediction pop as the movement
 features above. The hook's models and viewmodel must be in the gamedir:
 `progs/{star,bit,v_star}.mdl`.

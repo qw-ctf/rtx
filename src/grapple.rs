@@ -29,9 +29,9 @@ use crate::game::GameState;
 
 /// QuakeWorld default player speed, the base the hook speeds scale off (purectf's `self.maxspeed`).
 const MAXSPEED: f32 = 320.0;
-/// Hook throw speed (`2.5 * maxspeed`): the classic ~800 ups.
+/// Hook throw speed before the `rtx_hook_speed` multiplier (`2.5 * maxspeed` = ~800 ups at ×1).
 const HOOK_THROW_SPEED: f32 = 2.5 * MAXSPEED;
-/// Reel-in speed (`2.35 * maxspeed`): the classic ~750 ups.
+/// Reel-in speed before the `rtx_hook_pull` multiplier (`2.35 * maxspeed` = ~750 ups at ×1).
 const HOOK_PULL_SPEED: f32 = 2.35 * MAXSPEED;
 /// Distance under which the rope is taut enough to ditch the now-redundant chain links.
 const HOOK_CLOSE: f32 = 100.0;
@@ -55,6 +55,7 @@ impl GameState {
         self.host.make_vectors(v_angle);
         let v_forward = self.globals.v_forward;
         let now = self.globals.time;
+        let throw_speed = HOOK_THROW_SPEED * self.host.cvar(c"rtx_hook_speed");
 
         let m = self.spawn();
         {
@@ -63,7 +64,7 @@ impl GameState {
             hook.v.solid = Solid::BBox;
             hook.set_owner(player);
             hook.classname = Some("hook".into());
-            hook.v.velocity = v_forward * HOOK_THROW_SPEED;
+            hook.v.velocity = v_forward * throw_speed;
             hook.v.avelocity = Vec3::new(0.0, 0.0, -500.0);
             hook.set_touch(Touch::Hook);
             hook.think = Think::BuildChain; // defer the links a frame, as the QC does
@@ -201,7 +202,8 @@ impl GameState {
         };
         let dir = target - self.entities[player].v.origin;
         let len = dir.length();
-        self.entities[player].v.velocity = dir.normalize_or_zero() * HOOK_PULL_SPEED;
+        let pull_speed = HOOK_PULL_SPEED * self.host.cvar(c"rtx_hook_pull");
+        self.entities[player].v.velocity = dir.normalize_or_zero() * pull_speed;
 
         if len <= HOOK_CLOSE && self.entities[player].grapple.lefty {
             // Close enough — drop the chain links now, once (ktx played CHAIN3 here; we don't).

@@ -413,6 +413,10 @@ impl GameState {
         // Grappling hook (purectf port), on by default — every player spawns with it (impulse 22
         // to select). `rtx_grapple 0` to disable.
         self.host.cvar_set_float(cstr(b"rtx_grapple\0"), 1.0);
+        // Hook throw / reel-in speed multipliers (purectf's `localinfo hookspeed`/`hookpull`),
+        // each scaling its base `× sv_maxspeed`. Defaults match purectf's shipped server.cfg.
+        self.host.cvar_set_float(cstr(b"rtx_hook_speed\0"), 1.25);
+        self.host.cvar_set_float(cstr(b"rtx_hook_pull\0"), 1.0);
 
         self.host.dprint(cstr(b"rtx: QuakeWorld game module loaded\0"));
 
