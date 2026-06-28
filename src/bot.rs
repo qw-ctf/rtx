@@ -177,12 +177,20 @@ fn run_bot(game: &mut GameState, e: EntId) {
         return;
     };
 
-    // Which gates are currently shut? (door still at its closed `pos1`.) Read before borrowing
-    // the bot mutably, since it touches other entities (the door edicts).
+    // Which gates are currently shut, and whether each activator can be triggered right now?
+    // Read before borrowing the bot mutably (these touch the door/movewall + activator edicts).
+    // A gate is shut while its obstruction still sits at its closed origin; a shoot activator is
+    // "ready" only while it takes damage — re-triggerable triggers go dead during their cooldown.
     let gate_closed: Vec<bool> = (0..graph.gate_count())
         .map(|gi| {
-            let d = EntId(graph.gate(gi).door);
-            (game.entities[d].v.origin - game.entities[d].mover.pos1).length() < 4.0
+            let g = graph.gate(gi);
+            (game.entities[EntId(g.obstruction)].v.origin - g.closed_origin).length() < 8.0
+        })
+        .collect();
+    let gate_ready: Vec<bool> = (0..graph.gate_count())
+        .map(|gi| {
+            let g = graph.gate(gi);
+            !g.shoot || game.entities[EntId(g.activator)].v.takedamage != 0.0
         })
         .collect();
 
@@ -315,11 +323,20 @@ fn run_bot(game: &mut GameState, e: EntId) {
             angles = Vec3::new(pitch, yaw, 0.0);
             buttons &= !BUTTON_JUMP;
             if g.shoot {
-                // Switch to the shotgun and fire at the button.
+                // Switch to the shotgun and fire at the activator. If it's so high above us that
+                // aiming would exceed the view-pitch limit (the shot lands under it), back
+                // straight away first for a shallower angle — ground movement stays horizontal
+                // regardless of look pitch, so we can keep aiming up while backpedalling. Only
+                // fire while the activator is ready (not in its post-trigger cooldown).
                 impulse = IMPULSE_SHOTGUN;
-                (forward, side) = (0, 0);
-                if weapon == Items::SHOTGUN.as_f32() {
-                    buttons |= BUTTON_ATTACK;
+                if pitch < -68.0 {
+                    forward = (-MOVE_SPEED) as i32;
+                    side = 0;
+                } else {
+                    (forward, side) = (0, 0);
+                    if weapon == Items::SHOTGUN.as_f32() && gate_ready[gi] {
+                        buttons |= BUTTON_ATTACK;
+                    }
                 }
             } else {
                 // Walk into the button to push it.

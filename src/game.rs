@@ -550,36 +550,75 @@ impl GameState {
             .collect()
     }
 
-    /// Gather the [`GateInfo`](crate::navmesh::GateInfo) for every button-gated door: a
-    /// `func_door` with a targetname (it has no auto-trigger, so it stays shut) paired with the
-    /// `func_button` whose `target` fires it. Records the door's closed-position world box (from
-    /// `pos1`), the button centre, and whether the button is shot (`health > 0`) or touched.
+    /// Gather the [`GateInfo`](crate::navmesh::GateInfo) for every button-gated obstruction: a
+    /// targeted `func_door` (slides; rests closed at `pos1`) or a blocking `func_movewall`
+    /// (rotates, driven by a rotator; rests at its current origin). Each is paired with the
+    /// `func_button` that ultimately opens it, found by following `target` → `targetname` back
+    /// from the obstruction — directly for a door, or through the rotator for a movewall.
     fn collect_gates(&self) -> Vec<crate::navmesh::GateInfo> {
-        let doors: Vec<EntId> = self
-            .find_by_classname("door")
-            .filter(|&d| self.entities[d].targetname.is_some())
-            .collect();
+        // (obstruction, closed origin) for every entity that blocks a path until triggered.
+        let mut obstructions: Vec<(EntId, Vec3)> = Vec::new();
+        for d in self.find_by_classname("door") {
+            if self.entities[d].targetname.is_some() {
+                obstructions.push((d, self.entities[d].mover.pos1));
+            }
+        }
+        for w in self.find_by_classname("func_movewall") {
+            let e = &self.entities[w];
+            if e.targetname.is_some() && e.v.solid == defs::Solid::Bsp {
+                obstructions.push((w, e.v.origin));
+            }
+        }
+
         let mut gates = Vec::new();
-        for door in doors {
-            let tn = self.entities[door].targetname.clone().unwrap();
-            let Some(button) = self
-                .find_by_classname("func_button")
-                .find(|&b| self.entities[b].target.as_deref() == Some(tn.as_ref()))
-            else {
+        for (obs, closed_origin) in obstructions {
+            let tn = self.entities[obs].targetname.clone().unwrap();
+            let Some((activator, shoot)) = self.find_activator(&tn, 0) else {
                 continue;
             };
-            let bent = &self.entities[button];
-            let dent = &self.entities[door];
-            let closed = dent.mover.pos1; // door rests closed at pos1
+            let oent = &self.entities[obs];
+            let bent = &self.entities[activator];
             gates.push(crate::navmesh::GateInfo {
-                door: door.0,
-                closed_min: closed + dent.v.mins,
-                closed_max: closed + dent.v.maxs,
+                obstruction: obs.0,
+                closed_origin,
+                closed_min: closed_origin + oent.v.mins,
+                closed_max: closed_origin + oent.v.maxs,
+                activator: activator.0,
                 button: bent.v.origin + (bent.v.mins + bent.v.maxs) * 0.5,
-                shoot: bent.v.health > 0.0,
+                shoot,
             });
         }
         gates
+    }
+
+    /// Follow `target` → `targetname` from `tn` back to the player-facing activator that fires
+    /// the chain: a `func_button` (door gates), or a shootable/touchable trigger
+    /// (`trigger_multiple`/`trigger_once`) reached through rotators and relays (movewall gates).
+    /// Returns the activator and whether it's shot (`health > 0`). Depth-bounded against cycles.
+    fn find_activator(&self, tn: &str, depth: u32) -> Option<(EntId, bool)> {
+        if depth > 5 {
+            return None;
+        }
+        for (i, e) in self.entities.iter().enumerate() {
+            if !e.in_use || e.target.as_deref() != Some(tn) {
+                continue;
+            }
+            // An intermediate (rotator, relay) is itself triggered — follow the chain back.
+            if let Some(next) = e.targetname.clone() {
+                if let Some(found) = self.find_activator(&next, depth + 1) {
+                    return Some(found);
+                }
+                continue;
+            }
+            // Leaf: the thing a player shoots or touches to fire the chain.
+            if matches!(
+                e.classname(),
+                Some("func_button" | "trigger_multiple" | "trigger_once")
+            ) {
+                return Some((EntId(i as u32), e.v.health > 0.0));
+            }
+        }
+        None
     }
 
     /// `GAME_START_FRAME` — once per server frame. `is_bot_frame` runs only bot logic.

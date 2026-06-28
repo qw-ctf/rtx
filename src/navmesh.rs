@@ -498,7 +498,9 @@ impl NavGraph {
                 self.gated.insert(c, idx);
             }
             self.gates.push(Gate {
-                door: gi.door,
+                obstruction: gi.obstruction,
+                closed_origin: gi.closed_origin,
+                activator: gi.activator,
                 button_cell,
                 aim: gi.button,
                 shoot: gi.shoot,
@@ -572,22 +574,30 @@ pub struct TeleportInfo {
     pub dest: Vec3,
 }
 
-/// A button-gated door: the door entity (to read its open/closed position), where the bot
-/// operates the button from (`button_cell`), the button centre to face/touch/shoot (`aim`),
-/// and whether the button is shot rather than touched.
+/// A button-gated obstruction (a sliding `func_door` or a rotating `func_movewall`): the
+/// obstructing entity (to read its current position), where it sits while blocking
+/// (`closed_origin` — it's "open" once moved from here), where the bot operates the button from
+/// (`button_cell`), the button centre to face/touch/shoot (`aim`), and whether it's shot.
 pub struct Gate {
-    pub door: u32,
+    pub obstruction: u32,
+    pub closed_origin: Vec3,
+    /// The activator entity (button or shootable trigger), to read its cooldown/`takedamage`
+    /// state — a re-triggerable activator goes dead for a while after each use.
+    pub activator: u32,
     pub button_cell: CellId,
     pub aim: Vec3,
     pub shoot: bool,
 }
 
-/// Inputs for [`NavGraph::add_gates`], gathered from spawned door/button entities: the door's
-/// closed-position world box, the button centre, and how the button is activated.
+/// Inputs for [`NavGraph::add_gates`], gathered from spawned obstruction/activator entities: the
+/// obstruction's closed-position origin and world box, the activator entity + its centre, and
+/// whether it's shot rather than touched.
 pub struct GateInfo {
-    pub door: u32,
+    pub obstruction: u32,
+    pub closed_origin: Vec3,
     pub closed_min: Vec3,
     pub closed_max: Vec3,
+    pub activator: u32,
     pub button: Vec3,
     pub shoot: bool,
 }
@@ -814,9 +824,11 @@ mod tests {
         // covered cells become gated and the button resolves to an operating cell.
         let dcell = g.cells[start as usize].origin;
         let gate = GateInfo {
-            door: 0,
+            obstruction: 0,
+            closed_origin: dcell,
             closed_min: dcell - Vec3::new(32.0, 32.0, 8.0),
             closed_max: dcell + Vec3::new(32.0, 32.0, 56.0),
+            activator: 0,
             button: g.cells[goal as usize].origin,
             shoot: false,
         };
