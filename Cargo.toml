@@ -12,5 +12,6 @@ name = "rtx"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+binrw = "0.15"
 bitflags = "2"
 glam = "0.32"

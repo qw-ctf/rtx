@@ -2,17 +2,21 @@
 
 //! Minimal BSP reader — only the lumps the navmesh needs from the **player clip hull**.
 //!
-//! Inspired by the layout of the `bsp` crate at `/Users/daniel/Development/home/bsp`, but
-//! pared down to plain little-endian cursor reads over the raw file bytes (no `binrw`, no
-//! extra crate deps) and extended with the one lump that crate doesn't expose: `clipnodes`.
+//! Declarative `binrw` parsing in the style of the `bsp` crate at
+//! `/Users/daniel/Development/home/bsp`, pared down to the three lumps navigation needs and
+//! extended with the one that crate doesn't expose: `clipnodes`. The header skips straight to
+//! `planes`, `clipnodes`, and `models` with `pad_before`, and v29/HL clipnodes (`i16` children)
+//! normalize to the BSP2 shape (`i32`) via a `From` conversion — same approach the crate uses
+//! for nodes/leaves.
 //!
-//! We read `planes`, `clipnodes`, and the world model (`models[0]`) — the world's hull-1
-//! headnode plus its bounding box. Hull 1 is Quake's *standing player* collision hull: its
-//! clip planes were already beveled by the player box at BSP-compile time, so a single
-//! **point** test against hull 1 answers "would the player box collide here?" — no box trace
-//! needed (classic `SV_HullPointContents`). Everything else in the file (rendering BSP tree,
-//! faces, lightmaps, textures, vis) is irrelevant to navigation and skipped.
+//! Hull 1 is Quake's *standing player* collision hull: its clip planes were already beveled by
+//! the player box at compile time, so a single **point** test against hull 1 answers "would the
+//! player box collide here?" (classic `SV_HullPointContents`). Everything else in the file
+//! (rendering BSP tree, faces, lightmaps, textures, vis) is irrelevant to navigation.
 
+use std::io::{Cursor, Seek, SeekFrom};
+
+use binrw::{BinRead, BinReaderExt, BinResult};
 use glam::Vec3;
 
 /// `CONTENTS_SOLID` — the only clip-hull leaf value we test against. Clip hulls (1/2) resolve
@@ -20,22 +24,90 @@ use glam::Vec3;
 /// which this minimal parser doesn't read.
 pub const CONTENTS_SOLID: i32 = -2;
 
+/// A lump directory entry (`offset`, `size`).
+#[derive(BinRead, Clone, Copy)]
+#[br(little)]
+struct Lump {
+    offset: u32,
+    size: u32,
+}
+
+/// BSP format magic. v29 (Quake) and v30 (Half-Life) store clipnode children as `i16`; BSP2
+/// uses `i32`.
+#[derive(BinRead, PartialEq)]
+#[br(little)]
+enum Version {
+    #[br(magic(29u32))]
+    Bsp29,
+    #[br(magic(30u32))]
+    BspHl,
+    #[br(magic(0x3250_5342u32))] // "BSP2"
+    Bsp2,
+}
+
+/// The lump directory, reading only the three lumps the navmesh needs and skipping the rest
+/// (`pad_before` jumps over the unused entries: 1 before planes, 7 before clipnodes, 4 before
+/// models).
+#[derive(BinRead)]
+#[br(little)]
+struct Header {
+    version: Version,
+    #[br(pad_before = 8)]
+    planes: Lump,
+    #[br(pad_before = 56)]
+    clipnodes: Lump,
+    #[br(pad_before = 32)]
+    models: Lump,
+}
+
 /// A BSP plane (`dplane_t`): `normal·p - dist`. `kind` is the axial type — `0/1/2` for an
 /// axis-aligned plane (test just that coordinate), `>=3` for a general plane (dot product).
-#[derive(Clone, Copy)]
+#[derive(BinRead, Clone, Copy)]
+#[br(little)]
 pub struct Plane {
+    #[br(map = Vec3::from_array)]
     pub normal: Vec3,
     pub dist: f32,
     pub kind: i32,
 }
 
-/// A clip-hull BSP node (`dclipnode_t`). `children[0]` is the front side (`d >= 0`),
-/// `children[1]` the back; a negative child is a `CONTENTS_*` leaf rather than a node index.
-/// (v29/HL store the children as `i16`; we sign-extend to `i32` so BSP2 fits the same shape.)
-#[derive(Clone, Copy)]
+/// `dclipnode_t` as stored in v29/HL (`i16` children).
+#[derive(BinRead, Clone, Copy)]
+#[br(little)]
+struct ClipNodeV1 {
+    plane: u32,
+    children: [i16; 2],
+}
+
+/// A clip-hull BSP node, normalized to the BSP2 shape. `children[0]` is the front side
+/// (`d >= 0`), `children[1]` the back; a negative child is a `CONTENTS_*` leaf, not a node index.
+#[derive(BinRead, Clone, Copy)]
+#[br(little)]
 pub struct ClipNode {
     pub plane: u32,
     pub children: [i32; 2],
+}
+
+impl From<ClipNodeV1> for ClipNode {
+    fn from(v: ClipNodeV1) -> Self {
+        ClipNode {
+            plane: v.plane,
+            children: [v.children[0] as i32, v.children[1] as i32],
+        }
+    }
+}
+
+/// The world model (`models[0]`): we only need its bounding box and the hull-1 headnode, so
+/// `pad_before` skips `origin` and `headnode[0]` and the trailing fields aren't read at all.
+#[derive(BinRead)]
+#[br(little)]
+struct Model {
+    #[br(map = Vec3::from_array)]
+    mins: Vec3,
+    #[br(map = Vec3::from_array)]
+    maxs: Vec3,
+    #[br(pad_before = 16)] // skip origin (12) + headnode[0] (4)
+    clip1: i32,
 }
 
 /// The subset of a parsed BSP the navmesh consumes.
@@ -49,78 +121,29 @@ pub struct Bsp {
     pub maxs: Vec3,
 }
 
-// Lump indices into the 15-entry directory (Quake `lump_t` order).
-const LUMP_PLANES: usize = 1;
-const LUMP_CLIPNODES: usize = 9;
-const LUMP_MODELS: usize = 14;
-
-const PLANE_SIZE: usize = 20; // normal(12) + dist(4) + type(4)
-const MODEL_SIZE: usize = 64; // mins(12)+maxs(12)+origin(12)+headnode[4](16)+visleafs(4)+face(8)
-
 impl Bsp {
-    /// Parse the lumps the navmesh needs from a whole-file byte buffer. Returns `None` if the
-    /// file is too short, has an unsupported version, or a lump is malformed.
+    /// Parse the lumps the navmesh needs from a whole-file byte buffer. Returns `None` on an
+    /// unsupported version or a malformed/truncated lump.
     pub fn parse(bytes: &[u8]) -> Option<Bsp> {
-        let r = Reader::new(bytes);
-        let version = r.at(0)?.u32()?;
-        // v29 (Quake) and v30 (Half-Life) store clipnode children as i16; BSP2 uses i32.
-        let bsp2 = match version {
-            29 | 30 => false,
-            0x3250_5342 => true, // "BSP2"
-            _ => return None,
+        let mut c = Cursor::new(bytes);
+        let header: Header = c.read_le().ok()?;
+
+        let planes = read_lump::<Plane>(&mut c, &header.planes).ok()?;
+        let clipnodes = if header.version == Version::Bsp2 {
+            read_lump::<ClipNode>(&mut c, &header.clipnodes).ok()?
+        } else {
+            read_lump_into::<ClipNodeV1, ClipNode>(&mut c, &header.clipnodes).ok()?
         };
 
-        let planes = {
-            let (off, size) = r.lump(LUMP_PLANES)?;
-            let count = size / PLANE_SIZE;
-            let mut v = Vec::with_capacity(count);
-            let mut p = r.at(off)?;
-            for _ in 0..count {
-                v.push(Plane {
-                    normal: p.vec3()?,
-                    dist: p.f32()?,
-                    kind: p.i32()?,
-                });
-            }
-            v
-        };
-
-        let clipnodes = {
-            let (off, size) = r.lump(LUMP_CLIPNODES)?;
-            let elem = if bsp2 { 12 } else { 8 };
-            let count = size / elem;
-            let mut v = Vec::with_capacity(count);
-            let mut p = r.at(off)?;
-            for _ in 0..count {
-                let plane = p.u32()?;
-                let children = if bsp2 {
-                    [p.i32()?, p.i32()?]
-                } else {
-                    [p.i16()? as i32, p.i16()? as i32]
-                };
-                v.push(ClipNode { plane, children });
-            }
-            v
-        };
-
-        // World model is models[0]; we only need its bbox and hull-1 headnode.
-        let (moff, msize) = r.lump(LUMP_MODELS)?;
-        if msize < MODEL_SIZE {
-            return None;
-        }
-        let mut m = r.at(moff)?;
-        let mins = m.vec3()?;
-        let maxs = m.vec3()?;
-        let _origin = m.vec3()?;
-        let _headnode0 = m.i32()?;
-        let hull1_headnode = m.i32()?;
+        c.seek(SeekFrom::Start(header.models.offset as u64)).ok()?;
+        let model: Model = c.read_le().ok()?;
 
         Some(Bsp {
             planes,
             clipnodes,
-            hull1_headnode,
-            mins,
-            maxs,
+            hull1_headnode: model.clip1,
+            mins: model.mins,
+            maxs: model.maxs,
         })
     }
 
@@ -157,58 +180,38 @@ impl Bsp {
     }
 }
 
-/// A tiny forward-only little-endian byte reader over the file buffer.
-struct Reader<'a> {
-    bytes: &'a [u8],
-    pos: usize,
+/// Read a lump as a `Vec<T>` (count derived from the lump size and `T`'s on-disk size).
+fn read_lump<T>(c: &mut Cursor<&[u8]>, lump: &Lump) -> BinResult<Vec<T>>
+where
+    T: BinRead + for<'a> BinRead<Args<'a> = ()>,
+{
+    read_lump_into::<T, T>(c, lump)
 }
 
-impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Reader { bytes, pos: 0 }
+/// Read a lump of `T` records, converting each `Into` the normalized `U` (used to widen v29
+/// clipnodes to the BSP2 shape).
+fn read_lump_into<T, U>(c: &mut Cursor<&[u8]>, lump: &Lump) -> BinResult<Vec<U>>
+where
+    T: BinRead + for<'a> BinRead<Args<'a> = ()>,
+    U: From<T>,
+{
+    c.seek(SeekFrom::Start(lump.offset as u64))?;
+    let count = lump.size as usize / std::mem::size_of::<T>();
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        out.push(T::read_le(c)?.into());
     }
-
-    /// A fresh reader positioned at absolute byte offset `pos`.
-    fn at(&self, pos: usize) -> Option<Reader<'a>> {
-        (pos <= self.bytes.len()).then_some(Reader { bytes: self.bytes, pos })
-    }
-
-    /// Resolve lump `index` (0..15) to its `(offset, size)`. The directory is 15 entries of
-    /// `{u32 offset, u32 size}` starting right after the 4-byte version.
-    fn lump(&self, index: usize) -> Option<(usize, usize)> {
-        let mut e = self.at(4 + index * 8)?;
-        let off = e.u32()? as usize;
-        let size = e.u32()? as usize;
-        (off.checked_add(size)? <= self.bytes.len()).then_some((off, size))
-    }
-
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let end = self.pos.checked_add(n)?;
-        let s = self.bytes.get(self.pos..end)?;
-        self.pos = end;
-        Some(s)
-    }
-
-    fn u32(&mut self) -> Option<u32> {
-        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
-    }
-    fn i32(&mut self) -> Option<i32> {
-        Some(i32::from_le_bytes(self.take(4)?.try_into().ok()?))
-    }
-    fn i16(&mut self) -> Option<i16> {
-        Some(i16::from_le_bytes(self.take(2)?.try_into().ok()?))
-    }
-    fn f32(&mut self) -> Option<f32> {
-        Some(f32::from_le_bytes(self.take(4)?.try_into().ok()?))
-    }
-    fn vec3(&mut self) -> Option<Vec3> {
-        Some(Vec3::new(self.f32()?, self.f32()?, self.f32()?))
-    }
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Lump directory indices / element sizes, for the independent cross-check below.
+    const LUMP_PLANES: usize = 1;
+    const LUMP_CLIPNODES: usize = 9;
+    const PLANE_SIZE: usize = 20;
 
     /// Parse a real map (path from `RTX_TEST_BSP`, e.g. a Quake `dm2.bsp`) and check the parser
     /// holds together: lump counts match an independent header read, the hull-1 root is a real
