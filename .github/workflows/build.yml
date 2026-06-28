@@ -40,7 +40,7 @@ jobs:
         run: cp "target/release/${{ matrix.built }}" "${{ matrix.artifact }}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: qwprogs-${{ matrix.target }}
           path: ${{ matrix.artifact }}
