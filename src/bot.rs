@@ -176,6 +176,14 @@ fn run_bot(game: &mut GameState, e: EntId) {
 
     let bot = &mut game.entities[e].bot;
 
+    // A teleport (or any large instant displacement) invalidates the planned route — drop it
+    // and re-path from where we landed. ~200u in one frame is far beyond running/falling.
+    if bot.last_origin != Vec3::ZERO && (origin - bot.last_origin).length() > 200.0 {
+        bot.route.clear();
+        bot.repath_time = now;
+    }
+    bot.last_origin = origin;
+
     // Re-path when the route is empty, the human moved to a new cell, or the timer elapsed.
     if bot.route.is_empty() || bot.goal_cell != goal_cell || now >= bot.repath_time {
         bot.route = graph.find_path(bot_cell, goal_cell).unwrap_or_default();

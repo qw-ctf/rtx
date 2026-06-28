@@ -484,13 +484,15 @@ impl GameState {
             return;
         };
         // Build the cell/link graph from the player clip hull, then splice in the spawned
-        // func_plat lifts (entity-derived links, which need the entities to exist).
+        // entity-derived links (func_plat lifts, trigger_teleport warps), which need the
+        // entities to exist.
         let mut graph = crate::navmesh::NavGraph::build(&bsp);
         graph.add_plats(&bsp, &self.collect_plats());
+        graph.add_teleports(&self.collect_teleports());
         let counts = graph.summary();
         let msg = cstring(&format!(
             "rtx: navmesh: {} planes, {} clipnodes -> {} cells, {} links \
-             (walk {} step {} drop {} jump {} plat {})\n",
+             (walk {} step {} drop {} jump {} plat {} tele {})\n",
             bsp.planes.len(),
             bsp.clipnodes.len(),
             graph.cells.len(),
@@ -500,6 +502,7 @@ impl GameState {
             counts.drop,
             counts.jump,
             counts.plat,
+            counts.teleport,
         ));
         self.host.dprint(&msg);
         self.nav.bsp = Some(bsp);
@@ -522,6 +525,25 @@ impl GameState {
                     board: Vec3::new(cx, cy, pos2.z + maxs.z + 24.0),
                     exit: Vec3::new(cx, cy, pos1.z + maxs.z + 24.0),
                 }
+            })
+            .collect()
+    }
+
+    /// Gather the [`TeleportInfo`](crate::navmesh::TeleportInfo) for every `trigger_teleport`:
+    /// its world-space trigger box and the destination's arrival origin (resolved through the
+    /// `target` → `targetname` link, exactly as `teleport_touch` does at runtime).
+    fn collect_teleports(&self) -> Vec<crate::navmesh::TeleportInfo> {
+        self.find_by_classname("trigger_teleport")
+            .filter_map(|e| {
+                let ent = &self.entities[e];
+                let target = ent.target.clone()?;
+                let dest = self.find_by_targetname(&target).next()?;
+                let origin = ent.v.origin;
+                Some(crate::navmesh::TeleportInfo {
+                    tmin: origin + ent.v.mins,
+                    tmax: origin + ent.v.maxs,
+                    dest: self.entities[dest].v.origin,
+                })
             })
             .collect()
     }

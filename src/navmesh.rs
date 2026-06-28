@@ -73,6 +73,10 @@ pub enum LinkKind {
     /// link's `from` cell is the standing spot on the plat (its centre), `to` the floor the
     /// plat delivers to. Bots stay centred and wait rather than steering off.
     Plat,
+    /// Walking into a `trigger_teleport`: the engine warps you to the destination. No special
+    /// traversal — the bot just routes onto an entrance cell and is teleported; it then detects
+    /// the jump and re-paths from where it lands.
+    Teleport,
 }
 
 /// A directed edge between two cells, with its traversal kind and travel-time cost.
@@ -377,6 +381,7 @@ impl NavGraph {
                 LinkKind::Drop => c.drop += 1,
                 LinkKind::JumpGap => c.jump += 1,
                 LinkKind::Plat => c.plat += 1,
+                LinkKind::Teleport => c.teleport += 1,
             }
         }
         c
@@ -421,6 +426,49 @@ impl NavGraph {
                 }
             }
         }
+    }
+
+    /// Splice `trigger_teleport`s into the graph: every standable cell inside a teleporter's
+    /// trigger box gets a [`LinkKind::Teleport`] link to the cell at its destination. The bot
+    /// needs no special handling — routing onto an entrance cell walks it into the trigger and
+    /// the engine warps it; a separate displacement check then re-paths from the landing spot.
+    /// Teleporters whose destination doesn't reach any floor cell are skipped.
+    pub fn add_teleports(&mut self, teles: &[TeleportInfo]) {
+        for t in teles {
+            let Some(dest) = self.nearest_within(t.dest, GRID * 3.0, 96.0) else {
+                continue;
+            };
+            // Entrance cells: those whose footprint sits within the trigger box (loosened in Z
+            // so a floor cell standing in a doorway-tall trigger still counts).
+            let lo = Vec3::new(t.tmin.x, t.tmin.y, t.tmin.z - 32.0);
+            let hi = Vec3::new(t.tmax.x, t.tmax.y, t.tmax.z + 24.0);
+            for c in self.cells_in_box(lo, hi) {
+                if c != dest {
+                    self.push_link(Link { from: c, to: dest, kind: LinkKind::Teleport, cost: 0.2 });
+                }
+            }
+        }
+    }
+
+    /// Cells whose origin lies within the axis-aligned box `[min, max]`.
+    fn cells_in_box(&self, min: Vec3, max: Vec3) -> Vec<CellId> {
+        let mut out = Vec::new();
+        for gx in floor_grid(min.x)..=floor_grid(max.x) {
+            for gy in floor_grid(min.y)..=floor_grid(max.y) {
+                if let Some(ids) = self.grid.get(&(gx, gy)) {
+                    for &c in ids {
+                        let o = self.cells[c as usize].origin;
+                        if (min.x..=max.x).contains(&o.x)
+                            && (min.y..=max.y).contains(&o.y)
+                            && (min.z..=max.z).contains(&o.z)
+                        {
+                            out.push(c);
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Append a free-standing cell (not from the column carve) and index it. Used for plat
@@ -468,6 +516,14 @@ pub struct PlatInfo {
     pub exit: Vec3,
 }
 
+/// A `trigger_teleport`: its world-space trigger box (`tmin`/`tmax`) and the player-origin
+/// arrival point at its destination (`dest`).
+pub struct TeleportInfo {
+    pub tmin: Vec3,
+    pub tmax: Vec3,
+    pub dest: Vec3,
+}
+
 #[derive(Default)]
 pub struct LinkCounts {
     pub walk: u32,
@@ -475,6 +531,7 @@ pub struct LinkCounts {
     pub drop: u32,
     pub jump: u32,
     pub plat: u32,
+    pub teleport: u32,
 }
 
 /// Travel-time cost of a link: horizontal distance / speed, plus risk/effort penalties so A*
@@ -488,6 +545,8 @@ fn link_cost(kind: LinkKind, horiz: f32, dz: f32) -> f32 {
         LinkKind::JumpGap => base + 0.3,
         // Plat costs are computed at splice time (ride time + overhead), not here.
         LinkKind::Plat => base + 1.0,
+        // Teleporting is near-instant; cost is set at splice time.
+        LinkKind::Teleport => 0.2,
     }
 }
 
@@ -672,5 +731,15 @@ mod tests {
         assert_eq!(g.summary().plat, 1, "plat ride not added");
         assert_eq!(g.cells.len(), cells_before + 1, "board cell not added");
         eprintln!("plat splice: {} jump-aboard links", g.links.len() - links_before - 1);
+
+        // Teleport splice: a trigger box around a well-connected cell warping to another cell.
+        // Every standable cell in the box should gain a Teleport link to the destination.
+        let near = g.cells[start as usize].origin;
+        let tmin = near - Vec3::new(40.0, 40.0, 8.0);
+        let tmax = near + Vec3::new(40.0, 40.0, 56.0);
+        g.add_teleports(&[TeleportInfo { tmin, tmax, dest: exit }]);
+        let tele = g.summary().teleport;
+        assert!(tele >= 1, "no teleport links added");
+        eprintln!("teleport splice: {tele} entrance links");
     }
 }

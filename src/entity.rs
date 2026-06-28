@@ -487,6 +487,9 @@ pub struct BotState {
     /// Stuck detector: where we were when last checked, and since when we've been there.
     pub stuck_origin: Vec3,
     pub stuck_since: f32,
+    /// Origin on the previous bot frame, to detect a teleport (a large instant jump) and
+    /// re-path from the landing spot.
+    pub last_origin: Vec3,
     /// Per-frame toggle, flipped each tick, used to *pulse* buttons that QW only acts on at a
     /// press edge (the respawn key, which needs a release between presses).
     pub pulse: bool,
