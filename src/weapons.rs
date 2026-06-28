@@ -449,7 +449,7 @@ impl GameState {
         let time = self.time();
         if self.entities[e].v.ammo_cells < 1.0 {
             let best = self.w_best_weapon(e);
-            self.entities[e].v.weapon = best.as_f32();
+            self.entities[e].v.weapon = best;
             self.w_set_current_ammo(e);
             return;
         }
@@ -644,13 +644,13 @@ impl GameState {
             let v = &self.entities[e].v;
             (v.ammo_nails, v.weapon)
         };
-        if ammo_nails >= 2.0 && weapon.is(Items::SUPER_NAILGUN) {
+        if ammo_nails >= 2.0 && weapon == Weapon::SuperNailgun {
             self.w_fire_super_spikes(e);
             return;
         }
         if ammo_nails < 1.0 {
             let best = self.w_best_weapon(e);
-            self.entities[e].v.weapon = best.as_f32();
+            self.entities[e].v.weapon = best;
             self.w_set_current_ammo(e);
             return;
         }
@@ -733,33 +733,32 @@ impl GameState {
     // --- weapon selection & frame loop ---
 
     /// `W_BestWeapon` — best weapon the player can currently fire.
-    pub(crate) fn w_best_weapon(&self, e: EntId) -> Items {
+    pub(crate) fn w_best_weapon(&self, e: EntId) -> Weapon {
         let v = &self.entities[e].v;
         let has = |w: Items| v.items.has(w);
         if v.waterlevel <= 1.0 && v.ammo_cells >= 1.0 && has(Items::LIGHTNING) {
-            Items::LIGHTNING
+            Weapon::Lightning
         } else if v.ammo_nails >= 2.0 && has(Items::SUPER_NAILGUN) {
-            Items::SUPER_NAILGUN
+            Weapon::SuperNailgun
         } else if v.ammo_shells >= 2.0 && has(Items::SUPER_SHOTGUN) {
-            Items::SUPER_SHOTGUN
+            Weapon::SuperShotgun
         } else if v.ammo_nails >= 1.0 && has(Items::NAILGUN) {
-            Items::NAILGUN
+            Weapon::Nailgun
         } else if v.ammo_shells >= 1.0 && has(Items::SHOTGUN) {
-            Items::SHOTGUN
+            Weapon::Shotgun
         } else {
-            Items::AXE
+            Weapon::Axe
         }
     }
 
     /// `W_CheckNoAmmo` — switch off an empty weapon; returns whether we can fire.
     fn w_check_no_ammo(&mut self, e: EntId) -> bool {
         let v = &self.entities[e].v;
-        let weapon = Items::from_f32(v.weapon);
-        if v.currentammo > 0.0 || weapon == Items::AXE || weapon == Items::GRAPPLE {
+        if v.currentammo > 0.0 || v.weapon == Weapon::Axe || v.weapon == Weapon::Grapple {
             return true; // axe and grapple use no ammo
         }
         let best = self.w_best_weapon(e);
-        self.entities[e].v.weapon = best.as_f32();
+        self.entities[e].v.weapon = best;
         self.w_set_current_ammo(e);
         false
     }
@@ -774,43 +773,43 @@ impl GameState {
         self.host.make_vectors(v_angle);
         self.entities[e].combat.show_hostile = time + 1.0;
 
-        match Items::from_f32(self.entities[e].v.weapon) {
-            w if w == Items::AXE => {
+        match self.entities[e].v.weapon {
+            w if w == Weapon::Axe => {
                 self.entities[e].combat.attack_finished = time + 0.5;
                 self.host
                     .sound(e, Channel::Weapon, Sound::WEAPONS_AX1, 1.0, Attenuation::Norm);
                 self.start_axe_anim(e);
             }
-            w if w == Items::SHOTGUN => {
+            w if w == Weapon::Shotgun => {
                 self.start_shot_anim(e);
                 self.entities[e].combat.attack_finished = time + 0.5;
                 self.w_fire_shotgun(e);
             }
-            w if w == Items::SUPER_SHOTGUN => {
+            w if w == Weapon::SuperShotgun => {
                 self.start_shot_anim(e);
                 self.entities[e].combat.attack_finished = time + 0.7;
                 self.w_fire_super_shotgun(e);
             }
-            w if w == Items::NAILGUN || w == Items::SUPER_NAILGUN => {
+            w if w == Weapon::Nailgun || w == Weapon::SuperNailgun => {
                 self.start_nail(e);
             }
-            w if w == Items::GRENADE_LAUNCHER => {
+            w if w == Weapon::GrenadeLauncher => {
                 self.start_rocket_anim(e);
                 self.entities[e].combat.attack_finished = time + 0.6;
                 self.w_fire_grenade(e);
             }
-            w if w == Items::ROCKET_LAUNCHER => {
+            w if w == Weapon::RocketLauncher => {
                 self.start_rocket_anim(e);
                 self.entities[e].combat.attack_finished = time + 0.8;
                 self.w_fire_rocket(e);
             }
-            w if w == Items::LIGHTNING => {
+            w if w == Weapon::Lightning => {
                 self.entities[e].combat.attack_finished = time + 0.1;
                 self.host
                     .sound(e, Channel::Auto, Sound::WEAPONS_LSTART, 1.0, Attenuation::Norm);
                 self.start_light(e);
             }
-            w if w == Items::GRAPPLE => {
+            w if w == Weapon::Grapple => {
                 self.entities[e].combat.attack_finished = time + 0.1;
                 // Throws on the first press and animates the viewmodel; a no-op while out.
                 self.start_grapple_throw(e);
@@ -824,7 +823,7 @@ impl GameState {
         // Impulse 1 toggles axe <-> grapple: from a gun it selects the axe, and a second tap (now
         // on the axe) reaches the grapple — so double-tapping "1" throws you onto the hook.
         if self.entities[e].v.impulse as i32 == 1
-            && self.entities[e].v.weapon.is(Items::AXE)
+            && self.entities[e].v.weapon == Weapon::Axe
             && self.entities[e].v.items.has(Items::GRAPPLE)
         {
             self.select_grapple(e);
@@ -854,7 +853,7 @@ impl GameState {
             self.sprint_to(e, c"not enough ammo.\n");
             return;
         }
-        self.entities[e].v.weapon = weapon.as_f32();
+        self.entities[e].v.weapon = weapon.into();
         self.w_set_current_ammo(e);
     }
 
@@ -865,7 +864,7 @@ impl GameState {
             self.sprint_to(e, c"no grapple.\n");
             return;
         }
-        if self.entities[e].v.weapon.is(Items::GRAPPLE) {
+        if self.entities[e].v.weapon == Weapon::Grapple {
             return; // already selected — don't disturb an active hook
         }
         // Switching onto the grapple drops any hook already out (a fresh start).
@@ -873,7 +872,7 @@ impl GameState {
             let hook = EntId(self.entities[e].grapple.hook);
             self.reset_grapple(hook);
         }
-        self.entities[e].v.weapon = Items::GRAPPLE.as_f32();
+        self.entities[e].v.weapon = Weapon::Grapple;
         self.w_set_current_ammo(e);
     }
 
@@ -888,7 +887,7 @@ impl GameState {
         ent.v.items = ent.v.items.with(
             Items::AXE | Items::SHOTGUN | Items::SUPER_SHOTGUN | Items::NAILGUN | Items::SUPER_NAILGUN | Items::GRENADE_LAUNCHER | Items::ROCKET_LAUNCHER | Items::LIGHTNING | Items::KEY1 | Items::KEY2,
         );
-        ent.v.weapon = Items::ROCKET_LAUNCHER.as_f32();
+        ent.v.weapon = Weapon::RocketLauncher;
         ent.v.impulse = 0.0;
         self.w_set_current_ammo(e);
     }
@@ -907,7 +906,7 @@ impl GameState {
             Items::LIGHTNING,
         ];
         for step in 1..=ORDER.len() {
-            let weapon = Items::from_f32(self.entities[e].v.weapon);
+            let weapon = self.entities[e].v.weapon.item();
             let cur = ORDER.iter().position(|&w| w == weapon).unwrap_or(0);
             let next = if reverse {
                 (cur + ORDER.len() - (step % ORDER.len())) % ORDER.len()
@@ -916,7 +915,7 @@ impl GameState {
             };
             let weapon = ORDER[next];
             if self.weapon_fed(e, weapon) {
-                self.entities[e].v.weapon = weapon.as_f32();
+                self.entities[e].v.weapon = weapon.into();
                 self.w_set_current_ammo(e);
                 return;
             }

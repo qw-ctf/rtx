@@ -163,10 +163,6 @@ fn weapon_spec(item: Items) -> Option<&'static WeaponSpec> {
     WEAPON_SPECS.iter().find(|spec| spec.item == item)
 }
 
-fn weapon_spec_from_f32(item: f32) -> Option<&'static WeaponSpec> {
-    weapon_spec(Items::from_f32(item))
-}
-
 fn weapon_spec_for_classname(classname: &str) -> Option<&'static WeaponSpec> {
     WEAPON_SPECS
         .iter()
@@ -380,7 +376,7 @@ impl GameState {
         let Some(ammo_field) = spec.ammo_kind else {
             return;
         };
-        let new = spec.item.as_f32();
+        let new = Weapon::from(spec.item);
 
         if leave && self.entities[other].v.items.has(new) {
             return;
@@ -399,7 +395,7 @@ impl GameState {
 
         if self.weapon_code(new) <= w_switch {
             let in_water = self.entities[other].v.flags.has(Flags::INWATER);
-            if !in_water || !new.is(Items::LIGHTNING) {
+            if !in_water || new != Weapon::Lightning {
                 self.deathmatch_weapon(other, new);
             }
         }
@@ -423,7 +419,8 @@ impl GameState {
         let best = self.w_best_weapon(other);
         let (kind, aflag) = {
             let s = &self.entities[e];
-            (s.v.weapon, s.item.aflag)
+            // For an ammo item, `.weapon` is overloaded to hold the ammo-kind code (1–4).
+            (s.v.weapon.as_f32(), s.item.aflag)
         };
         let (field, cap) = match kind as i32 {
             1 => (AmmoKind::Shells, 100.0),
@@ -444,9 +441,9 @@ impl GameState {
         self.host.stuffcmd(other, c"bf\n");
 
         // Switch up to a better weapon if we were already on our best.
-        if self.entities[other].v.weapon == best.as_f32() {
+        if self.entities[other].v.weapon == best {
             let nb = self.w_best_weapon(other);
-            self.entities[other].v.weapon = nb.as_f32();
+            self.entities[other].v.weapon = nb;
         }
         self.w_set_current_ammo(other);
 
@@ -539,7 +536,7 @@ impl GameState {
             o.ammo_cells += s_cells;
         }
         let new = if new_bits != 0.0 {
-            new_bits
+            Weapon::from_f32(new_bits)
         } else {
             self.entities[other].v.weapon
         };
@@ -558,7 +555,7 @@ impl GameState {
         let _ = best;
         if self.weapon_code(new) <= b_switch {
             let in_water = self.entities[other].v.flags.has(Flags::INWATER);
-            if !in_water || !new.is(Items::LIGHTNING) {
+            if !in_water || new != Weapon::Lightning {
                 self.deathmatch_weapon(other, new);
             }
         }
@@ -574,7 +571,7 @@ impl GameState {
         if shells + nails + rockets + cells == 0.0 {
             return;
         }
-        let netname = weapon_spec_from_f32(weapon).map_or("", |spec| spec.backpack_name);
+        let netname = weapon_spec(weapon.item()).map_or("", |spec| spec.backpack_name);
         let vx = -100.0 + self.random() * 200.0;
         let vy = -100.0 + self.random() * 200.0;
         let time = self.time();
@@ -582,7 +579,7 @@ impl GameState {
         {
             let it = &mut self.entities[item];
             it.v.origin = origin - Vec3::new(0.0, 0.0, 24.0);
-            it.v.items = weapon;
+            it.v.items = weapon.as_f32();
             it.netname = Some(netname.into());
             it.v.ammo_shells = shells;
             it.v.ammo_nails = nails;
@@ -632,17 +629,17 @@ impl GameState {
     }
 
     /// `RankForWeapon` (lower is better).
-    fn rank_for_weapon(&self, w: f32) -> i32 {
-        weapon_spec_from_f32(w).map_or(7, |spec| spec.rank)
+    fn rank_for_weapon(&self, w: Weapon) -> i32 {
+        weapon_spec(w.item()).map_or(7, |spec| spec.rank)
     }
 
     /// `WeaponCode` — the `w_switch`/`b_switch` index of a weapon.
-    fn weapon_code(&self, w: f32) -> f32 {
-        weapon_spec_from_f32(w).map_or(1.0, |spec| spec.switch_code)
+    fn weapon_code(&self, w: Weapon) -> f32 {
+        weapon_spec(w.item()).map_or(1.0, |spec| spec.switch_code)
     }
 
     /// `Deathmatch_Weapon` — switch up to `new` if it outranks the current weapon.
-    fn deathmatch_weapon(&mut self, e: EntId, new: f32) {
+    fn deathmatch_weapon(&mut self, e: EntId, new: Weapon) {
         let cur = self.entities[e].v.weapon;
         if self.rank_for_weapon(new) < self.rank_for_weapon(cur) {
             self.entities[e].v.weapon = new;
@@ -779,7 +776,8 @@ impl GameState {
         {
             let ent = &mut self.entities[e];
             ent.item.aflag = amt;
-            ent.v.weapon = weapon_code;
+            // Ammo items overload `.weapon` to carry their ammo-kind code (a raw f32).
+            ent.v.weapon = Weapon::from_f32(weapon_code);
             ent.netname = Some(netname.into());
         }
         self.host
@@ -817,7 +815,7 @@ impl GameState {
         player: EntId,
     ) -> (f32, Option<Model>, Items) {
         let v = &self.entities[player].v;
-        let Some(spec) = weapon_spec_from_f32(v.weapon) else {
+        let Some(spec) = weapon_spec(v.weapon.item()) else {
             return (0.0, None, Items::empty());
         };
         let ammo = spec

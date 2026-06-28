@@ -15,7 +15,7 @@
 
 use glam::{Vec3, Vec3Swizzles};
 
-use crate::defs::{Bits, Flags, Items};
+use crate::defs::{Bits, Flags, Weapon};
 use crate::entity::{BotState, EntId};
 use crate::game::{cstring, GameState};
 use crate::navmesh::{LinkKind, NavGraph};
@@ -333,7 +333,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
                     side = 0;
                 } else {
                     (forward, side) = (0, 0);
-                    if weapon == Items::SHOTGUN.as_f32() && gate_ready[gi] {
+                    if weapon == Weapon::Shotgun && gate_ready[gi] {
                         buttons |= BUTTON_ATTACK;
                     }
                 }

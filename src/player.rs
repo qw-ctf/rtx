@@ -123,7 +123,7 @@ impl GameState {
         }
 
         let ent = &mut self.entities[e];
-        let anim = if ent.v.weapon.is(Items::AXE) { AXSTND } else { STAND };
+        let anim = if ent.v.weapon == Weapon::Axe { AXSTND } else { STAND };
         if ent.anim.walkframe >= anim.len {
             ent.anim.walkframe = 0;
         }
@@ -147,7 +147,7 @@ impl GameState {
         }
 
         let ent = &mut self.entities[e];
-        let anim = if ent.v.weapon.is(Items::AXE) { AXRUN } else { ROCKRUN };
+        let anim = if ent.v.weapon == Weapon::Axe { AXRUN } else { ROCKRUN };
         if ent.anim.walkframe >= anim.len {
             ent.anim.walkframe = 0;
         }
@@ -370,7 +370,7 @@ impl GameState {
         }
         self.entities[e].v.weaponframe = 0.0;
         self.pain_sound(e);
-        let anim = if weapon.is(Items::AXE) { AXPAIN } else { PAIN };
+        let anim = if weapon == Weapon::Axe { AXPAIN } else { PAIN };
         self.start_body_anim(e, anim, Think::PlayerRun);
     }
 
@@ -483,7 +483,7 @@ impl GameState {
             ent.v.angles.x = 0.0;
             ent.v.angles.z = 0.0;
         }
-        if self.entities[e].v.weapon.is(Items::AXE) {
+        if self.entities[e].v.weapon == Weapon::Axe {
             self.start_body_anim(e, AXDETH, Think::PlayerDead);
             return;
         }

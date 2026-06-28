@@ -187,7 +187,7 @@ impl GameState {
         // swing while shooting another gun.
         let (button0, is_grapple) = {
             let v = &self.entities[player].v;
-            (v.button0, v.weapon.is(Items::GRAPPLE))
+            (v.button0, v.weapon == Weapon::Grapple)
         };
         if button0 == 0.0 && is_grapple {
             self.reset_grapple(hook);

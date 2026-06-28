@@ -43,10 +43,11 @@ impl Bits for f32 {
     }
 }
 
-/// Equality test for QuakeC's `f32`-encoded *enum* fields (`.weapon`, `.solid`, `.movetype`,
-/// `.deadflag`, `.watertype`, …): `v.weapon.is(Items::AXE)` instead of the noisier
-/// `v.weapon == Items::AXE.as_f32()`. The single-value sibling of [`Bits::has`]; accepts any
-/// [`flag_bits!`] / [`float_enum!`] type via its `impl Into<f32>`.
+/// Equality test for QuakeC's `f32`-encoded *enum* fields that are still raw `f32`
+/// (`.deadflag`, `.watertype`, `.takedamage`, …): `v.watertype.is(Content::Water)` instead of
+/// the noisier `v.watertype == Content::Water.as_f32()`. The single-value sibling of
+/// [`Bits::has`]; accepts any [`float_enum!`] type via its `impl Into<f32>`. (Fields typed with
+/// a [`field_enum!`] newtype — `.weapon`, `.solid`, `.movetype` — use plain `==` instead.)
 pub trait FieldEq {
     /// Whether this field equals `value`.
     fn is(self, value: impl Into<f32>) -> bool;
@@ -350,6 +351,12 @@ macro_rules! field_enum {
             pub const fn as_f32(self) -> f32 {
                 self.0
             }
+            /// Wrap a raw engine `f32` (e.g. a restored spawn parameter) back into this field.
+            #[allow(dead_code)]
+            #[inline]
+            pub const fn from_f32(v: f32) -> Self {
+                $name(v)
+            }
         }
         impl From<$name> for f32 {
             #[inline]
@@ -406,6 +413,42 @@ field_enum! {
         Noclip = 8,
         FlyMissile = 9,
         Bounce = 10,
+    }
+}
+
+field_enum! {
+    /// `.weapon` — the player's *active* weapon: a single selection, not the `items` ownership
+    /// mask. Its values are exactly the weapon bits in [`Items`], so they're taken straight from
+    /// there. Use `v.weapon == Weapon::Shotgun` / `v.weapon = Weapon::Axe`; [`Weapon::item`]
+    /// bridges back to `Items` for ownership checks and the weapon-spec table.
+    Weapon {
+        None = 0,
+        Axe = Items::AXE.bits(),
+        Shotgun = Items::SHOTGUN.bits(),
+        SuperShotgun = Items::SUPER_SHOTGUN.bits(),
+        Nailgun = Items::NAILGUN.bits(),
+        SuperNailgun = Items::SUPER_NAILGUN.bits(),
+        GrenadeLauncher = Items::GRENADE_LAUNCHER.bits(),
+        RocketLauncher = Items::ROCKET_LAUNCHER.bits(),
+        Lightning = Items::LIGHTNING.bits(),
+        Grapple = Items::GRAPPLE.bits(),
+    }
+}
+
+impl Weapon {
+    /// The [`Items`] bit this active weapon corresponds to — for ownership checks and the
+    /// `WEAPON_SPECS` table, which are keyed by `Items`.
+    #[inline]
+    pub fn item(self) -> Items {
+        Items::from_f32(self.as_f32())
+    }
+}
+
+impl From<Items> for Weapon {
+    /// A single owned-weapon `Items` bit (e.g. the "best" weapon) as the active `Weapon`.
+    #[inline]
+    fn from(i: Items) -> Weapon {
+        Weapon::from_f32(i.as_f32())
     }
 }
 

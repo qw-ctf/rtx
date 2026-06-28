@@ -59,7 +59,7 @@ impl PlayerParms {
             nails: v.ammo_nails,
             rockets: v.ammo_rockets,
             cells: v.ammo_cells,
-            weapon: v.weapon,
+            weapon: v.weapon.as_f32(),
             armortype: v.armortype,
         }
     }
@@ -98,7 +98,7 @@ impl PlayerParms {
         v.ammo_nails = self.nails;
         v.ammo_rockets = self.rockets;
         v.ammo_cells = self.cells;
-        v.weapon = self.weapon;
+        v.weapon = Weapon::from_f32(self.weapon);
         v.armortype = self.armortype;
     }
 }
@@ -195,7 +195,7 @@ impl GameState {
         if self.host.cvar(c"rtx_grapple") != 0.0 {
             let ent = &mut self.entities[player];
             ent.v.items = ent.v.items.with(Items::GRAPPLE);
-            ent.v.weapon = Items::GRAPPLE.as_f32();
+            ent.v.weapon = Weapon::Grapple;
         }
         self.w_set_current_ammo(player);
 
@@ -280,11 +280,11 @@ impl GameState {
         let v = &self.entities[e].v;
         if self.time() > self.entities[e].combat.attack_finished
             && v.currentammo == 0.0
-            && !v.weapon.is(Items::AXE)
-            && !v.weapon.is(Items::GRAPPLE) // the grapple uses no ammo — don't auto-switch off it
+            && v.weapon != Weapon::Axe
+            && v.weapon != Weapon::Grapple // the grapple uses no ammo — don't auto-switch off it
         {
             let best = self.w_best_weapon(e);
-            self.entities[e].v.weapon = best.as_f32();
+            self.entities[e].v.weapon = best;
             self.w_set_current_ammo(e);
         }
     }
