@@ -23,7 +23,7 @@ impl GameState {
             (v.origin, v.absmin, v.absmax, v.movetype)
         };
 
-        if movetype.is(MoveType::Push) {
+        if movetype == MoveType::Push {
             let mid = 0.5 * (absmin + absmax);
             let tr = self.traceline(inflictor_org, mid, true, ignore);
             return tr.fraction == 1.0 || tr.ent == targ;
@@ -54,7 +54,7 @@ impl GameState {
             }
         }
         let movetype = self.entities[targ].v.movetype;
-        if movetype.is(MoveType::Push) || movetype.is(MoveType::None) {
+        if movetype == MoveType::Push || movetype == MoveType::None {
             // doors, triggers, etc.: their th_die does the work directly.
             self.run_die(targ);
             return;
@@ -127,7 +127,7 @@ impl GameState {
             (v.absmin + v.absmax) * 0.5
         };
         if inflictor != EntId::WORLD
-            && self.entities[targ].v.movetype.is(MoveType::Walk)
+            && self.entities[targ].v.movetype == MoveType::Walk
         {
             let dir = (self.entities[targ].v.origin - inflictor_org).normalize_or_zero();
             self.entities[targ].v.velocity += dir * damage * 8.0;

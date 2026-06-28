@@ -165,8 +165,8 @@ impl GameState {
             ent.classname = Some("player".into());
             ent.v.health = 100.0;
             ent.v.takedamage = TakeDamage::Aim.as_f32();
-            ent.v.solid = Solid::SlideBox.as_f32();
-            ent.v.movetype = MoveType::Walk.as_f32();
+            ent.v.solid = Solid::SlideBox;
+            ent.v.movetype = MoveType::Walk;
             ent.v.max_health = 100.0;
             ent.v.flags = Flags::CLIENT.as_f32();
             ent.v.effects = 0.0;
@@ -463,7 +463,7 @@ impl GameState {
                 continue;
             }
             let m = &self.entities[id].v;
-            if !m.movetype.is(MoveType::Push) || m.velocity.z <= best {
+            if m.movetype != MoveType::Push || m.velocity.z <= best {
                 continue;
             }
             let on_top = (-24.0..=48.0).contains(&(feet_z - m.absmax.z));
@@ -584,7 +584,7 @@ impl GameState {
             let ent = &self.entities[e];
             (ent.v.movetype, ent.v.health, ent.v.waterlevel, ent.v.watertype, ent.combat.air_finished)
         };
-        if movetype.is(MoveType::Noclip) || health < 0.0 {
+        if movetype == MoveType::Noclip || health < 0.0 {
             return;
         }
 

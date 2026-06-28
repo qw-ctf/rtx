@@ -19,6 +19,8 @@
 use core::ffi::c_char;
 use glam::Vec3;
 
+use crate::defs::{MoveType, Solid};
+
 /// QuakeC string reference. With `sv_pr2references 1` these are engine-managed `int`
 /// handles; the mod communicates real strings to the engine via trap calls (e.g.
 /// `setmodel`'s `char*`), so for our purposes these are opaque placeholders.
@@ -37,8 +39,8 @@ pub struct EntVars {
     pub absmax: Vec3,
     pub ltime: f32,
     pub lastruntime: f32,
-    pub movetype: f32,
-    pub solid: f32,
+    pub movetype: MoveType,
+    pub solid: Solid,
     pub origin: Vec3,
     pub oldorigin: Vec3,
     pub velocity: Vec3,

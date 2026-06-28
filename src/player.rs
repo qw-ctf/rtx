@@ -412,9 +412,9 @@ impl GameState {
             ent.weaponmodel = None;
             ent.v.view_ofs = Vec3::new(0.0, 0.0, -8.0);
             ent.v.deadflag = DeadFlag::Dying.as_f32();
-            ent.v.solid = Solid::Not.as_f32();
+            ent.v.solid = Solid::Not;
             ent.v.flags = ent.v.flags.without(Flags::ONGROUND);
-            ent.v.movetype = MoveType::Toss.as_f32();
+            ent.v.movetype = MoveType::Toss;
             ent.v.velocity.z += zboost;
         }
         self.set_weaponmodel(e, None); // clear the networked viewmodel
@@ -452,8 +452,8 @@ impl GameState {
         }
         let ent = &mut self.entities[e];
         ent.v.frame = DEATHA.last() as f32;
-        ent.v.solid = Solid::Not.as_f32();
-        ent.v.movetype = MoveType::Toss.as_f32();
+        ent.v.solid = Solid::Not;
+        ent.v.movetype = MoveType::Toss;
         ent.v.deadflag = DeadFlag::Dead.as_f32();
         ent.v.nextthink = -1.0;
     }
@@ -491,8 +491,8 @@ impl GameState {
             let gib = &mut self.entities[g];
             gib.v.origin = origin;
             gib.v.velocity = vel;
-            gib.v.movetype = MoveType::Bounce.as_f32();
-            gib.v.solid = Solid::Not.as_f32();
+            gib.v.movetype = MoveType::Bounce;
+            gib.v.solid = Solid::Not;
             gib.v.avelocity = avel;
             gib.think = Think::SubRemove;
             gib.v.ltime = time;
@@ -514,9 +514,9 @@ impl GameState {
             let ent = &mut self.entities[e];
             ent.v.frame = 0.0;
             ent.v.nextthink = -1.0;
-            ent.v.movetype = MoveType::Bounce.as_f32();
+            ent.v.movetype = MoveType::Bounce;
             ent.v.takedamage = TakeDamage::No.as_f32();
-            ent.v.solid = Solid::Not.as_f32();
+            ent.v.solid = Solid::Not;
             ent.v.view_ofs = Vec3::new(0.0, 0.0, 8.0);
             ent.v.velocity = vel;
             ent.v.flags = ent.v.flags.without(Flags::ONGROUND);

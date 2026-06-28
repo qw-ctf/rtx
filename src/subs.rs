@@ -37,10 +37,10 @@ impl GameState {
         if self.entities[e].v.angles != Vec3::ZERO {
             self.set_movedir(e);
         }
-        self.entities[e].v.solid = Solid::Trigger.as_f32();
+        self.entities[e].v.solid = Solid::Trigger;
         self.set_brush_model(e);
         let ent = &mut self.entities[e];
-        ent.v.movetype = MoveType::None.as_f32();
+        ent.v.movetype = MoveType::None;
         ent.v.modelindex = 0.0;
         ent.model = None;
     }

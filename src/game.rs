@@ -359,10 +359,9 @@ impl GameState {
     /// Implemented directly over our entity array (QuakeC's builtin links via `.chain`;
     /// returning a `Vec` is cleaner and avoids mutating shared state).
     pub(crate) fn find_radius(&self, org: Vec3, rad: f32) -> Vec<EntId> {
-        use defs::FieldEq;
         let mut out = Vec::new();
         for (i, e) in self.entities.iter().enumerate() {
-            if !e.in_use || e.v.solid.is(defs::Solid::Not) {
+            if !e.in_use || e.v.solid == defs::Solid::Not {
                 continue;
             }
             let center = e.v.origin + (e.v.mins + e.v.maxs) * 0.5;

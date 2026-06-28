@@ -20,7 +20,7 @@ impl GameState {
         if ent.v.max_health != 0.0 {
             ent.v.health = ent.v.max_health;
             ent.v.takedamage = TakeDamage::Yes.as_f32();
-            ent.v.solid = Solid::BBox.as_f32();
+            ent.v.solid = Solid::BBox;
         }
     }
 
@@ -147,7 +147,7 @@ impl GameState {
             ent.v.max_health = ent.v.health;
             ent.th_die = Die::TriggerKilled;
             ent.v.takedamage = TakeDamage::Yes.as_f32();
-            ent.v.solid = Solid::BBox.as_f32();
+            ent.v.solid = Solid::BBox;
             let origin = ent.v.origin;
             self.host.set_origin(e, origin);
         } else if !self.entities[e].v.spawnflags.has(TriggerFlags::NOTOUCH) {
@@ -274,8 +274,8 @@ impl GameState {
         {
             let ent = &mut self.entities[d];
             ent.classname = Some("teledeath".into());
-            ent.v.movetype = MoveType::None.as_f32();
-            ent.v.solid = Solid::Trigger.as_f32();
+            ent.v.movetype = MoveType::None;
+            ent.v.solid = Solid::Trigger;
             ent.v.angles = Vec3::ZERO;
             ent.set_touch(Touch::Tdeath);
             ent.v.nextthink = time + 0.2;
@@ -306,7 +306,7 @@ impl GameState {
         }
         {
             let v = &self.entities[other].v;
-            if v.health <= 0.0 || !v.solid.is(Solid::SlideBox) {
+            if v.health <= 0.0 || v.solid != Solid::SlideBox {
                 return;
             }
         }
@@ -391,7 +391,7 @@ impl GameState {
     /// `hurt_on` — re-enable a hurt trigger after its cooldown.
     pub(crate) fn hurt_on(&mut self, e: EntId) {
         let ent = &mut self.entities[e];
-        ent.v.solid = Solid::Trigger.as_f32();
+        ent.v.solid = Solid::Trigger;
         ent.v.nextthink = -1.0;
     }
 
@@ -399,7 +399,7 @@ impl GameState {
     pub(crate) fn hurt_touch(&mut self, e: EntId, other: EntId) {
         if self.entities[other].v.takedamage != 0.0 {
             let dmg = self.entities[e].mover.dmg;
-            self.entities[e].v.solid = Solid::Not.as_f32();
+            self.entities[e].v.solid = Solid::Not;
             self.t_damage(other, e, e, dmg);
             let time = self.time();
             let ent = &mut self.entities[e];

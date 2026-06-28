@@ -45,8 +45,8 @@ impl GameState {
 
         {
             let ent = &mut self.entities[e];
-            ent.v.movetype = MoveType::Push.as_f32();
-            ent.v.solid = Solid::Bsp.as_f32();
+            ent.v.movetype = MoveType::Push;
+            ent.v.solid = Solid::Bsp;
         }
         self.link_brush(e);
         let origin = self.entities[e].v.origin;

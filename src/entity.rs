@@ -200,7 +200,7 @@ pub enum Use {
     RotateDoorUse,
 }
 
-/// A `.blocked` behaviour for `MoveType::Push.as_f32()` movers (`GAME_EDICT_BLOCKED`).
+/// A `.blocked` behaviour for `MoveType::Push` movers (`GAME_EDICT_BLOCKED`).
 #[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Blocked {

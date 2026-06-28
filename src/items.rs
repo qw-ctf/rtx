@@ -180,8 +180,8 @@ impl GameState {
         {
             let ent = &mut self.entities[e];
             ent.v.flags = Flags::ITEM.as_f32();
-            ent.v.solid = Solid::Trigger.as_f32();
-            ent.v.movetype = MoveType::Toss.as_f32();
+            ent.v.solid = Solid::Trigger;
+            ent.v.movetype = MoveType::Toss;
             ent.v.velocity = Vec3::ZERO;
             ent.v.origin.z += 6.0;
         }
@@ -195,7 +195,7 @@ impl GameState {
         if let Some(model) = self.entities[e].model_cstr {
             self.host.set_model(e, model);
         }
-        self.entities[e].v.solid = Solid::Trigger.as_f32();
+        self.entities[e].v.solid = Solid::Trigger;
         self.host
             .sound(e, Channel::Voice, Sound::ITEMS_ITEMBK2, 1.0, Attenuation::Norm);
         let origin = self.entities[e].v.origin;
@@ -206,7 +206,7 @@ impl GameState {
     fn pickup_hide(&mut self, e: EntId) {
         let ent = &mut self.entities[e];
         ent.v.modelindex = 0.0;
-        ent.v.solid = Solid::Not.as_f32();
+        ent.v.solid = Solid::Not;
     }
 
     /// Schedule an item respawn (`SUB_regen`) after `delay`, then fire targets.
@@ -575,8 +575,8 @@ impl GameState {
             it.v.ammo_cells = cells;
             it.v.velocity = Vec3::new(vx, vy, 300.0);
             it.v.flags = Flags::ITEM.as_f32();
-            it.v.solid = Solid::Trigger.as_f32();
-            it.v.movetype = MoveType::Toss.as_f32();
+            it.v.solid = Solid::Trigger;
+            it.v.movetype = MoveType::Toss;
             it.set_touch(Touch::Backpack);
             it.v.nextthink = time + 120.0;
             it.think = Think::SubRemove;

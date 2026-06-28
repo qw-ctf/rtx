@@ -99,8 +99,8 @@ impl GameState {
         self.set_movedir(e);
         {
             let ent = &mut self.entities[e];
-            ent.v.movetype = MoveType::Push.as_f32();
-            ent.v.solid = Solid::Bsp.as_f32();
+            ent.v.movetype = MoveType::Push;
+            ent.v.solid = Solid::Bsp;
         }
         self.set_brush_model(e);
         self.entities[e].use_ = Use::ButtonUse;

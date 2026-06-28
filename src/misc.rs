@@ -99,8 +99,8 @@ impl GameState {
         {
             let ent = &mut self.entities[e];
             ent.v.angles = Vec3::ZERO;
-            ent.v.movetype = MoveType::Push.as_f32();
-            ent.v.solid = Solid::Bsp.as_f32();
+            ent.v.movetype = MoveType::Push;
+            ent.v.solid = Solid::Bsp;
             ent.use_ = Use::FuncWallUse;
         }
         self.set_brush_model(e);
@@ -112,8 +112,8 @@ impl GameState {
         {
             let ent = &mut self.entities[e];
             ent.v.angles = Vec3::ZERO;
-            ent.v.movetype = MoveType::None.as_f32();
-            ent.v.solid = Solid::Not.as_f32();
+            ent.v.movetype = MoveType::None;
+            ent.v.solid = Solid::Not;
         }
         self.set_brush_model(e);
         true
@@ -144,8 +144,8 @@ impl GameState {
     pub(crate) fn spawn_misc_explobox(&mut self, e: EntId, model: Model, size: Vec3) -> bool {
         {
             let ent = &mut self.entities[e];
-            ent.v.solid = Solid::BBox.as_f32();
-            ent.v.movetype = MoveType::None.as_f32();
+            ent.v.solid = Solid::BBox;
+            ent.v.movetype = MoveType::None;
         }
         self.entities[e].model_cstr = Some(model);
         self.host.set_model(e, model);

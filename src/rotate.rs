@@ -158,9 +158,9 @@ impl GameState {
                 let te = &mut self.entities[t];
                 te.mover.dmg = amount;
                 te.v.solid = if amount == 0.0 {
-                    Solid::Not.as_f32()
+                    Solid::Not
                 } else {
-                    Solid::Trigger.as_f32()
+                    Solid::Trigger
                 };
                 te.v.nextthink = -1.0;
             } else if self.entities[t].classname() == Some("func_movewall") {
@@ -211,8 +211,8 @@ impl GameState {
         {
             let ent = &mut self.entities[e];
             ent.classname = Some("rotate_object".into());
-            ent.v.solid = Solid::Not.as_f32();
-            ent.v.movetype = MoveType::None.as_f32();
+            ent.v.solid = Solid::Not;
+            ent.v.movetype = MoveType::None;
         }
         self.link_brush(e);
         self.entities[e].think = Think::None;
@@ -226,8 +226,8 @@ impl GameState {
     pub(crate) fn spawn_func_rotate_entity(&mut self, e: EntId) -> bool {
         {
             let ent = &mut self.entities[e];
-            ent.v.solid = Solid::Not.as_f32();
-            ent.v.movetype = MoveType::None.as_f32();
+            ent.v.solid = Solid::Not;
+            ent.v.movetype = MoveType::None;
         }
         self.link_brush(e);
         let (t, speed) = (self.time(), self.entities[e].mover.speed);
@@ -355,11 +355,11 @@ impl GameState {
         {
             let ent = &mut self.entities[e];
             ent.v.angles = Vec3::ZERO;
-            ent.v.movetype = MoveType::Push.as_f32();
+            ent.v.movetype = MoveType::Push;
             if spawnflags.has(MovewallFlags::NONBLOCKING) {
-                ent.v.solid = Solid::Not.as_f32();
+                ent.v.solid = Solid::Not;
             } else {
-                ent.v.solid = Solid::Bsp.as_f32();
+                ent.v.solid = Solid::Bsp;
                 ent.set_blocked(Blocked::MovewallBlocked);
             }
             if spawnflags.has(MovewallFlags::TOUCH) {
@@ -468,8 +468,8 @@ impl GameState {
             ent.noise1 = Some(n1);
             ent.noise2 = Some(n2);
             ent.noise3 = Some(n3);
-            ent.v.solid = Solid::Not.as_f32();
-            ent.v.movetype = MoveType::None.as_f32();
+            ent.v.solid = Solid::Not;
+            ent.v.movetype = MoveType::None;
         }
         self.link_brush(e);
         let origin = self.entities[e].v.origin;
@@ -623,8 +623,8 @@ impl GameState {
         }
         {
             let ent = &mut self.entities[e];
-            ent.v.solid = Solid::Not.as_f32();
-            ent.v.movetype = MoveType::Step.as_f32();
+            ent.v.solid = Solid::Not;
+            ent.v.movetype = MoveType::Step;
             ent.use_ = Use::RotateTrainUse;
         }
         self.link_brush(e);

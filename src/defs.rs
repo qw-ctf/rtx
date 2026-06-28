@@ -329,6 +329,36 @@ macro_rules! float_enum {
     };
 }
 
+/// Declare a discrete-valued enum that is *stored* in an engine-shared `f32` field (`.movetype`,
+/// `.solid`). Unlike [`float_enum!`], this is a `#[repr(transparent)]` newtype over `f32` with one
+/// associated const per variant — so the [`EntVars`](crate::abi::EntVars) field can be typed with
+/// it directly. The layout is identical to a bare `f32` (the engine still reads/writes a float),
+/// but `ent.v.movetype = MoveType::Push` and `ent.v.movetype == MoveType::Push` then work without
+/// the `.as_f32()`/`.is()` bridges. `Default` is the `0.0` value (the `None`/`Not` variant).
+macro_rules! field_enum {
+    ($(#[$meta:meta])* $name:ident { $($variant:ident = $val:expr,)* }) => {
+        $(#[$meta])*
+        #[repr(transparent)]
+        #[derive(Clone, Copy, PartialEq, PartialOrd, Debug, Default)]
+        pub struct $name(f32);
+        #[allow(non_upper_case_globals, dead_code)]
+        impl $name {
+            $(pub const $variant: $name = $name($val as f32);)*
+            /// The raw `f32` the engine-shared field stores.
+            #[inline]
+            pub const fn as_f32(self) -> f32 {
+                self.0
+            }
+        }
+        impl From<$name> for f32 {
+            #[inline]
+            fn from(v: $name) -> f32 {
+                v.0
+            }
+        }
+    };
+}
+
 /// Declare a `#[repr(i32)]` enum for a network-protocol opcode set (`MSG_*`, `MULTICAST_*`,
 /// `svc_*`, `TE_*`) — pure `i32` values written to the wire, with only the `as_i32` bridge
 /// the `write_*`/`multicast` builtins need (no `f32` projection — these never touch entity fields).
@@ -350,7 +380,7 @@ macro_rules! int_enum {
     };
 }
 
-float_enum! {
+field_enum! {
     /// `.solid` — how an entity interacts with others.
     Solid {
         Not = 0,      // no interaction
@@ -361,7 +391,7 @@ float_enum! {
     }
 }
 
-float_enum! {
+field_enum! {
     /// `.movetype` — how the engine moves an entity.
     MoveType {
         None = 0, // never moves

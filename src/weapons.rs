@@ -371,8 +371,8 @@ impl GameState {
         {
             let mis = &mut self.entities[m];
             mis.set_owner(e);
-            mis.v.movetype = MoveType::FlyMissile.as_f32();
-            mis.v.solid = Solid::BBox.as_f32();
+            mis.v.movetype = MoveType::FlyMissile;
+            mis.v.solid = Solid::BBox;
             mis.v.velocity = dir * 1000.0;
             mis.v.angles = vectoangles(mis.v.velocity);
             mis.set_touch(Touch::Missile);
@@ -563,8 +563,8 @@ impl GameState {
             let mis = &mut self.entities[m];
             mis.combat.voided = 0.0;
             mis.set_owner(e);
-            mis.v.movetype = MoveType::Bounce.as_f32();
-            mis.v.solid = Solid::BBox.as_f32();
+            mis.v.movetype = MoveType::Bounce;
+            mis.v.solid = Solid::BBox;
             mis.classname = Some("grenade".into());
             mis.v.velocity = velocity;
             mis.v.avelocity = Vec3::new(300.0, 300.0, 300.0);
@@ -598,8 +598,8 @@ impl GameState {
             let mis = &mut self.entities[m];
             mis.combat.voided = 0.0;
             mis.set_owner(e);
-            mis.v.movetype = MoveType::FlyMissile.as_f32();
-            mis.v.solid = Solid::BBox.as_f32();
+            mis.v.movetype = MoveType::FlyMissile;
+            mis.v.solid = Solid::BBox;
             mis.v.angles = vectoangles(dir);
             mis.set_touch(Touch::Spike);
             mis.classname = Some("spike".into());
@@ -677,7 +677,7 @@ impl GameState {
             return;
         }
         self.entities[e].combat.voided = 1.0;
-        if self.entities[other].v.solid.is(Solid::Trigger) {
+        if self.entities[other].v.solid == Solid::Trigger {
             return;
         }
         let origin = self.entities[e].v.origin;

@@ -57,8 +57,8 @@ impl GameState {
         for p in players {
             let v = &mut self.entities[p].v;
             v.takedamage = TakeDamage::No.as_f32();
-            v.solid = Solid::Not.as_f32();
-            v.movetype = MoveType::None.as_f32();
+            v.solid = Solid::Not;
+            v.movetype = MoveType::None;
             v.modelindex = 0.0;
         }
     }

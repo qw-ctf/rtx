@@ -232,8 +232,8 @@ impl GameState {
         let t = self.spawn();
         {
             let trig = &mut self.entities[t];
-            trig.v.movetype = MoveType::None.as_f32();
-            trig.v.solid = Solid::Trigger.as_f32();
+            trig.v.movetype = MoveType::None;
+            trig.v.solid = Solid::Trigger;
             trig.set_touch(Touch::DoorTriggerField);
             trig.set_owner(master);
         }
@@ -339,8 +339,8 @@ impl GameState {
         {
             let ent = &mut self.entities[e];
             ent.v.max_health = ent.v.health;
-            ent.v.solid = Solid::Bsp.as_f32();
-            ent.v.movetype = MoveType::Push.as_f32();
+            ent.v.solid = Solid::Bsp;
+            ent.v.movetype = MoveType::Push;
         }
         let origin = self.entities[e].v.origin;
         self.host.set_origin(e, origin);
@@ -407,8 +407,8 @@ impl GameState {
     pub(crate) fn spawn_func_door_secret(&mut self, e: EntId) -> bool {
         {
             let ent = &mut self.entities[e];
-            ent.v.solid = Solid::Bsp.as_f32();
-            ent.v.movetype = MoveType::Push.as_f32();
+            ent.v.solid = Solid::Bsp;
+            ent.v.movetype = MoveType::Push;
         }
         self.set_brush_model(e);
         true
