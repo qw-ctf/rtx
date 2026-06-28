@@ -17,12 +17,16 @@ jobs:
             target: linux-x86_64
             built: librtx.so
             artifact: qwprogs.so
-          - os: macos-latest
+          - os: macos-15
             target: macos-arm64
             built: librtx.dylib
             artifact: qwprogs.dylib
+          - os: windows-latest
+            target: windows-x86_64
+            built: rtx.dll
+            artifact: qwprogs.dll
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -31,11 +35,12 @@ jobs:
       - name: Build (release)
         run: cargo build --release --locked
 
-      - name: Stage mvdsv module
+      - name: Stage qwprogs module
+        shell: bash
         run: cp "target/release/${{ matrix.built }}" "${{ matrix.artifact }}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: qwprogs-${{ matrix.target }}
           path: ${{ matrix.artifact }}
