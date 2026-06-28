@@ -360,6 +360,7 @@ pub struct Entity {
     pub rot: RotState,
     pub bob: BobState,
     pub grapple: GrappleState,
+    pub bot: BotState,
     pub refs: CustomRefs,
     pub combat: CombatState,
     pub item: ItemState,
@@ -466,6 +467,29 @@ pub struct GrappleState {
     /// One-shot latch: the chain is still up and should be ditched once the reel gets close
     /// (QuakeC's `lefty`, reused to avoid a dedicated field).
     pub lefty: bool,
+}
+
+/// Per-bot navigation/AI state, on the bot's client edict (`1..=maxclients`). Non-bot edicts
+/// keep this at its `Default` (`is_bot == false`). See [`crate::bot`].
+#[derive(Default)]
+pub struct BotState {
+    /// Whether this client edict is an rtx-driven bot (fake client).
+    pub is_bot: bool,
+    /// 1-based engine client number, for `set_bot_cmd`/`remove_bot`.
+    pub client: i32,
+    /// Current A* route as link indices into the navmesh, and our leg within it.
+    pub route: Vec<u32>,
+    pub route_pos: usize,
+    /// The cell we last routed toward (`u32::MAX` = none), to detect when to re-path.
+    pub goal_cell: u32,
+    /// Earliest time we may recompute the route (throttles A*).
+    pub repath_time: f32,
+    /// Stuck detector: where we were when last checked, and since when we've been there.
+    pub stuck_origin: Vec3,
+    pub stuck_since: f32,
+    /// Per-frame toggle, flipped each tick, used to *pulse* buttons that QW only acts on at a
+    /// press edge (the respawn key, which needs a release between presses).
+    pub pulse: bool,
 }
 
 #[derive(Default)]

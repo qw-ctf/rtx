@@ -131,6 +131,8 @@ impl GameState {
         self.broadcast(PrintLevel::High, &message);
         self.host
             .sound(player, Channel::Body, Sound::PLAYER_TORNOFF2, 1.0, Attenuation::None);
+        // Clear bot bookkeeping if a bot left (kicked, or trimmed by the population manager).
+        crate::bot::on_disconnect(&mut self.entities[player]);
     }
 
     /// `SetNewParms` — default spawn parameters for a fresh player.

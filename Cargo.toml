@@ -7,7 +7,9 @@ authors = ["Daniel Svensson <dsvensson@gmail.com>"]
 
 [lib]
 name = "rtx"
-crate-type = ["cdylib"]
+# `rlib` in addition to the engine-loaded `cdylib` so the pure-logic modules (bsp parser,
+# navmesh) can be unit-tested with `cargo test`.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 bitflags = "2"

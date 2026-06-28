@@ -126,6 +126,8 @@ pub struct GameState {
     /// Resolved map-extension field references (entity `alpha`, …), looked up once per server.
     /// See [`Self::set_alpha`].
     ext_fields: ext_field::ExtFields,
+    /// Auto-generated navmesh for the current map (bot navigation). Rebuilt each map load.
+    pub(crate) nav: crate::navmesh::NavState,
     /// Escape hatch for string-declared sounds (precache-and-intern at load time). Empty for the
     /// current port — every sound is a registry handle — but here so a runtime path is registered
     /// through the same precache-guaranteeing door. Use `dyn_assets.sound(&host, path)`.
@@ -165,6 +167,7 @@ impl GameState {
             intermission_exit_time: 0.0,
             rng: 0x2545_f491, // nonzero default; reseeded in GAME_INIT
             ext_fields: ext_field::ExtFields::default(),
+            nav: crate::navmesh::NavState::default(),
             dyn_assets: crate::assets::DynAssets::default(),
         }
     }
@@ -418,6 +421,11 @@ impl GameState {
         self.host.cvar_set_float(cstr(b"rtx_hook_speed\0"), 1.25);
         self.host.cvar_set_float(cstr(b"rtx_hook_pull\0"), 1.0);
 
+        // Navmesh bots: how many to keep on the server (0 = none), and their skill (reserved
+        // for combat tuning later). Bots only spawn once a map's navmesh is built.
+        self.host.cvar_set_float(cstr(b"rtx_bots\0"), 0.0);
+        self.host.cvar_set_float(cstr(b"rtx_bot_skill\0"), 3.0);
+
         self.host.dprint(cstr(b"rtx: QuakeWorld game module loaded\0"));
 
         // `self.game_data` lives inside the OnceLock-pinned GameState, so its address is
@@ -433,6 +441,8 @@ impl GameState {
     fn load_entities(&mut self) -> isize {
         self.level.deathmatch = self.host.cvar(c"deathmatch") as i32;
         self.level.skill = self.host.cvar(c"skill") as i32;
+        // Fresh map: drop any prior navmesh so it's rebuilt lazily when bots are next wanted.
+        self.nav = crate::navmesh::NavState::default();
 
         // The worldspawn block configures `world` and runs the global precaches.
         let Some(world_fields) = self.parse_block() else {
@@ -454,10 +464,52 @@ impl GameState {
         1
     }
 
+    /// Build the bot navmesh for the current map on demand — the first time bots are wanted —
+    /// then cache it. Attempted at most once per map (a failed read won't retry every frame).
+    /// Best-effort: if the BSP can't be read or parsed the navmesh stays empty and bots simply
+    /// don't spawn — never fatal. Deferring this off the load path means a bot-less server
+    /// pays neither the build time nor the memory.
+    pub(crate) fn ensure_navmesh(&mut self) {
+        if self.nav.attempted {
+            return;
+        }
+        self.nav.attempted = true;
+        let path = cstring(&format!("maps/{}.bsp", self.level.mapname));
+        let Some(bytes) = self.host.read_file(&path) else {
+            self.host.dprint(c"rtx: navmesh: could not read map BSP; bots disabled\n");
+            return;
+        };
+        let Some(bsp) = crate::bsp::Bsp::parse(&bytes) else {
+            self.host.dprint(c"rtx: navmesh: unsupported/!malformed BSP; bots disabled\n");
+            return;
+        };
+        // Build the cell/link graph from the player clip hull.
+        let graph = crate::navmesh::NavGraph::build(&bsp);
+        let counts = graph.summary();
+        let msg = cstring(&format!(
+            "rtx: navmesh: {} planes, {} clipnodes -> {} cells, {} links \
+             (walk {} step {} drop {} jump {})\n",
+            bsp.planes.len(),
+            bsp.clipnodes.len(),
+            graph.cells.len(),
+            graph.links.len(),
+            counts.walk,
+            counts.step,
+            counts.drop,
+            counts.jump,
+        ));
+        self.host.dprint(&msg);
+        self.nav.bsp = Some(bsp);
+        self.nav.graph = Some(graph);
+    }
+
     /// `GAME_START_FRAME` — once per server frame. `is_bot_frame` runs only bot logic.
     fn start_frame(&mut self, _level_time: i32, is_bot_frame: i32) -> isize {
         if is_bot_frame == 0 {
             world::start_frame(self);
+            crate::bot::manage_population(self);
+        } else {
+            crate::bot::run_bots(self);
         }
         1
     }

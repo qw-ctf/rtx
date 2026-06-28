@@ -563,6 +563,161 @@ impl HostApi {
         self.ents.wrapping_add(ent.0 as usize)
     }
 
+    // --- filesystem (reading the map's BSP for the navmesh) ---
+
+    /// `G_FSOpenFile` for reading — opens `name` (under the gamedir/paks; `name` must pass the
+    /// engine's `FS_UnsafeFilename` check) in binary read mode. Returns `(handle, len)`, or
+    /// `None` if the file can't be opened. The engine writes the handle through a pointer arg
+    /// and returns the byte length (`-1` on failure).
+    fn fs_open_read(&self, name: &CStr) -> Option<(i32, i32)> {
+        // fsMode_t::FS_READ_BIN == 0 (mvdsv `g_public.h`).
+        const FS_READ_BIN: isize = 0;
+        let mut handle: i32 = 0;
+        let len = unsafe {
+            (self.syscall)(
+                B::FsOpenFile as isize,
+                name.as_ptr() as isize,
+                &mut handle as *mut i32 as isize,
+                FS_READ_BIN,
+            ) as i32
+        };
+        (len >= 0 && handle != 0).then_some((handle, len))
+    }
+
+    /// `G_FSReadFile` — read up to `buf.len()` bytes from `handle`. Returns bytes read (`<0` on
+    /// error).
+    fn fs_read(&self, buf: &mut [u8], handle: i32) -> i32 {
+        unsafe {
+            (self.syscall)(
+                B::FsReadFile as isize,
+                buf.as_mut_ptr() as isize,
+                buf.len() as isize,
+                handle as isize,
+            ) as i32
+        }
+    }
+
+    /// `G_FSCloseFile` — release a file handle.
+    fn fs_close(&self, handle: i32) {
+        unsafe { (self.syscall)(B::FsCloseFile as isize, handle as isize) };
+    }
+
+    /// Read an entire file into a `Vec<u8>` (open + read + close). `None` if it can't be opened
+    /// or read. Used to slurp `maps/<name>.bsp` for the navmesh build.
+    pub fn read_file(&self, name: &CStr) -> Option<Vec<u8>> {
+        let (handle, len) = self.fs_open_read(name)?;
+        let mut buf = vec![0u8; len.max(0) as usize];
+        let n = self.fs_read(&mut buf, handle);
+        self.fs_close(handle);
+        if n < 0 {
+            return None;
+        }
+        buf.truncate(n as usize);
+        Some(buf)
+    }
+
+    // --- bots (fake clients driven by the module) ---
+
+    /// `G_Add_Bot` — spawn a fake client (runs the module's ClientConnect + PutClientInServer).
+    /// `bottom`/`top` are the lower/upper shirt colors (0–13). Returns the 1-based client number,
+    /// or 0 if the server is full.
+    pub fn add_bot(&self, name: &CStr, bottom: i32, top: i32, skin: &CStr) -> i32 {
+        unsafe {
+            (self.syscall)(
+                B::AddBot as isize,
+                name.as_ptr() as isize,
+                bottom as isize,
+                top as isize,
+                skin.as_ptr() as isize,
+            ) as i32
+        }
+    }
+
+    /// `G_Remove_Bot` — disconnect a bot by its 1-based client number.
+    pub fn remove_bot(&self, client: i32) {
+        unsafe { (self.syscall)(B::RemoveBot as isize, client as isize) };
+    }
+
+    /// `G_SetBotUserInfo` — set a userinfo key on a bot client (`flags` 0 for normal userinfo).
+    pub fn set_bot_userinfo(&self, client: i32, key: &CStr, value: &CStr, flags: i32) {
+        unsafe {
+            (self.syscall)(
+                B::SetBotUserInfo as isize,
+                client as isize,
+                key.as_ptr() as isize,
+                value.as_ptr() as isize,
+                flags as isize,
+            )
+        };
+    }
+
+    /// `G_SetBotCMD` — feed a bot its usercmd for this frame. `angles` is `(pitch, yaw, roll)`;
+    /// `forward`/`side`/`up` are the integer move components; `buttons`/`impulse` as usual. The
+    /// engine runs this through the same `SV_RunCmd`/`PM_PlayerMove` as a human client. Must be
+    /// re-sent every frame — the engine reuses the last cmd otherwise.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_bot_cmd(
+        &self,
+        client: i32,
+        msec: i32,
+        angles: Vec3,
+        forward: i32,
+        side: i32,
+        up: i32,
+        buttons: i32,
+        impulse: i32,
+    ) {
+        unsafe {
+            (self.syscall)(
+                B::SetBotCmd as isize,
+                client as isize,
+                msec as isize,
+                pf(angles.x),
+                pf(angles.y),
+                pf(angles.z),
+                forward as isize,
+                side as isize,
+                up as isize,
+                buttons as isize,
+                impulse as isize,
+            )
+        };
+    }
+
+    /// `G_TraceCapsule` — like [`traceline`](Self::traceline) but sweeps a box (`mins`/`maxs`)
+    /// from `start` to `end`, writing results into the engine's `trace_*` globals. Used to
+    /// verify jump/drop arcs clear geometry. `nomonsters` follows QuakeC.
+    #[allow(clippy::too_many_arguments)]
+    pub fn trace_capsule(
+        &self,
+        start: Vec3,
+        end: Vec3,
+        nomonsters: bool,
+        ignore: EntId,
+        mins: Vec3,
+        maxs: Vec3,
+    ) {
+        unsafe {
+            (self.syscall)(
+                B::TraceCapsule as isize,
+                pf(start.x),
+                pf(start.y),
+                pf(start.z),
+                pf(end.x),
+                pf(end.y),
+                pf(end.z),
+                nomonsters as isize,
+                ignore.0 as isize,
+                pf(mins.x),
+                pf(mins.y),
+                pf(mins.z),
+                pf(maxs.x),
+                pf(maxs.y),
+                pf(maxs.z),
+            )
+        };
+    }
+
     /// `G_GetEntityToken` — fetch the next token from the map's entity string into `buf`.
     /// Returns `false` when the entity string is exhausted.
     pub fn get_entity_token<'b>(&self, buf: &'b mut [u8]) -> (bool, &'b str) {
