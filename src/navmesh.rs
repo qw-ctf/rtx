@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use glam::{Vec3, Vec3Swizzles};
+use glam::{Vec2, Vec3, Vec3Swizzles};
 
 use crate::bsp::Bsp;
 
@@ -69,6 +69,10 @@ pub enum LinkKind {
     Drop,
     /// A run-jump across a gap or up to a ledge within reach.
     JumpGap,
+    /// Riding a `func_plat`: board it at the bottom and let it carry you to the top. The
+    /// link's `from` cell is the standing spot on the plat (its centre), `to` the floor the
+    /// plat delivers to. Bots stay centred and wait rather than steering off.
+    Plat,
 }
 
 /// A directed edge between two cells, with its traversal kind and travel-time cost.
@@ -348,6 +352,11 @@ impl NavGraph {
         self.links[link_idx as usize].to
     }
 
+    /// The cell a link departs from.
+    pub fn link_source(&self, link_idx: u32) -> CellId {
+        self.links[link_idx as usize].from
+    }
+
     /// How a link is traversed (walk/step/drop/jump).
     pub fn link_kind(&self, link_idx: u32) -> LinkKind {
         self.links[link_idx as usize].kind
@@ -367,10 +376,96 @@ impl NavGraph {
                 LinkKind::Step => c.step += 1,
                 LinkKind::Drop => c.drop += 1,
                 LinkKind::JumpGap => c.jump += 1,
+                LinkKind::Plat => c.plat += 1,
             }
         }
         c
     }
+
+    // --- entity-derived links: func_plat (built after the static graph, from spawned ents) ---
+
+    /// Splice `func_plat` lifts into the graph. For each plat we add a cell on its surface at
+    /// the bottom (the board point), a [`LinkKind::Plat`] ride from there to the floor the plat
+    /// delivers to at the top, and `JumpGap` "jump aboard" links from the nearby lower floor
+    /// onto the plat — boarding by jumping is safer because the trigger that raises the plat is
+    /// larger than the plat brush. Plats whose top doesn't reach any floor cell are skipped.
+    pub fn add_plats(&mut self, bsp: &Bsp, plats: &[PlatInfo]) {
+        for p in plats {
+            // Where does the plat deliver you? Nearest floor cell to its raised surface.
+            let Some(top) = self.nearest_within(p.exit, GRID * 3.0, STEP_HEIGHT * 2.0) else {
+                continue;
+            };
+            let board = self.add_cell(p.board);
+            let ride = (p.exit.z - p.board.z).max(0.0);
+            self.push_link(Link {
+                from: board,
+                to: top,
+                kind: LinkKind::Plat,
+                cost: ride / MAX_SPEED + 1.0, // ride time + boarding/trigger overhead
+            });
+            // Jump-aboard links from the surrounding lower floor.
+            for c in self.cells_near(p.board.xy(), GRID * 3.0) {
+                if c == board {
+                    continue;
+                }
+                let from = self.cells[c as usize].origin;
+                let dz = p.board.z - from.z;
+                if dz.abs() <= JUMP_APEX && arc_clear(bsp, from, p.board) {
+                    let horiz = (p.board.xy() - from.xy()).length();
+                    self.push_link(Link {
+                        from: c,
+                        to: board,
+                        kind: LinkKind::JumpGap,
+                        cost: link_cost(LinkKind::JumpGap, horiz, dz),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Append a free-standing cell (not from the column carve) and index it. Used for plat
+    /// surfaces, which don't exist in the static world hull.
+    fn add_cell(&mut self, origin: Vec3) -> CellId {
+        let id = self.cells.len() as CellId;
+        let (gx, gy) = (floor_grid(origin.x), floor_grid(origin.y));
+        self.cells.push(Cell { origin, gx, gy });
+        self.adjacency.push(Vec::new());
+        self.grid.entry((gx, gy)).or_default().push(id);
+        id
+    }
+
+    /// Cells whose XY is within `radius` of `xy`.
+    fn cells_near(&self, xy: Vec2, radius: f32) -> Vec<CellId> {
+        let (gx, gy) = (floor_grid(xy.x), floor_grid(xy.y));
+        let r = (radius / GRID).ceil() as i32;
+        self.neighbors_within(gx, gy, r)
+            .into_iter()
+            .filter(|&c| (self.cells[c as usize].origin.xy() - xy).length() <= radius)
+            .collect()
+    }
+
+    /// Nearest cell to `p` within `horiz` XY and `vert` Z of it, by 3D distance.
+    fn nearest_within(&self, p: Vec3, horiz: f32, vert: f32) -> Option<CellId> {
+        let (gx, gy) = (floor_grid(p.x), floor_grid(p.y));
+        let r = (horiz / GRID).ceil() as i32;
+        self.neighbors_within(gx, gy, r)
+            .into_iter()
+            .filter(|&c| {
+                let o = self.cells[c as usize].origin;
+                (o.xy() - p.xy()).length() <= horiz && (o.z - p.z).abs() <= vert
+            })
+            .min_by(|&a, &b| {
+                let d = |c: CellId| (self.cells[c as usize].origin - p).length_squared();
+                d(a).total_cmp(&d(b))
+            })
+    }
+}
+
+/// The two standing positions a `func_plat` connects: the player-origin spot on the plat
+/// surface at the bottom of travel (`board`) and at the top (`exit`).
+pub struct PlatInfo {
+    pub board: Vec3,
+    pub exit: Vec3,
 }
 
 #[derive(Default)]
@@ -379,6 +474,7 @@ pub struct LinkCounts {
     pub step: u32,
     pub drop: u32,
     pub jump: u32,
+    pub plat: u32,
 }
 
 /// Travel-time cost of a link: horizontal distance / speed, plus risk/effort penalties so A*
@@ -390,6 +486,8 @@ fn link_cost(kind: LinkKind, horiz: f32, dz: f32) -> f32 {
         LinkKind::Step => base * 1.1,
         LinkKind::Drop => base + if -dz > SAFE_FALL { 1.0 } else { 0.1 },
         LinkKind::JumpGap => base + 0.3,
+        // Plat costs are computed at splice time (ride time + overhead), not here.
+        LinkKind::Plat => base + 1.0,
     }
 }
 
@@ -483,7 +581,7 @@ mod tests {
         };
         let bytes = std::fs::read(&path).expect("read bsp");
         let bsp = Bsp::parse(&bytes).expect("parse bsp");
-        let g = NavGraph::build(&bsp);
+        let mut g = NavGraph::build(&bsp);
         assert!(!g.cells.is_empty(), "no cells carved");
         assert!(!g.links.is_empty(), "no links built");
 
@@ -563,5 +661,16 @@ mod tests {
         assert_eq!(cell, goal, "route did not reach goal");
         eprintln!("A*: route to {goal} is {} links", route.len());
         assert!(reach_frac > 0.4, "best directed reach too low: {:.0}%", reach_frac * 100.0);
+
+        // Plat splice: synthesize a lift whose board sits just above a well-connected cell and
+        // whose exit is another reachable cell; confirm the ride + board cell wire in. (The
+        // jump-aboard count depends on local geometry/headroom, so it's reported, not asserted.)
+        let (links_before, cells_before) = (g.links.len(), g.cells.len());
+        let board = g.cells[start as usize].origin + Vec3::Z * 24.0;
+        let exit = g.cells[goal as usize].origin;
+        g.add_plats(&bsp, &[PlatInfo { board, exit }]);
+        assert_eq!(g.summary().plat, 1, "plat ride not added");
+        assert_eq!(g.cells.len(), cells_before + 1, "board cell not added");
+        eprintln!("plat splice: {} jump-aboard links", g.links.len() - links_before - 1);
     }
 }

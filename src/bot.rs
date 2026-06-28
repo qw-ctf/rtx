@@ -36,6 +36,8 @@ const REPATH_INTERVAL: f32 = 0.4;
 /// Stuck detector: if we move less than this over `STUCK_TIME`, jump and re-path.
 const STUCK_MOVE: f32 = 16.0;
 const STUCK_TIME: f32 = 0.7;
+/// A plat ride is "done" once we've risen to within this of the exit-floor height.
+const PLAT_RISE_TOL: f32 = 18.0;
 
 // --- population management (P3) ---
 
@@ -186,11 +188,18 @@ fn run_bot(game: &mut GameState, e: EntId) {
         bot.repath_time = now; // force a fresh path next frame
     }
 
-    // Advance past route legs we've already reached.
+    // Advance past route legs we've already reached. A plat leg completes when we've *risen*
+    // to the exit height (Z), not on XY arrival — we're standing still on the lift while it
+    // carries us up, so XY barely changes.
     while bot.route_pos < bot.route.len() {
-        let target_cell = graph.link_target(bot.route[bot.route_pos]);
-        let wp = graph.cell_origin(target_cell);
-        if (wp.xy() - origin.xy()).length() <= ARRIVE_RADIUS {
+        let leg = bot.route[bot.route_pos];
+        let target = graph.cell_origin(graph.link_target(leg));
+        let arrived = if graph.link_kind(leg) == LinkKind::Plat {
+            origin.z >= target.z - PLAT_RISE_TOL
+        } else {
+            (target.xy() - origin.xy()).length() <= ARRIVE_RADIUS
+        };
+        if arrived {
             bot.route_pos += 1;
         } else {
             break;
@@ -198,10 +207,17 @@ fn run_bot(game: &mut GameState, e: EntId) {
     }
 
     // Current waypoint + how to traverse to it. Past the route's end, home straight in on the
-    // human (final approach).
+    // human (final approach). While riding a plat, steer toward the plat *centre* (the leg's
+    // source cell) to stay aboard as it rises, instead of toward the far exit ledge.
     let (waypoint, kind, final_leg) = if bot.route_pos < bot.route.len() {
         let leg = bot.route[bot.route_pos];
-        (graph.cell_origin(graph.link_target(leg)), Some(graph.link_kind(leg)), false)
+        let k = graph.link_kind(leg);
+        let aim = if k == LinkKind::Plat {
+            graph.cell_origin(graph.link_source(leg))
+        } else {
+            graph.cell_origin(graph.link_target(leg))
+        };
+        (aim, Some(k), false)
     } else {
         (target_origin, None, true)
     };

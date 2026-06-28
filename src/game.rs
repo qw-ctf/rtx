@@ -483,12 +483,14 @@ impl GameState {
             self.host.dprint(c"rtx: navmesh: unsupported/!malformed BSP; bots disabled\n");
             return;
         };
-        // Build the cell/link graph from the player clip hull.
-        let graph = crate::navmesh::NavGraph::build(&bsp);
+        // Build the cell/link graph from the player clip hull, then splice in the spawned
+        // func_plat lifts (entity-derived links, which need the entities to exist).
+        let mut graph = crate::navmesh::NavGraph::build(&bsp);
+        graph.add_plats(&bsp, &self.collect_plats());
         let counts = graph.summary();
         let msg = cstring(&format!(
             "rtx: navmesh: {} planes, {} clipnodes -> {} cells, {} links \
-             (walk {} step {} drop {} jump {})\n",
+             (walk {} step {} drop {} jump {} plat {})\n",
             bsp.planes.len(),
             bsp.clipnodes.len(),
             graph.cells.len(),
@@ -497,10 +499,31 @@ impl GameState {
             counts.step,
             counts.drop,
             counts.jump,
+            counts.plat,
         ));
         self.host.dprint(&msg);
         self.nav.bsp = Some(bsp);
         self.nav.graph = Some(graph);
+    }
+
+    /// Gather the [`PlatInfo`](crate::navmesh::PlatInfo) for every spawned `func_plat`: the
+    /// player-origin standing spots on the plat surface at the bottom and top of its travel.
+    /// The plat moves only in Z (`pos2`→`pos1`); its top surface is `maxs.z` above the origin,
+    /// and a standing player origin sits 24 (`-mins.z`) above that surface.
+    fn collect_plats(&self) -> Vec<crate::navmesh::PlatInfo> {
+        self.find_by_classname("plat")
+            .map(|e| {
+                let ent = &self.entities[e];
+                let (pos1, pos2) = (ent.mover.pos1, ent.mover.pos2);
+                let (mins, maxs) = (ent.v.mins, ent.v.maxs);
+                let cx = pos1.x + (mins.x + maxs.x) * 0.5;
+                let cy = pos1.y + (mins.y + maxs.y) * 0.5;
+                crate::navmesh::PlatInfo {
+                    board: Vec3::new(cx, cy, pos2.z + maxs.z + 24.0),
+                    exit: Vec3::new(cx, cy, pos1.z + maxs.z + 24.0),
+                }
+            })
+            .collect()
     }
 
     /// `GAME_START_FRAME` — once per server frame. `is_bot_frame` runs only bot logic.
