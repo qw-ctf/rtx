@@ -15,14 +15,16 @@
 
 use glam::{Vec3, Vec3Swizzles};
 
-use crate::defs::{Bits, Flags};
+use crate::defs::{Bits, Flags, Items};
 use crate::entity::{BotState, EntId};
 use crate::game::{cstring, GameState};
-use crate::navmesh::LinkKind;
+use crate::navmesh::{LinkKind, NavGraph};
 
 // usercmd button bits.
 const BUTTON_ATTACK: i32 = 1;
 const BUTTON_JUMP: i32 = 2;
+/// Impulse to select the shotgun (for shooting a health-gated button).
+const IMPULSE_SHOTGUN: i32 = 2;
 
 /// Move-component scale (matches ktx: project the desired world direction onto the view
 /// vectors and scale by 800; pmove clamps to `sv_maxspeed`).
@@ -140,6 +142,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     let origin = game.entities[e].v.origin;
     let v_angle = game.entities[e].v.v_angle;
     let client = game.entities[e].bot.client;
+    let weapon = game.entities[e].v.weapon;
     let on_ground = game.entities[e].v.flags.has(Flags::ONGROUND);
     let alive = game.entities[e].v.health > 0.0 && game.entities[e].v.deadflag == 0.0;
     // Flip the per-frame pulse used for press/release-edge buttons.
@@ -174,6 +177,15 @@ fn run_bot(game: &mut GameState, e: EntId) {
         return;
     };
 
+    // Which gates are currently shut? (door still at its closed `pos1`.) Read before borrowing
+    // the bot mutably, since it touches other entities (the door edicts).
+    let gate_closed: Vec<bool> = (0..graph.gate_count())
+        .map(|gi| {
+            let d = EntId(graph.gate(gi).door);
+            (game.entities[d].v.origin - game.entities[d].mover.pos1).length() < 4.0
+        })
+        .collect();
+
     let bot = &mut game.entities[e].bot;
 
     // A teleport (or any large instant displacement) invalidates the planned route — drop it
@@ -184,16 +196,43 @@ fn run_bot(game: &mut GameState, e: EntId) {
     }
     bot.last_origin = origin;
 
-    // Re-path when the route is empty, the human moved to a new cell, or the timer elapsed.
-    if bot.route.is_empty() || bot.goal_cell != goal_cell || now >= bot.repath_time {
-        bot.route = graph.find_path(bot_cell, goal_cell).unwrap_or_default();
+    // Gate errand: drop it once the gate's door has opened.
+    if let Some(gi) = bot.gate {
+        if gate_closed.get(gi).copied() != Some(true) {
+            bot.gate = None;
+            bot.route.clear();
+            bot.repath_time = now;
+        }
+    }
+
+    // Effective goal: the human, or — while opening a gate — that gate's button.
+    let goal = match bot.gate {
+        Some(gi) => graph.gate(gi).button_cell,
+        None => goal_cell,
+    };
+
+    // Re-path when the route is empty, the goal changed, or the timer elapsed.
+    if bot.route.is_empty() || bot.goal_cell != goal || now >= bot.repath_time {
+        bot.route = graph.find_path(bot_cell, goal).unwrap_or_default();
         bot.route_pos = 0;
-        bot.goal_cell = goal_cell;
+        bot.goal_cell = goal;
         bot.repath_time = now + REPATH_INTERVAL;
     }
     // If we've fallen off the planned route (missed a jump, got shoved), re-localize next.
-    if bot.route_pos >= bot.route.len() && bot_cell != goal_cell && now >= bot.repath_time {
+    if bot.route_pos >= bot.route.len() && bot_cell != goal && now >= bot.repath_time {
         bot.repath_time = now; // force a fresh path next frame
+    }
+
+    // Not on an errand yet? If the route to the human crosses a shut gate, divert to its button.
+    if bot.gate.is_none() {
+        if let Some(gi) = route_blocking_gate(graph, &bot.route, bot.route_pos, &gate_closed) {
+            let button_cell = graph.gate(gi).button_cell;
+            bot.gate = Some(gi);
+            bot.route = graph.find_path(bot_cell, button_cell).unwrap_or_default();
+            bot.route_pos = 0;
+            bot.goal_cell = button_cell;
+            bot.repath_time = now + REPATH_INTERVAL;
+        }
     }
 
     // Advance past route legs we've already reached. A plat leg completes when we've *risen*
@@ -245,9 +284,9 @@ fn run_bot(game: &mut GameState, e: EntId) {
     let to_wp = waypoint.xy() - origin.xy();
     let dist = to_wp.length();
     let yaw = to_wp.y.atan2(to_wp.x).to_degrees();
-    let angles = Vec3::new(0.0, yaw, 0.0);
+    let mut angles = Vec3::new(0.0, yaw, 0.0);
 
-    let (mut forward, mut side, mut buttons) = (0, 0, 0);
+    let (mut forward, mut side, mut buttons, mut impulse) = (0, 0, 0, 0);
     let close_enough = final_leg && dist <= POLITE_DIST;
     if !close_enough {
         let (fwd, right) = angle_vectors(angles);
@@ -263,7 +302,44 @@ fn run_bot(game: &mut GameState, e: EntId) {
         buttons |= BUTTON_JUMP;
     }
 
-    host.set_bot_cmd(client, msec, angles, forward, side, 0, buttons, 0);
+    // Opening a gate's button: once at it, face it and push (walk in) or shoot it.
+    if let Some(gi) = bot.gate {
+        let g = graph.gate(gi);
+        let at_button = bot.route_pos >= bot.route.len()
+            || (origin.xy() - graph.cell_origin(g.button_cell).xy()).length() < 40.0;
+        if at_button {
+            let eye = origin + Vec3::new(0.0, 0.0, 22.0);
+            let d = g.aim - eye;
+            let yaw = d.y.atan2(d.x).to_degrees();
+            let pitch = -d.z.atan2(d.xy().length()).to_degrees();
+            angles = Vec3::new(pitch, yaw, 0.0);
+            buttons &= !BUTTON_JUMP;
+            if g.shoot {
+                // Switch to the shotgun and fire at the button.
+                impulse = IMPULSE_SHOTGUN;
+                (forward, side) = (0, 0);
+                if weapon == Items::SHOTGUN.as_f32() {
+                    buttons |= BUTTON_ATTACK;
+                }
+            } else {
+                // Walk into the button to push it.
+                let (fwd, right) = angle_vectors(Vec3::new(0.0, yaw, 0.0));
+                let dir = (g.aim - origin).normalize_or_zero();
+                forward = (fwd.dot(dir) * MOVE_SPEED) as i32;
+                side = (right.dot(dir) * MOVE_SPEED) as i32;
+            }
+        }
+    }
+
+    host.set_bot_cmd(client, msec, angles, forward, side, 0, buttons, impulse);
+}
+
+/// The first shut gate whose blocked cell lies on the remaining route, if any.
+fn route_blocking_gate(graph: &NavGraph, route: &[u32], from: usize, closed: &[bool]) -> Option<usize> {
+    route.get(from..)?.iter().find_map(|&leg| {
+        let gi = graph.gate_of_cell(graph.link_target(leg))?;
+        (*closed.get(gi)?).then_some(gi)
+    })
 }
 
 /// The nearest living human player to bot `bot_e` (skips bots, spectators, and the dead).

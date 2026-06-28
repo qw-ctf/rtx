@@ -489,10 +489,11 @@ impl GameState {
         let mut graph = crate::navmesh::NavGraph::build(&bsp);
         graph.add_plats(&bsp, &self.collect_plats());
         graph.add_teleports(&self.collect_teleports());
+        graph.add_gates(&self.collect_gates());
         let counts = graph.summary();
         let msg = cstring(&format!(
             "rtx: navmesh: {} planes, {} clipnodes -> {} cells, {} links \
-             (walk {} step {} drop {} jump {} plat {} tele {})\n",
+             (walk {} step {} drop {} jump {} plat {} tele {}), {} gates\n",
             bsp.planes.len(),
             bsp.clipnodes.len(),
             graph.cells.len(),
@@ -503,6 +504,7 @@ impl GameState {
             counts.jump,
             counts.plat,
             counts.teleport,
+            graph.gate_count(),
         ));
         self.host.dprint(&msg);
         self.nav.bsp = Some(bsp);
@@ -546,6 +548,38 @@ impl GameState {
                 })
             })
             .collect()
+    }
+
+    /// Gather the [`GateInfo`](crate::navmesh::GateInfo) for every button-gated door: a
+    /// `func_door` with a targetname (it has no auto-trigger, so it stays shut) paired with the
+    /// `func_button` whose `target` fires it. Records the door's closed-position world box (from
+    /// `pos1`), the button centre, and whether the button is shot (`health > 0`) or touched.
+    fn collect_gates(&self) -> Vec<crate::navmesh::GateInfo> {
+        let doors: Vec<EntId> = self
+            .find_by_classname("door")
+            .filter(|&d| self.entities[d].targetname.is_some())
+            .collect();
+        let mut gates = Vec::new();
+        for door in doors {
+            let tn = self.entities[door].targetname.clone().unwrap();
+            let Some(button) = self
+                .find_by_classname("func_button")
+                .find(|&b| self.entities[b].target.as_deref() == Some(tn.as_ref()))
+            else {
+                continue;
+            };
+            let bent = &self.entities[button];
+            let dent = &self.entities[door];
+            let closed = dent.mover.pos1; // door rests closed at pos1
+            gates.push(crate::navmesh::GateInfo {
+                door: door.0,
+                closed_min: closed + dent.v.mins,
+                closed_max: closed + dent.v.maxs,
+                button: bent.v.origin + (bent.v.mins + bent.v.maxs) * 0.5,
+                shoot: bent.v.health > 0.0,
+            });
+        }
+        gates
     }
 
     /// `GAME_START_FRAME` — once per server frame. `is_bot_frame` runs only bot logic.

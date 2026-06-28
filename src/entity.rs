@@ -482,6 +482,8 @@ pub struct BotState {
     pub route_pos: usize,
     /// The cell we last routed toward (`u32::MAX` = none), to detect when to re-path.
     pub goal_cell: u32,
+    /// The gate currently being opened as an errand (`None` = following the human normally).
+    pub gate: Option<usize>,
     /// Earliest time we may recompute the route (throttles A*).
     pub repath_time: f32,
     /// Stuck detector: where we were when last checked, and since when we've been there.

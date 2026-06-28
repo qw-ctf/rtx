@@ -95,6 +95,9 @@ pub struct NavGraph {
     pub links: Vec<Link>,
     pub adjacency: Vec<Vec<u32>>,
     grid: GridIndex,
+    gates: Vec<Gate>,
+    /// Cells a closed gate blocks → the gate's index.
+    gated: HashMap<CellId, usize>,
 }
 
 impl NavGraph {
@@ -106,6 +109,8 @@ impl NavGraph {
             cells: cells_grid.0,
             links: Vec::new(),
             grid: cells_grid.1,
+            gates: Vec::new(),
+            gated: HashMap::new(),
         };
         graph.link_cells(bsp);
         graph
@@ -471,6 +476,49 @@ impl NavGraph {
         out
     }
 
+    // --- entity-derived: button-gated doors ---
+
+    /// Register button-gated doors. Each `func_door` with a targetname is a gate that stays
+    /// shut until its `func_button` fires it; the static carve (hull 0, no door brushes) has
+    /// cells passing straight through, so we mark the cells inside the door's *closed* volume
+    /// as gated and remember which button opens them. Bots detour to the button before crossing
+    /// (see `bot.rs`). Gates whose closed door blocks no cell, or whose button has no nearby
+    /// cell to operate from, are skipped.
+    pub fn add_gates(&mut self, gates: &[GateInfo]) {
+        for gi in gates {
+            let blocked = self.cells_in_box(gi.closed_min, gi.closed_max);
+            if blocked.is_empty() {
+                continue;
+            }
+            let Some(button_cell) = self.nearest_within(gi.button, GRID * 5.0, 160.0) else {
+                continue;
+            };
+            let idx = self.gates.len();
+            for &c in &blocked {
+                self.gated.insert(c, idx);
+            }
+            self.gates.push(Gate {
+                door: gi.door,
+                button_cell,
+                aim: gi.button,
+                shoot: gi.shoot,
+            });
+        }
+    }
+
+    pub fn gate_count(&self) -> usize {
+        self.gates.len()
+    }
+
+    pub fn gate(&self, i: usize) -> &Gate {
+        &self.gates[i]
+    }
+
+    /// The gate (if any) that blocks cell `c` when shut.
+    pub fn gate_of_cell(&self, c: CellId) -> Option<usize> {
+        self.gated.get(&c).copied()
+    }
+
     /// Append a free-standing cell (not from the column carve) and index it. Used for plat
     /// surfaces, which don't exist in the static world hull.
     fn add_cell(&mut self, origin: Vec3) -> CellId {
@@ -522,6 +570,26 @@ pub struct TeleportInfo {
     pub tmin: Vec3,
     pub tmax: Vec3,
     pub dest: Vec3,
+}
+
+/// A button-gated door: the door entity (to read its open/closed position), where the bot
+/// operates the button from (`button_cell`), the button centre to face/touch/shoot (`aim`),
+/// and whether the button is shot rather than touched.
+pub struct Gate {
+    pub door: u32,
+    pub button_cell: CellId,
+    pub aim: Vec3,
+    pub shoot: bool,
+}
+
+/// Inputs for [`NavGraph::add_gates`], gathered from spawned door/button entities: the door's
+/// closed-position world box, the button centre, and how the button is activated.
+pub struct GateInfo {
+    pub door: u32,
+    pub closed_min: Vec3,
+    pub closed_max: Vec3,
+    pub button: Vec3,
+    pub shoot: bool,
 }
 
 #[derive(Default)]
@@ -741,5 +809,20 @@ mod tests {
         let tele = g.summary().teleport;
         assert!(tele >= 1, "no teleport links added");
         eprintln!("teleport splice: {tele} entrance links");
+
+        // Gate splice: a closed door box over a well-connected cell, with a button nearby. The
+        // covered cells become gated and the button resolves to an operating cell.
+        let dcell = g.cells[start as usize].origin;
+        let gate = GateInfo {
+            door: 0,
+            closed_min: dcell - Vec3::new(32.0, 32.0, 8.0),
+            closed_max: dcell + Vec3::new(32.0, 32.0, 56.0),
+            button: g.cells[goal as usize].origin,
+            shoot: false,
+        };
+        g.add_gates(&[gate]);
+        assert_eq!(g.gate_count(), 1, "gate not registered");
+        assert!(g.gate_of_cell(start).is_some(), "covered cell not gated");
+        eprintln!("gate splice: button cell {}", g.gate(0).button_cell);
     }
 }
