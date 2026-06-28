@@ -52,6 +52,21 @@ It reels server-side too, so it shows the same one-frame prediction pop as the m
 features above. The hook's models and viewmodel must be in the gamedir:
 `progs/{star,bit,v_star}.mdl`.
 
+## Bots
+
+Navmesh-driven bots that need **no per-map waypoint files** — the navmesh is generated from the
+map's BSP clip hull when the map loads. Bots are real client slots: the engine runs their input
+through the same player-move code as humans, so gravity, stepping, and jumps come for free.
+
+| cvar | default | what it does |
+|------|---------|--------------|
+| `rtx_bots` | `0` | How many bots to keep on the server. The population is reconciled to this count (spawning/removing as needed), leaving room for humans. Bots only spawn once the map's navmesh is built. |
+| `rtx_bot_skill` | `3` | Bot skill (reserved for combat tuning later). |
+
+The current behaviour is deliberately minimal — each bot pathfinds to and **follows the nearest
+human** around the map (through doors, off ledges, across jumps), recovering after a missed jump.
+There's **no shooting yet**; goal-seeking and combat are planned next.
+
 ## Building
 
 ```sh
