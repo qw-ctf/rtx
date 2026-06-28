@@ -12,7 +12,7 @@ use glam::Vec3;
 use crate::assets::{Model, Sound};
 use crate::abi::EntVars;
 use crate::defs::*;
-use crate::entity::{Die, EntId, Pain};
+use crate::entity::{CombatState, Die, EntId, Pain};
 use crate::game::GameState;
 
 #[derive(Clone, Copy)]
@@ -171,16 +171,13 @@ impl GameState {
             ent.v.flags = Flags::CLIENT.as_f32();
             ent.v.effects = 0.0;
             ent.v.deadflag = DeadFlag::No.as_f32();
-            ent.combat.show_hostile = 0.0;
+            // Respawn: a fresh player, so wipe all per-life combat state (powerup timers, pain
+            // and attack cooldowns, the air-jump latch, …) and set only the two time-based timers.
+            ent.combat = CombatState::default();
             ent.combat.air_finished = time + 12.0;
-            ent.mover.dmg = 2.0; // initial water damage
-            ent.combat.super_damage_finished = 0.0;
-            ent.combat.radsuit_finished = 0.0;
-            ent.combat.invisible_finished = 0.0;
-            ent.combat.invincible_finished = 0.0;
-            ent.combat.invincible_time = 0.0;
-            ent.mover.pausetime = 0.0;
             ent.combat.attack_finished = time;
+            ent.mover.dmg = 2.0; // initial water damage
+            ent.mover.pausetime = 0.0;
             ent.th_pain = Pain::Player;
             ent.th_die = Die::Player;
         }

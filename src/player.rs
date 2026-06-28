@@ -14,7 +14,7 @@ use glam::Vec3;
 use crate::assets::{Model, Sound};
 use crate::anim::{Anim, frames};
 use crate::defs::*;
-use crate::entity::{EntId, Think};
+use crate::entity::{CombatState, EntId, Think};
 use crate::game::GameState;
 
 // `player.mdl` frames and the animations built on them. The `frames!` machinery and the `Anim`
@@ -399,10 +399,9 @@ impl GameState {
         {
             let ent = &mut self.entities[e];
             ent.v.items = ent.v.items.without(Items::INVISIBILITY);
-            ent.combat.invisible_finished = 0.0;
-            ent.combat.invincible_finished = 0.0;
-            ent.combat.super_damage_finished = 0.0;
-            ent.combat.radsuit_finished = 0.0;
+            // Death ends this life's combat state: clear all of it (powerup timers and effects,
+            // cooldowns, the air-jump latch, …). Nothing below reads it, and respawn re-inits it.
+            ent.combat = CombatState::default();
         }
         self.drop_backpack(e);
         let vz = self.entities[e].v.velocity.z;
