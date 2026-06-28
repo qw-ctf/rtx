@@ -655,6 +655,15 @@ impl GameState {
             // path_corner waypoints are inert markers used by trains.
             "path_corner" => SpawnAction::Keep,
 
+            // rotate.rs — Hipnotic rotating brushes
+            "func_rotate_entity" => SpawnAction::Spawn(GameState::spawn_func_rotate_entity),
+            "func_rotate_train" => SpawnAction::Spawn(GameState::spawn_func_rotate_train),
+            "func_rotate_door" => SpawnAction::Spawn(GameState::spawn_func_rotate_door),
+            "func_movewall" => SpawnAction::Spawn(GameState::spawn_func_movewall),
+            "rotate_object" => SpawnAction::Spawn(GameState::spawn_rotate_object),
+            "path_rotate" => SpawnAction::Spawn(GameState::spawn_path_rotate),
+            "info_rotate" => SpawnAction::Spawn(GameState::spawn_info_rotate),
+
             // misc.qc
             "info_null" => SpawnAction::Spawn(GameState::spawn_info_null),
             "light" => SpawnAction::Spawn(GameState::spawn_light),
@@ -715,6 +724,12 @@ impl GameState {
         match key {
             "alpha" => return self.set_alpha(id, parse_f32(value)),
             "colormod" => return self.set_colormod(id, parse_vec3(value)),
+            // Map-declared sound paths (used by path_rotate / func_rotate_train). The typed
+            // `Sound` handle implies a precache, so these go through the runtime escape hatch.
+            "noise" => return self.set_noise_field(id, 0, value),
+            "noise1" => return self.set_noise_field(id, 1, value),
+            "noise2" => return self.set_noise_field(id, 2, value),
+            "noise3" => return self.set_noise_field(id, 3, value),
             _ => {}
         }
         let ent = &mut self.entities[id];
@@ -748,7 +763,32 @@ impl GameState {
             "height" => ent.mover.height = parse_f32(value),
             "dmg" => ent.mover.dmg = parse_f32(value),
             "count" => ent.mover.count = parse_f32(value),
+            // rotate.rs keys (Hipnotic rotating brushes).
+            "rotate" => ent.rot.rotate = parse_vec3(value),
+            "path" => ent.path = Some(value.into()),
+            "event" => ent.event = Some(value.into()),
+            "group" => ent.group = Some(value.into()),
             _ => {}
+        }
+    }
+
+    /// Store a map-declared sound path in one of the entity's `noise` slots, precaching it
+    /// through [`DynAssets`](crate::assets::DynAssets) so the typed [`Sound`] handle still
+    /// guarantees a precache. Empty values are ignored.
+    fn set_noise_field(&mut self, id: EntId, slot: u8, value: &str) {
+        if value.is_empty() {
+            return;
+        }
+        let Ok(path) = CString::new(value) else {
+            return;
+        };
+        let sound = self.dyn_assets.sound(&self.host, &path);
+        let ent = &mut self.entities[id];
+        match slot {
+            0 => ent.noise = Some(sound),
+            1 => ent.noise1 = Some(sound),
+            2 => ent.noise2 = Some(sound),
+            _ => ent.noise3 = Some(sound),
         }
     }
 

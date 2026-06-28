@@ -226,6 +226,51 @@ flag_bits! {
     }
 }
 
+flag_bits! {
+    /// `func_rotate_entity` `.spawnflags` (Hipnotic continual rotator): `TOGGLE` lets a trigger
+    /// turn the spin on/off; `START_ON` spins from spawn.
+    RotateEntityFlags {
+        TOGGLE   = 1 << 0;
+        START_ON = 1 << 1;
+    }
+}
+
+flag_bits! {
+    /// `path_rotate` `.spawnflags` — per-corner behaviour for `func_rotate_train`: `ROTATION`
+    /// spins at the corner's `rotate` rate, `ANGLES` turns to its `angles` (clearing rotation),
+    /// `STOP` waits for a retrigger, `NO_ROTATE` stops spinning while waiting, `DAMAGE` causes
+    /// `dmg` along the segment, `MOVETIME` reads `speed` as travel time, `SET_DAMAGE` applies
+    /// `dmg` to all of the train's targets.
+    PathRotateFlags {
+        ROTATION   = 1 << 0;
+        ANGLES     = 1 << 1;
+        STOP       = 1 << 2;
+        NO_ROTATE  = 1 << 3;
+        DAMAGE     = 1 << 4;
+        MOVETIME   = 1 << 5;
+        SET_DAMAGE = 1 << 6;
+    }
+}
+
+flag_bits! {
+    /// `func_movewall` `.spawnflags` — collision proxy for a rotating object: `VISIBLE` draws the
+    /// brush (otherwise it's an invisible clip), `TOUCH` damages the player on contact,
+    /// `NONBLOCKING` makes it non-solid.
+    MovewallFlags {
+        VISIBLE     = 1 << 0;
+        TOUCH       = 1 << 1;
+        NONBLOCKING = 1 << 2;
+    }
+}
+
+flag_bits! {
+    /// `func_rotate_door` `.spawnflags`: `STAYOPEN` reopens after closing, so a trigger-once door
+    /// can't jam shut when blocked.
+    RotateDoorFlags {
+        STAYOPEN = 1 << 0;
+    }
+}
+
 // --- player bounding box & view offset ---
 pub const VEC_HULL_MIN: Vec3 = Vec3::new(-16.0, -16.0, -24.0);
 pub const VEC_HULL_MAX: Vec3 = Vec3::new(16.0, 16.0, 32.0);

@@ -50,6 +50,8 @@ impl EntId {
 /// A scheduled `think` behaviour. Modeled as a data enum (not a fn pointer) so it is
 /// `Debug`/`Eq` and the central dispatcher's `match` is exhaustiveness-checked. QuakeC's
 /// think-chains map to a variant per chain entry; animation cursors live in `walkframe`.
+// Variant names mirror their QuakeC `*_think` functions, hence the shared `Think` suffix.
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Think {
     #[default]
@@ -114,6 +116,24 @@ pub enum Think {
     HurtOn,
     PlayTeleport,
     ExecuteChangelevel,
+
+    // --- rotate.rs (Hipnotic rotating brushes) ---
+    /// `func_rotate_entity` deferred setup (links targets once they've spawned).
+    RotateEntityFirstThink,
+    /// `func_rotate_entity` continual-spin tick.
+    RotateEntityThink,
+    /// `func_rotate_train` per-tick move+rotate; runs `think1` when a segment ends.
+    RotateTrainThink,
+    /// Train `think1` continuations (find start, advance, wait, stop).
+    RotateTrainFind,
+    RotateTrainNext,
+    RotateTrainWait,
+    RotateTrainStop,
+    /// `func_rotate_door` swing tick and its arrival follow-up.
+    RotateDoorThink,
+    RotateDoorThink2,
+    /// `func_movewall` keep-alive tick (holds `ltime` current for the pusher).
+    MovewallThink,
 }
 
 /// A `.touch` behaviour (`GAME_EDICT_TOUCH`). The dispatcher reads `self`/`other` and
@@ -148,6 +168,8 @@ pub enum Touch {
     TriggerMonsterjump,
     Tdeath,
     Changelevel,
+    /// `func_movewall` clip brush: damages the player it touches (if armed).
+    Movewall,
 }
 
 /// A `.use` behaviour, fired by `SUB_UseTargets` / button presses.
@@ -168,6 +190,10 @@ pub enum Use {
     CounterUse,
     LightUse,
     FuncWallUse,
+    // rotate.rs
+    RotateEntityUse,
+    RotateTrainUse,
+    RotateDoorUse,
 }
 
 /// A `.blocked` behaviour for `MoveType::Push.as_f32()` movers (`GAME_EDICT_BLOCKED`).
@@ -179,6 +205,8 @@ pub enum Blocked {
     DoorBlocked,
     PlatBlocked,
     TrainBlocked,
+    /// `func_movewall`: damages whoever blocks it and reverses a rotating-door group.
+    MovewallBlocked,
 }
 
 /// A `.th_pain` behaviour, invoked by `T_Damage`.
@@ -208,6 +236,41 @@ pub const STATE_TOP: f32 = 0.0;
 pub const STATE_BOTTOM: f32 = 1.0;
 pub const STATE_UP: f32 = 2.0;
 pub const STATE_DOWN: f32 = 3.0;
+
+/// How a brush targeted by a rotator follows it (hiprot's `rotate_type`), assigned by
+/// `link_rotate_targets` from the target's classname.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum RotateType {
+    /// Plain follower: origin tracks the rotated offset from the centre.
+    #[default]
+    SetOrigin,
+    /// `rotate_object`: also copies the rotator's angles, so the brush visibly turns.
+    Rotate,
+    /// `func_movewall`: a `MoveType::Push` clip brush driven by velocity, so it pushes/crushes.
+    Movewall,
+}
+
+/// State-machine position for a rotator. The QC overloaded one integer `state` with three
+/// unrelated meanings (continual spin / door swing / train); this names them and splits them
+/// by entity. Each rotator type uses only its own subset.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum RotPhase {
+    #[default]
+    None,
+    // func_rotate_entity (continual spin)
+    Active,
+    Inactive,
+    SpeedingUp,
+    SlowingDown,
+    // func_rotate_door
+    Closed,
+    Open,
+    Opening,
+    Closing,
+    // func_rotate_train — only `Moving` is behaviourally read (whether to snap on arrival);
+    // the find/next/wait/stop steps are tracked by `think1`.
+    Moving,
+}
 
 /// One game entity: the engine-shared `v`, followed by the private Rust tail.
 ///
@@ -259,6 +322,13 @@ pub struct Entity {
     pub mdl: Option<Box<str>>,
     /// `trigger_changelevel`'s destination map name.
     pub map: Option<Box<str>>,
+    /// `func_rotate_train` path chain: the `path` map key (first corner), then the running
+    /// cursor as the train advances corner to corner.
+    pub path: Option<Box<str>>,
+    /// `path_rotate`'s corner event target — fired via `SUB_UseTargets` when the train arrives.
+    pub event: Option<Box<str>>,
+    /// `func_rotate_door`'s group name, so a whole door group reverses direction together.
+    pub group: Option<Box<str>>,
     /// The item's model as a `'static` C string, kept so a respawned item can be re-shown
     /// (the engine stores the raw pointer, so it must outlive the entity — see the native
     /// string ABI notes in `abi.rs`). Item models are all string literals, so this is sound.
@@ -269,6 +339,7 @@ pub struct Entity {
 
     pub anim: AnimState,
     pub mover: MoverState,
+    pub rot: RotState,
     pub refs: CustomRefs,
     pub combat: CombatState,
     pub item: ItemState,
@@ -316,6 +387,28 @@ pub struct MoverState {
     pub t_length: f32,
     pub t_width: f32,
     pub pausetime: f32,
+}
+
+/// Scratch for the Hipnotic rotating-brush system (`rotate.rs`). A rotator spins its targeted
+/// brushes around its own origin by recomputing their positions each tick; these fields hold
+/// the rotation rate, the per-tick scratch offset, and the small state machines. The shared
+/// vector/float scratch (`dest`/`dest1`/`dest2`/`finaldest`/`finalangle`, `speed`/`wait`/`dmg`/
+/// `count`/`cnt`) is reused from [`MoverState`].
+#[derive(Default)]
+#[allow(dead_code)]
+pub struct RotState {
+    /// Rotation rate in degrees/sec per axis (the `rotate` map key; per-segment for trains).
+    pub rotate: Vec3,
+    /// A target's rotated offset from the centre, recomputed each tick.
+    pub neworigin: Vec3,
+    /// How this entity follows its rotator (targets only).
+    pub kind: RotateType,
+    /// State-machine position (rotators only).
+    pub phase: RotPhase,
+    /// When the current rotation/move segment ends (`ltime`-based; trains and doors).
+    pub endtime: f32,
+    /// `1 / segment-traveltime`, for the train's origin interpolation.
+    pub duration: f32,
 }
 
 #[derive(Default)]

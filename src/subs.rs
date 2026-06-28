@@ -176,4 +176,15 @@ impl GameState {
             .map(|(i, _)| EntId(i as u32))
     }
 
+    /// Live entities whose `group` matches `name` (used by rotating-door groups).
+    pub(crate) fn find_by_group<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> impl Iterator<Item = EntId> + 'a {
+        self.entities
+            .iter()
+            .enumerate()
+            .filter(move |(_, e)| e.in_use && e.group.as_deref() == Some(name))
+            .map(|(i, _)| EntId(i as u32))
+    }
 }

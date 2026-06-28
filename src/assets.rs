@@ -62,6 +62,13 @@ asset_registry!(Sound, precache_sounds, precache_sound, {
     DOORS_DDOOR2 = c"doors/ddoor2.wav";
     DOORS_DOORMV1 = c"doors/doormv1.wav";
     DOORS_DRCLOS4 = c"doors/drclos4.wav";
+    // Hipnotic rotating-door sound sets (sounds 1/2/3 in func_rotate_door).
+    DOORS_LATCH2 = c"doors/latch2.wav";
+    DOORS_WINCH2 = c"doors/winch2.wav";
+    DOORS_AIRDOOR1 = c"doors/airdoor1.wav";
+    DOORS_AIRDOOR2 = c"doors/airdoor2.wav";
+    DOORS_BASESEC1 = c"doors/basesec1.wav";
+    DOORS_BASESEC2 = c"doors/basesec2.wav";
     DOORS_HYDRO1 = c"doors/hydro1.wav";
     DOORS_HYDRO2 = c"doors/hydro2.wav";
     DOORS_MEDTRY = c"doors/medtry.wav";

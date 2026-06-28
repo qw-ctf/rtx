@@ -62,6 +62,17 @@ impl GameState {
             TrainNext => self.train_next(e),
             TrainWait => self.train_wait(e),
             FuncTrainFind => self.func_train_find(e),
+            // rotate.rs (Hipnotic rotating brushes)
+            RotateEntityFirstThink => self.rotate_entity_firstthink(e),
+            RotateEntityThink => self.rotate_entity_think(e),
+            RotateTrainThink => self.rotate_train_think(e),
+            RotateTrainFind => self.rotate_train_find(e),
+            RotateTrainNext => self.rotate_train_next(e),
+            RotateTrainWait => self.rotate_train_wait(e),
+            RotateTrainStop => self.rotate_train_stop(e),
+            RotateDoorThink => self.rotate_door_think(e),
+            RotateDoorThink2 => self.rotate_door_think2(e),
+            MovewallThink => self.movewall_think(e),
         }
     }
 
@@ -95,6 +106,8 @@ impl GameState {
             DoorTriggerField => self.door_trigger_touch(e, other),
             // plats.qc
             PlatCenter => self.plat_center_touch(e, other),
+            // rotate.rs
+            Movewall => self.movewall_touch(e, other),
             // server.qc
             Changelevel => self.changelevel_touch(e, other),
             // trigger_monsterjump only affects monsters (absent in this subset).
@@ -125,6 +138,10 @@ impl GameState {
             // misc.qc
             LightUse => self.light_use(e),
             FuncWallUse => self.func_wall_use(e),
+            // rotate.rs
+            RotateEntityUse => self.rotate_entity_use(e),
+            RotateTrainUse => self.rotate_train_use(e),
+            RotateDoorUse => self.rotate_door_use(e),
         }
     }
 
@@ -136,6 +153,7 @@ impl GameState {
             DoorBlocked => self.door_blocked(e, other),
             PlatBlocked => self.plat_crush(e, other),
             TrainBlocked => self.train_blocked(e, other),
+            MovewallBlocked => self.movewall_blocked(e, other),
         }
     }
 

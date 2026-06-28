@@ -33,6 +33,7 @@ mod items;
 mod misc;
 mod plats;
 mod player;
+mod rotate;
 mod server;
 mod spectate;
 mod subs;
