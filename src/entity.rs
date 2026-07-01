@@ -521,8 +521,11 @@ pub struct BotState {
     /// Only used while the mode marks this bot as an audience/spectator; zero otherwise.
     pub wander_target: Vec3,
     pub wander_time: f32,
-    /// When the current gate errand began, to give up on a door that never opens (unreachable
-    /// button), and the gate index + expiry to avoid re-taking that errand for a while after.
+    /// Gate-errand progress watchdog: the closest we've gotten to the target button and the time
+    /// we last got closer. If we stop making progress (stuck at a door we can't reach the button
+    /// of) we give up — a flat timeout would wrongly abandon a button that's simply far away. Plus
+    /// the gate index + expiry to avoid re-taking that errand for a while after giving up.
+    pub gate_best_dist: f32,
     pub gate_since: f32,
     pub avoid_gate: i32,
     pub avoid_gate_until: f32,

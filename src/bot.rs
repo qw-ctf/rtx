@@ -19,7 +19,7 @@ use crate::defs::{Bits, Flags, Items, Solid, Weapon};
 use crate::entity::{BotState, EntId};
 use crate::game::{cstring, GameState};
 use crate::mode::BotIntent;
-use crate::navmesh::{LinkKind, NavGraph};
+use crate::navmesh::{CellId, LinkKind, NavGraph};
 
 // usercmd button bits.
 const BUTTON_ATTACK: i32 = 1;
@@ -50,8 +50,9 @@ const GOAL_SELECT_INTERVAL: f32 = 1.5;
 /// detours away — riding an elevator, walking to a teleporter — isn't mistaken for being stuck.
 const GOAL_GIVEUP_TIME: f32 = 10.0;
 const GOAL_AVOID_TIME: f32 = 12.0;
-/// Gate errand give-up: if a door hasn't opened this long after we committed to its button, its
-/// button is out of reach (or unusable) — abandon and avoid the gate for `GATE_AVOID_TIME`.
+/// Gate errand give-up: if a bot goes this long without getting any closer to a gate's button, the
+/// button is out of reach (or unusable) — abandon and avoid the gate for `GATE_AVOID_TIME`. Keyed
+/// on lack of progress, not elapsed time, so a button that's just far away is still pursued.
 const GATE_GIVEUP_TIME: f32 = 4.0;
 const GATE_AVOID_TIME: f32 = 6.0;
 
@@ -346,20 +347,32 @@ fn run_bot(game: &mut GameState, e: EntId) {
     }
     bot.last_origin = origin;
 
-    // Gate errand: drop it once the gate's door has opened — or give up if we've been at it too
-    // long without the door opening (button out of reach, or we can't operate it), so we stop
-    // camping against a door we can't get through and try something else.
+    // Gate errand: drop it once the gate's door has opened — or give up if we stop making progress
+    // toward its button (stuck at a door whose button we can't actually reach), so we don't camp
+    // there. Progress-based, not a flat timeout: a button that's simply far across the map (e.g.
+    // when we spawned right next to the door) still gets reached.
     if let Some(gi) = bot.gate {
-        if gate_closed.get(gi).copied() != Some(true) {
-            bot.gate = None;
-            bot.route.clear();
-            bot.repath_time = now;
-        } else if now - bot.gate_since > GATE_GIVEUP_TIME {
+        let give_up = |bot: &mut BotState| {
             bot.avoid_gate = gi as i32;
             bot.avoid_gate_until = now + GATE_AVOID_TIME;
             bot.gate = None;
             bot.route.clear();
             bot.repath_time = now;
+        };
+        if gate_closed.get(gi).copied() != Some(true) {
+            bot.gate = None; // door opened — done
+            bot.route.clear();
+            bot.repath_time = now;
+        } else if !button_reachable(graph, bot_cell, gi, &gate_closed) {
+            give_up(bot); // button is walled off behind this very gate — route around instead
+        } else {
+            let d = (graph.cell_origin(graph.gate(gi).button_cell).xy() - origin.xy()).length();
+            if d < bot.gate_best_dist - 4.0 {
+                bot.gate_best_dist = d; // got closer — reset the give-up clock
+                bot.gate_since = now;
+            } else if now - bot.gate_since > GATE_GIVEUP_TIME {
+                give_up(bot); // no progress toward a reachable button — stuck; try elsewhere
+            }
         }
     }
 
@@ -371,7 +384,17 @@ fn run_bot(game: &mut GameState, e: EntId) {
 
     // Re-path when the route is empty, the goal changed, or the timer elapsed.
     if bot.route.is_empty() || bot.goal_cell != goal || now >= bot.repath_time {
-        bot.route = graph.find_path(bot_cell, goal, &gate_closed).unwrap_or_default();
+        let mut route = graph.find_path(bot_cell, goal, &gate_closed).unwrap_or_default();
+        // Goal unreachable from here (behind a shut door with no way around from this spot, or a
+        // disconnected pocket)? Don't home straight into a wall — head to the reachable cell
+        // nearest the goal, approaching as far as the graph allows (often enough for line of sight
+        // or to find a connection). Better than freezing until the target wanders into view.
+        if route.is_empty() && bot_cell != goal {
+            if let Some(near) = graph.nearest_reachable_to(bot_cell, goal, &gate_closed) {
+                route = graph.find_path(bot_cell, near, &gate_closed).unwrap_or_default();
+            }
+        }
+        bot.route = route;
         bot.route_pos = 0;
         bot.goal_cell = goal;
         bot.repath_time = now + REPATH_INTERVAL;
@@ -390,13 +413,21 @@ fn run_bot(game: &mut GameState, e: EntId) {
         let block = route_blocking_gate(graph, &bot.route, bot.route_pos, &gate_closed)
             .filter(|&gi| gi as i32 != avoid);
         if let Some(gi) = block {
-            let button_cell = graph.gate(gi).button_cell;
-            bot.gate = Some(gi);
-            bot.gate_since = now;
-            bot.route = graph.find_path(bot_cell, button_cell, &gate_closed).unwrap_or_default();
-            bot.route_pos = 0;
-            bot.goal_cell = button_cell;
-            bot.repath_time = now + REPATH_INTERVAL;
+            if button_reachable(graph, bot_cell, gi, &gate_closed) {
+                let button_cell = graph.gate(gi).button_cell;
+                bot.gate = Some(gi);
+                bot.gate_since = now;
+                bot.gate_best_dist = f32::INFINITY; // first frame records the starting distance
+                bot.route = graph.find_path(bot_cell, button_cell, &gate_closed).unwrap_or_default();
+                bot.route_pos = 0;
+                bot.goal_cell = button_cell;
+                bot.repath_time = now + REPATH_INTERVAL;
+            } else {
+                // Button is walled off behind this gate — don't chase it; avoid the gate so
+                // route_blocking_gate stops re-selecting it and find_path routes around the pillar.
+                bot.avoid_gate = gi as i32;
+                bot.avoid_gate_until = now + GATE_AVOID_TIME;
+            }
         }
     }
 
@@ -541,6 +572,17 @@ fn route_blocking_gate(graph: &NavGraph, route: &[u32], from: usize, closed: &[b
         let gi = graph.gate_of_link(leg)?;
         (*closed.get(gi)?).then_some(gi)
     })
+}
+
+/// Whether gate `gi`'s button can be reached from `from` *without* crossing gate `gi`'s own shut
+/// door. False for the chicken-and-egg case (e.g. arenazap's central plate, which opens all four
+/// pillars but sits behind them): a bot outside can't reach it, so committing to that gate is
+/// futile — it should route around the pillar instead. A `None` path counts as unreachable.
+fn button_reachable(graph: &NavGraph, from: CellId, gi: usize, gate_closed: &[bool]) -> bool {
+    match graph.find_path(from, graph.gate(gi).button_cell, gate_closed) {
+        Some(route) => !route.iter().any(|&leg| graph.gate_of_link(leg) == Some(gi)),
+        None => false,
+    }
 }
 
 /// The nearest living human player to bot `bot_e` (skips bots, spectators, and the dead).

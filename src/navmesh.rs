@@ -41,6 +41,9 @@ const MAX_SPEED: f32 = 320.0;
 /// XY sampling step. 32 = the player's full width: one column per body. Coarser than the
 /// plan's 16 to keep the build cheap on big maps; thin ledges may be missed (revisit).
 const GRID: f32 = 32.0;
+/// Player hull half-width (the QW player box is ±16 in X/Y). Used to grow obstacles by the agent
+/// radius so a bot doesn't clip geometry its path's centre-line technically clears.
+const PLAYER_HALF_WIDTH: f32 = 16.0;
 /// Vertical sweep step when scanning a column for floors (refined by bisection after).
 const SCAN_DZ: f32 = 8.0;
 
@@ -357,6 +360,26 @@ impl NavGraph {
         None
     }
 
+    /// The reachable cell (per current door states) whose origin is closest to `goal`'s, when
+    /// `goal` itself can't be reached. Lets a bot head as far toward an unreachable target as the
+    /// graph allows — approaching a wall/door/connection to get line of sight — instead of homing
+    /// straight into geometry. `None` only if nothing but `start` is reachable.
+    pub fn nearest_reachable_to(
+        &self,
+        start: CellId,
+        goal: CellId,
+        gate_closed: &[bool],
+    ) -> Option<CellId> {
+        let costs = self.costs_from(start, gate_closed);
+        let goal_pos = self.cells[goal as usize].origin;
+        (0..self.cells.len() as CellId)
+            .filter(|&c| c != start && costs[c as usize].is_finite())
+            .min_by(|&a, &b| {
+                let d = |c: CellId| (self.cells[c as usize].origin - goal_pos).length_squared();
+                d(a).total_cmp(&d(b))
+            })
+    }
+
     /// Dijkstra cost-flood from `start`: the travel-time cost to reach every cell (`INFINITY`
     /// for unreachable ones). One pass answers "how far is each item?" for goal selection, far
     /// cheaper than an A* per candidate. Indexed by [`CellId`].
@@ -557,12 +580,19 @@ impl NavGraph {
             let Some(button_cell) = self.nearest_within(gi.button, GRID * 5.0, 160.0) else {
                 continue;
             };
+            // Inflate the door box by the player's horizontal half-width before testing links: a
+            // link whose centre-line passes just *beside* the door still can't be walked (the
+            // player's 32-wide body clips it), so it must be gated too — otherwise a bot takes the
+            // "around" route onto that link and wedges against the pillar. This is the standard
+            // navmesh trick of growing obstacles by the agent radius.
+            let margin = Vec3::new(PLAYER_HALF_WIDTH, PLAYER_HALF_WIDTH, 0.0);
+            let (lo, hi) = (gi.closed_min - margin, gi.closed_max + margin);
             let hit: Vec<usize> = (0..self.links.len())
                 .filter(|&li| {
                     let link = self.links[li];
                     let p0 = self.cells[link.from as usize].origin;
                     let p1 = self.cells[link.to as usize].origin;
-                    segment_aabb_intersect(p0, p1, gi.closed_min, gi.closed_max)
+                    segment_aabb_intersect(p0, p1, lo, hi)
                 })
                 .collect();
             if hit.is_empty() {
