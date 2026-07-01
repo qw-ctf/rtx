@@ -330,6 +330,19 @@ impl GameState {
 
         self.check_powerups(e);
         self.w_weapon_frame(e);
+
+        // Bots: publish the full view angles through `v.angles`. When the engine networks a
+        // player it sends their `lastcmd` view angles (what a tracking spectator's camera and
+        // other clients' body-pitch rendering use) — but for bot clients FTE nulls `lastcmd`
+        // (sv_ents.c `if (isbot) clst.lastcmd = NULL`) and falls back to `v.angles`, which
+        // SV_RunCmd re-derives every tick as the model's -pitch/3 — so a spectated bot looked
+        // nearly level while its rockets flew up/down. PostThink runs after that derivation and
+        // before the frame is sent, so writing the real view here makes the fallback carry
+        // exactly what a human's lastcmd would (remote clients re-derive body pitch themselves).
+        if self.entities[e].bot.is_bot {
+            let v = &mut self.entities[e].v;
+            v.angles = Vec3::new(v.v_angle.x, v.v_angle.y, 0.0);
+        }
     }
 
     /// `GAME_CLIENT_COMMAND` — handle a client console command; returns whether we consumed
