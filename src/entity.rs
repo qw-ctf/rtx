@@ -517,6 +517,24 @@ pub struct BotState {
     /// Per-frame toggle, flipped each tick, used to *pulse* buttons that QW only acts on at a
     /// press edge (the respawn key, which needs a release between presses).
     pub pulse: bool,
+    /// Smoothed view state: a critically damped spring drives `aim` (current view angles, seeded
+    /// from `v_angle`) toward the frame's look target with angular velocity `aim_vel` (deg/s), so
+    /// a spectated bot turns like a mouse-controlled human — fast proportional flicks, smooth
+    /// settle, no per-frame snapping. Spring stiffness scales with skill, so low-skill bots also
+    /// track moving targets more slowly.
+    pub aim: Vec3,
+    pub aim_vel: Vec3,
+    /// Drifting aim error (degrees, x=pitch y=yaw): wanders smoothly toward `aim_err_target`,
+    /// which is resampled at `aim_err_until` — misses sweep past the target and drift back rather
+    /// than buzz (per-frame white noise reads as jitter). Magnitude scales inversely with skill.
+    pub aim_err: Vec3,
+    pub aim_err_target: Vec3,
+    pub aim_err_until: f32,
+    /// Where the combat enemy was last actually visible, and when. While line of sight is briefly
+    /// lost the bot *holds this angle* (like a player holding a corner) instead of snapping back
+    /// to its navigation view.
+    pub enemy_seen_at: Vec3,
+    pub enemy_seen_time: f32,
     /// Audience-wander destination (a round mode's stands) and the next time to pick a new one.
     /// Only used while the mode marks this bot as an audience/spectator; zero otherwise.
     pub wander_target: Vec3,

@@ -464,6 +464,14 @@ fn run_bot(game: &mut GameState, e: EntId) {
     } else {
         (target_origin, None, true)
     };
+    // Where the *eyes* go while navigating: a couple of legs ahead of the feet (or the final
+    // target when the route is short), so the view sweeps down the corridor instead of snapping
+    // to every 32u grid cell the bot steps through. Steering still uses `waypoint`.
+    let look_point = if bot.route_pos + 2 < bot.route.len() {
+        graph.cell_origin(graph.link_target(bot.route[bot.route_pos + 2]))
+    } else {
+        target_origin
+    };
 
     // Stuck detection.
     let mut force_jump = false;
@@ -481,6 +489,20 @@ fn run_bot(game: &mut GameState, e: EntId) {
     let dist = to_wp.length();
     let yaw = to_wp.y.atan2(to_wp.x).to_degrees();
     let mut angles = Vec3::new(0.0, yaw, 0.0);
+
+    // Nav look target: eyes on the look-ahead point down the corridor (combat/gate may override
+    // below). Falls back to the steering yaw when the look point is on top of us.
+    let eye = origin + Vec3::new(0.0, 0.0, 22.0);
+    let to_look = look_point - eye;
+    let mut look = if to_look.xy().length() > 8.0 {
+        Vec3::new(
+            -to_look.z.atan2(to_look.xy().length()).to_degrees(),
+            to_look.y.atan2(to_look.x).to_degrees(),
+            0.0,
+        )
+    } else {
+        angles
+    };
 
     let (mut forward, mut side, mut buttons, mut impulse) = (0, 0, 0, 0);
     // Politely stop short only when tailing a human; when fetching an item, walk right onto it so
@@ -508,11 +530,11 @@ fn run_bot(game: &mut GameState, e: EntId) {
         let at_button = bot.route_pos >= bot.route.len()
             || (origin.xy() - graph.cell_origin(g.button_cell).xy()).length() < 40.0;
         if at_button {
-            let eye = origin + Vec3::new(0.0, 0.0, 22.0);
             let d = g.aim - eye;
             let yaw = d.y.atan2(d.x).to_degrees();
             let pitch = -d.z.atan2(d.xy().length()).to_degrees();
             angles = Vec3::new(pitch, yaw, 0.0);
+            look = angles; // the button needs a precise aim; the spring settles on it while parked
             buttons &= !BUTTON_JUMP;
             if g.shoot {
                 // Switch to the shotgun and fire at the activator. If it's so high above us that
@@ -540,15 +562,52 @@ fn run_bot(game: &mut GameState, e: EntId) {
         }
     }
 
-    // Combat overlay: once the navmesh has produced movement toward the enemy, let the combat
-    // layer take over aim/weapon/fire/dodge as soon as we can see them (it no-ops without LOS,
-    // leaving the navigation above to keep closing the distance).
+    // The frame's movement as a world-space velocity, decoupled from the view: smoothing the eyes
+    // below can't change where the bot goes, and combat can steer independently of its aim.
+    let (nf, nr) = angle_vectors(angles);
+    let mut move_world = nf * forward as f32 + nr * side as f32;
+
+    // Combat overlay: with an enemy in sight, the combat layer picks the look (live aim with a
+    // drifting error) and its own movement; having *just lost* sight it holds the angle where the
+    // enemy vanished while navigation keeps driving; otherwise navigation's look/move stand.
     if let Some(en) = enemy {
         crate::bot_combat::engage(
-            game, e, en, origin, now, &mut angles, &mut forward, &mut side, &mut buttons,
-            &mut impulse,
+            game, e, en, origin, now, &mut look, &mut move_world, &mut buttons, &mut impulse,
         );
     }
+
+    // Aim spring: drive the view toward `look` with a critically damped spring (position +
+    // angular-velocity state), so the aim moves like a mouse — fast proportional flicks that
+    // settle smoothly, never per-frame snaps. Stiffness scales with skill: low-skill bots swing
+    // onto targets visibly slower. The movement is then re-projected onto the smoothed view
+    // (orthonormal, so the world velocity — where the bot actually goes — is preserved exactly).
+    let view = {
+        let dt = game.globals.frametime.clamp(0.001, 0.05);
+        let skill = host.cvar(c"rtx_bot_skill").clamp(0.0, 7.0);
+        let omega = 6.0 + skill * 2.0; // spring stiffness (1/s): sluggish → pro-snappy
+        let b = &mut game.entities[e].bot;
+        if b.aim == Vec3::ZERO {
+            b.aim = v_angle; // seed from the real view so the first frame doesn't snap from zero
+        }
+        let spring = |a: f32, v: f32, target: f32| {
+            let mut d = (target - a) % 360.0;
+            if d > 180.0 {
+                d -= 360.0;
+            } else if d < -180.0 {
+                d += 360.0;
+            }
+            let v = v + (omega * omega * d - 2.0 * omega * v) * dt;
+            (wrap180(a + v * dt), v)
+        };
+        let (pitch, pv) = spring(b.aim.x, b.aim_vel.x, look.x);
+        let (yaw, yv) = spring(b.aim.y, b.aim_vel.y, look.y);
+        b.aim = Vec3::new(pitch, yaw, 0.0);
+        b.aim_vel = Vec3::new(pv, yv, 0.0);
+        b.aim
+    };
+    let (vf, vr) = angle_vectors(view);
+    let forward = vf.dot(move_world).round() as i32;
+    let side = vr.dot(move_world).round() as i32;
 
     // Combat/gate diagnostics: what the bot is chasing and whether it's stuck at a gate. Enable
     // with `rtx_bot_debug 1` (conprint shows without `developer`).
@@ -563,7 +622,18 @@ fn run_bot(game: &mut GameState, e: EntId) {
         )));
     }
 
-    host.set_bot_cmd(client, msec, angles, forward, side, 0, buttons, impulse);
+    host.set_bot_cmd(client, msec, view, forward, side, 0, buttons, impulse);
+}
+
+/// Wrap an angle into (-180, 180].
+fn wrap180(a: f32) -> f32 {
+    let mut a = a % 360.0;
+    if a > 180.0 {
+        a -= 360.0;
+    } else if a < -180.0 {
+        a += 360.0;
+    }
+    a
 }
 
 /// The first shut gate whose blocked cell lies on the remaining route, if any.

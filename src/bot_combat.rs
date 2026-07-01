@@ -75,9 +75,24 @@ fn choose_weapon(g: &GameState, e: EntId, dist: f32) -> WeaponChoice {
     WeaponChoice { impulse: 1, weapon: Weapon::Axe, projectile_speed: 0.0 }
 }
 
-/// Overlay combat onto the already-computed movement command. Only takes over once the bot has a
-/// clear line of sight to `enemy`; before that it leaves the navmesh command alone so the bot
-/// keeps pathing toward its target.
+/// How long after losing sight of the enemy the bot keeps *holding the angle* where they vanished
+/// (like a player holding a corner) before its eyes fall back to the navigation view.
+const HOLD_ANGLE_TIME: f32 = 2.0;
+
+/// View angles (pitch, yaw, 0) from `eye` toward `point`.
+fn angles_to(eye: Vec3, point: Vec3) -> Vec3 {
+    let d = point - eye;
+    let yaw = d.y.atan2(d.x).to_degrees();
+    let pitch = -d.z.atan2(d.xy().length().max(1.0)).to_degrees();
+    Vec3::new(pitch, yaw, 0.0)
+}
+
+/// Overlay combat onto the frame's decisions. `look` is the desired view (smoothed downstream by
+/// the aim spring in `bot.rs`); `move_world` is the desired world-space velocity — the two are
+/// independent, so the bot can run one way while looking another. With line of sight it aims
+/// (leading the target, plus a smoothly drifting skill-scaled error), fights for range, and fires;
+/// having *recently* lost sight it holds the angle where the enemy vanished while navigation keeps
+/// it moving; otherwise it leaves the navigation view/movement untouched.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn engage(
     game: &mut GameState,
@@ -85,9 +100,8 @@ pub(crate) fn engage(
     enemy: EntId,
     origin: Vec3,
     now: f32,
-    angles: &mut Vec3,
-    forward: &mut i32,
-    side: &mut i32,
+    look: &mut Vec3,
+    move_world: &mut Vec3,
     buttons: &mut i32,
     impulse: &mut i32,
 ) {
@@ -97,10 +111,18 @@ pub(crate) fn engage(
     let enemy_vel = game.entities[enemy].v.velocity;
 
     // Line of sight? Trace to the enemy's eyes, ignoring ourselves. Clear if we hit the enemy or
-    // nothing at all. Without LOS, leave navigation in charge (no shooting through walls).
+    // nothing at all.
     let tr = game.traceline(my_eye, enemy_eye, false, e);
     let los = tr.ent == enemy || tr.fraction > 0.95;
     if !los {
+        // No shooting through walls; navigation keeps driving the movement. But if we saw the
+        // enemy moments ago, hold the angle where they disappeared instead of snapping the view
+        // back to the route — the human "holding the corner" look, and it kills the nav↔enemy
+        // view flip-flop while line of sight flickers at an edge.
+        let b = &game.entities[e].bot;
+        if b.enemy_seen_time > 0.0 && now - b.enemy_seen_time < HOLD_ANGLE_TIME {
+            *look = angles_to(my_eye, b.enemy_seen_at);
+        }
         return;
     }
 
@@ -123,19 +145,34 @@ pub(crate) fn engage(
         enemy_eye
     };
 
-    // Skill-scaled aim error: higher `rtx_bot_skill` → tighter aim.
+    // Skill-scaled *drifting* aim error: the error wanders smoothly toward a periodically
+    // resampled offset (never a fresh random per frame — white noise reads as jitter on the view).
+    // Misses sweep past the target and drift back, like human tracking error. Pitch error is kept
+    // smaller than yaw (vertical mouse control is steadier). Skill 7 ⇒ error ≈ 0.
     let skill = game.host().cvar(c"rtx_bot_skill").clamp(0.0, 7.0);
     let spread = (7.0 - skill).max(0.0); // half-range, degrees
-    let err_yaw = (game.random() - 0.5) * 2.0 * spread;
-    let err_pitch = (game.random() - 0.5) * 2.0 * spread;
+    let frametime = game.globals.frametime;
+    if now >= game.entities[e].bot.aim_err_until {
+        let (r1, r2, r3) = (game.random(), game.random(), game.random());
+        let b = &mut game.entities[e].bot;
+        b.aim_err_target =
+            Vec3::new((r1 - 0.5) * spread, (r2 - 0.5) * 2.0 * spread, 0.0);
+        b.aim_err_until = now + 0.3 + r3 * 0.3;
+    }
+    let err = {
+        let b = &mut game.entities[e].bot;
+        let t = (4.0 * frametime).min(1.0);
+        b.aim_err = b.aim_err + (b.aim_err_target - b.aim_err) * t;
+        // Remember where the enemy is while we can see them, for the hold-the-angle behavior.
+        b.enemy_seen_at = aim;
+        b.enemy_seen_time = now;
+        b.aim_err
+    };
 
-    let d = aim - my_eye;
-    let yaw = d.y.atan2(d.x).to_degrees() + err_yaw;
-    let pitch = -d.z.atan2(d.xy().length()).to_degrees() + err_pitch;
-    *angles = Vec3::new(pitch, yaw, 0.0);
+    let clean = angles_to(my_eye, aim);
+    *look = Vec3::new(clean.x + err.x, clean.y + err.y, 0.0);
 
-    // Movement in the enemy-facing frame: hold a preferred range and strafe to dodge. Retreat
-    // when hurt.
+    // Movement (world-space): hold a preferred range and strafe to dodge; retreat when hurt.
     let health = game.entities[e].v.health;
     let strafe_sign = if ((now * 0.9) + e.0 as f32).sin() >= 0.0 { 1.0 } else { -1.0 };
     let want_forward = if health < LOW_HEALTH || dist < PREFERRED_RANGE - 100.0 {
@@ -145,8 +182,9 @@ pub(crate) fn engage(
     } else {
         0.0 // hold and strafe
     };
-    *forward = want_forward as i32;
-    *side = (strafe_sign * MOVE_SPEED) as i32;
+    let dir = Vec3::new(to_enemy.x, to_enemy.y, 0.0).normalize_or_zero();
+    let perp = Vec3::new(-dir.y, dir.x, 0.0);
+    *move_world = dir * want_forward + perp * (strafe_sign * MOVE_SPEED);
     *buttons &= !BUTTON_JUMP; // don't bunny-hop while dueling
 
     // Fire: LOS is clear and we're aimed at the enemy. The engine paces shots via

@@ -70,11 +70,13 @@ Frogbot-Rocket-Arena QuakeC, minus its clan-arena team machinery). Two players f
 at a time; everyone else waits in the **audience** (the `info_player_deathmatch` spots — the
 stands) and roams there. Each round the fighters spawn with a
 **full loadout** (all weapons, full ammo, red armour) **inside the arena** (the
-`info_teleport_destination` spots), are invulnerable through a short countdown, then fight. Getting
-killed **drops you to the audience**; the **winner stays** and faces the next challenger pulled
-from the front of the audience queue (losers go to the back), so the arena is always a fresh duel.
-On a plain deathmatch map with no teleport destinations it falls back to DM spawns so the mode
-still runs. Bots play it fully — see below.
+`info_teleport_destination` spots), are invulnerable through a short countdown, then fight. During
+the countdown you can move to position but **can't fire yet** (a screen blink if you try); at
+"FIGHT" weapons go hot. Getting killed **drops you to the audience**; the **winner stays** — kept
+in place and topped back up to full — and faces the next challenger pulled from the front of the
+audience queue (losers go to the back), so the arena is always a fresh duel. On a plain deathmatch
+map with no teleport destinations it falls back to DM spawns so the mode still runs. Bots play it
+fully — see below.
 
 ## Bots
 
@@ -85,7 +87,7 @@ through the same player-move code as humans, so gravity, stepping, and jumps com
 | cvar | default | what it does |
 |------|---------|--------------|
 | `rtx_bots` | `0` | How many bots to keep on the server. The population is reconciled to this count (spawning/removing as needed), leaving room for humans. Bots only spawn once the map's navmesh is built. |
-| `rtx_bot_skill` | `3` | Bot skill (reserved for combat tuning later). |
+| `rtx_bot_skill` | `3` | Bot skill (0–7): tightens aim and speeds how fast a bot turns/tracks. |
 
 In free-for-all each bot pathfinds to the best reachable **item pickup**, or **follows the nearest
 human** when nothing's worth fetching (through doors, off ledges, across jumps, recovering after a
@@ -93,7 +95,9 @@ missed jump). The mode can redirect this brain without touching it: in **Rocket 
 **fight** — they path to the nearest enemy and, once they have line of sight, aim (leading the
 target for rockets), pick a weapon by range, strafe/retreat, and fire — and, when eliminated, roam
 the audience like everyone else. The combat layer (`src/bot_combat.rs`) is generic and reused by
-any mode that hands a bot an enemy; aim tightens with `rtx_bot_skill`.
+any mode that hands a bot an enemy. A bot's view **lerps** toward its target angle rather than
+snapping, so it turns naturally when spectated; both the turn/track speed and aim tightness scale
+with `rtx_bot_skill` (a low-skill bot visibly swings onto a target more slowly).
 
 ## Building
 
