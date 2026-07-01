@@ -197,11 +197,18 @@ impl GameState {
             ent.v.items = ent.v.items.with(Items::GRAPPLE);
             ent.v.weapon = Weapon::Grapple;
         }
+        // The active mode has the final say on the loadout (e.g. Rocket Arena's fixed arsenal —
+        // rocket launcher active, no grapple / an audience player's empty hands), so it runs after
+        // the grapple handout and overrides it. FFA leaves the decoded parms + grapple as-is.
+        let mode = self.mode;
+        mode.apply_loadout(self, player);
         self.w_set_current_ammo(player);
 
 
 
-        let spot = self.select_spawn_point();
+        // The mode chooses the spawn point (arena vs. audience in Rocket Arena; a plain DM spawn
+        // otherwise).
+        let spot = mode.select_spawn(self, player);
         let origin = self.entities[spot].v.origin + Vec3::new(0.0, 0.0, 1.0);
         let angles = self.entities[spot].v.angles;
         {
@@ -403,6 +410,11 @@ impl GameState {
             v.button0 = 0.0;
             v.button1 = 0.0;
             v.button2 = 0.0;
+        }
+        // A mode may drive respawns itself (e.g. hold a dead player until the next round).
+        let mode = self.mode;
+        if !mode.allow_respawn(self, e) {
+            return;
         }
         self.respawn(e);
     }
@@ -833,15 +845,32 @@ impl GameState {
 
     /// `SelectSpawnPoint` — pick a deathmatch spawn (preferring unoccupied ones), falling
     /// back to the single-player start.
-    fn select_spawn_point(&mut self) -> EntId {
-        let spots: Vec<EntId> = self.find_by_classname("info_player_deathmatch").collect();
-        if spots.is_empty() {
-            return self
-                .find_by_classname("info_player_start")
-                .next()
-                .unwrap_or(EntId::WORLD);
+    /// Standard deathmatch spawn: a free `info_player_deathmatch`, falling back to
+    /// `info_player_start` when a map has none.
+    pub(crate) fn select_spawn_point(&mut self) -> EntId {
+        let spot = self.pick_spawn_of("info_player_deathmatch");
+        if spot != EntId::WORLD {
+            return spot;
         }
+        self.find_by_classname("info_player_start")
+            .next()
+            .unwrap_or(EntId::WORLD)
+    }
 
+    /// Pick a spawn point of a specific classname (e.g. `info_teleport_destination` for arena
+    /// fighters), preferring an unoccupied one. `EntId::WORLD` if the map has none — the caller
+    /// decides the fallback.
+    pub(crate) fn select_spawn_point_of(&mut self, classname: &str) -> EntId {
+        self.pick_spawn_of(classname)
+    }
+
+    /// Shared spawn-point picker: a random unoccupied entity of `classname` (any of them if all
+    /// are occupied), or `EntId::WORLD` if none exist.
+    fn pick_spawn_of(&mut self, classname: &str) -> EntId {
+        let spots: Vec<EntId> = self.find_by_classname(classname).collect();
+        if spots.is_empty() {
+            return EntId::WORLD;
+        }
         let free: Vec<EntId> = spots
             .iter()
             .copied()

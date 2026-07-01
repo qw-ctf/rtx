@@ -53,6 +53,12 @@ pub fn worldspawn(game: &mut GameState) {
     host.lightstyle(10, c"mmamammmmammamamaaamammma"); // 10 FLUORESCENT FLICKER
     host.lightstyle(11, c"abcdefghijklmnopqrrqponmlkjihgfedcba"); // 11 SLOW PULSE NOT FADE TO BLACK
     host.lightstyle(63, c"a"); // 63 testing
+
+    // Pick the game mode from `rtx_mode` now, and re-sync it every frame in `start_frame`.
+    game.refresh_mode();
+    // Fresh map = fresh match: reset any round state (refresh_mode only resets on a mode change,
+    // so a same-mode map change would otherwise carry a stale mid-round state over).
+    game.arena = crate::mode::ArenaState::default();
 }
 
 /// `StartFrame` — runs once per server frame. Refreshes match cvars and the frame counter.
@@ -63,4 +69,6 @@ pub fn start_frame(game: &mut GameState) {
     game.level.teamplay = host.cvar(c"teamplay") as i32;
     game.level.deathmatch = host.cvar(c"deathmatch") as i32;
     game.level.framecount += 1;
+    // Keep the active game mode in sync with `rtx_mode` (read live like the other rtx cvars).
+    game.refresh_mode();
 }

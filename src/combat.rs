@@ -64,6 +64,10 @@ impl GameState {
 
         self.client_obituary(targ, attacker);
 
+        // Notify the mode (round-based modes track eliminations / round end here).
+        let mode = self.mode;
+        mode.on_death(self, targ, attacker);
+
         {
             let t = &mut self.entities[targ];
             t.v.takedamage = TakeDamage::No.as_f32();
@@ -82,6 +86,12 @@ impl GameState {
         mut damage: f32,
     ) {
         if self.entities[targ].v.takedamage == 0.0 {
+            return;
+        }
+        // Mode-level damage gate (Rocket Arena countdown protection / harmless audience). Only
+        // affects players; world objects (doors, grenades) always pass.
+        let mode = self.mode;
+        if !mode.damage_allowed(self, targ) {
             return;
         }
         if self.is_grenade(targ) {

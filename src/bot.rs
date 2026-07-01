@@ -18,6 +18,7 @@ use glam::{Vec3, Vec3Swizzles};
 use crate::defs::{Bits, Flags, Items, Solid, Weapon};
 use crate::entity::{BotState, EntId};
 use crate::game::{cstring, GameState};
+use crate::mode::BotIntent;
 use crate::navmesh::{LinkKind, NavGraph};
 
 // usercmd button bits.
@@ -212,25 +213,38 @@ fn run_bot(game: &mut GameState, e: EntId) {
 
     let idle = |angles: Vec3| host.set_bot_cmd(client, msec, angles, 0, 0, 0, 0, 0);
 
+    // Ask the active mode for this bot's intent. A round mode (Rocket Arena) returns Fight/Move to
+    // drive combat or audience-roaming; FFA returns None, leaving the generic item/human brain
+    // below in charge. Every mode-specific bot adaptation lives behind this one hook — the rest of
+    // run_bot stays mode-agnostic and reusable.
+    let mode = game.mode;
+    let intent = mode.bot_intent(game, e);
+    if intent.is_some() {
+        game.entities[e].bot.goal_item = 0; // a mode target supersedes any item chase
+    }
+
     // Item goal (P5): re-pick the best reachable pickup on a slow cadence, and drop a chosen item
     // once it's been grabbed (no longer available/respawning soon) so the bot moves on. With no
-    // worthwhile item, fall back to following the nearest human.
-    if now >= game.entities[e].bot.goal_select_time {
-        let pick = game.select_item_goal(e);
-        let (new_item, new_cell) = pick.map_or((0, 0), |(it, c)| (it.0, c));
-        let b = &mut game.entities[e].bot;
-        if new_item != b.goal_item {
-            b.goal_started = now; // restart the watchdog for a new goal
+    // worthwhile item, fall back to following the nearest human. Skipped when a mode supplies an
+    // intent (it chooses its own target below).
+    if intent.is_none() {
+        if now >= game.entities[e].bot.goal_select_time {
+            let pick = game.select_item_goal(e);
+            let (new_item, new_cell) = pick.map_or((0, 0), |(it, c)| (it.0, c));
+            let b = &mut game.entities[e].bot;
+            if new_item != b.goal_item {
+                b.goal_started = now; // restart the watchdog for a new goal
+            }
+            (b.goal_item, b.goal_item_cell) = (new_item, new_cell);
+            b.goal_select_time = now + GOAL_SELECT_INTERVAL;
         }
-        (b.goal_item, b.goal_item_cell) = (new_item, new_cell);
-        b.goal_select_time = now + GOAL_SELECT_INTERVAL;
-    }
-    if game.entities[e].bot.goal_item != 0
-        && !game.item_goal_valid(e, EntId(game.entities[e].bot.goal_item), now)
-    {
-        let b = &mut game.entities[e].bot;
-        b.goal_item = 0;
-        b.goal_select_time = now; // re-pick next frame
+        if game.entities[e].bot.goal_item != 0
+            && !game.item_goal_valid(e, EntId(game.entities[e].bot.goal_item), now)
+        {
+            let b = &mut game.entities[e].bot;
+            b.goal_item = 0;
+            b.goal_select_time = now; // re-pick next frame
+        }
     }
 
     // Opt-in diagnostics (`rtx_bot_debug 1`): one throttled line per bot — what it wants, how far,
@@ -252,16 +266,29 @@ fn run_bot(game: &mut GameState, e: EntId) {
         host.conprint(&msg); // conprint always shows; dprint needs `developer 1`
     }
 
-    let chasing = game.entities[e].bot.goal_item != 0;
-    // Where we're headed: the chosen item, or the nearest human. Neither → idle.
-    let (target_origin, item_cell) = if chasing {
-        let it = EntId(game.entities[e].bot.goal_item);
-        (game.entities[it].v.origin, Some(game.entities[e].bot.goal_item_cell))
-    } else if let Some(h) = nearest_human(game, e) {
-        (game.entities[h].v.origin, None)
+    // The mode's intent (fight an enemy / roam to a spot), if any, and whether we're on an item.
+    let enemy = if let Some(BotIntent::Fight(en)) = intent {
+        Some(en)
     } else {
-        idle(v_angle);
-        return;
+        None
+    };
+    let chasing = intent.is_none() && game.entities[e].bot.goal_item != 0;
+    // Where we're headed: the mode's target, the chosen item, or the nearest human. None → idle.
+    let (target_origin, item_cell) = match intent {
+        Some(BotIntent::Fight(en)) => (game.entities[en].v.origin, None),
+        Some(BotIntent::Move(pos)) => (pos, None),
+        None if chasing => {
+            let it = EntId(game.entities[e].bot.goal_item);
+            (game.entities[it].v.origin, Some(game.entities[e].bot.goal_item_cell))
+        }
+        None => {
+            if let Some(h) = nearest_human(game, e) {
+                (game.entities[h].v.origin, None)
+            } else {
+                idle(v_angle);
+                return;
+            }
+        }
     };
 
     // Goal watchdog: while chasing an item and *not* already detouring to open a gate, give up on
@@ -461,6 +488,16 @@ fn run_bot(game: &mut GameState, e: EntId) {
                 side = (right.dot(dir) * MOVE_SPEED) as i32;
             }
         }
+    }
+
+    // Combat overlay: once the navmesh has produced movement toward the enemy, let the combat
+    // layer take over aim/weapon/fire/dodge as soon as we can see them (it no-ops without LOS,
+    // leaving the navigation above to keep closing the distance).
+    if let Some(en) = enemy {
+        crate::bot_combat::engage(
+            game, e, en, origin, now, &mut angles, &mut forward, &mut side, &mut buttons,
+            &mut impulse,
+        );
     }
 
     host.set_bot_cmd(client, msec, angles, forward, side, 0, buttons, impulse);

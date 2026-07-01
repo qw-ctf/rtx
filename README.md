@@ -52,6 +52,30 @@ It reels server-side too, so it shows the same one-frame prediction pop as the m
 features above. The hook's models and viewmodel must be in the gamedir:
 `progs/{star,bit,v_star}.mdl`.
 
+## Game modes
+
+The game mode is selected with **`rtx_mode`**, read at map load. Modes are pluggable: each one
+overrides only the policy it changes — **ruleset** (round/damage/respawn rules), **spawns**,
+**loadout**, and the **bot brain** — behind a small `GameMode` trait (`src/mode/`). Free-for-all
+is just the baseline mode, so adding a mode doesn't touch the generic gameplay or bot code.
+
+| cvar | default | what it does |
+|------|---------|--------------|
+| `rtx_mode` | `ffa` | `ffa` = free-for-all deathmatch (stock behaviour). `ra` = Rocket Arena. |
+| `rtx_ra_countdown` | `3` | Rocket Arena: seconds of spawn-protected countdown before "FIGHT". |
+| `rtx_ra_lightning_gun` | `0` | Rocket Arena: include the lightning gun in the arena arsenal (`0` leaves it out). |
+
+**`ra` — Rocket Arena.** Round-based 1v1 duels following the classic arena loop (ported from the
+Frogbot-Rocket-Arena QuakeC, minus its clan-arena team machinery). Two players fight in the arena
+at a time; everyone else waits in the **audience** (the `info_player_deathmatch` spots — the
+stands) and roams there. Each round the fighters spawn with a
+**full loadout** (all weapons, full ammo, red armour) **inside the arena** (the
+`info_teleport_destination` spots), are invulnerable through a short countdown, then fight. Getting
+killed **drops you to the audience**; the **winner stays** and faces the next challenger pulled
+from the front of the audience queue (losers go to the back), so the arena is always a fresh duel.
+On a plain deathmatch map with no teleport destinations it falls back to DM spawns so the mode
+still runs. Bots play it fully — see below.
+
 ## Bots
 
 Navmesh-driven bots that need **no per-map waypoint files** — the navmesh is generated from the
@@ -63,9 +87,13 @@ through the same player-move code as humans, so gravity, stepping, and jumps com
 | `rtx_bots` | `0` | How many bots to keep on the server. The population is reconciled to this count (spawning/removing as needed), leaving room for humans. Bots only spawn once the map's navmesh is built. |
 | `rtx_bot_skill` | `3` | Bot skill (reserved for combat tuning later). |
 
-The current behaviour is deliberately minimal — each bot pathfinds to and **follows the nearest
-human** around the map (through doors, off ledges, across jumps), recovering after a missed jump.
-There's **no shooting yet**; goal-seeking and combat are planned next.
+In free-for-all each bot pathfinds to the best reachable **item pickup**, or **follows the nearest
+human** when nothing's worth fetching (through doors, off ledges, across jumps, recovering after a
+missed jump). The mode can redirect this brain without touching it: in **Rocket Arena** bots
+**fight** — they path to the nearest enemy and, once they have line of sight, aim (leading the
+target for rockets), pick a weapon by range, strafe/retreat, and fire — and, when eliminated, roam
+the audience like everyone else. The combat layer (`src/bot_combat.rs`) is generic and reused by
+any mode that hands a bot an enemy; aim tightens with `rtx_bot_skill`.
 
 ## Building
 

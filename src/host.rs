@@ -10,6 +10,7 @@
 //! `float`.
 
 use core::ffi::CStr;
+use std::ffi::CString;
 
 use glam::Vec3;
 
@@ -212,6 +213,20 @@ impl HostApi {
     /// `G_CVAR_SET_FLOAT` — set a cvar from a float.
     pub fn cvar_set_float(&self, name: &CStr, value: f32) {
         unsafe { (self.syscall)(B::CvarSetFloat as isize, name.as_ptr() as isize, pf(value)) };
+    }
+
+    /// Register a default: set the cvar only if it isn't already set. `GAME_INIT` runs on every
+    /// map load, so a plain `cvar_set` there would overwrite a value the user put in `server.cfg`
+    /// (or a `set` before `map`) each time — this preserves an existing value and only seeds the
+    /// default when the cvar is unset (empty string). Generic over the value type so both string
+    /// and numeric defaults read the same, e.g. `cvar_default("rtx_mode", "ffa")` and
+    /// `cvar_default("rtx_bots", 0.0)`.
+    pub fn cvar_default<V: CvarValue>(&self, name: &str, default: V) {
+        let name = CString::new(name).unwrap_or_default();
+        let mut buf = [0u8; 64];
+        if self.cvar_string(&name, &mut buf).is_empty() {
+            default.set_cvar(self, &name);
+        }
     }
 
     /// `G_PRECACHE_MODEL`.
@@ -729,6 +744,30 @@ impl HostApi {
             )
         } != 0;
         (more, cstr_from_buf(buf))
+    }
+}
+
+/// A value that can seed a cvar default via [`HostApi::cvar_default`] — implemented for numbers
+/// (`f32`/`f64`, so plain `0.0` literals work) and `&str`, so one `cvar_default` handles both.
+pub trait CvarValue {
+    fn set_cvar(self, host: &HostApi, name: &CStr);
+}
+
+impl CvarValue for f32 {
+    fn set_cvar(self, host: &HostApi, name: &CStr) {
+        host.cvar_set_float(name, self);
+    }
+}
+
+impl CvarValue for f64 {
+    fn set_cvar(self, host: &HostApi, name: &CStr) {
+        host.cvar_set_float(name, self as f32);
+    }
+}
+
+impl CvarValue for &str {
+    fn set_cvar(self, host: &HostApi, name: &CStr) {
+        host.cvar_set(name, &CString::new(self).unwrap_or_default());
     }
 }
 

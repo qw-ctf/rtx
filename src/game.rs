@@ -114,6 +114,12 @@ pub struct GameState {
     game_data: GameData,
     /// Match-wide state.
     pub level: Level,
+    /// The active game mode (`rtx_mode`) — a stateless behavior descriptor. Reselected each map
+    /// load in `worldspawn`; defaults to FFA. See [`crate::mode`].
+    pub mode: &'static dyn crate::mode::GameMode,
+    /// Rocket-Arena round-state machine. Only meaningful while `mode` is the arena; otherwise
+    /// left at its default. See [`crate::mode::ArenaState`].
+    pub arena: crate::mode::ArenaState,
     /// QuakeC transient globals threaded through target-firing and damage (`activator`,
     /// `damage_attacker`, `damage_inflictor`). Set at the top of the relevant callbacks.
     pub activator: EntId,
@@ -162,6 +168,8 @@ impl GameState {
             fields,
             game_data,
             level: Level::default(),
+            mode: crate::mode::default_mode(),
+            arena: crate::mode::ArenaState::default(),
             activator: EntId::WORLD,
             damage_attacker: EntId::WORLD,
             damage_inflictor: EntId::WORLD,
@@ -409,38 +417,48 @@ impl GameState {
         // matching how ktx re-runs `G_InitExtensions` each `GAME_INIT`.
         self.ext_fields = ext_field::ExtFields::default();
 
+        // rtx tunables below use `cvar_default*`, not `cvar_set*`: `GAME_INIT` runs on every map
+        // load, so a forced set would wipe any value the user put in `server.cfg` (or a `set`
+        // before `map`) each time. Registering the default only when the cvar is unset preserves
+        // the user's value while still seeding a first-run default.
+
         // Mid-air double jump, on by default (set `rtx_doublejump 0` to disable).
-        self.host
-            .cvar_set_float(cstr(b"rtx_doublejump\0"), 1.0);
+        self.host.cvar_default("rtx_doublejump", 1.0);
 
         // Wall jump (kick off a wall you jump into), on by default (`rtx_walljump 0` to disable).
-        self.host
-            .cvar_set_float(cstr(b"rtx_walljump\0"), 1.0);
+        self.host.cvar_default("rtx_walljump", 1.0);
 
         // Elevator jump: a rising lift boosts your jump by `lift_speed * rtx_elevator_jump`.
         // It's a multiplier (0 disables, 1 = add the lift's true speed, 2 = double it, …).
-        self.host
-            .cvar_set_float(cstr(b"rtx_elevator_jump\0"), 2.0);
+        self.host.cvar_default("rtx_elevator_jump", 2.0);
 
         // Shoot live grenades to detonate them early, on by default (`rtx_shootable_grenades 0`
         // to restore classic non-shootable grenades).
-        self.host
-            .cvar_set_float(cstr(b"rtx_shootable_grenades\0"), 1.0);
+        self.host.cvar_default("rtx_shootable_grenades", 1.0);
 
         // Grappling hook (purectf port), on by default — every player spawns with it (impulse 22
         // to select). `rtx_grapple 0` to disable.
-        self.host.cvar_set_float(cstr(b"rtx_grapple\0"), 1.0);
+        self.host.cvar_default("rtx_grapple", 1.0);
         // Hook throw / reel-in speed multipliers (purectf's `localinfo hookspeed`/`hookpull`),
         // each scaling its base `× sv_maxspeed`. Defaults match purectf's shipped server.cfg.
-        self.host.cvar_set_float(cstr(b"rtx_hook_speed\0"), 1.25);
-        self.host.cvar_set_float(cstr(b"rtx_hook_pull\0"), 1.0);
+        self.host.cvar_default("rtx_hook_speed", 1.25);
+        self.host.cvar_default("rtx_hook_pull", 1.0);
+
+        // Game mode: `ffa` (free-for-all deathmatch, the default) or `ra` (Rocket Arena). Read
+        // live each frame. A string cvar. See `crate::mode`.
+        self.host.cvar_default("rtx_mode", "ffa");
+        // Rocket Arena: seconds of spawn-protected countdown before "FIGHT". (The arena is always
+        // a 1v1 duel — the fighter count isn't a cvar.)
+        self.host.cvar_default("rtx_ra_countdown", 3.0);
+        // Rocket Arena: include the lightning gun in the arena arsenal (0 = leave it out).
+        self.host.cvar_default("rtx_ra_lightning_gun", 0.0);
 
         // Navmesh bots: how many to keep on the server (0 = none), and their skill (reserved
         // for combat tuning later). Bots only spawn once a map's navmesh is built.
-        self.host.cvar_set_float(cstr(b"rtx_bots\0"), 0.0);
-        self.host.cvar_set_float(cstr(b"rtx_bot_skill\0"), 3.0);
+        self.host.cvar_default("rtx_bots", 0.0);
+        self.host.cvar_default("rtx_bot_skill", 3.0);
         // Per-bot goal/pickup diagnostics to the server console (0 = off).
-        self.host.cvar_set_float(cstr(b"rtx_bot_debug\0"), 0.0);
+        self.host.cvar_default("rtx_bot_debug", 0.0);
 
         // conprint (not dprint) so it shows without `developer 1` — lets you confirm at a glance
         // that the freshly built module is the one actually loaded.
@@ -663,6 +681,9 @@ impl GameState {
     fn start_frame(&mut self, _level_time: i32, is_bot_frame: i32) -> isize {
         if is_bot_frame == 0 {
             world::start_frame(self);
+            // Drive the active mode's per-frame state machine (round countdown/fight/reset).
+            let mode = self.mode;
+            mode.tick(self);
             crate::bot::manage_population(self);
         } else {
             crate::bot::run_bots(self);

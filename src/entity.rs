@@ -12,6 +12,7 @@ use std::ffi::CString;
 use glam::Vec3;
 
 use crate::abi::{EntVars, STRING_REF_COUNT};
+use crate::mode::ArenaPlayer;
 
 /// A `Copy` index handle into the entity array. Never a borrow, so holding one across a
 /// trap call is fine — this is what keeps the safe API free of aliasing hazards.
@@ -367,6 +368,8 @@ pub struct Entity {
     pub refs: CustomRefs,
     pub combat: CombatState,
     pub item: ItemState,
+    /// Per-player game-mode state (arena role / round wins). Default in FFA; read by round modes.
+    pub arena: ArenaPlayer,
 }
 
 #[derive(Default)]
@@ -514,6 +517,10 @@ pub struct BotState {
     /// Per-frame toggle, flipped each tick, used to *pulse* buttons that QW only acts on at a
     /// press edge (the respawn key, which needs a release between presses).
     pub pulse: bool,
+    /// Audience-wander destination (a round mode's stands) and the next time to pick a new one.
+    /// Only used while the mode marks this bot as an audience/spectator; zero otherwise.
+    pub wander_target: Vec3,
+    pub wander_time: f32,
 }
 
 #[derive(Default)]
