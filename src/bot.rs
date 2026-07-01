@@ -584,7 +584,9 @@ fn run_bot(game: &mut GameState, e: EntId) {
     let view = {
         let dt = game.globals.frametime.clamp(0.001, 0.05);
         let skill = host.cvar(c"rtx_bot_skill").clamp(0.0, 7.0);
-        let omega = 6.0 + skill * 2.0; // spring stiffness (1/s): sluggish → pro-snappy
+        // Spring stiffness (1/s): sluggish → pro-snappy. Shared with the combat feed-forward,
+        // whose lag compensation assumes exactly this spring.
+        let omega = crate::bot_combat::aim_omega(skill);
         let b = &mut game.entities[e].bot;
         if b.aim == Vec3::ZERO {
             b.aim = v_angle; // seed from the real view so the first frame doesn't snap from zero
@@ -626,7 +628,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
 }
 
 /// Wrap an angle into (-180, 180].
-fn wrap180(a: f32) -> f32 {
+pub(crate) fn wrap180(a: f32) -> f32 {
     let mut a = a % 360.0;
     if a > 180.0 {
         a -= 360.0;

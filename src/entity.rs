@@ -535,6 +535,11 @@ pub struct BotState {
     /// to its navigation view.
     pub enemy_seen_at: Vec3,
     pub enemy_seen_time: f32,
+    /// Last frame's clean firing-solution angles and their timestamp, to estimate how fast the
+    /// solution is moving (deg/s). Feeds the aim feed-forward that cancels the spring's tracking
+    /// lag against a strafing target.
+    pub look_prev: Vec3,
+    pub look_prev_time: f32,
     /// Audience-wander destination (a round mode's stands) and the next time to pick a new one.
     /// Only used while the mode marks this bot as an audience/spectator; zero otherwise.
     pub wander_target: Vec3,

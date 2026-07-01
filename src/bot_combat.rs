@@ -15,7 +15,7 @@
 
 use glam::{Vec3, Vec3Swizzles};
 
-use crate::defs::{Bits, Items, Weapon, VEC_VIEW_OFS};
+use crate::defs::{Bits, Flags, Items, Weapon, VEC_VIEW_OFS};
 use crate::entity::EntId;
 use crate::game::GameState;
 
@@ -79,6 +79,41 @@ fn choose_weapon(g: &GameState, e: EntId, dist: f32) -> WeaponChoice {
 /// (like a player holding a corner) before its eyes fall back to the navigation view.
 const HOLD_ANGLE_TIME: f32 = 2.0;
 
+/// Aim-spring stiffness (1/s) for a given skill — the single source shared with the spring
+/// integrator in `bot.rs`, so the feed-forward lag estimate here matches the actual spring.
+pub(crate) fn aim_omega(skill: f32) -> f32 {
+    6.0 + skill * 2.0
+}
+
+/// Time for a projectile of speed `s` fired from the origin to meet a target at relative position
+/// `r` moving at constant velocity `v`: the smallest positive root of `|r + v·t| = s·t`
+/// (quadratic `(v·v − s²)t² + 2(r·v)t + r·r = 0`). This is what makes lead *geometry-aware*:
+/// motion perpendicular to the line of fire lengthens the flight and shifts the aim a lot, motion
+/// straight toward/away barely does. `None` when no positive intercept exists (target outrunning
+/// the projectile).
+fn intercept_time(r: Vec3, v: Vec3, s: f32) -> Option<f32> {
+    let a = v.dot(v) - s * s;
+    let b = 2.0 * r.dot(v);
+    let c = r.dot(r);
+    if a.abs() < 1e-3 {
+        // Degenerate: target speed equals projectile speed — the quadratic collapses to linear.
+        let t = -c / b;
+        return (b.abs() > 1e-6 && t > 0.0).then_some(t);
+    }
+    let disc = b * b - 4.0 * a * c;
+    if disc < 0.0 {
+        return None;
+    }
+    let sq = disc.sqrt();
+    let mut best = f32::INFINITY;
+    for t in [(-b - sq) / (2.0 * a), (-b + sq) / (2.0 * a)] {
+        if t > 0.0 && t < best {
+            best = t;
+        }
+    }
+    best.is_finite().then_some(best)
+}
+
 /// View angles (pitch, yaw, 0) from `eye` toward `point`.
 fn angles_to(eye: Vec3, point: Vec3) -> Vec3 {
     let d = point - eye;
@@ -136,11 +171,32 @@ pub(crate) fn engage(
         *impulse = choice.impulse;
     }
 
-    // Aim point: lead the target for projectiles (constant-velocity prediction), direct for
-    // hitscan.
+    // Predicted velocity for the intercept: a grounded target is led horizontally; an airborne
+    // one with its full velocity (plus the ballistic correction below — gravity isn't in the
+    // linear solve).
+    let grounded = game.entities[enemy].v.flags.has(Flags::ONGROUND);
+    let pred_vel = if grounded {
+        Vec3::new(enemy_vel.x, enemy_vel.y, 0.0)
+    } else {
+        enemy_vel
+    };
+
+    // Aim point. For projectiles, solve the true intercept — where the enemy *will be* when the
+    // rocket arrives — instead of offsetting by the flight time to where they are *now* (which
+    // under-leads exactly when it matters most: motion perpendicular to the line of fire).
     let aim = if choice.projectile_speed > 0.0 {
-        let lead = dist / choice.projectile_speed;
-        enemy_eye + enemy_vel * lead
+        let s = choice.projectile_speed;
+        let t = intercept_time(enemy_eye - my_eye, pred_vel, s).unwrap_or(dist / s);
+        let mut aim = enemy_eye + pred_vel * t;
+        if !grounded {
+            // Ballistic correction: an airborne enemy falls under gravity during the flight.
+            aim.z -= 0.5 * game.host().cvar(c"sv_gravity") * t * t;
+        } else if choice.weapon == Weapon::RocketLauncher && pred_vel.xy().length() > 150.0 {
+            // A grounded strafer is hard to hit directly — aim at the shins so a near miss
+            // becomes floor splash (the human counter to a strafing target).
+            aim.z -= 38.0; // eye (+22 over origin) → shin (−16)
+        }
+        aim
     } else {
         enemy_eye
     };
@@ -170,7 +226,29 @@ pub(crate) fn engage(
     };
 
     let clean = angles_to(my_eye, aim);
-    *look = Vec3::new(clean.x + err.x, clean.y + err.y, 0.0);
+
+    // Feed-forward: the aim spring tracks a moving solution with a steady-state lag of
+    // 2·rate/ω, so on a constant strafer the crosshair would trail forever. Estimate how fast the
+    // solution is moving (from last frame's clean angles) and aim ahead by the expected lag —
+    // skill-scaled, so skill 7 locks onto strafers while low skill keeps trailing them.
+    let ff = {
+        let b = &mut game.entities[e].bot;
+        let dt = now - b.look_prev_time;
+        let rate = if b.look_prev_time > 0.0 && dt > 1e-3 && dt < 0.25 {
+            Vec3::new(
+                (crate::bot::wrap180(clean.x - b.look_prev.x) / dt).clamp(-180.0, 180.0),
+                (crate::bot::wrap180(clean.y - b.look_prev.y) / dt).clamp(-180.0, 180.0),
+                0.0,
+            )
+        } else {
+            Vec3::ZERO // stale/first sample (just acquired the target) — no estimate yet
+        };
+        b.look_prev = clean;
+        b.look_prev_time = now;
+        rate * (2.0 / aim_omega(skill)) * (skill / 7.0)
+    };
+
+    *look = Vec3::new(clean.x + ff.x + err.x, clean.y + ff.y + err.y, 0.0);
 
     // Movement (world-space): hold a preferred range and strafe to dodge; retreat when hurt.
     let health = game.entities[e].v.health;
@@ -187,7 +265,50 @@ pub(crate) fn engage(
     *move_world = dir * want_forward + perp * (strafe_sign * MOVE_SPEED);
     *buttons &= !BUTTON_JUMP; // don't bunny-hop while dueling
 
-    // Fire: LOS is clear and we're aimed at the enemy. The engine paces shots via
-    // `attack_finished`, so holding the button each frame fires at the weapon's rate.
-    *buttons |= BUTTON_ATTACK;
+    // Fire only when the crosshair is on the spot. The shot leaves along the *smoothed* view
+    // (`bot.aim`, last frame's spring output) — firing every frame would put rockets wherever the
+    // lagging view happens to point, i.e. behind a strafer no matter how good the intercept is.
+    // Humans fire when the crosshair reaches the target; the cone is weapon-based plus low-skill
+    // leniency (a low-skill bot fires looser and misses, rather than never firing).
+    let view = game.entities[e].bot.aim;
+    let base_cone = match choice.weapon {
+        Weapon::Lightning => 2.5,
+        Weapon::RocketLauncher => 4.0,
+        _ => 5.0,
+    };
+    let cone = base_cone + (7.0 - skill);
+    let dp = crate::bot::wrap180(view.x - clean.x);
+    let dy = crate::bot::wrap180(view.y - clean.y);
+    let on_target = view == Vec3::ZERO || (dp * dp + dy * dy).sqrt() <= cone;
+    if on_target {
+        // The engine paces shots via `attack_finished`; holding fire shoots at the weapon's rate.
+        *buttons |= BUTTON_ATTACK;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intercept_leads_perpendicular_motion() {
+        // Strafer at 400u moving 320 ups perpendicular to the line of fire, rocket at 1000 ups:
+        // the true intercept takes longer than the naive dist/speed = 0.4s, and the solution must
+        // sit exactly on the projectile sphere |r + v·t| = s·t.
+        let r = Vec3::new(400.0, 0.0, 0.0);
+        let v = Vec3::new(0.0, 320.0, 0.0);
+        let s = 1000.0;
+        let t = intercept_time(r, v, s).expect("intercept exists");
+        assert!(t > 0.4, "perpendicular motion must lengthen the flight (naive 0.4), got {t}");
+        let miss = ((r + v * t).length() - s * t).abs();
+        assert!(miss < 0.1, "intercept not on the projectile sphere: off by {miss}");
+
+        // Radial motion is the near-no-op case: running straight away at 320 ups gives the exact
+        // closing-speed time 400/(1000-320).
+        let t2 = intercept_time(r, Vec3::new(320.0, 0.0, 0.0), s).unwrap();
+        assert!((t2 - 400.0 / 680.0).abs() < 1e-3, "radial case wrong: {t2}");
+
+        // Outrunnable target: no positive intercept.
+        assert!(intercept_time(r, Vec3::new(1100.0, 0.0, 0.0), 1000.0).is_none());
+    }
 }
