@@ -307,6 +307,16 @@ pub struct Entity {
     /// so they live *inside* the entity array, which the engine's offset arithmetic requires.
     pub string_refs: [u64; STRING_REF_COUNT],
 
+    /// `.maxspeed` — the player's ground/air move speed cap. An *extended* entvars field, declared
+    /// in the `fields` table handed to the engine at `GAME_INIT` so the engine addresses it at this
+    /// offset (it must therefore live inside the entity array). mvdsv clamps pmove `wishspeed` to a
+    /// per-client `cl->maxspeed`, which it seeds *from this field* every frame — but only when the
+    /// mod declares a `maxspeed` field. A bot's `cl->maxspeed` is otherwise left at `0` by
+    /// `PF2_Add_Bot` (it never runs the normal spawn's initializer), which caps its move speed to
+    /// zero: the bot can jump but not walk. Declaring this field and setting it on spawn is how the
+    /// engine's sync gets a sane cap onto every client, bots included. Set in `put_client_in_server`.
+    pub maxspeed: f32,
+
     // --- private tail: engine never addresses these ---
     /// Whether this slot is currently a live entity.
     pub in_use: bool,

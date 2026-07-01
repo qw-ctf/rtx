@@ -236,6 +236,12 @@ impl Field {
         ofs: 0,
         type_: 0,
     };
+
+    /// Declare an extended entity field by name, byte offset from the entity base, and type —
+    /// so the engine writes/reads it at our chosen location (e.g. the player `maxspeed` cap).
+    pub fn new(name: &'static core::ffi::CStr, ofs: i32, ty: FieldType) -> Field {
+        Field { name: name.as_ptr(), ofs, type_: ty as i32 }
+    }
 }
 
 /// `gameData_t` from `g_public.h` — returned (by pointer) from `GAME_INIT`. The engine

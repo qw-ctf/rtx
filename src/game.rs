@@ -15,7 +15,8 @@ use glam::Vec3;
 
 use crate::assets::{Model, Sound};
 use crate::abi::{
-    Field, GameData, GlobalVars, STRING_REF_COUNT, STRING_REF_NETNAME, STRING_REF_WEAPONMODEL,
+    Field, FieldType, GameData, GlobalVars, STRING_REF_COUNT, STRING_REF_NETNAME,
+    STRING_REF_WEAPONMODEL,
 };
 use crate::{defs, ext_field};
 use crate::entity::{EntId, Entities, Entity};
@@ -106,8 +107,8 @@ pub struct GameState {
     /// The shared globals block. Owned here to keep the buffer alive at a stable address;
     /// the engine also accesses it through `game_data.global`.
     pub(crate) globals: Box<GlobalVars>,
-    /// Custom-field table handed to the engine (terminator-only for now). Owned for
-    /// lifetime; accessed by the engine through `game_data.fields`.
+    /// Custom-field table handed to the engine (the extended `maxspeed` field, plus the
+    /// terminator). Owned for lifetime; accessed by the engine through `game_data.fields`.
     #[allow(dead_code)]
     fields: Box<[Field]>,
     /// The handshake reply; its `ents`/`global`/`fields` point into the boxes above.
@@ -148,7 +149,18 @@ impl GameState {
         let mut entities = Entities::new(MAX_EDICTS);
         let host = HostApi::new(syscall, entities.as_mut_ptr());
         let mut globals = Box::new(GlobalVars::default());
-        let fields: Box<[Field]> = Box::new([Field::TERMINATOR]);
+        // Declare the extended `maxspeed` field so the engine can seed each client's move-speed
+        // cap from it (required for bots to walk under mvdsv, which never initializes a bot's cap
+        // otherwise; set on spawn in `put_client_in_server`). `ofs` is the byte offset from the
+        // entity base.
+        let fields: Box<[Field]> = Box::new([
+            Field::new(
+                c"maxspeed",
+                core::mem::offset_of!(Entity, maxspeed) as i32,
+                FieldType::Float,
+            ),
+            Field::TERMINATOR,
+        ]);
 
         // Point the handshake struct at the stable heap buffers. These pointers survive
         // `self` being moved into the OnceLock because the Box *contents* don't move.

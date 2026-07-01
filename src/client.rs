@@ -179,9 +179,17 @@ impl GameState {
     /// `PutClientInServer` — set up (or respawn) the player entity at a spawn point.
     pub(crate) fn put_client_in_server(&mut self, player: EntId) {
         let time = self.globals.time;
+        // The move-speed cap the engine seeds each client's pmove clamp from (via the declared
+        // `maxspeed` field). Standard `sv_maxspeed` is 320; fall back to it if the cvar reads as
+        // unset so a client is never accidentally pinned to a zero cap.
+        let maxspeed = {
+            let v = self.host.cvar(c"sv_maxspeed");
+            if v > 0.0 { v } else { 320.0 }
+        };
         {
             let ent = &mut self.entities[player];
             ent.in_use = true;
+            ent.maxspeed = maxspeed;
             ent.classname = Some("player".into());
             ent.v.health = 100.0;
             ent.v.takedamage = TakeDamage::Aim.as_f32();
