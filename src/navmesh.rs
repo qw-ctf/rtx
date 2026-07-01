@@ -343,6 +343,54 @@ impl NavGraph {
         None
     }
 
+    /// Dijkstra cost-flood from `start`: the travel-time cost to reach every cell (`INFINITY`
+    /// for unreachable ones). One pass answers "how far is each item?" for goal selection, far
+    /// cheaper than an A* per candidate. Indexed by [`CellId`].
+    pub fn costs_from(&self, start: CellId) -> Vec<f32> {
+        use std::cmp::Ordering;
+        use std::collections::BinaryHeap;
+
+        struct Node {
+            g: f32,
+            cell: CellId,
+        }
+        impl PartialEq for Node {
+            fn eq(&self, o: &Self) -> bool {
+                self.g == o.g
+            }
+        }
+        impl Eq for Node {}
+        impl PartialOrd for Node {
+            fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+                Some(self.cmp(o))
+            }
+        }
+        impl Ord for Node {
+            fn cmp(&self, o: &Self) -> Ordering {
+                o.g.partial_cmp(&self.g).unwrap_or(Ordering::Equal) // min-heap on g
+            }
+        }
+
+        let mut cost = vec![f32::INFINITY; self.cells.len()];
+        let mut heap = BinaryHeap::new();
+        cost[start as usize] = 0.0;
+        heap.push(Node { g: 0.0, cell: start });
+        while let Some(Node { g, cell }) = heap.pop() {
+            if g > cost[cell as usize] {
+                continue; // a cheaper path already settled this cell
+            }
+            for &li in &self.adjacency[cell as usize] {
+                let link = self.links[li as usize];
+                let ng = g + link.cost;
+                if ng < cost[link.to as usize] {
+                    cost[link.to as usize] = ng;
+                    heap.push(Node { g: ng, cell: link.to });
+                }
+            }
+        }
+        cost
+    }
+
     /// Walk `came_from` link indices back from `goal` to `start` into a forward link route.
     fn reconstruct(&self, came_from: &[u32], start: CellId, goal: CellId) -> Vec<u32> {
         let mut route = Vec::new();
@@ -695,6 +743,10 @@ pub struct NavState {
     /// Whether a build has been attempted for this map (so a failed BSP read doesn't retry
     /// every frame). Reset when a new map loads.
     pub attempted: bool,
+    /// Static catalog of item-goal pickups: `(entity index, nearest cell)`. Built once with the
+    /// graph; items don't move, so their cell is fixed. Live availability and desire are read
+    /// fresh at selection time (see [`crate::bot_goals`]).
+    pub goals: Vec<(u32, CellId)>,
 }
 
 impl NavState {

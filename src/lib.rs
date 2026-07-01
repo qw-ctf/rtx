@@ -20,6 +20,7 @@ mod anim;
 mod assets;
 mod bob;
 mod bot;
+mod bot_goals;
 mod bsp;
 mod buttons;
 mod client;

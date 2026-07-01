@@ -15,7 +15,7 @@
 
 use glam::{Vec3, Vec3Swizzles};
 
-use crate::defs::{Bits, Flags, Weapon};
+use crate::defs::{Bits, Flags, Items, Solid, Weapon};
 use crate::entity::{BotState, EntId};
 use crate::game::{cstring, GameState};
 use crate::navmesh::{LinkKind, NavGraph};
@@ -40,6 +40,15 @@ const STUCK_MOVE: f32 = 16.0;
 const STUCK_TIME: f32 = 0.7;
 /// A plat ride is "done" once we've risen to within this of the exit-floor height.
 const PLAT_RISE_TOL: f32 = 18.0;
+/// Minimum seconds between item-goal re-selections (so a bot commits to a pickup rather than
+/// flip-flopping between two of similar worth each frame).
+const GOAL_SELECT_INTERVAL: f32 = 1.5;
+/// Goal watchdog: if a bot has been chasing the *same* item this long (and isn't detouring to open
+/// a gate) without ever collecting it, that item is effectively unreachable for it — abandon it and
+/// avoid it for `GOAL_AVOID_TIME`, then retry. Time-based (not distance) so a legitimate route that
+/// detours away — riding an elevator, walking to a teleporter — isn't mistaken for being stuck.
+const GOAL_GIVEUP_TIME: f32 = 10.0;
+const GOAL_AVOID_TIME: f32 = 12.0;
 
 // --- population management (P3) ---
 
@@ -128,9 +137,51 @@ pub fn run_bots(game: &mut GameState) {
     for i in 1..=maxclients as u32 {
         let e = EntId(i);
         if game.entities[e].bot.is_bot && game.entities[e].in_use {
+            bot_pickup_items(game, e);
             run_bot(game, e);
         }
     }
+}
+
+/// Generous fixed pickup half-extents (the player hull ±16 plus the item trigger ±16, with a
+/// little slack). We use a fixed box rather than the item's engine-side `mins`/`maxs` because
+/// `set_size` may not sync those to our shadow `EntVars`, which would make the test a degenerate
+/// point and almost never fire.
+const PICKUP_XY: f32 = 40.0;
+const PICKUP_Z: f32 = 48.0;
+
+/// Manually collect any item the bot is standing on. The engine doesn't run the trigger-touch
+/// phase for `SetBotCMD` fake clients the way it does for human `SV_RunCmd`, so a bot would walk
+/// onto a pickup and never actually take it — it'd just keep wanting it and circle. We replicate
+/// the touch here, guarded by `solid == Trigger` (a respawning item that's already been taken is
+/// non-solid → skipped) so this can't double-grant even if an engine *does* fire the touch.
+fn bot_pickup_items(game: &mut GameState, e: EntId) {
+    if game.entities[e].v.health <= 0.0 || game.entities[e].v.deadflag != 0.0 {
+        return;
+    }
+    let origin = game.entities[e].v.origin;
+    // Gather first (immutable borrow of nav/entities), then fire touches (needs `&mut game`).
+    let hits: Vec<EntId> = game
+        .nav
+        .goals
+        .iter()
+        .filter_map(|&(idx, _)| {
+            let item = EntId(idx);
+            let it = &game.entities[item];
+            (it.v.solid == Solid::Trigger && on_item(origin, it.v.origin)).then_some(item)
+        })
+        .collect();
+    for item in hits {
+        if game.entities[item].v.solid == Solid::Trigger {
+            game.run_touch(item, e);
+        }
+    }
+}
+
+/// Whether a bot at `bot_origin` is close enough to an item at `item_origin` to collect it.
+fn on_item(bot_origin: Vec3, item_origin: Vec3) -> bool {
+    let d = item_origin - bot_origin;
+    d.x.abs() <= PICKUP_XY && d.y.abs() <= PICKUP_XY && d.z.abs() <= PICKUP_Z
 }
 
 fn run_bot(game: &mut GameState, e: EntId) {
@@ -161,17 +212,80 @@ fn run_bot(game: &mut GameState, e: EntId) {
 
     let idle = |angles: Vec3| host.set_bot_cmd(client, msec, angles, 0, 0, 0, 0, 0);
 
-    let Some(target) = nearest_human(game, e) else {
+    // Item goal (P5): re-pick the best reachable pickup on a slow cadence, and drop a chosen item
+    // once it's been grabbed (no longer available/respawning soon) so the bot moves on. With no
+    // worthwhile item, fall back to following the nearest human.
+    if now >= game.entities[e].bot.goal_select_time {
+        let pick = game.select_item_goal(e);
+        let (new_item, new_cell) = pick.map_or((0, 0), |(it, c)| (it.0, c));
+        let b = &mut game.entities[e].bot;
+        if new_item != b.goal_item {
+            b.goal_started = now; // restart the watchdog for a new goal
+        }
+        (b.goal_item, b.goal_item_cell) = (new_item, new_cell);
+        b.goal_select_time = now + GOAL_SELECT_INTERVAL;
+    }
+    if game.entities[e].bot.goal_item != 0
+        && !game.item_goal_valid(e, EntId(game.entities[e].bot.goal_item), now)
+    {
+        let b = &mut game.entities[e].bot;
+        b.goal_item = 0;
+        b.goal_select_time = now; // re-pick next frame
+    }
+
+    // Opt-in diagnostics (`rtx_bot_debug 1`): one throttled line per bot — what it wants, how far,
+    // whether it's standing on that item, and whether it owns the LG. Pinpoints pickup-vs-desire.
+    if host.cvar(c"rtx_bot_debug") != 0.0 && now >= game.entities[e].bot.repath_time {
+        let gi = game.entities[e].bot.goal_item;
+        let (goal, dist, overlap) = if gi != 0 {
+            let it = &game.entities[EntId(gi)];
+            let on = it.v.solid == Solid::Trigger && on_item(origin, it.v.origin);
+            (it.classname().unwrap_or("?"), (it.v.origin - origin).length(), on)
+        } else {
+            ("human", 0.0, false)
+        };
+        let own_lg = game.entities[e].v.items.has(Items::LIGHTNING) as i32;
+        let msg = cstring(&format!(
+            "rtx bot{client}: want={goal} dist={dist:.0} on_item={overlap} ownLG={own_lg} cells={:.0}\n",
+            game.entities[e].v.ammo_cells,
+        ));
+        host.conprint(&msg); // conprint always shows; dprint needs `developer 1`
+    }
+
+    let chasing = game.entities[e].bot.goal_item != 0;
+    // Where we're headed: the chosen item, or the nearest human. Neither → idle.
+    let (target_origin, item_cell) = if chasing {
+        let it = EntId(game.entities[e].bot.goal_item);
+        (game.entities[it].v.origin, Some(game.entities[e].bot.goal_item_cell))
+    } else if let Some(h) = nearest_human(game, e) {
+        (game.entities[h].v.origin, None)
+    } else {
         idle(v_angle);
         return;
     };
-    let target_origin = game.entities[target].v.origin;
+
+    // Goal watchdog: while chasing an item and *not* already detouring to open a gate, give up on
+    // one we've chased too long without collecting (behind an elevator/button/movewall/teleporter
+    // chain the router can't thread) so we stop circling and go fetch something reachable instead.
+    if chasing
+        && game.entities[e].bot.gate.is_none()
+        && now - game.entities[e].bot.goal_started > GOAL_GIVEUP_TIME
+    {
+        let b = &mut game.entities[e].bot;
+        b.avoid_item = b.goal_item;
+        b.avoid_until = now + GOAL_AVOID_TIME;
+        b.goal_item = 0;
+        b.goal_select_time = now; // re-pick (skipping the abandoned item) next frame
+    }
 
     // Graph queries (borrows game.nav) and bot-state updates (borrows game.entities) are on
     // disjoint fields, so they coexist; `host` is a Copy, no game borrow held across the send.
     let graph = game.nav.graph.as_ref().unwrap();
-    let (Some(bot_cell), Some(goal_cell)) = (graph.nearest(origin), graph.nearest(target_origin))
-    else {
+    let Some(bot_cell) = graph.nearest(origin) else {
+        idle(v_angle);
+        return;
+    };
+    let Some(goal_cell) = item_cell.or_else(|| graph.nearest(target_origin)) else {
         idle(v_angle);
         return;
     };
@@ -294,7 +408,9 @@ fn run_bot(game: &mut GameState, e: EntId) {
     let mut angles = Vec3::new(0.0, yaw, 0.0);
 
     let (mut forward, mut side, mut buttons, mut impulse) = (0, 0, 0, 0);
-    let close_enough = final_leg && dist <= POLITE_DIST;
+    // Politely stop short only when tailing a human; when fetching an item, walk right onto it so
+    // the pickup's touch fires.
+    let close_enough = final_leg && !chasing && dist <= POLITE_DIST;
     if !close_enough {
         let (fwd, right) = angle_vectors(angles);
         let dir = Vec3::new(to_wp.x, to_wp.y, 0.0).normalize_or_zero();

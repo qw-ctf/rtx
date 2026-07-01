@@ -487,6 +487,22 @@ pub struct BotState {
     pub goal_cell: u32,
     /// The gate currently being opened as an errand (`None` = following the human normally).
     pub gate: Option<usize>,
+    /// The item entity this bot is fetching (`0` = none → follow a human), and the navmesh cell
+    /// it sits in. See [`crate::bot_goals`].
+    pub goal_item: u32,
+    pub goal_item_cell: u32,
+    /// Earliest time the bot may re-pick its item goal (throttles the catalog scan).
+    pub goal_select_time: f32,
+    /// When the bot began chasing its current item goal. If it's *still* chasing the same item
+    /// long after (one it can't actually reach — e.g. behind an elevator/button/movewall/teleporter
+    /// chain the router can't thread), it abandons that goal rather than circling forever. Uses
+    /// time-on-goal, not distance, so a legitimate route that walks *away* toward a teleporter
+    /// isn't mistaken for being stuck.
+    pub goal_started: f32,
+    /// An item to skip while picking goals, until `avoid_until` — set when we gave up reaching it,
+    /// so we don't immediately re-fixate on the same unreachable pickup.
+    pub avoid_item: u32,
+    pub avoid_until: f32,
     /// Earliest time we may recompute the route (throttles A*).
     pub repath_time: f32,
     /// Stuck detector: where we were when last checked, and since when we've been there.

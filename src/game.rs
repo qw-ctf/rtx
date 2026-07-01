@@ -439,8 +439,12 @@ impl GameState {
         // for combat tuning later). Bots only spawn once a map's navmesh is built.
         self.host.cvar_set_float(cstr(b"rtx_bots\0"), 0.0);
         self.host.cvar_set_float(cstr(b"rtx_bot_skill\0"), 3.0);
+        // Per-bot goal/pickup diagnostics to the server console (0 = off).
+        self.host.cvar_set_float(cstr(b"rtx_bot_debug\0"), 0.0);
 
-        self.host.dprint(cstr(b"rtx: QuakeWorld game module loaded\0"));
+        // conprint (not dprint) so it shows without `developer 1` — lets you confirm at a glance
+        // that the freshly built module is the one actually loaded.
+        self.host.conprint(cstr(b"rtx: QuakeWorld game module loaded (bot-goals build)\n\0"));
 
         // `self.game_data` lives inside the OnceLock-pinned GameState, so its address is
         // stable for the process — safe to hand to the engine.
@@ -505,9 +509,10 @@ impl GameState {
         graph.add_teleports(&self.collect_teleports());
         graph.add_gates(&self.collect_gates());
         let counts = graph.summary();
+        let goals = self.collect_goals(&graph);
         let msg = cstring(&format!(
             "rtx: navmesh: {} planes, {} clipnodes -> {} cells, {} links \
-             (walk {} step {} drop {} jump {} plat {} tele {}), {} gates\n",
+             (walk {} step {} drop {} jump {} plat {} tele {}), {} gates, {} item goals\n",
             bsp.planes.len(),
             bsp.clipnodes.len(),
             graph.cells.len(),
@@ -519,10 +524,29 @@ impl GameState {
             counts.plat,
             counts.teleport,
             graph.gate_count(),
+            goals.len(),
         ));
         self.host.dprint(&msg);
         self.nav.bsp = Some(bsp);
         self.nav.graph = Some(graph);
+        self.nav.goals = goals;
+    }
+
+    /// Build the static item-goal catalog: every spawned pickup (weapons, health, armor, ammo,
+    /// powerups) paired with the navmesh cell nearest it. Items don't move, so this is computed
+    /// once with the navmesh; [`GameState::select_item_goal`] reads live availability per query.
+    fn collect_goals(&self, graph: &crate::navmesh::NavGraph) -> Vec<(u32, crate::navmesh::CellId)> {
+        self.entities
+            .iter()
+            .enumerate()
+            .filter_map(|(i, ent)| {
+                let cn = ent.classname()?;
+                if i == 0 || !crate::bot_goals::is_goal_classname(cn) {
+                    return None;
+                }
+                Some((i as u32, graph.nearest(ent.v.origin)?))
+            })
+            .collect()
     }
 
     /// Gather the [`PlatInfo`](crate::navmesh::PlatInfo) for every spawned `func_plat`: the
