@@ -96,9 +96,19 @@ pub struct NavGraph {
     pub adjacency: Vec<Vec<u32>>,
     grid: GridIndex,
     gates: Vec<Gate>,
-    /// Cells a closed gate blocks → the gate's index.
-    gated: HashMap<CellId, usize>,
+    /// Per-link gate tag: the index of the gate whose *closed* door the link's segment passes
+    /// through, or `-1` for an ungated link. This is the "navmesh aware of dynamic geometry" core
+    /// — a link (graph edge) knows which door it depends on, so pathfinding can price it by the
+    /// door's live state (see [`find_path`](Self::find_path)). Empty until [`add_gates`](Self::add_gates)
+    /// runs; indexed by link index (parallel to `links`).
+    gated_links: Vec<i32>,
 }
+
+/// Extra travel-time cost charged to a link whose gate is currently shut. Large enough that the
+/// planner routes around a closed door whenever any open way exists, but finite so it still
+/// crosses (and the bot then detours to the button) when there's no alternative — matching how a
+/// game engine prices a disabled-but-openable NavMesh link rather than deleting it outright.
+const CLOSED_GATE_PENALTY: f32 = 100_000.0;
 
 impl NavGraph {
     /// Build the graph from a parsed BSP's player hull. Pure; safe to run at load time.
@@ -110,7 +120,7 @@ impl NavGraph {
             links: Vec::new(),
             grid: cells_grid.1,
             gates: Vec::new(),
-            gated: HashMap::new(),
+            gated_links: Vec::new(),
         };
         graph.link_cells(bsp);
         graph
@@ -285,7 +295,11 @@ impl NavGraph {
     /// indices (each link's `to` is the next cell, its `kind` how to get there). `None` if no
     /// route exists (different connected components). Heuristic = straight-line travel time, an
     /// admissible lower bound on cost, so the path is optimal.
-    pub fn find_path(&self, start: CellId, goal: CellId) -> Option<Vec<u32>> {
+    /// A* from `start` to `goal`. `gate_closed[i]` marks gate `i`'s door as currently shut; a link
+    /// through a shut gate is charged [`CLOSED_GATE_PENALTY`], so the route bends around closed
+    /// doors when it can and only crosses one (leaving the bot to open it) when there's no other
+    /// way. Pass `&[]` to treat every door as open.
+    pub fn find_path(&self, start: CellId, goal: CellId, gate_closed: &[bool]) -> Option<Vec<u32>> {
         use std::cmp::Ordering;
         use std::collections::BinaryHeap;
 
@@ -332,7 +346,7 @@ impl NavGraph {
             }
             for &li in &self.adjacency[cell as usize] {
                 let link = self.links[li as usize];
-                let ng = g_cost[cell as usize] + link.cost;
+                let ng = g_cost[cell as usize] + link.cost + self.gate_penalty(li, gate_closed);
                 if ng < g_cost[link.to as usize] {
                     g_cost[link.to as usize] = ng;
                     came_from[link.to as usize] = li;
@@ -346,7 +360,7 @@ impl NavGraph {
     /// Dijkstra cost-flood from `start`: the travel-time cost to reach every cell (`INFINITY`
     /// for unreachable ones). One pass answers "how far is each item?" for goal selection, far
     /// cheaper than an A* per candidate. Indexed by [`CellId`].
-    pub fn costs_from(&self, start: CellId) -> Vec<f32> {
+    pub fn costs_from(&self, start: CellId, gate_closed: &[bool]) -> Vec<f32> {
         use std::cmp::Ordering;
         use std::collections::BinaryHeap;
 
@@ -381,7 +395,7 @@ impl NavGraph {
             }
             for &li in &self.adjacency[cell as usize] {
                 let link = self.links[li as usize];
-                let ng = g + link.cost;
+                let ng = g + link.cost + self.gate_penalty(li, gate_closed);
                 if ng < cost[link.to as usize] {
                     cost[link.to as usize] = ng;
                     heap.push(Node { g: ng, cell: link.to });
@@ -526,24 +540,37 @@ impl NavGraph {
 
     // --- entity-derived: button-gated doors ---
 
-    /// Register button-gated doors. Each `func_door` with a targetname is a gate that stays
-    /// shut until its `func_button` fires it; the static carve (hull 0, no door brushes) has
-    /// cells passing straight through, so we mark the cells inside the door's *closed* volume
-    /// as gated and remember which button opens them. Bots detour to the button before crossing
-    /// (see `bot.rs`). Gates whose closed door blocks no cell, or whose button has no nearby
-    /// cell to operate from, are skipped.
+    /// Register button-gated doors. Each `func_door` with a targetname is a gate that stays shut
+    /// until its `func_button` fires it; the static carve (hull 0, no door brushes) has links
+    /// running straight through, so we tag every link whose *segment* passes through the door's
+    /// *closed* volume with that gate and remember which button opens it. Tagging links (not cells)
+    /// is what makes this robust for thin pillars — a link crossing a 14-unit door is caught even
+    /// when no cell centre lands inside it. Pathfinding then prices those links by door state
+    /// (see [`find_path`](Self::find_path)); bots detour to the button when a route must cross a
+    /// shut one (see `bot.rs`). Gates whose closed door crosses no link, or whose button has no
+    /// nearby cell to operate from, are skipped.
     pub fn add_gates(&mut self, gates: &[GateInfo]) {
+        if self.gated_links.len() != self.links.len() {
+            self.gated_links = vec![-1; self.links.len()];
+        }
         for gi in gates {
-            let blocked = self.cells_in_box(gi.closed_min, gi.closed_max);
-            if blocked.is_empty() {
-                continue;
-            }
             let Some(button_cell) = self.nearest_within(gi.button, GRID * 5.0, 160.0) else {
                 continue;
             };
-            let idx = self.gates.len();
-            for &c in &blocked {
-                self.gated.insert(c, idx);
+            let hit: Vec<usize> = (0..self.links.len())
+                .filter(|&li| {
+                    let link = self.links[li];
+                    let p0 = self.cells[link.from as usize].origin;
+                    let p1 = self.cells[link.to as usize].origin;
+                    segment_aabb_intersect(p0, p1, gi.closed_min, gi.closed_max)
+                })
+                .collect();
+            if hit.is_empty() {
+                continue; // door crosses no link — not an obstruction the bots can hit
+            }
+            let idx = self.gates.len() as i32;
+            for li in hit {
+                self.gated_links[li] = idx;
             }
             self.gates.push(Gate {
                 obstruction: gi.obstruction,
@@ -564,9 +591,22 @@ impl NavGraph {
         &self.gates[i]
     }
 
-    /// The gate (if any) that blocks cell `c` when shut.
-    pub fn gate_of_cell(&self, c: CellId) -> Option<usize> {
-        self.gated.get(&c).copied()
+    /// The gate (if any) whose shut door link `li` passes through.
+    pub fn gate_of_link(&self, li: u32) -> Option<usize> {
+        match self.gated_links.get(li as usize).copied().unwrap_or(-1) {
+            g if g >= 0 => Some(g as usize),
+            _ => None,
+        }
+    }
+
+    /// Extra A* cost for link `li` given the current door states — [`CLOSED_GATE_PENALTY`] if its
+    /// gate is shut, else nothing.
+    #[inline]
+    fn gate_penalty(&self, li: u32, gate_closed: &[bool]) -> f32 {
+        match self.gate_of_link(li) {
+            Some(g) if gate_closed.get(g).copied().unwrap_or(false) => CLOSED_GATE_PENALTY,
+            _ => 0.0,
+        }
     }
 
     /// Append a free-standing cell (not from the column carve) and index it. Used for plat
@@ -721,6 +761,34 @@ fn floor_grid(v: f32) -> i32 {
     (v / GRID).floor() as i32
 }
 
+/// Whether the segment `p0`→`p1` intersects the axis-aligned box `[min, max]` (slab method).
+/// Used to decide which navmesh links a closed door's volume blocks.
+fn segment_aabb_intersect(p0: Vec3, p1: Vec3, min: Vec3, max: Vec3) -> bool {
+    let (o, d) = (p0.to_array(), (p1 - p0).to_array());
+    let (lo, hi) = (min.to_array(), max.to_array());
+    let (mut tmin, mut tmax) = (0.0f32, 1.0f32);
+    for i in 0..3 {
+        if d[i].abs() < 1e-6 {
+            if o[i] < lo[i] || o[i] > hi[i] {
+                return false; // parallel to this slab and outside it
+            }
+        } else {
+            let inv = 1.0 / d[i];
+            let mut t0 = (lo[i] - o[i]) * inv;
+            let mut t1 = (hi[i] - o[i]) * inv;
+            if t0 > t1 {
+                std::mem::swap(&mut t0, &mut t1);
+            }
+            tmin = tmin.max(t0);
+            tmax = tmax.min(t1);
+            if tmin > tmax {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// How many grid columns a jump can span.
 fn jump_grid_radius() -> i32 {
     (JUMP_REACH / GRID).ceil() as i32
@@ -733,6 +801,11 @@ fn dir_bucket(dgx: i32, dgy: i32) -> usize {
 }
 
 /// Per-map navigation state, reset each map load. Lives on `GameState`.
+/// The product of a background navmesh build handed back to the main thread: the parsed BSP and
+/// the finished graph, or `None` if the BSP couldn't be parsed. `Send` (plain data), so it crosses
+/// the worker→main channel.
+pub type NavBuild = Option<(Bsp, NavGraph)>;
+
 #[derive(Default)]
 pub struct NavState {
     /// The parsed clip-hull geometry the navmesh is derived from. `None` until a map's BSP
@@ -740,13 +813,34 @@ pub struct NavState {
     pub bsp: Option<Bsp>,
     /// The built navigation graph. `None` until [`NavGraph::build`] runs (bots stay disabled).
     pub graph: Option<NavGraph>,
-    /// Whether a build has been attempted for this map (so a failed BSP read doesn't retry
-    /// every frame). Reset when a new map loads.
+    /// Whether a build has been kicked off for this map (so a failed BSP read doesn't retry every
+    /// frame). Reset when a new map loads.
     pub attempted: bool,
+    /// A background build in flight: the channel the worker thread delivers its finished graph on.
+    /// The main thread polls it each frame and swaps the result into `graph`/`bsp` when ready
+    /// (`None` when no build is running). Dropping it (on map change) discards a stale build.
+    pub pending: Option<std::sync::mpsc::Receiver<NavBuild>>,
     /// Static catalog of item-goal pickups: `(entity index, nearest cell)`. Built once with the
     /// graph; items don't move, so their cell is fixed. Live availability and desire are read
     /// fresh at selection time (see [`crate::bot_goals`]).
     pub goals: Vec<(u32, CellId)>,
+}
+
+/// Build a navmesh off the main thread from pre-gathered, `Send` inputs: the raw BSP bytes plus the
+/// entity-derived plat/teleport/gate info. Pure — no engine or game-state access — so it runs
+/// safely on a worker thread whose result the main thread swaps in when ready.
+pub fn build_navmesh(
+    bytes: Vec<u8>,
+    plats: Vec<PlatInfo>,
+    teleports: Vec<TeleportInfo>,
+    gates: Vec<GateInfo>,
+) -> NavBuild {
+    let bsp = Bsp::parse(&bytes)?;
+    let mut graph = NavGraph::build(&bsp);
+    graph.add_plats(&bsp, &plats);
+    graph.add_teleports(&teleports);
+    graph.add_gates(&gates);
+    Some((bsp, graph))
 }
 
 impl NavState {
@@ -841,7 +935,9 @@ mod tests {
 
         // Assert A* returns a valid chain to the farthest reachable cell.
         let goal = *best.last().unwrap();
-        let route = g.find_path(start, goal).expect("A* found no route to a reachable cell");
+        let route = g
+            .find_path(start, goal, &[])
+            .expect("A* found no route to a reachable cell");
         let mut cell = start;
         for &li in &route {
             assert_eq!(g.links[li as usize].from, cell, "route discontinuity");
@@ -872,8 +968,8 @@ mod tests {
         assert!(tele >= 1, "no teleport links added");
         eprintln!("teleport splice: {tele} entrance links");
 
-        // Gate splice: a closed door box over a well-connected cell, with a button nearby. The
-        // covered cells become gated and the button resolves to an operating cell.
+        // Gate splice: a closed door box over a well-connected cell, with a button nearby. Links
+        // whose segment crosses the box become gated, and the button resolves to an operating cell.
         let dcell = g.cells[start as usize].origin;
         let gate = GateInfo {
             obstruction: 0,
@@ -886,7 +982,13 @@ mod tests {
         };
         g.add_gates(&[gate]);
         assert_eq!(g.gate_count(), 1, "gate not registered");
-        assert!(g.gate_of_cell(start).is_some(), "covered cell not gated");
-        eprintln!("gate splice: button cell {}", g.gate(0).button_cell);
+        let gated_links = (0..g.links.len() as u32)
+            .filter(|&li| g.gate_of_link(li).is_some())
+            .count();
+        assert!(gated_links > 0, "no link tagged by the gate");
+        // The state-aware A* still resolves with the gate shut (routes around, or through with the
+        // penalty when there's no other way).
+        assert!(g.find_path(start, goal, &[true]).is_some(), "no route with gate shut");
+        eprintln!("gate splice: {gated_links} gated links, button cell {}", g.gate(0).button_cell);
     }
 }

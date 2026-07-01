@@ -50,6 +50,10 @@ const GOAL_SELECT_INTERVAL: f32 = 1.5;
 /// detours away — riding an elevator, walking to a teleporter — isn't mistaken for being stuck.
 const GOAL_GIVEUP_TIME: f32 = 10.0;
 const GOAL_AVOID_TIME: f32 = 12.0;
+/// Gate errand give-up: if a door hasn't opened this long after we committed to its button, its
+/// button is out of reach (or unusable) — abandon and avoid the gate for `GATE_AVOID_TIME`.
+const GATE_GIVEUP_TIME: f32 = 4.0;
+const GATE_AVOID_TIME: f32 = 6.0;
 
 // --- population management (P3) ---
 
@@ -305,6 +309,12 @@ fn run_bot(game: &mut GameState, e: EntId) {
         b.goal_select_time = now; // re-pick (skipping the abandoned item) next frame
     }
 
+    // Current door states, for gate-aware pathfinding. A shut gate makes its links expensive, so
+    // `find_path` bends the route around a closed door when any open way exists and only crosses
+    // one (leaving the bot to detour to the button) when there's no alternative. Computed before
+    // the nav borrow (it reads the obstruction edicts).
+    let gate_closed = game.gate_closed_flags();
+
     // Graph queries (borrows game.nav) and bot-state updates (borrows game.entities) are on
     // disjoint fields, so they coexist; `host` is a Copy, no game borrow held across the send.
     let graph = game.nav.graph.as_ref().unwrap();
@@ -317,16 +327,8 @@ fn run_bot(game: &mut GameState, e: EntId) {
         return;
     };
 
-    // Which gates are currently shut, and whether each activator can be triggered right now?
-    // Read before borrowing the bot mutably (these touch the door/movewall + activator edicts).
-    // A gate is shut while its obstruction still sits at its closed origin; a shoot activator is
-    // "ready" only while it takes damage — re-triggerable triggers go dead during their cooldown.
-    let gate_closed: Vec<bool> = (0..graph.gate_count())
-        .map(|gi| {
-            let g = graph.gate(gi);
-            (game.entities[EntId(g.obstruction)].v.origin - g.closed_origin).length() < 8.0
-        })
-        .collect();
+    // Whether each gate's activator can be triggered right now: a shoot activator is "ready" only
+    // while it takes damage — re-triggerable triggers go dead during their cooldown.
     let gate_ready: Vec<bool> = (0..graph.gate_count())
         .map(|gi| {
             let g = graph.gate(gi);
@@ -344,9 +346,17 @@ fn run_bot(game: &mut GameState, e: EntId) {
     }
     bot.last_origin = origin;
 
-    // Gate errand: drop it once the gate's door has opened.
+    // Gate errand: drop it once the gate's door has opened — or give up if we've been at it too
+    // long without the door opening (button out of reach, or we can't operate it), so we stop
+    // camping against a door we can't get through and try something else.
     if let Some(gi) = bot.gate {
         if gate_closed.get(gi).copied() != Some(true) {
+            bot.gate = None;
+            bot.route.clear();
+            bot.repath_time = now;
+        } else if now - bot.gate_since > GATE_GIVEUP_TIME {
+            bot.avoid_gate = gi as i32;
+            bot.avoid_gate_until = now + GATE_AVOID_TIME;
             bot.gate = None;
             bot.route.clear();
             bot.repath_time = now;
@@ -361,7 +371,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
 
     // Re-path when the route is empty, the goal changed, or the timer elapsed.
     if bot.route.is_empty() || bot.goal_cell != goal || now >= bot.repath_time {
-        bot.route = graph.find_path(bot_cell, goal).unwrap_or_default();
+        bot.route = graph.find_path(bot_cell, goal, &gate_closed).unwrap_or_default();
         bot.route_pos = 0;
         bot.goal_cell = goal;
         bot.repath_time = now + REPATH_INTERVAL;
@@ -371,12 +381,19 @@ fn run_bot(game: &mut GameState, e: EntId) {
         bot.repath_time = now; // force a fresh path next frame
     }
 
-    // Not on an errand yet? If the route to the human crosses a shut gate, divert to its button.
+    // Not on an errand yet? `find_path` already routes *around* a shut gate when it can (its links
+    // are priced high), so if the chosen route still crosses one, there's no other way in — divert
+    // to that gate's button. Skip a gate we recently gave up on (its button was unreachable) so we
+    // don't immediately re-camp on it.
     if bot.gate.is_none() {
-        if let Some(gi) = route_blocking_gate(graph, &bot.route, bot.route_pos, &gate_closed) {
+        let avoid = if now < bot.avoid_gate_until { bot.avoid_gate } else { -1 };
+        let block = route_blocking_gate(graph, &bot.route, bot.route_pos, &gate_closed)
+            .filter(|&gi| gi as i32 != avoid);
+        if let Some(gi) = block {
             let button_cell = graph.gate(gi).button_cell;
             bot.gate = Some(gi);
-            bot.route = graph.find_path(bot_cell, button_cell).unwrap_or_default();
+            bot.gate_since = now;
+            bot.route = graph.find_path(bot_cell, button_cell, &gate_closed).unwrap_or_default();
             bot.route_pos = 0;
             bot.goal_cell = button_cell;
             bot.repath_time = now + REPATH_INTERVAL;
@@ -436,8 +453,10 @@ fn run_bot(game: &mut GameState, e: EntId) {
 
     let (mut forward, mut side, mut buttons, mut impulse) = (0, 0, 0, 0);
     // Politely stop short only when tailing a human; when fetching an item, walk right onto it so
-    // the pickup's touch fires.
-    let close_enough = final_leg && !chasing && dist <= POLITE_DIST;
+    // the pickup's touch fires — and when hunting an enemy, never stop short (otherwise the bot
+    // halts 64u away and just stands there, e.g. right at a door between it and its target; the
+    // combat layer manages the actual fighting distance once it has line of sight).
+    let close_enough = final_leg && !chasing && enemy.is_none() && dist <= POLITE_DIST;
     if !close_enough {
         let (fwd, right) = angle_vectors(angles);
         let dir = Vec3::new(to_wp.x, to_wp.y, 0.0).normalize_or_zero();
@@ -500,13 +519,26 @@ fn run_bot(game: &mut GameState, e: EntId) {
         );
     }
 
+    // Combat/gate diagnostics: what the bot is chasing and whether it's stuck at a gate. Enable
+    // with `rtx_bot_debug 1` (conprint shows without `developer`).
+    if host.cvar(c"rtx_bot_debug") != 0.0 {
+        let gate = game.entities[e].bot.gate;
+        let route = game.entities[e].bot.route.len();
+        host.conprint(&cstring(&format!(
+            "rtx bot{client}: enemy={} gate={gate:?} route={route} fwd={forward} side={side} \
+             atk={}\n",
+            enemy.is_some(),
+            (buttons & BUTTON_ATTACK) != 0,
+        )));
+    }
+
     host.set_bot_cmd(client, msec, angles, forward, side, 0, buttons, impulse);
 }
 
 /// The first shut gate whose blocked cell lies on the remaining route, if any.
 fn route_blocking_gate(graph: &NavGraph, route: &[u32], from: usize, closed: &[bool]) -> Option<usize> {
     route.get(from..)?.iter().find_map(|&leg| {
-        let gi = graph.gate_of_cell(graph.link_target(leg))?;
+        let gi = graph.gate_of_link(leg)?;
         (*closed.get(gi)?).then_some(gi)
     })
 }

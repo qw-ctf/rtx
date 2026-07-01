@@ -505,27 +505,76 @@ impl GameState {
     /// Best-effort: if the BSP can't be read or parsed the navmesh stays empty and bots simply
     /// don't spawn — never fatal. Deferring this off the load path means a bot-less server
     /// pays neither the build time nor the memory.
+    /// Live door states for gate-aware pathfinding: `[i]` is true while gate `i`'s door is shut
+    /// (present at its closed origin). A door that slid open, or one a button *removed* (freed, so
+    /// `in_use` is cleared), reads as open. Empty when there's no navmesh or no gates.
+    pub(crate) fn gate_closed_flags(&self) -> Vec<bool> {
+        let Some(graph) = self.nav.graph.as_ref() else {
+            return Vec::new();
+        };
+        (0..graph.gate_count())
+            .map(|gi| {
+                let g = graph.gate(gi);
+                let obs = &self.entities[EntId(g.obstruction)];
+                obs.in_use && (obs.v.origin - g.closed_origin).length() < 8.0
+            })
+            .collect()
+    }
+
+    /// Ensure the map's navmesh is (being) built. The heavy graph construction runs on a worker
+    /// thread from `Send` inputs gathered here (BSP bytes + entity-derived plats/teleports/gates);
+    /// the result is polled each frame and swapped in atomically when ready, so a big map never
+    /// hitches the server frame. Bots stay disabled until the swap lands.
     pub(crate) fn ensure_navmesh(&mut self) {
-        if self.nav.attempted {
+        if self.nav.graph.is_some() {
+            return; // already built
+        }
+        if self.nav.pending.is_some() {
+            self.poll_navmesh_build(); // a build is in flight — install it once ready
             return;
         }
+        if self.nav.attempted {
+            return; // a prior read/parse failed; don't retry until the next map
+        }
         self.nav.attempted = true;
+
         let path = cstring(&format!("maps/{}.bsp", self.level.mapname));
         let Some(bytes) = self.host.read_file(&path) else {
             self.host.dprint(c"rtx: navmesh: could not read map BSP; bots disabled\n");
             return;
         };
-        let Some(bsp) = crate::bsp::Bsp::parse(&bytes) else {
-            self.host.dprint(c"rtx: navmesh: unsupported/!malformed BSP; bots disabled\n");
+        // Gather the entity-derived inputs on the main thread (they read the spawned entities),
+        // then hand everything to a worker thread for the pure, potentially-slow graph build.
+        let plats = self.collect_plats();
+        let teleports = self.collect_teleports();
+        let gates = self.collect_gates();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::navmesh::build_navmesh(bytes, plats, teleports, gates));
+        });
+        self.nav.pending = Some(rx);
+        self.host.dprint(c"rtx: navmesh: building in background...\n");
+    }
+
+    /// Poll the in-flight background build; when it delivers, compute item goals and swap the graph
+    /// in. A `None` result (unparseable BSP) or a dead worker just clears the pending build.
+    fn poll_navmesh_build(&mut self) {
+        let Some(rx) = self.nav.pending.as_ref() else {
             return;
         };
-        // Build the cell/link graph from the player clip hull, then splice in the spawned
-        // entity-derived links (func_plat lifts, trigger_teleport warps), which need the
-        // entities to exist.
-        let mut graph = crate::navmesh::NavGraph::build(&bsp);
-        graph.add_plats(&bsp, &self.collect_plats());
-        graph.add_teleports(&self.collect_teleports());
-        graph.add_gates(&self.collect_gates());
+        let built = match rx.try_recv() {
+            Ok(built) => built,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return, // still building
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.nav.pending = None;
+                return;
+            }
+        };
+        self.nav.pending = None;
+        let Some((bsp, graph)) = built else {
+            self.host.dprint(c"rtx: navmesh: unsupported/malformed BSP; bots disabled\n");
+            return;
+        };
         let counts = graph.summary();
         let goals = self.collect_goals(&graph);
         let msg = cstring(&format!(
@@ -630,6 +679,9 @@ impl GameState {
         for (obs, closed_origin) in obstructions {
             let tn = self.entities[obs].targetname.clone().unwrap();
             let Some((activator, shoot)) = self.find_activator(&tn, 0) else {
+                self.host.dprint(&cstring(&format!(
+                    "rtx: navmesh: gate '{tn}' has no reachable button/trigger — skipped\n"
+                )));
                 continue;
             };
             let oent = &self.entities[obs];
@@ -647,16 +699,20 @@ impl GameState {
         gates
     }
 
-    /// Follow `target` → `targetname` from `tn` back to the player-facing activator that fires
-    /// the chain: a `func_button` (door gates), or a shootable/touchable trigger
+    /// Follow `target`/`killtarget` → `targetname` from `tn` back to the player-facing activator
+    /// that fires the chain: a `func_button` (door gates), or a shootable/touchable trigger
     /// (`trigger_multiple`/`trigger_once`) reached through rotators and relays (movewall gates).
-    /// Returns the activator and whether it's shot (`health > 0`). Depth-bounded against cycles.
+    /// A button that *removes* the obstruction does so via `killtarget` (the door is deleted
+    /// rather than slid), so both keys are followed. Returns the activator and whether it's shot
+    /// (`health > 0`). Depth-bounded against cycles.
     fn find_activator(&self, tn: &str, depth: u32) -> Option<(EntId, bool)> {
         if depth > 5 {
             return None;
         }
         for (i, e) in self.entities.iter().enumerate() {
-            if !e.in_use || e.target.as_deref() != Some(tn) {
+            if !e.in_use
+                || (e.target.as_deref() != Some(tn) && e.killtarget.as_deref() != Some(tn))
+            {
                 continue;
             }
             // An intermediate (rotator, relay) is itself triggered — follow the chain back.

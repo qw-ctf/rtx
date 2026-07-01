@@ -308,7 +308,9 @@ impl GameState {
             return None;
         }
         let bot_cell = graph.nearest(self.entities[bot_e].v.origin)?;
-        let costs = graph.costs_from(bot_cell);
+        // Gate-aware: items behind a shut door cost more, so a bot prefers ones it can reach now.
+        let gate_closed = self.gate_closed_flags();
+        let costs = graph.costs_from(bot_cell, &gate_closed);
         let now = self.time();
         let s = self.bot_stats(bot_e);
         // An item we recently gave up reaching, to skip until its avoid window lapses.
