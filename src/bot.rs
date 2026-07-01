@@ -93,7 +93,7 @@ pub fn manage_population(game: &mut GameState) {
     } else if count > want {
         if let Some(e) = last_bot {
             host.remove_bot(game.entities[e].bot.client);
-            game.entities[e].bot = BotState::default();
+            game.retire_slot(e); // fully retire the slot (bot state + in_use/classname/arena)
         }
     }
 }

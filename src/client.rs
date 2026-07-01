@@ -135,8 +135,22 @@ impl GameState {
         self.broadcast(PrintLevel::High, &message);
         self.host
             .sound(player, Channel::Body, Sound::PLAYER_TORNOFF2, 1.0, Attenuation::None);
-        // Clear bot bookkeeping if a bot left (kicked, or trimmed by the population manager).
-        crate::bot::on_disconnect(&mut self.entities[player]);
+        self.retire_slot(player);
+    }
+
+    /// Retire a client slot from our private shadow state when it leaves — a human disconnecting,
+    /// or a bot trimmed by the population manager. The engine frees the edict, but `in_use`,
+    /// `classname`, the per-player arena role/queue, and bot bookkeeping are all *our* fields it
+    /// never touches. Left stale, the departed player still counts as a live player and fighter:
+    /// bots stop being trimmed (they think a human is still here), the Rocket Arena queue jams (a
+    /// phantom fighter fills a slot), and a bot can even lock onto the freed edict and fire at its
+    /// zeroed origin.
+    pub(crate) fn retire_slot(&mut self, e: EntId) {
+        crate::bot::on_disconnect(&mut self.entities[e]); // resets bot state if it was a bot
+        let ent = &mut self.entities[e];
+        ent.in_use = false;
+        ent.classname = None;
+        ent.arena = crate::mode::ArenaPlayer::default();
     }
 
     /// `SetNewParms` — default spawn parameters for a fresh player.
