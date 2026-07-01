@@ -54,6 +54,9 @@ pub(crate) struct ArenaPlayer {
     /// either a current fighter, or an audience member not yet stamped. See the arena's round
     /// former, which pulls the lowest-stamped audience member in as the next challenger.
     pub queue: u32,
+    /// Throttle for the "can't fire yet" screen blink during the countdown (world time of the last
+    /// blink), so a held fire button flashes once in a while rather than every frame.
+    pub flash_time: f32,
 }
 
 /// A mode's per-frame directive for one bot — the *only* channel through which a mode influences
@@ -99,6 +102,12 @@ pub(crate) trait GameMode: Sync {
     /// May `targ` take damage right now? Used for round countdown spawn-protection and to keep
     /// audience players harmless. Default: yes.
     fn damage_allowed(&self, _g: &GameState, _targ: EntId) -> bool {
+        true
+    }
+
+    /// May weapons fire right now? Gates the actual shot (muzzle/projectile), not just damage —
+    /// used to lock out firing before "FIGHT" in a round mode. Default: yes.
+    fn weapons_hot(&self, _g: &GameState) -> bool {
         true
     }
 

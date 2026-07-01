@@ -172,6 +172,11 @@ impl GameMode for Arena {
         matches!(g.arena.round, RoundState::Live)
     }
 
+    fn weapons_hot(&self, g: &GameState) -> bool {
+        // No firing until "FIGHT" — locked out through warmup, countdown, and the post-round pause.
+        matches!(g.arena.round, RoundState::Live)
+    }
+
     fn on_death(&self, g: &mut GameState, victim: EntId, _attacker: EntId) {
         if !matches!(g.arena.round, RoundState::Live) {
             return;
@@ -188,18 +193,22 @@ impl GameMode for Arena {
     fn bot_intent(&self, g: &mut GameState, bot: EntId) -> Option<BotIntent> {
         match g.entities[bot].arena.role {
             ArenaRole::Fighter => {
-                // Before the round goes live (countdown), and if somehow no enemy is left, hold
-                // position on the spawn spot rather than run off into the map.
+                // Before the round goes live (countdown), roam the arena to take up a position,
+                // rather than standing on the spawn (which looks dead and trips the stuck-jumper).
                 if !matches!(g.arena.round, RoundState::Live) {
-                    return Some(BotIntent::Move(g.entities[bot].v.origin));
+                    return Some(BotIntent::Move(
+                        self.wander_point(g, bot, "info_teleport_destination"),
+                    ));
                 }
                 Some(match nearest_enemy(g, bot) {
                     Some(enemy) => BotIntent::Fight(enemy),
-                    None => BotIntent::Move(g.entities[bot].v.origin),
+                    None => BotIntent::Move(self.wander_point(g, bot, "info_teleport_destination")),
                 })
             }
             // Eliminated / waiting: mill around the audience (the deathmatch spawns / stands).
-            ArenaRole::Audience => Some(BotIntent::Move(self.wander_point(g, bot))),
+            ArenaRole::Audience => {
+                Some(BotIntent::Move(self.wander_point(g, bot, "info_player_deathmatch")))
+            }
         }
     }
 }
@@ -221,6 +230,14 @@ impl Arena {
             }
         }
 
+        // Fighters carried over from the previous round (the survivor(s)) — snapshot *before* we
+        // promote challengers, so we can tell a carried-over winner apart from a fresh challenger
+        // (audience members are alive too, so "alive" alone isn't enough).
+        let carried: Vec<EntId> = players(g)
+            .into_iter()
+            .filter(|&e| g.entities[e].arena.role == ArenaRole::Fighter)
+            .collect();
+
         // Fill empty fighter slots with the longest-waiting audience members.
         let mut fighters = fighter_count(g);
         while fighters < FIGHTER_SLOTS {
@@ -236,9 +253,20 @@ impl Arena {
             fighters += 1;
         }
 
-        // Respawn every fighter into the arena, fresh.
+        // Bring fighters up for the new round. A carried-over winner still alive *stays where they
+        // are* and is just topped back up to full — no teleport. Challengers promoted from the
+        // audience (and any dead carried-over slot) get a fresh spawn inside the arena.
         for e in players(g) {
-            if g.entities[e].arena.role == ArenaRole::Fighter {
+            if g.entities[e].arena.role != ArenaRole::Fighter {
+                continue;
+            }
+            let winner_stays = carried.contains(&e)
+                && g.entities[e].v.health > 0.0
+                && g.entities[e].v.deadflag == 0.0;
+            if winner_stays {
+                self.apply_loadout(g, e);
+                g.w_set_current_ammo(e);
+            } else {
                 g.put_client_in_server(e);
             }
         }
@@ -267,24 +295,28 @@ impl Arena {
         };
     }
 
-    /// The audience destination for a waiting bot: a deathmatch spawn (the stands), re-picked on a
-    /// staggered timer so it strolls between vantage points instead of freezing. This is the
-    /// arena's whole audience-roaming brain — kept here, out of the generic bot code.
-    fn wander_point(&self, g: &mut GameState, bot: EntId) -> Vec3 {
+    /// A roaming destination among `classname` spawns for a bot that has no one to fight — the
+    /// audience stands (`info_player_deathmatch`) for waiting players, or the arena
+    /// (`info_teleport_destination`) for fighters during the countdown. Re-picked on a staggered
+    /// timer *or* once we're nearly there, so the bot keeps strolling between vantage points
+    /// instead of freezing on the spot (a frozen bot also trips the stuck-jumper). Kept here, out
+    /// of the generic bot code.
+    fn wander_point(&self, g: &mut GameState, bot: EntId, classname: &str) -> Vec3 {
         let now = g.time();
-        let need = g.entities[bot].bot.wander_time <= now
-            || g.entities[bot].bot.wander_target == Vec3::ZERO;
-        if need {
-            let spot = g.select_spawn_point_of("info_player_deathmatch");
-            let origin = g.entities[bot].v.origin;
-            let target = if spot != EntId::WORLD {
+        let origin = g.entities[bot].v.origin;
+        let target = g.entities[bot].bot.wander_target;
+        let (dx, dy) = (target.x - origin.x, target.y - origin.y);
+        let arrived = target != Vec3::ZERO && (dx * dx + dy * dy).sqrt() < 48.0;
+        if now >= g.entities[bot].bot.wander_time || target == Vec3::ZERO || arrived {
+            let spot = g.select_spawn_point_of(classname);
+            let next = if spot != EntId::WORLD {
                 g.entities[spot].v.origin
             } else {
                 origin
             };
             let jitter = g.random();
             let b = &mut g.entities[bot].bot;
-            b.wander_target = target;
+            b.wander_target = next;
             b.wander_time = now + 3.0 + jitter * 3.0;
         }
         g.entities[bot].bot.wander_target

@@ -963,9 +963,30 @@ impl GameState {
         }
         self.impulse_commands(e);
         if self.entities[e].v.button0 != 0.0 {
-            self.super_damage_sound(e);
-            self.w_attack(e);
+            // The active mode may lock out firing (e.g. Rocket Arena's pre-"FIGHT" countdown).
+            // Weapon *switching* above still works; only the shot is withheld.
+            let mode = self.mode;
+            if mode.weapons_hot(self) {
+                self.super_damage_sound(e);
+                self.w_attack(e);
+            } else {
+                self.deny_fire(e);
+            }
         }
+    }
+
+    /// Firing is disabled right now: blink a human's screen (throttled) so a held fire button gives
+    /// feedback instead of silence. Bots are skipped (they don't hold fire pre-round anyway).
+    fn deny_fire(&mut self, e: EntId) {
+        if self.entities[e].bot.is_bot {
+            return;
+        }
+        let now = self.time();
+        if now < self.entities[e].arena.flash_time {
+            return;
+        }
+        self.entities[e].arena.flash_time = now + 0.5;
+        self.host.stuffcmd(e, c"bf\n");
     }
 
     // --- small helpers ---
