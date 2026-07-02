@@ -182,23 +182,9 @@ impl GameMode for TeamMatch {
     }
 
     fn apply_loadout(&self, g: &mut GameState, e: EntId) {
-        // Assign a team the first time this player is placed (team == 0). Reattach a reconnecting
-        // player from the locked roster by netname; otherwise auto-balance onto the smallest team.
-        if g.entities[e].arena.team == 0 {
-            let name = g.netname_of(e);
-            let team = g
-                .team_match
-                .roster
-                .iter()
-                .find(|(n, _)| *n == name)
-                .map(|&(_, t)| t)
-                .filter(|&t| t >= 1)
-                .unwrap_or_else(|| smallest_team(g));
-            g.entities[e].arena.team = team;
-        }
-        apply_team_identity(g, e);
-        // Weapons/ammo are left as the decoded DM parms (shotgun + axe, plus the grapple handout) —
-        // a standard team-DM start.
+        // Assign/reattach the team + colours; weapons/ammo stay the decoded DM parms (shotgun + axe,
+        // plus the grapple handout) — a standard team-DM start.
+        assign_team(g, e);
     }
 
     fn weapons_hot(&self, g: &GameState) -> bool {
@@ -219,7 +205,7 @@ impl TeamMatch {
     /// a fresh map or a switch away from team mode — starts a fresh warmup (keeping the parsed
     /// format). Runs after `refresh_mode` (which owns the alias→config tracking).
     pub(crate) fn on_worldspawn(g: &mut GameState) {
-        if g.mode.name() != "team" {
+        if !is_match_mode(g.mode.name()) {
             g.team_match = MatchState::default();
             return;
         }
@@ -240,7 +226,7 @@ impl TeamMatch {
     /// Begin a match: lock the current roster and reload the map. Called from the `start` command.
     /// The countdown is armed in `on_worldspawn` after the reload (via `resuming`).
     pub(crate) fn start(g: &mut GameState) {
-        if g.mode.name() != "team" || !matches!(g.team_match.phase, MatchPhase::Warmup) {
+        if !is_match_mode(g.mode.name()) || !matches!(g.team_match.phase, MatchPhase::Warmup) {
             return;
         }
         let roster: Vec<(String, u8)> = players(g)
@@ -287,14 +273,39 @@ impl TeamMatch {
     }
 }
 
+/// Whether `name` is one of the match-lifecycle modes (team DM or CTF) that share `MatchState`, the
+/// warmup→start→countdown→live→ended machine, the locked roster, and the team-coordination helpers.
+pub(crate) fn is_match_mode(name: &str) -> bool {
+    name == "team" || name == "ctf"
+}
+
+/// Assign player `e` a team the first time they're placed (team `0`): reattach a reconnecting player
+/// from the locked roster by netname, else auto-balance onto the smallest team; then apply the team
+/// colours/userinfo. Shared by team DM and CTF (called from their `apply_loadout`).
+pub(crate) fn assign_team(g: &mut GameState, e: EntId) {
+    if g.entities[e].arena.team == 0 {
+        let name = g.netname_of(e);
+        let team = g
+            .team_match
+            .roster
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|&(_, t)| t)
+            .filter(|&t| t >= 1)
+            .unwrap_or_else(|| smallest_team(g));
+        g.entities[e].arena.team = team;
+    }
+    apply_team_identity(g, e);
+}
+
 /// The `(name, color)` identity for team `t` (1-based), cycling the palette past [`MAX_TEAMS`].
-fn team_identity(t: u8) -> (&'static str, &'static str) {
+pub(crate) fn team_identity(t: u8) -> (&'static str, &'static str) {
     TEAM_IDENTITY[(t as usize).saturating_sub(1) % MAX_TEAMS]
 }
 
 /// Write player `e`'s team name + shirt/pant colour into userinfo, so friendly fire
 /// (`teamplay_protects`) and the engine scoreboard follow the team, and teammates share a colour.
-fn apply_team_identity(g: &mut GameState, e: EntId) {
+pub(crate) fn apply_team_identity(g: &mut GameState, e: EntId) {
     let (name, color) = team_identity(g.entities[e].arena.team);
     let is_bot = g.entities[e].bot.is_bot;
     let host = *g.host();
@@ -314,7 +325,7 @@ fn apply_team_identity(g: &mut GameState, e: EntId) {
 }
 
 /// The team id (1-based) with the fewest current members — ties break to the lowest id.
-fn smallest_team(g: &GameState) -> u8 {
+pub(crate) fn smallest_team(g: &GameState) -> u8 {
     let teams = g.team_match.config.teams.max(1);
     let mut counts = vec![0u32; teams];
     for e in players(g) {
@@ -333,7 +344,7 @@ fn smallest_team(g: &GameState) -> u8 {
 }
 
 /// Every connected player edict (humans and bots, `1..=maxclients`).
-fn players(g: &GameState) -> Vec<EntId> {
+pub(crate) fn players(g: &GameState) -> Vec<EntId> {
     let maxclients = g.host().cvar(c"maxclients") as i32;
     (1..=maxclients as u32)
         .map(EntId)
@@ -343,7 +354,7 @@ fn players(g: &GameState) -> Vec<EntId> {
 
 /// The nearest living player on a *different* team to `bot` — the team-aware enemy picker (the
 /// teammate filter the FFA/Arena/Midair pickers deliberately lack).
-fn nearest_enemy(g: &GameState, bot: EntId) -> Option<EntId> {
+pub(crate) fn nearest_enemy(g: &GameState, bot: EntId) -> Option<EntId> {
     let origin = g.entities[bot].v.origin;
     let my_team = g.entities[bot].arena.team;
     let mut best: Option<(EntId, f32)> = None;
@@ -365,7 +376,7 @@ fn nearest_enemy(g: &GameState, bot: EntId) -> Option<EntId> {
 
 /// Center-print to every connected human (bots are fake clients with no connection — a unicast to
 /// one makes the engine warn "msg_entity: not a client").
-fn centerprint_all(g: &GameState, msg: &str) {
+pub(crate) fn centerprint_all(g: &GameState, msg: &str) {
     let host = *g.host();
     let cmsg = cstring(msg);
     for e in players(g) {

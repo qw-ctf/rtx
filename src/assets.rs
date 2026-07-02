@@ -193,6 +193,7 @@ asset_registry!(Model, precache_models, precache_model, {
     PROGS_BOLT2 = c"progs/bolt2.mdl";
     PROGS_BOLT3 = c"progs/bolt3.mdl";
     PROGS_EYES = c"progs/eyes.mdl";
+    PROGS_FLAG = c"progs/flag.mdl";
     PROGS_FLAME = c"progs/flame.mdl";
     PROGS_FLAME2 = c"progs/flame2.mdl";
     PROGS_G_LIGHT = c"progs/g_light.mdl";

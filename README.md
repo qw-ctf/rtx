@@ -61,12 +61,13 @@ is just the baseline mode, so adding a mode doesn't touch the generic gameplay o
 
 | cvar | default | what it does |
 |------|---------|--------------|
-| `rtx_mode` | `ffa` | `ffa` = free-for-all deathmatch (stock behaviour). `ra` = Rocket Arena. `midair` = airborne-only rocket DM. A **team format** (`1on1`/`duel`, `2on2`, `2on2on2`, any `NonM…`) = team deathmatch. |
+| `rtx_mode` | `ffa` | `ffa` = free-for-all deathmatch (stock behaviour). `ra` = Rocket Arena. `midair` = airborne-only rocket DM. `ctf` = Capture the Flag. A **team format** (`1on1`/`duel`, `2on2`, `2on2on2`, any `NonM…`) = team deathmatch. |
 | `rtx_ra_countdown` | `3` | Rocket Arena: seconds of spawn-protected countdown before "FIGHT". |
 | `rtx_ra_lightning_gun` | `0` | Rocket Arena: include the lightning gun in the arena arsenal (`0` leaves it out). |
 | `rtx_midair_minheight` | `40` | Midair: minimum height (units) above the floor for a victim to count as airborne. |
 | `rtx_midair_kb_ground` / `rtx_midair_kb_air` | `6` / `3` | Midair: rocket knockback multipliers for grounded vs airborne victims (ground is stronger, to launch players up). |
-| `rtx_match_countdown` | `3` | Team match: seconds of spawn-protected countdown after the match-start map reload before "FIGHT". |
+| `rtx_match_countdown` | `3` | Team match / CTF: seconds of spawn-protected countdown after the match-start map reload before "FIGHT". |
+| `rtx_capturelimit` | `8` | CTF: captures a team needs to win (`0` = no limit, ends on `timelimit`). |
 
 **`ra` — Rocket Arena.** Round-based 1v1 duels following the classic arena loop (ported from the
 Frogbot-Rocket-Arena QuakeC, minus its clan-arena team machinery). Two players fight in the arena
@@ -99,8 +100,19 @@ is warmup → **`start`** → live → results: in **warmup** everyone plays and
 smallest team; typing **`start`** in the console **reloads the map** (fresh entities) and runs a
 countdown, **locking the roster**; play then runs to the limit and returns to warmup. Players who
 drop and reconnect are **reattached to their team**. Bots fill and play the teams, targeting only
-the other side. The team primitives are reusable — a future round-based team mode builds on the same
-layer.
+the other side. The team primitives are reusable — CTF (below) is the second consumer, and a future
+round-based team mode builds on the same layer.
+
+**`ctf` — Capture the Flag** (modeled on **purectf**), built on the team layer above. Two teams
+(red/blue) each own a flag at a base (`item_flag_team1`/`item_flag_team2`). Grab the **enemy** flag,
+carry it to **your** base while **your** flag is home, and it's a **capture** (+1 to your team, +15
+frags to the carrier). Touch your **own** flag where it lies to **return** it (+1); a dropped flag
+also **auto-returns** after 40 s, and a killed carrier **drops** it where they fell. Teams win at
+`rtx_capturelimit`. It uses the same match lifecycle as team DM — warmup → **`start`** (map reload +
+countdown) → live → results — with friendly fire via `teamplay`, the grapple handed out for movement,
+and CTF bots that grab, run flags home, chase enemy carriers, and defend. (Runes and the proximity
+defense/assist bonuses are deferred for now.) CTF requires the flag model **`progs/flag.mdl`** in the
+gamedir.
 
 ## Bots
 

@@ -17,7 +17,7 @@ use crate::mode::ArenaPlayer;
 
 /// A `Copy` index handle into the entity array. Never a borrow, so holding one across a
 /// trap call is fine — this is what keeps the safe API free of aliasing hazards.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct EntId(pub u32);
 
 impl EntId {
@@ -152,6 +152,8 @@ pub enum Think {
     UpdateChain,
     /// Lead chain link removes the whole chain.
     RemoveChain,
+    /// CTF flag idle tick: auto-return a dropped flag once its timeout elapses.
+    FlagReturn,
 }
 
 /// A `.touch` behaviour (`GAME_EDICT_TOUCH`). The dispatcher reads `self`/`other` and
@@ -190,6 +192,8 @@ pub enum Touch {
     Movewall,
     /// Grappling-hook head: anchor to whatever it strikes.
     Hook,
+    /// CTF flag: grab (enemy), return (own, dropped), or capture (own base while carrying enemy).
+    Flag,
 }
 
 /// A `.use` behaviour, fired by `SUB_UseTargets` / button presses.
@@ -381,6 +385,8 @@ pub struct Entity {
     pub item: ItemState,
     /// Per-player game-mode state (arena role / round wins). Default in FFA; read by round modes.
     pub arena: ArenaPlayer,
+    /// CTF flag state — only meaningful on the two flag entities (`flag.team != 0`).
+    pub flag: FlagState,
 }
 
 #[derive(Default)]
@@ -623,6 +629,33 @@ pub struct ItemState {
     pub items2: f32,
     pub aflag2: f32,
     pub last_pickup_msg: f32,
+}
+
+/// A CTF flag's phase (on the flag entity).
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FlagPhase {
+    /// At its base (`home`), capturable / returnable-to.
+    #[default]
+    Home,
+    /// Held by `carrier` (hidden, non-solid).
+    Carried,
+    /// Lying in the field; auto-returns at `return_at`.
+    Dropped,
+}
+
+/// CTF flag state, on the flag entity's private tail (`team == 0` on any non-flag entity). See
+/// [`crate::mode::ctf`].
+#[derive(Default)]
+pub struct FlagState {
+    /// Owning team (`1`/`2`); `0` means this entity isn't a flag.
+    pub team: u8,
+    /// Base origin to return to.
+    pub home: Vec3,
+    /// The player carrying it (`WORLD` when not carried).
+    pub carrier: EntId,
+    /// World time a dropped flag auto-returns.
+    pub return_at: f32,
+    pub phase: FlagPhase,
 }
 
 // The engine writes 8-byte native pointers into `string_refs` via unaligned-looking but

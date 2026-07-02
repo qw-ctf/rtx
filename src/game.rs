@@ -461,6 +461,8 @@ impl GameState {
         // Team match (`rtx_mode 1on1`/`2on2`/`2on2on2`/…): seconds of spawn-protected countdown after
         // the match-start map reload before "FIGHT".
         self.host.cvar_default("rtx_match_countdown", 3.0);
+        // CTF: captures a team needs to win the match (`0` = no limit, ends on timelimit only).
+        self.host.cvar_default("rtx_capturelimit", 8.0);
         // Midair: minimum height above the floor (units) for a victim to count as airborne, and the
         // knockback multipliers for airborne (`kb_air`) vs grounded (`kb_ground`) rocket hits — the
         // ground value is bigger to pop grounded players up into the air. Tunables over rtx's bare
@@ -944,6 +946,10 @@ impl GameState {
                 item_bit: defs::Items::QUAD,
                 effect: defs::Effects::BLUE,
             },
+
+            // ctf.rs — CTF flags (spawn only in the ctf mode; harmlessly removed otherwise)
+            "item_flag_team1" => SpawnAction::Spawn(GameState::spawn_flag_team1),
+            "item_flag_team2" => SpawnAction::Spawn(GameState::spawn_flag_team2),
 
             // triggers.qc
             "trigger_multiple" => SpawnAction::Spawn(GameState::spawn_trigger_multiple),

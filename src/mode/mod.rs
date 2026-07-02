@@ -29,14 +29,16 @@ use crate::entity::EntId;
 use crate::game::{cstring, GameState};
 
 mod arena;
+mod ctf;
 mod ffa;
 mod midair;
 mod team;
 
 pub(crate) use arena::{Arena, ArenaState};
+pub(crate) use ctf::Ctf;
 pub(crate) use ffa::Ffa;
 pub(crate) use midair::Midair;
-pub(crate) use team::{MatchState, TeamMatch};
+pub(crate) use team::{is_match_mode, MatchPhase, MatchState, TeamMatch};
 
 /// A player's standing in a round-based mode (Rocket Arena): fighting in the arena, or waiting
 /// in the audience (fresh joiners, and players eliminated until the next round). Stored per
@@ -64,6 +66,9 @@ pub(crate) struct ArenaPlayer {
     /// Team id in a team match (`1..=N`; `0` = unassigned/none). Only the team modes read it. See
     /// [`crate::mode::team`].
     pub team: u8,
+    /// In CTF, the team id of the enemy flag this player is carrying (`0` = not carrying). See
+    /// [`crate::mode::ctf`].
+    pub carrying: u8,
 }
 
 /// A mode's per-frame directive for one bot — the *only* channel through which a mode influences
@@ -192,6 +197,8 @@ static MIDAIR: Midair = Midair;
 /// The team-match singleton — every team alias (`1on1`/`duel`/`2on2`/`2on2on2`/`NonM…`) resolves to
 /// it; the parsed format lives in [`GameState::team_match`], not the descriptor.
 static TEAM: TeamMatch = TeamMatch;
+/// The Capture-the-Flag singleton (`rtx_mode ctf`) — reuses the match lifecycle + team layer.
+static CTF: Ctf = Ctf;
 
 /// The default mode used before a map selects one (matches `rtx_mode ffa`).
 pub(crate) fn default_mode() -> &'static dyn GameMode {
@@ -204,6 +211,7 @@ pub(crate) fn select_mode(name: &str) -> &'static dyn GameMode {
     match name {
         "ra" => &ARENA,
         "midair" => &MIDAIR,
+        "ctf" => &CTF,
         _ if team::parse_match_alias(name).is_some() => &TEAM,
         _ => &FFA,
     }
@@ -228,15 +236,20 @@ impl GameState {
             self.arena = ArenaState::default();
             host.conprint(&cstring(&format!("rtx: game mode = {}\n", next.name())));
         }
-        // `name`'s borrow of `buf` is done (config is Copy); free to take `&mut self`.
-        if next.name() == "team" {
-            if let Some(cfg) = team_config {
-                if cfg != self.team_match.config {
-                    self.team_match = MatchState {
-                        config: cfg,
-                        ..Default::default()
-                    };
-                }
+        // `name`'s borrow of `buf` is done (config is Copy); free to take `&mut self`. Both match
+        // modes carry their format in `MatchState` (the descriptor `name()` is constant): team DM
+        // parses the alias; CTF is a fixed 2-team format. A changed format is a fresh match.
+        if is_match_mode(next.name()) {
+            let cfg = if next.name() == "ctf" {
+                team::MatchConfig { teams: 2, size: 0 }
+            } else {
+                team_config.unwrap_or_default()
+            };
+            if cfg != self.team_match.config {
+                self.team_match = MatchState {
+                    config: cfg,
+                    ..Default::default()
+                };
             }
             // Team play needs friendly-fire protection on (the `"team"` userinfo does the rest).
             if host.cvar(c"teamplay") == 0.0 {

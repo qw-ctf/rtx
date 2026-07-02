@@ -132,6 +132,8 @@ impl GameState {
         self.broadcast(PrintLevel::High, &message);
         self.host
             .sound(player, Channel::Body, Sound::PLAYER_TORNOFF2, 1.0, Attenuation::None);
+        // Drop a carried flag before `retire_slot` clears the carry marker (no-op outside CTF).
+        self.drop_flag_if_carrying(player);
         self.retire_slot(player);
     }
 
@@ -401,9 +403,9 @@ impl GameState {
 
     /// `CheckRules` — end the level on time/frag limit.
     fn check_rules(&mut self, e: EntId) {
-        // Team matches own their limits (team score, in `TeamMatch::tick`) — don't let an individual
-        // player's frags trip the stock intermission path.
-        if self.mode.name() == "team" {
+        // Team/CTF matches own their limits (team score / capture limit, in the mode's `tick`) —
+        // don't let an individual player's frags trip the stock intermission path.
+        if crate::mode::is_match_mode(self.mode.name()) {
             return;
         }
         let frags = self.entities[e].v.frags;
