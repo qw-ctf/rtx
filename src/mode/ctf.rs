@@ -212,8 +212,41 @@ impl Ctf {
     }
 }
 
-/// The team-aware CTF bot brain: run a captured flag home; fight a close enemy; retrieve a stolen
-/// own flag; otherwise go grab the enemy flag. All navigation is the generic `Move`/`Fight` seam.
+/// How close an enemy must be for an attacker to break off and fight instead of pushing the flag.
+const ATTACK_ENGAGE: f32 = 500.0;
+/// How close to our base an enemy must be for a defender to leave the flag and engage.
+const DEFEND_RADIUS: f32 = 700.0;
+
+/// Split a bot's job on its team. Roles are what turn "every bot rushes the same flag" into a team:
+/// most bots [`Attack`](CtfRole::Attack) (grab and run the enemy flag), a minority
+/// [`Defend`](CtfRole::Defend) (hold the base, retrieve the flag, intercept attackers).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CtfRole {
+    Attack,
+    Defend,
+}
+
+/// Assign `bot` a stable role among its team's bots: sort the team's bots by edict id and make the
+/// lowest ~third (at least one, once a team has two) defenders, the rest attackers. Deterministic, so
+/// a bot keeps its role frame to frame as long as the roster holds; a lone bot always attacks.
+fn ctf_role(g: &GameState, bot: EntId, team: u8) -> CtfRole {
+    let mut mates: Vec<EntId> = team::players(g)
+        .into_iter()
+        .filter(|&e| g.entities[e].arena.team == team && g.entities[e].bot.is_bot)
+        .collect();
+    mates.sort_unstable_by_key(|e| e.0);
+    let defenders = if mates.len() <= 1 { 0 } else { (mates.len() / 3).max(1) };
+    let rank = mates.iter().position(|&e| e == bot).unwrap_or(0);
+    if rank < defenders {
+        CtfRole::Defend
+    } else {
+        CtfRole::Attack
+    }
+}
+
+/// The team-aware CTF bot brain. Carrying the flag always overrides to a run home; otherwise the
+/// bot's [`CtfRole`] picks between pushing the enemy flag and holding our own base. All navigation is
+/// the generic `Move`/`Fight` seam.
 fn ctf_bot_intent(g: &mut GameState, bot: EntId) -> Option<BotIntent> {
     let team = g.entities[bot].arena.team;
     if team == 0 {
@@ -221,28 +254,50 @@ fn ctf_bot_intent(g: &mut GameState, bot: EntId) -> Option<BotIntent> {
     }
     let origin = g.entities[bot].v.origin;
 
-    // Carrying the enemy flag → run to our base to capture (don't stop to fight).
+    // Carrying the enemy flag → run to our base to capture (all roles; don't stop to fight).
     if g.entities[bot].arena.carrying != 0 {
         if let Some(hf) = base_flag(g, team) {
             return Some(BotIntent::Move(g.entities[hf].flag.home));
         }
     }
-    // A close enemy in the way → fight it.
-    if let Some(en) = team::nearest_enemy(g, bot) {
-        if (g.entities[en].v.origin - origin).length_squared() < 500.0 * 500.0 {
-            return Some(BotIntent::Fight(en));
+
+    match ctf_role(g, bot, team) {
+        CtfRole::Defend => {
+            if let Some(of) = base_flag(g, team) {
+                let (carrier, phase, flag_pos, home) = {
+                    let f = &g.entities[of].flag;
+                    (f.carrier, f.phase, g.entities[of].v.origin, f.home)
+                };
+                // Our flag stolen → hunt down the carrier to bring it back.
+                if carrier != EntId::WORLD {
+                    return Some(BotIntent::Fight(carrier));
+                }
+                // An enemy pushing our base → intercept it before it reaches the flag.
+                if let Some(en) = team::nearest_enemy_to(g, team, home) {
+                    if (g.entities[en].v.origin - home).length_squared() < DEFEND_RADIUS * DEFEND_RADIUS {
+                        return Some(BotIntent::Fight(en));
+                    }
+                }
+                // Flag knocked out into the field → go stand on it to return it; else hold at home.
+                let target = if matches!(phase, FlagPhase::Home) {
+                    home
+                } else {
+                    flag_pos
+                };
+                return Some(BotIntent::Move(target));
+            }
         }
-    }
-    // Our flag stolen → hunt the carrier.
-    if let Some(of) = base_flag(g, team) {
-        let carrier = g.entities[of].flag.carrier;
-        if carrier != EntId::WORLD {
-            return Some(BotIntent::Fight(carrier));
+        CtfRole::Attack => {
+            // A close enemy in the way → fight it, otherwise keep pushing for the enemy flag.
+            if let Some(en) = team::nearest_enemy(g, bot) {
+                if (g.entities[en].v.origin - origin).length_squared() < ATTACK_ENGAGE * ATTACK_ENGAGE {
+                    return Some(BotIntent::Fight(en));
+                }
+            }
+            if let Some(ef) = enemy_flag(g, team) {
+                return Some(BotIntent::Move(g.entities[ef].v.origin));
+            }
         }
-    }
-    // Otherwise head for the enemy flag to grab it.
-    if let Some(ef) = enemy_flag(g, team) {
-        return Some(BotIntent::Move(g.entities[ef].v.origin));
     }
     team::nearest_enemy(g, bot).map(BotIntent::Fight)
 }

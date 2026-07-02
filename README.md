@@ -113,7 +113,10 @@ frags to the carrier). Touch your **own** flag where it lies to **return** it (+
 also **auto-returns** after 40 s, and a killed carrier **drops** it where they fell. Teams win at
 `rtx_capturelimit`. It uses the same match lifecycle as team DM — warmup → **`start`** (map reload +
 countdown) → live → results — with friendly fire via `teamplay`, the grapple handed out for movement,
-and CTF bots that grab, run flags home, chase enemy carriers, and defend. Full purectf scoring is in:
+and CTF bots that **split into roles**: most attack (grab the enemy flag and run it home), while a
+minority (about a third, at least one) defend — holding the base, intercepting attackers that close
+on it, chasing down whoever steals the flag, and re-touching a dropped flag to return it. A carrier
+always runs home regardless of role. Full purectf scoring is in:
 capture +15, teammates +10, plus the frag-carrier, carrier-protect, flag-defense, and return/frag
 **assist** bonuses. The four **runes** (Resistance, Strength, Haste, Regeneration — `rtx_runes`) spawn
 at DM points, one per player, dropped on death; the flag and rune can be tossed (`rtx_ctf_tossflag`

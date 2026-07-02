@@ -15,6 +15,8 @@
 //! the whole match state survives the start-reload because it lives on the process-lifetime
 //! [`GameState`] (guarded in `worldspawn`).
 
+use glam::Vec3;
+
 use super::{BotIntent, GameMode};
 use crate::entity::EntId;
 use crate::game::{cstring, GameState};
@@ -357,16 +359,22 @@ pub(crate) fn players(g: &GameState) -> Vec<EntId> {
 pub(crate) fn nearest_enemy(g: &GameState, bot: EntId) -> Option<EntId> {
     let origin = g.entities[bot].v.origin;
     let my_team = g.entities[bot].arena.team;
+    nearest_enemy_to(g, my_team, origin)
+}
+
+/// The nearest living player not on `my_team` to an arbitrary `point` — used to pick a target near a
+/// base to defend, not just near the bot itself.
+pub(crate) fn nearest_enemy_to(g: &GameState, my_team: u8, point: Vec3) -> Option<EntId> {
     let mut best: Option<(EntId, f32)> = None;
     for e in players(g) {
         let ent = &g.entities[e];
-        if e == bot || ent.arena.team == my_team {
+        if ent.arena.team == my_team {
             continue;
         }
         if ent.v.health <= 0.0 || ent.v.deadflag != 0.0 {
             continue;
         }
-        let d = (ent.v.origin - origin).length_squared();
+        let d = (ent.v.origin - point).length_squared();
         if best.is_none_or(|(_, bd)| d < bd) {
             best = Some((e, d));
         }
