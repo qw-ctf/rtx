@@ -365,8 +365,10 @@ fn run_bot(game: &mut GameState, e: EntId) {
             if let Some(h) = nearest_human(game, e) {
                 (game.entities[h].v.origin, None)
             } else {
-                idle(v_angle);
-                return;
+                // Nothing to chase and no human to follow: **roam** to a random reachable spot
+                // instead of freezing, so a human-less server (e.g. bots-only FFA) keeps its bots
+                // moving — and finding items and each other — rather than standing on spawn.
+                (roam_target(game, e, origin, now), None)
             }
         }
     };
@@ -1137,6 +1139,32 @@ fn runway(graph: &NavGraph, route: &[u32], route_pos: usize, origin: Vec3) -> (f
         any = true;
     }
     (dist, any)
+}
+
+/// A wander destination for an idle bot with nothing to chase: a random reachable navmesh cell,
+/// refreshed on arrival or every few seconds. Keeps bots moving on a human-less server instead of
+/// freezing on the spawn (the "bots stand still with no human" case).
+fn roam_target(game: &mut GameState, e: EntId, origin: Vec3, now: f32) -> Vec3 {
+    let (wt, wtime) = {
+        let b = &game.entities[e].bot;
+        (b.wander_target, b.wander_time)
+    };
+    let reached = wt != Vec3::ZERO && (wt.xy() - origin.xy()).length() < 64.0;
+    if wt != Vec3::ZERO && !reached && now < wtime {
+        return wt;
+    }
+    let r = game.random(); // before borrowing the graph (needs &mut game)
+    let Some(g) = game.nav.graph.as_ref() else {
+        return origin;
+    };
+    if g.cells.is_empty() {
+        return origin;
+    }
+    let idx = ((r * g.cells.len() as f32) as usize).min(g.cells.len() - 1);
+    let cell = g.cell_origin(idx as u32);
+    game.entities[e].bot.wander_target = cell; // disjoint field from game.nav — coexists with `g`
+    game.entities[e].bot.wander_time = now + 5.0;
+    cell
 }
 
 /// The nearest living human player to bot `bot_e` (skips bots, spectators, and the dead).

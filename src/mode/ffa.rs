@@ -8,15 +8,11 @@
 //! override, which makes bots tail the nearest human in *any* mode, lives in `bot::run_bot`.)
 
 use super::{team, BotIntent, GameMode};
-use crate::defs::Bits;
 use crate::entity::EntId;
 use crate::game::GameState;
 
 /// The free-for-all deathmatch mode (`rtx_mode ffa`).
 pub(crate) struct Ffa;
-
-/// Health below which a bot breaks off the fight to go find a health pickup.
-const LOW_HEALTH: f32 = 50.0;
 
 impl GameMode for Ffa {
     fn name(&self) -> &'static str {
@@ -24,18 +20,12 @@ impl GameMode for Ffa {
     }
 
     fn bot_intent(&self, g: &mut GameState, bot: EntId) -> Option<BotIntent> {
-        // Survive: when hurt or completely out of ammo, fall through to the generic item brain so
-        // it fetches health / a weapon instead of charging in weak. (`None` = default behavior.)
-        let (health, unarmed) = {
-            let v = &g.entities[bot].v;
-            let ammo = v.ammo_shells + v.ammo_nails + v.ammo_rockets + v.ammo_cells;
-            (v.health, ammo <= 0.0 && !v.items.has(crate::defs::Items::LIGHTNING))
-        };
-        if health < LOW_HEALTH || unarmed {
-            return None;
-        }
-        // Frag: hunt the nearest living opponent. The mode-agnostic combat layer (`bot_combat`) then
-        // paths to them, aims, and shoots; items along the way are still picked up automatically.
+        // Everyone is an enemy: always hunt the nearest living player (human or bot). The
+        // mode-agnostic combat layer (`bot_combat`) paths to them, aims, shoots, and retreats when
+        // hurt; items along the way are picked up automatically. Deliberately *not* gated on
+        // health/ammo — falling back to the item/follow brain would idle a bot on a human-less
+        // server (which is exactly the "bots stand still with no human" bug). `None` only when this
+        // bot is the last one alive, and the roam fallback in `run_bot` keeps even that moving.
         nearest_player(g, bot).map(BotIntent::Fight)
     }
 }

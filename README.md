@@ -137,12 +137,14 @@ through the same player-move code as humans, so gravity, stepping, and jumps com
 | `rtx_bot_skill` | `3` | Bot skill (0–7): tightens aim and speeds how fast a bot turns/tracks. |
 | `rtx_bot_pacifist` | `0` | Make bots **not fight** in **any** mode — they just trail the nearest human around the map (for experimenting). `0` = bots play the mode normally. |
 
-In free-for-all each bot **hunts and frags the nearest player** — everyone's an enemy — pathing to
-them and, once in sight, aiming and shooting via the shared combat layer, breaking off to grab a
-**health** pickup when hurt (and picking up items along the way). Set `rtx_bot_pacifist 1` — in any
-mode — and they stop fighting and just tail the nearest human instead. In the absence of a target they pathfind to
-the best reachable **item pickup**, or **follow the nearest human** when nothing's worth fetching
-(through doors, off ledges, across jumps, recovering after a missed jump). On open, roughly-straight stretches they **bunnyhop** (`rtx_bot_bhop`) — chaining jumps
+In free-for-all each bot **hunts and frags the nearest player** — everyone's an enemy, so a
+bots-only server plays itself — pathing to them and, once in sight, aiming and shooting via the
+shared combat layer (retreating when hurt, grabbing items it passes over). Set `rtx_bot_pacifist 1`
+— in any mode — and they stop fighting and just tail the nearest human instead. With nothing to
+chase and no human to follow, a bot **roams** to a random reachable spot rather than standing on its
+spawn. Otherwise (when a mode leaves the brain in charge) it pathfinds to the best reachable **item
+pickup**, or **follows the nearest human** (through doors, off ledges, across jumps, recovering after
+a missed jump). On open, roughly-straight stretches they **bunnyhop** (`rtx_bot_bhop`) — chaining jumps
 and **air-strafing** (sweeping the view while holding one strafe key) to exploit QuakeWorld's
 air-acceleration and build speed far past `sv_maxspeed`, weaving the heading toward the waypoint;
 they drop back to a normal gait for corners, ledges, combat, or the final approach to a goal. That
