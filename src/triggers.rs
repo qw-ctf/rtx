@@ -10,7 +10,6 @@ use crate::defs::*;
 use crate::entity::{Die, EntId, Think, Touch, Use};
 use crate::game::GameState;
 
-
 impl GameState {
     // --- trigger_multiple / once / secret / counter / relay ---
 
@@ -30,8 +29,7 @@ impl GameState {
             return;
         }
         if self.entities[e].classname() == Some("trigger_secret") {
-            if self.entities[self.entities[e].enemy()].classname() != Some("player")
-            {
+            if self.entities[self.entities[e].enemy()].classname() != Some("player") {
                 return;
             }
             self.globals.found_secrets += 1.0;
@@ -115,8 +113,7 @@ impl GameState {
             return;
         }
         if show {
-            self.host
-                .centerprint(activator, c"Sequence completed!");
+            self.host.centerprint(activator, c"Sequence completed!");
         }
         self.entities[e].set_enemy(activator);
         self.multi_trigger(e);
@@ -282,11 +279,7 @@ impl GameState {
             ent.think = Think::SubRemove;
             ent.set_owner(death_owner);
         }
-        self.host.set_size(
-            d,
-            mins - Vec3::ONE,
-            maxs + Vec3::ONE,
-        );
+        self.host.set_size(d, mins - Vec3::ONE, maxs + Vec3::ONE);
         self.host.set_origin(d, org);
         self.globals.force_retouch = 2.0;
     }
@@ -294,9 +287,7 @@ impl GameState {
     /// `teleport_touch`.
     pub(crate) fn teleport_touch(&mut self, e: EntId, other: EntId) {
         let time = self.time();
-        if self.entities[e].targetname.is_some()
-            && self.entities[e].v.nextthink < time
-        {
+        if self.entities[e].targetname.is_some() && self.entities[e].v.nextthink < time {
             return;
         }
         if self.entities[e].v.spawnflags.has(TeleportFlags::PLAYER_ONLY)

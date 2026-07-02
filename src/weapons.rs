@@ -66,12 +66,7 @@ impl GameState {
         true
     }
 
-    fn shootable_grenade_on_line(
-        &self,
-        start: Vec3,
-        end: Vec3,
-        max_fraction: f32,
-    ) -> Option<EntId> {
+    fn shootable_grenade_on_line(&self, start: Vec3, end: Vec3, max_fraction: f32) -> Option<EntId> {
         // Engine traces can skip entities owned by the ignored player. Grenades keep their
         // owner for collision filtering and damage credit, so hitscan weapons need this
         // explicit line check to support shooting your own grenade.
@@ -84,10 +79,7 @@ impl GameState {
         let mut best = max_fraction;
         let mut hit = None;
         for (i, ent) in self.entities.iter().enumerate() {
-            if ent.classname() != Some("grenade")
-                || !ent.in_use
-                || ent.combat.voided != 0.0
-            {
+            if ent.classname() != Some("grenade") || !ent.in_use || ent.combat.voided != 0.0 {
                 continue;
             }
             let t = (ent.v.origin - start).dot(dir) / len2;
@@ -95,8 +87,7 @@ impl GameState {
                 continue;
             }
             let closest = start + dir * t;
-            if (ent.v.origin - closest).length_squared()
-                <= SHOOTABLE_GRENADE_HIT_RADIUS * SHOOTABLE_GRENADE_HIT_RADIUS
+            if (ent.v.origin - closest).length_squared() <= SHOOTABLE_GRENADE_HIT_RADIUS * SHOOTABLE_GRENADE_HIT_RADIUS
             {
                 best = t;
                 hit = Some(EntId(i as u32));
@@ -105,12 +96,7 @@ impl GameState {
         hit
     }
 
-    fn try_detonate_shootable_grenade_on_line(
-        &mut self,
-        start: Vec3,
-        end: Vec3,
-        max_fraction: f32,
-    ) -> bool {
+    fn try_detonate_shootable_grenade_on_line(&mut self, start: Vec3, end: Vec3, max_fraction: f32) -> bool {
         if !self.shootable_grenades_enabled() {
             return false;
         }
@@ -234,8 +220,7 @@ impl GameState {
         let mut multi_damage = 0.0f32;
 
         for _ in 0..shotcount {
-            let direction =
-                dir + crandom(self) * spread.x * v_right + crandom(self) * spread.y * v_up;
+            let direction = dir + crandom(self) * spread.x * v_right + crandom(self) * spread.y * v_up;
             let end = src + direction * 2048.0;
             let tr = self.traceline(src, end, false, e);
             if self.try_detonate_shootable_grenade_on_line(src, end, tr.fraction) {
@@ -550,10 +535,7 @@ impl GameState {
         let shootable = self.shootable_grenades_enabled();
         let m = self.spawn();
         let velocity = if v_angle.x != 0.0 {
-            v_forward * 600.0
-                + v_up * 200.0
-                + crandom(self) * v_right * 10.0
-                + crandom(self) * v_up * 10.0
+            v_forward * 600.0 + v_up * 200.0 + crandom(self) * v_right * 10.0 + crandom(self) * v_up * 10.0
         } else {
             let mut vel = self.aim_dir(e) * 600.0;
             vel.z = 200.0;
@@ -580,8 +562,7 @@ impl GameState {
         }
         self.host.set_model(m, Model::PROGS_GRENADE);
         if shootable {
-            self.host
-                .set_size(m, SHOOTABLE_GRENADE_MINS, SHOOTABLE_GRENADE_MAXS);
+            self.host.set_size(m, SHOOTABLE_GRENADE_MINS, SHOOTABLE_GRENADE_MAXS);
         } else {
             self.host.set_size(m, Vec3::ZERO, Vec3::ZERO);
         }
@@ -885,7 +866,16 @@ impl GameState {
         ent.v.ammo_shells = 100.0;
         ent.v.ammo_cells = 200.0;
         ent.v.items = ent.v.items.with(
-            Items::AXE | Items::SHOTGUN | Items::SUPER_SHOTGUN | Items::NAILGUN | Items::SUPER_NAILGUN | Items::GRENADE_LAUNCHER | Items::ROCKET_LAUNCHER | Items::LIGHTNING | Items::KEY1 | Items::KEY2,
+            Items::AXE
+                | Items::SHOTGUN
+                | Items::SUPER_SHOTGUN
+                | Items::NAILGUN
+                | Items::SUPER_NAILGUN
+                | Items::GRENADE_LAUNCHER
+                | Items::ROCKET_LAUNCHER
+                | Items::LIGHTNING
+                | Items::KEY1
+                | Items::KEY2,
         );
         ent.v.weapon = Weapon::RocketLauncher;
         ent.v.impulse = 0.0;
@@ -933,9 +923,7 @@ impl GameState {
             w if w == Items::SUPER_SHOTGUN => v.ammo_shells >= 2.0,
             w if w == Items::NAILGUN => v.ammo_nails >= 1.0,
             w if w == Items::SUPER_NAILGUN => v.ammo_nails >= 2.0,
-            w if w == Items::GRENADE_LAUNCHER || w == Items::ROCKET_LAUNCHER => {
-                v.ammo_rockets >= 1.0
-            }
+            w if w == Items::GRENADE_LAUNCHER || w == Items::ROCKET_LAUNCHER => v.ammo_rockets >= 1.0,
             w if w == Items::LIGHTNING => v.ammo_cells >= 1.0,
             _ => true, // axe
         }

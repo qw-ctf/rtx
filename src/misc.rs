@@ -5,14 +5,12 @@
 //! ordinary still entities rather than via `makestatic`, which keeps edict bookkeeping
 //! simple; rarely-used set pieces are spawned inert.)
 
-
 use glam::Vec3;
 
 use crate::assets::{Model, Sound};
 use crate::defs::*;
 use crate::entity::{Die, EntId, Use};
 use crate::game::GameState;
-
 
 impl GameState {
     /// `info_null` — a target placeholder that removes itself.

@@ -157,11 +157,7 @@ impl GameState {
             if self.entities[t].classname() == Some("trigger_hurt") {
                 let te = &mut self.entities[t];
                 te.mover.dmg = amount;
-                te.v.solid = if amount == 0.0 {
-                    Solid::Not
-                } else {
-                    Solid::Trigger
-                };
+                te.v.solid = if amount == 0.0 { Solid::Not } else { Solid::Trigger };
                 te.v.nextthink = -1.0;
             } else if self.entities[t].classname() == Some("func_movewall") {
                 self.entities[t].mover.dmg = amount;
@@ -246,10 +242,7 @@ impl GameState {
     pub(crate) fn rotate_entity_firstthink(&mut self, e: EntId) {
         self.link_rotate_targets(e);
         let t = self.time();
-        let start_on = self.entities[e]
-            .v
-            .spawnflags
-            .has(RotateEntityFlags::START_ON);
+        let start_on = self.entities[e].v.spawnflags.has(RotateEntityFlags::START_ON);
         let ent = &mut self.entities[e];
         if start_on {
             ent.rot.phase = RotPhase::Active;
@@ -860,11 +853,7 @@ impl GameState {
         };
         let (targ_origin, targ_angles_flag, targ_angles) = {
             let tv = &self.entities[targ];
-            (
-                tv.v.origin,
-                tv.v.spawnflags.has(PathRotateFlags::ANGLES),
-                tv.v.angles,
-            )
+            (tv.v.origin, tv.v.spawnflags.has(PathRotateFlags::ANGLES), tv.v.angles)
         };
 
         // `speed == -1` warps straight to the next corner after the wait.
@@ -966,8 +955,7 @@ impl GameState {
         if self.entities[targ].classname() == Some("path_rotate") {
             Some(targ)
         } else {
-            self.host
-                .dprint(c"rotate_train: next target is not a path_rotate\n");
+            self.host.dprint(c"rotate_train: next target is not a path_rotate\n");
             None
         }
     }

@@ -165,10 +165,7 @@ impl GameState {
     }
 
     /// Live entities whose `targetname` matches `name`.
-    pub(crate) fn find_by_targetname<'a>(
-        &'a self,
-        name: &'a str,
-    ) -> impl Iterator<Item = EntId> + 'a {
+    pub(crate) fn find_by_targetname<'a>(&'a self, name: &'a str) -> impl Iterator<Item = EntId> + 'a {
         self.entities
             .iter()
             .enumerate()
@@ -177,10 +174,7 @@ impl GameState {
     }
 
     /// Live entities whose `group` matches `name` (used by rotating-door groups).
-    pub(crate) fn find_by_group<'a>(
-        &'a self,
-        name: &'a str,
-    ) -> impl Iterator<Item = EntId> + 'a {
+    pub(crate) fn find_by_group<'a>(&'a self, name: &'a str) -> impl Iterator<Item = EntId> + 'a {
         self.entities
             .iter()
             .enumerate()

@@ -164,9 +164,7 @@ fn weapon_spec(item: Items) -> Option<&'static WeaponSpec> {
 }
 
 fn weapon_spec_for_classname(classname: &str) -> Option<&'static WeaponSpec> {
-    WEAPON_SPECS
-        .iter()
-        .find(|spec| spec.classname == Some(classname))
+    WEAPON_SPECS.iter().find(|spec| spec.classname == Some(classname))
 }
 
 impl GameState {
@@ -280,8 +278,7 @@ impl GameState {
         let time = self.time();
         if healtype == 2.0 {
             // Megahealth: rot back down later, no normal respawn.
-            self.entities[other].v.items =
-                self.entities[other].v.items.with(Items::SUPERHEALTH);
+            self.entities[other].v.items = self.entities[other].v.items.with(Items::SUPERHEALTH);
             self.pickup_hide(e);
             if self.level.deathmatch != 4 {
                 let ent = &mut self.entities[e];
@@ -310,8 +307,7 @@ impl GameState {
             self.entities[e].v.nextthink = time + 1.0;
             return;
         }
-        self.entities[owner].v.items =
-            self.entities[owner].v.items.without(Items::SUPERHEALTH);
+        self.entities[owner].v.items = self.entities[owner].v.items.without(Items::SUPERHEALTH);
         if self.level.deathmatch != 2 {
             let ent = &mut self.entities[e];
             ent.v.nextthink = time + 20.0;
@@ -366,11 +362,7 @@ impl GameState {
         let dm = self.level.deathmatch;
         let leave = dm == 2 || dm == 3 || dm == 5;
 
-        let Some(spec) = self
-            .entities[e]
-            .classname()
-            .and_then(weapon_spec_for_classname)
-        else {
+        let Some(spec) = self.entities[e].classname().and_then(weapon_spec_for_classname) else {
             return;
         };
         let Some(ammo_field) = spec.ammo_kind else {
@@ -477,8 +469,7 @@ impl GameState {
         let item_bits = self.entities[e].v.items;
 
         self.item_pickup_sound(e, other, Channel::Voice);
-        self.entities[other].v.items =
-            self.entities[other].v.items.with(item_bits);
+        self.entities[other].v.items = self.entities[other].v.items.with(item_bits);
 
         match class.as_deref() {
             Some("item_artifact_envirosuit") => {
@@ -566,7 +557,14 @@ impl GameState {
     pub(crate) fn drop_backpack(&mut self, e: EntId) {
         let (shells, nails, rockets, cells, weapon, origin) = {
             let v = &self.entities[e].v;
-            (v.ammo_shells, v.ammo_nails, v.ammo_rockets, v.ammo_cells, v.weapon, v.origin)
+            (
+                v.ammo_shells,
+                v.ammo_nails,
+                v.ammo_rockets,
+                v.ammo_cells,
+                v.weapon,
+                v.origin,
+            )
         };
         if shells + nails + rockets + cells == 0.0 {
             return;
@@ -649,8 +647,7 @@ impl GameState {
     // --- small helpers ---
 
     fn is_live_player(&self, e: EntId) -> bool {
-        self.entities[e].classname() == Some("player")
-            && self.entities[e].v.health > 0.0
+        self.entities[e].classname() == Some("player") && self.entities[e].v.health > 0.0
     }
 
     fn sprint_low(&self, e: EntId, msg: &str) {
@@ -713,8 +710,7 @@ impl GameState {
             ent.item.healamount = 25.0;
             ent.item.healtype = 1.0;
         }
-        self.host
-            .set_size(e, Vec3::ZERO, Vec3::new(32.0, 32.0, 56.0));
+        self.host.set_size(e, Vec3::ZERO, Vec3::new(32.0, 32.0, 56.0));
         self.start_item(e);
         true
     }
@@ -780,8 +776,7 @@ impl GameState {
             ent.v.weapon = Weapon::from_f32(weapon_code);
             ent.netname = Some(netname.into());
         }
-        self.host
-            .set_size(e, Vec3::ZERO, Vec3::new(32.0, 32.0, 56.0));
+        self.host.set_size(e, Vec3::ZERO, Vec3::new(32.0, 32.0, 56.0));
         self.start_item(e);
         true
     }
@@ -810,17 +805,12 @@ impl GameState {
         true
     }
 
-    pub(crate) fn current_weapon_ammo_state(
-        &self,
-        player: EntId,
-    ) -> (f32, Option<Model>, Items) {
+    pub(crate) fn current_weapon_ammo_state(&self, player: EntId) -> (f32, Option<Model>, Items) {
         let v = &self.entities[player].v;
         let Some(spec) = weapon_spec(v.weapon.item()) else {
             return (0.0, None, Items::empty());
         };
-        let ammo = spec
-            .ammo_kind
-            .map_or(0.0, |kind| self.ammo_of(player, kind));
+        let ammo = spec.ammo_kind.map_or(0.0, |kind| self.ammo_of(player, kind));
         (ammo, spec.view_model, spec.ammo_bit)
     }
 }

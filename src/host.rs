@@ -15,8 +15,8 @@ use std::ffi::CString;
 use glam::Vec3;
 
 use crate::assets::{Model, Sound};
-use crate::entity::{EntId, Entity};
 use crate::defs::{Attenuation, Channel, MsgDest, Multicast, PrintLevel, Svc, Te};
+use crate::entity::{EntId, Entity};
 
 /// The host-provided dispatcher. Variadic, C ABI; calling it is `unsafe`.
 pub type SyscallFn = unsafe extern "C" fn(arg: isize, ...) -> isize;
@@ -205,9 +205,7 @@ impl HostApi {
 
     /// `G_CVAR_SET` — set a cvar from a string.
     pub fn cvar_set(&self, name: &CStr, value: &CStr) {
-        unsafe {
-            (self.syscall)(B::CvarSet as isize, name.as_ptr() as isize, value.as_ptr() as isize)
-        };
+        unsafe { (self.syscall)(B::CvarSet as isize, name.as_ptr() as isize, value.as_ptr() as isize) };
     }
 
     /// `G_CVAR_SET_FLOAT` — set a cvar from a float.
@@ -441,9 +439,7 @@ impl HostApi {
 
     /// `G_POINTCONTENTS` — the `Content` value at a point (compare via `Content::X.as_f32()`).
     pub fn pointcontents(&self, p: Vec3) -> f32 {
-        unsafe {
-            (self.syscall)(B::PointContents as isize, pf(p.x), pf(p.y), pf(p.z)) as i32 as f32
-        }
+        unsafe { (self.syscall)(B::PointContents as isize, pf(p.x), pf(p.y), pf(p.z)) as i32 as f32 }
     }
 
     /// `G_CENTERPRINT` — center-screen message to one client.
@@ -729,15 +725,7 @@ impl HostApi {
     /// from `start` to `end`, writing results into the engine's `trace_*` globals. Used to
     /// verify jump/drop arcs clear geometry. `nomonsters` follows QuakeC.
     #[allow(clippy::too_many_arguments)]
-    pub fn trace_capsule(
-        &self,
-        start: Vec3,
-        end: Vec3,
-        nomonsters: bool,
-        ignore: EntId,
-        mins: Vec3,
-        maxs: Vec3,
-    ) {
+    pub fn trace_capsule(&self, start: Vec3, end: Vec3, nomonsters: bool, ignore: EntId, mins: Vec3, maxs: Vec3) {
         unsafe {
             (self.syscall)(
                 B::TraceCapsule as isize,

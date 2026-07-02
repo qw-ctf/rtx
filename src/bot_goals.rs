@@ -54,7 +54,12 @@ enum Category {
     Health,
     /// `value`/`at` feed `TotalStrength`; `gate` is the current-absorb threshold above which it's
     /// not worth taking; `double` weights the cheap green armor up (matching ktx).
-    Armor { value: f32, at: f32, gate: f32, double: bool },
+    Armor {
+        value: f32,
+        at: f32,
+        gate: f32,
+        double: bool,
+    },
     Weapon(WeaponKind),
     Ammo(AmmoKind),
 }
@@ -65,13 +70,28 @@ fn category(classname: &str) -> Option<Category> {
     use AmmoKind::*;
     use WeaponKind::*;
     Some(match classname {
-        "item_artifact_super_damage"
-        | "item_artifact_invulnerability"
-        | "item_artifact_invisibility" => Category::Powerup,
+        "item_artifact_super_damage" | "item_artifact_invulnerability" | "item_artifact_invisibility" => {
+            Category::Powerup
+        }
         "item_health" => Category::Health,
-        "item_armor1" => Category::Armor { value: 100.0, at: 0.3, gate: 30.0, double: true },
-        "item_armor2" => Category::Armor { value: 150.0, at: 0.6, gate: 90.0, double: false },
-        "item_armorInv" => Category::Armor { value: 200.0, at: 0.8, gate: 160.0, double: false },
+        "item_armor1" => Category::Armor {
+            value: 100.0,
+            at: 0.3,
+            gate: 30.0,
+            double: true,
+        },
+        "item_armor2" => Category::Armor {
+            value: 150.0,
+            at: 0.6,
+            gate: 90.0,
+            double: false,
+        },
+        "item_armorInv" => Category::Armor {
+            value: 200.0,
+            at: 0.8,
+            gate: 160.0,
+            double: false,
+        },
         "weapon_supershotgun" => Category::Weapon(Ssg),
         "weapon_nailgun" => Category::Weapon(Ng),
         "weapon_supernailgun" => Category::Weapon(Sng),
@@ -182,7 +202,11 @@ fn weapon_desire(s: &Stats, w: WeaponKind) -> f32 {
             (20.0 - fp).max(0.0).max(nails)
         }
         WeaponKind::Ssg => {
-            let shells = if fp < 20.0 && s.shells < 50.0 { 2.5 - s.shells * 0.05 } else { 0.0 };
+            let shells = if fp < 20.0 && s.shells < 50.0 {
+                2.5 - s.shells * 0.05
+            } else {
+                0.0
+            };
             (20.0 - fp).max(0.0).max(shells)
         }
     }
@@ -193,13 +217,33 @@ fn weapon_desire(s: &Stats, w: WeaponKind) -> f32 {
 fn ammo_desire(s: &Stats, a: AmmoKind) -> f32 {
     let fp = s.firepower;
     match a {
-        AmmoKind::Rockets => if s.rockets < 100.0 { (20.0 - s.rockets).max(5.0) } else { 0.0 },
-        AmmoKind::Cells => if s.cells < 100.0 { ((50.0 - s.cells) * 0.2).max(2.5) } else { 0.0 },
+        AmmoKind::Rockets => {
+            if s.rockets < 100.0 {
+                (20.0 - s.rockets).max(5.0)
+            } else {
+                0.0
+            }
+        }
+        AmmoKind::Cells => {
+            if s.cells < 100.0 {
+                ((50.0 - s.cells) * 0.2).max(2.5)
+            } else {
+                0.0
+            }
+        }
         AmmoKind::Nails => {
-            if fp < 20.0 && s.nails < 200.0 { (2.5 - s.nails * 0.0125).max(0.0) } else { 0.0 }
+            if fp < 20.0 && s.nails < 200.0 {
+                (2.5 - s.nails * 0.0125).max(0.0)
+            } else {
+                0.0
+            }
         }
         AmmoKind::Shells => {
-            if fp < 20.0 && s.shells < 100.0 { (2.5 - s.shells * 0.05).max(0.0) } else { 0.0 }
+            if fp < 20.0 && s.shells < 100.0 {
+                (2.5 - s.shells * 0.05).max(0.0)
+            } else {
+                0.0
+            }
         }
     }
 }
@@ -248,10 +292,19 @@ impl GameState {
                     0.0
                 }
             }
-            Category::Armor { value, at, gate, double } => {
+            Category::Armor {
+                value,
+                at,
+                gate,
+                double,
+            } => {
                 if s.armor < gate {
                     let gain = (total_strength(s.health, value, at) - s.strength).max(0.0);
-                    if double { gain * 2.0 } else { gain }
+                    if double {
+                        gain * 2.0
+                    } else {
+                        gain
+                    }
                 } else {
                     0.0
                 }

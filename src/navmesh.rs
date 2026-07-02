@@ -142,7 +142,11 @@ impl NavGraph {
                 let (x, y) = (gx as f32 * GRID, gy as f32 * GRID);
                 Self::column_floors(bsp, x, y, |origin_z| {
                     let id = cells.len() as CellId;
-                    cells.push(Cell { origin: Vec3::new(x, y, origin_z), gx, gy });
+                    cells.push(Cell {
+                        origin: Vec3::new(x, y, origin_z),
+                        gx,
+                        gy,
+                    });
                     grid.entry((gx, gy)).or_default().push(id);
                 });
             }
@@ -208,7 +212,12 @@ impl NavGraph {
             return None;
         }
         let horiz = (b.origin.xy() - a.origin.xy()).length();
-        Some(Link { from, to, kind, cost: link_cost(kind, horiz, dz) })
+        Some(Link {
+            from,
+            to,
+            kind,
+            cost: link_cost(kind, horiz, dz),
+        })
     }
 
     /// Jump links out of `from`: only from a **ledge edge** (the adjacent column toward the
@@ -242,12 +251,15 @@ impl NavGraph {
             }
             let oct = dir_bucket(dgx, dgy);
             if best[oct].is_none_or(|(d, _)| horiz < d) {
-                best[oct] = Some((horiz, Link {
-                    from,
-                    to,
-                    kind: LinkKind::JumpGap,
-                    cost: link_cost(LinkKind::JumpGap, horiz, dz),
-                }));
+                best[oct] = Some((
+                    horiz,
+                    Link {
+                        from,
+                        to,
+                        kind: LinkKind::JumpGap,
+                        cost: link_cost(LinkKind::JumpGap, horiz, dz),
+                    },
+                ));
             }
         }
         best.into_iter().flatten().map(|(_, l)| l).collect()
@@ -309,9 +321,7 @@ impl NavGraph {
         if start == goal {
             return Some(Vec::new());
         }
-        let h = |c: CellId| {
-            (self.cells[goal as usize].origin - self.cells[c as usize].origin).length() / MAX_SPEED
-        };
+        let h = |c: CellId| (self.cells[goal as usize].origin - self.cells[c as usize].origin).length() / MAX_SPEED;
 
         // Min-heap on f = g + h (Reverse via a custom ordering on a NaN-free f32 key).
         struct Node {
@@ -341,7 +351,10 @@ impl NavGraph {
         let mut came_from = vec![u32::MAX; n]; // link index used to reach this cell
         let mut heap = BinaryHeap::new();
         g_cost[start as usize] = 0.0;
-        heap.push(Node { f: h(start), cell: start });
+        heap.push(Node {
+            f: h(start),
+            cell: start,
+        });
 
         while let Some(Node { cell, .. }) = heap.pop() {
             if cell == goal {
@@ -353,7 +366,10 @@ impl NavGraph {
                 if ng < g_cost[link.to as usize] {
                     g_cost[link.to as usize] = ng;
                     came_from[link.to as usize] = li;
-                    heap.push(Node { f: ng + h(link.to), cell: link.to });
+                    heap.push(Node {
+                        f: ng + h(link.to),
+                        cell: link.to,
+                    });
                 }
             }
         }
@@ -364,12 +380,7 @@ impl NavGraph {
     /// `goal` itself can't be reached. Lets a bot head as far toward an unreachable target as the
     /// graph allows — approaching a wall/door/connection to get line of sight — instead of homing
     /// straight into geometry. `None` only if nothing but `start` is reachable.
-    pub fn nearest_reachable_to(
-        &self,
-        start: CellId,
-        goal: CellId,
-        gate_closed: &[bool],
-    ) -> Option<CellId> {
+    pub fn nearest_reachable_to(&self, start: CellId, goal: CellId, gate_closed: &[bool]) -> Option<CellId> {
         let costs = self.costs_from(start, gate_closed);
         let goal_pos = self.cells[goal as usize].origin;
         (0..self.cells.len() as CellId)
@@ -534,7 +545,12 @@ impl NavGraph {
             let hi = Vec3::new(t.tmax.x, t.tmax.y, t.tmax.z + 24.0);
             for c in self.cells_in_box(lo, hi) {
                 if c != dest {
-                    self.push_link(Link { from: c, to: dest, kind: LinkKind::Teleport, cost: 0.2 });
+                    self.push_link(Link {
+                        from: c,
+                        to: dest,
+                        kind: LinkKind::Teleport,
+                        cost: 0.2,
+                    });
                 }
             }
         }
@@ -961,7 +977,11 @@ mod tests {
             .unwrap();
         let (start, reached) = (best[0], best.len());
         let reach_frac = reached as f32 / g.cells.len() as f32;
-        eprintln!("best directed reach: {reached}/{} = {:.0}%", g.cells.len(), reach_frac * 100.0);
+        eprintln!(
+            "best directed reach: {reached}/{} = {:.0}%",
+            g.cells.len(),
+            reach_frac * 100.0
+        );
 
         // Assert A* returns a valid chain to the farthest reachable cell.
         let goal = *best.last().unwrap();
@@ -975,7 +995,11 @@ mod tests {
         }
         assert_eq!(cell, goal, "route did not reach goal");
         eprintln!("A*: route to {goal} is {} links", route.len());
-        assert!(reach_frac > 0.4, "best directed reach too low: {:.0}%", reach_frac * 100.0);
+        assert!(
+            reach_frac > 0.4,
+            "best directed reach too low: {:.0}%",
+            reach_frac * 100.0
+        );
 
         // Plat splice: synthesize a lift whose board sits just above a well-connected cell and
         // whose exit is another reachable cell; confirm the ride + board cell wire in. (The
@@ -1019,6 +1043,9 @@ mod tests {
         // The state-aware A* still resolves with the gate shut (routes around, or through with the
         // penalty when there's no other way).
         assert!(g.find_path(start, goal, &[true]).is_some(), "no route with gate shut");
-        eprintln!("gate splice: {gated_links} gated links, button cell {}", g.gate(0).button_cell);
+        eprintln!(
+            "gate splice: {gated_links} gated links, button cell {}",
+            g.gate(0).button_cell
+        );
     }
 }

@@ -78,13 +78,7 @@ impl GameState {
     }
 
     /// `T_Damage` — the only function that reduces health.
-    pub(crate) fn t_damage(
-        &mut self,
-        targ: EntId,
-        inflictor: EntId,
-        attacker: EntId,
-        mut damage: f32,
-    ) {
+    pub(crate) fn t_damage(&mut self, targ: EntId, inflictor: EntId, attacker: EntId, mut damage: f32) {
         if self.entities[targ].v.takedamage == 0.0 {
             return;
         }
@@ -136,16 +130,12 @@ impl GameState {
             let v = &self.entities[inflictor].v;
             (v.absmin + v.absmax) * 0.5
         };
-        if inflictor != EntId::WORLD
-            && self.entities[targ].v.movetype == MoveType::Walk
-        {
+        if inflictor != EntId::WORLD && self.entities[targ].v.movetype == MoveType::Walk {
             let dir = (self.entities[targ].v.origin - inflictor_org).normalize_or_zero();
             self.entities[targ].v.velocity += dir * damage * 8.0;
 
             let rj = self.host.cvar(c"rj");
-            if rj > 1.0
-                && self.same_player_netname(attacker, targ)
-            {
+            if rj > 1.0 && self.same_player_netname(attacker, targ) {
                 self.entities[targ].v.velocity += dir * damage * rj;
             }
         }
@@ -302,11 +292,7 @@ impl GameState {
     /// A display name for an entity (its stored netname, else its classname).
     pub(crate) fn netname_of(&self, ent: EntId) -> String {
         let e = &self.entities[ent];
-        e.netname
-            .as_deref()
-            .or_else(|| e.classname())
-            .unwrap_or("")
-            .to_owned()
+        e.netname.as_deref().or_else(|| e.classname()).unwrap_or("").to_owned()
     }
 }
 

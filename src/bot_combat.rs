@@ -52,27 +52,51 @@ fn choose_weapon(g: &GameState, e: EntId, dist: f32) -> WeaponChoice {
     // unarmed (audience never gets here).
     if dist < SPLASH_RANGE {
         if have(Items::SUPER_SHOTGUN) && v.ammo_shells >= 2.0 {
-            return WeaponChoice { impulse: 3, weapon: Weapon::SuperShotgun, projectile_speed: 0.0 };
+            return WeaponChoice {
+                impulse: 3,
+                weapon: Weapon::SuperShotgun,
+                projectile_speed: 0.0,
+            };
         }
         if have(Items::SHOTGUN) && v.ammo_shells >= 1.0 {
-            return WeaponChoice { impulse: 2, weapon: Weapon::Shotgun, projectile_speed: 0.0 };
+            return WeaponChoice {
+                impulse: 2,
+                weapon: Weapon::Shotgun,
+                projectile_speed: 0.0,
+            };
         }
     }
 
     // Mid range: the lightning gun (fast, high DPS) when fed.
     if dist < PREFERRED_RANGE + 150.0 && have(Items::LIGHTNING) && v.ammo_cells >= 1.0 {
-        return WeaponChoice { impulse: 8, weapon: Weapon::Lightning, projectile_speed: 0.0 };
+        return WeaponChoice {
+            impulse: 8,
+            weapon: Weapon::Lightning,
+            projectile_speed: 0.0,
+        };
     }
 
     // Default: the rocket launcher (projectile, lead the target).
     if have(Items::ROCKET_LAUNCHER) && v.ammo_rockets >= 1.0 {
-        return WeaponChoice { impulse: 7, weapon: Weapon::RocketLauncher, projectile_speed: ROCKET_SPEED };
+        return WeaponChoice {
+            impulse: 7,
+            weapon: Weapon::RocketLauncher,
+            projectile_speed: ROCKET_SPEED,
+        };
     }
     // Ammo-starved fallbacks.
     if have(Items::SUPER_SHOTGUN) && v.ammo_shells >= 2.0 {
-        return WeaponChoice { impulse: 3, weapon: Weapon::SuperShotgun, projectile_speed: 0.0 };
+        return WeaponChoice {
+            impulse: 3,
+            weapon: Weapon::SuperShotgun,
+            projectile_speed: 0.0,
+        };
     }
-    WeaponChoice { impulse: 1, weapon: Weapon::Axe, projectile_speed: 0.0 }
+    WeaponChoice {
+        impulse: 1,
+        weapon: Weapon::Axe,
+        projectile_speed: 0.0,
+    }
 }
 
 /// How long after losing sight of the enemy the bot keeps *holding the angle* where they vanished
@@ -211,8 +235,7 @@ pub(crate) fn engage(
     if now >= game.entities[e].bot.aim_err_until {
         let (r1, r2, r3) = (game.random(), game.random(), game.random());
         let b = &mut game.entities[e].bot;
-        b.aim_err_target =
-            Vec3::new((r1 - 0.5) * spread, (r2 - 0.5) * 2.0 * spread, 0.0);
+        b.aim_err_target = Vec3::new((r1 - 0.5) * spread, (r2 - 0.5) * 2.0 * spread, 0.0);
         b.aim_err_until = now + 0.3 + r3 * 0.3;
     }
     let err = {
@@ -252,7 +275,11 @@ pub(crate) fn engage(
 
     // Movement (world-space): hold a preferred range and strafe to dodge; retreat when hurt.
     let health = game.entities[e].v.health;
-    let strafe_sign = if ((now * 0.9) + e.0 as f32).sin() >= 0.0 { 1.0 } else { -1.0 };
+    let strafe_sign = if ((now * 0.9) + e.0 as f32).sin() >= 0.0 {
+        1.0
+    } else {
+        -1.0
+    };
     let want_forward = if health < LOW_HEALTH || dist < PREFERRED_RANGE - 100.0 {
         -MOVE_SPEED // back off
     } else if dist > PREFERRED_RANGE + 100.0 {
@@ -299,7 +326,10 @@ mod tests {
         let v = Vec3::new(0.0, 320.0, 0.0);
         let s = 1000.0;
         let t = intercept_time(r, v, s).expect("intercept exists");
-        assert!(t > 0.4, "perpendicular motion must lengthen the flight (naive 0.4), got {t}");
+        assert!(
+            t > 0.4,
+            "perpendicular motion must lengthen the flight (naive 0.4), got {t}"
+        );
         let miss = ((r + v * t).length() - s * t).abs();
         assert!(miss < 0.1, "intercept not on the projectile sphere: off by {miss}");
 

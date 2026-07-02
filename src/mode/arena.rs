@@ -199,9 +199,7 @@ impl GameMode for Arena {
                 // Before the round goes live (countdown), roam the arena to take up a position,
                 // rather than standing on the spawn (which looks dead and trips the stuck-jumper).
                 if !matches!(g.arena.round, RoundState::Live) {
-                    return Some(BotIntent::Move(
-                        self.wander_point(g, bot, "info_teleport_destination"),
-                    ));
+                    return Some(BotIntent::Move(self.wander_point(g, bot, "info_teleport_destination")));
                 }
                 Some(match nearest_enemy(g, bot) {
                     Some(enemy) => BotIntent::Fight(enemy),
@@ -209,9 +207,7 @@ impl GameMode for Arena {
                 })
             }
             // Eliminated / waiting: mill around the audience (the deathmatch spawns / stands).
-            ArenaRole::Audience => {
-                Some(BotIntent::Move(self.wander_point(g, bot, "info_player_deathmatch")))
-            }
+            ArenaRole::Audience => Some(BotIntent::Move(self.wander_point(g, bot, "info_player_deathmatch"))),
         }
     }
 }
@@ -257,9 +253,7 @@ impl Arena {
         while fighters < FIGHTER_SLOTS {
             let next = players(g)
                 .into_iter()
-                .filter(|&e| {
-                    g.entities[e].arena.role == ArenaRole::Audience && g.entities[e].arena.queue != 0
-                })
+                .filter(|&e| g.entities[e].arena.role == ArenaRole::Audience && g.entities[e].arena.queue != 0)
                 .min_by_key(|&e| g.entities[e].arena.queue);
             let Some(e) = next else { break }; // not enough players to fill the arena
             g.entities[e].arena.role = ArenaRole::Fighter;
@@ -274,9 +268,7 @@ impl Arena {
             if g.entities[e].arena.role != ArenaRole::Fighter {
                 continue;
             }
-            let winner_stays = carried.contains(&e)
-                && g.entities[e].v.health > 0.0
-                && g.entities[e].v.deadflag == 0.0;
+            let winner_stays = carried.contains(&e) && g.entities[e].v.health > 0.0 && g.entities[e].v.deadflag == 0.0;
             if winner_stays {
                 self.apply_loadout(g, e);
                 g.w_set_current_ammo(e);
@@ -297,10 +289,7 @@ impl Arena {
             g.entities[w].arena.round_wins += 1;
             let name = g.netname_of(w);
             let wins = g.entities[w].arena.round_wins;
-            g.broadcast(
-                PrintLevel::High,
-                &format!("{name} wins the round! ({wins} total)\n"),
-            );
+            g.broadcast(PrintLevel::High, &format!("{name} wins the round! ({wins} total)\n"));
         } else {
             g.broadcast(PrintLevel::High, "Round over — no survivor\n");
         }
@@ -374,14 +363,11 @@ fn live_fighters(g: &GameState) -> Vec<EntId> {
 /// last-man-standing round, no teams).
 fn nearest_enemy(g: &GameState, bot: EntId) -> Option<EntId> {
     let origin = g.entities[bot].v.origin;
-    live_fighters(g)
-        .into_iter()
-        .filter(|&e| e != bot)
-        .min_by(|&a, &b| {
-            let da = (g.entities[a].v.origin - origin).length_squared();
-            let db = (g.entities[b].v.origin - origin).length_squared();
-            da.total_cmp(&db)
-        })
+    live_fighters(g).into_iter().filter(|&e| e != bot).min_by(|&a, &b| {
+        let da = (g.entities[a].v.origin - origin).length_squared();
+        let db = (g.entities[b].v.origin - origin).length_squared();
+        da.total_cmp(&db)
+    })
 }
 
 /// Center-print a message to every connected human. Bots are fake clients with no connection, so

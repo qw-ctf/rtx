@@ -102,12 +102,7 @@ impl GameState {
         }
         let name = self.netname_of(other);
         self.broadcast(PrintLevel::High, &format!("{name} exited the level\n"));
-        self.level.nextmap = self
-            .entities[e]
-            .map
-            .as_deref()
-            .unwrap_or("")
-            .to_owned();
+        self.level.nextmap = self.entities[e].map.as_deref().unwrap_or("").to_owned();
         self.activator = other;
         self.sub_use_targets(e);
         let time = self.time();

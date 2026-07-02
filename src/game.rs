@@ -13,16 +13,15 @@ use std::ffi::CString;
 
 use glam::Vec3;
 
-use crate::assets::{Model, Sound};
 use crate::abi::{
-    Field, FieldType, GameData, GlobalVars, STRING_REF_COUNT, STRING_REF_NETNAME,
-    STRING_REF_WEAPONMODEL,
+    Field, FieldType, GameData, GlobalVars, STRING_REF_COUNT, STRING_REF_NETNAME, STRING_REF_WEAPONMODEL,
 };
-use crate::{defs, ext_field};
+use crate::assets::{Model, Sound};
 use crate::entity::{EntId, Entities, Entity};
 use crate::game_command::GameCommand;
 use crate::host::{HostApi, SyscallFn};
 use crate::world;
+use crate::{defs, ext_field};
 
 /// Matches `MAX_EDICTS` in `ktx/include/q_shared.h`.
 pub const MAX_EDICTS: usize = 2048;
@@ -284,8 +283,7 @@ impl GameState {
     /// See [`EntVars::link_string_refs`] for the ABI; mirrors ktx's `initialise_spawned_ent`.
     fn setup_string_refs(&mut self, id: EntId) {
         // Byte offset, within the whole entity array, of this entity's first scratch cell.
-        let base = id.index() * core::mem::size_of::<Entity>()
-            + core::mem::offset_of!(Entity, string_refs);
+        let base = id.index() * core::mem::size_of::<Entity>() + core::mem::offset_of!(Entity, string_refs);
 
         let ent = &mut self.entities[id];
         ent.string_refs = [0; STRING_REF_COUNT];
@@ -343,17 +341,10 @@ impl GameState {
 
     /// `traceline` — trace from `start` to `end` and read the result out of the engine
     /// globals into a value (so callers don't juggle the shared `trace_*` block).
-    pub(crate) fn traceline(
-        &mut self,
-        start: Vec3,
-        end: Vec3,
-        nomonsters: bool,
-        ignore: EntId,
-    ) -> TraceResult {
+    pub(crate) fn traceline(&mut self, start: Vec3, end: Vec3, nomonsters: bool, ignore: EntId) -> TraceResult {
         // The traceline builtin takes the ignore entity as an edict *index* (it runs
         // `EdictNum(arg)`), unlike entvars `.entity` fields which store byte offsets.
-        self.host
-            .traceline(start, end, nomonsters, ignore);
+        self.host.traceline(start, end, nomonsters, ignore);
         let g = &self.globals;
         TraceResult {
             allsolid: g.trace_allsolid != 0.0,
@@ -387,8 +378,7 @@ impl GameState {
     /// Play the entity's `.noise` sound on `chan` at full volume (no-op if unset).
     pub(crate) fn play_noise(&self, e: EntId, chan: defs::Channel) {
         if let Some(noise) = self.entities[e].noise {
-            self.host
-                .sound(e, chan, noise, 1.0, defs::Attenuation::Norm);
+            self.host.sound(e, chan, noise, 1.0, defs::Attenuation::Norm);
         }
     }
 
@@ -420,8 +410,7 @@ impl GameState {
             return 0;
         }
         // mvdsv: declare that we use 64-bit string references.
-        self.host
-            .cvar_set_float(cstr(b"sv_pr2references\0"), 1.0);
+        self.host.cvar_set_float(cstr(b"sv_pr2references\0"), 1.0);
 
         // The engine wipes its extension-trap table on every map load (and the field-reference
         // cookie is regenerated), so the registration and resolved field refs from a previous map
@@ -474,7 +463,8 @@ impl GameState {
 
         // conprint (not dprint) so it shows without `developer 1` — lets you confirm at a glance
         // that the freshly built module is the one actually loaded.
-        self.host.conprint(cstr(b"rtx: QuakeWorld game module loaded (bot-goals build)\n\0"));
+        self.host
+            .conprint(cstr(b"rtx: QuakeWorld game module loaded (bot-goals build)\n\0"));
 
         // `self.game_data` lives inside the OnceLock-pinned GameState, so its address is
         // stable for the process — safe to hand to the engine.
@@ -552,7 +542,8 @@ impl GameState {
 
         let path = cstring(&format!("maps/{}.bsp", self.level.mapname));
         let Some(bytes) = self.host.read_file(&path) else {
-            self.host.dprint(c"rtx: navmesh: could not read map BSP; bots disabled\n");
+            self.host
+                .dprint(c"rtx: navmesh: could not read map BSP; bots disabled\n");
             return;
         };
         // Gather the entity-derived inputs on the main thread (they read the spawned entities),
@@ -584,7 +575,8 @@ impl GameState {
         };
         self.nav.pending = None;
         let Some((bsp, graph)) = built else {
-            self.host.dprint(c"rtx: navmesh: unsupported/malformed BSP; bots disabled\n");
+            self.host
+                .dprint(c"rtx: navmesh: unsupported/malformed BSP; bots disabled\n");
             return;
         };
         let counts = graph.summary();
@@ -722,9 +714,7 @@ impl GameState {
             return None;
         }
         for (i, e) in self.entities.iter().enumerate() {
-            if !e.in_use
-                || (e.target.as_deref() != Some(tn) && e.killtarget.as_deref() != Some(tn))
-            {
+            if !e.in_use || (e.target.as_deref() != Some(tn) && e.killtarget.as_deref() != Some(tn)) {
                 continue;
             }
             // An intermediate (rotator, relay) is itself triggered — follow the chain back.
@@ -735,10 +725,7 @@ impl GameState {
                 continue;
             }
             // Leaf: the thing a player shoots or touches to fire the chain.
-            if matches!(
-                e.classname(),
-                Some("func_button" | "trigger_multiple" | "trigger_once")
-            ) {
+            if matches!(e.classname(), Some("func_button" | "trigger_multiple" | "trigger_once")) {
                 return Some((EntId(i as u32), e.v.health > 0.0));
             }
         }
@@ -847,9 +834,7 @@ impl GameState {
                 item_bit,
                 effect,
             } => self.spawn_powerup(id, model, noise, netname, item_bit, effect),
-            SpawnAction::Flame { model, skin, frame } => {
-                self.spawn_flame(id, model, skin, frame)
-            }
+            SpawnAction::Flame { model, skin, frame } => self.spawn_flame(id, model, skin, frame),
             SpawnAction::Explobox { model, size } => self.spawn_misc_explobox(id, model, size),
         }
     }
@@ -860,9 +845,15 @@ impl GameState {
         match class {
             // Positional markers scanned later (spawn points, teleport/intermission
             // destinations): kept in place with no behaviour of their own.
-            "info_player_start" | "info_player_start2" | "info_player_deathmatch"
-            | "info_player_coop" | "info_player_team1" | "info_player_team2"
-            | "info_player_team3" | "info_player_team4" | "info_intermission"
+            "info_player_start"
+            | "info_player_start2"
+            | "info_player_deathmatch"
+            | "info_player_coop"
+            | "info_player_team1"
+            | "info_player_team2"
+            | "info_player_team3"
+            | "info_player_team4"
+            | "info_intermission"
             | "info_notnull" => SpawnAction::Keep,
 
             // items.qc
@@ -870,10 +861,12 @@ impl GameState {
             "item_armor1" => SpawnAction::Armor(0.0),
             "item_armor2" => SpawnAction::Armor(1.0),
             "item_armorInv" => SpawnAction::Armor(2.0),
-            "weapon_supershotgun" | "weapon_nailgun" | "weapon_supernailgun"
-            | "weapon_grenadelauncher" | "weapon_rocketlauncher" | "weapon_lightning" => {
-                SpawnAction::Weapon
-            }
+            "weapon_supershotgun"
+            | "weapon_nailgun"
+            | "weapon_supernailgun"
+            | "weapon_grenadelauncher"
+            | "weapon_rocketlauncher"
+            | "weapon_lightning" => SpawnAction::Weapon,
             "item_shells" => SpawnAction::Ammo {
                 weapon_code: 1.0,
                 netname: "shells",
@@ -946,9 +939,7 @@ impl GameState {
             "trigger_push" => SpawnAction::Spawn(GameState::spawn_trigger_push),
             "trigger_monsterjump" => SpawnAction::Spawn(GameState::spawn_trigger_monsterjump),
             "trigger_changelevel" => SpawnAction::Spawn(GameState::spawn_trigger_changelevel),
-            "info_teleport_destination" => {
-                SpawnAction::Spawn(GameState::spawn_info_teleport_destination)
-            }
+            "info_teleport_destination" => SpawnAction::Spawn(GameState::spawn_info_teleport_destination),
             // setskill/onlyregistered are start-map only: drop them.
             "trigger_setskill" => SpawnAction::Drop,
 
@@ -995,16 +986,12 @@ impl GameState {
                 skin: 1.0,
                 frame: true,
             },
-            "light_flame_small_yellow" | "light_flame_small_white" => {
-                SpawnAction::Flame {
-                    model: Model::PROGS_FLAME2,
-                    skin: 0.0,
-                    frame: true,
-                }
-            }
-            "func_wall" | "func_episodegate" | "func_bossgate" => {
-                SpawnAction::Spawn(GameState::spawn_func_wall)
-            }
+            "light_flame_small_yellow" | "light_flame_small_white" => SpawnAction::Flame {
+                model: Model::PROGS_FLAME2,
+                skin: 0.0,
+                frame: true,
+            },
+            "func_wall" | "func_episodegate" | "func_bossgate" => SpawnAction::Spawn(GameState::spawn_func_wall),
             "func_illusionary" => SpawnAction::Spawn(GameState::spawn_func_illusionary),
             "misc_explobox" => SpawnAction::Explobox {
                 model: Model::MAPS_B_EXPLOB,
@@ -1158,10 +1145,7 @@ impl GameState {
     }
 
     /// Live entities whose classname matches `name` (the QuakeC `find(... classname ...)`).
-    pub(crate) fn find_by_classname<'a>(
-        &'a self,
-        name: &'a str,
-    ) -> impl Iterator<Item = EntId> + 'a {
+    pub(crate) fn find_by_classname<'a>(&'a self, name: &'a str) -> impl Iterator<Item = EntId> + 'a {
         self.entities
             .iter()
             .enumerate()

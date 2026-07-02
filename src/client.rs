@@ -9,8 +9,8 @@ use core::ffi::CStr;
 
 use glam::Vec3;
 
-use crate::assets::{Model, Sound};
 use crate::abi::EntVars;
+use crate::assets::{Model, Sound};
 use crate::defs::*;
 use crate::entity::{CombatState, Die, EntId, Pain};
 use crate::game::GameState;
@@ -46,12 +46,7 @@ impl PlayerParms {
     fn from_survivor(v: &EntVars) -> Self {
         Self {
             items: v.items.without(
-                Items::KEY1
-                    | Items::KEY2
-                    | Items::INVISIBILITY
-                    | Items::INVULNERABILITY
-                    | Items::SUIT
-                    | Items::QUAD,
+                Items::KEY1 | Items::KEY2 | Items::INVISIBILITY | Items::INVULNERABILITY | Items::SUIT | Items::QUAD,
             ),
             health: v.health.clamp(50.0, 100.0),
             armorvalue: v.armorvalue,
@@ -184,7 +179,11 @@ impl GameState {
         // unset so a client is never accidentally pinned to a zero cap.
         let maxspeed = {
             let v = self.host.cvar(c"sv_maxspeed");
-            if v > 0.0 { v } else { 320.0 }
+            if v > 0.0 {
+                v
+            } else {
+                320.0
+            }
         };
         {
             let ent = &mut self.entities[player];
@@ -226,8 +225,6 @@ impl GameState {
         mode.apply_loadout(self, player);
         self.w_set_current_ammo(player);
 
-
-
         // The mode chooses the spawn point (arena vs. audience in Rocket Arena; a plain DM spawn
         // otherwise).
         let spot = mode.select_spawn(self, player);
@@ -251,8 +248,7 @@ impl GameState {
         self.level.modelindex_eyes = self.entities[player].v.modelindex;
         self.host.set_model(player, Model::PROGS_PLAYER);
         self.level.modelindex_player = self.entities[player].v.modelindex;
-        self.host
-            .set_size(player, VEC_HULL_MIN, VEC_HULL_MAX);
+        self.host.set_size(player, VEC_HULL_MIN, VEC_HULL_MAX);
         self.host.set_origin(player, origin);
 
         // Telefrag anyone already standing here, then kick off the idle animation loop.
@@ -310,7 +306,8 @@ impl GameState {
         if self.time() > self.entities[e].combat.attack_finished
             && v.currentammo == 0.0
             && v.weapon != Weapon::Axe
-            && v.weapon != Weapon::Grapple // the grapple uses no ammo — don't auto-switch off it
+            && v.weapon != Weapon::Grapple
+        // the grapple uses no ammo — don't auto-switch off it
         {
             let best = self.w_best_weapon(e);
             self.entities[e].v.weapon = best;
@@ -320,19 +317,14 @@ impl GameState {
 
     /// `PlayerPostThink` — runs after engine physics: landing damage, powerups, weapon loop.
     pub(crate) fn player_post_think(&mut self, e: EntId) {
-        if self.entities[e].v.view_ofs == Vec3::ZERO || self.entities[e].v.deadflag != 0.0
-        {
+        if self.entities[e].v.view_ofs == Vec3::ZERO || self.entities[e].v.deadflag != 0.0 {
             return;
         }
 
         // Landing sound / falling damage.
         let (jump_flag, on_ground, watertype) = {
             let ent = &self.entities[e];
-            (
-                ent.combat.jump_flag,
-                ent.v.flags.has(Flags::ONGROUND),
-                ent.v.watertype,
-            )
+            (ent.combat.jump_flag, ent.v.flags.has(Flags::ONGROUND), ent.v.watertype)
         };
         if jump_flag < -300.0 && on_ground {
             if watertype.is(Content::Water) {
@@ -423,12 +415,7 @@ impl GameState {
 
         let (deadflag, b0, b1, b2) = {
             let v = &self.entities[e].v;
-            (
-                self.entities[e].v.deadflag,
-                v.button0,
-                v.button1,
-                v.button2,
-            )
+            (self.entities[e].v.deadflag, v.button0, v.button1, v.button2)
         };
         if deadflag.is(DeadFlag::Dead) {
             if b0 != 0.0 || b1 != 0.0 || b2 != 0.0 {
@@ -467,7 +454,11 @@ impl GameState {
         if waterlevel >= 2.0 {
             if swim_flag < time {
                 self.entities[e].combat.swim_flag = time + 1.0;
-                let s = if self.random() < 0.5 { Sound::MISC_WATER1 } else { Sound::MISC_WATER2 };
+                let s = if self.random() < 0.5 {
+                    Sound::MISC_WATER1
+                } else {
+                    Sound::MISC_WATER2
+                };
                 self.host.sound(e, Channel::Body, s, 1.0, Attenuation::Norm);
             }
             return;
@@ -646,7 +637,13 @@ impl GameState {
         let time = self.time();
         let (movetype, health, waterlevel, watertype, air_finished) = {
             let ent = &self.entities[e];
-            (ent.v.movetype, ent.v.health, ent.v.waterlevel, ent.v.watertype, ent.combat.air_finished)
+            (
+                ent.v.movetype,
+                ent.v.health,
+                ent.v.waterlevel,
+                ent.v.watertype,
+                ent.combat.air_finished,
+            )
         };
         if movetype == MoveType::Noclip || health < 0.0 {
             return;
@@ -906,11 +903,7 @@ impl GameState {
         if spots.is_empty() {
             return EntId::WORLD;
         }
-        let free: Vec<EntId> = spots
-            .iter()
-            .copied()
-            .filter(|&s| !self.spot_occupied(s))
-            .collect();
+        let free: Vec<EntId> = spots.iter().copied().filter(|&s| !self.spot_occupied(s)).collect();
         let pool = if free.is_empty() { &spots } else { &free };
 
         let pick = (self.random() * pool.len() as f32) as usize;
@@ -929,9 +922,6 @@ impl GameState {
     /// Read the player's `name` userinfo key.
     pub(crate) fn read_netname(&self, player: EntId) -> String {
         let mut buf = [0u8; 64];
-        self.host
-            .infokey(player, c"name", &mut buf)
-            .to_owned()
+        self.host.infokey(player, c"name", &mut buf).to_owned()
     }
-
 }

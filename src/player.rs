@@ -8,11 +8,10 @@
 //! `GAME_EDICT_THINK` callback (the engine ignores the entvars `think` funcref for native
 //! modules and re-enters us whenever `nextthink` elapses).
 
-
 use glam::Vec3;
 
+use crate::anim::{frames, seq, Anim};
 use crate::assets::{Model, Sound};
-use crate::anim::{seq, Anim, frames};
 use crate::defs::*;
 use crate::entity::{CombatState, EntId, Think};
 use crate::game::GameState;
@@ -202,7 +201,14 @@ impl GameState {
     pub(crate) fn player_weapon_anim(&mut self, e: EntId) {
         let (wf, base, wf_base, len, fire, muzzle) = {
             let ent = &self.entities[e];
-            (ent.anim.walkframe, ent.anim.anim_base, ent.anim.anim_wf_base, ent.anim.anim_len, ent.anim.anim_fire, ent.anim.anim_muzzle)
+            (
+                ent.anim.walkframe,
+                ent.anim.anim_base,
+                ent.anim.anim_wf_base,
+                ent.anim.anim_len,
+                ent.anim.anim_fire,
+                ent.anim.anim_muzzle,
+            )
         };
         if wf == muzzle {
             self.muzzleflash(e);
@@ -379,7 +385,13 @@ impl GameState {
         let time = self.time();
         let (health, watertype, waterlevel, pain_finished, axhitme) = {
             let ent = &self.entities[e];
-            (ent.v.health, ent.v.watertype, ent.v.waterlevel, ent.combat.pain_finished, ent.combat.axhitme)
+            (
+                ent.v.health,
+                ent.v.watertype,
+                ent.v.waterlevel,
+                ent.combat.pain_finished,
+                ent.combat.axhitme,
+            )
         };
         if health < 0.0 {
             return;
@@ -391,12 +403,20 @@ impl GameState {
         }
         if watertype.is(Content::Water) && waterlevel == 3.0 {
             self.death_bubbles(e, 1.0);
-            let s = if self.random() > 0.5 { Sound::PLAYER_DROWN1 } else { Sound::PLAYER_DROWN2 };
+            let s = if self.random() > 0.5 {
+                Sound::PLAYER_DROWN1
+            } else {
+                Sound::PLAYER_DROWN2
+            };
             self.host.sound(e, Channel::Voice, s, 1.0, Attenuation::Norm);
             return;
         }
         if watertype.is(Content::Slime) || watertype.is(Content::Lava) {
-            let s = if self.random() > 0.5 { Sound::PLAYER_LBURN1 } else { Sound::PLAYER_LBURN2 };
+            let s = if self.random() > 0.5 {
+                Sound::PLAYER_LBURN1
+            } else {
+                Sound::PLAYER_LBURN2
+            };
             self.host.sound(e, Channel::Voice, s, 1.0, Attenuation::Norm);
             return;
         }
@@ -527,9 +547,19 @@ impl GameState {
             v.x += 200.0 * self.rng_unit();
             v.y += 200.0 * self.rng_unit();
         } else {
-            v = Vec3::new(100.0 * self.rng_unit(), 100.0 * self.rng_unit(), 200.0 + 100.0 * self.random());
+            v = Vec3::new(
+                100.0 * self.rng_unit(),
+                100.0 * self.rng_unit(),
+                200.0 + 100.0 * self.random(),
+            );
         }
-        v * if dm > -50.0 { 0.7 } else if dm > -200.0 { 2.0 } else { 10.0 }
+        v * if dm > -50.0 {
+            0.7
+        } else if dm > -200.0 {
+            2.0
+        } else {
+            10.0
+        }
     }
 
     /// `ThrowGib` — spawn a tumbling gib model.
@@ -575,7 +605,8 @@ impl GameState {
             ent.v.flags = ent.v.flags.without(Flags::ONGROUND);
             ent.v.avelocity = avel;
         }
-        self.host.set_size(e, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
+        self.host
+            .set_size(e, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
         let mut origin = self.entities[e].v.origin;
         origin.z -= 24.0;
         self.host.set_origin(e, origin);
@@ -595,7 +626,11 @@ impl GameState {
                 .sound(e, Channel::Voice, Sound::PLAYER_TELEDTH1, 1.0, Attenuation::None);
             return;
         }
-        let s = if self.random() < 0.5 { Sound::PLAYER_GIB } else { Sound::PLAYER_UDEATH };
+        let s = if self.random() < 0.5 {
+            Sound::PLAYER_GIB
+        } else {
+            Sound::PLAYER_UDEATH
+        };
         self.host.sound(e, Channel::Voice, s, 1.0, Attenuation::None);
     }
 

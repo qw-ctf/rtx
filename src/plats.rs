@@ -7,9 +7,7 @@ use glam::Vec3;
 
 use crate::assets::Sound;
 use crate::defs::*;
-use crate::entity::{
-    Blocked, EntId, Think, Touch, Use, STATE_BOTTOM, STATE_DOWN, STATE_TOP, STATE_UP,
-};
+use crate::entity::{Blocked, EntId, Think, Touch, Use, STATE_BOTTOM, STATE_DOWN, STATE_TOP, STATE_UP};
 use crate::game::GameState;
 
 impl GameState {
@@ -70,9 +68,7 @@ impl GameState {
 
     /// `plat_center_touch` — a player on the inner trigger raises/holds the plat.
     pub(crate) fn plat_center_touch(&mut self, e: EntId, other: EntId) {
-        if self.entities[other].classname() != Some("player")
-            || self.entities[other].v.health <= 0.0
-        {
+        if self.entities[other].classname() != Some("player") || self.entities[other].v.health <= 0.0 {
             return;
         }
         let plat = self.entities[e].enemy();

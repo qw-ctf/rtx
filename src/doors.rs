@@ -8,9 +8,7 @@ use glam::Vec3;
 
 use crate::assets::Sound;
 use crate::defs::*;
-use crate::entity::{
-    Blocked, Die, EntId, Think, Touch, Use, STATE_BOTTOM, STATE_DOWN, STATE_TOP, STATE_UP,
-};
+use crate::entity::{Blocked, Die, EntId, Think, Touch, Use, STATE_BOTTOM, STATE_DOWN, STATE_TOP, STATE_UP};
 use crate::game::GameState;
 
 impl GameState {

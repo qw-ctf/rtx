@@ -161,10 +161,7 @@ impl GameState {
         if next.name() != self.mode.name() {
             self.mode = next;
             self.arena = ArenaState::default();
-            host.conprint(&crate::game::cstring(&format!(
-                "rtx: game mode = {}\n",
-                next.name()
-            )));
+            host.conprint(&crate::game::cstring(&format!("rtx: game mode = {}\n", next.name())));
         }
     }
 }

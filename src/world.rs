@@ -32,13 +32,6 @@ pub fn worldspawn(game: &mut GameState) {
 
     // Models.
 
-
-
-
-
-
-
-
     // Light animation tables. 'a' is total darkness, 'z' is maxbright.
     host.lightstyle(0, c"m"); // 0 normal
     host.lightstyle(1, c"mmnmmommommnonmmonqnmmo"); // 1 FLICKER (first variety)

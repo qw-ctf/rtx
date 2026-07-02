@@ -78,7 +78,11 @@ pub fn manage_population(game: &mut GameState) {
 
     // Only field bots while at least one human is in the game — an empty server (or one whose
     // last human just left) wants none, so the trim path below removes them.
-    let want = if humans >= 1 { host.cvar(c"rtx_bots").max(0.0) as i32 } else { 0 };
+    let want = if humans >= 1 {
+        host.cvar(c"rtx_bots").max(0.0) as i32
+    } else {
+        0
+    };
 
     // Build the navmesh on demand the first time bots are actually wanted.
     if want > 0 {
@@ -120,8 +124,16 @@ fn add_one_bot(game: &mut GameState, index: i32) {
 
 /// A rotating set of bot names.
 fn bot_name(index: i32) -> &'static str {
-    const NAMES: [&str; 8] =
-        ["Grunt", "Ranger", "Visor", "Sarge", "Bitterman", "Hossman", "Daemia", "Klesk"];
+    const NAMES: [&str; 8] = [
+        "Grunt",
+        "Ranger",
+        "Visor",
+        "Sarge",
+        "Bitterman",
+        "Hossman",
+        "Daemia",
+        "Klesk",
+    ];
     NAMES[(index as usize) % NAMES.len()]
 }
 
@@ -243,9 +255,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
             (b.goal_item, b.goal_item_cell) = (new_item, new_cell);
             b.goal_select_time = now + GOAL_SELECT_INTERVAL;
         }
-        if game.entities[e].bot.goal_item != 0
-            && !game.item_goal_valid(e, EntId(game.entities[e].bot.goal_item), now)
-        {
+        if game.entities[e].bot.goal_item != 0 && !game.item_goal_valid(e, EntId(game.entities[e].bot.goal_item), now) {
             let b = &mut game.entities[e].bot;
             b.goal_item = 0;
             b.goal_select_time = now; // re-pick next frame
@@ -299,10 +309,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // Goal watchdog: while chasing an item and *not* already detouring to open a gate, give up on
     // one we've chased too long without collecting (behind an elevator/button/movewall/teleporter
     // chain the router can't thread) so we stop circling and go fetch something reachable instead.
-    if chasing
-        && game.entities[e].bot.gate.is_none()
-        && now - game.entities[e].bot.goal_started > GOAL_GIVEUP_TIME
-    {
+    if chasing && game.entities[e].bot.gate.is_none() && now - game.entities[e].bot.goal_started > GOAL_GIVEUP_TIME {
         let b = &mut game.entities[e].bot;
         b.avoid_item = b.goal_item;
         b.avoid_until = now + GOAL_AVOID_TIME;
@@ -410,8 +417,8 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // don't immediately re-camp on it.
     if bot.gate.is_none() {
         let avoid = if now < bot.avoid_gate_until { bot.avoid_gate } else { -1 };
-        let block = route_blocking_gate(graph, &bot.route, bot.route_pos, &gate_closed)
-            .filter(|&gi| gi as i32 != avoid);
+        let block =
+            route_blocking_gate(graph, &bot.route, bot.route_pos, &gate_closed).filter(|&gi| gi as i32 != avoid);
         if let Some(gi) = block {
             if button_reachable(graph, bot_cell, gi, &gate_closed) {
                 let button_cell = graph.gate(gi).button_cell;
@@ -527,8 +534,8 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // Opening a gate's button: once at it, face it and push (walk in) or shoot it.
     if let Some(gi) = bot.gate {
         let g = graph.gate(gi);
-        let at_button = bot.route_pos >= bot.route.len()
-            || (origin.xy() - graph.cell_origin(g.button_cell).xy()).length() < 40.0;
+        let at_button =
+            bot.route_pos >= bot.route.len() || (origin.xy() - graph.cell_origin(g.button_cell).xy()).length() < 40.0;
         if at_button {
             let d = g.aim - eye;
             let yaw = d.y.atan2(d.x).to_degrees();
@@ -572,7 +579,15 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // enemy vanished while navigation keeps driving; otherwise navigation's look/move stand.
     if let Some(en) = enemy {
         crate::bot_combat::engage(
-            game, e, en, origin, now, &mut look, &mut move_world, &mut buttons, &mut impulse,
+            game,
+            e,
+            en,
+            origin,
+            now,
+            &mut look,
+            &mut move_world,
+            &mut buttons,
+            &mut impulse,
         );
     }
 

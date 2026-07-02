@@ -27,12 +27,7 @@ impl GameState {
 
     /// `SpectatorDisconnect`.
     pub(crate) fn spectator_disconnect(&mut self, e: EntId) {
-        let name = self
-            .entities[e]
-            .netname
-            .as_deref()
-            .unwrap_or("")
-            .to_owned();
+        let name = self.entities[e].netname.as_deref().unwrap_or("").to_owned();
         self.broadcast(
             crate::defs::PrintLevel::Medium,
             &format!("Spectator {name} left the game\n"),

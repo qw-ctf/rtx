@@ -257,11 +257,7 @@ impl DynAssets {
 }
 
 /// Return the interned `'static` copy of `path`, precaching (via `precache`) on first insertion.
-fn intern(
-    map: &mut HashMap<CString, &'static CStr>,
-    path: &CStr,
-    precache: impl FnOnce(),
-) -> &'static CStr {
+fn intern(map: &mut HashMap<CString, &'static CStr>, path: &CStr, precache: impl FnOnce()) -> &'static CStr {
     if let Some(&p) = map.get(path) {
         return p;
     }
