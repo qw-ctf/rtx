@@ -140,8 +140,14 @@ human** when nothing's worth fetching (through doors, off ledges, across jumps, 
 missed jump). On open, roughly-straight stretches they **bunnyhop** (`rtx_bot_bhop`) — chaining jumps
 and **air-strafing** (sweeping the view while holding one strafe key) to exploit QuakeWorld's
 air-acceleration and build speed far past `sv_maxspeed`, weaving the heading toward the waypoint;
-they drop back to a normal gait for corners, ledges, combat, or the final approach to a goal. When
-`rtx_doublejump` is on, the navmesh also links the **wider gaps and higher ledges
+they drop back to a normal gait for corners, ledges, combat, or the final approach to a goal. That
+speed unlocks **speed jumps** — the navmesh links **gaps too wide for any normal or double jump**,
+cleared by arriving at the takeoff with built-up bhop speed (a jump's reach = speed × airtime, and
+airtime is fixed, so faster = farther). Each such link's start is the *runway* itself, so a bot that
+takes it is guaranteed to run the whole accelerating approach before the leap — and it refuses to
+launch if it somehow reaches the edge too slow. These are the only way across a wide gap when the
+double jump is off. When `rtx_doublejump` is on, the navmesh also links the **wider gaps and higher
+ledges
 a double jump reaches** — the bot ground-jumps, then **air-jumps near the apex** to restack the arc
 and clear a gap a single jump can't (it also spends the air jump to recover an undershot ordinary
 jump). When `rtx_grapple` is on, the navmesh also grows **hook links** — edges a bot crosses

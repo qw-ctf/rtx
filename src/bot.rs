@@ -286,6 +286,9 @@ fn run_bot(game: &mut GameState, e: EntId) {
         game.entities[e].bot.hook_fails = 0;
     }
     let hooking = game.entities[e].bot.hook_phase != HookPhase::Idle;
+    // On a speed-jump leg the route must be frozen: the link's `from` is the runway start, now behind
+    // the bot, so a repath would drop the link and turn the bot around at speed. Treated like `hooking`.
+    let on_sj = game.entities[e].bot.sj_leg.is_some();
 
     // Ask the active mode for this bot's intent. A round mode (Rocket Arena) returns Fight/Move to
     // drive combat or audience-roaming; FFA returns None, leaving the generic item/human brain
@@ -406,7 +409,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // A teleport (or any large instant displacement) invalidates the planned route — drop it
     // and re-path from where we landed. ~200u in one frame is far beyond running/falling. Skipped
     // mid-hook: the reel and the parabola move fast on purpose and must not clear the hook route.
-    if !hooking && bot.last_origin != Vec3::ZERO && (origin - bot.last_origin).length() > 200.0 {
+    if !hooking && !on_sj && bot.last_origin != Vec3::ZERO && (origin - bot.last_origin).length() > 200.0 {
         bot.route.clear();
         bot.repath_time = now;
     }
@@ -416,7 +419,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // toward its button (stuck at a door whose button we can't actually reach), so we don't camp
     // there. Progress-based, not a flat timeout: a button that's simply far across the map (e.g.
     // when we spawned right next to the door) still gets reached. Suspended mid-hook.
-    if !hooking && bot.gate.is_some() {
+    if !hooking && !on_sj && bot.gate.is_some() {
         let gi = bot.gate.unwrap();
         let give_up = |bot: &mut BotState| {
             bot.avoid_gate = gi as i32;
@@ -450,7 +453,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
 
     // Re-path when the route is empty, the goal changed, or the timer elapsed. Frozen mid-hook so
     // the traversal keeps the route that put it on the hook leg.
-    if !hooking && (bot.route.is_empty() || bot.goal_cell != goal || now >= bot.repath_time) {
+    if !hooking && !on_sj && (bot.route.is_empty() || bot.goal_cell != goal || now >= bot.repath_time) {
         let mut route = graph.find_path(bot_cell, goal, &gate_closed).unwrap_or_default();
         // Goal unreachable from here (behind a shut door with no way around from this spot, or a
         // disconnected pocket)? Don't home straight into a wall — head to the reachable cell
@@ -467,7 +470,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
         bot.repath_time = now + REPATH_INTERVAL;
     }
     // If we've fallen off the planned route (missed a jump, got shoved), re-localize next.
-    if !hooking && bot.route_pos >= bot.route.len() && bot_cell != goal && now >= bot.repath_time {
+    if !hooking && !on_sj && bot.route_pos >= bot.route.len() && bot_cell != goal && now >= bot.repath_time {
         bot.repath_time = now; // force a fresh path next frame
     }
 
@@ -475,7 +478,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // are priced high), so if the chosen route still crosses one, there's no other way in — divert
     // to that gate's button. Skip a gate we recently gave up on (its button was unreachable) so we
     // don't immediately re-camp on it.
-    if !hooking && bot.gate.is_none() {
+    if !hooking && !on_sj && bot.gate.is_none() {
         let avoid = if now < bot.avoid_gate_until { bot.avoid_gate } else { -1 };
         let block =
             route_blocking_gate(graph, &bot.route, bot.route_pos, &gate_closed).filter(|&gi| gi as i32 != avoid);
@@ -503,7 +506,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // carries us up, so XY barely changes.
     // A bunnyhopping bot covers ground fast enough to orbit a 24u waypoint, so widen the arrival gate
     // with speed and also advance once a waypoint slips *behind* the velocity.
-    let arrive_r = if bot.bhop {
+    let arrive_r = if bot.bhop || bot.sj_leg.is_some() {
         ARRIVE_RADIUS.max(2.0 * speed * frametime)
     } else {
         ARRIVE_RADIUS
@@ -519,7 +522,8 @@ fn run_bot(game: &mut GameState, e: EntId) {
             LinkKind::Hook => false,
             _ => {
                 let to = target.xy() - origin.xy();
-                to.length() <= arrive_r || (bot.bhop && to.dot(v_xy) < 0.0 && to.length() <= 64.0)
+                let fast = bot.bhop || bot.sj_leg.is_some();
+                to.length() <= arrive_r || (fast && to.dot(v_xy) < 0.0 && to.length() <= 64.0)
             }
         };
         if arrived {
@@ -593,7 +597,37 @@ fn run_bot(game: &mut GameState, e: EntId) {
         bot.bhop = false;
         bot.bhop_dir = 0.0;
     }
-    let bhop_active = bot.bhop;
+    // A speed-jump leg is a *committed* bhop run-up + leap: engage bhop unconditionally (the link is a
+    // pre-verified runway) and track it so the route stays frozen. Latch/clear `sj_leg` on the leg.
+    let mut sj_active = matches!(kind, Some(LinkKind::SpeedJump)) && host.cvar_bool(c"rtx_bot_bhop") && !hook_active;
+    if sj_active {
+        if bot.sj_leg != cur_leg {
+            bot.sj_leg = cur_leg;
+            bot.sj_started = now;
+        }
+        // Watchdog: the route is frozen mid-leg, so if the run-up stalls (blocked, shoved, never
+        // built speed) abandon it and re-path rather than wedging on the runway forever.
+        if now - bot.sj_started > 4.0 {
+            bot.sj_leg = None;
+            bot.route.clear();
+            bot.repath_time = now;
+            sj_active = false;
+        }
+    } else if bot.sj_leg.is_some() {
+        bot.sj_leg = None;
+    }
+    let bhop_active = bot.bhop || sj_active;
+    // "Don't leap to your death": if we somehow reach the takeoff edge too slow to clear the gap,
+    // hold the jump (keep accelerating) rather than launching short into it.
+    let sj_hold = sj_active && {
+        match cur_leg.and_then(|l| graph.speed_jump_of_link(l)) {
+            Some(tr) => {
+                let to_edge = tr.takeoff.xy() - origin.xy();
+                (to_edge.length() < 48.0 || to_edge.dot(v_xy) < 0.0) && speed < tr.v_req * 0.9
+            }
+            None => false,
+        }
+    };
 
     // Steering: face the waypoint and run toward it.
     let to_wp = waypoint.xy() - origin.xy();
@@ -779,7 +813,9 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // released (airborne) before it'll fire again. Gating on ground state pulses it correctly,
     // so a jump that falls short is retried on the next landing instead of the bot getting
     // stuck holding +jump against a ledge.
-    if on_ground && (force_jump || bhop_active || matches!(kind, Some(LinkKind::JumpGap | LinkKind::DoubleJump))) {
+    if on_ground
+        && (force_jump || (bhop_active && !sj_hold) || matches!(kind, Some(LinkKind::JumpGap | LinkKind::DoubleJump)))
+    {
         buttons |= BUTTON_JUMP;
     }
     // Mid-air (double) jump: rtx grants one air jump per air travel. On a double-jump leg, spend it
@@ -938,8 +974,9 @@ fn run_bot(game: &mut GameState, e: EntId) {
             }
         };
         let a_max = bot_bhop::air_accel_max(accel, maxspeed, dt);
-        // Steer toward the look-ahead point (smoother than the 32u next cell).
-        let ahead = look_point.xy() - origin.xy();
+        // Steer toward the look-ahead point (smoother than the 32u next cell) — but on a speed jump
+        // aim straight at the landing, so the leap goes across the gap, not off toward a later goal.
+        let ahead = if sj_active { waypoint.xy() } else { look_point.xy() } - origin.xy();
         let bearing = if ahead.length() > 8.0 {
             ahead.y.atan2(ahead.x).to_degrees()
         } else {

@@ -589,6 +589,27 @@ impl GameState {
         });
         // Double-jump links: only when the map allows the mid-air jump, so bots plan the wider gaps.
         let double_jump = self.host.cvar_bool(c"rtx_doublejump");
+        // Speed-jump links (bhop-carried leaps): only when bots bunnyhop, with the physics that turn
+        // a runway length into attainable speed.
+        let speed_jump = self.host.cvar_bool(c"rtx_bot_bhop").then(|| navmesh::SpeedJumpParams {
+            gravity: self.host.cvar(c"sv_gravity").max(1.0),
+            accel: {
+                let a = self.host.cvar(c"sv_accelerate");
+                if a > 0.0 {
+                    a
+                } else {
+                    10.0
+                }
+            },
+            maxspeed: {
+                let m = self.host.cvar(c"sv_maxspeed");
+                if m > 0.0 {
+                    m
+                } else {
+                    320.0
+                }
+            },
+        });
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(navmesh::build_navmesh(
@@ -598,6 +619,7 @@ impl GameState {
                 gates,
                 hooks,
                 double_jump,
+                speed_jump,
             ));
         });
         self.nav.pending = Some(rx);
@@ -628,7 +650,7 @@ impl GameState {
         let goals = self.collect_goals(&graph);
         let msg = cstring(&format!(
             "rtx: navmesh: {} planes, {} clipnodes -> {} cells, {} links \
-             (walk {} step {} drop {} jump {} djump {} plat {} tele {} hook {}), {} gates, {} item goals\n",
+             (walk {} step {} drop {} jump {} djump {} sjump {} plat {} tele {} hook {}), {} gates, {} item goals\n",
             bsp.planes.len(),
             bsp.clipnodes.len(),
             graph.cells.len(),
@@ -638,6 +660,7 @@ impl GameState {
             counts.drop,
             counts.jump,
             counts.double_jump,
+            counts.speed_jump,
             counts.plat,
             counts.teleport,
             counts.hook,

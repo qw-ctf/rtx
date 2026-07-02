@@ -616,6 +616,10 @@ pub struct BotState {
     pub bhop_since: f32,
     pub bhop_dir: f32,
     pub bhop_prev_yaw: f32,
+    /// The [`LinkKind::SpeedJump`](crate::navmesh::LinkKind::SpeedJump) leg currently being flown (a
+    /// committed bhop run-up + leap), and when it began. `None` = not on a speed jump.
+    pub sj_leg: Option<u32>,
+    pub sj_started: f32,
 }
 
 /// Phase of a bot's grenade lob→shoot combo. `Idle` unless a combo is in progress.

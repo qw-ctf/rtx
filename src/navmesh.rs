@@ -44,6 +44,71 @@ const DOUBLE_ARC_PEAK: f32 = 100.0;
 /// `sv_maxspeed` default — the cost denominator (travel time = distance / speed).
 const MAX_SPEED: f32 = 320.0;
 
+// --- speed jumps (bunnyhop-carried leaps across wide gaps) ---
+
+/// Jump impulse (`velocity.z`) — fixed, so a jump's airtime/apex don't change with horizontal speed;
+/// only the reach does (`speed · airtime`). That's what lets a fast bhopping bot clear a wide gap.
+const JUMP_VZ: f32 = 270.0;
+/// The QW `PM_AirAccelerate` projected-wishspeed cap (mirrors `bot_bhop::AIR_CAP`; cross-checked in a
+/// test). Bhop speed builds at a rate set by this and the tickrate.
+const SJ_AIR_CAP: f32 = 30.0;
+/// Conservative server tickrate assumed for the bhop acceleration model.
+const SJ_TICKRATE: f32 = 72.0;
+/// Speed we'll plan bhop runways up to (reach ≈ `V·0.675` ≈ 600u); real runways bound it further.
+const SPEED_JUMP_V_CAP: f32 = 900.0;
+/// Derate the ideal bhop model to attainable speed (the S-weave + a friction frame per landing).
+const BHOP_EFF: f32 = 0.8;
+/// Longest runway we bother measuring.
+const RUNWAY_MAX: f32 = 2048.0;
+/// The measured runway must reach this multiple of the jump's required entry speed.
+const SJ_MARGIN: f32 = 1.15;
+/// Walkable floor must continue this far past the landing (the takeoff-phase window).
+const SJ_LANDING_DEPTH: f32 = 96.0;
+/// At most this many speed-jump links per source cell.
+const SPEED_JUMP_MAX_PER_CELL: usize = 3;
+
+/// Airtime of a jump reaching a target `dz` above (or below) the takeoff, at gravity `g`: the
+/// descending root of `JUMP_VZ·t − ½g·t² = dz`. `0` if `dz` is unreachable (above the apex).
+fn jump_airtime(dz: f32, gravity: f32) -> f32 {
+    let disc = JUMP_VZ * JUMP_VZ - 2.0 * gravity * dz;
+    if disc < 0.0 {
+        return 0.0;
+    }
+    (JUMP_VZ + disc.sqrt()) / gravity
+}
+
+/// The horizontal entry speed needed to clear `horiz` while rising/falling `dz`, at gravity `g`.
+fn v_required(horiz: f32, dz: f32, gravity: f32) -> f32 {
+    let t = jump_airtime(dz, gravity);
+    if t <= 0.0 {
+        f32::INFINITY
+    } else {
+        horiz / t
+    }
+}
+
+/// Bhop speed-gain constant `k`: velocity² grows at `2k` per second while air-strafing. Derived from
+/// the perpendicular air-accel cap and the tickrate (`k = tick · a² / 2`, `a = min(accel·maxspeed/tick, cap)`).
+fn bhop_k(accel: f32, maxspeed: f32) -> f32 {
+    let a = (accel * maxspeed / SJ_TICKRATE).min(SJ_AIR_CAP);
+    SJ_TICKRATE * a * a / 2.0
+}
+
+/// Speed reached after air-strafing `len` units from `v0`: `(v0³ + 3k·len)^⅓`.
+fn attainable_speed(v0: f32, len: f32, k: f32) -> f32 {
+    (v0.powi(3) + 3.0 * k * len.max(0.0)).cbrt()
+}
+
+/// Runway length needed to air-strafe from `v0` up to `v`: `(v³ − v0³) / 3k`.
+fn runway_len_for(v: f32, v0: f32, k: f32) -> f32 {
+    ((v.powi(3) - v0.powi(3)) / (3.0 * k)).max(0.0)
+}
+
+/// Time to air-strafe from `v0` up to `v`: `(v² − v0²) / 2k`.
+fn runway_time(v: f32, v0: f32, k: f32) -> f32 {
+    ((v * v - v0 * v0) / (2.0 * k)).max(0.0)
+}
+
 // --- grappling-hook traversal (see `add_hooks`) ---
 
 /// Height above a cell's standing origin the hook launches from (`throw_grapple` spawns it at
@@ -120,6 +185,12 @@ pub enum LinkKind {
     /// bot ground-jumps, then air-jumps near the apex (rtx's `rtx_doublejump`). Only emitted when the
     /// map has double jump enabled.
     DoubleJump,
+    /// A **speed jump**: a leap across a gap wider than any single/double jump, cleared by arriving
+    /// at the takeoff with **bunnyhop-built speed**. The link's `from` is the *start of the runway*
+    /// (not the ledge), so taking it means running the whole run-up — the bot is guaranteed the speed
+    /// by construction. The [`SpeedJumpTraversal`] side table carries the takeoff point and required
+    /// speed. Only emitted when bots bhop (`rtx_bot_bhop`).
+    SpeedJump,
     /// Riding a `func_plat`: board it at the bottom and let it carry you to the top. The
     /// link's `from` cell is the standing spot on the plat (its centre), `to` the floor the
     /// plat delivers to. Bots stay centred and wait rather than steering off.
@@ -165,6 +236,18 @@ pub struct NavGraph {
     /// side-table pattern as `gated_links`), so the bot can look up how to fly a hook leg.
     hook_links: Vec<i32>,
     hooks: Vec<HookTraversal>,
+    /// Per-link speed-jump payload index (parallel to `links`, `-1` for non-speed-jump links) — the
+    /// takeoff point + required entry speed the bot executor needs.
+    speed_jump_links: Vec<i32>,
+    speed_jumps: Vec<SpeedJumpTraversal>,
+}
+
+/// A solved speed jump: where the takeoff ledge is and the horizontal speed needed there, so the
+/// runtime can refuse to leap if the bot somehow reaches the edge too slow to clear the gap.
+#[derive(Clone, Copy)]
+pub struct SpeedJumpTraversal {
+    pub takeoff: Vec3,
+    pub v_req: f32,
 }
 
 /// Extra travel-time cost charged to a link whose gate is currently shut. Large enough that the
@@ -186,6 +269,8 @@ impl NavGraph {
             gated_links: Vec::new(),
             hook_links: Vec::new(),
             hooks: Vec::new(),
+            speed_jump_links: Vec::new(),
+            speed_jumps: Vec::new(),
         };
         graph.link_cells(bsp);
         graph
@@ -380,6 +465,151 @@ impl NavGraph {
         for link in pending {
             self.push_link(link);
         }
+    }
+
+    /// Splice **speed-jump** links: leaps across gaps too wide for any single/double jump, cleared by
+    /// arriving at the ledge with bunnyhop-built speed. For each ledge edge, measure the straight
+    /// runway feeding it, cap the attainable speed to that, and link the widest reachable targets —
+    /// but with `from` set to the *runway start* so A* commits the whole run-up (the bot is thus
+    /// guaranteed the speed). Only where a plain/double jump can't already make it. Gated on bhop.
+    pub fn add_speed_jumps(&mut self, bsp: &Bsp, params: SpeedJumpParams, double_jump: bool) {
+        let k = bhop_k(params.accel, params.maxspeed);
+        let mut pending: Vec<(Link, SpeedJumpTraversal)> = Vec::new();
+        for ledge in 0..self.cells.len() as CellId {
+            self.solve_speed_jumps_from(bsp, ledge, params, k, double_jump, &mut pending);
+        }
+        for (link, tr) in pending {
+            self.push_speed_jump(link, tr);
+        }
+    }
+
+    /// The speed-jump links leaving ledge cell `ledge` (the takeoff), appended to `out`.
+    fn solve_speed_jumps_from(
+        &self,
+        bsp: &Bsp,
+        ledge: CellId,
+        params: SpeedJumpParams,
+        k: f32,
+        double_jump: bool,
+        out: &mut Vec<(Link, SpeedJumpTraversal)>,
+    ) {
+        let a = self.cells[ledge as usize];
+        let mut cands: Vec<(f32, Link, SpeedJumpTraversal)> = Vec::new(); // (v_req, link, traversal)
+        for (dgx, dgy) in COMPASS {
+            // Take off from a ledge edge, and only where a straight runway can feed the jump.
+            if self.has_ground_near(a.gx + dgx.signum(), a.gy + dgy.signum(), a.origin.z) {
+                continue;
+            }
+            let runway = self.measure_runway(bsp, &a, dgx, dgy);
+            let v_max = SPEED_JUMP_V_CAP.min(BHOP_EFF * attainable_speed(MAX_SPEED, runway, k));
+            if v_max * jump_airtime(0.0, params.gravity) <= JUMP_REACH + 1.0 {
+                continue; // this runway buys nothing past a normal jump
+            }
+            let reach_cap = v_max * jump_airtime(-MAX_DROP, params.gravity);
+            let scan = ((reach_cap / GRID).ceil() as i32).max(1);
+            let mut best: Option<(f32, Link, SpeedJumpTraversal)> = None;
+            for to in self.neighbors_within(a.gx, a.gy, scan) {
+                if to == ledge {
+                    continue;
+                }
+                let b = self.cells[to as usize];
+                let (bgx, bgy) = (b.gx - a.gx, b.gy - a.gy);
+                if (bgx.abs() <= 1 && bgy.abs() <= 1) || dir_bucket(bgx, bgy) != dir_bucket(dgx, dgy) {
+                    continue;
+                }
+                let dz = b.origin.z - a.origin.z;
+                let horiz = (b.origin.xy() - a.origin.xy()).length();
+                if !(-MAX_DROP..=JUMP_APEX).contains(&dz) || horiz <= JUMP_REACH {
+                    continue;
+                }
+                // Skip what a double jump already covers (when enabled), and any existing direct link.
+                if (double_jump && horiz <= DOUBLE_JUMP_REACH && dz <= DOUBLE_JUMP_APEX)
+                    || self.has_direct_link(ledge, to)
+                {
+                    continue;
+                }
+                let airtime = jump_airtime(dz, params.gravity);
+                let v_req = v_required(horiz, dz, params.gravity);
+                if airtime <= 0.0 || v_req * SJ_MARGIN > v_max {
+                    continue;
+                }
+                // Flat-long arc clearance, a landing with room to slide out at speed, and a
+                // runway-start cell to anchor from.
+                let steps = ((horiz / 24.0).ceil() as i32).max(8);
+                let depth_cols = (SJ_LANDING_DEPTH / GRID).ceil() as i32;
+                let landing_ok = (1..=depth_cols)
+                    .all(|i| self.has_ground_near(b.gx + dgx.signum() * i, b.gy + dgy.signum() * i, b.origin.z));
+                if !arc_clear_peak(bsp, a.origin, b.origin, JUMP_APEX, steps) || !landing_ok {
+                    continue;
+                }
+                let need = runway_len_for(v_req * SJ_MARGIN, MAX_SPEED, k);
+                let dir = Vec3::new(dgx.signum() as f32, dgy.signum() as f32, 0.0).normalize_or_zero();
+                let Some(start) = self.nearest_within(a.origin - dir * need, GRID * 1.5, STEP_HEIGHT * 3.0) else {
+                    continue;
+                };
+                if start == to {
+                    continue;
+                }
+                let cost = runway_time(v_req * SJ_MARGIN, MAX_SPEED, k) + airtime + 1.0;
+                let link = Link {
+                    from: start,
+                    to,
+                    kind: LinkKind::SpeedJump,
+                    cost,
+                };
+                let tr = SpeedJumpTraversal {
+                    takeoff: a.origin,
+                    v_req,
+                };
+                if best.is_none_or(|(bv, _, _)| v_req < bv) {
+                    best = Some((v_req, link, tr));
+                }
+            }
+            if let Some(c) = best {
+                cands.push(c);
+            }
+        }
+        cands.sort_by(|x, y| x.0.total_cmp(&y.0));
+        cands.truncate(SPEED_JUMP_MAX_PER_CELL);
+        out.extend(cands.into_iter().map(|(_, l, t)| (l, t)));
+    }
+
+    /// Measure the straight, flat, hop-wide runway feeding ledge cell `a` from behind (opposite the
+    /// jump direction): walk grid columns back while each has a cell within `STEP_HEIGHT`, hop
+    /// headroom, and ground in both perpendicular columns (so the air-strafe weave stays on floor).
+    fn measure_runway(&self, bsp: &Bsp, a: &Cell, dgx: i32, dgy: i32) -> f32 {
+        let (bx, by) = (-dgx.signum(), -dgy.signum());
+        if bx == 0 && by == 0 {
+            return 0.0;
+        }
+        let step_len = GRID * (((bx * bx + by * by) as f32).sqrt());
+        let (px, py) = (-by, bx); // perpendicular grid direction
+        let (mut gx, mut gy, mut z, mut len) = (a.gx, a.gy, a.origin.z, 0.0);
+        while len < RUNWAY_MAX {
+            let (ngx, ngy) = (gx + bx, gy + by);
+            let Some(cid) = self.cell_near(ngx, ngy, z) else {
+                break;
+            };
+            let c = self.cells[cid as usize].origin;
+            if bsp.is_solid(c + Vec3::new(0.0, 0.0, JUMP_APEX))
+                || self.cell_near(ngx + px, ngy + py, c.z).is_none()
+                || self.cell_near(ngx - px, ngy - py, c.z).is_none()
+            {
+                break;
+            }
+            len += step_len;
+            (gx, gy, z) = (ngx, ngy, c.z);
+        }
+        len
+    }
+
+    /// A cell in grid column `(gx, gy)` within `STEP_HEIGHT` of height `z`, if any.
+    fn cell_near(&self, gx: i32, gy: i32, z: f32) -> Option<CellId> {
+        self.grid.get(&(gx, gy)).and_then(|ids| {
+            ids.iter()
+                .copied()
+                .find(|&id| (self.cells[id as usize].origin.z - z).abs() <= STEP_HEIGHT)
+        })
     }
 
     /// Whether grid column `(gx, gy)` has a cell within `STEP_HEIGHT` of height `z` — i.e.
@@ -599,6 +829,7 @@ impl NavGraph {
                 LinkKind::Drop => c.drop += 1,
                 LinkKind::JumpGap => c.jump += 1,
                 LinkKind::DoubleJump => c.double_jump += 1,
+                LinkKind::SpeedJump => c.speed_jump += 1,
                 LinkKind::Plat => c.plat += 1,
                 LinkKind::Teleport => c.teleport += 1,
                 LinkKind::Hook => c.hook += 1,
@@ -904,6 +1135,25 @@ impl NavGraph {
         self.hook_links.push(h);
     }
 
+    /// The solved traversal for speed-jump link `li`, or `None` for any other link.
+    pub fn speed_jump_of_link(&self, li: u32) -> Option<&SpeedJumpTraversal> {
+        match self.speed_jump_links.get(li as usize).copied().unwrap_or(-1) {
+            s if s >= 0 => self.speed_jumps.get(s as usize),
+            _ => None,
+        }
+    }
+
+    /// Push a speed-jump link with its traversal, keeping the side table in step.
+    fn push_speed_jump(&mut self, link: Link, traversal: SpeedJumpTraversal) {
+        if self.speed_jump_links.len() != self.links.len() {
+            self.speed_jump_links.resize(self.links.len(), -1);
+        }
+        let s = self.speed_jumps.len() as i32;
+        self.speed_jumps.push(traversal);
+        self.push_link(link);
+        self.speed_jump_links.push(s);
+    }
+
     /// Append a free-standing cell (not from the column carve) and index it. Used for plat
     /// surfaces, which don't exist in the static world hull.
     fn add_cell(&mut self, origin: Vec3) -> CellId {
@@ -950,6 +1200,15 @@ pub struct HookParams {
     pub gravity: f32,
     pub pull: f32,  // HOOK_PULL_BASE × rtx_hook_pull
     pub throw: f32, // HOOK_THROW_BASE × rtx_hook_speed
+}
+
+/// Live physics the speed-jump solver needs: gravity (jump airtime) and the bhop acceleration
+/// (`sv_accelerate`/`sv_maxspeed`) that converts a runway length into attainable speed.
+#[derive(Clone, Copy)]
+pub struct SpeedJumpParams {
+    pub gravity: f32,
+    pub accel: f32,
+    pub maxspeed: f32,
 }
 
 /// A solved hook traversal, stored per hook link in a side table (parallel to `links`, like
@@ -1019,6 +1278,7 @@ pub struct LinkCounts {
     pub drop: u32,
     pub jump: u32,
     pub double_jump: u32,
+    pub speed_jump: u32,
     pub plat: u32,
     pub teleport: u32,
     pub hook: u32,
@@ -1035,6 +1295,8 @@ fn link_cost(kind: LinkKind, horiz: f32, dz: f32) -> f32 {
         LinkKind::JumpGap => base + 0.3,
         // A double jump is a touch pricier — a harder maneuver (two timed jumps) than a single hop.
         LinkKind::DoubleJump => base + 0.6,
+        // Speed-jump costs (runway run-up + flight + commitment) are computed at splice time.
+        LinkKind::SpeedJump => base + 2.0,
         // Plat costs are computed at splice time (ride time + overhead), not here.
         LinkKind::Plat => base + 1.0,
         // Teleporting is near-instant; cost is set at splice time.
@@ -1287,6 +1549,7 @@ pub fn build_navmesh(
     gates: Vec<GateInfo>,
     hooks: Option<HookParams>,
     double_jump: bool,
+    speed_jump: Option<SpeedJumpParams>,
 ) -> NavBuild {
     let bsp = Bsp::parse(&bytes)?;
     let mut graph = NavGraph::build(&bsp);
@@ -1294,6 +1557,11 @@ pub fn build_navmesh(
     // off their endpoints and lets `add_gates` tag any of these links that cross a door.
     if double_jump {
         graph.add_double_jumps(&bsp);
+    }
+    // Speed jumps after double jumps, so they only fill the gaps double jumps can't (they see the DJ
+    // links via `has_direct_link`).
+    if let Some(params) = speed_jump {
+        graph.add_speed_jumps(&bsp, params, double_jump);
     }
     // Hooks first: they derive from the static hull, and going before the plat/gate splices keeps
     // plat surfaces off hook endpoints and lets `add_gates` tag any hook link crossing a door.
@@ -1586,6 +1854,77 @@ mod tests {
             );
         }
         eprintln!("double-jump splice: {djumps} links");
+
+        // Speed-jump splice: leaps beyond a single jump, cleared by bhop speed. Every emitted link's
+        // takeoff must need more than maxspeed, its from-cell must sit a real runway back from the
+        // takeoff, and the required speed must be within the runway's attainable cap.
+        let params = SpeedJumpParams {
+            gravity: 800.0,
+            accel: 10.0,
+            maxspeed: MAX_SPEED,
+        };
+        let k = bhop_k(params.accel, params.maxspeed);
+        let mut gs = NavGraph::build(&bsp);
+        gs.add_speed_jumps(&bsp, params, false);
+        let sjumps = gs.summary().speed_jump;
+        for li in 0..gs.links.len() as u32 {
+            if gs.link_kind(li) != LinkKind::SpeedJump {
+                continue;
+            }
+            let tr = *gs
+                .speed_jump_of_link(li)
+                .expect("speed-jump link missing its traversal");
+            let start = gs.cell_origin(gs.link_source(li));
+            let land = gs.cell_origin(gs.link_target(li));
+            let horiz = (land.xy() - tr.takeoff.xy()).length();
+            // Beyond a single jump's *reach* (else a JumpGap covers it) — a wide flat gap, or a
+            // downhill one whose extra airtime a JumpGap's flat 200u cap still missed.
+            assert!(horiz > JUMP_REACH, "speed jump within single-jump reach: {horiz}");
+            assert!(tr.v_req <= SPEED_JUMP_V_CAP + 1.0, "v_req over the cap: {}", tr.v_req);
+            // The from-cell is the runway start: at least the runway needed to build the *extra*
+            // speed over maxspeed (a gap crossable at ≤ maxspeed needs no runway → from = ledge).
+            let need = runway_len_for(tr.v_req.max(MAX_SPEED), MAX_SPEED, k);
+            let back = (start.xy() - tr.takeoff.xy()).length();
+            assert!(back + GRID >= need, "runway too short: {back} < {need}");
+        }
+        eprintln!("speed-jump splice: {sjumps} links");
+    }
+
+    /// The speed-jump ballistic + runway model, and its agreement with the real bhop controller.
+    #[test]
+    fn speed_jump_model() {
+        // A jump at exactly maxspeed reaches ~JUMP_REACH: v_required(216, 0) ≈ 320.
+        let t = jump_airtime(0.0, 800.0);
+        assert!((t - 0.675).abs() < 0.01, "flat airtime {t}");
+        assert!((v_required(MAX_SPEED * t, 0.0, 800.0) - MAX_SPEED).abs() < 1.0);
+        // Rising shrinks airtime (needs more speed); dropping lengthens it.
+        assert!(jump_airtime(45.0, 800.0) < t && jump_airtime(-200.0, 800.0) > t);
+
+        // attainable_speed / runway_len_for are inverses.
+        let k = bhop_k(10.0, MAX_SPEED);
+        let v = attainable_speed(MAX_SPEED, 800.0, k);
+        assert!(v > 450.0, "800u runway should build good speed, got {v}"); // ~480, ≈1.5× maxspeed
+        assert!((runway_len_for(v, MAX_SPEED, k) - 800.0).abs() < 1.0);
+
+        // The build-time model, derated, is conservative vs the actual bhop controller: simulate a
+        // real air-strafe over the runway and confirm it reaches at least the planned speed.
+        use crate::bot_bhop::{air_accel_max, apply_airaccel, strafe, wishdir_of};
+        let dt = 1.0 / 72.0;
+        let a_max = air_accel_max(10.0, MAX_SPEED, dt);
+        let steps = (800.0 / (MAX_SPEED * dt)) as i32; // ~time to cover the runway, air frames only
+        let mut vel = glam::Vec2::new(MAX_SPEED, 0.0);
+        let mut sigma = 0.0;
+        for _ in 0..steps {
+            let s = strafe(vel, 0.0, sigma, a_max);
+            sigma = s.sigma;
+            vel = apply_airaccel(vel, wishdir_of(s.view_yaw, s.side), MAX_SPEED, 10.0, dt);
+        }
+        let planned = BHOP_EFF * attainable_speed(MAX_SPEED, 800.0, k);
+        assert!(
+            vel.length() >= planned,
+            "controller {} slower than planned {planned}",
+            vel.length()
+        );
     }
 
     /// Count cells directly reachable from `start` over the (directed) graph — a small DFS helper
