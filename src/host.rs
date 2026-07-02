@@ -222,11 +222,29 @@ impl HostApi {
     /// and numeric defaults read the same, e.g. `cvar_default("rtx_mode", "ffa")` and
     /// `cvar_default("rtx_bots", 0.0)`.
     pub fn cvar_default<V: CvarValue>(&self, name: &str, default: V) {
-        let name = CString::new(name).unwrap_or_default();
-        let mut buf = [0u8; 64];
-        if self.cvar_string(&name, &mut buf).is_empty() {
-            default.set_cvar(self, &name);
+        // Preserve any existing value (server.cfg, or a prior map) — only seed when unset.
+        if self.cvar_is_set(name) {
+            return;
         }
+        // Seed through the `set` console command, not the `G_CVAR_SET*` builtins: mvdsv's cvar-set
+        // builtins are a no-op on a cvar that doesn't exist yet — they refuse to create it
+        // ("Cvar_Set: variable ... not found") — so a code default would silently never take (it
+        // reads back as 0/""). `set` creates the cvar; fteqw honours it identically. The value is
+        // quoted so string defaults survive the console tokenizer.
+        //
+        // The queued `set` isn't flushed here on purpose: `cvar_default` runs during `GAME_INIT`,
+        // before mvdsv sets `pr_global_struct`, so a `G_executecmd` flush would dereference NULL and
+        // crash. The buffer flushes on its own before the first game frame — long before any of
+        // these cvars is read (the earliest, `rtx_ra_countdown`, only once a round forms).
+        self.localcmd(&format!("set {name} \"{}\"", default.cvar_token()));
+    }
+
+    /// Whether a cvar currently has a non-empty value (set in server.cfg, by a prior map, or a
+    /// default we already seeded). Used by [`cvar_default`](Self::cvar_default) to avoid clobbering.
+    fn cvar_is_set(&self, name: &str) -> bool {
+        let cname = CString::new(name).unwrap_or_default();
+        let mut buf = [0u8; 64];
+        !self.cvar_string(&cname, &mut buf).is_empty()
     }
 
     /// `G_PRECACHE_MODEL`.
@@ -451,6 +469,14 @@ impl HostApi {
     /// `G_STUFFCMD` — send a command to a client's console.
     pub fn stuffcmd(&self, ent: EntId, cmd: &CStr) {
         unsafe { (self.syscall)(B::StuffCmd as isize, ent.0 as isize, cmd.as_ptr() as isize, 0) };
+    }
+
+    /// `G_LOCALCMD` — append a console command to the server's command buffer (run at the next
+    /// flush). A terminating newline is added, so pass the command without one.
+    pub fn localcmd(&self, cmd: &str) {
+        if let Ok(cmd) = CString::new(format!("{cmd}\n")) {
+            unsafe { (self.syscall)(B::LocalCmd as isize, cmd.as_ptr() as isize) };
+        }
     }
 
     /// `G_MAKESTATIC` — turn an entity into a static (client-side only) entity and remove it.
@@ -749,25 +775,26 @@ impl HostApi {
 
 /// A value that can seed a cvar default via [`HostApi::cvar_default`] — implemented for numbers
 /// (`f32`/`f64`, so plain `0.0` literals work) and `&str`, so one `cvar_default` handles both.
+/// The value is rendered as the argument to a `set` console command.
 pub trait CvarValue {
-    fn set_cvar(self, host: &HostApi, name: &CStr);
+    fn cvar_token(&self) -> String;
 }
 
 impl CvarValue for f32 {
-    fn set_cvar(self, host: &HostApi, name: &CStr) {
-        host.cvar_set_float(name, self);
+    fn cvar_token(&self) -> String {
+        format!("{self}")
     }
 }
 
 impl CvarValue for f64 {
-    fn set_cvar(self, host: &HostApi, name: &CStr) {
-        host.cvar_set_float(name, self as f32);
+    fn cvar_token(&self) -> String {
+        format!("{self}")
     }
 }
 
 impl CvarValue for &str {
-    fn set_cvar(self, host: &HostApi, name: &CStr) {
-        host.cvar_set(name, &CString::new(self).unwrap_or_default());
+    fn cvar_token(&self) -> String {
+        (*self).to_string()
     }
 }
 
