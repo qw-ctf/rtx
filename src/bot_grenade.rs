@@ -573,10 +573,12 @@ fn detonate(
 }
 
 /// The **generic hazard shove**, rocket-launcher variant. The knockback trick isn't grenade-specific
-/// — any splash weapon shoves. A rocket is the *simpler* delivery: a hit near the enemy pushes them
-/// straight away from the bot, so when the bot already stands on the far side of a grounded enemy
-/// from a hazard, one low rocket drives them into it — no lob/arc needed. Returns whether it took
-/// over the frame (aim + fire a shove rocket); the caller then skips the grenade combo.
+/// — any splash weapon shoves — and a rocket doesn't need a *direct hit*: one put on the **ground
+/// just behind the enemy** (the same blast point `B` the grenade lob targets, on the far side from
+/// the hazard) shoves them into it by splash alone, from wherever the bot has a clear line to that
+/// spot. That's more flexible than a body shot (a static ground point is easy to hit, and the bot
+/// needn't stand on any particular side) and just as strong. The lob is the fallback for when the
+/// blast has to be *arced over* the enemy instead. Returns whether it took over the frame.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rocket_shove(
     game: &mut GameState,
@@ -590,9 +592,9 @@ pub(crate) fn rocket_shove(
     let Some(en) = enemy else {
         return false;
     };
-    let (items, ammo, my_team) = {
+    let (items, ammo, health, my_team) = {
         let ent = &game.entities[e];
-        (ent.v.items, ent.v.ammo_rockets, ent.arena.team)
+        (ent.v.items, ent.v.ammo_rockets, ent.v.health, ent.arena.team)
     };
     if !items.has(Items::ROCKET_LAUNCHER) || ammo < 1.0 {
         return false;
@@ -607,36 +609,42 @@ pub(crate) fn rocket_shove(
         )
     };
     let dist = (e_org - origin).length();
-    // Sensible rocket-shove band: far enough not to splash ourselves, near enough to place the shot;
-    // and the target must be a grounded, walking, not-sprinting player (so the low rocket lands on
-    // them and the shove reads cleanly).
+    // The target must be a grounded, walking, not-sprinting player (so the ground point stays valid
+    // for the rocket's short flight); and it can't be point-blank (self-splash).
     if !(200.0..=700.0).contains(&dist) || !en_grounded || !en_walk || e_vel.xy().length() > 250.0 {
         return false;
     }
     let Some(h) = enemy_hazard(game, en) else {
         return false;
     };
-    // We must be on the far side of the enemy from the hazard: a rocket pushes them away from us,
-    // i.e. toward the hazard, only then.
-    let to_en = (e_org - origin).xy().normalize_or_zero();
-    if to_en.dot(h.dir.xy().normalize_or_zero()) < 0.6 {
-        return false;
-    }
-    // Predict the shove from a near-feet impact on our side and require it to carry them over the
-    // edge; don't catch a teammate.
+    // The blast point: on the ground behind the enemy, away from the hazard, so the outward splash
+    // drives them into it. Same `B` as the lob — only the delivery differs.
     let e_feet = e_org - Vec3::new(0.0, 0.0, 24.0);
-    let to_bot = (origin - e_org).xy().normalize_or_zero();
-    let blast = e_feet + Vec3::new(to_bot.x, to_bot.y, 0.0) * 16.0;
-    if !shove_reaches(player_center(game, en), e_org, blast, h.dir, h.edge_dist)
-        || teammate_in_blast(game, e, my_team, e_org)
-        || !los_to(game, e, en)
-    {
+    let b = e_feet - h.dir * SHOVE_OFFSET;
+    let e_center = player_center(game, en);
+    if !shove_reaches(e_center, e_org, b, h.dir, h.edge_dist) || teammate_in_blast(game, e, my_team, b) {
         return false;
     }
-    // Aim a low rocket at the enemy's feet — maximal horizontal push, with a little lift to clear a
-    // lip — select the launcher, and fire once the smoothed view is on it.
+    // Don't splash ourselves (attacker damage is halved), and don't stand on top of the blast.
+    let d_self = (b - origin).length();
+    if blast_self_damage(d_self) * 0.5 > health * GRENADE_SHOOT_HEALTH_FRAC || d_self < GRENADE_MIN_SHOOT {
+        return false;
+    }
+    // We need a clear straight shot to `B`: the rocket must reach that ground spot, not detonate on
+    // the enemy in the way (that would blast the wrong point) or on a wall short of it. If it can't,
+    // this is a job for the lob (which arcs over) — bail so the combo takes it.
     let eye = origin + VEC_VIEW_OFS;
-    *look = bot_combat::angles_to(eye, e_feet + Vec3::new(0.0, 0.0, 4.0));
+    let aim = b + Vec3::new(0.0, 0.0, 2.0);
+    let tr = game.traceline(eye, aim, false, e);
+    if tr.ent == en {
+        return false; // enemy blocks the shot
+    }
+    let hit = eye + (aim - eye) * tr.fraction;
+    if (hit - b).length() > 48.0 {
+        return false; // a wall stops the rocket short of B
+    }
+    // Aim the rocket at the ground point, select the launcher, and fire once the view is on it.
+    *look = bot_combat::angles_to(eye, aim);
     if game.entities[e].v.weapon != Weapon::RocketLauncher {
         *impulse = 7;
         *buttons &= !BUTTON_ATTACK;

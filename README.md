@@ -158,12 +158,13 @@ more health it takes to justify setting it off) — and a grenade too close to s
 **run and hop clear** instead of detonating it in their own face. Offensively they use splash weapons for
 **position manipulation** — if an enemy stands near **lava, slime, a pit or a ledge**, the bot sets
 off a blast so the outward **knockback shoves them into the hazard**, verifying the shove actually
-carries them across the edge before committing. It's a **generic strategy** with two deliveries: a
-**rocket** when the bot already stands on the far side of the enemy from the hazard (a low rocket
-pushes them straight away from the bot — one aimed shot), or a **grenade lob→shoot combo** when it
-needs to arc the blast *behind* them: aim a ballistic arc (solved from the launcher's fixed
-speed/loft against gravity), lob, switch to a hitscan gun, and detonate in flight. With no hazard the
-grenade combo becomes a plain airburst. All of it is safety-checked — never self-splash, never a
+carries them across the edge before committing. It's a **generic strategy** — the blast point sits on the ground **behind** the enemy (away from the
+hazard) so the outward splash drives them in — with two deliveries: a **rocket** put straight onto
+that ground spot (no direct hit needed; a static point is easy to hit and works from any angle with a
+clear line to it), or a **grenade lob→shoot combo** when the blast must be **arced over** the enemy
+to reach it — aim a ballistic arc (solved from the launcher's fixed speed/loft against gravity), lob,
+switch to a hitscan gun, and detonate in flight. With no hazard the grenade combo becomes a plain
+airburst. All of it is safety-checked — never self-splash, never a
 teammate, never a shove the wrong way, never a lob into a wall.
 
 ## Map rotation
