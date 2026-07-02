@@ -267,6 +267,15 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // Dead: pulse +attack to respawn. rtx's death-think needs all buttons *released* (Dead →
     // Respawnable) and then *pressed* again — so the button must be pulsed, not held.
     if !alive {
+        if host.cvar_bool(c"rtx_bot_debug") {
+            let v = &game.entities[e].v;
+            host.conprint(&cstring(&format!(
+                "rtx bot{client}: DEAD health={} deadflag={} classname={:?} pulse={pulse}\n",
+                v.health,
+                v.deadflag,
+                game.entities[e].classname(),
+            )));
+        }
         let buttons = if pulse { BUTTON_ATTACK } else { 0 };
         host.set_bot_cmd(client, msec, v_angle, 0, 0, 0, buttons, 0);
         return;
