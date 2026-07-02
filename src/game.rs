@@ -140,10 +140,13 @@ pub struct GameState {
     ext_fields: ext_field::ExtFields,
     /// Auto-generated navmesh for the current map (bot navigation). Rebuilt each map load.
     pub(crate) nav: navmesh::NavState,
-    /// Server time of the last engine **bot frame** (`GAME_START_FRAME` with `is_bot_frame`). The
-    /// engine only issues those once a real client is connected, so on an empty (bots-only) server
-    /// this goes stale and the normal frame drives the bots itself. See `start_frame`.
-    bot_frame_time: f32,
+    /// Set by each engine **bot frame** (`GAME_START_FRAME` with `is_bot_frame`) and cleared by the
+    /// next normal frame. The engine only issues bot frames once a real client is connected, so on an
+    /// empty (bots-only) server this stays clear and the normal frame drives the bots itself. See
+    /// `start_frame`. Frame-based, not time-based, so it doesn't depend on the clock advancing.
+    bot_frame_seen: bool,
+    /// One-shot: whether we've logged that the normal frame is driving the bots (diagnostic).
+    normal_bot_drive_logged: bool,
     /// Escape hatch for string-declared sounds (precache-and-intern at load time). Empty for the
     /// current port — every sound is a registry handle — but here so a runtime path is registered
     /// through the same precache-guaranteeing door. Use `dyn_assets.sound(&host, path)`.
@@ -198,7 +201,8 @@ impl GameState {
             rng: 0x2545_f491, // nonzero default; reseeded in GAME_INIT
             ext_fields: ext_field::ExtFields::default(),
             nav: navmesh::NavState::default(),
-            bot_frame_time: 0.0,
+            bot_frame_seen: false,
+            normal_bot_drive_logged: false,
             dyn_assets: DynAssets::default(),
         }
     }
@@ -823,13 +827,20 @@ impl GameState {
             mode.tick(self);
             bot::manage_population(self);
             // The engine only issues bot frames (below) once a real client is connected. On an empty
-            // bots-only server those never arrive, so if we haven't seen one recently, drive the bots
-            // from this normal frame instead — otherwise they'd spawn and just stand there.
-            if self.time() - self.bot_frame_time > 0.25 {
+            // bots-only server those never arrive, so if no bot frame ran since the last normal frame,
+            // drive the bots from this normal frame instead — otherwise they'd spawn and just stand
+            // there. (When a real client is present the bot frame drives them and this stays idle.)
+            if !self.bot_frame_seen {
+                if !self.normal_bot_drive_logged && self.nav.is_loaded() {
+                    self.host
+                        .dprint(c"rtx: no engine bot frame — driving bots from the normal frame\n");
+                    self.normal_bot_drive_logged = true;
+                }
                 bot::run_bots(self);
             }
+            self.bot_frame_seen = false;
         } else {
-            self.bot_frame_time = self.time();
+            self.bot_frame_seen = true;
             bot::run_bots(self);
         }
         1
