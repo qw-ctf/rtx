@@ -61,9 +61,12 @@ is just the baseline mode, so adding a mode doesn't touch the generic gameplay o
 
 | cvar | default | what it does |
 |------|---------|--------------|
-| `rtx_mode` | `ffa` | `ffa` = free-for-all deathmatch (stock behaviour). `ra` = Rocket Arena. |
+| `rtx_mode` | `ffa` | `ffa` = free-for-all deathmatch (stock behaviour). `ra` = Rocket Arena. `midair` = airborne-only rocket DM. A **team format** (`1on1`/`duel`, `2on2`, `2on2on2`, any `NonM…`) = team deathmatch. |
 | `rtx_ra_countdown` | `3` | Rocket Arena: seconds of spawn-protected countdown before "FIGHT". |
 | `rtx_ra_lightning_gun` | `0` | Rocket Arena: include the lightning gun in the arena arsenal (`0` leaves it out). |
+| `rtx_midair_minheight` | `40` | Midair: minimum height (units) above the floor for a victim to count as airborne. |
+| `rtx_midair_kb_ground` / `rtx_midair_kb_air` | `6` / `3` | Midair: rocket knockback multipliers for grounded vs airborne victims (ground is stronger, to launch players up). |
+| `rtx_match_countdown` | `3` | Team match: seconds of spawn-protected countdown after the match-start map reload before "FIGHT". |
 
 **`ra` — Rocket Arena.** Round-based 1v1 duels following the classic arena loop (ported from the
 Frogbot-Rocket-Arena QuakeC, minus its clan-arena team machinery). Two players fight in the arena
@@ -77,6 +80,27 @@ in place and topped back up to full — and faces the next challenger pulled fro
 audience queue (losers go to the back), so the arena is always a fresh duel. On a plain deathmatch
 map with no teleport destinations it falls back to DM spawns so the mode still runs. Bots play it
 fully — see below.
+
+**`midair` — airborne-only rocket DM** (modeled on [KTX](https://github.com/QW-Group/ktx)'s
+midair). Everyone spawns with a **rocket launcher** (+ axe), 255 rockets, red armour and 250
+health, at normal gravity. A direct rocket on an **airborne** victim is an **instant kill**; on a
+**grounded** victim it deals no damage but delivers a hard **knockback that launches them skyward**
+— so you rocket someone up, then airshot them out of the air. Non-rocket damage is harmless, and
+your own rockets never hurt you but still fling you (free rocket-jumps). Kills score by **how high
+the victim was** (vertical distance from where you fired): **bronze/silver/gold/platinum** for
+**+1/+2/+4/+8** at `>0/256/512/1024` units, announced as an airshot line. Bots play it — they hunt
+the nearest player, launch grounded targets and airshot them.
+
+**Team formats — `1on1`/`duel`, `2on2`, `2on2on2`, any `NonM…`.** A generic team-match layer: the
+alias picks **N teams of size M** (`2on2on2` = three teams of two). It's a **continuous team
+deathmatch** — teams frag to the `fraglimit`, friendly fire follows `teamplay`, and each team gets a
+colour (red/blue/green/…) and its `info_player_teamN` spawns (DM spawns as fallback). The lifecycle
+is warmup → **`start`** → live → results: in **warmup** everyone plays and is auto-balanced onto the
+smallest team; typing **`start`** in the console **reloads the map** (fresh entities) and runs a
+countdown, **locking the roster**; play then runs to the limit and returns to warmup. Players who
+drop and reconnect are **reattached to their team**. Bots fill and play the teams, targeting only
+the other side. The team primitives are reusable — a future round-based team mode builds on the same
+layer.
 
 ## Bots
 

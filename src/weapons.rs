@@ -370,6 +370,10 @@ impl GameState {
         self.host.set_size(m, Vec3::ZERO, Vec3::ZERO);
         self.host
             .set_origin(m, origin + v_forward * 8.0 + Vec3::new(0.0, 0.0, 16.0));
+        // Stamp the shooter's firing origin (set after `set_origin` so it isn't clobbered): the
+        // midair mode scores airshots by the vertical shooter→victim distance. Unused otherwise —
+        // `FlyMissile` physics never touch `oldorigin`.
+        self.entities[m].v.oldorigin = origin;
     }
 
     // --- lightning ---

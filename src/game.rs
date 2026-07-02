@@ -120,6 +120,10 @@ pub struct GameState {
     /// Rocket-Arena round-state machine. Only meaningful while `mode` is the arena; otherwise
     /// left at its default. See [`crate::mode::ArenaState`].
     pub arena: ArenaState,
+    /// Team-match state (config + lifecycle + locked roster). Only meaningful while a team `rtx_mode`
+    /// alias is active. Lives here (not on the mode descriptor) so it survives the match-start map
+    /// reload. See [`crate::mode::MatchState`].
+    pub team_match: crate::mode::MatchState,
     /// QuakeC transient globals threaded through target-firing and damage (`activator`,
     /// `damage_attacker`, `damage_inflictor`). Set at the top of the relevant callbacks.
     pub activator: EntId,
@@ -181,6 +185,7 @@ impl GameState {
             level: Level::default(),
             mode: mode::default_mode(),
             arena: ArenaState::default(),
+            team_match: crate::mode::MatchState::default(),
             activator: EntId::WORLD,
             damage_attacker: EntId::WORLD,
             damage_inflictor: EntId::WORLD,
@@ -445,14 +450,24 @@ impl GameState {
         self.host.cvar_default("rtx_hook_speed", 1.25);
         self.host.cvar_default("rtx_hook_pull", 1.0);
 
-        // Game mode: `ffa` (free-for-all deathmatch, the default) or `ra` (Rocket Arena). Read
-        // live each frame. A string cvar. See `crate::mode`.
+        // Game mode: `ffa` (free-for-all deathmatch, the default), `ra` (Rocket Arena), or
+        // `midair` (airborne-only rocket DM). Read live each frame. A string cvar. See `crate::mode`.
         self.host.cvar_default("rtx_mode", "ffa");
         // Rocket Arena: seconds of spawn-protected countdown before "FIGHT". (The arena is always
         // a 1v1 duel — the fighter count isn't a cvar.)
         self.host.cvar_default("rtx_ra_countdown", 3.0);
         // Rocket Arena: include the lightning gun in the arena arsenal (off = leave it out).
         self.host.cvar_default("rtx_ra_lightning_gun", false);
+        // Team match (`rtx_mode 1on1`/`2on2`/`2on2on2`/…): seconds of spawn-protected countdown after
+        // the match-start map reload before "FIGHT".
+        self.host.cvar_default("rtx_match_countdown", 3.0);
+        // Midair: minimum height above the floor (units) for a victim to count as airborne, and the
+        // knockback multipliers for airborne (`kb_air`) vs grounded (`kb_ground`) rocket hits — the
+        // ground value is bigger to pop grounded players up into the air. Tunables over rtx's bare
+        // `damage*8` knockback base, so they don't match KTX's raw c1/c2 literals.
+        self.host.cvar_default("rtx_midair_minheight", 40.0);
+        self.host.cvar_default("rtx_midair_kb_ground", 6.0);
+        self.host.cvar_default("rtx_midair_kb_air", 3.0);
 
         // Navmesh bots: how many to keep on the server (0 = none), and their skill (reserved
         // for combat tuning later). Bots only spawn once a map's navmesh is built.

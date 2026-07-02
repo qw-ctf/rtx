@@ -55,6 +55,9 @@ pub fn worldspawn(game: &mut GameState) {
     // Fresh map = fresh match: reset any round state (refresh_mode only resets on a mode change,
     // so a same-mode map change would otherwise carry a stale mid-round state over).
     game.arena = ArenaState::default();
+    // Team-match state is guarded rather than blindly reset: a match-start reload preserves the
+    // locked roster and arms the countdown; any other load starts a fresh warmup.
+    crate::mode::TeamMatch::on_worldspawn(game);
 }
 
 /// `StartFrame` — runs once per server frame. Refreshes match cvars and the frame counter.

@@ -680,6 +680,21 @@ impl HostApi {
         unsafe { (self.syscall)(B::RemoveBot as isize, client as isize) };
     }
 
+    /// `G_SETUSERINFO` — set a userinfo key on any client server-side (`flags` 0 for normal
+    /// userinfo). Used to force a human player's `"team"`/colours in a team match; bots use
+    /// [`set_bot_userinfo`](Self::set_bot_userinfo).
+    pub fn set_userinfo(&self, client: i32, key: &CStr, value: &CStr, flags: i32) {
+        unsafe {
+            (self.syscall)(
+                B::SetUserInfo as isize,
+                client as isize,
+                key.as_ptr() as isize,
+                value.as_ptr() as isize,
+                flags as isize,
+            )
+        };
+    }
+
     /// `G_SetBotUserInfo` — set a userinfo key on a bot client (`flags` 0 for normal userinfo).
     pub fn set_bot_userinfo(&self, client: i32, key: &CStr, value: &CStr, flags: i32) {
         unsafe {

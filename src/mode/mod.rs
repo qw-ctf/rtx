@@ -30,9 +30,13 @@ use crate::game::{cstring, GameState};
 
 mod arena;
 mod ffa;
+mod midair;
+mod team;
 
 pub(crate) use arena::{Arena, ArenaState};
 pub(crate) use ffa::Ffa;
+pub(crate) use midair::Midair;
+pub(crate) use team::{MatchState, TeamMatch};
 
 /// A player's standing in a round-based mode (Rocket Arena): fighting in the arena, or waiting
 /// in the audience (fresh joiners, and players eliminated until the next round). Stored per
@@ -57,6 +61,9 @@ pub(crate) struct ArenaPlayer {
     /// Throttle for the "can't fire yet" screen blink during the countdown (world time of the last
     /// blink), so a held fire button flashes once in a while rather than every frame.
     pub flash_time: f32,
+    /// Team id in a team match (`1..=N`; `0` = unassigned/none). Only the team modes read it. See
+    /// [`crate::mode::team`].
+    pub team: u8,
 }
 
 /// A mode's per-frame directive for one bot — the *only* channel through which a mode influences
@@ -73,14 +80,42 @@ pub(crate) enum BotIntent {
     Move(Vec3),
 }
 
+/// How a mode shapes one hit's effect on a player (see [`GameMode::player_damage`]). `health` is
+/// the damage sent into the normal armor/health path (a large value one-shots through armor);
+/// `knockback` is the impulse basis the engine turns into velocity. They're separate so a mode can
+/// deal zero health damage yet still fling the target — Midair launches grounded players this way.
+pub(crate) struct DamageOutcome {
+    pub health: f32,
+    pub knockback: f32,
+}
+
+impl DamageOutcome {
+    /// Take the hit unchanged (health and knockback both the incoming damage) — the stock rule.
+    pub fn pass(incoming: f32) -> Self {
+        Self {
+            health: incoming,
+            knockback: incoming,
+        }
+    }
+
+    /// No effect at all — no health loss and no knockback (spawn protection, untouchable audience).
+    pub fn none() -> Self {
+        Self {
+            health: 0.0,
+            knockback: 0.0,
+        }
+    }
+}
+
 /// The behavior of one game mode. Every hook has a default that reproduces stock FFA deathmatch,
 /// so a mode only overrides the policy pieces it changes:
 ///
-/// - **Ruleset** — [`tick`](GameMode::tick), [`damage_allowed`](GameMode::damage_allowed),
-///   [`on_death`](GameMode::on_death), [`allow_respawn`](GameMode::allow_respawn).
+/// - **Ruleset** — [`tick`](GameMode::tick), [`player_damage`](GameMode::player_damage),
+///   [`weapons_hot`](GameMode::weapons_hot), [`on_death`](GameMode::on_death),
+///   [`announce_death`](GameMode::announce_death), [`allow_respawn`](GameMode::allow_respawn).
 /// - **Spawns** — [`select_spawn`](GameMode::select_spawn).
 /// - **Loadout** — [`apply_loadout`](GameMode::apply_loadout).
-/// - **Bots** — [`bot_enemy`](GameMode::bot_enemy), [`bot_audience`](GameMode::bot_audience).
+/// - **Bots** — [`bot_intent`](GameMode::bot_intent).
 pub(crate) trait GameMode: Sync {
     /// The `rtx_mode` value that selects this mode.
     fn name(&self) -> &'static str;
@@ -99,10 +134,21 @@ pub(crate) trait GameMode: Sync {
     /// spawn parms (stock FFA loadout).
     fn apply_loadout(&self, _g: &mut GameState, _e: EntId) {}
 
-    /// May `targ` take damage right now? Used for round countdown spawn-protection and to keep
-    /// audience players harmless. Default: yes.
-    fn damage_allowed(&self, _g: &GameState, _targ: EntId) -> bool {
-        true
+    /// Shape one hit landing on `targ` — the mode's damage ruleset, consulted in `t_damage` after
+    /// the quad multiplier and before armor. Returns the health damage to apply and the knockback
+    /// impulse basis (see [`DamageOutcome`]); [`DamageOutcome::none`] blocks the hit entirely (no
+    /// pain, no knockback), reproducing a hard damage gate. `incoming` is the post-quad damage.
+    /// Default: pass through unchanged. Used for Rocket Arena countdown protection / untouchable
+    /// audience, and for Midair's airborne-only kills + launch knockback.
+    fn player_damage(
+        &self,
+        _g: &mut GameState,
+        _targ: EntId,
+        _attacker: EntId,
+        _inflictor: EntId,
+        incoming: f32,
+    ) -> DamageOutcome {
+        DamageOutcome::pass(incoming)
     }
 
     /// May weapons fire right now? Gates the actual shot (muzzle/projectile), not just damage —
@@ -111,8 +157,16 @@ pub(crate) trait GameMode: Sync {
         true
     }
 
-    /// Called after a player dies (obituary already printed): record eliminations, check for a
-    /// round end. Default: nothing.
+    /// Print the mode's own kill announcement / scoring instead of the default obituary. Called in
+    /// `killed` just before `client_obituary`; return `true` to suppress the default (the mode has
+    /// handled the frag + broadcast itself). Default: `false` (use the stock obituary). Midair uses
+    /// this for its height-tiered airshot scoring.
+    fn announce_death(&self, _g: &mut GameState, _victim: EntId, _attacker: EntId) -> bool {
+        false
+    }
+
+    /// Called after a player dies (obituary already printed / suppressed): record eliminations,
+    /// check for a round end. Default: nothing.
     fn on_death(&self, _g: &mut GameState, _victim: EntId, _attacker: EntId) {}
 
     /// May a dead player respawn now via the death-think button press? A mode that drives
@@ -133,35 +187,61 @@ pub(crate) trait GameMode: Sync {
 static FFA: Ffa = Ffa;
 /// The Rocket Arena singleton (`rtx_mode ra`).
 static ARENA: Arena = Arena;
+/// The Midair singleton (`rtx_mode midair`).
+static MIDAIR: Midair = Midair;
+/// The team-match singleton — every team alias (`1on1`/`duel`/`2on2`/`2on2on2`/`NonM…`) resolves to
+/// it; the parsed format lives in [`GameState::team_match`], not the descriptor.
+static TEAM: TeamMatch = TeamMatch;
 
 /// The default mode used before a map selects one (matches `rtx_mode ffa`).
 pub(crate) fn default_mode() -> &'static dyn GameMode {
     &FFA
 }
 
-/// Resolve an `rtx_mode` string to its mode descriptor. Unknown values fall back to FFA.
+/// Resolve an `rtx_mode` string to its mode descriptor. Any team format alias resolves to the
+/// shared team-match descriptor; unknown values fall back to FFA.
 pub(crate) fn select_mode(name: &str) -> &'static dyn GameMode {
     match name {
         "ra" => &ARENA,
+        "midair" => &MIDAIR,
+        _ if team::parse_match_alias(name).is_some() => &TEAM,
         _ => &FFA,
     }
 }
 
 impl GameState {
     /// Sync the active mode to the `rtx_mode` cvar. Read live every frame (like every other rtx
-    /// cvar) so `rtx_mode ra` takes effect without a map reload — and because `init` re-defaults
-    /// the cvar to `ffa` on each map load right before the first `worldspawn`, a one-shot read
-    /// there would always see `ffa`. Re-selecting only on an actual change keeps round state from
-    /// resetting every frame; switching modes deliberately does reset it (a fresh match).
+    /// cvar) so a mode change takes effect without a map reload. Re-selecting only on an actual
+    /// change keeps round/match state from resetting every frame; switching modes deliberately does
+    /// reset it (a fresh match). `rtx_mode` is preserved across a map reload (`cvar_default` only
+    /// seeds an unset cvar), so the team-match start-reload keeps its alias.
     pub(crate) fn refresh_mode(&mut self) {
         let host = self.host;
         let mut buf = [0u8; 16];
         let name = host.cvar_string(c"rtx_mode", &mut buf);
         let next = select_mode(name);
+        // The team descriptor's `name()` is a constant, so switching format (`2on2`→`3on3`) isn't a
+        // descriptor change — track the parsed format separately (below).
+        let team_config = team::parse_match_alias(name);
         if next.name() != self.mode.name() {
             self.mode = next;
             self.arena = ArenaState::default();
             host.conprint(&cstring(&format!("rtx: game mode = {}\n", next.name())));
+        }
+        // `name`'s borrow of `buf` is done (config is Copy); free to take `&mut self`.
+        if next.name() == "team" {
+            if let Some(cfg) = team_config {
+                if cfg != self.team_match.config {
+                    self.team_match = MatchState {
+                        config: cfg,
+                        ..Default::default()
+                    };
+                }
+            }
+            // Team play needs friendly-fire protection on (the `"team"` userinfo does the rest).
+            if host.cvar(c"teamplay") == 0.0 {
+                host.cvar_set(c"teamplay", c"1");
+            }
         }
     }
 }

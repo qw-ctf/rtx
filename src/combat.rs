@@ -62,10 +62,14 @@ impl GameState {
 
         self.entities[targ].set_enemy(attacker);
 
-        self.client_obituary(targ, attacker);
+        // The mode may print its own scoring/announcement (Midair's airshot tiers) in place of the
+        // stock obituary; otherwise the default obituary runs.
+        let mode = self.mode;
+        if !mode.announce_death(self, targ, attacker) {
+            self.client_obituary(targ, attacker);
+        }
 
         // Notify the mode (round-based modes track eliminations / round end here).
-        let mode = self.mode;
         mode.on_death(self, targ, attacker);
 
         {
@@ -80,12 +84,6 @@ impl GameState {
     /// `T_Damage` — the only function that reduces health.
     pub(crate) fn t_damage(&mut self, targ: EntId, inflictor: EntId, attacker: EntId, mut damage: f32) {
         if self.entities[targ].v.takedamage == 0.0 {
-            return;
-        }
-        // Mode-level damage gate (Rocket Arena countdown protection / harmless audience). Only
-        // affects players; world objects (doors, grenades) always pass.
-        let mode = self.mode;
-        if !mode.damage_allowed(self, targ) {
             return;
         }
         if self.is_grenade(targ) {
@@ -103,6 +101,17 @@ impl GameState {
         if self.entities[attacker].combat.super_damage_finished > time && !inflictor_is_door {
             damage *= if self.level.deathmatch == 4 { 8.0 } else { 4.0 };
         }
+
+        // Mode damage ruleset (Rocket Arena countdown/audience protection; Midair airborne-only
+        // kills + launch knockback), applied after quad and before armor. A fully-blocked hit — no
+        // health *and* no knockback — short-circuits exactly like the old boolean damage gate.
+        let mode = self.mode;
+        let outcome = mode.player_damage(self, targ, attacker, inflictor, damage);
+        if outcome.health <= 0.0 && outcome.knockback <= 0.0 {
+            return;
+        }
+        damage = outcome.health;
+        let knockback = outcome.knockback;
 
         // Armor absorption.
         let take;
@@ -132,11 +141,11 @@ impl GameState {
         };
         if inflictor != EntId::WORLD && self.entities[targ].v.movetype == MoveType::Walk {
             let dir = (self.entities[targ].v.origin - inflictor_org).normalize_or_zero();
-            self.entities[targ].v.velocity += dir * damage * 8.0;
+            self.entities[targ].v.velocity += dir * knockback * 8.0;
 
             let rj = self.host.cvar(c"rj");
             if rj > 1.0 && self.same_player_netname(attacker, targ) {
-                self.entities[targ].v.velocity += dir * damage * rj;
+                self.entities[targ].v.velocity += dir * knockback * rj;
             }
         }
 

@@ -16,7 +16,7 @@
 
 use glam::Vec3;
 
-use super::{ArenaRole, BotIntent, GameMode};
+use super::{ArenaRole, BotIntent, DamageOutcome, GameMode};
 use crate::defs::{Items, PrintLevel, Weapon};
 use crate::entity::EntId;
 use crate::game::{cstring, GameState};
@@ -147,7 +147,7 @@ impl GameMode for Arena {
             v.weapon = Weapon::RocketLauncher;
         } else {
             // Audience: axe only, no ammo — harmless spectators wandering the stands (damage to
-            // them is refused, see `damage_allowed`). Health/armor must stay positive: a client
+            // them is refused, see `player_damage`). Health/armor must stay positive: a client
             // (and the bot AI) treats 0 health as dead and locks movement, so they'd freeze.
             v.items = Items::AXE.as_f32();
             v.health = 100.0;
@@ -161,18 +161,26 @@ impl GameMode for Arena {
         }
     }
 
-    fn damage_allowed(&self, g: &GameState, targ: EntId) -> bool {
+    fn player_damage(
+        &self,
+        g: &mut GameState,
+        targ: EntId,
+        _attacker: EntId,
+        _inflictor: EntId,
+        incoming: f32,
+    ) -> DamageOutcome {
         // Only gate players — doors, buttons, grenades, etc. must stay damageable (bots shoot
         // gate buttons to open them).
         let t = &g.entities[targ];
         if t.classname() != Some("player") {
-            return true;
+            return DamageOutcome::pass(incoming);
         }
-        // Audience is untouchable; fighters are protected until the round goes live.
-        if t.arena.role == ArenaRole::Audience {
-            return false;
+        // Audience is untouchable; fighters are protected until the round goes live. A blocked hit
+        // deals nothing and imparts no knockback (spawn protection), as before.
+        if t.arena.role == ArenaRole::Audience || !matches!(g.arena.round, RoundState::Live) {
+            return DamageOutcome::none();
         }
-        matches!(g.arena.round, RoundState::Live)
+        DamageOutcome::pass(incoming)
     }
 
     fn weapons_hot(&self, g: &GameState) -> bool {

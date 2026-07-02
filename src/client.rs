@@ -371,6 +371,12 @@ impl GameState {
                 self.client_kill(e);
                 1
             }
+            // Start a team match: lock the roster, reload the map, run the countdown (no-op unless a
+            // team `rtx_mode` is active and we're in warmup). See `crate::mode::team`.
+            "start" => {
+                crate::mode::TeamMatch::start(self);
+                1
+            }
             _ => 0,
         }
     }
@@ -395,6 +401,11 @@ impl GameState {
 
     /// `CheckRules` — end the level on time/frag limit.
     fn check_rules(&mut self, e: EntId) {
+        // Team matches own their limits (team score, in `TeamMatch::tick`) — don't let an individual
+        // player's frags trip the stock intermission path.
+        if self.mode.name() == "team" {
+            return;
+        }
         let frags = self.entities[e].v.frags;
         let tl = self.level.timelimit;
         let fl = self.level.fraglimit;
