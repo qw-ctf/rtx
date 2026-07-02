@@ -136,13 +136,24 @@ through the same player-move code as humans, so gravity, stepping, and jumps com
 | `rtx_bot_alone` | `0` | Keep bots on the server even when **no humans** are connected (`0` = bots leave an empty server; `1` = they stay and play it out). |
 | `rtx_bot_skill` | `3` | Bot skill (0–7): tightens aim and speeds how fast a bot turns/tracks. |
 | `rtx_bot_pacifist` | `0` | Make bots **not fight** in **any** mode — they just trail the nearest human around the map (for experimenting). `0` = bots play the mode normally. |
+| `rtx_bot_greed` | `1` | Let a fighting bot **break off to grab a compelling nearby pickup** — a powerup (quad/pent), a weapon it lacks, or a big health/armor swing — while it can't see its target, instead of only chasing the enemy. `0` = bots only pursue items when the mode leaves the brain idle. |
 
 In free-for-all each bot **hunts and frags the nearest player** — everyone's an enemy, so a
 bots-only server plays itself — pathing to them and, once in sight, aiming and shooting via the
 shared combat layer (retreating when hurt, grabbing items it passes over). Set `rtx_bot_pacifist 1`
 — in any mode — and they stop fighting and just tail the nearest human instead. With nothing to
 chase and no human to follow, a bot **roams** to a random reachable spot rather than standing on its
-spawn. Otherwise (when a mode leaves the brain in charge) it pathfinds to the best reachable **item
+spawn.
+
+Bots value pickups the way ktx does: each item's **desire** is the marginal effective-HP (health,
+armor), firepower (weapons, ammo), or flat dominance (powerups) it would give *this* bot right now,
+weighted by how soon it can reach and collect it (`desire × (lookahead − t) / (t + 5)`) — so they
+skip health at full, weapons they own, and ammo they're capped on, time an item's respawn, and prize
+the **quad/pent** above almost anything. Dropped **backpacks** (a dead player's weapon + ammo, or a
+teammate's toss) are sought and collected the same way. With `rtx_bot_greed` on (the default), a bot
+in the thick of a fight will **detour for the quad, a weapon it's missing, or a big health/armor
+pickup** whenever its target slips out of sight — the enemy is just one more goal competing with the
+items. Otherwise (when a mode leaves the brain in charge) it pathfinds to the best reachable **item
 pickup**, or **follows the nearest human** (through doors, off ledges, across jumps, recovering after
 a missed jump). On open, roughly-straight stretches they **bunnyhop** (`rtx_bot_bhop`) — chaining jumps
 and **air-strafing** (sweeping the view while holding one strafe key) to exploit QuakeWorld's

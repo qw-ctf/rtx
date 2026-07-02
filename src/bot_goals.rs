@@ -18,12 +18,18 @@
 //! own stats are read fresh each time a goal is chosen.
 
 use crate::defs::{Bits, Items, Solid};
-use crate::entity::{EntId, Think};
+use crate::entity::{EntId, Think, Touch};
 use crate::game::GameState;
 use crate::navmesh::CellId;
 
 /// Beyond this travel-or-respawn time (seconds) an item isn't worth pursuing.
 pub(crate) const LOOKAHEAD: f32 = 10.0;
+
+/// Minimum *desire* an item must have for a bot to break off combat and detour for it (the
+/// `rtx_bot_greed` behavior). Set so powerups (200+) and a genuinely wanted weapon/health/armor
+/// swing clear it, while a minor ammo top-off (≈2.5) doesn't — a bot won't abandon a firefight for
+/// a handful of shells, but it will for the quad, an RL it lacks, or a big health/armor pickup.
+pub(crate) const COMBAT_GREED_MIN_DESIRE: f32 = 40.0;
 
 /// The weapons a bot can want, and the ammo kinds. Real enums (not raw [`Items`] bits) so the
 /// desire match stays exhaustive.
@@ -127,6 +133,23 @@ fn weapon_bit(w: WeaponKind) -> Items {
         WeaponKind::Rl => Items::ROCKET_LAUNCHER,
         WeaponKind::Lg => Items::LIGHTNING,
     }
+}
+
+/// The best weapon a backpack's `items` bitfield carries, if any (a death drop holds a single
+/// weapon, but be defensive and take the strongest). Axe/shotgun carry no bit we care about — the
+/// bot always owns those — so only the six pickup weapons map.
+fn weapon_kind_of(items: f32) -> Option<WeaponKind> {
+    use WeaponKind::*;
+    [
+        (Items::LIGHTNING, Lg),
+        (Items::ROCKET_LAUNCHER, Rl),
+        (Items::GRENADE_LAUNCHER, Gl),
+        (Items::SUPER_NAILGUN, Sng),
+        (Items::NAILGUN, Ng),
+        (Items::SUPER_SHOTGUN, Ssg),
+    ]
+    .into_iter()
+    .find_map(|(bit, w)| items.has(bit).then_some(w))
 }
 
 /// The ammo a weapon pickup carries — what you still gain by re-grabbing an owned weapon when it
@@ -322,6 +345,32 @@ impl GameState {
         }
     }
 
+    /// How much this bot wants a dropped **backpack** (from a death drop or a teammate's toss).
+    /// A backpack carries a single weapon bit plus a slice of ammo, so its worth is the best of the
+    /// weapon it grants (if the bot lacks it) and the ammo it refills — the same currency the
+    /// catalog items use, so a backpack competes on equal footing. Unlike map items a backpack is
+    /// dynamic (spawned on death, auto-removed after 120 s), so it never lives in the static catalog.
+    fn backpack_desire(&self, s: &Stats, item: EntId) -> f32 {
+        let v = &self.entities[item].v;
+        let mut desire = 0.0_f32;
+        if let Some(w) = weapon_kind_of(v.items) {
+            if !s.items.has(weapon_bit(w)) {
+                desire = desire.max(weapon_desire(s, w));
+            }
+        }
+        for (amount, kind) in [
+            (v.ammo_shells, AmmoKind::Shells),
+            (v.ammo_nails, AmmoKind::Nails),
+            (v.ammo_rockets, AmmoKind::Rockets),
+            (v.ammo_cells, AmmoKind::Cells),
+        ] {
+            if amount > 0.0 {
+                desire = desire.max(ammo_desire(s, kind));
+            }
+        }
+        desire
+    }
+
     /// The effective time-to-collect for `item` given the raw travel cost: `None` if it's hidden
     /// with no scheduled respawn (uncollectable), else `max(travel, respawn-wait)`.
     fn item_collect_time(&self, item: EntId, travel: f32, now: f32) -> Option<f32> {
@@ -342,6 +391,11 @@ impl GameState {
     /// now-worthless pickup and circle it until the throttled re-select kicked in.
     pub(crate) fn item_goal_valid(&self, bot_e: EntId, item: EntId, now: f32) -> bool {
         let ent = &self.entities[item];
+        // A backpack has no goal classname and never respawns: it's valid while it's still on the
+        // floor (solid) and still carries something this bot wants.
+        if ent.touch == Touch::Backpack {
+            return ent.v.solid == Solid::Trigger && self.backpack_desire(&self.bot_stats(bot_e), item) > 0.0;
+        }
         let reachable_soon = ent.v.solid == Solid::Trigger
             || (matches!(ent.think, Think::SubRegen) && ent.v.nextthink - now < LOOKAHEAD);
         if !reachable_soon {
@@ -354,12 +408,27 @@ impl GameState {
     }
 
     /// Pick the highest-scoring reachable item goal for a bot, or `None` to fall back to following
-    /// a human. Scans the static per-map catalog against a single Dijkstra flood from the bot.
+    /// a human. Scans the static per-map catalog *and* any live dropped backpacks against a single
+    /// Dijkstra flood from the bot.
     pub(crate) fn select_item_goal(&self, bot_e: EntId) -> Option<(EntId, CellId)> {
+        self.best_item_goal(bot_e).map(|(item, cell, _)| (item, cell))
+    }
+
+    /// Pick an item worth *breaking off combat* for — the same best goal, but only returned when
+    /// its desire clears [`COMBAT_GREED_MIN_DESIRE`]. Lets a fighting bot detour for the quad, a
+    /// weapon it lacks, or a big health/armor pickup without chasing every trivial ammo box.
+    pub(crate) fn select_combat_item(&self, bot_e: EntId) -> Option<(EntId, CellId)> {
+        self.best_item_goal(bot_e)
+            .filter(|&(_, _, desire)| desire >= COMBAT_GREED_MIN_DESIRE)
+            .map(|(item, cell, _)| (item, cell))
+    }
+
+    /// The best `(item, cell, desire)` for a bot by `desire × (LOOKAHEAD − t) / (t + 5)`, over both
+    /// the static catalog and live backpacks. `desire` is returned so callers can apply their own
+    /// bar (combat-detour vs. idle pickup). Backpacks are on the floor now, so their `t` is pure
+    /// travel; the catalog folds in respawn-wait via [`item_collect_time`].
+    fn best_item_goal(&self, bot_e: EntId) -> Option<(EntId, CellId, f32)> {
         let graph = self.nav.graph.as_ref()?;
-        if self.nav.goals.is_empty() {
-            return None;
-        }
         let bot_cell = graph.nearest(self.entities[bot_e].v.origin)?;
         // Gate-aware: items behind a shut door cost more, so a bot prefers ones it can reach now.
         let gate_closed = self.gate_closed_flags();
@@ -371,10 +440,22 @@ impl GameState {
             let b = &self.entities[bot_e].bot;
             (b.avoid_item, b.avoid_until)
         };
+        let skip = |idx: u32| idx == avoid_item && now < avoid_until;
+        let score_of = |desire: f32, t: f32| desire * (LOOKAHEAD - t) / (t + 5.0);
 
-        let mut best: Option<(EntId, CellId, f32)> = None;
+        // best = (item, cell, desire, score) — score orders the search, desire is handed back.
+        let mut best: Option<(EntId, CellId, f32, f32)> = None;
+        let mut consider = |item: EntId, cell: CellId, desire: f32, t: f32| {
+            if t < LOOKAHEAD {
+                let score = score_of(desire, t);
+                if best.is_none_or(|(_, _, _, b)| score > b) {
+                    best = Some((item, cell, desire, score));
+                }
+            }
+        };
+
         for &(idx, cell) in &self.nav.goals {
-            if idx == avoid_item && now < avoid_until {
+            if skip(idx) {
                 continue;
             }
             let item = EntId(idx);
@@ -392,14 +473,30 @@ impl GameState {
             let Some(t) = self.item_collect_time(item, travel, now) else {
                 continue;
             };
-            if t >= LOOKAHEAD {
+            consider(item, cell, desire, t);
+        }
+
+        // Live backpacks aren't in the static catalog (they spawn on death / a teammate's toss and
+        // auto-remove), so scan the edicts for them each time.
+        for (i, ent) in self.entities.iter().enumerate() {
+            if ent.touch != Touch::Backpack || ent.v.solid != Solid::Trigger || skip(i as u32) {
                 continue;
             }
-            let score = desire * (LOOKAHEAD - t) / (t + 5.0);
-            if best.is_none_or(|(_, _, b)| score > b) {
-                best = Some((item, cell, score));
+            let item = EntId(i as u32);
+            let desire = self.backpack_desire(&s, item);
+            if desire <= 0.0 {
+                continue;
             }
+            let Some(cell) = graph.nearest(ent.v.origin) else {
+                continue;
+            };
+            let travel = costs[cell as usize];
+            if !travel.is_finite() {
+                continue;
+            }
+            consider(item, cell, desire, travel);
         }
-        best.map(|(item, cell, _)| (item, cell))
+
+        best.map(|(item, cell, desire, _)| (item, cell, desire))
     }
 }

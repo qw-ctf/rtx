@@ -19,7 +19,7 @@ use crate::bot_bhop;
 use crate::bot_combat;
 use crate::bot_grenade;
 use crate::defs::{Bits, Flags, Items, Solid, Weapon};
-use crate::entity::{BotState, EntId, Entity, GrenadePhase, HookPhase};
+use crate::entity::{BotState, EntId, Entity, GrenadePhase, HookPhase, Touch};
 use crate::game::{cstring, GameState};
 use crate::mode::BotIntent;
 use crate::navmesh::{CellId, LinkKind, NavGraph};
@@ -202,7 +202,8 @@ fn bot_pickup_items(game: &mut GameState, e: EntId) {
     }
     let origin = game.entities[e].v.origin;
     // Gather first (immutable borrow of nav/entities), then fire touches (needs `&mut game`).
-    let hits: Vec<EntId> = game
+    // Catalog items (weapons/ammo/health/armor/powerups)...
+    let mut hits: Vec<EntId> = game
         .nav
         .goals
         .iter()
@@ -212,6 +213,13 @@ fn bot_pickup_items(game: &mut GameState, e: EntId) {
             (it.v.solid == Solid::Trigger && on_item(origin, it.v.origin)).then_some(item)
         })
         .collect();
+    // ...plus any dropped backpack we're standing on. Backpacks aren't in the static catalog (they
+    // spawn on death / a teammate's toss), so without this a bot would walk over one and never take
+    // it — the engine skips the trigger-touch phase for `SetBotCMD` fake clients.
+    hits.extend(game.entities.iter().enumerate().filter_map(|(i, it)| {
+        (it.touch == Touch::Backpack && it.v.solid == Solid::Trigger && on_item(origin, it.v.origin))
+            .then_some(EntId(i as u32))
+    }));
     for item in hits {
         if game.entities[item].v.solid == Solid::Trigger {
             game.run_touch(item, e);
@@ -310,17 +318,24 @@ fn run_bot(game: &mut GameState, e: EntId) {
     } else {
         mode.bot_intent(game, e)
     };
-    if intent.is_some() {
-        game.entities[e].bot.goal_item = 0; // a mode target supersedes any item chase
-    }
-
     // Item goal (P5): re-pick the best reachable pickup on a slow cadence, and drop a chosen item
-    // once it's been grabbed (no longer available/respawning soon) so the bot moves on. With no
-    // worthwhile item, fall back to following the nearest human. Skipped when a mode supplies an
-    // intent (it chooses its own target below).
-    if intent.is_none() {
+    // once it's been grabbed (no longer available/respawning soon) so the bot moves on.
+    //
+    // Three cases feed the same `goal_item` slot:
+    //  - No mode intent → the full item brain (idle pickup, or follow-a-human fallback below).
+    //  - A **Fight** intent with `rtx_bot_greed` → a *combat detour*: still pick a compelling item
+    //    (`select_combat_item` bars trivial ones) so the bot can break off to grab the quad / a
+    //    needed weapon / big health, ktx-style, without abandoning combat — `enemy` stays set, so
+    //    the combat overlay keeps aiming and firing whenever it has line of sight (see below).
+    //  - Any other mode intent (a **Move** objective, or Fight with greed off) → no item chase.
+    let greedy = matches!(intent, Some(BotIntent::Fight(_))) && host.cvar_bool(c"rtx_bot_greed");
+    if intent.is_none() || greedy {
         if now >= game.entities[e].bot.goal_select_time {
-            let pick = game.select_item_goal(e);
+            let pick = if greedy {
+                game.select_combat_item(e)
+            } else {
+                game.select_item_goal(e)
+            };
             let (new_item, new_cell) = pick.map_or((0, 0), |(it, c)| (it.0, c));
             let b = &mut game.entities[e].bot;
             if new_item != b.goal_item {
@@ -334,6 +349,8 @@ fn run_bot(game: &mut GameState, e: EntId) {
             b.goal_item = 0;
             b.goal_select_time = now; // re-pick next frame
         }
+    } else {
+        game.entities[e].bot.goal_item = 0; // a Move objective supersedes any item chase
     }
 
     // Opt-in diagnostics (`rtx_bot_debug 1`): one throttled line per bot — what it wants, how far,
@@ -343,7 +360,10 @@ fn run_bot(game: &mut GameState, e: EntId) {
         let (goal, dist, overlap) = if gi != 0 {
             let it = &game.entities[EntId(gi)];
             let on = it.v.solid == Solid::Trigger && on_item(origin, it.v.origin);
-            (it.classname().unwrap_or("?"), (it.v.origin - origin).length(), on)
+            let name = it
+                .classname()
+                .unwrap_or(if it.touch == Touch::Backpack { "backpack" } else { "?" });
+            (name, (it.v.origin - origin).length(), on)
         } else {
             ("human", 0.0, false)
         };
@@ -361,15 +381,22 @@ fn run_bot(game: &mut GameState, e: EntId) {
     } else {
         None
     };
-    let chasing = intent.is_none() && game.entities[e].bot.goal_item != 0;
-    // Where we're headed: the mode's target, the chosen item, or the nearest human. None → idle.
+    // A committed item goal drives *movement* — set by the idle brain, or by the greedy combat
+    // detour (Fight + `rtx_bot_greed`). Under a Fight intent the enemy is still tracked above, so
+    // the combat overlay keeps aiming/firing on line of sight (and its range-keeping owns movement
+    // then); the detour only steers navigation while the enemy is *out* of sight, when navigation
+    // would otherwise just beeline the enemy. This is ktx's "the enemy is one more goal" in effect.
+    let chasing = game.entities[e].bot.goal_item != 0;
+    let goal_item_org = {
+        let it = EntId(game.entities[e].bot.goal_item);
+        (game.entities[it].v.origin, Some(game.entities[e].bot.goal_item_cell))
+    };
+    // Where we're headed: the detour item, the mode's target, the chosen item, or the nearest human.
     let (target_origin, item_cell) = match intent {
+        Some(BotIntent::Fight(_)) if chasing => goal_item_org,
         Some(BotIntent::Fight(en)) => (game.entities[en].v.origin, None),
         Some(BotIntent::Move(pos)) => (pos, None),
-        None if chasing => {
-            let it = EntId(game.entities[e].bot.goal_item);
-            (game.entities[it].v.origin, Some(game.entities[e].bot.goal_item_cell))
-        }
+        None if chasing => goal_item_org,
         None => {
             if let Some(h) = nearest_human(game, e) {
                 (game.entities[h].v.origin, None)

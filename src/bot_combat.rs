@@ -85,11 +85,27 @@ fn choose_weapon(g: &GameState, e: EntId, dist: f32) -> WeaponChoice {
             projectile_speed: ROCKET_SPEED,
         };
     }
-    // Ammo-starved fallbacks.
+    // Ammo-starved fallbacks: pick the best owned gun with ammo before resorting to the axe. This
+    // is also the *only* branch a bot with just the stock loadout (shotgun + axe) reaches at range,
+    // so without the shotgun/lightning arms here it would roam throwing the axe at distant enemies.
     if have(Items::SUPER_SHOTGUN) && v.ammo_shells >= 2.0 {
         return WeaponChoice {
             impulse: 3,
             weapon: Weapon::SuperShotgun,
+            projectile_speed: 0.0,
+        };
+    }
+    if have(Items::LIGHTNING) && v.ammo_cells >= 1.0 {
+        return WeaponChoice {
+            impulse: 8,
+            weapon: Weapon::Lightning,
+            projectile_speed: 0.0,
+        };
+    }
+    if have(Items::SHOTGUN) && v.ammo_shells >= 1.0 {
+        return WeaponChoice {
+            impulse: 2,
+            weapon: Weapon::Shotgun,
             projectile_speed: 0.0,
         };
     }

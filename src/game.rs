@@ -500,6 +500,9 @@ impl GameState {
         self.host.cvar_default("rtx_bot_alone", false);
         // Pacifist bots: in FFA, don't fight — just trail the nearest human (for experimenting).
         self.host.cvar_default("rtx_bot_pacifist", false);
+        // Greedy bots: let a fighting bot break off to grab a compelling nearby pickup (powerup, a
+        // weapon it lacks, big health/armor) instead of only chasing the enemy — ktx-style item play.
+        self.host.cvar_default("rtx_bot_greed", true);
         // Per-bot goal/pickup diagnostics to the server console (off by default).
         self.host.cvar_default("rtx_bot_debug", false);
 
