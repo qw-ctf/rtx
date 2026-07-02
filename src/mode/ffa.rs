@@ -4,8 +4,8 @@
 //! `ffa` changes nothing about how the game plays), so it exists to make FFA *a* mode rather than
 //! *the* mode. The one behavior it does supply is the **bot brain**: in FFA everyone is an enemy, so
 //! bots hunt and frag the nearest player (breaking off to grab health when hurt), which is what turns
-//! them from item-collecting wanderers into deathmatch opponents. `rtx_bot_pacifist` restores the
-//! old, harmless "just tail the nearest human" behavior for experimenting.
+//! them from item-collecting wanderers into deathmatch opponents. (The global `rtx_bot_pacifist`
+//! override, which makes bots tail the nearest human in *any* mode, lives in `bot::run_bot`.)
 
 use super::{team, BotIntent, GameMode};
 use crate::defs::Bits;
@@ -24,10 +24,6 @@ impl GameMode for Ffa {
     }
 
     fn bot_intent(&self, g: &mut GameState, bot: EntId) -> Option<BotIntent> {
-        // Pacifist: never fight, just trail the nearest human around the map.
-        if g.host().cvar_bool(c"rtx_bot_pacifist") {
-            return nearest_human(g, bot).map(|h| BotIntent::Move(g.entities[h].v.origin));
-        }
         // Survive: when hurt or completely out of ammo, fall through to the generic item brain so
         // it fetches health / a weapon instead of charging in weak. (`None` = default behavior.)
         let (health, unarmed) = {
@@ -46,22 +42,12 @@ impl GameMode for Ffa {
 
 /// The nearest living *other* player to `bot` — everyone is an enemy in FFA (humans and bots alike).
 fn nearest_player(g: &GameState, bot: EntId) -> Option<EntId> {
-    nearest(g, bot, |_| true)
-}
-
-/// The nearest living *human* to `bot` (skips other bots) — the pacifist follow target.
-fn nearest_human(g: &GameState, bot: EntId) -> Option<EntId> {
-    nearest(g, bot, |ent| !ent.bot.is_bot)
-}
-
-/// Nearest living player other than `bot` passing `pick`, by squared distance.
-fn nearest(g: &GameState, bot: EntId, pick: impl Fn(&crate::entity::Entity) -> bool) -> Option<EntId> {
     let origin = g.entities[bot].v.origin;
     team::players(g)
         .into_iter()
         .filter(|&e| {
             let ent = &g.entities[e];
-            e != bot && ent.v.health > 0.0 && ent.v.deadflag == 0.0 && pick(ent)
+            e != bot && ent.v.health > 0.0 && ent.v.deadflag == 0.0
         })
         .min_by(|&a, &b| {
             let d = |e: EntId| (g.entities[e].v.origin - origin).length_squared();

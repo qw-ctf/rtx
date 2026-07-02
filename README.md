@@ -135,12 +135,12 @@ through the same player-move code as humans, so gravity, stepping, and jumps com
 | `rtx_bot_count` | `0` | How many bots to keep on the server. The population is reconciled to this count (spawning/removing as needed), leaving room for humans. Bots only spawn once the map's navmesh is built. |
 | `rtx_bot_alone` | `0` | Keep bots on the server even when **no humans** are connected (`0` = bots leave an empty server; `1` = they stay and play it out). |
 | `rtx_bot_skill` | `3` | Bot skill (0–7): tightens aim and speeds how fast a bot turns/tracks. |
-| `rtx_bot_pacifist` | `0` | In FFA, make bots **not fight** — just trail the nearest human around the map (for experimenting). `0` = bots frag as normal. |
+| `rtx_bot_pacifist` | `0` | Make bots **not fight** in **any** mode — they just trail the nearest human around the map (for experimenting). `0` = bots play the mode normally. |
 
 In free-for-all each bot **hunts and frags the nearest player** — everyone's an enemy — pathing to
 them and, once in sight, aiming and shooting via the shared combat layer, breaking off to grab a
-**health** pickup when hurt (and picking up items along the way). Set `rtx_bot_pacifist 1` and they
-stop fighting and just tail the nearest human instead. In the absence of a target they pathfind to
+**health** pickup when hurt (and picking up items along the way). Set `rtx_bot_pacifist 1` — in any
+mode — and they stop fighting and just tail the nearest human instead. In the absence of a target they pathfind to
 the best reachable **item pickup**, or **follow the nearest human** when nothing's worth fetching
 (through doors, off ledges, across jumps, recovering after a missed jump). On open, roughly-straight stretches they **bunnyhop** (`rtx_bot_bhop`) — chaining jumps
 and **air-strafing** (sweeping the view while holding one strafe key) to exploit QuakeWorld's

@@ -292,11 +292,15 @@ fn run_bot(game: &mut GameState, e: EntId) {
     let on_sj = game.entities[e].bot.sj_leg.is_some();
 
     // Ask the active mode for this bot's intent. A round mode (Rocket Arena) returns Fight/Move to
-    // drive combat or audience-roaming; FFA returns None, leaving the generic item/human brain
-    // below in charge. Every mode-specific bot adaptation lives behind this one hook — the rest of
-    // run_bot stays mode-agnostic and reusable.
+    // drive combat or audience-roaming; FFA hunts the nearest player. Every mode-specific bot
+    // adaptation lives behind this one hook — the rest of run_bot stays mode-agnostic and reusable.
     let mode = game.mode;
-    let intent = mode.bot_intent(game, e);
+    let intent = if host.cvar_bool(c"rtx_bot_pacifist") {
+        // Global override, any mode: don't fight — just tail the nearest human around the map.
+        nearest_human(game, e).map(|h| BotIntent::Move(game.entities[h].v.origin))
+    } else {
+        mode.bot_intent(game, e)
+    };
     if intent.is_some() {
         game.entities[e].bot.goal_item = 0; // a mode target supersedes any item chase
     }
