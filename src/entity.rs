@@ -12,6 +12,7 @@ use std::ffi::CString;
 use glam::Vec3;
 
 use crate::abi::{EntVars, STRING_REF_COUNT};
+use crate::assets::{Model, Sound};
 use crate::mode::ArenaPlayer;
 
 /// A `Copy` index handle into the entity array. Never a borrow, so holding one across a
@@ -342,11 +343,11 @@ pub struct Entity {
     pub netname: Option<Box<str>>,
     // Mover sound slots (door/plat/button). Typed `Sound` handles so they're provably precached;
     // these are our own state, distinct from the engine-visible `EntVars.noise*` string slots.
-    pub noise: Option<crate::assets::Sound>,
-    pub noise1: Option<crate::assets::Sound>,
-    pub noise2: Option<crate::assets::Sound>,
-    pub noise3: Option<crate::assets::Sound>,
-    pub noise4: Option<crate::assets::Sound>,
+    pub noise: Option<Sound>,
+    pub noise1: Option<Sound>,
+    pub noise2: Option<Sound>,
+    pub noise3: Option<Sound>,
+    pub noise4: Option<Sound>,
     pub deathtype: Option<Box<str>>,
     pub mdl: Option<Box<str>>,
     /// `trigger_changelevel`'s destination map name.
@@ -361,7 +362,7 @@ pub struct Entity {
     /// The item's model as a `'static` C string, kept so a respawned item can be re-shown
     /// (the engine stores the raw pointer, so it must outlive the entity — see the native
     /// string ABI notes in `abi.rs`). Item models are all string literals, so this is sound.
-    pub model_cstr: Option<crate::assets::Model>,
+    pub model_cstr: Option<Model>,
     /// Owned C string backing a brush model (`*N`) passed to `setmodel`. The engine keeps the
     /// raw pointer, so this must live as long as the entity references the model.
     pub model_cs: Option<CString>,

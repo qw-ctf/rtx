@@ -15,12 +15,13 @@ use glam::Vec3;
 use crate::abi::{
     Field, FieldType, GameData, GlobalVars, STRING_REF_COUNT, STRING_REF_NETNAME, STRING_REF_WEAPONMODEL,
 };
-use crate::assets::{Model, Sound};
+use crate::assets::{DynAssets, Model, Sound};
 use crate::entity::{EntId, Entities, Entity};
 use crate::game_command::GameCommand;
 use crate::host::{HostApi, SyscallFn};
+use crate::mode::{self, ArenaState, GameMode};
 use crate::world;
-use crate::{defs, ext_field};
+use crate::{bot, bot_goals, defs, ext_field, navmesh};
 
 /// Matches `MAX_EDICTS` in `ktx/include/q_shared.h`.
 pub const MAX_EDICTS: usize = 2048;
@@ -115,10 +116,10 @@ pub struct GameState {
     pub level: Level,
     /// The active game mode (`rtx_mode`) — a stateless behavior descriptor. Reselected each map
     /// load in `worldspawn`; defaults to FFA. See [`crate::mode`].
-    pub mode: &'static dyn crate::mode::GameMode,
+    pub mode: &'static dyn GameMode,
     /// Rocket-Arena round-state machine. Only meaningful while `mode` is the arena; otherwise
     /// left at its default. See [`crate::mode::ArenaState`].
-    pub arena: crate::mode::ArenaState,
+    pub arena: ArenaState,
     /// QuakeC transient globals threaded through target-firing and damage (`activator`,
     /// `damage_attacker`, `damage_inflictor`). Set at the top of the relevant callbacks.
     pub activator: EntId,
@@ -134,12 +135,12 @@ pub struct GameState {
     /// See [`Self::set_alpha`].
     ext_fields: ext_field::ExtFields,
     /// Auto-generated navmesh for the current map (bot navigation). Rebuilt each map load.
-    pub(crate) nav: crate::navmesh::NavState,
+    pub(crate) nav: navmesh::NavState,
     /// Escape hatch for string-declared sounds (precache-and-intern at load time). Empty for the
     /// current port — every sound is a registry handle — but here so a runtime path is registered
     /// through the same precache-guaranteeing door. Use `dyn_assets.sound(&host, path)`.
     #[allow(dead_code)]
-    pub(crate) dyn_assets: crate::assets::DynAssets,
+    pub(crate) dyn_assets: DynAssets,
 }
 
 impl GameState {
@@ -178,8 +179,8 @@ impl GameState {
             fields,
             game_data,
             level: Level::default(),
-            mode: crate::mode::default_mode(),
-            arena: crate::mode::ArenaState::default(),
+            mode: mode::default_mode(),
+            arena: ArenaState::default(),
             activator: EntId::WORLD,
             damage_attacker: EntId::WORLD,
             damage_inflictor: EntId::WORLD,
@@ -187,8 +188,8 @@ impl GameState {
             intermission_exit_time: 0.0,
             rng: 0x2545_f491, // nonzero default; reseeded in GAME_INIT
             ext_fields: ext_field::ExtFields::default(),
-            nav: crate::navmesh::NavState::default(),
-            dyn_assets: crate::assets::DynAssets::default(),
+            nav: navmesh::NavState::default(),
+            dyn_assets: DynAssets::default(),
         }
     }
 
@@ -295,7 +296,7 @@ impl GameState {
     /// QuakeC just assigns the string — so we write the `'static` `char*` straight into its
     /// indirection scratch cell (native `VM_MemoryBase` is 0, so a raw pointer is correct).
     /// `None` clears the viewmodel.
-    pub(crate) fn set_weaponmodel(&mut self, e: EntId, model: Option<crate::assets::Model>) {
+    pub(crate) fn set_weaponmodel(&mut self, e: EntId, model: Option<Model>) {
         let ptr = model.map_or(0, |m| m.path().as_ptr() as u64);
         self.entities[e].string_refs[STRING_REF_WEAPONMODEL] = ptr;
     }
@@ -479,7 +480,7 @@ impl GameState {
         self.level.deathmatch = self.host.cvar(c"deathmatch") as i32;
         self.level.skill = self.host.cvar(c"skill") as i32;
         // Fresh map: drop any prior navmesh so it's rebuilt lazily when bots are next wanted.
-        self.nav = crate::navmesh::NavState::default();
+        self.nav = navmesh::NavState::default();
 
         // The worldspawn block configures `world` and runs the global precaches.
         let Some(world_fields) = self.parse_block() else {
@@ -552,7 +553,7 @@ impl GameState {
         let gates = self.collect_gates();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(crate::navmesh::build_navmesh(bytes, plats, teleports, gates));
+            let _ = tx.send(navmesh::build_navmesh(bytes, plats, teleports, gates));
         });
         self.nav.pending = Some(rx);
         self.host.dprint(c"rtx: navmesh: building in background...\n");
@@ -605,13 +606,13 @@ impl GameState {
     /// Build the static item-goal catalog: every spawned pickup (weapons, health, armor, ammo,
     /// powerups) paired with the navmesh cell nearest it. Items don't move, so this is computed
     /// once with the navmesh; [`GameState::select_item_goal`] reads live availability per query.
-    fn collect_goals(&self, graph: &crate::navmesh::NavGraph) -> Vec<(u32, crate::navmesh::CellId)> {
+    fn collect_goals(&self, graph: &navmesh::NavGraph) -> Vec<(u32, navmesh::CellId)> {
         self.entities
             .iter()
             .enumerate()
             .filter_map(|(i, ent)| {
                 let cn = ent.classname()?;
-                if i == 0 || !crate::bot_goals::is_goal_classname(cn) {
+                if i == 0 || !bot_goals::is_goal_classname(cn) {
                     return None;
                 }
                 Some((i as u32, graph.nearest(ent.v.origin)?))
@@ -623,7 +624,7 @@ impl GameState {
     /// player-origin standing spots on the plat surface at the bottom and top of its travel.
     /// The plat moves only in Z (`pos2`→`pos1`); its top surface is `maxs.z` above the origin,
     /// and a standing player origin sits 24 (`-mins.z`) above that surface.
-    fn collect_plats(&self) -> Vec<crate::navmesh::PlatInfo> {
+    fn collect_plats(&self) -> Vec<navmesh::PlatInfo> {
         self.find_by_classname("plat")
             .map(|e| {
                 let ent = &self.entities[e];
@@ -631,7 +632,7 @@ impl GameState {
                 let (mins, maxs) = (ent.v.mins, ent.v.maxs);
                 let cx = pos1.x + (mins.x + maxs.x) * 0.5;
                 let cy = pos1.y + (mins.y + maxs.y) * 0.5;
-                crate::navmesh::PlatInfo {
+                navmesh::PlatInfo {
                     board: Vec3::new(cx, cy, pos2.z + maxs.z + 24.0),
                     exit: Vec3::new(cx, cy, pos1.z + maxs.z + 24.0),
                 }
@@ -642,14 +643,14 @@ impl GameState {
     /// Gather the [`TeleportInfo`](crate::navmesh::TeleportInfo) for every `trigger_teleport`:
     /// its world-space trigger box and the destination's arrival origin (resolved through the
     /// `target` → `targetname` link, exactly as `teleport_touch` does at runtime).
-    fn collect_teleports(&self) -> Vec<crate::navmesh::TeleportInfo> {
+    fn collect_teleports(&self) -> Vec<navmesh::TeleportInfo> {
         self.find_by_classname("trigger_teleport")
             .filter_map(|e| {
                 let ent = &self.entities[e];
                 let target = ent.target.clone()?;
                 let dest = self.find_by_targetname(&target).next()?;
                 let origin = ent.v.origin;
-                Some(crate::navmesh::TeleportInfo {
+                Some(navmesh::TeleportInfo {
                     tmin: origin + ent.v.mins,
                     tmax: origin + ent.v.maxs,
                     dest: self.entities[dest].v.origin,
@@ -663,7 +664,7 @@ impl GameState {
     /// (rotates, driven by a rotator; rests at its current origin). Each is paired with the
     /// `func_button` that ultimately opens it, found by following `target` → `targetname` back
     /// from the obstruction — directly for a door, or through the rotator for a movewall.
-    fn collect_gates(&self) -> Vec<crate::navmesh::GateInfo> {
+    fn collect_gates(&self) -> Vec<navmesh::GateInfo> {
         // (obstruction, closed origin) for every entity that blocks a path until triggered.
         let mut obstructions: Vec<(EntId, Vec3)> = Vec::new();
         for d in self.find_by_classname("door") {
@@ -689,7 +690,7 @@ impl GameState {
             };
             let oent = &self.entities[obs];
             let bent = &self.entities[activator];
-            gates.push(crate::navmesh::GateInfo {
+            gates.push(navmesh::GateInfo {
                 obstruction: obs.0,
                 closed_origin,
                 closed_min: closed_origin + oent.v.mins,
@@ -738,9 +739,9 @@ impl GameState {
             // Drive the active mode's per-frame state machine (round countdown/fight/reset).
             let mode = self.mode;
             mode.tick(self);
-            crate::bot::manage_population(self);
+            bot::manage_population(self);
         } else {
-            crate::bot::run_bots(self);
+            bot::run_bots(self);
         }
         1
     }

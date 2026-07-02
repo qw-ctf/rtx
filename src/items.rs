@@ -11,7 +11,7 @@ use glam::Vec3;
 use crate::assets::{Model, Sound};
 use crate::defs::*;
 use crate::entity::{EntId, Think, Touch};
-use crate::game::GameState;
+use crate::game::{self, GameState};
 
 /// The four ammo pools.
 #[derive(Clone, Copy)]
@@ -651,7 +651,7 @@ impl GameState {
     }
 
     fn sprint_low(&self, e: EntId, msg: &str) {
-        let c = crate::game::cstring(msg);
+        let c = game::cstring(msg);
         self.host.sprint(e, PrintLevel::Low, &c);
     }
 

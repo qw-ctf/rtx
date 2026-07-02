@@ -2,7 +2,10 @@
 
 //! Ported from `qw-qc/world.qc` — world setup (`worldspawn`) and per-frame `StartFrame`.
 
+use crate::assets;
+use crate::entity::EntId;
 use crate::game::GameState;
+use crate::mode::ArenaState;
 
 /// `worldspawn` — global level setup: gravity, precaches, light-style animation tables.
 /// (The QuakeC body's `InitBodyQue`/body-queue setup is deferred to a later milestone.)
@@ -10,11 +13,11 @@ pub fn worldspawn(game: &mut GameState) {
     let host = *game.host();
 
     // worldtype was parked in the world entity's skin during field parsing.
-    game.level.worldtype = game.ent(crate::entity::EntId::WORLD).v.skin;
+    game.level.worldtype = game.ent(EntId::WORLD).v.skin;
 
     // Custom map gravity (qw-qc special-cases e1m8).
     let mut buf = [0u8; 64];
-    let modelname = host.infokey(crate::entity::EntId::WORLD, c"modelname", &mut buf);
+    let modelname = host.infokey(EntId::WORLD, c"modelname", &mut buf);
     // Strip "maps/" and ".bsp" to recover the bare map name.
     game.level.mapname = modelname
         .strip_prefix("maps/")
@@ -27,8 +30,8 @@ pub fn worldspawn(game: &mut GameState) {
 
     // Every sound, from the single registry (`assets.rs`): the set of nameable sounds *is* the
     // set of precached sounds, so a missing precache is unrepresentable.
-    crate::assets::precache_sounds(&host);
-    crate::assets::precache_models(&host);
+    assets::precache_sounds(&host);
+    assets::precache_models(&host);
 
     // Models.
 
@@ -51,7 +54,7 @@ pub fn worldspawn(game: &mut GameState) {
     game.refresh_mode();
     // Fresh map = fresh match: reset any round state (refresh_mode only resets on a mode change,
     // so a same-mode map change would otherwise carry a stale mid-round state over).
-    game.arena = crate::mode::ArenaState::default();
+    game.arena = ArenaState::default();
 }
 
 /// `StartFrame` — runs once per server frame. Refreshes match cvars and the frame counter.

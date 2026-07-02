@@ -15,6 +15,7 @@
 
 use glam::{Vec3, Vec3Swizzles};
 
+use crate::bot;
 use crate::defs::{Bits, Flags, Items, Weapon, VEC_VIEW_OFS};
 use crate::entity::EntId;
 use crate::game::GameState;
@@ -259,8 +260,8 @@ pub(crate) fn engage(
         let dt = now - b.look_prev_time;
         let rate = if b.look_prev_time > 0.0 && dt > 1e-3 && dt < 0.25 {
             Vec3::new(
-                (crate::bot::wrap180(clean.x - b.look_prev.x) / dt).clamp(-180.0, 180.0),
-                (crate::bot::wrap180(clean.y - b.look_prev.y) / dt).clamp(-180.0, 180.0),
+                (bot::wrap180(clean.x - b.look_prev.x) / dt).clamp(-180.0, 180.0),
+                (bot::wrap180(clean.y - b.look_prev.y) / dt).clamp(-180.0, 180.0),
                 0.0,
             )
         } else {
@@ -304,8 +305,8 @@ pub(crate) fn engage(
         _ => 5.0,
     };
     let cone = base_cone + (7.0 - skill);
-    let dp = crate::bot::wrap180(view.x - clean.x);
-    let dy = crate::bot::wrap180(view.y - clean.y);
+    let dp = bot::wrap180(view.x - clean.x);
+    let dy = bot::wrap180(view.y - clean.y);
     let on_target = view == Vec3::ZERO || (dp * dp + dy * dy).sqrt() <= cone;
     if on_target {
         // The engine paces shots via `attack_finished`; holding fire shoots at the weapon's rate.

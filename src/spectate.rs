@@ -3,6 +3,7 @@
 //! Spectator hooks, ported from `qw-qc/spectate.qc`. mvdsv routes the spectator variants of
 //! connect/disconnect/postthink here (selected by the `isSpectator` argument in `game.rs`).
 
+use crate::defs;
 use crate::entity::EntId;
 use crate::game::GameState;
 
@@ -15,7 +16,7 @@ impl GameState {
         ent.netname = Some(name.as_str().into());
         ent.set_goalentity(EntId::WORLD);
         self.broadcast(
-            crate::defs::PrintLevel::Medium,
+            defs::PrintLevel::Medium,
             &format!("Spectator {name} entered the game\n"),
         );
     }
@@ -28,10 +29,7 @@ impl GameState {
     /// `SpectatorDisconnect`.
     pub(crate) fn spectator_disconnect(&mut self, e: EntId) {
         let name = self.entities[e].netname.as_deref().unwrap_or("").to_owned();
-        self.broadcast(
-            crate::defs::PrintLevel::Medium,
-            &format!("Spectator {name} left the game\n"),
-        );
+        self.broadcast(defs::PrintLevel::Medium, &format!("Spectator {name} left the game\n"));
     }
 
     /// `SpectatorThink` — handle the free-fly cycle impulse.

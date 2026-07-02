@@ -11,9 +11,11 @@ use glam::Vec3;
 
 use crate::abi::EntVars;
 use crate::assets::{Model, Sound};
+use crate::bot;
 use crate::defs::*;
 use crate::entity::{CombatState, Die, EntId, Pain};
 use crate::game::GameState;
+use crate::mode::ArenaPlayer;
 
 #[derive(Clone, Copy)]
 struct PlayerParms {
@@ -141,11 +143,11 @@ impl GameState {
     /// phantom fighter fills a slot), and a bot can even lock onto the freed edict and fire at its
     /// zeroed origin.
     pub(crate) fn retire_slot(&mut self, e: EntId) {
-        crate::bot::on_disconnect(&mut self.entities[e]); // resets bot state if it was a bot
+        bot::on_disconnect(&mut self.entities[e]); // resets bot state if it was a bot
         let ent = &mut self.entities[e];
         ent.in_use = false;
         ent.classname = None;
-        ent.arena = crate::mode::ArenaPlayer::default();
+        ent.arena = ArenaPlayer::default();
     }
 
     /// `SetNewParms` — default spawn parameters for a fresh player.

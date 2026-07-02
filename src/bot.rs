@@ -15,8 +15,9 @@
 
 use glam::{Vec3, Vec3Swizzles};
 
+use crate::bot_combat;
 use crate::defs::{Bits, Flags, Items, Solid, Weapon};
-use crate::entity::{BotState, EntId};
+use crate::entity::{BotState, EntId, Entity};
 use crate::game::{cstring, GameState};
 use crate::mode::BotIntent;
 use crate::navmesh::{CellId, LinkKind, NavGraph};
@@ -578,7 +579,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // drifting error) and its own movement; having *just lost* sight it holds the angle where the
     // enemy vanished while navigation keeps driving; otherwise navigation's look/move stand.
     if let Some(en) = enemy {
-        crate::bot_combat::engage(
+        bot_combat::engage(
             game,
             e,
             en,
@@ -601,7 +602,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
         let skill = host.cvar(c"rtx_bot_skill").clamp(0.0, 7.0);
         // Spring stiffness (1/s): sluggish → pro-snappy. Shared with the combat feed-forward,
         // whose lag compensation assumes exactly this spring.
-        let omega = crate::bot_combat::aim_omega(skill);
+        let omega = bot_combat::aim_omega(skill);
         let b = &mut game.entities[e].bot;
         if b.aim == Vec3::ZERO {
             b.aim = v_angle; // seed from the real view so the first frame doesn't snap from zero
@@ -708,7 +709,7 @@ fn angle_vectors(angles: Vec3) -> (Vec3, Vec3) {
 
 /// Drop bot bookkeeping when a bot client disconnects (kicked, or removed by the manager), so
 /// a slot reused by a future human isn't mistaken for a bot.
-pub fn on_disconnect(ent: &mut crate::entity::Entity) {
+pub fn on_disconnect(ent: &mut Entity) {
     if ent.bot.is_bot {
         ent.bot = BotState::default();
     }
