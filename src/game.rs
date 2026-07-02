@@ -8,7 +8,6 @@
 //! `GAME_INIT` and keeps them for the process lifetime — those buffers are never
 //! reallocated, so the pointers stay valid.
 
-use core::ffi::CStr;
 use std::ffi::CString;
 
 use glam::Vec3;
@@ -406,11 +405,11 @@ impl GameState {
         }
         let api = self.host.api_version();
         if api < GAME_API_VERSION {
-            self.host.error(cstr(b"rtx: server API too old\0"));
+            self.host.error(c"rtx: server API too old");
             return 0;
         }
         // mvdsv: declare that we use 64-bit string references.
-        self.host.cvar_set_float(cstr(b"sv_pr2references\0"), 1.0);
+        self.host.cvar_set_float(c"sv_pr2references", 1.0);
 
         // The engine wipes its extension-trap table on every map load (and the field-reference
         // cookie is regenerated), so the registration and resolved field refs from a previous map
@@ -464,7 +463,7 @@ impl GameState {
         // conprint (not dprint) so it shows without `developer 1` — lets you confirm at a glance
         // that the freshly built module is the one actually loaded.
         self.host
-            .conprint(cstr(b"rtx: QuakeWorld game module loaded (bot-goals build)\n\0"));
+            .conprint(c"rtx: QuakeWorld game module loaded (bot-goals build)\n");
 
         // `self.game_data` lives inside the OnceLock-pinned GameState, so its address is
         // stable for the process — safe to hand to the engine.
@@ -1173,10 +1172,4 @@ fn parse_vec3(s: &str) -> Vec3 {
         parts.next().unwrap_or(0.0),
         parts.next().unwrap_or(0.0),
     )
-}
-
-/// Build a `&CStr` from a NUL-terminated byte literal at compile-checked call sites.
-#[inline]
-fn cstr(bytes: &'static [u8]) -> &'static CStr {
-    CStr::from_bytes_with_nul(bytes).expect("literal must be NUL-terminated")
 }
