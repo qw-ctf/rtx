@@ -489,6 +489,8 @@ impl GameState {
         // Keep bots on the server even with no humans connected (default off: bots leave an empty
         // server).
         self.host.cvar_default("rtx_bot_alone", false);
+        // Pacifist bots: in FFA, don't fight — just trail the nearest human (for experimenting).
+        self.host.cvar_default("rtx_bot_pacifist", false);
         // Per-bot goal/pickup diagnostics to the server console (off by default).
         self.host.cvar_default("rtx_bot_debug", false);
 
