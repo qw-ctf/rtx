@@ -63,6 +63,9 @@ impl GameMode for Arena {
 
     fn tick(&self, g: &mut GameState) {
         let now = g.time();
+        // Queue every waiting player the moment they're in the audience, so the challenger order
+        // reflects *when they started waiting* (see `stamp_audience`).
+        self.stamp_audience(g);
         match g.arena.round {
             RoundState::Warmup => {
                 if count_players(g) >= 2 {
@@ -214,21 +217,32 @@ impl GameMode for Arena {
 }
 
 impl Arena {
-    /// Form the next round: keep any current fighter (the previous winner stays), fill the
-    /// remaining arena slots from the front of the audience queue, respawn all fighters into the
-    /// arena with a full loadout, and begin the spawn-protected countdown. Everyone else stays in
-    /// the audience. This is the "winner stays, loser goes to the back of the queue" duel model —
-    /// the arena never holds more than `rtx_ra_fighters` players.
-    fn form_round(&self, g: &mut GameState, now: f32) {
-        // Stamp any audience member that isn't queued yet (fresh joiners, and players just
-        // eliminated — whose stamp was cleared when they last became a fighter), so they line up
-        // behind those already waiting.
+    /// Give any audience member that isn't queued yet a fresh monotonic stamp, so the challenger
+    /// queue orders players by *when they entered the audience* — fresh joiners and just-eliminated
+    /// fighters alike line up behind everyone already waiting. Run every frame (from [`Self::tick`])
+    /// rather than lazily at round formation: a player eliminated mid-match and the players who
+    /// joined *while that match was running* all reach the next [`Self::form_round`] with
+    /// `queue == 0`, and stamping them there in edict order lets a low-edict eliminated player jump
+    /// the queue — the "I lose the round but still play the next one" bug. Stamping as they enter
+    /// preserves the true waiting order. A promoted challenger's stamp is cleared to 0 (it's a
+    /// fighter now, not waiting); it re-stamps only once eliminated back into the audience.
+    fn stamp_audience(&self, g: &mut GameState) {
         for e in players(g) {
             if g.entities[e].arena.role == ArenaRole::Audience && g.entities[e].arena.queue == 0 {
                 g.arena.serial += 1;
                 g.entities[e].arena.queue = g.arena.serial;
             }
         }
+    }
+
+    /// Form the next round: keep any current fighter (the previous winner stays), fill the
+    /// remaining arena slots from the front of the audience queue, respawn all fighters into the
+    /// arena with a full loadout, and begin the spawn-protected countdown. Everyone else stays in
+    /// the audience. This is the "winner stays, loser goes to the back of the queue" duel model —
+    /// the arena never holds more than `rtx_ra_fighters` players.
+    fn form_round(&self, g: &mut GameState, now: f32) {
+        // Everyone waiting is already queued by `stamp_audience` (run every frame), so their order
+        // reflects when they started waiting — no lazy stamping here.
 
         // Fighters carried over from the previous round (the survivor(s)) — snapshot *before* we
         // promote challengers, so we can tell a carried-over winner apart from a fresh challenger
