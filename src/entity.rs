@@ -154,6 +154,8 @@ pub enum Think {
     RemoveChain,
     /// CTF flag idle tick: auto-return a dropped flag once its timeout elapses.
     FlagReturn,
+    /// CTF rune idle tick: relocate to a fresh spawn if untouched too long.
+    RuneRespawn,
 }
 
 /// A `.touch` behaviour (`GAME_EDICT_TOUCH`). The dispatcher reads `self`/`other` and
@@ -194,6 +196,8 @@ pub enum Touch {
     Hook,
     /// CTF flag: grab (enemy), return (own, dropped), or capture (own base while carrying enemy).
     Flag,
+    /// CTF rune pickup (one per player).
+    Rune,
 }
 
 /// A `.use` behaviour, fired by `SUB_UseTargets` / button presses.
@@ -641,6 +645,9 @@ pub enum FlagPhase {
     Carried,
     /// Lying in the field; auto-returns at `return_at`.
     Dropped,
+    /// Voluntarily tossed: like `Dropped`, but `carrier` (the tosser) can't re-grab until
+    /// `return_at`, after which it becomes a normal `Dropped` flag.
+    Tossed,
 }
 
 /// CTF flag state, on the flag entity's private tail (`team == 0` on any non-flag entity). See

@@ -23,7 +23,10 @@ use glam::Vec3;
 use super::team;
 use super::{BotIntent, GameMode, MatchPhase};
 use crate::assets::{Model, Sound};
-use crate::defs::{Attenuation, Channel, MoveType, PrintLevel, Solid};
+use crate::defs::{
+    Attenuation, Channel, MoveType, PrintLevel, Solid, RUNE_HASTE, RUNE_MASK, RUNE_REGEN, RUNE_RESISTANCE,
+    RUNE_STRENGTH,
+};
 use crate::entity::{EntId, FlagPhase, Think, Touch};
 use crate::game::GameState;
 
@@ -33,11 +36,31 @@ const CAPTURE_BONUS: f32 = 15.0;
 const RETURN_BONUS: f32 = 1.0;
 /// Seconds a dropped flag waits before auto-returning (`TEAM_CAPTURE_FLAG_RETURN_TIME`).
 const FLAG_RETURN_TIME: f32 = 40.0;
+/// Seconds a rune waits, untouched, before relocating to a fresh spawn.
+const RUNE_RESPAWN_TIME: f32 = 120.0;
 /// Results-screen pause before returning to warmup / rotating.
 const END_PAUSE: f32 = 5.0;
 /// `EF_FLAG1`/`EF_FLAG2` — the client-side "flag on the carrier's back" effect bits.
 const EF_FLAG1: i32 = 16;
 const EF_FLAG2: i32 = 32;
+
+// --- purectf frag bonuses + assist windows (seconds / frags). ---
+/// Frag an enemy flag carrier (blocked for the first `CARRIER_FLAG_SINCE` after they grabbed).
+const FRAG_CARRIER_BONUS: f32 = 2.0;
+const CARRIER_FLAG_SINCE: f32 = 2.0;
+/// Frag someone who hurt your carrier within `CARRIER_DANGER` seconds.
+const CARRIER_DANGER_PROTECT_BONUS: f32 = 2.0;
+const CARRIER_DANGER: f32 = 4.0;
+/// Frag near your own carrier / your own flag (within `PROTECT_RADIUS`).
+const CARRIER_PROTECT_BONUS: f32 = 1.0;
+const FLAG_DEFENSE_BONUS: f32 = 1.0;
+const PROTECT_RADIUS: f32 = 400.0;
+/// Each teammate's share of a capture, and the assist windows a capture pays out on.
+const TEAM_CAPTURE_BONUS: f32 = 10.0;
+const RETURN_ASSIST_BONUS: f32 = 1.0;
+const RETURN_ASSIST: f32 = 4.0;
+const FRAG_CARRIER_ASSIST_BONUS: f32 = 2.0;
+const FRAG_CARRIER_ASSIST: f32 = 6.0;
 
 /// The CTF mode descriptor. Stateless — the match lifecycle lives in [`super::MatchState`] (shared
 /// with team DM), the flag state on the flag entities.
@@ -66,6 +89,7 @@ impl GameMode for Ctf {
                     let tl = g.level.timelimit;
                     g.team_match.live_until = if tl > 0 { now + tl as f32 } else { 0.0 };
                     reset_flags(g);
+                    g.spawn_runes();
                     g.team_match.phase = MatchPhase::Live;
                     team::centerprint_all(g, "FIGHT!");
                 }
@@ -116,6 +140,66 @@ impl GameMode for Ctf {
 
     fn bot_intent(&self, g: &mut GameState, bot: EntId) -> Option<BotIntent> {
         ctf_bot_intent(g, bot)
+    }
+
+    fn on_death(&self, g: &mut GameState, victim: EntId, attacker: EntId) {
+        ctf_frag_bonuses(g, victim, attacker);
+    }
+}
+
+/// purectf's kill-time CTF bonuses (obituary side): fragging the enemy carrier, protecting your own
+/// carrier / flag by fragging attackers near them. Runs after the stock obituary credited the +1.
+fn ctf_frag_bonuses(g: &mut GameState, victim: EntId, attacker: EntId) {
+    if attacker == victim
+        || g.entities[attacker].classname() != Some("player")
+        || g.entities[victim].classname() != Some("player")
+    {
+        return;
+    }
+    let now = g.time();
+    let a_team = g.entities[attacker].arena.team;
+    let v_team = g.entities[victim].arena.team;
+    if a_team == 0 {
+        return;
+    }
+    let mut protected_carrier = false;
+
+    // Fragged the enemy flag carrier.
+    if g.entities[victim].arena.carrying != 0 && a_team != v_team {
+        g.entities[attacker].arena.last_fragged_carrier = now;
+        if g.entities[victim].arena.flag_since + CARRIER_FLAG_SINCE <= now {
+            g.entities[attacker].v.frags += FRAG_CARRIER_BONUS;
+        }
+    }
+    // Fragged someone who recently hurt your carrier (and you aren't the carrier yourself).
+    if g.entities[victim].arena.last_hurt_carrier + CARRIER_DANGER > now && g.entities[attacker].arena.carrying == 0 {
+        g.entities[attacker].v.frags += CARRIER_DANGER_PROTECT_BONUS;
+        protected_carrier = true;
+    }
+
+    // Proximity scans around the attacker and the victim: a teammate carrier nearby (carrier
+    // protect, once) and your own flag nearby (flag defense, once).
+    let mut flag_defended = false;
+    let centers = [g.entities[attacker].v.origin, g.entities[victim].v.origin];
+    for center in centers {
+        for head in g.find_radius(center, PROTECT_RADIUS) {
+            if !protected_carrier
+                && head != attacker
+                && g.entities[head].classname() == Some("player")
+                && g.entities[head].arena.team == a_team
+                && g.entities[head].arena.carrying != 0
+            {
+                g.entities[attacker].v.frags += CARRIER_PROTECT_BONUS;
+                protected_carrier = true;
+            }
+            if !flag_defended
+                && g.entities[head].flag.team == a_team
+                && matches!(g.entities[head].flag.phase, FlagPhase::Home)
+            {
+                g.entities[attacker].v.frags += FLAG_DEFENSE_BONUS;
+                flag_defended = true;
+            }
+        }
     }
 }
 
@@ -219,6 +303,10 @@ impl GameState {
         if self.entities[flag].flag.phase == FlagPhase::Carried {
             return;
         }
+        // The tosser can't re-grab a flag they just tossed until the lock expires.
+        if self.entities[flag].flag.phase == FlagPhase::Tossed && other == self.entities[flag].flag.carrier {
+            return;
+        }
         let flag_team = self.entities[flag].flag.team;
         let player_team = self.entities[other].arena.team;
         if flag_team == 0 || player_team == 0 {
@@ -239,15 +327,59 @@ impl GameState {
         }
     }
 
-    /// `Think::FlagReturn` — idle flag tick: auto-return a dropped flag once its timeout elapses.
+    /// `Think::FlagReturn` — idle flag tick: promote a tossed flag to dropped once its re-grab lock
+    /// expires, and auto-return a dropped flag once its timeout elapses.
     pub(crate) fn flag_return_think(&mut self, flag: EntId) {
         let time = self.time();
         self.entities[flag].v.nextthink = time + 0.5;
-        if self.entities[flag].flag.phase == FlagPhase::Dropped && time >= self.entities[flag].flag.return_at {
+        let phase = self.entities[flag].flag.phase;
+        let due = time >= self.entities[flag].flag.return_at;
+        if phase == FlagPhase::Tossed && due {
+            // Lock over: a normal dropped flag now, with the full auto-return timer.
+            let f = &mut self.entities[flag];
+            f.flag.phase = FlagPhase::Dropped;
+            f.flag.carrier = EntId::WORLD;
+            f.flag.return_at = time + FLAG_RETURN_TIME;
+        } else if phase == FlagPhase::Dropped && due {
             self.flag_send_home(flag);
             let (name, _) = team::team_identity(self.entities[flag].flag.team);
             self.broadcast(PrintLevel::High, &format!("The {name} flag returned to base.\n"));
         }
+    }
+
+    /// Impulse 26 — toss the enemy flag you carry (gated by `rtx_ctf_tossflag`). It flies along your
+    /// aim and you can't re-grab it for 2 s.
+    pub(crate) fn toss_flag(&mut self, player: EntId) {
+        if self.mode.name() != "ctf"
+            || !self.host.cvar_bool(c"rtx_ctf_tossflag")
+            || self.entities[player].arena.carrying == 0
+        {
+            return;
+        }
+        let Some(flag) = self.carried_flag(player) else {
+            self.entities[player].arena.carrying = 0;
+            return;
+        };
+        let team = self.entities[flag].flag.team;
+        let dir = self.aim_dir(player);
+        let origin = self.entities[player].v.origin + Vec3::new(0.0, 0.0, 16.0);
+        let time = self.time();
+        self.entities[player].arena.carrying = 0;
+        self.set_flag_effect(player, team, false);
+        {
+            let f = &mut self.entities[flag];
+            f.flag.phase = FlagPhase::Tossed;
+            f.flag.carrier = player; // lock reference (the tosser)
+            f.flag.return_at = time + 2.0;
+            f.v.solid = Solid::Trigger;
+            f.v.movetype = MoveType::Toss;
+            f.v.velocity = dir * 300.0;
+        }
+        self.host.set_model(flag, Model::PROGS_FLAG);
+        self.host.set_origin(flag, origin);
+        let (tname, _) = team::team_identity(team);
+        let name = self.netname_of(player);
+        self.broadcast(PrintLevel::High, &format!("{name} tossed the {tname} flag!\n"));
     }
 
     /// Drop the flag a player is carrying (called on their death/disconnect), leaving it in the
@@ -272,6 +404,7 @@ impl GameState {
             f.v.modelindex = 0.0;
         }
         self.entities[other].arena.carrying = team;
+        self.entities[other].arena.flag_since = self.time();
         self.set_flag_effect(other, team, true);
         let name = self.netname_of(other);
         let (tname, _) = team::team_identity(team);
@@ -287,6 +420,25 @@ impl GameState {
             self.team_match.scores[idx] += 1;
         }
         self.entities[carrier].v.frags += CAPTURE_BONUS;
+        // Teammates share the capture (+10 each) and cash in any recent return / carrier-frag as an
+        // assist; enemies lose their carrier-hurt window (purectf's LoopThroughPlayersAfterCapture).
+        let now = self.time();
+        for p in team::players(self) {
+            if p == carrier {
+                continue;
+            }
+            if self.entities[p].arena.team == team {
+                self.entities[p].v.frags += TEAM_CAPTURE_BONUS;
+                if self.entities[p].arena.last_returned_flag + RETURN_ASSIST > now {
+                    self.entities[p].v.frags += RETURN_ASSIST_BONUS;
+                }
+                if self.entities[p].arena.last_fragged_carrier + FRAG_CARRIER_ASSIST > now {
+                    self.entities[p].v.frags += FRAG_CARRIER_ASSIST_BONUS;
+                }
+            } else {
+                self.entities[p].arena.last_hurt_carrier = -5.0;
+            }
+        }
         // Send the carried enemy flag home and clear the carry.
         if let Some(f) = self.carried_flag(carrier) {
             self.flag_send_home(f);
@@ -306,6 +458,7 @@ impl GameState {
     fn ctf_return_flag(&mut self, flag: EntId, returner: EntId) {
         self.flag_send_home(flag);
         self.entities[returner].v.frags += RETURN_BONUS;
+        self.entities[returner].arena.last_returned_flag = self.time();
         let name = self.netname_of(returner);
         let (tname, _) = team::team_identity(self.entities[flag].flag.team);
         self.broadcast(PrintLevel::High, &format!("{name} returned the {tname} flag!\n"));
@@ -384,6 +537,173 @@ impl GameState {
     fn carried_flag(&self, player: EntId) -> Option<EntId> {
         self.find_by_classname("flag")
             .find(|&f| self.entities[f].flag.carrier == player)
+    }
+
+    // --- runes (purectf): one held per player, dropped/tossable, four game runes. ---
+
+    /// Clear any runes and spawn the four game runes at random deathmatch spawns. Called when a CTF
+    /// match goes live; a no-op if `rtx_runes` is off.
+    pub(crate) fn spawn_runes(&mut self) {
+        let existing: Vec<EntId> = self.find_by_classname("item_rune").collect();
+        for r in existing {
+            self.free(r);
+        }
+        for p in team::players(self) {
+            self.entities[p].arena.runes = 0;
+            self.refresh_haste_speed(p);
+        }
+        if self.mode.name() != "ctf" || self.host.cvar(c"rtx_runes") as i32 == 1 {
+            return; // 1 = runes off
+        }
+        for bit in [RUNE_RESISTANCE, RUNE_STRENGTH, RUNE_HASTE, RUNE_REGEN] {
+            let spot = self.select_spawn_point();
+            if spot != EntId::WORLD {
+                let org = self.entities[spot].v.origin;
+                self.do_spawn_rune(org, bit);
+            }
+        }
+    }
+
+    /// Create one rune item (`item_rune`) near `origin`.
+    fn do_spawn_rune(&mut self, origin: Vec3, bit: u8) -> EntId {
+        let e = self.spawn();
+        let (model, msg) = rune_asset(bit);
+        {
+            let ent = &mut self.entities[e];
+            ent.classname = Some("item_rune".into());
+            ent.arena.runes = bit; // which rune this item is
+            ent.netname = Some(msg.into());
+            ent.v.movetype = MoveType::Toss;
+            ent.v.solid = Solid::Trigger;
+        }
+        self.host.set_model(e, model);
+        self.host
+            .set_size(e, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
+        let jx = -500.0 + self.random() * 1000.0;
+        let jy = -500.0 + self.random() * 1000.0;
+        let time = self.time();
+        {
+            let ent = &mut self.entities[e];
+            ent.v.velocity = Vec3::new(jx, jy, 300.0);
+            ent.think = Think::RuneRespawn;
+            ent.v.nextthink = time + RUNE_RESPAWN_TIME;
+        }
+        self.entities[e].set_touch(Touch::Rune);
+        self.host.set_origin(e, origin + Vec3::new(0.0, 0.0, 4.0));
+        e
+    }
+
+    /// `Touch::Rune` — pick up a rune (one per player; a held rune blocks the pickup).
+    pub(crate) fn rune_touch(&mut self, rune: EntId, other: EntId) {
+        if other == self.entities[rune].owner()
+            || self.entities[other].classname() != Some("player")
+            || self.entities[other].v.health <= 0.0
+            || self.entities[other].v.deadflag != 0.0
+        {
+            return;
+        }
+        if self.entities[other].arena.runes & RUNE_MASK != 0 {
+            self.sprint_to(other, c"You already have a rune (tossrune to drop).\n");
+            return;
+        }
+        let bit = self.entities[rune].arena.runes;
+        self.entities[other].arena.runes |= bit;
+        self.refresh_haste_speed(other);
+        self.host
+            .sound(other, Channel::Item, Sound::WEAPONS_LOCK4, 1.0, Attenuation::Norm);
+        self.sprint_to(other, c"You got a rune!\n");
+        self.free(rune);
+    }
+
+    /// `Think::RuneRespawn` — an untouched rune relocates to a fresh spawn.
+    pub(crate) fn rune_respawn(&mut self, rune: EntId) {
+        let bit = self.entities[rune].arena.runes;
+        let spot = self.select_spawn_point();
+        let org = if spot != EntId::WORLD {
+            self.entities[spot].v.origin
+        } else {
+            self.entities[rune].v.origin
+        };
+        self.free(rune);
+        self.do_spawn_rune(org, bit);
+    }
+
+    /// Drop the runes a player holds where they are (called on death; owner-locked briefly).
+    pub(crate) fn drop_runes(&mut self, player: EntId) {
+        let runes = self.entities[player].arena.runes & RUNE_MASK;
+        if runes == 0 {
+            return;
+        }
+        let origin = self.entities[player].v.origin;
+        for bit in [RUNE_RESISTANCE, RUNE_STRENGTH, RUNE_HASTE, RUNE_REGEN] {
+            if runes & bit != 0 {
+                self.do_spawn_rune(origin, bit);
+            }
+        }
+        self.entities[player].arena.runes = 0;
+        self.refresh_haste_speed(player);
+    }
+
+    /// Impulse 24 — toss your held rune(s) along your aim (gated by `rtx_ctf_tossrune`).
+    pub(crate) fn toss_rune(&mut self, player: EntId) {
+        if self.mode.name() != "ctf" || !self.host.cvar_bool(c"rtx_ctf_tossrune") {
+            return;
+        }
+        let runes = self.entities[player].arena.runes & RUNE_MASK;
+        if runes == 0 {
+            return;
+        }
+        let origin = self.entities[player].v.origin;
+        let dir = self.aim_dir(player);
+        for bit in [RUNE_RESISTANCE, RUNE_STRENGTH, RUNE_HASTE, RUNE_REGEN] {
+            if runes & bit != 0 {
+                let r = self.do_spawn_rune(origin, bit);
+                self.entities[r].v.velocity = dir * 300.0 + Vec3::new(0.0, 0.0, 200.0);
+            }
+        }
+        self.entities[player].arena.runes = 0;
+        self.refresh_haste_speed(player);
+    }
+
+    /// Recompute a player's move-speed cap for the Haste rune (`×1.25` when held, `rtx_runes 0`).
+    pub(crate) fn refresh_haste_speed(&mut self, e: EntId) {
+        let base = {
+            let v = self.host.cvar(c"sv_maxspeed");
+            if v > 0.0 {
+                v
+            } else {
+                320.0
+            }
+        };
+        // Only the "pure" mode (`rtx_runes 0`) grants the speed boost; `2` is haste-attack only.
+        let pure = self.host.cvar(c"rtx_runes") as i32 == 0;
+        let haste = pure && self.entities[e].arena.runes & RUNE_HASTE != 0;
+        self.entities[e].maxspeed = base * if haste { 1.25 } else { 1.0 };
+    }
+
+    /// Regeneration rune: heal health/armor toward 150 while held (called each frame in prethink).
+    pub(crate) fn ctf_rune_regen(&mut self, e: EntId) {
+        if self.entities[e].arena.runes & RUNE_REGEN == 0 {
+            return;
+        }
+        let dt = self.globals.frametime;
+        let v = &mut self.entities[e].v;
+        if v.health > 0.0 && v.health < 150.0 {
+            v.health = (v.health + 10.0 * dt).min(150.0);
+        }
+        if v.armortype > 0.0 && v.armorvalue < 150.0 {
+            v.armorvalue = (v.armorvalue + 10.0 * dt).min(150.0);
+        }
+    }
+}
+
+/// The `(model, pickup message)` for a rune bit.
+fn rune_asset(bit: u8) -> (Model, &'static str) {
+    match bit {
+        RUNE_RESISTANCE => (Model::PROGS_END1, "Resistance"),
+        RUNE_STRENGTH => (Model::PROGS_END2, "Strength"),
+        RUNE_HASTE => (Model::PROGS_END3, "Haste"),
+        _ => (Model::PROGS_END4, "Regeneration"),
     }
 }
 

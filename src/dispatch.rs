@@ -82,6 +82,7 @@ impl GameState {
             UpdateChain => self.update_chain(e),
             RemoveChain => self.remove_chain(e),
             FlagReturn => self.flag_return_think(e),
+            RuneRespawn => self.rune_respawn(e),
         }
     }
 
@@ -121,6 +122,7 @@ impl GameState {
             Hook => self.anchor_grapple(e, other),
             // ctf.rs
             Flag => self.flag_touch(e, other),
+            Rune => self.rune_touch(e, other),
             // server.qc
             Changelevel => self.changelevel_touch(e, other),
             // trigger_monsterjump only affects monsters (absent in this subset).

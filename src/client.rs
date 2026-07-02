@@ -275,6 +275,7 @@ impl GameState {
 
         self.check_rules(e);
         self.water_move(e);
+        self.ctf_rune_regen(e); // Regeneration rune (no-op outside CTF)
 
         let deadflag = self.entities[e].v.deadflag;
         if deadflag >= DeadFlag::Dead.as_f32() {

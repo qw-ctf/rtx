@@ -463,6 +463,12 @@ impl GameState {
         self.host.cvar_default("rtx_match_countdown", 3.0);
         // CTF: captures a team needs to win the match (`0` = no limit, ends on timelimit only).
         self.host.cvar_default("rtx_capturelimit", 8.0);
+        // CTF runes: `0` = on (with the Haste speed boost), `1` = off, `2` = on without the speed
+        // boost (Haste is attack-rate only). Runes spawn only in CTF.
+        self.host.cvar_default("rtx_runes", 0.0);
+        // CTF: allow voluntarily tossing your carried flag (impulse 26) / held rune (impulse 24).
+        self.host.cvar_default("rtx_ctf_tossflag", false);
+        self.host.cvar_default("rtx_ctf_tossrune", false);
         // Midair: minimum height above the floor (units) for a victim to count as airborne, and the
         // knockback multipliers for airborne (`kb_air`) vs grounded (`kb_ground`) rocket hits — the
         // ground value is bigger to pop grounded players up into the air. Tunables over rtx's bare

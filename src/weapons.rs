@@ -109,7 +109,7 @@ impl GameState {
 
     /// `aim` — autoaim direction. QW deathmatch effectively disables vertical autoaim, so we
     /// return straight-ahead `v_forward` (after refreshing the angle vectors).
-    fn aim_dir(&mut self, e: EntId) -> Vec3 {
+    pub(crate) fn aim_dir(&mut self, e: EntId) -> Vec3 {
         let v_angle = self.entities[e].v.v_angle;
         self.host.make_vectors(v_angle);
         self.globals.v_forward
@@ -801,6 +801,13 @@ impl GameState {
             }
             _ => {}
         }
+        // CTF Haste rune: halve the remaining attack cooldown (fire ~2× as fast).
+        if self.entities[e].arena.runes & crate::defs::RUNE_HASTE != 0 {
+            let af = self.entities[e].combat.attack_finished;
+            if af > time {
+                self.entities[e].combat.attack_finished = time + (af - time) * 0.5;
+            }
+        }
     }
 
     /// `W_ChangeWeapon` — switch to the impulse-selected weapon if owned and fed.
@@ -943,6 +950,8 @@ impl GameState {
             11 => self.entities[e].v.team += 1.0, // ServerflagsCommand stand-in
             12 => self.cycle_weapon(e, true),
             22 => self.select_grapple(e), // grappling hook
+            24 => self.toss_rune(e),      // CTF: drop your held rune
+            26 => self.toss_flag(e),      // CTF: toss the enemy flag you carry
             _ => {}
         }
         self.entities[e].v.impulse = 0.0;
@@ -996,7 +1005,7 @@ impl GameState {
     }
 
     /// `sprint(self, PrintLevel::High, ...)` to a player.
-    fn sprint_to(&self, e: EntId, msg: &CStr) {
+    pub(crate) fn sprint_to(&self, e: EntId, msg: &CStr) {
         self.host.sprint(e, PrintLevel::High, msg);
     }
 }

@@ -68,6 +68,8 @@ is just the baseline mode, so adding a mode doesn't touch the generic gameplay o
 | `rtx_midair_kb_ground` / `rtx_midair_kb_air` | `6` / `3` | Midair: rocket knockback multipliers for grounded vs airborne victims (ground is stronger, to launch players up). |
 | `rtx_match_countdown` | `3` | Team match / CTF: seconds of spawn-protected countdown after the match-start map reload before "FIGHT". |
 | `rtx_capturelimit` | `8` | CTF: captures a team needs to win (`0` = no limit, ends on `timelimit`). |
+| `rtx_runes` | `0` | CTF runes: `0` = on (Haste adds move speed), `1` = off, `2` = on without the speed boost. |
+| `rtx_ctf_tossflag` / `rtx_ctf_tossrune` | `0` / `0` | CTF: allow tossing your carried flag (impulse 26) / held rune (impulse 24). |
 
 **`ra` — Rocket Arena.** Round-based 1v1 duels following the classic arena loop (ported from the
 Frogbot-Rocket-Arena QuakeC, minus its clan-arena team machinery). Two players fight in the arena
@@ -110,9 +112,12 @@ frags to the carrier). Touch your **own** flag where it lies to **return** it (+
 also **auto-returns** after 40 s, and a killed carrier **drops** it where they fell. Teams win at
 `rtx_capturelimit`. It uses the same match lifecycle as team DM — warmup → **`start`** (map reload +
 countdown) → live → results — with friendly fire via `teamplay`, the grapple handed out for movement,
-and CTF bots that grab, run flags home, chase enemy carriers, and defend. (Runes and the proximity
-defense/assist bonuses are deferred for now.) CTF requires the flag model **`progs/flag.mdl`** in the
-gamedir.
+and CTF bots that grab, run flags home, chase enemy carriers, and defend. Full purectf scoring is in:
+capture +15, teammates +10, plus the frag-carrier, carrier-protect, flag-defense, and return/frag
+**assist** bonuses. The four **runes** (Resistance, Strength, Haste, Regeneration — `rtx_runes`) spawn
+at DM points, one per player, dropped on death; the flag and rune can be tossed (`rtx_ctf_tossflag`
+/ `rtx_ctf_tossrune`, impulse 26 / 24). CTF requires the flag model **`progs/flag.mdl`** (and the
+rune models `progs/end1-4.mdl`) in the gamedir.
 
 ## Bots
 

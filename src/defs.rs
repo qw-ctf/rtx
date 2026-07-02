@@ -582,3 +582,15 @@ pub const STOP_EPSILON: f32 = 0.1;
 
 // --- the standard QuakeC big-number "infinity" for traces ---
 pub const WEAPON_BIG_RANGE: f32 = 100000.0;
+
+// --- CTF runes (purectf; applied in combat/weapons/player, one held per player). See `crate::mode::ctf`. ---
+/// Resistance — halves incoming damage.
+pub const RUNE_RESISTANCE: u8 = 1;
+/// Strength — doubles outgoing damage.
+pub const RUNE_STRENGTH: u8 = 2;
+/// Haste — faster attacks and movement.
+pub const RUNE_HASTE: u8 = 4;
+/// Regeneration — regenerates health/armor over time.
+pub const RUNE_REGEN: u8 = 8;
+/// All four game runes.
+pub const RUNE_MASK: u8 = RUNE_RESISTANCE | RUNE_STRENGTH | RUNE_HASTE | RUNE_REGEN;

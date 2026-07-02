@@ -102,6 +102,23 @@ impl GameState {
             damage *= if self.level.deathmatch == 4 { 8.0 } else { 4.0 };
         }
 
+        // CTF runes: Strength doubles the attacker's outgoing damage (after quad); Resistance halves
+        // the target's incoming damage. Also mark a carrier-defense window when an enemy hurts a
+        // flag carrier (see `crate::mode::ctf` scoring). All no-ops when no runes / not CTF.
+        if self.entities[attacker].arena.runes & RUNE_STRENGTH != 0 {
+            damage *= 2.0;
+        }
+        if self.entities[targ].arena.runes & RUNE_RESISTANCE != 0 {
+            damage *= 0.5;
+        }
+        if self.entities[targ].arena.carrying != 0
+            && attacker != targ
+            && self.entities[attacker].classname() == Some("player")
+            && self.entities[attacker].arena.team != self.entities[targ].arena.team
+        {
+            self.entities[attacker].arena.last_hurt_carrier = time;
+        }
+
         // Mode damage ruleset (Rocket Arena countdown/audience protection; Midair airborne-only
         // kills + launch knockback), applied after quad and before armor. A fully-blocked hit — no
         // health *and* no knockback — short-circuits exactly like the old boolean damage gate.

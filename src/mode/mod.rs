@@ -69,6 +69,17 @@ pub(crate) struct ArenaPlayer {
     /// In CTF, the team id of the enemy flag this player is carrying (`0` = not carrying). See
     /// [`crate::mode::ctf`].
     pub carrying: u8,
+    /// CTF held-rune bitfield (`crate::defs::RUNE_*`; `0` = none). One rune per player.
+    pub runes: u8,
+    // --- CTF assist/defense bookkeeping (world times; `0` = never) ---
+    /// When this player grabbed the enemy flag (a short grace before a carrier-frag scores).
+    pub flag_since: f32,
+    /// When this player last returned their own flag (a return→capture assist window).
+    pub last_returned_flag: f32,
+    /// When this player last fragged an enemy flag carrier (a frag→capture assist window).
+    pub last_fragged_carrier: f32,
+    /// When this player last damaged an enemy flag carrier (a carrier-defense window).
+    pub last_hurt_carrier: f32,
 }
 
 /// A mode's per-frame directive for one bot — the *only* channel through which a mode influences
