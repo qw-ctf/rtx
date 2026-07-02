@@ -33,6 +33,14 @@ const SAFE_FALL: f32 = 88.0;
 const JUMP_APEX: f32 = 45.0;
 /// Horizontal reach of a running jump (`maxspeed · air-time`), conservatively floored.
 const JUMP_REACH: f32 = 200.0;
+/// Extra reach/rise unlocked by rtx's mid-air **double jump** (`rtx_doublejump`): a second jump near
+/// the apex restacks a ~45u arc, roughly doubling both. Conservatively floored so a bot with slightly
+/// off air-jump timing still clears the linked gap.
+const DOUBLE_JUMP_REACH: f32 = 300.0;
+const DOUBLE_JUMP_APEX: f32 = 80.0;
+/// Clearance envelope for a double jump — the real two-arc path peaks ~91u above the launch, so
+/// sample the arc a touch higher to be safe.
+const DOUBLE_ARC_PEAK: f32 = 100.0;
 /// `sv_maxspeed` default — the cost denominator (travel time = distance / speed).
 const MAX_SPEED: f32 = 320.0;
 
@@ -108,6 +116,10 @@ pub enum LinkKind {
     Drop,
     /// A run-jump across a gap or up to a ledge within reach.
     JumpGap,
+    /// A **double jump** across a wider gap / up to a higher ledge than a single jump reaches — the
+    /// bot ground-jumps, then air-jumps near the apex (rtx's `rtx_doublejump`). Only emitted when the
+    /// map has double jump enabled.
+    DoubleJump,
     /// Riding a `func_plat`: board it at the bottom and let it carry you to the top. The
     /// link's `from` cell is the standing spot on the plat (its centre), `to` the floor the
     /// plat delivers to. Bots stay centred and wait rather than steering off.
@@ -313,6 +325,61 @@ impl NavGraph {
             }
         }
         best.into_iter().flatten().map(|(_, l)| l).collect()
+    }
+
+    /// Splice **double-jump** links: gaps/ledges beyond a single jump's reach but within a double
+    /// jump's, gated on `rtx_doublejump`. Same ledge-edge/octant-dedup shape as [`find_jumps`], but
+    /// the wider reach/apex and the taller arc-clearance envelope — and only for targets a plain
+    /// jump can't already make (else a `JumpGap` covers it). The bot air-jumps mid-flight to cross.
+    pub fn add_double_jumps(&mut self, bsp: &Bsp) {
+        let mut pending: Vec<Link> = Vec::new();
+        for from in 0..self.cells.len() as CellId {
+            let a = self.cells[from as usize];
+            let mut best: [Option<(f32, Link)>; 9] = Default::default();
+            for to in self.neighbors_within(a.gx, a.gy, double_jump_grid_radius()) {
+                if to == from {
+                    continue;
+                }
+                let b = self.cells[to as usize];
+                let (dgx, dgy) = (b.gx - a.gx, b.gy - a.gy);
+                if dgx.abs() <= 1 && dgy.abs() <= 1 {
+                    continue;
+                }
+                let dz = b.origin.z - a.origin.z;
+                let horiz = (b.origin.xy() - a.origin.xy()).length();
+                if !(-MAX_DROP..=DOUBLE_JUMP_APEX).contains(&dz) || horiz > DOUBLE_JUMP_REACH {
+                    continue;
+                }
+                // Only worthwhile beyond a single jump — otherwise `find_jumps` already linked it.
+                if horiz <= JUMP_REACH && dz <= JUMP_APEX {
+                    continue;
+                }
+                // Take off from a ledge edge, clear the taller arc, and don't duplicate a route the
+                // static graph already provides (walk/step/jump).
+                if self.has_ground_near(a.gx + dgx.signum(), a.gy + dgy.signum(), a.origin.z)
+                    || !arc_clear_peak(bsp, a.origin, b.origin, DOUBLE_ARC_PEAK, 12)
+                    || self.has_direct_link(from, to)
+                {
+                    continue;
+                }
+                let oct = dir_bucket(dgx, dgy);
+                if best[oct].is_none_or(|(d, _)| horiz < d) {
+                    best[oct] = Some((
+                        horiz,
+                        Link {
+                            from,
+                            to,
+                            kind: LinkKind::DoubleJump,
+                            cost: link_cost(LinkKind::DoubleJump, horiz, dz),
+                        },
+                    ));
+                }
+            }
+            pending.extend(best.into_iter().flatten().map(|(_, l)| l));
+        }
+        for link in pending {
+            self.push_link(link);
+        }
     }
 
     /// Whether grid column `(gx, gy)` has a cell within `STEP_HEIGHT` of height `z` — i.e.
@@ -531,6 +598,7 @@ impl NavGraph {
                 LinkKind::Step => c.step += 1,
                 LinkKind::Drop => c.drop += 1,
                 LinkKind::JumpGap => c.jump += 1,
+                LinkKind::DoubleJump => c.double_jump += 1,
                 LinkKind::Plat => c.plat += 1,
                 LinkKind::Teleport => c.teleport += 1,
                 LinkKind::Hook => c.hook += 1,
@@ -950,6 +1018,7 @@ pub struct LinkCounts {
     pub step: u32,
     pub drop: u32,
     pub jump: u32,
+    pub double_jump: u32,
     pub plat: u32,
     pub teleport: u32,
     pub hook: u32,
@@ -964,6 +1033,8 @@ fn link_cost(kind: LinkKind, horiz: f32, dz: f32) -> f32 {
         LinkKind::Step => base * 1.1,
         LinkKind::Drop => base + if -dz > SAFE_FALL { 1.0 } else { 0.1 },
         LinkKind::JumpGap => base + 0.3,
+        // A double jump is a touch pricier — a harder maneuver (two timed jumps) than a single hop.
+        LinkKind::DoubleJump => base + 0.6,
         // Plat costs are computed at splice time (ride time + overhead), not here.
         LinkKind::Plat => base + 1.0,
         // Teleporting is near-instant; cost is set at splice time.
@@ -1003,8 +1074,12 @@ fn path_clear(bsp: &Bsp, a: Vec3, b: Vec3) -> bool {
 /// Whether a jump arc from `a` to `b` clears geometry: sample a parabola peaking `JUMP_APEX`
 /// above the higher endpoint and require every point to be open.
 fn arc_clear(bsp: &Bsp, a: Vec3, b: Vec3) -> bool {
-    let peak = a.z.max(b.z) + JUMP_APEX;
-    let steps = 8;
+    arc_clear_peak(bsp, a, b, JUMP_APEX, 8)
+}
+
+/// [`arc_clear`] with a caller-chosen apex height (for the taller double-jump arc) and step count.
+fn arc_clear_peak(bsp: &Bsp, a: Vec3, b: Vec3, apex: f32, steps: i32) -> bool {
+    let peak = a.z.max(b.z) + apex;
     (0..=steps).all(|i| {
         let t = i as f32 / steps as f32;
         let xy = a.xy().lerp(b.xy(), t);
@@ -1165,6 +1240,11 @@ fn jump_grid_radius() -> i32 {
     (JUMP_REACH / GRID).ceil() as i32
 }
 
+/// How many grid columns a double jump can span.
+fn double_jump_grid_radius() -> i32 {
+    (DOUBLE_JUMP_REACH / GRID).ceil() as i32
+}
+
 /// Bucket a grid direction into a 3×3 compass cell (0..9, center index 4 unused), for jump
 /// dedup. Distinct for all 8 surrounding directions — opposite directions never collide.
 fn dir_bucket(dgx: i32, dgy: i32) -> usize {
@@ -1206,9 +1286,15 @@ pub fn build_navmesh(
     teleports: Vec<TeleportInfo>,
     gates: Vec<GateInfo>,
     hooks: Option<HookParams>,
+    double_jump: bool,
 ) -> NavBuild {
     let bsp = Bsp::parse(&bytes)?;
     let mut graph = NavGraph::build(&bsp);
+    // Static-geometry jump/hook splices first (before the plat/gate splices): keeps plat surfaces
+    // off their endpoints and lets `add_gates` tag any of these links that cross a door.
+    if double_jump {
+        graph.add_double_jumps(&bsp);
+    }
     // Hooks first: they derive from the static hull, and going before the plat/gate splices keeps
     // plat surfaces off hook endpoints and lets `add_gates` tag any hook link crossing a door.
     if let Some(params) = hooks {
@@ -1476,6 +1562,30 @@ mod tests {
             "hook splice: {hooks} links ({vertical} vertical, {fling} fling); \
              best directed reach {reach_before} -> {reach_after}"
         );
+
+        // Double-jump splice: every emitted link must be beyond a single jump's reach (else a
+        // JumpGap already covers it) but within the double-jump envelope. Report the count.
+        let mut gd = NavGraph::build(&bsp);
+        gd.add_double_jumps(&bsp);
+        let djumps = gd.summary().double_jump;
+        for li in 0..gd.links.len() as u32 {
+            if gd.link_kind(li) != LinkKind::DoubleJump {
+                continue;
+            }
+            let a = gd.cell_origin(gd.link_source(li));
+            let b = gd.cell_origin(gd.link_target(li));
+            let dz = b.z - a.z;
+            let horiz = (b.xy() - a.xy()).length();
+            assert!(
+                horiz <= DOUBLE_JUMP_REACH && (-MAX_DROP..=DOUBLE_JUMP_APEX).contains(&dz),
+                "double-jump link out of envelope: dz={dz} horiz={horiz}"
+            );
+            assert!(
+                horiz > JUMP_REACH || dz > JUMP_APEX,
+                "double-jump link a single jump could make"
+            );
+        }
+        eprintln!("double-jump splice: {djumps} links");
     }
 
     /// Count cells directly reachable from `start` over the (directed) graph — a small DFS helper

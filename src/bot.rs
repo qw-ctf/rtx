@@ -234,6 +234,10 @@ fn run_bot(game: &mut GameState, e: EntId) {
     let weapon = game.entities[e].v.weapon;
     let on_ground = game.entities[e].v.flags.has(Flags::ONGROUND);
     let alive = game.entities[e].v.health > 0.0 && game.entities[e].v.deadflag == 0.0;
+    // Vertical speed and whether the once-per-air-travel double jump is still available — snapshot
+    // now, since the `&mut bot` binding below blocks reading the edict during the move logic.
+    let vz = game.entities[e].v.velocity.z;
+    let air_jumped = game.entities[e].combat.air_jumped;
     // Snapshot grapple state up front (it's set in the previous frame's PlayerPreThink, so it's
     // stable across this bot frame) — lets the hook driver read it without re-borrowing the edict
     // while the `&mut bot` binding is live. `anchor` is meaningful only once `on_hook`.
@@ -733,8 +737,22 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // released (airborne) before it'll fire again. Gating on ground state pulses it correctly,
     // so a jump that falls short is retried on the next landing instead of the bot getting
     // stuck holding +jump against a ledge.
-    if on_ground && (force_jump || matches!(kind, Some(LinkKind::JumpGap))) {
+    if on_ground && (force_jump || matches!(kind, Some(LinkKind::JumpGap | LinkKind::DoubleJump))) {
         buttons |= BUTTON_JUMP;
+    }
+    // Mid-air (double) jump: rtx grants one air jump per air travel. On a double-jump leg, spend it
+    // near the apex (`vz` small) to restack the arc and clear the wider gap; on a plain jump leg,
+    // spend it as a *recovery* only when we're descending short of a higher target (an undershoot).
+    // `air_jumped` gates re-pressing it, and the engine ignores it when the floor's close (landing).
+    if !on_ground && !air_jumped && vz <= 30.0 {
+        let air_jump = match kind {
+            Some(LinkKind::DoubleJump) => true,
+            Some(LinkKind::JumpGap) => vz < 0.0 && waypoint.z > origin.z + 20.0,
+            _ => false,
+        };
+        if air_jump {
+            buttons |= BUTTON_JUMP;
+        }
     }
 
     // Opening a gate's button: once at it, face it and push (walk in) or shoot it.

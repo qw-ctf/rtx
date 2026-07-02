@@ -137,7 +137,10 @@ through the same player-move code as humans, so gravity, stepping, and jumps com
 
 In free-for-all each bot pathfinds to the best reachable **item pickup**, or **follows the nearest
 human** when nothing's worth fetching (through doors, off ledges, across jumps, recovering after a
-missed jump). When `rtx_grapple` is on, the navmesh also grows **hook links** — edges a bot crosses
+missed jump). When `rtx_doublejump` is on, the navmesh also links the **wider gaps and higher ledges
+a double jump reaches** — the bot ground-jumps, then **air-jumps near the apex** to restack the arc
+and clear a gap a single jump can't (it also spends the air jump to recover an undershot ordinary
+jump). When `rtx_grapple` is on, the navmesh also grows **hook links** — edges a bot crosses
 with the **grappling hook**: it throws the hook at an anchor, reels to build speed, then **releases
 mid-reel so the resulting velocity flings it along a parabola** onto a ledge or across a gap a plain
 jump can't reach (a straight pull-up is just the degenerate case). Because the arc is deterministic,

@@ -585,9 +585,18 @@ impl GameState {
             pull: navmesh::HOOK_PULL_BASE * self.host.cvar(c"rtx_hook_pull"),
             throw: navmesh::HOOK_THROW_BASE * self.host.cvar(c"rtx_hook_speed"),
         });
+        // Double-jump links: only when the map allows the mid-air jump, so bots plan the wider gaps.
+        let double_jump = self.host.cvar_bool(c"rtx_doublejump");
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(navmesh::build_navmesh(bytes, plats, teleports, gates, hooks));
+            let _ = tx.send(navmesh::build_navmesh(
+                bytes,
+                plats,
+                teleports,
+                gates,
+                hooks,
+                double_jump,
+            ));
         });
         self.nav.pending = Some(rx);
         self.host.dprint(c"rtx: navmesh: building in background...\n");
@@ -617,7 +626,7 @@ impl GameState {
         let goals = self.collect_goals(&graph);
         let msg = cstring(&format!(
             "rtx: navmesh: {} planes, {} clipnodes -> {} cells, {} links \
-             (walk {} step {} drop {} jump {} plat {} tele {} hook {}), {} gates, {} item goals\n",
+             (walk {} step {} drop {} jump {} djump {} plat {} tele {} hook {}), {} gates, {} item goals\n",
             bsp.planes.len(),
             bsp.clipnodes.len(),
             graph.cells.len(),
@@ -626,6 +635,7 @@ impl GameState {
             counts.step,
             counts.drop,
             counts.jump,
+            counts.double_jump,
             counts.plat,
             counts.teleport,
             counts.hook,
