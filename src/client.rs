@@ -215,7 +215,7 @@ impl GameState {
         // The grappling hook is handed out at spawn (also selectable via impulse 22 or a double-tap
         // of impulse 1), gated by a cvar like the other rtx movement features. It carries no ammo,
         // so it's just an extra item bit — and we spawn holding it by default.
-        if self.host.cvar(c"rtx_grapple") != 0.0 {
+        if self.host.cvar_bool(c"rtx_grapple") {
             let ent = &mut self.entities[player];
             ent.v.items = ent.v.items.with(Items::GRAPPLE);
             ent.v.weapon = Weapon::Grapple;
@@ -477,7 +477,7 @@ impl GameState {
             // ground jump's impulse is applied by the engine's pmove, but nothing lifts us
             // mid-air, so both set velocity themselves.
             if !self.try_wall_jump(e) {
-                if self.entities[e].combat.air_jumped || self.host.cvar(c"rtx_doublejump") == 0.0 {
+                if self.entities[e].combat.air_jumped || !self.host.cvar_bool(c"rtx_doublejump") {
                     return;
                 }
                 // Don't double-jump when about to land (or just after takeoff) — preserves bunny
@@ -592,7 +592,7 @@ impl GameState {
         /// Upward velocity imparted by the kick.
         const UP: f32 = 270.0;
 
-        if self.host.cvar(c"rtx_walljump") == 0.0 {
+        if !self.host.cvar_bool(c"rtx_walljump") {
             return false;
         }
         let (origin, vel) = {

@@ -44,7 +44,7 @@ pub(crate) fn vectoangles(v: Vec3) -> Vec3 {
 
 impl GameState {
     fn shootable_grenades_enabled(&self) -> bool {
-        self.host.cvar(c"rtx_shootable_grenades") != 0.0
+        self.host.cvar_bool(c"rtx_shootable_grenades")
     }
 
     pub(crate) fn is_grenade(&self, e: EntId) -> bool {

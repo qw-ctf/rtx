@@ -203,6 +203,11 @@ impl HostApi {
         unsafe { rf((self.syscall)(B::Cvar as isize, name.as_ptr() as isize)) }
     }
 
+    /// Read a cvar as a boolean toggle: `> 0.0` is true, `0.0` (or negative) is false.
+    pub fn cvar_bool(&self, name: &CStr) -> bool {
+        self.cvar(name) > 0.0
+    }
+
     /// `G_CVAR_SET` — set a cvar from a string.
     pub fn cvar_set(&self, name: &CStr, value: &CStr) {
         unsafe { (self.syscall)(B::CvarSet as isize, name.as_ptr() as isize, value.as_ptr() as isize) };
@@ -216,9 +221,9 @@ impl HostApi {
     /// Register a default: set the cvar only if it isn't already set. `GAME_INIT` runs on every
     /// map load, so a plain `cvar_set` there would overwrite a value the user put in `server.cfg`
     /// (or a `set` before `map`) each time — this preserves an existing value and only seeds the
-    /// default when the cvar is unset (empty string). Generic over the value type so both string
-    /// and numeric defaults read the same, e.g. `cvar_default("rtx_mode", "ffa")` and
-    /// `cvar_default("rtx_bots", 0.0)`.
+    /// default when the cvar is unset (empty string). Generic over the value type so string,
+    /// numeric, and boolean defaults read the same, e.g. `cvar_default("rtx_mode", "ffa")`,
+    /// `cvar_default("rtx_bots", 0.0)`, and `cvar_default("rtx_grapple", true)`.
     pub fn cvar_default<V: CvarValue>(&self, name: &str, default: V) {
         // Preserve any existing value (server.cfg, or a prior map) — only seed when unset.
         if self.cvar_is_set(name) {
@@ -761,9 +766,9 @@ impl HostApi {
     }
 }
 
-/// A value that can seed a cvar default via [`HostApi::cvar_default`] — implemented for numbers
-/// (`f32`/`f64`, so plain `0.0` literals work) and `&str`, so one `cvar_default` handles both.
-/// The value is rendered as the argument to a `set` console command.
+/// A value that can seed a cvar default via [`HostApi::cvar_default`] — implemented for `f32`
+/// (numeric cvars), `bool` (0/1 toggles), and `&str` (string cvars), so one `cvar_default` handles
+/// all three. The value is rendered as the argument to a `set` console command.
 pub trait CvarValue {
     fn cvar_token(&self) -> String;
 }
@@ -774,9 +779,10 @@ impl CvarValue for f32 {
     }
 }
 
-impl CvarValue for f64 {
+impl CvarValue for bool {
     fn cvar_token(&self) -> String {
-        format!("{self}")
+        // `1`/`0` so the same value reads back as truthy/falsy via `HostApi::cvar_bool`.
+        if *self { "1" } else { "0" }.to_string()
     }
 }
 

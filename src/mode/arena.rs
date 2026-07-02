@@ -122,7 +122,7 @@ impl GameMode for Arena {
     fn apply_loadout(&self, g: &mut GameState, e: EntId) {
         let fighter = g.entities[e].arena.role == ArenaRole::Fighter;
         // The lightning gun is off by default (rtx_ra_lightning_gun 0) — a rockets-first arena.
-        let lightning = g.host().cvar(c"rtx_ra_lightning_gun") != 0.0;
+        let lightning = g.host().cvar_bool(c"rtx_ra_lightning_gun");
         let v = &mut g.entities[e].v;
         if fighter {
             // Full arsenal + full ammo + red armor, mirroring arena.qc:a_newitems defaults.

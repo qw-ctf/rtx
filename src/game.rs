@@ -424,10 +424,10 @@ impl GameState {
         // the user's value while still seeding a first-run default.
 
         // Mid-air double jump, on by default (set `rtx_doublejump 0` to disable).
-        self.host.cvar_default("rtx_doublejump", 1.0);
+        self.host.cvar_default("rtx_doublejump", true);
 
         // Wall jump (kick off a wall you jump into), on by default (`rtx_walljump 0` to disable).
-        self.host.cvar_default("rtx_walljump", 1.0);
+        self.host.cvar_default("rtx_walljump", true);
 
         // Elevator jump: a rising lift boosts your jump by `lift_speed * rtx_elevator_jump`.
         // It's a multiplier (0 disables, 1 = add the lift's true speed, 2 = double it, …).
@@ -435,11 +435,11 @@ impl GameState {
 
         // Shoot live grenades to detonate them early, on by default (`rtx_shootable_grenades 0`
         // to restore classic non-shootable grenades).
-        self.host.cvar_default("rtx_shootable_grenades", 1.0);
+        self.host.cvar_default("rtx_shootable_grenades", true);
 
         // Grappling hook (purectf port), on by default — every player spawns with it (impulse 22
         // to select). `rtx_grapple 0` to disable.
-        self.host.cvar_default("rtx_grapple", 1.0);
+        self.host.cvar_default("rtx_grapple", true);
         // Hook throw / reel-in speed multipliers (purectf's `localinfo hookspeed`/`hookpull`),
         // each scaling its base `× sv_maxspeed`. Defaults match purectf's shipped server.cfg.
         self.host.cvar_default("rtx_hook_speed", 1.25);
@@ -451,15 +451,15 @@ impl GameState {
         // Rocket Arena: seconds of spawn-protected countdown before "FIGHT". (The arena is always
         // a 1v1 duel — the fighter count isn't a cvar.)
         self.host.cvar_default("rtx_ra_countdown", 3.0);
-        // Rocket Arena: include the lightning gun in the arena arsenal (0 = leave it out).
-        self.host.cvar_default("rtx_ra_lightning_gun", 0.0);
+        // Rocket Arena: include the lightning gun in the arena arsenal (off = leave it out).
+        self.host.cvar_default("rtx_ra_lightning_gun", false);
 
         // Navmesh bots: how many to keep on the server (0 = none), and their skill (reserved
         // for combat tuning later). Bots only spawn once a map's navmesh is built.
         self.host.cvar_default("rtx_bots", 0.0);
         self.host.cvar_default("rtx_bot_skill", 3.0);
-        // Per-bot goal/pickup diagnostics to the server console (0 = off).
-        self.host.cvar_default("rtx_bot_debug", 0.0);
+        // Per-bot goal/pickup diagnostics to the server console (off by default).
+        self.host.cvar_default("rtx_bot_debug", false);
 
         // conprint (not dprint) so it shows without `developer 1` — lets you confirm at a glance
         // that the freshly built module is the one actually loaded.

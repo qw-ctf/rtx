@@ -265,7 +265,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
 
     // Opt-in diagnostics (`rtx_bot_debug 1`): one throttled line per bot — what it wants, how far,
     // whether it's standing on that item, and whether it owns the LG. Pinpoints pickup-vs-desire.
-    if host.cvar(c"rtx_bot_debug") != 0.0 && now >= game.entities[e].bot.repath_time {
+    if host.cvar_bool(c"rtx_bot_debug") && now >= game.entities[e].bot.repath_time {
         let gi = game.entities[e].bot.goal_item;
         let (goal, dist, overlap) = if gi != 0 {
             let it = &game.entities[EntId(gi)];
@@ -629,7 +629,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
 
     // Combat/gate diagnostics: what the bot is chasing and whether it's stuck at a gate. Enable
     // with `rtx_bot_debug 1` (conprint shows without `developer`).
-    if host.cvar(c"rtx_bot_debug") != 0.0 {
+    if host.cvar_bool(c"rtx_bot_debug") {
         let gate = game.entities[e].bot.gate;
         let route = game.entities[e].bot.route.len();
         host.conprint(&cstring(&format!(
