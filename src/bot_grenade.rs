@@ -263,6 +263,17 @@ fn player_center(game: &GameState, p: EntId) -> Vec3 {
     v.origin + (v.mins + v.maxs) * 0.5
 }
 
+/// The best hazard to shove enemy `en` into, if any — the shared detection both the grenade lob and
+/// the rocket shove use. Builds the solidity/liquid oracles over the live BSP + `pointcontents`.
+fn enemy_hazard(game: &GameState, en: EntId) -> Option<Hazard> {
+    let e_feet = game.entities[en].v.origin - Vec3::new(0.0, 0.0, 24.0);
+    let bsp = game.nav.bsp.as_ref();
+    let host = game.host();
+    let is_solid = |p: Vec3| bsp.is_some_and(|b| b.is_solid(p));
+    let contents = |p: Vec3| host.pointcontents(p);
+    find_hazard(&is_solid, &contents, e_feet)
+}
+
 /// Clear line from our eye to `target`'s eye.
 fn los_to(game: &mut GameState, e: EntId, target: EntId) -> bool {
     let from = game.entities[e].v.origin + VEC_VIEW_OFS;
@@ -362,13 +373,7 @@ fn try_start(game: &mut GameState, e: EntId, en: EntId, origin: Vec3, now: f32) 
     let e_feet = e_org - Vec3::new(0.0, 0.0, 24.0);
 
     // Look for a hazard to shove the enemy into; else consider a plain airburst.
-    let hazard = {
-        let bsp = game.nav.bsp.as_ref();
-        let is_solid = |p: Vec3| bsp.is_some_and(|b| b.is_solid(p));
-        let contents = |p: Vec3| host.pointcontents(p);
-        find_hazard(&is_solid, &contents, e_feet)
-    };
-    let (target, shove_dir, shove_edge) = match hazard {
+    let (target, shove_dir, shove_edge) = match enemy_hazard(game, en) {
         Some(h) => (e_feet - h.dir * SHOVE_OFFSET, h.dir, h.edge_dist),
         None => {
             // Plain airburst: throttled so it seasons fights rather than replacing the gun game
@@ -565,6 +570,84 @@ fn detonate(
     if fire_ok && can_hit_grenade(game, e, g) {
         shoot_grenade(game, e, g, look, buttons, impulse);
     }
+}
+
+/// The **generic hazard shove**, rocket-launcher variant. The knockback trick isn't grenade-specific
+/// — any splash weapon shoves. A rocket is the *simpler* delivery: a hit near the enemy pushes them
+/// straight away from the bot, so when the bot already stands on the far side of a grounded enemy
+/// from a hazard, one low rocket drives them into it — no lob/arc needed. Returns whether it took
+/// over the frame (aim + fire a shove rocket); the caller then skips the grenade combo.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rocket_shove(
+    game: &mut GameState,
+    e: EntId,
+    enemy: Option<EntId>,
+    origin: Vec3,
+    look: &mut Vec3,
+    buttons: &mut i32,
+    impulse: &mut i32,
+) -> bool {
+    let Some(en) = enemy else {
+        return false;
+    };
+    let (items, ammo, my_team) = {
+        let ent = &game.entities[e];
+        (ent.v.items, ent.v.ammo_rockets, ent.arena.team)
+    };
+    if !items.has(Items::ROCKET_LAUNCHER) || ammo < 1.0 {
+        return false;
+    }
+    let (e_org, e_vel, en_grounded, en_walk) = {
+        let v = &game.entities[en].v;
+        (
+            v.origin,
+            v.velocity,
+            v.flags.has(Flags::ONGROUND),
+            v.movetype == MoveType::Walk,
+        )
+    };
+    let dist = (e_org - origin).length();
+    // Sensible rocket-shove band: far enough not to splash ourselves, near enough to place the shot;
+    // and the target must be a grounded, walking, not-sprinting player (so the low rocket lands on
+    // them and the shove reads cleanly).
+    if !(200.0..=700.0).contains(&dist) || !en_grounded || !en_walk || e_vel.xy().length() > 250.0 {
+        return false;
+    }
+    let Some(h) = enemy_hazard(game, en) else {
+        return false;
+    };
+    // We must be on the far side of the enemy from the hazard: a rocket pushes them away from us,
+    // i.e. toward the hazard, only then.
+    let to_en = (e_org - origin).xy().normalize_or_zero();
+    if to_en.dot(h.dir.xy().normalize_or_zero()) < 0.6 {
+        return false;
+    }
+    // Predict the shove from a near-feet impact on our side and require it to carry them over the
+    // edge; don't catch a teammate.
+    let e_feet = e_org - Vec3::new(0.0, 0.0, 24.0);
+    let to_bot = (origin - e_org).xy().normalize_or_zero();
+    let blast = e_feet + Vec3::new(to_bot.x, to_bot.y, 0.0) * 16.0;
+    if !shove_reaches(player_center(game, en), e_org, blast, h.dir, h.edge_dist)
+        || teammate_in_blast(game, e, my_team, e_org)
+        || !los_to(game, e, en)
+    {
+        return false;
+    }
+    // Aim a low rocket at the enemy's feet — maximal horizontal push, with a little lift to clear a
+    // lip — select the launcher, and fire once the smoothed view is on it.
+    let eye = origin + VEC_VIEW_OFS;
+    *look = bot_combat::angles_to(eye, e_feet + Vec3::new(0.0, 0.0, 4.0));
+    if game.entities[e].v.weapon != Weapon::RocketLauncher {
+        *impulse = 7;
+        *buttons &= !BUTTON_ATTACK;
+        return true;
+    }
+    if aim_err(game.entities[e].bot.aim, *look) < 4.0 {
+        *buttons |= BUTTON_ATTACK;
+    } else {
+        *buttons &= !BUTTON_ATTACK;
+    }
+    true
 }
 
 #[cfg(test)]

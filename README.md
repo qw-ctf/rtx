@@ -155,14 +155,16 @@ with `rtx_bot_skill` (a low-skill bot visibly swings onto a target more slowly).
 Bots also play the **shootable-grenade** game (above). Defensively they shoot down an **incoming**
 grenade — but only from outside its blast, weighed against their own health (the closer it is, the
 more health it takes to justify setting it off) — and a grenade too close to safely pop makes them
-**run and hop clear** instead of detonating it in their own face. Offensively they **lob** grenades
-and chain **lob→shoot combos**: a bot aims a ballistic arc (solved from the launcher's fixed
-speed/loft against gravity), lobs a grenade, switches to a hitscan gun, and detonates it in flight.
-The marquee use is **position manipulation** — if an enemy stands near **lava, slime, a pit or a
-ledge**, the bot lobs behind them and pops the grenade so the outward blast **knockback shoves them
-into the hazard** (it verifies the shove actually carries them across the edge before committing);
-otherwise it's a plain airburst. All of it is safety-checked — never self-splash, never a teammate,
-never a shove the wrong way, never a lob into a wall.
+**run and hop clear** instead of detonating it in their own face. Offensively they use splash weapons for
+**position manipulation** — if an enemy stands near **lava, slime, a pit or a ledge**, the bot sets
+off a blast so the outward **knockback shoves them into the hazard**, verifying the shove actually
+carries them across the edge before committing. It's a **generic strategy** with two deliveries: a
+**rocket** when the bot already stands on the far side of the enemy from the hazard (a low rocket
+pushes them straight away from the bot — one aimed shot), or a **grenade lob→shoot combo** when it
+needs to arc the blast *behind* them: aim a ballistic arc (solved from the launcher's fixed
+speed/loft against gravity), lob, switch to a hitscan gun, and detonate in flight. With no hazard the
+grenade combo becomes a plain airburst. All of it is safety-checked — never self-splash, never a
+teammate, never a shove the wrong way, never a lob into a wall.
 
 ## Map rotation
 

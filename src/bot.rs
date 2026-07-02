@@ -813,11 +813,13 @@ fn run_bot(game: &mut GameState, e: EntId) {
         );
     }
 
-    // Shootable-grenade overlays: first react to live grenades — shoot down an incoming one at a
-    // safe range, run/hop clear of one too close, or detonate one already on the enemy. If that
-    // defensive/opportunistic pass handled the frame it wins; otherwise run the proactive lob→shoot
-    // combo (lob a grenade and detonate it to airburst the enemy or shove them into a hazard). Both
-    // run after `engage` so they override its aim/movement, and only when not flying a hook leg.
+    // Splash-weapon overlays, run after `engage` (they override its aim/movement) and only when not
+    // flying a hook leg. Priority: (1) defensive/opportunistic reaction to live grenades — if it
+    // handled the frame it wins and any stale combo is dropped; (2) finish an in-progress grenade
+    // lob→shoot combo; (3) a one-shot rocket **hazard shove** when the bot is already positioned for
+    // it (cheaper than a lob); (4) otherwise start a grenade combo (hazard shove via a lobbed arc, or
+    // a plain airburst). The hazard shove is the generic strategy — the knockback shoves regardless
+    // of which splash weapon delivers the blast.
     if !hook_engaged {
         let handled = bot_combat::grenade_tactics(
             game,
@@ -833,17 +835,22 @@ fn run_bot(game: &mut GameState, e: EntId) {
             game.entities[e].bot.grenade_phase = crate::entity::GrenadePhase::Idle;
         // defence drops a stale combo
         } else {
-            bot_grenade::grenade_combo(
-                game,
-                e,
-                enemy,
-                origin,
-                now,
-                &mut look,
-                &mut move_world,
-                &mut buttons,
-                &mut impulse,
-            );
+            // A one-shot rocket shove takes priority over *starting* a grenade combo, but never
+            // interrupts one already in progress (the short-circuit keeps a running combo going).
+            let running = game.entities[e].bot.grenade_phase != crate::entity::GrenadePhase::Idle;
+            if running || !bot_grenade::rocket_shove(game, e, enemy, origin, &mut look, &mut buttons, &mut impulse) {
+                bot_grenade::grenade_combo(
+                    game,
+                    e,
+                    enemy,
+                    origin,
+                    now,
+                    &mut look,
+                    &mut move_world,
+                    &mut buttons,
+                    &mut impulse,
+                );
+            }
         }
     }
 
