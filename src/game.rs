@@ -484,8 +484,11 @@ impl GameState {
 
         // Navmesh bots: how many to keep on the server (0 = none), and their skill (reserved
         // for combat tuning later). Bots only spawn once a map's navmesh is built.
-        self.host.cvar_default("rtx_bots", 0.0);
+        self.host.cvar_default("rtx_bot_count", 0.0);
         self.host.cvar_default("rtx_bot_skill", 3.0);
+        // Keep bots on the server even with no humans connected (default off: bots leave an empty
+        // server).
+        self.host.cvar_default("rtx_bot_alone", false);
         // Per-bot goal/pickup diagnostics to the server console (off by default).
         self.host.cvar_default("rtx_bot_debug", false);
 

@@ -132,7 +132,8 @@ through the same player-move code as humans, so gravity, stepping, and jumps com
 
 | cvar | default | what it does |
 |------|---------|--------------|
-| `rtx_bots` | `0` | How many bots to keep on the server. The population is reconciled to this count (spawning/removing as needed), leaving room for humans. Bots only spawn once the map's navmesh is built. |
+| `rtx_bot_count` | `0` | How many bots to keep on the server. The population is reconciled to this count (spawning/removing as needed), leaving room for humans. Bots only spawn once the map's navmesh is built. |
+| `rtx_bot_alone` | `0` | Keep bots on the server even when **no humans** are connected (`0` = bots leave an empty server; `1` = they stay and play it out). |
 | `rtx_bot_skill` | `3` | Bot skill (0–7): tightens aim and speeds how fast a bot turns/tracks. |
 
 In free-for-all each bot pathfinds to the best reachable **item pickup**, or **follows the nearest

@@ -80,7 +80,7 @@ const GATE_AVOID_TIME: f32 = 6.0;
 
 // --- population management (P3) ---
 
-/// Reconcile the live bot count to `rtx_bots`, one add/remove per call (called each normal
+/// Reconcile the live bot count to `rtx_bot_count`, one add/remove per call (called each normal
 /// server frame). No-ops until a navmesh exists for the map, so bots never spawn blind.
 pub fn manage_population(game: &mut GameState) {
     let host = *game.host();
@@ -98,10 +98,11 @@ pub fn manage_population(game: &mut GameState) {
         }
     }
 
-    // Only field bots while at least one human is in the game — an empty server (or one whose
-    // last human just left) wants none, so the trim path below removes them.
-    let want = if humans >= 1 {
-        host.cvar(c"rtx_bots").max(0.0) as i32
+    // Field bots while at least one human is in the game — an empty server (or one whose last human
+    // just left) wants none, so the trim path below removes them. `rtx_bot_alone` overrides that,
+    // keeping bots on even with no humans (a demo/idle server that plays itself).
+    let want = if humans >= 1 || host.cvar_bool(c"rtx_bot_alone") {
+        host.cvar(c"rtx_bot_count").max(0.0) as i32
     } else {
         0
     };

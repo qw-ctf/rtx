@@ -223,7 +223,7 @@ impl HostApi {
     /// (or a `set` before `map`) each time — this preserves an existing value and only seeds the
     /// default when the cvar is unset (empty string). Generic over the value type so string,
     /// numeric, and boolean defaults read the same, e.g. `cvar_default("rtx_mode", "ffa")`,
-    /// `cvar_default("rtx_bots", 0.0)`, and `cvar_default("rtx_grapple", true)`.
+    /// `cvar_default("rtx_bot_count", 0.0)`, and `cvar_default("rtx_grapple", true)`.
     pub fn cvar_default<V: CvarValue>(&self, name: &str, default: V) {
         // Preserve any existing value (server.cfg, or a prior map) — only seed when unset.
         if self.cvar_is_set(name) {
