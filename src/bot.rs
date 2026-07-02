@@ -264,18 +264,18 @@ fn run_bot(game: &mut GameState, e: EntId) {
         b.pulse
     };
 
-    // Dead: pulse +attack to respawn. rtx's death-think needs all buttons *released* (Dead →
-    // Respawnable) and then *pressed* again — so the button must be pulsed, not held.
+    // Connected but never spawned (health 0, not dead): the engine defers `PutClientInServer` — the
+    // full spawn that sets health/loadout — to the bot's spawn on a *bot frame*, which an empty
+    // (bots-only) server never runs. So the bot sits at 0 health forever, and the respawn pulse below
+    // can't help it (`death_think` only runs for `deadflag >= Dead`). Spawn it ourselves; next frame
+    // it's alive and plays normally.
+    if !alive && game.entities[e].v.deadflag == 0.0 {
+        game.put_client_in_server(e);
+        return;
+    }
+    // Genuinely dead (fragged): pulse +attack to respawn. rtx's death-think needs all buttons
+    // *released* (Dead → Respawnable) and then *pressed* again — so the button must be pulsed.
     if !alive {
-        if host.cvar_bool(c"rtx_bot_debug") {
-            let v = &game.entities[e].v;
-            host.conprint(&cstring(&format!(
-                "rtx bot{client}: DEAD health={} deadflag={} classname={:?} pulse={pulse}\n",
-                v.health,
-                v.deadflag,
-                game.entities[e].classname(),
-            )));
-        }
         let buttons = if pulse { BUTTON_ATTACK } else { 0 };
         host.set_bot_cmd(client, msec, v_angle, 0, 0, 0, buttons, 0);
         return;
