@@ -469,6 +469,9 @@ impl GameState {
         // CTF: allow voluntarily tossing your carried flag (impulse 26) / held rune (impulse 24).
         self.host.cvar_default("rtx_ctf_tossflag", false);
         self.host.cvar_default("rtx_ctf_tossrune", false);
+        // Any mode: let players drop items for teammates — a capped ammo backpack (impulse 20) and
+        // the current weapon (impulse 21), as in purectf. `0` disables both.
+        self.host.cvar_default("rtx_dropitems", false);
         // Midair: minimum height above the floor (units) for a victim to count as airborne, and the
         // knockback multipliers for airborne (`kb_air`) vs grounded (`kb_ground`) rocket hits — the
         // ground value is bigger to pop grounded players up into the air. Tunables over rtx's bare

@@ -949,6 +949,8 @@ impl GameState {
             10 => self.cycle_weapon(e, false),
             11 => self.entities[e].v.team += 1.0, // ServerflagsCommand stand-in
             12 => self.cycle_weapon(e, true),
+            20 => self.toss_ammo(e),      // drop a capped ammo backpack (rtx_dropitems)
+            21 => self.toss_weapon(e),    // drop your current weapon (rtx_dropitems)
             22 => self.select_grapple(e), // grappling hook
             24 => self.toss_rune(e),      // CTF: drop your held rune
             26 => self.toss_flag(e),      // CTF: toss the enemy flag you carry

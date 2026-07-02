@@ -70,6 +70,7 @@ is just the baseline mode, so adding a mode doesn't touch the generic gameplay o
 | `rtx_capturelimit` | `8` | CTF: captures a team needs to win (`0` = no limit, ends on `timelimit`). |
 | `rtx_runes` | `0` | CTF runes: `0` = on (Haste adds move speed), `1` = off, `2` = on without the speed boost. |
 | `rtx_ctf_tossflag` / `rtx_ctf_tossrune` | `0` / `0` | CTF: allow tossing your carried flag (impulse 26) / held rune (impulse 24). |
+| `rtx_dropitems` | `0` | Any mode: let players hand items to teammates — a **capped ammo backpack** (impulse 20; up to 20 shells / 20 nails / 10 rockets / 20 cells, deducted from you) and your **current weapon** (impulse 21; drops it as a pickup and switches you to your next-best gun — the axe, single shotgun, and grapple stay). Ported from purectf. |
 
 **`ra` — Rocket Arena.** Round-based 1v1 duels following the classic arena loop (ported from the
 Frogbot-Rocket-Arena QuakeC, minus its clan-arena team machinery). Two players fight in the arena

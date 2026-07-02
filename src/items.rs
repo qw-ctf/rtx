@@ -570,6 +570,19 @@ impl GameState {
             return;
         }
         let netname = weapon_spec(weapon.item()).map_or("", |spec| spec.backpack_name);
+        self.spawn_backpack(
+            origin,
+            Model::PROGS_BACKPACK,
+            netname,
+            weapon.as_f32(),
+            [shells, nails, rockets, cells],
+        );
+    }
+
+    /// Spawn a dropped backpack-like item at `origin`: a toss-physics trigger carrying `items`
+    /// (a weapon bit, or `0.0` for pure ammo) and `[shells, nails, rockets, cells]`, collected via
+    /// [`Touch::Backpack`] and auto-removed after 120 s. Shared by death drops and the toss commands.
+    fn spawn_backpack(&mut self, origin: Vec3, model: Model, netname: &str, items: f32, ammo: [f32; 4]) -> EntId {
         let vx = -100.0 + self.random() * 200.0;
         let vy = -100.0 + self.random() * 200.0;
         let time = self.time();
@@ -577,12 +590,12 @@ impl GameState {
         {
             let it = &mut self.entities[item];
             it.v.origin = origin - Vec3::new(0.0, 0.0, 24.0);
-            it.v.items = weapon.as_f32();
+            it.v.items = items;
             it.netname = Some(netname.into());
-            it.v.ammo_shells = shells;
-            it.v.ammo_nails = nails;
-            it.v.ammo_rockets = rockets;
-            it.v.ammo_cells = cells;
+            it.v.ammo_shells = ammo[0];
+            it.v.ammo_nails = ammo[1];
+            it.v.ammo_rockets = ammo[2];
+            it.v.ammo_cells = ammo[3];
             it.v.velocity = Vec3::new(vx, vy, 300.0);
             it.v.flags = Flags::ITEM.as_f32();
             it.v.solid = Solid::Trigger;
@@ -591,9 +604,72 @@ impl GameState {
             it.v.nextthink = time + 120.0;
             it.think = Think::SubRemove;
         }
-        self.host.set_model(item, Model::PROGS_BACKPACK);
+        self.host.set_model(item, model);
         self.host
             .set_size(item, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
+        item
+    }
+
+    // --- voluntary item drops (impulse 20/21, `rtx_dropitems`) ---
+
+    /// `TossBackpack` (impulse 20) — drop a capped slice of your ammo for a teammate: up to 20
+    /// shells / 20 nails / 10 rockets / 20 cells, deducted from you. Gated by `rtx_dropitems`.
+    pub(crate) fn toss_ammo(&mut self, e: EntId) {
+        if !self.host.cvar_bool(c"rtx_dropitems") || !self.is_live_player(e) {
+            return;
+        }
+        let (have, origin) = {
+            let v = &self.entities[e].v;
+            ([v.ammo_shells, v.ammo_nails, v.ammo_rockets, v.ammo_cells], v.origin)
+        };
+        let caps = [20.0f32, 20.0, 10.0, 20.0];
+        let drop = [
+            have[0].min(caps[0]),
+            have[1].min(caps[1]),
+            have[2].min(caps[2]),
+            have[3].min(caps[3]),
+        ];
+        if drop.iter().sum::<f32>() == 0.0 {
+            self.sprint_low(e, "No ammo to drop\n");
+            return;
+        }
+        {
+            let v = &mut self.entities[e].v;
+            v.ammo_shells -= drop[0];
+            v.ammo_nails -= drop[1];
+            v.ammo_rockets -= drop[2];
+            v.ammo_cells -= drop[3];
+        }
+        self.spawn_backpack(origin, Model::PROGS_BACKPACK, "ammo", 0.0, drop);
+        self.w_set_current_ammo(e);
+    }
+
+    /// `TossWeapon` (impulse 21) — drop your current weapon as a pickup for a teammate and switch to
+    /// your next-best weapon. The axe, single shotgun, and grapple stay put. Gated by `rtx_dropitems`.
+    pub(crate) fn toss_weapon(&mut self, e: EntId) {
+        if !self.host.cvar_bool(c"rtx_dropitems") || !self.is_live_player(e) {
+            return;
+        }
+        let weapon = self.entities[e].v.weapon;
+        if matches!(weapon, Weapon::None | Weapon::Axe | Weapon::Shotgun | Weapon::Grapple) {
+            return;
+        }
+        let item_bit = weapon.item();
+        let Some(spec) = weapon_spec(item_bit) else {
+            return;
+        };
+        let Some(model) = spec.pickup_model else {
+            return;
+        };
+        let netname = spec.backpack_name;
+        let origin = self.entities[e].v.origin;
+        {
+            let v = &mut self.entities[e].v;
+            v.items = v.items.without(item_bit);
+        }
+        self.spawn_backpack(origin, model, netname, weapon.as_f32(), [0.0; 4]);
+        self.entities[e].v.weapon = self.w_best_weapon(e);
+        self.w_set_current_ammo(e);
     }
 
     // --- ammo/weapon helpers ---
