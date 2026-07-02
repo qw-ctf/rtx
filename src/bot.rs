@@ -15,10 +15,11 @@
 
 use glam::{Vec3, Vec3Swizzles};
 
+use crate::bot_bhop;
 use crate::bot_combat;
 use crate::bot_grenade;
 use crate::defs::{Bits, Flags, Items, Solid, Weapon};
-use crate::entity::{BotState, EntId, Entity, HookPhase};
+use crate::entity::{BotState, EntId, Entity, GrenadePhase, HookPhase};
 use crate::game::{cstring, GameState};
 use crate::mode::BotIntent;
 use crate::navmesh::{CellId, LinkKind, NavGraph};
@@ -226,7 +227,8 @@ fn on_item(bot_origin: Vec3, item_origin: Vec3) -> bool {
 fn run_bot(game: &mut GameState, e: EntId) {
     let host = *game.host();
     let now = game.time();
-    let msec = ((game.globals.frametime * 1000.0) as i32).clamp(1, 100);
+    let frametime = game.globals.frametime;
+    let msec = ((frametime * 1000.0) as i32).clamp(1, 100);
 
     let origin = game.entities[e].v.origin;
     let v_angle = game.entities[e].v.v_angle;
@@ -238,6 +240,8 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // now, since the `&mut bot` binding below blocks reading the edict during the move logic.
     let vz = game.entities[e].v.velocity.z;
     let air_jumped = game.entities[e].combat.air_jumped;
+    let v_xy = game.entities[e].v.velocity.xy();
+    let speed = v_xy.length();
     // Snapshot grapple state up front (it's set in the previous frame's PlayerPreThink, so it's
     // stable across this bot frame) — lets the hook driver read it without re-borrowing the edict
     // while the `&mut bot` binding is live. `anchor` is meaningful only once `on_hook`.
@@ -497,6 +501,13 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // Advance past route legs we've already reached. A plat leg completes when we've *risen*
     // to the exit height (Z), not on XY arrival — we're standing still on the lift while it
     // carries us up, so XY barely changes.
+    // A bunnyhopping bot covers ground fast enough to orbit a 24u waypoint, so widen the arrival gate
+    // with speed and also advance once a waypoint slips *behind* the velocity.
+    let arrive_r = if bot.bhop {
+        ARRIVE_RADIUS.max(2.0 * speed * frametime)
+    } else {
+        ARRIVE_RADIUS
+    };
     while bot.route_pos < bot.route.len() {
         let leg = bot.route[bot.route_pos];
         let target = graph.cell_origin(graph.link_target(leg));
@@ -506,7 +517,10 @@ fn run_bot(game: &mut GameState, e: EntId) {
             // still at the *bottom* of the swing. The hook driver advances it only once the parabola
             // has landed (see below).
             LinkKind::Hook => false,
-            _ => (target.xy() - origin.xy()).length() <= ARRIVE_RADIUS,
+            _ => {
+                let to = target.xy() - origin.xy();
+                to.length() <= arrive_r || (bot.bhop && to.dot(v_xy) < 0.0 && to.length() <= 64.0)
+            }
         };
         if arrived {
             bot.route_pos += 1;
@@ -552,6 +566,34 @@ fn run_bot(game: &mut GameState, e: EntId) {
         bot.repath_time = now; // re-path next frame
         bot.stuck_since = now;
     }
+
+    // Bunnyhop policy: air-strafe to build speed only on an open, roughly-straight ground stretch
+    // toward a far waypoint, with no combat / hook / gate / grenade demanding the view or movement.
+    // Eligibility must hold briefly before engaging (so a momentary straightaway doesn't stutter the
+    // gait); disengaging is instant. See `bot_bhop`.
+    let goal_dist = (target_origin.xy() - origin.xy()).length();
+    let (runway_dist, runway_straight) = runway(graph, &bot.route, bot.route_pos, origin);
+    let bhop_eligible = host.cvar_bool(c"rtx_bot_bhop")
+        && enemy.is_none()
+        && !hook_active
+        && bot.gate.is_none()
+        && bot.grenade_phase == GrenadePhase::Idle
+        && !final_leg
+        && matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
+        && goal_dist > 300.0
+        && runway_straight
+        && runway_dist >= 256.0f32.max(speed * 0.9);
+    if bhop_eligible {
+        if bot.bhop_since == 0.0 {
+            bot.bhop_since = now;
+        }
+        bot.bhop = now - bot.bhop_since >= 0.3;
+    } else {
+        bot.bhop_since = 0.0;
+        bot.bhop = false;
+        bot.bhop_dir = 0.0;
+    }
+    let bhop_active = bot.bhop;
 
     // Steering: face the waypoint and run toward it.
     let to_wp = waypoint.xy() - origin.xy();
@@ -737,7 +779,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // released (airborne) before it'll fire again. Gating on ground state pulses it correctly,
     // so a jump that falls short is retried on the next landing instead of the bot getting
     // stuck holding +jump against a ledge.
-    if on_ground && (force_jump || matches!(kind, Some(LinkKind::JumpGap | LinkKind::DoubleJump))) {
+    if on_ground && (force_jump || bhop_active || matches!(kind, Some(LinkKind::JumpGap | LinkKind::DoubleJump))) {
         buttons |= BUTTON_JUMP;
     }
     // Mid-air (double) jump: rtx grants one air jump per air travel. On a double-jump leg, spend it
@@ -837,8 +879,9 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // lob→shoot combo; (3) a one-shot rocket **hazard shove** when the bot is already positioned for
     // it (cheaper than a lob); (4) otherwise start a grenade combo (hazard shove via a lobbed arc, or
     // a plain airburst). The hazard shove is the generic strategy — the knockback shoves regardless
-    // of which splash weapon delivers the blast.
-    if !hook_engaged {
+    // of which splash weapon delivers the blast. Skipped while bunnyhopping (no enemy, view is busy
+    // air-strafing).
+    if !hook_engaged && !bhop_active {
         let handled = bot_combat::grenade_tactics(
             game,
             e,
@@ -872,13 +915,60 @@ fn run_bot(game: &mut GameState, e: EntId) {
         }
     }
 
-    // Aim spring: drive the view toward `look` with a critically damped spring (position +
-    // angular-velocity state), so the aim moves like a mouse — fast proportional flicks that
-    // settle smoothly, never per-frame snaps. Stiffness scales with skill: low-skill bots swing
-    // onto targets visibly slower. The movement is then re-projected onto the smoothed view
-    // (orthonormal, so the world velocity — where the bot actually goes — is preserved exactly).
-    let view = {
-        let dt = game.globals.frametime.clamp(0.001, 0.05);
+    // View + move for the frame. Bunnyhopping bypasses the aim spring and the world-move reprojection
+    // entirely — an air-strafe needs the view yaw swept *independently* of the travel direction, with
+    // `forward = 0` and one strafe key held, which the reprojection can't express. Otherwise the
+    // normal aim spring smooths the view and the world move is projected onto it.
+    let (view, forward, side) = if bhop_active {
+        let dt = frametime.clamp(0.001, 0.05);
+        let accel = {
+            let a = host.cvar(c"sv_accelerate");
+            if a > 0.0 {
+                a
+            } else {
+                10.0
+            }
+        };
+        let maxspeed = {
+            let m = host.cvar(c"sv_maxspeed");
+            if m > 0.0 {
+                m
+            } else {
+                320.0
+            }
+        };
+        let a_max = bot_bhop::air_accel_max(accel, maxspeed, dt);
+        // Steer toward the look-ahead point (smoother than the 32u next cell).
+        let ahead = look_point.xy() - origin.xy();
+        let bearing = if ahead.length() > 8.0 {
+            ahead.y.atan2(ahead.x).to_degrees()
+        } else {
+            yaw
+        };
+        let (view_yaw, fwd, sd) = if on_ground {
+            (bearing, MOVE_SPEED as i32, 0) // ground frame between hops: run straight; jump pressed above
+        } else {
+            let prev_sigma = game.entities[e].bot.bhop_dir;
+            let s = bot_bhop::strafe(v_xy, bearing, prev_sigma, a_max);
+            game.entities[e].bot.bhop_dir = s.sigma;
+            (s.view_yaw, 0, s.side.round() as i32)
+        };
+        let view = Vec3::new(look.x, view_yaw, 0.0);
+        // Seed the aim spring so combat re-acquisition continues from the real view with a plausible
+        // turn rate (a human-like flick) instead of snapping.
+        let b = &mut game.entities[e].bot;
+        let yv = if b.bhop_prev_yaw == 0.0 {
+            0.0
+        } else {
+            (wrap180(view.y - b.bhop_prev_yaw) / dt).clamp(-720.0, 720.0)
+        };
+        b.bhop_prev_yaw = view.y;
+        b.aim = view;
+        b.aim_vel = Vec3::new(0.0, yv, 0.0);
+        (view, fwd, sd)
+    } else {
+        game.entities[e].bot.bhop_prev_yaw = 0.0; // forget the bhop yaw so the next engage seeds clean
+        let dt = frametime.clamp(0.001, 0.05);
         let skill = host.cvar(c"rtx_bot_skill").clamp(0.0, 7.0);
         // Spring stiffness (1/s): sluggish → pro-snappy. Shared with the combat feed-forward,
         // whose lag compensation assumes exactly this spring.
@@ -901,11 +991,14 @@ fn run_bot(game: &mut GameState, e: EntId) {
         let (yaw, yv) = spring(b.aim.y, b.aim_vel.y, look.y);
         b.aim = Vec3::new(pitch, yaw, 0.0);
         b.aim_vel = Vec3::new(pv, yv, 0.0);
-        b.aim
+        let view = b.aim;
+        let (vf, vr) = angle_vectors(view);
+        (
+            view,
+            vf.dot(move_world).round() as i32,
+            vr.dot(move_world).round() as i32,
+        )
     };
-    let (vf, vr) = angle_vectors(view);
-    let forward = vf.dot(move_world).round() as i32;
-    let side = vr.dot(move_world).round() as i32;
 
     // Hook fire, decided *after* the spring: the hook flies along `v_angle` (the smoothed view we're
     // about to send), so the throw must wait until that view has actually settled onto the anchor —
@@ -935,8 +1028,8 @@ fn run_bot(game: &mut GameState, e: EntId) {
         let route = game.entities[e].bot.route.len();
         let hph = game.entities[e].bot.hook_phase;
         host.conprint(&cstring(&format!(
-            "rtx bot{client}: enemy={} gate={gate:?} hook={hph:?} route={route} fwd={forward} side={side} \
-             atk={}\n",
+            "rtx bot{client}: enemy={} gate={gate:?} hook={hph:?} bhop={bhop_active} spd={speed:.0} \
+             route={route} fwd={forward} side={side} atk={}\n",
             enemy.is_some(),
             (buttons & BUTTON_ATTACK) != 0,
         )));
@@ -973,6 +1066,35 @@ fn button_reachable(graph: &NavGraph, from: CellId, gi: usize, gate_closed: &[bo
         Some(route) => !route.iter().any(|&leg| graph.gate_of_link(leg) == Some(gi)),
         None => false,
     }
+}
+
+/// How far, and whether, a bunnyhop runway extends from `route_pos`: sum the lengths of the leading
+/// `Walk`/`Step` legs while each stays within ~20° of the initial heading, stopping at the first
+/// turn, non-ground leg, or route end. Returns `(distance, has_a_straight_leg)`.
+fn runway(graph: &NavGraph, route: &[u32], route_pos: usize, origin: Vec3) -> (f32, bool) {
+    let Some(&first) = route.get(route_pos) else {
+        return (0.0, false);
+    };
+    let base = graph.cell_origin(graph.link_target(first)).xy() - origin.xy();
+    if base.length() < 1.0 {
+        return (0.0, false);
+    }
+    let base_yaw = base.y.atan2(base.x).to_degrees();
+    let (mut dist, mut prev, mut any) = (0.0, origin.xy(), false);
+    for &leg in &route[route_pos..] {
+        if !matches!(graph.link_kind(leg), LinkKind::Walk | LinkKind::Step) {
+            break;
+        }
+        let tgt = graph.cell_origin(graph.link_target(leg)).xy();
+        let seg = tgt - prev;
+        if seg.length() > 1.0 && wrap180(seg.y.atan2(seg.x).to_degrees() - base_yaw).abs() > 20.0 {
+            break; // the corridor turned — end of the straightaway
+        }
+        dist += seg.length();
+        prev = tgt;
+        any = true;
+    }
+    (dist, any)
 }
 
 /// The nearest living human player to bot `bot_e` (skips bots, spectators, and the dead).

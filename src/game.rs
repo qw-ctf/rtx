@@ -430,6 +430,8 @@ impl GameState {
 
         // Mid-air double jump, on by default (set `rtx_doublejump 0` to disable).
         self.host.cvar_default("rtx_doublejump", true);
+        // Bots bunnyhop (air-strafe to build speed) on open stretches; on by default.
+        self.host.cvar_default("rtx_bot_bhop", true);
 
         // Wall jump (kick off a wall you jump into), on by default (`rtx_walljump 0` to disable).
         self.host.cvar_default("rtx_walljump", true);

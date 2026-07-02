@@ -137,7 +137,11 @@ through the same player-move code as humans, so gravity, stepping, and jumps com
 
 In free-for-all each bot pathfinds to the best reachable **item pickup**, or **follows the nearest
 human** when nothing's worth fetching (through doors, off ledges, across jumps, recovering after a
-missed jump). When `rtx_doublejump` is on, the navmesh also links the **wider gaps and higher ledges
+missed jump). On open, roughly-straight stretches they **bunnyhop** (`rtx_bot_bhop`) — chaining jumps
+and **air-strafing** (sweeping the view while holding one strafe key) to exploit QuakeWorld's
+air-acceleration and build speed far past `sv_maxspeed`, weaving the heading toward the waypoint;
+they drop back to a normal gait for corners, ledges, combat, or the final approach to a goal. When
+`rtx_doublejump` is on, the navmesh also links the **wider gaps and higher ledges
 a double jump reaches** — the bot ground-jumps, then **air-jumps near the apex** to restack the arc
 and clear a gap a single jump can't (it also spends the air jump to recover an undershot ordinary
 jump). When `rtx_grapple` is on, the navmesh also grows **hook links** — edges a bot crosses

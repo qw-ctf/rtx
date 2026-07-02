@@ -20,6 +20,7 @@ mod anim;
 mod assets;
 mod bob;
 mod bot;
+mod bot_bhop;
 mod bot_combat;
 mod bot_goals;
 mod bot_grenade;
