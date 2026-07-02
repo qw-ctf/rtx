@@ -140,6 +140,10 @@ pub struct GameState {
     ext_fields: ext_field::ExtFields,
     /// Auto-generated navmesh for the current map (bot navigation). Rebuilt each map load.
     pub(crate) nav: navmesh::NavState,
+    /// Server time of the last engine **bot frame** (`GAME_START_FRAME` with `is_bot_frame`). The
+    /// engine only issues those once a real client is connected, so on an empty (bots-only) server
+    /// this goes stale and the normal frame drives the bots itself. See `start_frame`.
+    bot_frame_time: f32,
     /// Escape hatch for string-declared sounds (precache-and-intern at load time). Empty for the
     /// current port — every sound is a registry handle — but here so a runtime path is registered
     /// through the same precache-guaranteeing door. Use `dyn_assets.sound(&host, path)`.
@@ -194,6 +198,7 @@ impl GameState {
             rng: 0x2545_f491, // nonzero default; reseeded in GAME_INIT
             ext_fields: ext_field::ExtFields::default(),
             nav: navmesh::NavState::default(),
+            bot_frame_time: 0.0,
             dyn_assets: DynAssets::default(),
         }
     }
@@ -817,7 +822,14 @@ impl GameState {
             let mode = self.mode;
             mode.tick(self);
             bot::manage_population(self);
+            // The engine only issues bot frames (below) once a real client is connected. On an empty
+            // bots-only server those never arrive, so if we haven't seen one recently, drive the bots
+            // from this normal frame instead — otherwise they'd spawn and just stand there.
+            if self.time() - self.bot_frame_time > 0.25 {
+                bot::run_bots(self);
+            }
         } else {
+            self.bot_frame_time = self.time();
             bot::run_bots(self);
         }
         1
