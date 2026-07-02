@@ -50,7 +50,8 @@ Throw and reel speeds are tunable via `rtx_hook_speed` (default `1.25`) and `rtx
 
 It reels server-side too, so it shows the same one-frame prediction pop as the movement
 features above. The hook's models and viewmodel must be in the gamedir:
-`progs/{star,bit,v_star}.mdl`.
+`progs/{star,bit,v_star}.mdl`. Bots use it to navigate — see [Bots](#bots), where the navmesh grows
+hook links a bot swings across.
 
 ## Game modes
 
@@ -136,7 +137,14 @@ through the same player-move code as humans, so gravity, stepping, and jumps com
 
 In free-for-all each bot pathfinds to the best reachable **item pickup**, or **follows the nearest
 human** when nothing's worth fetching (through doors, off ledges, across jumps, recovering after a
-missed jump). The mode can redirect this brain without touching it: in **Rocket Arena** bots
+missed jump). When `rtx_grapple` is on, the navmesh also grows **hook links** — edges a bot crosses
+with the **grappling hook**: it throws the hook at an anchor, reels to build speed, then **releases
+mid-reel so the resulting velocity flings it along a parabola** onto a ledge or across a gap a plain
+jump can't reach (a straight pull-up is just the degenerate case). Because the arc is deterministic,
+the links are found and verified when the map's navmesh is built by simulating the swing against the
+BSP, and A* prices them as travel time — so bots take a hook only when it beats the ground route.
+This measurably widens where bots can go on vertical/CTF maps. The mode can redirect the brain
+without touching it: in **Rocket Arena** bots
 **fight** — they path to the nearest enemy and, once they have line of sight, aim (leading the
 target for rockets), pick a weapon by range, strafe/retreat, and fire — and, when eliminated, roam
 the audience like everyone else. The combat layer (`src/bot_combat.rs`) is generic and reused by

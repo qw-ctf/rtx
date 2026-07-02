@@ -237,6 +237,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // stable across this bot frame) — lets the hook driver read it without re-borrowing the edict
     // while the `&mut bot` binding is live. `anchor` is meaningful only once `on_hook`.
     let grapple_hook = EntId(game.entities[e].grapple.hook);
+    let has_grapple = game.entities[e].v.items.has(Items::GRAPPLE);
     let hook_out = game.entities[e].grapple.hook_out;
     let on_hook = game.entities[e].grapple.on_hook;
     let anchor = if hook_out {
@@ -593,10 +594,14 @@ fn run_bot(game: &mut GameState, e: EntId) {
                 bot.hook_phase = HookPhase::Idle;
             } else {
                 if bot.hook_phase == HookPhase::Idle {
-                    bot.hook_phase = HookPhase::Aim;
-                    bot.hook_link = leg;
-                    bot.hook_started = now;
-                    bot.hook_release_dist = tr.release_dist;
+                    if !has_grapple {
+                        hook_failed = true; // no hook to fly this leg (a mode stripped it)
+                    } else {
+                        bot.hook_phase = HookPhase::Aim;
+                        bot.hook_link = leg;
+                        bot.hook_started = now;
+                        bot.hook_release_dist = tr.release_dist;
+                    }
                 }
                 match bot.hook_phase {
                     HookPhase::Aim => {
