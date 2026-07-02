@@ -167,6 +167,14 @@ switch to a hitscan gun, and detonate in flight. With no hazard the grenade comb
 airburst. All of it is safety-checked — never self-splash, never a
 teammate, never a shove the wrong way, never a lob into a wall.
 
+They also throw **indirect bank shots** at enemies with **no line of sight**: a solver simulates a
+bouncing grenade against the map's collision hull (a real `SV_RecursiveHullCheck` trace, reflecting
+off surface normals with QuakeWorld's `MOVETYPE_BOUNCE` physics), searching launch angles for one
+whose ricochet path reaches the hidden enemy — then lobs it and lets the **2.5 s fuse** detonate it
+around the corner (a launch-jitter robustness sweep rejects knife-edge angles the throw's spread
+would spoil). It's gated to stay honest and rare — a recently-seen, slow target and higher bot skill
+— with flag carriers worth a blind lob past the throttle.
+
 ## Map rotation
 
 Set **`rtx_maplist`** to a whitespace-separated list of maps and the server cycles through them **in

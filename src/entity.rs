@@ -599,6 +599,9 @@ pub struct BotState {
     pub grenade_look: Vec3,
     /// The lobbed grenade entity once captured (`0` = not yet in flight / none).
     pub grenade_ent: u32,
+    /// This combo is a no-line-of-sight **bank shot** — detonate on the fuse, not by shooting the
+    /// grenade (which the bot can't see). See `bot_grenade::try_start_bank`.
+    pub grenade_bank: bool,
     /// Desired shove direction (unit, horizontal) when the combo is a hazard shove; `ZERO` for a
     /// plain airburst.
     pub grenade_shove_dir: Vec3,

@@ -37,6 +37,10 @@ const SHOVE_OFFSET: f32 = 72.0;
 /// Combo restart throttles: after a failed/aborted attempt, and after a completed one.
 const COMBO_COOLDOWN: f32 = 4.0;
 const COMBO_DONE_COOLDOWN: f32 = 1.5;
+/// Bank-shot restart throttles — longer, so a blind lob that found no path isn't re-attempted every
+/// few seconds.
+const BANK_COOLDOWN: f32 = 6.0;
+const BANK_DONE_COOLDOWN: f32 = 3.0;
 /// Give up a windup / an uncaptured lob after these.
 const WINDUP_TIMEOUT: f32 = 1.2;
 const CAPTURE_TIMEOUT: f32 = 0.3;
@@ -128,6 +132,181 @@ pub(crate) fn shove_reaches(e_center: Vec3, e_origin: Vec3, b: Vec3, shove_dir: 
         horiz.length() * 0.25
     };
     reach > edge_dist + 16.0
+}
+
+// --- multi-bounce bank shots (indirect fire, no line of sight) ---
+
+/// Backoff of a `MOVETYPE_BOUNCE` reflection — the stock QuakeWorld `ClipVelocity` factor. It's an
+/// energy-losing over-reflection off the surface, **not** a 2.0 mirror.
+const BOUNCE_BACKOFF: f32 = 1.5;
+/// Below this speed on a floor (`n.z > 0.7`) the grenade comes to rest.
+const BOUNCE_REST_SPEED: f32 = 60.0;
+/// Cap the bounces we bother simulating.
+const BOUNCE_MAX: u8 = 8;
+/// A pass this close to the enemy centre counts as a touch (bbox ±16 xy, grenade small) — the
+/// grenade would explode on them.
+const BANK_TOUCH: f32 = 32.0;
+/// Fuse/rest detonation within this of the enemy is a "good" bank (≈ half the 160 blast radius, so
+/// the splash still bites through the sim's hull/spread slop).
+const BANK_GOOD: f32 = 90.0;
+/// The robustness sweep (launch jitter) must still land within this.
+const BANK_TOL: f32 = 140.0;
+
+/// Reflect a velocity off a surface normal with the grenade bounce backoff (`v − 1.5·(v·n)·n`).
+fn bounce_velocity(v: Vec3, n: Vec3) -> Vec3 {
+    v - BOUNCE_BACKOFF * v.dot(n) * n
+}
+
+/// Distance from point `p` to the segment `a→b`.
+fn point_seg_dist(p: Vec3, a: Vec3, b: Vec3) -> f32 {
+    let ab = b - a;
+    let len2 = ab.length_squared();
+    let t = if len2 < 1e-6 {
+        0.0
+    } else {
+        ((p - a).dot(ab) / len2).clamp(0.0, 1.0)
+    };
+    (a + ab * t - p).length()
+}
+
+/// The outcome of simulating a bouncing grenade thrown at `v0` from `p0`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BounceSim {
+    /// Where and when it detonates (a touch, a rest, or the 2.5 s fuse).
+    pub det_pos: Vec3,
+    pub det_time: f32,
+    /// It passed through the (moving) enemy — an early touch explosion.
+    pub hit_enemy: bool,
+    pub bounces: u8,
+    /// Closest the path came back to the thrower's own origin after leaving (`INF` if it never did).
+    pub self_return: f32,
+    /// Distance of the first bounce from the thrower (`INF` if it never bounced).
+    pub first_bounce: f32,
+}
+
+/// Simulate a `MOVETYPE_BOUNCE` grenade: integrate the parabola, bounce off world geometry via the
+/// `trace` oracle (reflecting with [`bounce_velocity`]), and detonate on touching the (moving) enemy
+/// or on the fuse/rest — modelling `SV_Physics_Bounce` + `grenade_touch`. Pure over the oracles, so
+/// it's unit-testable with a synthetic world. `enemy_at(t)` gives the led enemy position at time `t`.
+pub(crate) fn simulate_bounce(
+    trace: &impl Fn(Vec3, Vec3) -> crate::bsp::HullTrace,
+    p0: Vec3,
+    v0: Vec3,
+    gravity: f32,
+    enemy_at: &impl Fn(f32) -> Vec3,
+) -> BounceSim {
+    let (mut p, mut v, mut t) = (p0, v0, 0.0f32);
+    let mut bounces = 0u8;
+    let mut self_return = f32::INFINITY;
+    let mut first_bounce = f32::INFINITY;
+    let mut det: Option<(Vec3, f32, bool)> = None;
+
+    while t < GL_FUSE {
+        let dt = (16.0 / v.length().max(1.0)).min(0.02);
+        v.z -= gravity * dt; // SV_AddGravity before the move
+        let target = p + v * dt;
+        let tr = trace(p, target);
+        let seg_end = if tr.fraction < 1.0 { tr.endpos } else { target };
+
+        let e = enemy_at(t);
+        if t > 0.3 {
+            self_return = self_return.min(point_seg_dist(p0, p, seg_end));
+        }
+        if point_seg_dist(e, p, seg_end) < BANK_TOUCH {
+            det = Some((seg_end, t, true)); // explodes on the enemy
+            break;
+        }
+
+        if tr.fraction < 1.0 {
+            if first_bounce.is_infinite() {
+                first_bounce = (tr.endpos - p0).length();
+            }
+            p = tr.endpos + tr.plane_normal * 0.25; // nudge off the surface
+            v = bounce_velocity(v, tr.plane_normal);
+            bounces += 1;
+            t += tr.fraction * dt;
+            if tr.plane_normal.z > 0.7 && v.length() < BOUNCE_REST_SPEED {
+                det = Some((p, GL_FUSE, false)); // rests on the floor; fuse blows it there
+                break;
+            }
+            if bounces > BOUNCE_MAX {
+                det = Some((p, t, false));
+                break;
+            }
+        } else {
+            p = target;
+            t += dt;
+        }
+    }
+    let (det_pos, det_time, hit_enemy) = det.unwrap_or((p, GL_FUSE, false));
+    BounceSim {
+        det_pos,
+        det_time,
+        hit_enemy,
+        bounces,
+        self_return,
+        first_bounce,
+    }
+}
+
+/// A solved bank shot: the view to lob along, and where it detonates.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BankShot {
+    pub look: Vec3,
+    pub det_pos: Vec3,
+}
+
+/// Search launch angles for a bouncing lob that reaches an out-of-sight enemy. Samples a fan of
+/// yaws around the bearing and a few lofts, simulates each, and picks the one that detonates closest
+/// to the (led) enemy — preferring a direct touch, then fewer bounces. A robustness sweep rejects
+/// knife-edge angles the ±10 u launch spread would spoil. `None` if nothing gets close.
+pub(crate) fn solve_bank(
+    trace: &impl Fn(Vec3, Vec3) -> crate::bsp::HullTrace,
+    p0: Vec3,
+    e_org: Vec3,
+    e_vel: Vec3,
+    gravity: f32,
+) -> Option<BankShot> {
+    let bearing = (e_org - p0).xy();
+    let base_yaw = bearing.y.atan2(bearing.x).to_degrees();
+    let enemy_at = |t: f32| e_org + e_vel * t.min(1.0);
+
+    let mut best: Option<(f32, BankShot)> = None;
+    for dyaw in [0.0f32, 15.0, -15.0, 30.0, -30.0, 45.0, -45.0] {
+        for pitch in [-40.0f32, -25.0, -10.0, 5.0] {
+            let view = Vec3::new(pitch, base_yaw + dyaw, 0.0);
+            let sim = simulate_bounce(trace, p0, launch_velocity(view), gravity, &enemy_at);
+            let det_dist = (enemy_at(sim.det_time) - sim.det_pos).length();
+            if !(sim.hit_enemy || det_dist < BANK_GOOD) {
+                continue;
+            }
+            // Don't bank into our own feet or ricochet back past ourselves.
+            if sim.self_return < 160.0 || sim.first_bounce < 64.0 {
+                continue;
+            }
+            let score = (if sim.hit_enemy { 0.0 } else { det_dist }) + sim.bounces as f32 * 20.0 + sim.det_time * 5.0;
+            if best.is_none_or(|(bs, _)| score < bs) {
+                best = Some((
+                    score,
+                    BankShot {
+                        look: view,
+                        det_pos: sim.det_pos,
+                    },
+                ));
+            }
+        }
+    }
+    let (_, shot) = best?;
+    // Launch-jitter robustness: the winner must survive small angle perturbations.
+    for (dp, dy) in [(1.5f32, 0.0f32), (-1.5, 0.0), (0.0, 1.5), (0.0, -1.5)] {
+        let view = Vec3::new(shot.look.x + dp, shot.look.y + dy, 0.0);
+        let sim = simulate_bounce(trace, p0, launch_velocity(view), gravity, &enemy_at);
+        let dd = (enemy_at(sim.det_time) - sim.det_pos).length();
+        if !(sim.hit_enemy || dd < BANK_TOL) {
+            return None;
+        }
+    }
+    Some(shot)
 }
 
 // --- blast knockback ---
@@ -254,6 +433,7 @@ fn combo_reset(game: &mut GameState, e: EntId, next_try: f32) {
     let b = &mut game.entities[e].bot;
     b.grenade_phase = GrenadePhase::Idle;
     b.grenade_ent = 0;
+    b.grenade_bank = false;
     b.grenade_next_try = next_try;
 }
 
@@ -356,18 +536,25 @@ fn try_start(game: &mut GameState, e: EntId, en: EntId, origin: Vec3, now: f32) 
     if !items.has(Items::GRENADE_LAUNCHER) || ammo_rockets < 1.0 || health < 50.0 {
         return;
     }
-    if hitscan_choice(game, e).is_none() {
-        return; // need a gun to detonate with
-    }
     let e_org = game.entities[en].v.origin;
     let dist = (e_org - origin).length();
     if !(LOB_MIN_RANGE..=LOB_MAX_RANGE).contains(&dist) {
         return;
     }
-    // The shove only works on a grounded, walking target (knockback needs `movetype == Walk`).
+    // The lob shove / airburst wants a grounded, walking target (knockback needs `movetype == Walk`,
+    // and the enemy must stay put for the arc).
     let en_grounded = game.entities[en].v.flags.has(Flags::ONGROUND);
-    if game.entities[en].v.movetype != MoveType::Walk || !en_grounded || !los_to(game, e, en) {
+    if game.entities[en].v.movetype != MoveType::Walk || !en_grounded {
         return;
+    }
+    // No line of sight → this is a job for an indirect **bank shot** (fuse-detonated), not the
+    // LOS-required lob→shoot combo.
+    if !los_to(game, e, en) {
+        try_start_bank(game, e, en, origin, now);
+        return;
+    }
+    if hitscan_choice(game, e).is_none() {
+        return; // the LOS combo needs a gun to detonate with (a bank shot uses the fuse)
     }
     let my_team = game.entities[e].arena.team;
     let e_feet = e_org - Vec3::new(0.0, 0.0, 24.0);
@@ -441,6 +628,62 @@ fn try_start(game: &mut GameState, e: EntId, en: EntId, origin: Vec3, now: f32) 
     b.grenade_shove_dir = shove_dir;
     b.grenade_shove_edge = shove_edge;
     b.grenade_ent = 0;
+    b.grenade_bank = false;
+}
+
+/// Try to start an indirect **bank shot** at an out-of-sight enemy (Idle → Windup): search the
+/// bouncing-grenade solver for a lob that banks off geometry to reach them, and if one exists, aim
+/// it. Detonation is left to the fuse (the bot can't see the grenade to shoot it). Gated to keep it
+/// honest and rare: a fresh belief in the enemy's position, a slow target, higher skill, and a real
+/// solution — flag carriers bypass the frequency throttle as a persistent threat worth a blind lob.
+fn try_start_bank(game: &mut GameState, e: EntId, en: EntId, origin: Vec3, now: f32) {
+    let host = *game.host();
+    if host.cvar(c"rtx_bot_skill") < 4.0 || game.nav.bsp.is_none() {
+        return;
+    }
+    let e_org = game.entities[en].v.origin;
+    let e_vel = game.entities[en].v.velocity;
+    if e_vel.xy().length() > 120.0 {
+        combo_reset(game, e, now + BANK_COOLDOWN); // too mobile to predict over a ~2s flight
+        return;
+    }
+    // Only bank at a position we actually saw recently — don't lob blindly at a stale origin.
+    let seen = game.entities[e].bot.enemy_seen_time;
+    if seen <= 0.0 || now - seen > 3.0 {
+        combo_reset(game, e, now + BANK_COOLDOWN);
+        return;
+    }
+    // Season it in: an occasional attempt, unless the enemy carries a flag (worth a blind grenade).
+    let carrier = game.entities[en].arena.carrying != 0;
+    if !carrier && (now * 5.0 + e.0 as f32).sin() < 0.7 {
+        return;
+    }
+    let gravity = host.cvar(c"sv_gravity").max(1.0);
+    let shot = {
+        let Some(bsp) = game.nav.bsp.as_ref() else {
+            return;
+        };
+        let trace = |a: Vec3, b: Vec3| bsp.hull1_trace(a, b);
+        solve_bank(&trace, origin, e_org, e_vel, gravity)
+    };
+    let Some(shot) = shot else {
+        combo_reset(game, e, now + BANK_COOLDOWN);
+        return;
+    };
+    let my_team = game.entities[e].arena.team;
+    if teammate_in_blast(game, e, my_team, shot.det_pos) {
+        combo_reset(game, e, now + BANK_COOLDOWN);
+        return;
+    }
+    let b = &mut game.entities[e].bot;
+    b.grenade_phase = GrenadePhase::Windup;
+    b.grenade_started = now;
+    b.grenade_target = shot.det_pos;
+    b.grenade_look = shot.look;
+    b.grenade_shove_dir = Vec3::ZERO;
+    b.grenade_shove_edge = 0.0;
+    b.grenade_ent = 0;
+    b.grenade_bank = true;
 }
 
 /// Select the GL, aim the lob, and fire once the smoothed view is on it (Windup → Lobbed).
@@ -493,7 +736,16 @@ fn lobbed(game: &mut GameState, e: EntId, origin: Vec3, now: f32, look: &mut Vec
     }
     let g = EntId(game.entities[e].bot.grenade_ent);
     if !grenade_live(game, g) {
-        combo_reset(game, e, now + COMBO_DONE_COOLDOWN); // already went off (touch) — done
+        combo_reset(game, e, now + COMBO_DONE_COOLDOWN); // already went off (touch/fuse) — done
+        return;
+    }
+    // Bank shot: no line of sight to the grenade, so don't switch to a detonator or yank the view at
+    // an unseen wall — just let the fuse blow it near the enemy. Navigation/combat keep the bot
+    // moving (often back toward line of sight) while it burns. A backstop reset covers a lost track.
+    if game.entities[e].bot.grenade_bank {
+        if now - game.entities[e].bot.grenade_started > GL_FUSE + 0.5 {
+            combo_reset(game, e, now + BANK_DONE_COOLDOWN);
+        }
         return;
     }
     // Keep requesting the detonator every frame — the switch impulse is swallowed until the GL's
@@ -778,6 +1030,109 @@ mod tests {
             predict_shove(v_center, v_origin, Vec3::new(-400.0, 0.0, 4.0)).length(),
             0.0
         );
+    }
+
+    #[test]
+    fn bounce_backoff_is_one_and_a_half() {
+        // Straight down onto a floor (n = +z): vz reverses to −0.5·vz_in (the 1.5-not-2.0 pitfall).
+        let out = bounce_velocity(Vec3::new(30.0, 0.0, -100.0), Vec3::new(0.0, 0.0, 1.0));
+        assert!((out.z - 50.0).abs() < 0.01, "vz {}", out.z);
+        assert!((out.x - 30.0).abs() < 0.01, "tangential x preserved"); // no change along the surface
+    }
+
+    // A trace oracle for an infinite floor at z = 0 (solid below), open above.
+    fn floor_trace(a: Vec3, b: Vec3) -> crate::bsp::HullTrace {
+        use crate::bsp::HullTrace;
+        if b.z >= 0.0 {
+            return HullTrace {
+                fraction: 1.0,
+                endpos: b,
+                plane_normal: Vec3::ZERO,
+                start_solid: false,
+                all_solid: false,
+            };
+        }
+        let f = if (a.z - b.z).abs() < 1e-6 {
+            0.0
+        } else {
+            (a.z / (a.z - b.z)).clamp(0.0, 1.0)
+        };
+        HullTrace {
+            fraction: f,
+            endpos: a + (b - a) * f,
+            plane_normal: Vec3::new(0.0, 0.0, 1.0),
+            start_solid: a.z < 0.0,
+            all_solid: false,
+        }
+    }
+
+    #[test]
+    fn bounce_fuse_in_open_matches_closed_form() {
+        // No geometry → the grenade flies free and blows on the 2.5 s fuse at the parabola position.
+        let open = |_: Vec3, b: Vec3| crate::bsp::HullTrace {
+            fraction: 1.0,
+            endpos: b,
+            plane_normal: Vec3::ZERO,
+            start_solid: false,
+            all_solid: false,
+        };
+        let far = |_: f32| Vec3::new(100000.0, 0.0, 0.0); // enemy elsewhere, never touched
+        let p0 = Vec3::ZERO;
+        let v0 = launch_velocity(Vec3::new(-30.0, 0.0, 0.0));
+        let sim = simulate_bounce(&open, p0, v0, G, &far);
+        assert!(!sim.hit_enemy);
+        assert!((sim.det_time - GL_FUSE).abs() < 0.03, "det_time {}", sim.det_time);
+        let t = GL_FUSE;
+        let want = p0 + v0 * t - Vec3::new(0.0, 0.0, 0.5 * G * t * t);
+        // Semi-implicit Euler (matching the engine's SV_Physics_Toss) drifts ~20u from the
+        // continuous parabola over the full fuse — inside the blast's slop, and the same scheme the
+        // engine uses, so the sim tracks the real grenade rather than the ideal one.
+        assert!(
+            (sim.det_pos - want).length() < 40.0,
+            "det_pos {:?} want {want:?}",
+            sim.det_pos
+        );
+    }
+
+    #[test]
+    fn bounce_touches_enemy_on_the_path() {
+        // Enemy standing in the flat throw's path → an early touch detonation before the fuse.
+        let open = |_: Vec3, b: Vec3| crate::bsp::HullTrace {
+            fraction: 1.0,
+            endpos: b,
+            plane_normal: Vec3::ZERO,
+            start_solid: false,
+            all_solid: false,
+        };
+        let v0 = launch_velocity(Vec3::new(18.435, 0.0, 0.0)); // level launch (elevation 0) along +x
+                                                               // Enemy ~120u ahead, at the height the level throw has fallen to there → the path passes
+                                                               // right through them.
+        let enemy = |_: f32| Vec3::new(120.0, 0.0, 45.0);
+        let sim = simulate_bounce(&open, Vec3::new(0.0, 0.0, 60.0), v0, G, &enemy);
+        assert!(sim.hit_enemy, "should touch the enemy");
+        assert!(sim.det_time < GL_FUSE);
+    }
+
+    #[test]
+    fn solve_bank_open_space_and_out_of_range() {
+        // In the open a "bank" degenerates to a direct arc onto the enemy → a solution exists.
+        let sim = solve_bank(
+            &floor_trace,
+            Vec3::new(0.0, 0.0, 40.0),
+            Vec3::new(300.0, 0.0, 40.0),
+            Vec3::ZERO,
+            G,
+        );
+        assert!(sim.is_some(), "should find a lob onto a reachable enemy");
+        // Far out of grenade range → nothing lands close.
+        let none = solve_bank(
+            &floor_trace,
+            Vec3::new(0.0, 0.0, 40.0),
+            Vec3::new(1500.0, 0.0, 40.0),
+            Vec3::ZERO,
+            G,
+        );
+        assert!(none.is_none());
     }
 
     #[test]
