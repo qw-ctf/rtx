@@ -13,15 +13,53 @@ impl GameState {
         if self.intermission_running {
             return;
         }
-        // Prefer a serverinfo `nextmap`, else replay the current level.
-        let mut buf = [0u8; 64];
-        let nextmap = self.host.infokey(EntId::WORLD, c"nextmap", &mut buf).to_owned();
-        self.level.nextmap = if nextmap.is_empty() {
-            self.level.mapname.clone()
+        // A configured rotation (`rtx_maplist`) wins; else a serverinfo `nextmap`; else replay.
+        self.level.nextmap = if let Some(m) = self.queued_next_map() {
+            m
         } else {
-            nextmap
+            let mut buf = [0u8; 64];
+            let nextmap = self.host.infokey(EntId::WORLD, c"nextmap", &mut buf).to_owned();
+            if nextmap.is_empty() {
+                self.level.mapname.clone()
+            } else {
+                nextmap
+            }
         };
         self.execute_changelevel();
+    }
+
+    /// The next map in the configured rotation — `rtx_maplist` is a whitespace-separated list of map
+    /// names, cycled after the current map. `None` when no list is set (the stock `nextmap`/replay
+    /// behaviour then applies). If the current map isn't in the list, the rotation starts at its
+    /// first entry.
+    pub(crate) fn queued_next_map(&self) -> Option<String> {
+        // Match the engine's own `set` ceiling (`MAX_COM_TOKEN`/config-line = 1024) so we never read
+        // less of the list than a config could set — ~80-100 map names, far more than any rotation.
+        let mut buf = [0u8; 1024];
+        let list = self.host.cvar_string(c"rtx_maplist", &mut buf);
+        let maps: Vec<&str> = list.split_whitespace().collect();
+        if maps.is_empty() {
+            return None;
+        }
+        let cur = self.level.mapname.as_str();
+        let next = match maps.iter().position(|&m| m == cur) {
+            Some(i) => maps[(i + 1) % maps.len()],
+            None => maps[0],
+        };
+        Some(next.to_owned())
+    }
+
+    /// Per-frame rotation driver: once the intermission scoreboard has been shown for its pause,
+    /// advance to the next map **without** waiting for a player button press — but only when a
+    /// rotation (`rtx_maplist`) is configured, so the stock button-to-advance intermission is
+    /// unchanged otherwise. Called each server frame from `start_frame`.
+    pub(crate) fn map_queue_frame(&mut self) {
+        if !self.intermission_running || self.time() < self.intermission_exit_time {
+            return;
+        }
+        if self.queued_next_map().is_some() {
+            self.goto_next_map();
+        }
     }
 
     /// `FindIntermission` — the camera entity for the scoreboard view.

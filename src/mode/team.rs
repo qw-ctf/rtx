@@ -79,6 +79,8 @@ pub(crate) struct MatchState {
     /// countdown. Distinguishes a match-start reload (preserve state) from any other map change
     /// (fresh warmup).
     pub resuming: bool,
+    /// World time the match ends on `timelimit` (`0` = no time limit). Set when the round goes Live.
+    pub live_until: f32,
 }
 
 /// The team-match mode descriptor. Stateless — the config/lifecycle live in [`MatchState`].
@@ -124,11 +126,14 @@ impl GameMode for TeamMatch {
                     }
                 }
                 if now >= until {
-                    // Go live on a clean slate: zero every player's frags and the team scores.
+                    // Go live on a clean slate: zero every player's frags and the team scores, and
+                    // arm the time limit (`timelimit` is in seconds; 0 = none).
                     for e in players(g) {
                         g.entities[e].v.frags = 0.0;
                     }
                     g.team_match.scores = vec![0; g.team_match.config.teams];
+                    let tl = g.level.timelimit;
+                    g.team_match.live_until = if tl > 0 { now + tl as f32 } else { 0.0 };
                     g.team_match.phase = MatchPhase::Live;
                     centerprint_all(g, "FIGHT!");
                 }
@@ -144,14 +149,21 @@ impl GameMode for TeamMatch {
                 }
                 g.team_match.scores = scores.clone();
                 let fl = g.level.fraglimit;
-                if fl != 0 && scores.iter().any(|&s| s >= fl) {
+                let time_up = g.team_match.live_until > 0.0 && now >= g.team_match.live_until;
+                if (fl != 0 && scores.iter().any(|&s| s >= fl)) || time_up {
                     self.end_match(g, now);
                 }
             }
             MatchPhase::Ended { until } => {
                 if now >= until {
-                    g.team_match.phase = MatchPhase::Warmup;
-                    g.team_match.roster.clear();
+                    // Rotate to the next map in the queue if one is configured; otherwise loop back
+                    // to warmup on the same map for another `start`.
+                    if g.queued_next_map().is_some() {
+                        g.next_level();
+                    } else {
+                        g.team_match.phase = MatchPhase::Warmup;
+                        g.team_match.roster.clear();
+                    }
                 }
             }
         }

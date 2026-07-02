@@ -12,6 +12,12 @@ use crate::mode::ArenaState;
 pub fn worldspawn(game: &mut GameState) {
     let host = *game.host();
 
+    // A fresh level clears any intermission carried over from the changelevel that brought us here
+    // (`intermission_running` lives on the process-lifetime GameState) — otherwise the new map would
+    // start frozen in the scoreboard view, and a map rotation would re-cycle instantly.
+    game.intermission_running = false;
+    game.intermission_exit_time = 0.0;
+
     // worldtype was parked in the world entity's skin during field parsing.
     game.level.worldtype = game.ent(EntId::WORLD).v.skin;
 

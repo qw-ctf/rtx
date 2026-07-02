@@ -123,6 +123,21 @@ any mode that hands a bot an enemy. A bot's view **lerps** toward its target ang
 snapping, so it turns naturally when spectated; both the turn/track speed and aim tightness scale
 with `rtx_bot_skill` (a low-skill bot visibly swings onto a target more slowly).
 
+## Map rotation
+
+Set **`rtx_maplist`** to a whitespace-separated list of maps and the server cycles through them **in
+order** each time a level ends (on `timelimit`/`fraglimit`, or when a team match finishes):
+
+```
+set rtx_maplist "dm2 dm3 dm4 dm6 aerowalk"
+```
+
+The next map is the one after the current map in the list (wrapping around; if the current map isn't
+listed, the rotation starts at the first entry). It takes precedence over a serverinfo `nextmap`.
+When a list is configured the end-of-level intermission scoreboard **auto-advances** after its pause
+instead of waiting for a player to press a button; with no list set, the stock behaviour is
+unchanged. Leave `rtx_maplist` empty (the default) to disable rotation.
+
 ## Building
 
 ```sh

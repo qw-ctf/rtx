@@ -751,6 +751,8 @@ impl GameState {
     fn start_frame(&mut self, _level_time: i32, is_bot_frame: i32) -> isize {
         if is_bot_frame == 0 {
             world::start_frame(self);
+            // Auto-advance a configured map rotation past the intermission scoreboard.
+            self.map_queue_frame();
             // Drive the active mode's per-frame state machine (round countdown/fight/reset).
             let mode = self.mode;
             mode.tick(self);
