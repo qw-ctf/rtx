@@ -314,9 +314,215 @@ pub(crate) fn engage(
     }
 }
 
+// --- shootable-grenade tactics -----------------------------------------------------------------
+
+/// Grenade blast: damage at the centre and the radius over which it falls off (`grenade_explode`
+/// deals 120 over `damage + 40` units; see `combat.rs::t_radius_damage`).
+const GRENADE_BLAST_DAMAGE: f32 = 120.0;
+const GRENADE_BLAST_RADIUS: f32 = 160.0;
+/// How near a grenade must be for a bot to notice it at all.
+const GRENADE_AWARE: f32 = 320.0;
+/// Never shoot a grenade closer than this — detonating it point-blank is worse than the threat.
+const GRENADE_MIN_SHOOT: f32 = 100.0;
+/// Only shoot a grenade to disarm/airburst it if the splash we'd eat is at most this share of our
+/// health — a low-health bot only detonates ones already outside its own blast, a healthy one will
+/// trade a little splash for the disarm (the "far enough vs health" call).
+const GRENADE_SHOOT_HEALTH_FRAC: f32 = 0.5;
+
+/// Splash a blast at `dist` from its centre would deal to a player (linear falloff to the radius).
+fn blast_self_damage(dist: f32) -> f32 {
+    if dist < GRENADE_BLAST_RADIUS {
+        (GRENADE_BLAST_DAMAGE - 0.5 * dist).max(0.0)
+    } else {
+        0.0
+    }
+}
+
+/// The best hitscan weapon the bot owns and can feed, for detonating a grenade precisely: the
+/// lightning beam first (a continuous line, most reliable on the 8u hit radius), then the shotguns.
+fn hitscan_choice(g: &GameState, e: EntId) -> Option<(i32, Weapon)> {
+    let v = &g.entities[e].v;
+    if v.items.has(Items::LIGHTNING) && v.ammo_cells >= 1.0 {
+        Some((8, Weapon::Lightning))
+    } else if v.items.has(Items::SUPER_SHOTGUN) && v.ammo_shells >= 2.0 {
+        Some((3, Weapon::SuperShotgun))
+    } else if v.items.has(Items::SHOTGUN) && v.ammo_shells >= 1.0 {
+        Some((2, Weapon::Shotgun))
+    } else {
+        None
+    }
+}
+
+/// Whether a living teammate (other than `e`) stands within a blast at `pos` — so we don't detonate
+/// a grenade on our own side. Always false in non-team play (`my_team == 0`).
+fn teammate_in_blast(g: &GameState, e: EntId, my_team: u8, pos: Vec3) -> bool {
+    if my_team == 0 {
+        return false;
+    }
+    let maxclients = g.host().cvar(c"maxclients") as i32;
+    (1..=maxclients as u32).map(EntId).any(|p| {
+        let ent = &g.entities[p];
+        p != e
+            && ent.in_use
+            && ent.classname() == Some("player")
+            && ent.v.health > 0.0
+            && ent.arena.team == my_team
+            && (ent.v.origin - pos).length() < GRENADE_BLAST_RADIUS
+    })
+}
+
+/// Whether the bot has a clear line to the grenade's centre (so a shot could actually reach it).
+fn can_hit_grenade(game: &mut GameState, e: EntId, grenade: EntId) -> bool {
+    let from = game.entities[e].v.origin + VEC_VIEW_OFS;
+    let to = game.entities[grenade].v.origin;
+    let tr = game.traceline(from, to, false, e);
+    tr.fraction > 0.9 || tr.ent == grenade
+}
+
+/// Aim at a grenade and fire a hitscan shot to detonate it; select the gun first if needed. Returns
+/// `false` (didn't commit) if the bot has no usable hitscan weapon. The shot leaves along the
+/// *smoothed* view, so it fires only once that view has swung onto the grenade (and the gun is in
+/// hand), matching how `engage` gates its shots.
+fn shoot_grenade(
+    game: &mut GameState,
+    e: EntId,
+    grenade: EntId,
+    look: &mut Vec3,
+    buttons: &mut i32,
+    impulse: &mut i32,
+) -> bool {
+    let Some((imp, weapon)) = hitscan_choice(game, e) else {
+        return false;
+    };
+    let eye = game.entities[e].v.origin + VEC_VIEW_OFS;
+    let gpos = game.entities[grenade].v.origin;
+    *look = angles_to(eye, gpos);
+    if game.entities[e].v.weapon != weapon {
+        *impulse = imp; // switching takes a frame; fire once we hold it
+        return true;
+    }
+    // The detonation line check accepts a shot passing within 8u of the grenade — convert that to an
+    // angular tolerance at this range so the bot fires as soon as its aim is close enough to connect.
+    let dist = (gpos - eye).length().max(1.0);
+    let cone = (8.0 / dist).atan().to_degrees().clamp(1.5, 5.0);
+    let view = game.entities[e].bot.aim;
+    let dp = bot::wrap180(view.x - look.x);
+    let dy = bot::wrap180(view.y - look.y);
+    if view == Vec3::ZERO || (dp * dp + dy * dy).sqrt() <= cone {
+        *buttons |= BUTTON_ATTACK;
+    }
+    true
+}
+
+/// React to live shootable grenades, overlaid *after* [`engage`]. Two uses of the blast's area of
+/// effect, both weighed against our own splash so we never blow ourselves up:
+///
+/// - **Defensive** — the nearest enemy grenade that's within (or heading into) our blast. If we can
+///   detonate it at a safe distance (the splash we'd take is a small share of our health) we shoot
+///   it down; if it's too close for that, we **run and hop away** instead.
+/// - **Offensive** — a grenade sitting on the current enemy (and clear of our teammates): a free
+///   airburst, shot from outside its blast.
+///
+/// Everything routes through the normal usercmd (`look`/`move_world`/`buttons`/`impulse`); the shot
+/// detonates the grenade through the engine's `shootable_grenade_on_line`/`t_damage` path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn grenade_tactics(
+    game: &mut GameState,
+    e: EntId,
+    enemy: Option<EntId>,
+    origin: Vec3,
+    look: &mut Vec3,
+    move_world: &mut Vec3,
+    buttons: &mut i32,
+    impulse: &mut i32,
+) {
+    if !game.host().cvar_bool(c"rtx_shootable_grenades") {
+        return; // grenades aren't hittable (and are point-size), so there's nothing to exploit
+    }
+    let live: Vec<EntId> = game
+        .entities
+        .iter()
+        .enumerate()
+        .filter(|(_, ent)| ent.classname() == Some("grenade") && ent.in_use && ent.combat.voided == 0.0)
+        .map(|(i, _)| EntId(i as u32))
+        .collect();
+    if live.is_empty() {
+        return;
+    }
+    let my_team = game.entities[e].arena.team;
+    let health = game.entities[e].v.health.max(1.0);
+
+    // Nearest threatening enemy grenade (defence), and the nearest grenade sitting on our enemy that
+    // we can safely detonate (offence).
+    let mut threat: Option<(EntId, f32)> = None; // (grenade, dist to us)
+    let mut offense: Option<(EntId, f32)> = None;
+    for grenade in live {
+        let gpos = game.entities[grenade].v.origin;
+        let gvel = game.entities[grenade].v.velocity;
+        let d = (gpos - origin).length();
+        if d > GRENADE_AWARE {
+            continue;
+        }
+        let owner = game.entities[grenade].owner();
+        let ally = owner == e || (my_team != 0 && owner.is_some() && game.entities[owner].arena.team == my_team);
+        if !ally {
+            // A threat if it's already within our splash, or approaching us from range.
+            let approaching = (origin - gpos).dot(gvel) > 0.0;
+            if (d < GRENADE_BLAST_RADIUS + 40.0 || approaching) && threat.is_none_or(|(_, bd)| d < bd) {
+                threat = Some((grenade, d));
+            }
+        }
+        if let Some(en) = enemy {
+            let on_enemy = (game.entities[en].v.origin - gpos).length() < GRENADE_BLAST_RADIUS;
+            if on_enemy
+                && blast_self_damage(d) <= health * GRENADE_SHOOT_HEALTH_FRAC
+                && !teammate_in_blast(game, e, my_team, gpos)
+                && offense.is_none_or(|(_, bd)| d < bd)
+            {
+                offense = Some((grenade, d));
+            }
+        }
+    }
+
+    // Defence takes priority — survival first.
+    if let Some((grenade, d)) = threat {
+        let safe_to_shoot = d >= GRENADE_MIN_SHOOT && blast_self_damage(d) <= health * GRENADE_SHOOT_HEALTH_FRAC;
+        if safe_to_shoot && can_hit_grenade(game, e, grenade) && shoot_grenade(game, e, grenade, look, buttons, impulse)
+        {
+            return;
+        }
+        // Too close (or no clear shot / no hitscan gun): run directly away and hop off the ground —
+        // put distance between us and the blast rather than setting it off in our face.
+        let gpos = game.entities[grenade].v.origin;
+        let away = Vec3::new(origin.x - gpos.x, origin.y - gpos.y, 0.0).normalize_or_zero();
+        *move_world = away * MOVE_SPEED;
+        if game.entities[e].v.flags.has(Flags::ONGROUND) {
+            *buttons |= BUTTON_JUMP;
+        }
+        return;
+    }
+
+    // Offence: airburst a grenade sitting on the enemy.
+    if let Some((grenade, _)) = offense {
+        if can_hit_grenade(game, e, grenade) {
+            shoot_grenade(game, e, grenade, look, buttons, impulse);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Blast falloff: full damage at the centre, tapering to zero at the radius, matching
+    /// `t_radius_damage`'s `120 - 0.5·dist`.
+    #[test]
+    fn grenade_blast_falloff() {
+        assert_eq!(blast_self_damage(0.0), 120.0);
+        assert_eq!(blast_self_damage(160.0), 0.0); // past the radius
+        assert!((blast_self_damage(140.0) - 50.0).abs() < 0.01);
+        assert_eq!(blast_self_damage(400.0), 0.0);
+    }
 
     #[test]
     fn intercept_leads_perpendicular_motion() {

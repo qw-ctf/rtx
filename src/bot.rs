@@ -812,6 +812,22 @@ fn run_bot(game: &mut GameState, e: EntId) {
         );
     }
 
+    // Shootable-grenade overlay: react to live grenades — detonate one on the enemy for an airburst,
+    // shoot down an incoming one at a safe range, or run/hop clear of one too close to safely pop.
+    // Runs after `engage` so it can override its aim/movement, and only when not flying a hook leg.
+    if !hook_engaged {
+        bot_combat::grenade_tactics(
+            game,
+            e,
+            enemy,
+            origin,
+            &mut look,
+            &mut move_world,
+            &mut buttons,
+            &mut impulse,
+        );
+    }
+
     // Aim spring: drive the view toward `look` with a critically damped spring (position +
     // angular-velocity state), so the aim moves like a mouse — fast proportional flicks that
     // settle smoothly, never per-frame snaps. Stiffness scales with skill: low-skill bots swing

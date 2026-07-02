@@ -152,6 +152,12 @@ any mode that hands a bot an enemy. A bot's view **lerps** toward its target ang
 snapping, so it turns naturally when spectated; both the turn/track speed and aim tightness scale
 with `rtx_bot_skill` (a low-skill bot visibly swings onto a target more slowly).
 
+Bots also play the **shootable-grenade** game (above): they detonate a grenade sitting on an enemy
+for a free **airburst**, and shoot down an **incoming** grenade — but only from outside its blast,
+and weighed against their own health (the closer the grenade, the more health it takes to justify
+setting it off). A grenade too close to safely pop makes the bot **run and hop clear** instead of
+detonating it in its own face.
+
 ## Map rotation
 
 Set **`rtx_maplist`** to a whitespace-separated list of maps and the server cycles through them **in
