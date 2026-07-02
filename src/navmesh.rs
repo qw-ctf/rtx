@@ -1066,8 +1066,8 @@ fn simulate_arc(is_solid: impl Fn(Vec3) -> bool, r: Vec3, v0: Vec3, gravity: f32
 }
 
 /// Fly a release from `r` and report where it lands (descending onto floor), or `None` if it's
-/// blocked or never lands.
-fn arc_land(bsp: &Bsp, r: Vec3, v0: Vec3, gravity: f32) -> Option<(Vec3, f32, f32)> {
+/// blocked or never lands. Also used by the bot grenade-lob solver to verify an arc's clearance.
+pub(crate) fn arc_land(bsp: &Bsp, r: Vec3, v0: Vec3, gravity: f32) -> Option<(Vec3, f32, f32)> {
     match simulate_arc(|p| bsp.is_solid(p), r, v0, gravity) {
         ArcResult::Land { pos, airtime, vz } => Some((pos, airtime, vz)),
         _ => None,

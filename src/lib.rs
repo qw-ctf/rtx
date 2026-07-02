@@ -22,6 +22,7 @@ mod bob;
 mod bot;
 mod bot_combat;
 mod bot_goals;
+mod bot_grenade;
 mod bsp;
 mod buttons;
 mod client;

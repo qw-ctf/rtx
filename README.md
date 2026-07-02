@@ -152,11 +152,17 @@ any mode that hands a bot an enemy. A bot's view **lerps** toward its target ang
 snapping, so it turns naturally when spectated; both the turn/track speed and aim tightness scale
 with `rtx_bot_skill` (a low-skill bot visibly swings onto a target more slowly).
 
-Bots also play the **shootable-grenade** game (above): they detonate a grenade sitting on an enemy
-for a free **airburst**, and shoot down an **incoming** grenade — but only from outside its blast,
-and weighed against their own health (the closer the grenade, the more health it takes to justify
-setting it off). A grenade too close to safely pop makes the bot **run and hop clear** instead of
-detonating it in its own face.
+Bots also play the **shootable-grenade** game (above). Defensively they shoot down an **incoming**
+grenade — but only from outside its blast, weighed against their own health (the closer it is, the
+more health it takes to justify setting it off) — and a grenade too close to safely pop makes them
+**run and hop clear** instead of detonating it in their own face. Offensively they **lob** grenades
+and chain **lob→shoot combos**: a bot aims a ballistic arc (solved from the launcher's fixed
+speed/loft against gravity), lobs a grenade, switches to a hitscan gun, and detonates it in flight.
+The marquee use is **position manipulation** — if an enemy stands near **lava, slime, a pit or a
+ledge**, the bot lobs behind them and pops the grenade so the outward blast **knockback shoves them
+into the hazard** (it verifies the shove actually carries them across the edge before committing);
+otherwise it's a plain airburst. All of it is safety-checked — never self-splash, never a teammate,
+never a shove the wrong way, never a lob into a wall.
 
 ## Map rotation
 

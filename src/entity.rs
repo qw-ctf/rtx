@@ -588,6 +588,38 @@ pub struct BotState {
     pub hook_prev_dist: f32,
     /// Consecutive failed hook attempts toward the current goal — two in a row abandons the goal.
     pub hook_fails: u8,
+    /// Grenade lob→shoot combo state machine (see `bot_grenade`): aim a lobbed grenade, then
+    /// detonate it to airburst an enemy or shove them into a hazard.
+    pub grenade_phase: GrenadePhase,
+    /// When the current combo phase began (per-phase timeout base; becomes the fuse clock once the
+    /// grenade is fired).
+    pub grenade_started: f32,
+    /// The blast point the lob targets, and the solved view angles to lob it there.
+    pub grenade_target: Vec3,
+    pub grenade_look: Vec3,
+    /// The lobbed grenade entity once captured (`0` = not yet in flight / none).
+    pub grenade_ent: u32,
+    /// Desired shove direction (unit, horizontal) when the combo is a hazard shove; `ZERO` for a
+    /// plain airburst.
+    pub grenade_shove_dir: Vec3,
+    /// Distance from the enemy to the hazard edge — the shove must carry them at least this far.
+    pub grenade_shove_edge: f32,
+    /// Earliest time the bot may start another combo (anti-spam).
+    pub grenade_next_try: f32,
+}
+
+/// Phase of a bot's grenade lob→shoot combo. `Idle` unless a combo is in progress.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GrenadePhase {
+    /// Not running a combo.
+    #[default]
+    Idle,
+    /// Grenade launcher selected, settling the view onto the lob angles before firing.
+    Windup,
+    /// Grenade in the air; switching to a detonator and tracking it.
+    Lobbed,
+    /// Detonator in hand; shoot the grenade the instant its blast lands the enemy where we want.
+    Detonate,
 }
 
 /// Phase of a bot's grappling-hook traversal. `Idle` unless the current route leg is a hook link.

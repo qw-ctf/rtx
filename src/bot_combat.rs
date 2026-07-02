@@ -140,7 +140,7 @@ fn intercept_time(r: Vec3, v: Vec3, s: f32) -> Option<f32> {
 }
 
 /// View angles (pitch, yaw, 0) from `eye` toward `point`.
-fn angles_to(eye: Vec3, point: Vec3) -> Vec3 {
+pub(crate) fn angles_to(eye: Vec3, point: Vec3) -> Vec3 {
     let d = point - eye;
     let yaw = d.y.atan2(d.x).to_degrees();
     let pitch = -d.z.atan2(d.xy().length().max(1.0)).to_degrees();
@@ -319,18 +319,18 @@ pub(crate) fn engage(
 /// Grenade blast: damage at the centre and the radius over which it falls off (`grenade_explode`
 /// deals 120 over `damage + 40` units; see `combat.rs::t_radius_damage`).
 const GRENADE_BLAST_DAMAGE: f32 = 120.0;
-const GRENADE_BLAST_RADIUS: f32 = 160.0;
+pub(crate) const GRENADE_BLAST_RADIUS: f32 = 160.0;
 /// How near a grenade must be for a bot to notice it at all.
 const GRENADE_AWARE: f32 = 320.0;
 /// Never shoot a grenade closer than this — detonating it point-blank is worse than the threat.
-const GRENADE_MIN_SHOOT: f32 = 100.0;
+pub(crate) const GRENADE_MIN_SHOOT: f32 = 100.0;
 /// Only shoot a grenade to disarm/airburst it if the splash we'd eat is at most this share of our
 /// health — a low-health bot only detonates ones already outside its own blast, a healthy one will
 /// trade a little splash for the disarm (the "far enough vs health" call).
-const GRENADE_SHOOT_HEALTH_FRAC: f32 = 0.5;
+pub(crate) const GRENADE_SHOOT_HEALTH_FRAC: f32 = 0.5;
 
 /// Splash a blast at `dist` from its centre would deal to a player (linear falloff to the radius).
-fn blast_self_damage(dist: f32) -> f32 {
+pub(crate) fn blast_self_damage(dist: f32) -> f32 {
     if dist < GRENADE_BLAST_RADIUS {
         (GRENADE_BLAST_DAMAGE - 0.5 * dist).max(0.0)
     } else {
@@ -340,7 +340,7 @@ fn blast_self_damage(dist: f32) -> f32 {
 
 /// The best hitscan weapon the bot owns and can feed, for detonating a grenade precisely: the
 /// lightning beam first (a continuous line, most reliable on the 8u hit radius), then the shotguns.
-fn hitscan_choice(g: &GameState, e: EntId) -> Option<(i32, Weapon)> {
+pub(crate) fn hitscan_choice(g: &GameState, e: EntId) -> Option<(i32, Weapon)> {
     let v = &g.entities[e].v;
     if v.items.has(Items::LIGHTNING) && v.ammo_cells >= 1.0 {
         Some((8, Weapon::Lightning))
@@ -355,7 +355,7 @@ fn hitscan_choice(g: &GameState, e: EntId) -> Option<(i32, Weapon)> {
 
 /// Whether a living teammate (other than `e`) stands within a blast at `pos` — so we don't detonate
 /// a grenade on our own side. Always false in non-team play (`my_team == 0`).
-fn teammate_in_blast(g: &GameState, e: EntId, my_team: u8, pos: Vec3) -> bool {
+pub(crate) fn teammate_in_blast(g: &GameState, e: EntId, my_team: u8, pos: Vec3) -> bool {
     if my_team == 0 {
         return false;
     }
@@ -372,7 +372,7 @@ fn teammate_in_blast(g: &GameState, e: EntId, my_team: u8, pos: Vec3) -> bool {
 }
 
 /// Whether the bot has a clear line to the grenade's centre (so a shot could actually reach it).
-fn can_hit_grenade(game: &mut GameState, e: EntId, grenade: EntId) -> bool {
+pub(crate) fn can_hit_grenade(game: &mut GameState, e: EntId, grenade: EntId) -> bool {
     let from = game.entities[e].v.origin + VEC_VIEW_OFS;
     let to = game.entities[grenade].v.origin;
     let tr = game.traceline(from, to, false, e);
@@ -383,7 +383,7 @@ fn can_hit_grenade(game: &mut GameState, e: EntId, grenade: EntId) -> bool {
 /// `false` (didn't commit) if the bot has no usable hitscan weapon. The shot leaves along the
 /// *smoothed* view, so it fires only once that view has swung onto the grenade (and the gun is in
 /// hand), matching how `engage` gates its shots.
-fn shoot_grenade(
+pub(crate) fn shoot_grenade(
     game: &mut GameState,
     e: EntId,
     grenade: EntId,
@@ -435,9 +435,9 @@ pub(crate) fn grenade_tactics(
     move_world: &mut Vec3,
     buttons: &mut i32,
     impulse: &mut i32,
-) {
+) -> bool {
     if !game.host().cvar_bool(c"rtx_shootable_grenades") {
-        return; // grenades aren't hittable (and are point-size), so there's nothing to exploit
+        return false; // grenades aren't hittable (and are point-size), so there's nothing to exploit
     }
     let live: Vec<EntId> = game
         .entities
@@ -447,10 +447,14 @@ pub(crate) fn grenade_tactics(
         .map(|(i, _)| EntId(i as u32))
         .collect();
     if live.is_empty() {
-        return;
+        return false;
     }
     let my_team = game.entities[e].arena.team;
     let health = game.entities[e].v.health.max(1.0);
+    // A grenade this bot is running as a lob→shoot combo (see `bot_grenade`): don't let the
+    // opportunistic offence below detonate it early — that would blow it *short* of the enemy and
+    // shove them the wrong way. The combo driver detonates it at the right moment itself.
+    let combo_grenade = game.entities[e].bot.grenade_ent;
 
     // Nearest threatening enemy grenade (defence), and the nearest grenade sitting on our enemy that
     // we can safely detonate (offence).
@@ -474,7 +478,8 @@ pub(crate) fn grenade_tactics(
         }
         if let Some(en) = enemy {
             let on_enemy = (game.entities[en].v.origin - gpos).length() < GRENADE_BLAST_RADIUS;
-            if on_enemy
+            if grenade.0 != combo_grenade
+                && on_enemy
                 && blast_self_damage(d) <= health * GRENADE_SHOOT_HEALTH_FRAC
                 && !teammate_in_blast(game, e, my_team, gpos)
                 && offense.is_none_or(|(_, bd)| d < bd)
@@ -489,7 +494,7 @@ pub(crate) fn grenade_tactics(
         let safe_to_shoot = d >= GRENADE_MIN_SHOOT && blast_self_damage(d) <= health * GRENADE_SHOOT_HEALTH_FRAC;
         if safe_to_shoot && can_hit_grenade(game, e, grenade) && shoot_grenade(game, e, grenade, look, buttons, impulse)
         {
-            return;
+            return true;
         }
         // Too close (or no clear shot / no hitscan gun): run directly away and hop off the ground —
         // put distance between us and the blast rather than setting it off in our face.
@@ -499,7 +504,7 @@ pub(crate) fn grenade_tactics(
         if game.entities[e].v.flags.has(Flags::ONGROUND) {
             *buttons |= BUTTON_JUMP;
         }
-        return;
+        return true;
     }
 
     // Offence: airburst a grenade sitting on the enemy.
@@ -508,6 +513,7 @@ pub(crate) fn grenade_tactics(
             shoot_grenade(game, e, grenade, look, buttons, impulse);
         }
     }
+    false
 }
 
 #[cfg(test)]

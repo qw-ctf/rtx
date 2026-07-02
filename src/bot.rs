@@ -16,6 +16,7 @@
 use glam::{Vec3, Vec3Swizzles};
 
 use crate::bot_combat;
+use crate::bot_grenade;
 use crate::defs::{Bits, Flags, Items, Solid, Weapon};
 use crate::entity::{BotState, EntId, Entity, HookPhase};
 use crate::game::{cstring, GameState};
@@ -812,11 +813,13 @@ fn run_bot(game: &mut GameState, e: EntId) {
         );
     }
 
-    // Shootable-grenade overlay: react to live grenades — detonate one on the enemy for an airburst,
-    // shoot down an incoming one at a safe range, or run/hop clear of one too close to safely pop.
-    // Runs after `engage` so it can override its aim/movement, and only when not flying a hook leg.
+    // Shootable-grenade overlays: first react to live grenades — shoot down an incoming one at a
+    // safe range, run/hop clear of one too close, or detonate one already on the enemy. If that
+    // defensive/opportunistic pass handled the frame it wins; otherwise run the proactive lob→shoot
+    // combo (lob a grenade and detonate it to airburst the enemy or shove them into a hazard). Both
+    // run after `engage` so they override its aim/movement, and only when not flying a hook leg.
     if !hook_engaged {
-        bot_combat::grenade_tactics(
+        let handled = bot_combat::grenade_tactics(
             game,
             e,
             enemy,
@@ -826,6 +829,22 @@ fn run_bot(game: &mut GameState, e: EntId) {
             &mut buttons,
             &mut impulse,
         );
+        if handled {
+            game.entities[e].bot.grenade_phase = crate::entity::GrenadePhase::Idle;
+        // defence drops a stale combo
+        } else {
+            bot_grenade::grenade_combo(
+                game,
+                e,
+                enemy,
+                origin,
+                now,
+                &mut look,
+                &mut move_world,
+                &mut buttons,
+                &mut impulse,
+            );
+        }
     }
 
     // Aim spring: drive the view toward `look` with a critically damped spring (position +

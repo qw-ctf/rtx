@@ -1,0 +1,704 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+//! Bot grenade play — proactively **lobbing** grenades and chaining **lob→shoot combos**, using the
+//! blast's knockback both for airburst damage and to **shove opponents into hazards** (lava, slime,
+//! pits, ledges). It layers on top of [`crate::bot_combat`]: the combat overlay handles the direct
+//! gunfight; this module decides when a grenade is the better play, aims the arc, then detonates it
+//! at the moment its blast pushes the enemy where the bot wants them.
+//!
+//! Everything routes through the usercmd (`look`/`move_world`/`buttons`/`impulse`) like the rest of
+//! the bot code — the module never fires a weapon directly. The ballistic and knockback math is
+//! factored into pure functions (unit-tested) so the engine coupling is pinned down and verifiable
+//! offline; the stateful combo driver reads the world and drives those.
+
+use glam::{Vec3, Vec3Swizzles};
+
+use crate::bot;
+use crate::bot_combat::{
+    self, blast_self_damage, can_hit_grenade, hitscan_choice, shoot_grenade, teammate_in_blast, GRENADE_MIN_SHOOT,
+    GRENADE_SHOOT_HEALTH_FRAC,
+};
+use crate::defs::{Bits, Content, Flags, Items, MoveType, Weapon, VEC_VIEW_OFS};
+use crate::entity::{EntId, GrenadePhase};
+use crate::game::GameState;
+
+const BUTTON_ATTACK: i32 = 1;
+const MOVE_SPEED: f32 = 800.0;
+/// Impulse that selects the grenade launcher.
+const GL_IMPULSE: i32 = 6;
+/// Range band in which a lob combo makes sense (closer = fight; farther = out of GL range).
+const LOB_MIN_RANGE: f32 = 200.0;
+const LOB_MAX_RANGE: f32 = 500.0;
+/// Accepted miss of the simulated lob arc vs. the target, for the clearance check.
+const LOB_LAND_TOL: f32 = 48.0;
+/// Blast offset behind the enemy (toward the near side, away from the hazard) so the outward
+/// knockback drives them into it.
+const SHOVE_OFFSET: f32 = 72.0;
+/// Combo restart throttles: after a failed/aborted attempt, and after a completed one.
+const COMBO_COOLDOWN: f32 = 4.0;
+const COMBO_DONE_COOLDOWN: f32 = 1.5;
+/// Give up a windup / an uncaptured lob after these.
+const WINDUP_TIMEOUT: f32 = 1.2;
+const CAPTURE_TIMEOUT: f32 = 0.3;
+/// Throw once the smoothed view is within this many degrees of the lob solution.
+const LOB_AIM_TOL: f32 = 2.5;
+
+// --- grenade launcher physics (mirrors `w_fire_grenade`, weapons.rs) ---
+
+/// Grenade launch speed: `|(600 forward, 200 up)| = √(600² + 200²)`.
+const GL_SPEED: f32 = 632.455_5;
+/// Fixed loft of the launch above the view-forward direction: `atan2(200, 600)`.
+const GL_LOFT_DEG: f32 = 18.434_95;
+/// Grenade fuse (seconds) before it self-detonates.
+pub(crate) const GL_FUSE: f32 = 2.5;
+/// The whole arc must land in less than this, leaving time to switch to a detonator and shoot
+/// (the GL's own 0.6 s cooldown swallows the switch impulse first).
+const LOB_MAX_FLIGHT: f32 = GL_FUSE - 0.8;
+
+/// QuakeWorld `AngleVectors` (roll 0): the view's forward, right, and up unit vectors. Matches the
+/// engine's `makevectors`, which is what `w_fire_grenade` uses to orient the launch.
+fn view_vectors(angles: Vec3) -> (Vec3, Vec3, Vec3) {
+    let (sp, cp) = angles.x.to_radians().sin_cos();
+    let (sy, cy) = angles.y.to_radians().sin_cos();
+    let forward = Vec3::new(cp * cy, cp * sy, -sp);
+    let right = Vec3::new(sy, -cy, 0.0);
+    let up = Vec3::new(sp * cy, sp * sy, cp);
+    (forward, right, up)
+}
+
+/// The grenade launch velocity for a given view — `600·forward + 200·up`, exactly as
+/// `w_fire_grenade` builds it (minus the ±10 u random spread). Fixed magnitude [`GL_SPEED`] at
+/// [`GL_LOFT_DEG`] above the view-forward.
+pub(crate) fn launch_velocity(view: Vec3) -> Vec3 {
+    let (forward, _right, up) = view_vectors(view);
+    forward * 600.0 + up * 200.0
+}
+
+/// Solve the view angles that lob a grenade from `p0` (the player origin — grenades spawn there) to
+/// land at `b`, given the fixed launch speed `s` and gravity `g`. Because the launch sits a fixed
+/// [`GL_LOFT_DEG`] above the view-forward, the view pitch is `loft − φ` where `φ` is the ballistic
+/// launch elevation. `high` picks the lofted arc (clears walls) over the flat one (faster, harder to
+/// dodge). Returns the `(look, flight_time)`; `None` when out of range or the arc takes too long.
+pub(crate) fn solve_lob(p0: Vec3, b: Vec3, s: f32, g: f32, high: bool) -> Option<(Vec3, f32)> {
+    let to = b - p0;
+    let r = to.xy().length();
+    if r < 1.0 {
+        return None; // straight up/down — not a lob
+    }
+    let dz = to.z;
+    let s2 = s * s;
+    // tanφ = (s² ± √(s⁴ − g(gR² + 2·dz·s²))) / (gR); minus = flat arc, plus = lofted.
+    let disc = s2 * s2 - g * (g * r * r + 2.0 * dz * s2);
+    if disc < 0.0 {
+        return None; // out of range
+    }
+    let root = disc.sqrt();
+    let tan_phi = if high {
+        (s2 + root) / (g * r)
+    } else {
+        (s2 - root) / (g * r)
+    };
+    let phi = tan_phi.atan(); // launch elevation (radians)
+    let flight = r / (s * phi.cos()).max(1.0);
+    if flight > LOB_MAX_FLIGHT {
+        return None;
+    }
+    let mut pitch = GL_LOFT_DEG - phi.to_degrees();
+    if pitch == 0.0 {
+        pitch = -0.01; // v_angle.x == 0 takes a different velocity branch in w_fire_grenade
+    }
+    let yaw = to.y.atan2(to.x).to_degrees();
+    Some((Vec3::new(pitch.clamp(-80.0, 80.0), yaw, 0.0), flight))
+}
+
+/// Estimate whether the knockback from a blast at `b` actually carries the enemy across the hazard
+/// edge: the shove impulse's horizontal reach (grounded slide ≈ `0.25·|v_xy|`, or the airborne carry
+/// when launched) must exceed `edge_dist`, and it must point along `shove_dir`. This is what turns a
+/// "push roughly toward the lava" into a committed "they land in it".
+pub(crate) fn shove_reaches(e_center: Vec3, e_origin: Vec3, b: Vec3, shove_dir: Vec3, edge_dist: f32) -> bool {
+    let imp = predict_shove(e_center, e_origin, b);
+    let horiz = imp.xy();
+    if horiz.normalize_or_zero().dot(shove_dir.xy().normalize_or_zero()) < 0.6 {
+        return false;
+    }
+    // Airborne launch carries much farther than a ground slide; approximate both conservatively.
+    let reach = if imp.z > 150.0 {
+        horiz.length() * 0.5
+    } else {
+        horiz.length() * 0.25
+    };
+    reach > edge_dist + 16.0
+}
+
+// --- blast knockback ---
+
+/// The velocity impulse a grenade blast at `b` imparts to a victim (origin `v_origin`, bbox centre
+/// `v_center`): `8 · max(0, 120 − 0.5·dist) · normalize(v_origin − b)` — purely outward from the
+/// blast (`t_damage`'s knockback, combat.rs). A blast placed *below and behind* the victim (toward
+/// the far side from a hazard) therefore pushes them up-and-over toward it.
+pub(crate) fn predict_shove(v_center: Vec3, v_origin: Vec3, b: Vec3) -> Vec3 {
+    let points = (120.0 - 0.5 * (b - v_center).length()).max(0.0);
+    (v_origin - b).normalize_or_zero() * points * 8.0
+}
+
+// --- hazard detection (shove targets) ---
+
+/// The eight compass directions probed around an enemy for a shoveable hazard.
+const HAZARD_DIRS: [(f32, f32); 8] = [
+    (1.0, 0.0),
+    (0.707, 0.707),
+    (0.0, 1.0),
+    (-0.707, 0.707),
+    (-1.0, 0.0),
+    (-0.707, -0.707),
+    (0.0, -1.0),
+    (0.707, -0.707),
+];
+/// Distances out from the enemy sampled for a hazard edge.
+const HAZARD_RADII: [f32; 3] = [48.0, 96.0, 144.0];
+/// A downward drop past this counts as a lethal/harmful fall to shove someone off (2·SAFE_FALL).
+const HAZARD_DROP: f32 = 176.0;
+/// How far down to look for a floor before calling it a pit.
+const HAZARD_PROBE_DEPTH: f32 = 320.0;
+
+/// What kind of hazard a direction leads to. Ordered by how much a bot should prefer to shove there.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HazardKind {
+    Slime,
+    Pit, // a lethal/harmful fall (ledge or bottomless)
+    Lava,
+}
+
+impl HazardKind {
+    fn rank(self) -> u8 {
+        match self {
+            HazardKind::Lava => 3,
+            HazardKind::Pit => 2,
+            HazardKind::Slime => 1,
+        }
+    }
+}
+
+/// A shove opportunity near an enemy: the horizontal direction to push them, how far the hazard edge
+/// is, and what it is.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Hazard {
+    pub dir: Vec3,
+    pub edge_dist: f32,
+    pub kind: HazardKind,
+}
+
+/// Classify what's below `p` by marching down: lava/slime (from `contents`) or a big drop / pit
+/// (from `is_solid`). `None` if solid ground sits close below (no hazard).
+fn hazard_below(is_solid: &impl Fn(Vec3) -> bool, contents: &impl Fn(Vec3) -> f32, p: Vec3) -> Option<HazardKind> {
+    let mut d = 0.0;
+    while d <= HAZARD_PROBE_DEPTH {
+        let q = p - Vec3::new(0.0, 0.0, d);
+        let c = contents(q);
+        if c == Content::Lava.as_f32() {
+            return Some(HazardKind::Lava);
+        }
+        if c == Content::Slime.as_f32() {
+            return Some(HazardKind::Slime);
+        }
+        if is_solid(q) {
+            return (d > HAZARD_DROP).then_some(HazardKind::Pit);
+        }
+        d += 24.0;
+    }
+    Some(HazardKind::Pit) // no floor within reach — bottomless
+}
+
+/// Find the best hazard to shove an enemy (at `e_feet`) into: probe a ring of directions/distances,
+/// classify each by what lies below (liquids via `contents`, drops via `is_solid`), and require a
+/// clear horizontal path to it (a railing/wall between blocks the shove). Pure over the two oracles.
+pub(crate) fn find_hazard(
+    is_solid: &impl Fn(Vec3) -> bool,
+    contents: &impl Fn(Vec3) -> f32,
+    e_feet: Vec3,
+) -> Option<Hazard> {
+    let mut best: Option<Hazard> = None;
+    for (dx, dy) in HAZARD_DIRS {
+        let dir = Vec3::new(dx, dy, 0.0);
+        for r in HAZARD_RADII {
+            let p = e_feet + dir * r + Vec3::new(0.0, 0.0, 8.0);
+            // Reachable? The horizontal lane from the enemy out to the sample must be clear.
+            let start = e_feet + dir * 24.0 + Vec3::new(0.0, 0.0, 8.0);
+            let steps = ((p - start).length() / 16.0).ceil().max(1.0) as i32;
+            let clear = (0..=steps).all(|i| !is_solid(start.lerp(p, i as f32 / steps as f32)));
+            if !clear {
+                break; // walled off in this direction — try the next
+            }
+            if let Some(kind) = hazard_below(is_solid, contents, p) {
+                let cand = Hazard {
+                    dir,
+                    edge_dist: r,
+                    kind,
+                };
+                let better = best
+                    .is_none_or(|b| kind.rank() > b.kind.rank() || (kind.rank() == b.kind.rank() && r < b.edge_dist));
+                if better {
+                    best = Some(cand);
+                }
+                break; // found the near edge in this direction
+            }
+        }
+    }
+    best
+}
+
+// --- the combo driver (stateful; reads the world) ---
+
+/// Reset the combo and set a restart cooldown.
+fn combo_reset(game: &mut GameState, e: EntId, next_try: f32) {
+    let b = &mut game.entities[e].bot;
+    b.grenade_phase = GrenadePhase::Idle;
+    b.grenade_ent = 0;
+    b.grenade_next_try = next_try;
+}
+
+/// A player's bbox centre (where radius damage/knockback are measured).
+fn player_center(game: &GameState, p: EntId) -> Vec3 {
+    let v = &game.entities[p].v;
+    v.origin + (v.mins + v.maxs) * 0.5
+}
+
+/// Clear line from our eye to `target`'s eye.
+fn los_to(game: &mut GameState, e: EntId, target: EntId) -> bool {
+    let from = game.entities[e].v.origin + VEC_VIEW_OFS;
+    let to = game.entities[target].v.origin + VEC_VIEW_OFS;
+    let tr = game.traceline(from, to, false, e);
+    tr.ent == target || tr.fraction > 0.95
+}
+
+/// Whether a grenade entity is still live (in flight, not yet detonated).
+fn grenade_live(game: &GameState, g: EntId) -> bool {
+    let ent = &game.entities[g];
+    ent.in_use && ent.classname() == Some("grenade") && ent.combat.voided == 0.0
+}
+
+/// Find the bot's own just-fired grenade — a live grenade it owns, near its origin.
+fn own_live_grenade(game: &GameState, e: EntId, origin: Vec3) -> Option<EntId> {
+    game.entities
+        .iter()
+        .enumerate()
+        .filter(|(_, ent)| ent.classname() == Some("grenade") && ent.in_use && ent.combat.voided == 0.0)
+        .map(|(i, _)| EntId(i as u32))
+        .filter(|&g| game.entities[g].owner() == e && (game.entities[g].v.origin - origin).length() < 120.0)
+        .min_by(|&a, &b| {
+            let d = |g: EntId| (game.entities[g].v.origin - origin).length();
+            d(a).total_cmp(&d(b))
+        })
+}
+
+/// Angular error (deg) between two view angles (pitch/yaw), the larger axis.
+fn aim_err(view: Vec3, want: Vec3) -> f32 {
+    bot::wrap180(view.x - want.x)
+        .abs()
+        .max(bot::wrap180(view.y - want.y).abs())
+}
+
+/// Drive the grenade lob→shoot combo for one frame, overlaid after `engage` (and after the
+/// defensive grenade check, which wins). Picks up a fight where a lobbed-and-detonated grenade beats
+/// the gunfight — shoving a grounded enemy into a nearby hazard, or a plain airburst — and runs the
+/// [`GrenadePhase`] machine to aim, fire, track, and detonate it. Everything is written back through
+/// `look`/`move_world`/`buttons`/`impulse`; safety (self-splash, teammates, wrong-way shoves, walls)
+/// is enforced at every step.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn grenade_combo(
+    game: &mut GameState,
+    e: EntId,
+    enemy: Option<EntId>,
+    origin: Vec3,
+    now: f32,
+    look: &mut Vec3,
+    move_world: &mut Vec3,
+    buttons: &mut i32,
+    impulse: &mut i32,
+) {
+    let phase = game.entities[e].bot.grenade_phase;
+    // Losing the enemy cancels any in-progress combo (but a lobbed grenade can still fuse-blow).
+    let Some(en) = enemy else {
+        if phase != GrenadePhase::Idle {
+            combo_reset(game, e, now + COMBO_DONE_COOLDOWN);
+        }
+        return;
+    };
+    match phase {
+        GrenadePhase::Idle => try_start(game, e, en, origin, now),
+        GrenadePhase::Windup => windup(game, e, now, look, move_world, buttons, impulse),
+        GrenadePhase::Lobbed => lobbed(game, e, origin, now, look, impulse),
+        GrenadePhase::Detonate => detonate(game, e, en, origin, now, look, move_world, buttons, impulse),
+    }
+}
+
+/// Decide whether to start a combo, and if so aim the lob (Idle → Windup).
+fn try_start(game: &mut GameState, e: EntId, en: EntId, origin: Vec3, now: f32) {
+    let host = *game.host();
+    if now < game.entities[e].bot.grenade_next_try || !host.cvar_bool(c"rtx_shootable_grenades") {
+        return;
+    }
+    let (items, ammo_rockets, health) = {
+        let v = &game.entities[e].v;
+        (v.items, v.ammo_rockets, v.health)
+    };
+    if !items.has(Items::GRENADE_LAUNCHER) || ammo_rockets < 1.0 || health < 50.0 {
+        return;
+    }
+    if hitscan_choice(game, e).is_none() {
+        return; // need a gun to detonate with
+    }
+    let e_org = game.entities[en].v.origin;
+    let dist = (e_org - origin).length();
+    if !(LOB_MIN_RANGE..=LOB_MAX_RANGE).contains(&dist) {
+        return;
+    }
+    // The shove only works on a grounded, walking target (knockback needs `movetype == Walk`).
+    let en_grounded = game.entities[en].v.flags.has(Flags::ONGROUND);
+    if game.entities[en].v.movetype != MoveType::Walk || !en_grounded || !los_to(game, e, en) {
+        return;
+    }
+    let my_team = game.entities[e].arena.team;
+    let e_feet = e_org - Vec3::new(0.0, 0.0, 24.0);
+
+    // Look for a hazard to shove the enemy into; else consider a plain airburst.
+    let hazard = {
+        let bsp = game.nav.bsp.as_ref();
+        let is_solid = |p: Vec3| bsp.is_some_and(|b| b.is_solid(p));
+        let contents = |p: Vec3| host.pointcontents(p);
+        find_hazard(&is_solid, &contents, e_feet)
+    };
+    let (target, shove_dir, shove_edge) = match hazard {
+        Some(h) => (e_feet - h.dir * SHOVE_OFFSET, h.dir, h.edge_dist),
+        None => {
+            // Plain airburst: throttled so it seasons fights rather than replacing the gun game
+            // (skill-gated; low-skill bots don't bother). Land it at the enemy's feet.
+            let skill = host.cvar(c"rtx_bot_skill");
+            if skill < 3.0 || (now * 7.0 + e.0 as f32).sin() < 0.6 {
+                return;
+            }
+            (e_feet, Vec3::ZERO, 0.0)
+        }
+    };
+
+    // Safety on the blast point: outside our own splash, no teammate caught, a clear line to the
+    // enemy (so the blast actually reaches them), and — for a shove — not driving them toward us.
+    let self_splash = blast_self_damage((target - origin).length()) * 0.5;
+    if self_splash > health * GRENADE_SHOOT_HEALTH_FRAC
+        || (target - origin).length() < GRENADE_MIN_SHOOT
+        || teammate_in_blast(game, e, my_team, target)
+    {
+        combo_reset(game, e, now + COMBO_COOLDOWN);
+        return;
+    }
+    if shove_dir != Vec3::ZERO {
+        let to_bot = (origin - e_org).xy().normalize_or_zero();
+        let e_center = player_center(game, en);
+        // Bail unless the hazard is away from us AND the blast would actually shove them across the
+        // edge (not just nudge them toward it).
+        if shove_dir.xy().normalize_or_zero().dot(to_bot) > 0.5
+            || !shove_reaches(e_center, e_org, target, shove_dir, shove_edge)
+        {
+            combo_reset(game, e, now + COMBO_COOLDOWN);
+            return;
+        }
+    }
+    {
+        let tr = game.traceline(target + Vec3::new(0.0, 0.0, 8.0), e_org, false, en);
+        if !(tr.ent == en || tr.fraction > 0.9) {
+            combo_reset(game, e, now + COMBO_COOLDOWN);
+            return;
+        }
+    }
+
+    // Solve the lob (flat arc first, lofted as a fallback), and verify it clears geometry.
+    let gravity = host.cvar(c"sv_gravity").max(1.0);
+    let solved = [false, true].into_iter().find_map(|high| {
+        let (look, _flight) = solve_lob(origin, target, GL_SPEED, gravity, high)?;
+        let v0 = launch_velocity(look);
+        let clear = match game.nav.bsp.as_ref() {
+            Some(bsp) => crate::navmesh::arc_land(bsp, origin, v0, gravity)
+                .is_some_and(|(land, _, _)| (land.xy() - target.xy()).length() < LOB_LAND_TOL * 2.0),
+            None => true,
+        };
+        clear.then_some(look)
+    });
+    let Some(look) = solved else {
+        combo_reset(game, e, now + COMBO_COOLDOWN);
+        return;
+    };
+
+    let b = &mut game.entities[e].bot;
+    b.grenade_phase = GrenadePhase::Windup;
+    b.grenade_started = now;
+    b.grenade_target = target;
+    b.grenade_look = look;
+    b.grenade_shove_dir = shove_dir;
+    b.grenade_shove_edge = shove_edge;
+    b.grenade_ent = 0;
+}
+
+/// Select the GL, aim the lob, and fire once the smoothed view is on it (Windup → Lobbed).
+fn windup(
+    game: &mut GameState,
+    e: EntId,
+    now: f32,
+    look: &mut Vec3,
+    move_world: &mut Vec3,
+    buttons: &mut i32,
+    impulse: &mut i32,
+) {
+    if now - game.entities[e].bot.grenade_started > WINDUP_TIMEOUT {
+        combo_reset(game, e, now + COMBO_COOLDOWN);
+        return;
+    }
+    let want = game.entities[e].bot.grenade_look;
+    *look = want;
+    *move_world = Vec3::ZERO; // hold the firing stance
+    *buttons &= !BUTTON_ATTACK; // don't fire the current gun at lob pitch
+    let (weapon, attack_finished) = {
+        let ent = &game.entities[e];
+        (ent.v.weapon, ent.combat.attack_finished)
+    };
+    if weapon != Weapon::GrenadeLauncher {
+        *impulse = GL_IMPULSE;
+        return;
+    }
+    // Grenade launcher in hand: fire when the smoothed aim has settled and the GL is off cooldown.
+    if now >= attack_finished && aim_err(game.entities[e].bot.aim, want) < LOB_AIM_TOL {
+        *buttons |= BUTTON_ATTACK;
+        let b = &mut game.entities[e].bot;
+        b.grenade_phase = GrenadePhase::Lobbed;
+        b.grenade_started = now; // now the fuse clock
+    }
+}
+
+/// Capture the fired grenade and switch to the detonator (Lobbed → Detonate).
+fn lobbed(game: &mut GameState, e: EntId, origin: Vec3, now: f32, look: &mut Vec3, impulse: &mut i32) {
+    if game.entities[e].bot.grenade_ent == 0 {
+        match own_live_grenade(game, e, origin) {
+            Some(g) => game.entities[e].bot.grenade_ent = g.0,
+            None => {
+                if now - game.entities[e].bot.grenade_started > CAPTURE_TIMEOUT {
+                    combo_reset(game, e, now + COMBO_COOLDOWN); // the shot never produced a grenade
+                }
+                return;
+            }
+        }
+    }
+    let g = EntId(game.entities[e].bot.grenade_ent);
+    if !grenade_live(game, g) {
+        combo_reset(game, e, now + COMBO_DONE_COOLDOWN); // already went off (touch) — done
+        return;
+    }
+    // Keep requesting the detonator every frame — the switch impulse is swallowed until the GL's
+    // 0.6s cooldown ends, so a one-shot request would be lost.
+    if let Some((imp, weapon)) = hitscan_choice(game, e) {
+        if game.entities[e].v.weapon != weapon {
+            *impulse = imp;
+        } else {
+            game.entities[e].bot.grenade_phase = GrenadePhase::Detonate;
+        }
+    } else {
+        combo_reset(game, e, now + COMBO_COOLDOWN);
+        return;
+    }
+    let eye = origin + VEC_VIEW_OFS;
+    let gpos = game.entities[g].v.origin;
+    *look = bot_combat::angles_to(eye, gpos); // pre-aim the grenade
+}
+
+/// Detonate the grenade the instant its blast puts the enemy where we want them (Detonate → Idle).
+#[allow(clippy::too_many_arguments)]
+fn detonate(
+    game: &mut GameState,
+    e: EntId,
+    en: EntId,
+    origin: Vec3,
+    now: f32,
+    look: &mut Vec3,
+    move_world: &mut Vec3,
+    buttons: &mut i32,
+    impulse: &mut i32,
+) {
+    let g = EntId(game.entities[e].bot.grenade_ent);
+    if game.entities[e].bot.grenade_ent == 0 || !grenade_live(game, g) {
+        combo_reset(game, e, now + COMBO_DONE_COOLDOWN); // detonated (by us or fuse) — done
+        return;
+    }
+    // Fuse backstop: if we've held too long, stop and let it blow on its own.
+    if now - game.entities[e].bot.grenade_started > GL_FUSE {
+        combo_reset(game, e, now + COMBO_DONE_COOLDOWN);
+        return;
+    }
+    let (health, my_team) = (game.entities[e].v.health, game.entities[e].arena.team);
+    let gpos = game.entities[g].v.origin;
+    let eye = origin + VEC_VIEW_OFS;
+    *look = bot_combat::angles_to(eye, gpos);
+
+    // Never blow it up in our own face, or on a teammate. Back away if it's drifted too close.
+    let d_self = (gpos - origin).length();
+    if blast_self_damage(d_self) * 0.5 > health * GRENADE_SHOOT_HEALTH_FRAC
+        || d_self < GRENADE_MIN_SHOOT
+        || teammate_in_blast(game, e, my_team, gpos)
+    {
+        if d_self < 200.0 {
+            let away = Vec3::new(origin.x - gpos.x, origin.y - gpos.y, 0.0).normalize_or_zero();
+            *move_world = away * MOVE_SPEED;
+        }
+        return; // hold fire; the fuse is the backstop
+    }
+
+    // Is the geometry right? For a shove, the grenade must sit close to the enemy on the correct
+    // side so the outward push drives them toward the hazard; for an airburst, just close.
+    let shove_dir = game.entities[e].bot.grenade_shove_dir;
+    let shove_edge = game.entities[e].bot.grenade_shove_edge;
+    let e_center = player_center(game, en);
+    let e_org = game.entities[en].v.origin;
+    let fire_ok = if shove_dir != Vec3::ZERO {
+        // Detonate against the grenade's *actual* position (it bounced): close to the enemy, and the
+        // live blast geometry must still carry them across the hazard edge.
+        (gpos - e_center).length() < 140.0 && shove_reaches(e_center, e_org, gpos, shove_dir, shove_edge)
+    } else {
+        (gpos - e_center).length() < 100.0
+    };
+    if fire_ok && can_hit_grenade(game, e, g) {
+        shoot_grenade(game, e, g, look, buttons, impulse);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const G: f32 = 800.0;
+
+    // Oracle helpers: a flat floor at z ≤ 0 by default.
+    fn floor(p: Vec3) -> bool {
+        p.z <= 0.0
+    }
+
+    #[test]
+    fn finds_lava_edge_and_direction() {
+        // Lava fills x > 200 (as a liquid — not solid); solid floor at z ≤ 0 for x ≤ 200.
+        let solid = |p: Vec3| p.z <= 0.0 && p.x <= 200.0;
+        let contents = |p: Vec3| {
+            if p.x > 200.0 && p.z < 0.0 {
+                Content::Lava.as_f32()
+            } else {
+                Content::Empty.as_f32()
+            }
+        };
+        let e_feet = Vec3::new(160.0, 0.0, 24.0); // enemy near the lava edge
+        let h = find_hazard(&solid, &contents, e_feet).expect("lava found");
+        assert_eq!(h.kind, HazardKind::Lava);
+        assert!(h.dir.x > 0.5, "should push toward +x (the lava): {:?}", h.dir);
+    }
+
+    #[test]
+    fn finds_pit() {
+        // Floor at z ≤ 0 for x ≤ 200; bottomless past it.
+        let solid = |p: Vec3| p.z <= 0.0 && p.x <= 200.0;
+        let empty = |_: Vec3| Content::Empty.as_f32();
+        let h = find_hazard(&solid, &empty, Vec3::new(170.0, 0.0, 24.0)).expect("pit found");
+        assert_eq!(h.kind, HazardKind::Pit);
+        assert!(h.dir.x > 0.5);
+    }
+
+    #[test]
+    fn railing_blocks_the_shove() {
+        // Lava past x > 200, but a wall spans 96 < x < 104 for all z between enemy and it.
+        let solid = |p: Vec3| (p.z <= 0.0 && p.x <= 200.0) || (96.0..104.0).contains(&p.x);
+        let contents = |p: Vec3| {
+            if p.x > 200.0 && p.z < 0.0 {
+                Content::Lava.as_f32()
+            } else {
+                Content::Empty.as_f32()
+            }
+        };
+        assert!(find_hazard(&solid, &contents, Vec3::new(40.0, 0.0, 24.0)).is_none());
+    }
+
+    #[test]
+    fn open_floor_has_no_hazard() {
+        let empty = |_: Vec3| Content::Empty.as_f32();
+        assert!(find_hazard(&floor, &empty, Vec3::new(0.0, 0.0, 24.0)).is_none());
+    }
+
+    /// The launch matches `w_fire_grenade`: fixed speed, and elevation = view-up angle + loft.
+    #[test]
+    fn launch_speed_and_loft() {
+        for pitch in [0.0f32, -20.0, -45.0, 15.0, 30.0] {
+            let v = launch_velocity(Vec3::new(pitch, 37.0, 0.0));
+            assert!(
+                (v.length() - GL_SPEED).abs() < 0.01,
+                "speed off at pitch {pitch}: {}",
+                v.length()
+            );
+            let elev = v.z.atan2(v.xy().length()).to_degrees();
+            // view elevation is −pitch; launch sits loft above it.
+            assert!(
+                (elev - (-pitch + GL_LOFT_DEG)).abs() < 0.01,
+                "elevation off at pitch {pitch}: {elev}"
+            );
+        }
+    }
+
+    /// Integrate the solved arc to the flight time and confirm it lands on the target.
+    #[test]
+    fn solve_lob_lands_on_target() {
+        let p0 = Vec3::new(0.0, 0.0, 0.0);
+        for &(r, dz) in &[(300.0f32, 0.0f32), (250.0, 80.0), (400.0, -120.0), (150.0, 40.0)] {
+            let b = Vec3::new(r, 0.0, dz);
+            for high in [false, true] {
+                let Some((solved, t)) = solve_lob(p0, b, GL_SPEED, G, high) else {
+                    continue;
+                };
+                let v0 = launch_velocity(solved);
+                let landed = p0 + v0 * t - Vec3::new(0.0, 0.0, 0.5 * G * t * t);
+                assert!(
+                    (landed - b).length() < 2.0,
+                    "arc missed (r={r} dz={dz} high={high}): landed {landed:?} want {b:?}"
+                );
+            }
+        }
+    }
+
+    /// Beyond the flat-ground range `s²/g` there is no solution.
+    #[test]
+    fn solve_lob_out_of_range() {
+        let far = GL_SPEED * GL_SPEED / G + 100.0; // past max range
+        assert!(solve_lob(Vec3::ZERO, Vec3::new(far, 0.0, 0.0), GL_SPEED, G, false).is_none());
+        assert!(solve_lob(Vec3::ZERO, Vec3::new(far, 0.0, 0.0), GL_SPEED, G, true).is_none());
+    }
+
+    /// Knockback is outward from the blast, scaled by the splash points.
+    #[test]
+    fn shove_is_outward_and_scaled() {
+        // Blast 60u to the −x side of the victim → push toward +x, magnitude 8·(120−0.5·60)=720.
+        let v_center = Vec3::new(0.0, 0.0, 4.0);
+        let v_origin = Vec3::ZERO;
+        let b = Vec3::new(-60.0, 0.0, 4.0);
+        let imp = predict_shove(v_center, v_origin, b);
+        assert!(imp.x > 0.0 && imp.y.abs() < 1.0, "should push +x: {imp:?}");
+        assert!((imp.length() - 720.0).abs() < 1.0, "magnitude off: {}", imp.length());
+        // Outside the radius → no shove.
+        assert_eq!(
+            predict_shove(v_center, v_origin, Vec3::new(-400.0, 0.0, 4.0)).length(),
+            0.0
+        );
+    }
+
+    #[test]
+    fn shove_reaches_near_edge_not_far() {
+        // Blast 60u behind the enemy pushes +x hard (720ups → ~180u ground reach); dir = +x.
+        let ec = Vec3::new(0.0, 0.0, 4.0);
+        let eo = Vec3::ZERO;
+        let b = Vec3::new(-60.0, 0.0, 4.0);
+        let dir = Vec3::new(1.0, 0.0, 0.0);
+        assert!(shove_reaches(ec, eo, b, dir, 100.0), "should clear a 100u edge");
+        assert!(!shove_reaches(ec, eo, b, dir, 400.0), "shouldn't clear a 400u edge");
+        // Wrong-direction hazard: pushing +x doesn't help a −x hazard.
+        assert!(!shove_reaches(ec, eo, b, Vec3::new(-1.0, 0.0, 0.0), 50.0));
+    }
+}
