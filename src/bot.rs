@@ -17,7 +17,7 @@ use glam::{Vec3, Vec3Swizzles};
 
 use crate::bot_combat;
 use crate::defs::{Bits, Flags, Items, Solid, Weapon};
-use crate::entity::{BotState, EntId, Entity};
+use crate::entity::{BotState, EntId, Entity, HookPhase};
 use crate::game::{cstring, GameState};
 use crate::mode::BotIntent;
 use crate::navmesh::{CellId, LinkKind, NavGraph};
@@ -27,6 +27,25 @@ const BUTTON_ATTACK: i32 = 1;
 const BUTTON_JUMP: i32 = 2;
 /// Impulse to select the shotgun (for shooting a health-gated button).
 const IMPULSE_SHOTGUN: i32 = 2;
+/// Impulse to select the grappling hook (for flying a hook leg).
+const IMPULSE_GRAPPLE: i32 = 22;
+
+// --- grappling-hook leg execution ---
+
+/// Within this of the hook leg's source cell counts as "in stance" to throw from.
+const HOOK_STANCE: f32 = 24.0;
+/// Throw once the smoothed view is within this many degrees of the anchor.
+const HOOK_AIM_TOL: f32 = 2.0;
+/// Give up aiming/throwing if the hook hasn't bitten within these windows.
+const HOOK_AIM_TIMEOUT: f32 = 1.5;
+const HOOK_FLIGHT_TIMEOUT: f32 = 1.0;
+/// Abort a reel that runs this long (snagged, or a moving/none anchor) without releasing.
+const HOOK_REEL_TIMEOUT: f32 = 3.0;
+/// Abort if the live anchor sits this far from where the build expected it (hooked a player, a
+/// moving door, or a sky brush the runtime rejected) — the solved arc no longer applies.
+const HOOK_ANCHOR_DRIFT: f32 = 48.0;
+/// Ballistic watchdog slack added to the solved airtime before we give up waiting to land.
+const HOOK_BALLISTIC_SLACK: f32 = 1.0;
 
 /// Move-component scale (matches ktx: project the desired world direction onto the view
 /// vectors and scale by 800; pmove clamps to `sv_maxspeed`).
@@ -214,6 +233,19 @@ fn run_bot(game: &mut GameState, e: EntId) {
     let weapon = game.entities[e].v.weapon;
     let on_ground = game.entities[e].v.flags.has(Flags::ONGROUND);
     let alive = game.entities[e].v.health > 0.0 && game.entities[e].v.deadflag == 0.0;
+    // Snapshot grapple state up front (it's set in the previous frame's PlayerPreThink, so it's
+    // stable across this bot frame) — lets the hook driver read it without re-borrowing the edict
+    // while the `&mut bot` binding is live. `anchor` is meaningful only once `on_hook`.
+    let grapple_hook = EntId(game.entities[e].grapple.hook);
+    let hook_out = game.entities[e].grapple.hook_out;
+    let on_hook = game.entities[e].grapple.on_hook;
+    let anchor = if hook_out {
+        game.entities[grapple_hook].v.origin
+    } else {
+        Vec3::ZERO
+    };
+    // Live reel speed, for the release-crossing prediction (half a frame of lookahead).
+    let reel_half_step = crate::navmesh::HOOK_PULL_BASE * host.cvar(c"rtx_hook_pull") * game.globals.frametime * 0.5;
     // Flip the per-frame pulse used for press/release-edge buttons.
     let pulse = {
         let b = &mut game.entities[e].bot;
@@ -230,6 +262,20 @@ fn run_bot(game: &mut GameState, e: EntId) {
     }
 
     let idle = |angles: Vec3| host.set_bot_cmd(client, msec, angles, 0, 0, 0, 0, 0);
+
+    // Hook invariant net: if we're mid-hook but no longer hold the grapple (a mode loadout stripped
+    // it, e.g. Rocket Arena), abandon the traversal cleanly — release any live hook and reset the
+    // phase. Runs before the nav borrow, where `&mut game` is free. Other aborts (leg changed, hook
+    // vanished, timeouts) are handled inside the hook driver below.
+    if game.entities[e].bot.hook_phase != HookPhase::Idle && !game.entities[e].v.items.has(Items::GRAPPLE) {
+        if game.entities[e].grapple.hook_out {
+            let hook = EntId(game.entities[e].grapple.hook);
+            game.reset_grapple(hook);
+        }
+        game.entities[e].bot.hook_phase = HookPhase::Idle;
+        game.entities[e].bot.hook_fails = 0;
+    }
+    let hooking = game.entities[e].bot.hook_phase != HookPhase::Idle;
 
     // Ask the active mode for this bot's intent. A round mode (Rocket Arena) returns Fight/Move to
     // drive combat or audience-roaming; FFA returns None, leaving the generic item/human brain
@@ -348,8 +394,9 @@ fn run_bot(game: &mut GameState, e: EntId) {
     let bot = &mut game.entities[e].bot;
 
     // A teleport (or any large instant displacement) invalidates the planned route — drop it
-    // and re-path from where we landed. ~200u in one frame is far beyond running/falling.
-    if bot.last_origin != Vec3::ZERO && (origin - bot.last_origin).length() > 200.0 {
+    // and re-path from where we landed. ~200u in one frame is far beyond running/falling. Skipped
+    // mid-hook: the reel and the parabola move fast on purpose and must not clear the hook route.
+    if !hooking && bot.last_origin != Vec3::ZERO && (origin - bot.last_origin).length() > 200.0 {
         bot.route.clear();
         bot.repath_time = now;
     }
@@ -358,8 +405,9 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // Gate errand: drop it once the gate's door has opened — or give up if we stop making progress
     // toward its button (stuck at a door whose button we can't actually reach), so we don't camp
     // there. Progress-based, not a flat timeout: a button that's simply far across the map (e.g.
-    // when we spawned right next to the door) still gets reached.
-    if let Some(gi) = bot.gate {
+    // when we spawned right next to the door) still gets reached. Suspended mid-hook.
+    if !hooking && bot.gate.is_some() {
+        let gi = bot.gate.unwrap();
         let give_up = |bot: &mut BotState| {
             bot.avoid_gate = gi as i32;
             bot.avoid_gate_until = now + GATE_AVOID_TIME;
@@ -390,8 +438,9 @@ fn run_bot(game: &mut GameState, e: EntId) {
         None => goal_cell,
     };
 
-    // Re-path when the route is empty, the goal changed, or the timer elapsed.
-    if bot.route.is_empty() || bot.goal_cell != goal || now >= bot.repath_time {
+    // Re-path when the route is empty, the goal changed, or the timer elapsed. Frozen mid-hook so
+    // the traversal keeps the route that put it on the hook leg.
+    if !hooking && (bot.route.is_empty() || bot.goal_cell != goal || now >= bot.repath_time) {
         let mut route = graph.find_path(bot_cell, goal, &gate_closed).unwrap_or_default();
         // Goal unreachable from here (behind a shut door with no way around from this spot, or a
         // disconnected pocket)? Don't home straight into a wall — head to the reachable cell
@@ -408,7 +457,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
         bot.repath_time = now + REPATH_INTERVAL;
     }
     // If we've fallen off the planned route (missed a jump, got shoved), re-localize next.
-    if bot.route_pos >= bot.route.len() && bot_cell != goal && now >= bot.repath_time {
+    if !hooking && bot.route_pos >= bot.route.len() && bot_cell != goal && now >= bot.repath_time {
         bot.repath_time = now; // force a fresh path next frame
     }
 
@@ -416,7 +465,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // are priced high), so if the chosen route still crosses one, there's no other way in — divert
     // to that gate's button. Skip a gate we recently gave up on (its button was unreachable) so we
     // don't immediately re-camp on it.
-    if bot.gate.is_none() {
+    if !hooking && bot.gate.is_none() {
         let avoid = if now < bot.avoid_gate_until { bot.avoid_gate } else { -1 };
         let block =
             route_blocking_gate(graph, &bot.route, bot.route_pos, &gate_closed).filter(|&gi| gi as i32 != avoid);
@@ -445,10 +494,13 @@ fn run_bot(game: &mut GameState, e: EntId) {
     while bot.route_pos < bot.route.len() {
         let leg = bot.route[bot.route_pos];
         let target = graph.cell_origin(graph.link_target(leg));
-        let arrived = if graph.link_kind(leg) == LinkKind::Plat {
-            origin.z >= target.z - PLAT_RISE_TOL
-        } else {
-            (target.xy() - origin.xy()).length() <= ARRIVE_RADIUS
+        let arrived = match graph.link_kind(leg) {
+            LinkKind::Plat => origin.z >= target.z - PLAT_RISE_TOL,
+            // A hook leg never auto-advances on XY: a near-vertical pull-up passes the XY test while
+            // still at the *bottom* of the swing. The hook driver advances it only once the parabola
+            // has landed (see below).
+            LinkKind::Hook => false,
+            _ => (target.xy() - origin.xy()).length() <= ARRIVE_RADIUS,
         };
         if arrived {
             bot.route_pos += 1;
@@ -460,7 +512,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // Current waypoint + how to traverse to it. Past the route's end, home straight in on the
     // human (final approach). While riding a plat, steer toward the plat *centre* (the leg's
     // source cell) to stay aboard as it rises, instead of toward the far exit ledge.
-    let (waypoint, kind, final_leg) = if bot.route_pos < bot.route.len() {
+    let (waypoint, kind, final_leg, cur_leg) = if bot.route_pos < bot.route.len() {
         let leg = bot.route[bot.route_pos];
         let k = graph.link_kind(leg);
         let aim = if k == LinkKind::Plat {
@@ -468,10 +520,11 @@ fn run_bot(game: &mut GameState, e: EntId) {
         } else {
             graph.cell_origin(graph.link_target(leg))
         };
-        (aim, Some(k), false)
+        (aim, Some(k), false, Some(leg))
     } else {
-        (target_origin, None, true)
+        (target_origin, None, true, None)
     };
+    let hook_active = matches!(kind, Some(LinkKind::Hook)) || hooking;
     // Where the *eyes* go while navigating: a couple of legs ahead of the feet (or the final
     // target when the route is short), so the view sweeps down the corridor instead of snapping
     // to every 32u grid cell the bot steps through. Steering still uses `waypoint`.
@@ -481,9 +534,11 @@ fn run_bot(game: &mut GameState, e: EntId) {
         target_origin
     };
 
-    // Stuck detection.
+    // Stuck detection. Suppressed mid-hook: standing in the throw stance, reeling, and riding the
+    // parabola all look "stuck" to it, and a force-jump/repath there would wreck the traversal — the
+    // hook driver's own per-phase timeouts are its stuck detection.
     let mut force_jump = false;
-    if (origin - bot.stuck_origin).length() > STUCK_MOVE {
+    if hook_active || (origin - bot.stuck_origin).length() > STUCK_MOVE {
         bot.stuck_origin = origin;
         bot.stuck_since = now;
     } else if now - bot.stuck_since > STUCK_TIME {
@@ -511,6 +566,150 @@ fn run_bot(game: &mut GameState, e: EntId) {
     } else {
         angles
     };
+
+    // --- grappling-hook leg driver -------------------------------------------------------------
+    // Fly a LinkKind::Hook leg: select the grapple, settle the view on the anchor, throw, reel to
+    // build speed, then release into a gravity parabola that lands on the target ledge. All physics
+    // reads come from the `anchor`/`hook_out`/`on_hook` snapshot; graph reads use `cur_leg`'s stored
+    // HookTraversal. `reset_grapple` (needs `&mut game`) is deferred to `hook_reset` and flushed
+    // after the graph borrow ends. Per-phase timeouts are the traversal's own stuck detection.
+    let mut hook_look_target: Option<Vec3> = None; // view override → the anchor / landing
+    let mut hook_stand = false; // hold ground still (reel/parabola own the velocity)
+    let mut hook_approach: Option<Vec3> = None; // Aim: walk toward the throw stance (source cell)
+    let mut hook_select = false; // need to switch to the grapple
+    let mut hook_fire_ready = false; // Aim: eligible to throw once the smoothed view settles
+    let mut hook_hold_fire = false; // Flight/Reel: keep +attack held
+    let mut hook_reset: Option<EntId> = None; // deferred reset_grapple target
+    let mut hook_failed = false;
+    if hook_active {
+        if let Some((leg, tr)) = cur_leg.and_then(|l| graph.hook_of_link(l).copied().map(|t| (l, t))) {
+            let src = graph.cell_origin(graph.link_source(leg));
+            let tgt = graph.cell_origin(graph.link_target(leg));
+            // An enemy in an early phase → let combat win; abort a hook we haven't committed to.
+            if enemy.is_some() && matches!(bot.hook_phase, HookPhase::Idle | HookPhase::Aim) {
+                if hook_out {
+                    hook_reset = Some(grapple_hook);
+                }
+                bot.hook_phase = HookPhase::Idle;
+            } else {
+                if bot.hook_phase == HookPhase::Idle {
+                    bot.hook_phase = HookPhase::Aim;
+                    bot.hook_link = leg;
+                    bot.hook_started = now;
+                    bot.hook_release_dist = tr.release_dist;
+                }
+                match bot.hook_phase {
+                    HookPhase::Aim => {
+                        hook_look_target = Some(tr.stick);
+                        if weapon != Weapon::Grapple {
+                            hook_select = true;
+                        }
+                        if (origin.xy() - src.xy()).length() <= HOOK_STANCE {
+                            hook_stand = true;
+                            if weapon == Weapon::Grapple && on_ground && !hook_out {
+                                hook_fire_ready = true; // the throw fires post-spring, once aimed
+                            }
+                        } else {
+                            hook_approach = Some(src);
+                        }
+                        if now - bot.hook_started > HOOK_AIM_TIMEOUT {
+                            hook_failed = true;
+                        }
+                    }
+                    HookPhase::Flight => {
+                        hook_look_target = Some(tr.stick);
+                        hook_stand = true;
+                        hook_hold_fire = true;
+                        if on_hook {
+                            if (anchor - tr.stick).length() > HOOK_ANCHOR_DRIFT {
+                                hook_failed = true; // stuck somewhere the solve didn't predict
+                            } else {
+                                bot.hook_phase = HookPhase::Reel;
+                                bot.hook_started = now;
+                                bot.hook_prev_dist = (origin - anchor).length();
+                            }
+                        } else if !hook_out || now - bot.hook_started > HOOK_FLIGHT_TIMEOUT {
+                            hook_failed = true; // throw missed / hit sky (server reset it)
+                        }
+                    }
+                    HookPhase::Reel => {
+                        hook_look_target = Some(tgt); // pre-aim the landing
+                        hook_stand = true;
+                        hook_hold_fire = true;
+                        let d = (origin - anchor).length();
+                        if !on_hook || !hook_out || (anchor - tr.stick).length() > HOOK_ANCHOR_DRIFT {
+                            hook_failed = true; // hook lost or the anchor moved (door/plat/player)
+                        } else if d - reel_half_step <= bot.hook_release_dist {
+                            // Release: drop +attack so `service_grapple` lets go next PreThink.
+                            hook_hold_fire = false;
+                            bot.hook_phase = HookPhase::Ballistic;
+                            bot.hook_started = now;
+                        } else if d > bot.hook_prev_dist - 1.0 && now - bot.hook_started > HOOK_REEL_TIMEOUT {
+                            hook_failed = true; // reel stalled against a lip
+                        } else {
+                            bot.hook_prev_dist = d.min(bot.hook_prev_dist);
+                        }
+                    }
+                    HookPhase::Ballistic => {
+                        hook_look_target = Some(tgt);
+                        hook_stand = true; // zero input: the frictionless arc must match the solve
+                        if on_ground && now - bot.hook_started > 0.1 {
+                            if (origin.xy() - tgt.xy()).length() <= ARRIVE_RADIUS * 2.0 {
+                                bot.hook_fails = 0;
+                            }
+                            bot.route_pos += 1; // clear the hook leg; repath from the landing
+                            bot.hook_phase = HookPhase::Idle;
+                            bot.repath_time = now;
+                        } else if now - bot.hook_started > tr.airtime + HOOK_BALLISTIC_SLACK {
+                            bot.hook_phase = HookPhase::Idle; // never landed cleanly — just repath
+                            bot.repath_time = now;
+                        }
+                    }
+                    HookPhase::Idle => {}
+                }
+            }
+        } else {
+            // hooking but the current leg isn't a solvable hook (route changed under us) — abort.
+            if hook_out {
+                hook_reset = Some(grapple_hook);
+            }
+            bot.hook_phase = HookPhase::Idle;
+        }
+    }
+    if hook_failed {
+        if hook_out {
+            hook_reset = Some(grapple_hook);
+        }
+        bot.hook_phase = HookPhase::Idle;
+        bot.hook_fails = bot.hook_fails.saturating_add(1);
+        bot.repath_time = now;
+        if bot.hook_fails >= 2 {
+            bot.hook_fails = 0;
+            bot.route.clear();
+            if chasing {
+                bot.avoid_item = bot.goal_item;
+                bot.avoid_until = now + GOAL_AVOID_TIME;
+                bot.goal_item = 0;
+                bot.goal_select_time = now;
+            }
+        }
+    }
+    // Whether the hook is actively steering this frame (survives the abort branches above).
+    let hook_engaged = bot.hook_phase != HookPhase::Idle;
+    let hook_lock = matches!(
+        bot.hook_phase,
+        HookPhase::Flight | HookPhase::Reel | HookPhase::Ballistic
+    );
+    if let Some(t) = hook_look_target {
+        let d = t - eye;
+        if d.xy().length() > 1.0 {
+            look = Vec3::new(
+                -d.z.atan2(d.xy().length()).to_degrees(),
+                d.y.atan2(d.x).to_degrees(),
+                0.0,
+            );
+        }
+    }
 
     let (mut forward, mut side, mut buttons, mut impulse) = (0, 0, 0, 0);
     // Politely stop short only when tailing a human; when fetching an item, walk right onto it so
@@ -575,10 +774,26 @@ fn run_bot(game: &mut GameState, e: EntId) {
     let (nf, nr) = angle_vectors(angles);
     let mut move_world = nf * forward as f32 + nr * side as f32;
 
+    // Hook override: stand still while reeling/flying (the pull owns velocity; ground input would
+    // fight it or, airborne, break the frictionless arc), or walk toward the throw stance in Aim.
+    if hook_engaged {
+        move_world = match hook_approach {
+            _ if hook_stand => Vec3::ZERO,
+            Some(src) => Vec3::new(src.x - origin.x, src.y - origin.y, 0.0).normalize_or_zero() * MOVE_SPEED,
+            None => Vec3::ZERO,
+        };
+        buttons &= !BUTTON_JUMP;
+        if hook_select {
+            impulse = IMPULSE_GRAPPLE;
+        }
+    }
+
     // Combat overlay: with an enemy in sight, the combat layer picks the look (live aim with a
     // drifting error) and its own movement; having *just lost* sight it holds the angle where the
-    // enemy vanished while navigation keeps driving; otherwise navigation's look/move stand.
-    if let Some(en) = enemy {
+    // enemy vanished while navigation keeps driving; otherwise navigation's look/move stand. Hooks
+    // in flight/reel/ballistic lock out combat — an impulse or a dropped +attack there would break
+    // the reel/release (the grapple must stay selected and fire held until the release point).
+    if let Some(en) = enemy.filter(|_| !hook_lock) {
         bot_combat::engage(
             game,
             e,
@@ -627,13 +842,35 @@ fn run_bot(game: &mut GameState, e: EntId) {
     let forward = vf.dot(move_world).round() as i32;
     let side = vr.dot(move_world).round() as i32;
 
+    // Hook fire, decided *after* the spring: the hook flies along `v_angle` (the smoothed view we're
+    // about to send), so the throw must wait until that view has actually settled onto the anchor —
+    // gating on the raw target would launch the hook while the aim is still swinging. Once thrown we
+    // hold +attack every frame through the reel (the engine zeroes the cmd each tick, and a single
+    // released frame would drop the hook at impact or unhook mid-reel).
+    if hook_fire_ready {
+        let err = wrap180(view.x - look.x).abs().max(wrap180(view.y - look.y).abs());
+        if err < HOOK_AIM_TOL {
+            buttons |= BUTTON_ATTACK;
+            let b = &mut game.entities[e].bot;
+            b.hook_phase = HookPhase::Flight;
+            b.hook_started = now;
+        }
+    } else if hook_hold_fire {
+        buttons |= BUTTON_ATTACK;
+    }
+    // Flush any deferred hook release now the graph/bot borrows are done.
+    if let Some(h) = hook_reset {
+        game.reset_grapple(h);
+    }
+
     // Combat/gate diagnostics: what the bot is chasing and whether it's stuck at a gate. Enable
     // with `rtx_bot_debug 1` (conprint shows without `developer`).
     if host.cvar_bool(c"rtx_bot_debug") {
         let gate = game.entities[e].bot.gate;
         let route = game.entities[e].bot.route.len();
+        let hph = game.entities[e].bot.hook_phase;
         host.conprint(&cstring(&format!(
-            "rtx bot{client}: enemy={} gate={gate:?} route={route} fwd={forward} side={side} \
+            "rtx bot{client}: enemy={} gate={gate:?} hook={hph:?} route={route} fwd={forward} side={side} \
              atk={}\n",
             enemy.is_some(),
             (buttons & BUTTON_ATTACK) != 0,

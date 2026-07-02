@@ -55,8 +55,6 @@ const HOOK_RANGE_XY: f32 = 640.0;
 const HOOK_MAX_RISE: f32 = 512.0;
 /// Lowest a target may sit below the source and still be a hook link (a descending fling).
 const HOOK_MIN_RISE: f32 = -128.0;
-/// Largest fall from a release/pin point down onto the target the arc may end in.
-const HOOK_MAX_FALL: f32 = 160.0;
 /// Ray-march / arc-clearance sampling step (matches `path_clear` granularity).
 const HOOK_SAMPLE: f32 = 16.0;
 /// Spacing of candidate release points sampled along the reel rope.
@@ -895,7 +893,9 @@ pub struct HookTraversal {
     pub stick: Vec3,
     /// Distance from the anchor at which to release the reel (`0` = pull all the way in / drop).
     pub release_dist: f32,
-    /// Release velocity used to solve the arc (for the runtime re-solve seed and tests).
+    /// Release velocity used to solve the arc — the reel direction and speed at let-go. Read by the
+    /// build/test to re-fly the stored arc (the runtime reels toward the live anchor instead).
+    #[allow(dead_code)]
     pub v0: Vec3,
     /// Simulated airtime of the parabola — the runtime's Ballistic-phase watchdog base.
     pub airtime: f32,

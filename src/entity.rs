@@ -573,6 +573,37 @@ pub struct BotState {
     pub gate_since: f32,
     pub avoid_gate: i32,
     pub avoid_gate_until: f32,
+    /// Grappling-hook traversal state machine (see `bot.rs`), driven when the current route leg is a
+    /// [`LinkKind::Hook`](crate::navmesh::LinkKind::Hook): aim at the anchor, throw, reel to build
+    /// speed, release into a parabola, ride it to the target.
+    pub hook_phase: HookPhase,
+    /// The hook leg (link index) currently being flown, and when the active phase began (per-phase
+    /// timeout base).
+    pub hook_link: u32,
+    pub hook_started: f32,
+    /// Distance-from-anchor at which to release, re-solved against the *live* anchor once the hook
+    /// bites (so the parabola lands on the target despite aim/stance error), plus last frame's
+    /// distance-to-anchor to detect the release crossing and a stalled reel.
+    pub hook_release_dist: f32,
+    pub hook_prev_dist: f32,
+    /// Consecutive failed hook attempts toward the current goal — two in a row abandons the goal.
+    pub hook_fails: u8,
+}
+
+/// Phase of a bot's grappling-hook traversal. `Idle` unless the current route leg is a hook link.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HookPhase {
+    /// Not flying a hook.
+    #[default]
+    Idle,
+    /// Selecting the grapple and settling the view onto the anchor before the throw.
+    Aim,
+    /// Hook thrown, waiting for it to bite.
+    Flight,
+    /// Anchored: reeling in, holding fire, until the release point.
+    Reel,
+    /// Released: riding the parabola with no input until it lands.
+    Ballistic,
 }
 
 #[derive(Default)]
