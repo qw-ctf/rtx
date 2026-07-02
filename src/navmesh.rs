@@ -36,6 +36,44 @@ const JUMP_REACH: f32 = 200.0;
 /// `sv_maxspeed` default — the cost denominator (travel time = distance / speed).
 const MAX_SPEED: f32 = 320.0;
 
+// --- grappling-hook traversal (see `add_hooks`) ---
+
+/// Height above a cell's standing origin the hook launches from (`throw_grapple` spawns it at
+/// `origin + 16z`; the small `v_forward*16` XY offset is absorbed by the range margin).
+const HOOK_LAUNCH_Z: f32 = 16.0;
+/// Reel-in speed at the `rtx_hook_pull ×1` default (`2.35 · 320`, from `grapple.rs`). The live
+/// multiplier scales this; the build takes it as a [`HookParams`] field.
+pub const HOOK_PULL_BASE: f32 = 2.35 * 320.0;
+/// Hook throw (projectile) speed at `rtx_hook_speed ×1` (`2.5 · 320`). Only feeds the flight-time
+/// term of the cost; the live multiplier is applied from [`HookParams`].
+pub const HOOK_THROW_BASE: f32 = 2.5 * 320.0;
+/// Longest rope we'll consider — caps the anchor ray-march and keeps costs bounded.
+const HOOK_ROPE_MAX: f32 = 1024.0;
+/// Max horizontal reach of a hook link (a fling can cross a wide gap), bounding the candidate scan.
+const HOOK_RANGE_XY: f32 = 640.0;
+/// Highest rise a hook link may climb (reel + fling reaches well past a plain jump).
+const HOOK_MAX_RISE: f32 = 512.0;
+/// Lowest a target may sit below the source and still be a hook link (a descending fling).
+const HOOK_MIN_RISE: f32 = -128.0;
+/// Largest fall from a release/pin point down onto the target the arc may end in.
+const HOOK_MAX_FALL: f32 = 160.0;
+/// Ray-march / arc-clearance sampling step (matches `path_clear` granularity).
+const HOOK_SAMPLE: f32 = 16.0;
+/// Spacing of candidate release points sampled along the reel rope.
+const HOOK_R_STEP: f32 = 24.0;
+/// Fixed timestep for the offline parabola integration (~15 u/step at reel speed).
+const HOOK_SIM_DT: f32 = 0.02;
+/// Cap on simulated airtime before a candidate arc is abandoned.
+const HOOK_MAX_AIRTIME: f32 = 2.5;
+/// Landing acceptance: the descending arc must pass within this XY of the target cell…
+const HOOK_LAND_XY: f32 = 24.0;
+/// …and within this Z window above it.
+const HOOK_LAND_Z: f32 = 48.0;
+/// Fixed overhead charged to every hook link: aim-settle + weapon switch + throw/release latency.
+const HOOK_OVERHEAD: f32 = 1.2;
+/// At most this many hook links per source cell (post octant/elevation dedup), to bound explosion.
+const HOOK_MAX_PER_CELL: usize = 4;
+
 // --- grid ---
 
 /// XY sampling step. 32 = the player's full width: one column per body. Coarser than the
@@ -80,6 +118,13 @@ pub enum LinkKind {
     /// traversal — the bot just routes onto an entrance cell and is teleported; it then detects
     /// the jump and re-paths from where it lands.
     Teleport,
+    /// A grappling-hook swing: throw the hook at an anchor, reel toward it to build speed, then
+    /// **release mid-reel** so the resulting velocity flings the bot along a gravity parabola onto
+    /// the target ledge. The vertical pull-up (release at the anchor, near-zero speed, drop
+    /// straight down) is just the degenerate case. The per-link [`HookTraversal`] (stored in a side
+    /// table, see [`NavGraph::hook_of_link`]) carries the anchor and the release distance the bot
+    /// needs to reproduce the arc. Only emitted when the map hands out the hook (`rtx_grapple`).
+    Hook,
 }
 
 /// A directed edge between two cells, with its traversal kind and travel-time cost.
@@ -105,6 +150,11 @@ pub struct NavGraph {
     /// door's live state (see [`find_path`](Self::find_path)). Empty until [`add_gates`](Self::add_gates)
     /// runs; indexed by link index (parallel to `links`).
     gated_links: Vec<i32>,
+    /// Per-link hook payload index: for a [`LinkKind::Hook`] link, the index into `hooks` of its
+    /// solved [`HookTraversal`]; `-1` for every non-hook link. Parallel to `links` (the same
+    /// side-table pattern as `gated_links`), so the bot can look up how to fly a hook leg.
+    hook_links: Vec<i32>,
+    hooks: Vec<HookTraversal>,
 }
 
 /// Extra travel-time cost charged to a link whose gate is currently shut. Large enough that the
@@ -124,6 +174,8 @@ impl NavGraph {
             grid: cells_grid.1,
             gates: Vec::new(),
             gated_links: Vec::new(),
+            hook_links: Vec::new(),
+            hooks: Vec::new(),
         };
         graph.link_cells(bsp);
         graph
@@ -483,6 +535,7 @@ impl NavGraph {
                 LinkKind::JumpGap => c.jump += 1,
                 LinkKind::Plat => c.plat += 1,
                 LinkKind::Teleport => c.teleport += 1,
+                LinkKind::Hook => c.hook += 1,
             }
         }
         c
@@ -655,6 +708,136 @@ impl NavGraph {
         }
     }
 
+    // --- entity-independent: grappling-hook swing links ---
+
+    /// Splice grappling-hook swing links into the graph. From each **ledge-edge** cell, fire probe
+    /// rays out over the drop-off at a few pitches, find where the hook would anchor, then sample
+    /// release points along the reel and simulate the resulting gravity parabola — whatever standable
+    /// cell the arc lands on becomes the link's target. This discovers both vertical pull-ups and
+    /// long horizontal flings from one mechanism. Only accepted when the arc (and perturbed variants)
+    /// land safely, so a bot is never flung into a pit. Deduped per direction/elevation and capped.
+    pub fn add_hooks(&mut self, bsp: &Bsp, params: HookParams) {
+        if self.hook_links.len() != self.links.len() {
+            self.hook_links.resize(self.links.len(), -1);
+        }
+        // Solve per source cell first (immutable borrow), then splice (push_hook needs `&mut`).
+        let mut pending: Vec<(Link, HookTraversal)> = Vec::new();
+        for from in 0..self.cells.len() as CellId {
+            self.solve_hooks_from(bsp, from, params, &mut pending);
+        }
+        for (link, tr) in pending {
+            self.push_hook(link, tr);
+        }
+    }
+
+    /// Solve the hook links leaving cell `from`, appending accepted `(Link, HookTraversal)` to `out`.
+    fn solve_hooks_from(&self, bsp: &Bsp, from: CellId, params: HookParams, out: &mut Vec<(Link, HookTraversal)>) {
+        let c = self.cells[from as usize];
+        let a = c.origin;
+        let launch = a + Vec3::new(0.0, 0.0, HOOK_LAUNCH_Z);
+        // best per (compass octant, 128u elevation band): (cost, link, traversal)
+        let mut best: HashMap<(usize, i32), (f32, Link, HookTraversal)> = HashMap::new();
+
+        for (dgx, dgy) in COMPASS {
+            // Only launch out over a ledge/gap in this direction — hooking toward continuing ground
+            // is pointless (walk/step/jump already cover it).
+            if self.has_ground_near(c.gx + dgx, c.gy + dgy, a.z) {
+                continue;
+            }
+            let yaw = (dgy as f32).atan2(dgx as f32);
+            for pitch_deg in HOOK_PITCHES {
+                let pitch = pitch_deg.to_radians();
+                let (sp, cp) = pitch.sin_cos();
+                let (sy, cy) = yaw.sin_cos();
+                let dir = Vec3::new(cp * cy, cp * sy, sp);
+                let Some(stick) = march_to_solid(bsp, launch, dir, HOOK_ROPE_MAX) else {
+                    continue;
+                };
+                let rope = (stick - launch).length();
+                if rope < HOOK_SAMPLE {
+                    continue;
+                }
+                let v0 = dir * params.pull;
+                let rdir = v0.normalize_or_zero();
+                // Sample release points along the reel by their distance from the anchor. Everything
+                // keys off `stick` + `release_dist` (the reconstructable form the runtime re-solve and
+                // the test use), so the stored arc reproduces bit-for-bit — no fp drift on a grazing
+                // sample. Leave some rope reeled and some swing left.
+                let mut release_dist = HOOK_SAMPLE;
+                while release_dist < rope - HOOK_SAMPLE {
+                    let r = stick - rdir * release_dist;
+                    if let Some((land, airtime, vz)) = arc_land(bsp, r, v0, params.gravity) {
+                        if let Some(to) = self.nearest_within(land, HOOK_LAND_XY, HOOK_LAND_Z) {
+                            if to != from {
+                                let b = self.cells[to as usize].origin;
+                                let dz = b.z - a.z;
+                                let horiz = (b.xy() - a.xy()).length();
+                                let useful = dz > JUMP_APEX || horiz > JUMP_REACH;
+                                let in_range = (HOOK_MIN_RISE..=HOOK_MAX_RISE).contains(&dz) && horiz <= HOOK_RANGE_XY;
+                                if useful
+                                    && in_range
+                                    && !self.has_direct_link(from, to)
+                                    && perturb_ok(bsp, stick, rdir, release_dist, rope, params, b)
+                                {
+                                    let cost = hook_cost(rope, release_dist, airtime, vz, params);
+                                    let key = (dir_bucket(dgx, dgy), (dz / 128.0).floor() as i32);
+                                    if best.get(&key).is_none_or(|(bc, _, _)| cost < *bc) {
+                                        let link = Link {
+                                            from,
+                                            to,
+                                            kind: LinkKind::Hook,
+                                            cost,
+                                        };
+                                        let tr = HookTraversal {
+                                            stick,
+                                            release_dist,
+                                            v0,
+                                            airtime,
+                                        };
+                                        best.insert(key, (cost, link, tr));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    release_dist += HOOK_R_STEP;
+                }
+            }
+        }
+
+        // Keep the cheapest few per cell.
+        let mut chosen: Vec<(f32, Link, HookTraversal)> = best.into_values().collect();
+        chosen.sort_by(|x, y| x.0.total_cmp(&y.0));
+        chosen.truncate(HOOK_MAX_PER_CELL);
+        out.extend(chosen.into_iter().map(|(_, link, tr)| (link, tr)));
+    }
+
+    /// Whether `from` already has a direct (non-hook) link to `to` — such a target needs no hook.
+    fn has_direct_link(&self, from: CellId, to: CellId) -> bool {
+        self.adjacency[from as usize]
+            .iter()
+            .any(|&li| self.links[li as usize].to == to)
+    }
+
+    /// The solved traversal for hook link `li`, or `None` for a non-hook link.
+    pub fn hook_of_link(&self, li: u32) -> Option<&HookTraversal> {
+        match self.hook_links.get(li as usize).copied().unwrap_or(-1) {
+            h if h >= 0 => self.hooks.get(h as usize),
+            _ => None,
+        }
+    }
+
+    /// Push a hook link with its solved traversal, keeping the `hook_links` side table in step.
+    fn push_hook(&mut self, link: Link, traversal: HookTraversal) {
+        if self.hook_links.len() != self.links.len() {
+            self.hook_links.resize(self.links.len(), -1);
+        }
+        let h = self.hooks.len() as i32;
+        self.hooks.push(traversal);
+        self.push_link(link);
+        self.hook_links.push(h);
+    }
+
     /// Append a free-standing cell (not from the column carve) and index it. Used for plat
     /// surfaces, which don't exist in the static world hull.
     fn add_cell(&mut self, origin: Vec3) -> CellId {
@@ -691,6 +874,31 @@ impl NavGraph {
                 d(a).total_cmp(&d(b))
             })
     }
+}
+
+/// Live physics the hook-arc solver needs, gathered from cvars at build time (they can differ per
+/// map: `sv_gravity` is 100 on e1m8, and `rtx_hook_pull`/`rtx_hook_speed` are tunable). Reeling
+/// speed and gravity fix the parabola; the throw speed only prices the flight leg.
+#[derive(Clone, Copy)]
+pub struct HookParams {
+    pub gravity: f32,
+    pub pull: f32,  // HOOK_PULL_BASE × rtx_hook_pull
+    pub throw: f32, // HOOK_THROW_BASE × rtx_hook_speed
+}
+
+/// A solved hook traversal, stored per hook link in a side table (parallel to `links`, like
+/// `gated_links`). Carries what the bot can't cheaply re-derive: the anchor it should aim at, and
+/// the distance-to-anchor at which to let go so the ensuing parabola lands on the target.
+#[derive(Clone, Copy)]
+pub struct HookTraversal {
+    /// Where the hook is expected to stick (also the throw aim point).
+    pub stick: Vec3,
+    /// Distance from the anchor at which to release the reel (`0` = pull all the way in / drop).
+    pub release_dist: f32,
+    /// Release velocity used to solve the arc (for the runtime re-solve seed and tests).
+    pub v0: Vec3,
+    /// Simulated airtime of the parabola — the runtime's Ballistic-phase watchdog base.
+    pub airtime: f32,
 }
 
 /// The two standing positions a `func_plat` connects: the player-origin spot on the plat
@@ -744,6 +952,7 @@ pub struct LinkCounts {
     pub jump: u32,
     pub plat: u32,
     pub teleport: u32,
+    pub hook: u32,
 }
 
 /// Travel-time cost of a link: horizontal distance / speed, plus risk/effort penalties so A*
@@ -759,6 +968,9 @@ fn link_cost(kind: LinkKind, horiz: f32, dz: f32) -> f32 {
         LinkKind::Plat => base + 1.0,
         // Teleporting is near-instant; cost is set at splice time.
         LinkKind::Teleport => 0.2,
+        // Hook costs (throw + reel + parabola airtime + overhead) are computed at splice time from
+        // the solved trajectory; this fallback should never actually be priced.
+        LinkKind::Hook => base + HOOK_OVERHEAD,
     }
 }
 
@@ -805,6 +1017,119 @@ fn arc_clear(bsp: &Bsp, a: Vec3, b: Vec3) -> bool {
 /// Grid column index for a world coordinate.
 fn floor_grid(v: f32) -> i32 {
     (v / GRID).floor() as i32
+}
+
+/// The eight compass grid directions (used to find hook launch edges).
+const COMPASS: [(i32, i32); 8] = [(1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1)];
+
+/// Launch pitches (degrees above horizontal) tried when searching for a hook anchor.
+const HOOK_PITCHES: [f32; 4] = [20.0, 40.0, 60.0, 80.0];
+
+/// Outcome of flying a release velocity from a point under gravity against a solidity oracle.
+enum ArcResult {
+    /// The parabola descended onto solid: the standing position just above it, airtime, and the
+    /// vertical speed at impact (for fall-damage pricing).
+    Land { pos: Vec3, airtime: f32, vz: f32 },
+    /// Ran into solid while level or ascending — a wall/ceiling blocks this arc.
+    Blocked,
+    /// Never landed within the airtime cap.
+    Timeout,
+}
+
+/// Integrate a ballistic arc from `r` with initial velocity `v0` under `gravity`, stepping so no
+/// step advances more than `HOOK_SAMPLE`, until it hits solid (landing if descending, blocked
+/// otherwise) or the airtime cap. Pure: the world enters only through the `is_solid` oracle, so
+/// this is unit-testable against the closed-form parabola with a synthetic floor.
+fn simulate_arc(is_solid: impl Fn(Vec3) -> bool, r: Vec3, v0: Vec3, gravity: f32) -> ArcResult {
+    let mut p = r;
+    let mut v = v0;
+    let mut t = 0.0;
+    while t < HOOK_MAX_AIRTIME {
+        let dt = (HOOK_SAMPLE / v.length().max(1.0)).min(HOOK_SIM_DT);
+        let next = p + v * dt;
+        if is_solid(next) {
+            return if v.z < 0.0 {
+                ArcResult::Land {
+                    pos: p,
+                    airtime: t,
+                    vz: v.z,
+                }
+            } else {
+                ArcResult::Blocked
+            };
+        }
+        p = next;
+        v.z -= gravity * dt;
+        t += dt;
+    }
+    ArcResult::Timeout
+}
+
+/// Fly a release from `r` and report where it lands (descending onto floor), or `None` if it's
+/// blocked or never lands.
+fn arc_land(bsp: &Bsp, r: Vec3, v0: Vec3, gravity: f32) -> Option<(Vec3, f32, f32)> {
+    match simulate_arc(|p| bsp.is_solid(p), r, v0, gravity) {
+        ArcResult::Land { pos, airtime, vz } => Some((pos, airtime, vz)),
+        _ => None,
+    }
+}
+
+/// March a ray from `from` along unit `dir` until it strikes solid, returning the last empty point
+/// (the surface the hook would stick to), or `None` within `max`. Bisected for a tight surface.
+fn march_to_solid(bsp: &Bsp, from: Vec3, dir: Vec3, max: f32) -> Option<Vec3> {
+    let mut d = HOOK_SAMPLE;
+    while d <= max {
+        if bsp.is_solid(from + dir * d) {
+            let (mut lo, mut hi) = (d - HOOK_SAMPLE, d);
+            for _ in 0..4 {
+                let mid = (lo + hi) * 0.5;
+                if bsp.is_solid(from + dir * mid) {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            return Some(from + dir * lo);
+        }
+        d += HOOK_SAMPLE;
+    }
+    None
+}
+
+/// Robustness sweep for a candidate hook (release at distance `d` along the rope from `launch`
+/// toward the stick, target cell origin `b`): require the arc to still land near **`b`** under a
+/// ±10% reel-speed error and a ±16u release-point error. Clustering the perturbed landings on the
+/// target (not merely "somewhere standable") rejects fp-fragile grazing arcs whose landing swings
+/// wildly with a hair of input change — which is exactly what keeps the runtime re-solve honest and
+/// stops a bot being flung off-target when its reel timing is slightly off.
+fn perturb_ok(bsp: &Bsp, stick: Vec3, rdir: Vec3, release_dist: f32, rope: f32, params: HookParams, b: Vec3) -> bool {
+    let variants = [
+        (release_dist, params.pull * 0.9),
+        (release_dist, params.pull * 1.1),
+        ((release_dist - 16.0).max(HOOK_SAMPLE), params.pull),
+        ((release_dist + 16.0).min(rope - HOOK_SAMPLE), params.pull),
+    ];
+    variants.iter().all(|&(rd, pull)| {
+        let r = stick - rdir * rd;
+        match arc_land(bsp, r, rdir * pull, params.gravity) {
+            Some((land, _, _)) => {
+                (land.xy() - b.xy()).length() <= HOOK_LAND_XY * 2.0 && (land.z - b.z).abs() <= HOOK_LAND_Z * 2.0
+            }
+            None => false,
+        }
+    })
+}
+
+/// Travel-time cost of a hook link: hook flight + reel to the release point + parabola airtime +
+/// fixed overhead, plus a fall-damage surcharge on a hard landing (mirroring `Drop`).
+fn hook_cost(rope: f32, release_dist: f32, airtime: f32, vz_land: f32, params: HookParams) -> f32 {
+    let throw = rope / params.throw;
+    let reel = (rope - release_dist).max(0.0) / params.pull;
+    let mut c = throw + reel + airtime + HOOK_OVERHEAD;
+    if vz_land.abs() > 580.0 {
+        c += 1.0;
+    }
+    c
 }
 
 /// Whether the segment `p0`→`p1` intersects the axis-aligned box `[min, max]` (slab method).
@@ -880,9 +1205,15 @@ pub fn build_navmesh(
     plats: Vec<PlatInfo>,
     teleports: Vec<TeleportInfo>,
     gates: Vec<GateInfo>,
+    hooks: Option<HookParams>,
 ) -> NavBuild {
     let bsp = Bsp::parse(&bytes)?;
     let mut graph = NavGraph::build(&bsp);
+    // Hooks first: they derive from the static hull, and going before the plat/gate splices keeps
+    // plat surfaces off hook endpoints and lets `add_gates` tag any hook link crossing a door.
+    if let Some(params) = hooks {
+        graph.add_hooks(&bsp, params);
+    }
     graph.add_plats(&bsp, &plats);
     graph.add_teleports(&teleports);
     graph.add_gates(&gates);
@@ -899,6 +1230,32 @@ impl NavState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The parabola integrator matches the closed-form ballistic solution over a flat floor.
+    #[test]
+    fn hook_arc_matches_closed_form() {
+        // Floor at z = 0 (solid at or below), open above.
+        let floor = |p: Vec3| p.z <= 0.0;
+        let r = Vec3::new(0.0, 0.0, 100.0);
+        let v0 = Vec3::new(200.0, 0.0, 300.0);
+        let g = 800.0;
+        // Closed form: 100 + 300t - 400t^2 = 0 -> t = 1.0; x = 200.
+        match simulate_arc(floor, r, v0, g) {
+            ArcResult::Land { pos, airtime, vz } => {
+                assert!((pos.x - 200.0).abs() < 20.0, "landing x {} != ~200", pos.x);
+                assert!(pos.z.abs() < HOOK_SAMPLE, "landing z {} not near floor", pos.z);
+                assert!((airtime - 1.0).abs() < 0.1, "airtime {airtime} != ~1.0");
+                assert!(vz < 0.0, "must be descending at landing");
+            }
+            _ => panic!("arc did not land on the floor"),
+        }
+        // A ceiling just above the release point blocks the (ascending) arc.
+        let boxed = |p: Vec3| p.z <= 0.0 || p.z >= 110.0;
+        assert!(
+            matches!(simulate_arc(boxed, r, v0, g), ArcResult::Blocked),
+            "arc into a ceiling should be Blocked"
+        );
+    }
 
     /// Build the navmesh from a real map (`RTX_TEST_BSP`) and sanity-check it: cells and links
     /// exist, and a healthy majority of cells land in one connected component (a fragmented
@@ -1047,5 +1404,97 @@ mod tests {
             "gate splice: {gated_links} gated links, button cell {}",
             g.gate(0).button_cell
         );
+
+        // Hook splice: build a fresh graph (the gate test mutated `g`) and run the hook pass with
+        // stock physics. Hooks derive from real geometry, so — like reach — we report the count
+        // rather than assert a floor (flat maps legitimately have none), but every emitted link
+        // must satisfy its invariants and its stored arc must re-simulate onto the target corridor.
+        let params = HookParams {
+            gravity: 800.0,
+            pull: HOOK_PULL_BASE,
+            throw: HOOK_THROW_BASE,
+        };
+        let mut gh = NavGraph::build(&bsp);
+        let reach_before = {
+            let step = (gh.cells.len() / 32).max(1);
+            (0..gh.cells.len() as u32)
+                .step_by(step)
+                .map(|s| directed_reach_len(&gh, s))
+                .max()
+                .unwrap_or(0)
+        };
+        gh.add_hooks(&bsp, params);
+        let hooks = gh.summary().hook;
+        let mut vertical = 0;
+        let mut fling = 0;
+        for li in 0..gh.links.len() as u32 {
+            if gh.link_kind(li) != LinkKind::Hook {
+                continue;
+            }
+            let tr = *gh.hook_of_link(li).expect("hook link missing its traversal");
+            let a = gh.cell_origin(gh.link_source(li));
+            let b = gh.cell_origin(gh.link_target(li));
+            let dz = b.z - a.z;
+            let horiz = (b.xy() - a.xy()).length();
+            assert!(
+                (HOOK_MIN_RISE..=HOOK_MAX_RISE).contains(&dz) && horiz <= HOOK_RANGE_XY,
+                "hook link out of range: dz={dz} horiz={horiz}"
+            );
+            assert!(dz > JUMP_APEX || horiz > JUMP_REACH, "hook link no better than a jump");
+            // Re-fly the stored arc: release point is `release_dist` back from the stick along v0.
+            let dir = tr.v0.normalize_or_zero();
+            let r = tr.stick - dir * tr.release_dist;
+            match simulate_arc(|p| bsp.is_solid(p), r, tr.v0, params.gravity) {
+                ArcResult::Land { pos, .. } => {
+                    let d = (pos.xy() - b.xy()).length();
+                    assert!(d <= HOOK_LAND_XY * 2.0, "stored arc lands {d} from target (li {li})");
+                }
+                _ => panic!("stored hook arc no longer lands (li {li})"),
+            }
+            if horiz > JUMP_REACH {
+                fling += 1;
+            } else {
+                vertical += 1;
+            }
+        }
+        // Determinism: a second identical build yields the same hook count (the runtime re-solve
+        // and the offline build must agree).
+        let mut gh2 = NavGraph::build(&bsp);
+        gh2.add_hooks(&bsp, params);
+        assert_eq!(gh2.summary().hook, hooks, "hook build not deterministic");
+
+        let reach_after = {
+            let step = (gh.cells.len() / 32).max(1);
+            (0..gh.cells.len() as u32)
+                .step_by(step)
+                .map(|s| directed_reach_len(&gh, s))
+                .max()
+                .unwrap_or(0)
+        };
+        assert!(reach_after >= reach_before, "hooks reduced reachability");
+        eprintln!(
+            "hook splice: {hooks} links ({vertical} vertical, {fling} fling); \
+             best directed reach {reach_before} -> {reach_after}"
+        );
+    }
+
+    /// Count cells directly reachable from `start` over the (directed) graph — a small DFS helper
+    /// shared by the reach-delta checks.
+    fn directed_reach_len(g: &NavGraph, start: CellId) -> usize {
+        let mut seen = vec![false; g.cells.len()];
+        let mut stack = vec![start];
+        seen[start as usize] = true;
+        let mut n = 1;
+        while let Some(c) = stack.pop() {
+            for &li in &g.adjacency[c as usize] {
+                let to = g.links[li as usize].to;
+                if !seen[to as usize] {
+                    seen[to as usize] = true;
+                    n += 1;
+                    stack.push(to);
+                }
+            }
+        }
+        n
     }
 }

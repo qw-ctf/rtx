@@ -577,9 +577,17 @@ impl GameState {
         let plats = self.collect_plats();
         let teleports = self.collect_teleports();
         let gates = self.collect_gates();
+        // Hook links are only worth building when the map hands out the grapple. Snapshot the live
+        // physics (gravity is 100 on e1m8; the hook speeds are tunable) so the arc solver on the
+        // worker thread matches how the hook will actually fly in-game.
+        let hooks = self.host.cvar_bool(c"rtx_grapple").then(|| navmesh::HookParams {
+            gravity: self.host.cvar(c"sv_gravity").max(1.0),
+            pull: navmesh::HOOK_PULL_BASE * self.host.cvar(c"rtx_hook_pull"),
+            throw: navmesh::HOOK_THROW_BASE * self.host.cvar(c"rtx_hook_speed"),
+        });
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(navmesh::build_navmesh(bytes, plats, teleports, gates));
+            let _ = tx.send(navmesh::build_navmesh(bytes, plats, teleports, gates, hooks));
         });
         self.nav.pending = Some(rx);
         self.host.dprint(c"rtx: navmesh: building in background...\n");
@@ -609,7 +617,7 @@ impl GameState {
         let goals = self.collect_goals(&graph);
         let msg = cstring(&format!(
             "rtx: navmesh: {} planes, {} clipnodes -> {} cells, {} links \
-             (walk {} step {} drop {} jump {} plat {} tele {}), {} gates, {} item goals\n",
+             (walk {} step {} drop {} jump {} plat {} tele {} hook {}), {} gates, {} item goals\n",
             bsp.planes.len(),
             bsp.clipnodes.len(),
             graph.cells.len(),
@@ -620,6 +628,7 @@ impl GameState {
             counts.jump,
             counts.plat,
             counts.teleport,
+            counts.hook,
             graph.gate_count(),
             goals.len(),
         ));
