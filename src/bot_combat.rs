@@ -31,6 +31,11 @@ const ROCKET_SPEED: f32 = 1000.0;
 const PREFERRED_RANGE: f32 = 400.0;
 /// Below this we're in self-splash territory for the RL — switch to the super shotgun.
 const SPLASH_RANGE: f32 = 140.0;
+/// How far short of the aim point a projectile may land and still count as a clear shot. A wall
+/// that stops the rocket more than this before `aim` means the muzzle→aim path is blocked (corner
+/// self-splash; blast radius is 160 and attacker self-damage is only halved). Matches the slack in
+/// [`crate::bot_grenade::rocket_shove`].
+const LINE_OF_FIRE_SLACK: f32 = 48.0;
 /// Retreat when hurt below this.
 const LOW_HEALTH: f32 = 40.0;
 
@@ -324,7 +329,29 @@ pub(crate) fn engage(
     let dp = bot::wrap180(view.x - clean.x);
     let dy = bot::wrap180(view.y - clean.y);
     let on_target = view == Vec3::ZERO || (dp * dp + dy * dy).sqrt() <= cone;
-    if on_target {
+
+    // Line-of-fire clearance for projectiles (in practice only the RL — LG/SG are hitscan, speed 0).
+    // The eye→enemy_eye gate at the top says the *enemy* is visible, but the rocket doesn't leave
+    // the eye: it spawns at the muzzle (`origin + fwd*8 + (0,0,16)`; see weapons.rs `w_fire_rocket`)
+    // and flies at the led/shin-dropped `aim` point, not the enemy's eyes. A peeker around a corner
+    // can pass the eye ray while the muzzle→aim path clips the corner and self-splashes. So trace
+    // the real line of fire and hold fire when a wall stops the rocket short of `aim`.
+    //
+    // Trace along `clean` (the geometric muzzle→aim direction), not the smoothed `bot.aim`: this
+    // judges the *intended* shot and stays steady frame-to-frame rather than chattering with the aim
+    // spring's lag and drifting error. `on_target` already keeps the emitted view within `cone` of
+    // `clean`, so over the 8u muzzle offset the two directions differ by well under a unit.
+    let lof_clear = if choice.projectile_speed > 0.0 {
+        let fwd = bot::angle_vectors(clean).0;
+        let muzzle = origin + fwd * 8.0 + Vec3::new(0.0, 0.0, 16.0);
+        let tr = game.traceline(muzzle, aim, false, e);
+        // Enemy body in the way ⇒ a direct hit, clear. Otherwise clear only if nothing stopped the
+        // rocket appreciably short of `aim`.
+        tr.ent == enemy || (muzzle + (aim - muzzle) * tr.fraction - aim).length() <= LINE_OF_FIRE_SLACK
+    } else {
+        true // hitscan: the eye-ray LoS above already governs the shot
+    };
+    if on_target && lof_clear {
         // The engine paces shots via `attack_finished`; holding fire shoots at the weapon's rate.
         *buttons |= BUTTON_ATTACK;
     }

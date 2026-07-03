@@ -66,6 +66,11 @@ const PLAT_RISE_TOL: f32 = 18.0;
 /// Minimum seconds between item-goal re-selections (so a bot commits to a pickup rather than
 /// flip-flopping between two of similar worth each frame).
 const GOAL_SELECT_INTERVAL: f32 = 1.5;
+/// How long after the last line-of-sight frame the nav view may still point at a Fight enemy's
+/// live origin. Set equal to combat's `HOLD_ANGLE_TIME` (the 2s corner-hold in `bot_combat::engage`):
+/// while that hold owns the view it overrides `look` anyway, so the handoff is seamless — hold the
+/// corner for 2s, then look where we're travelling instead of tracking the enemy through geometry.
+const LOOK_LOS_GRACE: f32 = 2.0;
 /// Goal watchdog: if a bot has been chasing the *same* item this long (and isn't detouring to open
 /// a gate) without ever collecting it, that item is effectively unreachable for it — abandon it and
 /// avoid it for `GOAL_AVOID_TIME`, then retry. Time-based (not distance) so a legitimate route that
@@ -597,8 +602,24 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // Where the *eyes* go while navigating: a couple of legs ahead of the feet (or the final
     // target when the route is short), so the view sweeps down the corridor instead of snapping
     // to every 32u grid cell the bot steps through. Steering still uses `waypoint`.
+    //
+    // But a Fight target we're *not* detouring on sets `target_origin` to the enemy's LIVE origin,
+    // so aiming the eyes there while we can't see the enemy tracks it through walls — an aimbot
+    // look. Once combat's 2s corner-hold lapses (or if we never saw them), look where we're
+    // *travelling* instead. Non-combat targets — a human we follow, a committed item goal, or a
+    // greedy detour (`chasing`) — are exactly where we want to look, so they keep `target_origin`.
+    let combat_blind =
+        enemy.is_some() && !chasing && (enemy_seen_time <= 0.0 || now - enemy_seen_time > LOOK_LOS_GRACE);
     let look_point = if bot.route_pos + 2 < bot.route.len() {
         graph.cell_origin(graph.link_target(bot.route[bot.route_pos + 2]))
+    } else if combat_blind {
+        // Past the route's end `waypoint` *is* `target_origin` (the enemy), so there fall through
+        // to our actual travel heading rather than re-pointing the eyes at the hidden enemy.
+        if final_leg && speed > 20.0 {
+            origin + Vec3::new(v_xy.x, v_xy.y, 0.0)
+        } else {
+            waypoint
+        }
     } else {
         target_origin
     };
@@ -663,7 +684,9 @@ fn run_bot(game: &mut GameState, e: EntId) {
     }
     // "Don't leap to your death": if we somehow reach the takeoff edge too slow to clear the gap,
     // hold the jump (keep accelerating) rather than launching short into it.
-    let sj_takeoff = cur_leg.and_then(|l| graph.speed_jump_of_link(l)).map(|tr| (tr.takeoff, tr.v_req));
+    let sj_takeoff = cur_leg
+        .and_then(|l| graph.speed_jump_of_link(l))
+        .map(|tr| (tr.takeoff, tr.v_req));
     let sj_hold = sj_active && {
         match sj_takeoff {
             Some((takeoff, v_req)) => {
@@ -1265,7 +1288,7 @@ fn nearest_human(game: &GameState, bot_e: EntId) -> Option<EntId> {
 }
 
 /// QuakeWorld `AngleVectors` (roll assumed 0): the view's forward and right unit vectors.
-fn angle_vectors(angles: Vec3) -> (Vec3, Vec3) {
+pub(crate) fn angle_vectors(angles: Vec3) -> (Vec3, Vec3) {
     let (sy, cy) = angles.y.to_radians().sin_cos();
     let (sp, cp) = angles.x.to_radians().sin_cos();
     let forward = Vec3::new(cp * cy, cp * sy, -sp);
