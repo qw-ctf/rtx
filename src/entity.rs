@@ -609,12 +609,11 @@ pub struct BotState {
     pub grenade_shove_edge: f32,
     /// Earliest time the bot may start another combo (anti-spam).
     pub grenade_next_try: f32,
-    /// Bunnyhop state (see `bot_bhop`): whether it's air-strafing this run, since when it became
-    /// eligible (engage hysteresis), the sticky strafe sign, and last frame's sent view yaw (to seed
-    /// the aim spring's angular velocity when combat resumes).
-    pub bhop: bool,
-    pub bhop_since: f32,
-    pub bhop_dir: f32,
+    /// The bunnyhop controller (see `bot_bhop`): the hop-cycle phase machine, sticky strafe sign,
+    /// engage hysteresis, and telemetry.
+    pub bhop: crate::bot_bhop::Bhop,
+    /// Last frame's sent bhop view yaw (to seed the aim spring's angular velocity when combat
+    /// resumes).
     pub bhop_prev_yaw: f32,
     /// The [`LinkKind::SpeedJump`](crate::navmesh::LinkKind::SpeedJump) leg currently being flown (a
     /// committed bhop run-up + leap), and when it began. `None` = not on a speed jump.

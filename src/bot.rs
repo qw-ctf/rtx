@@ -249,6 +249,8 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // now, since the `&mut bot` binding below blocks reading the edict during the move logic.
     let vz = game.entities[e].v.velocity.z;
     let air_jumped = game.entities[e].combat.air_jumped;
+    // When combat last had line of sight (see `bot_combat::engage`) — snapshot for the bhop veto.
+    let enemy_seen_time = game.entities[e].bot.enemy_seen_time;
     let v_xy = game.entities[e].v.velocity.xy();
     let speed = v_xy.length();
     // Snapshot grapple state up front (it's set in the previous frame's PlayerPreThink, so it's
@@ -549,7 +551,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // carries us up, so XY barely changes.
     // A bunnyhopping bot covers ground fast enough to orbit a 24u waypoint, so widen the arrival gate
     // with speed and also advance once a waypoint slips *behind* the velocity.
-    let arrive_r = if bot.bhop || bot.sj_leg.is_some() {
+    let arrive_r = if bot.bhop.phase != bot_bhop::Phase::Off || bot.sj_leg.is_some() {
         ARRIVE_RADIUS.max(2.0 * speed * frametime)
     } else {
         ARRIVE_RADIUS
@@ -565,7 +567,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
             LinkKind::Hook => false,
             _ => {
                 let to = target.xy() - origin.xy();
-                let fast = bot.bhop || bot.sj_leg.is_some();
+                let fast = bot.bhop.phase != bot_bhop::Phase::Off || bot.sj_leg.is_some();
                 to.length() <= arrive_r || (fast && to.dot(v_xy) < 0.0 && to.length() <= 64.0)
             }
         };
@@ -614,32 +616,32 @@ fn run_bot(game: &mut GameState, e: EntId) {
         bot.stuck_since = now;
     }
 
-    // Bunnyhop policy: air-strafe to build speed only on an open, roughly-straight ground stretch
-    // toward a far waypoint, with no combat / hook / gate / grenade demanding the view or movement.
-    // Eligibility must hold briefly before engaging (so a momentary straightaway doesn't stutter the
-    // gait); disengaging is instant. See `bot_bhop`.
+    // Bunnyhop policy verdicts — everything that needs game state is judged here; *when* each
+    // verdict may apply in the hop cycle (engage hysteresis, mid-hop commitment, landing-only
+    // disengage) is `bot_bhop::Bhop::step`'s job. The entry runway bar is deliberately fixed:
+    // the old `speed·0.9` bar rose as the bot gained speed and cut runs short mid-air.
     let goal_dist = (target_origin.xy() - origin.xy()).length();
-    let (runway_dist, runway_straight) = runway(graph, &bot.route, bot.route_pos, origin);
-    let bhop_eligible = host.cvar_bool(c"rtx_bot_bhop")
-        && enemy.is_none()
-        && !hook_active
-        && bot.gate.is_none()
-        && bot.grenade_phase == GrenadePhase::Idle
-        && !final_leg
+    let runway_dist = runway(graph, &bot.route, bot.route_pos, origin);
+    // Combat only vetoes bhop while it *owns the view* — the enemy is in sight (or lost a moment
+    // ago), when the eyes must aim, not sweep a strafe. A mere Fight target being chased across
+    // the map is navigation, and navigation bunnyhops; in FFA every bot always has a target, so
+    // gating on target existence kept bhop permanently off. The grace here is deliberately much
+    // shorter than combat's 2s corner-hold: on a small open FFA map sight contact is frequent,
+    // and a long window suppresses hopping almost everywhere.
+    const BHOP_COMBAT_GRACE: f32 = 0.5;
+    let combat_view = enemy.is_some() && enemy_seen_time > 0.0 && now - enemy_seen_time < BHOP_COMBAT_GRACE;
+    let bhop_veto = !host.cvar_bool(c"rtx_bot_bhop")
+        || combat_view
+        || hook_active
+        || bot.gate.is_some()
+        || bot.grenade_phase != GrenadePhase::Idle;
+    let bhop_entry = !final_leg
         && matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
         && goal_dist > 300.0
-        && runway_straight
-        && runway_dist >= 256.0f32.max(speed * 0.9);
-    if bhop_eligible {
-        if bot.bhop_since == 0.0 {
-            bot.bhop_since = now;
-        }
-        bot.bhop = now - bot.bhop_since >= 0.3;
-    } else {
-        bot.bhop_since = 0.0;
-        bot.bhop = false;
-        bot.bhop_dir = 0.0;
-    }
+        && runway_dist >= bot_bhop::RUNWAY_ENGAGE;
+    // Lenient continuation gate for taking *another* hop from a landing: leg kinds churn as the
+    // route advances, and a run in progress shouldn't be dumped by the stricter entry conditions.
+    let bhop_sustain = matches!(kind, Some(LinkKind::Walk | LinkKind::Step)) && goal_dist > 150.0;
     // A speed-jump leg is a *committed* bhop run-up + leap: engage bhop unconditionally (the link is a
     // pre-verified runway) and track it so the route stays frozen. Latch/clear `sj_leg` on the leg.
     let mut sj_active = matches!(kind, Some(LinkKind::SpeedJump)) && host.cvar_bool(c"rtx_bot_bhop") && !hook_active;
@@ -659,18 +661,71 @@ fn run_bot(game: &mut GameState, e: EntId) {
     } else if bot.sj_leg.is_some() {
         bot.sj_leg = None;
     }
-    let bhop_active = bot.bhop || sj_active;
     // "Don't leap to your death": if we somehow reach the takeoff edge too slow to clear the gap,
     // hold the jump (keep accelerating) rather than launching short into it.
+    let sj_takeoff = cur_leg.and_then(|l| graph.speed_jump_of_link(l)).map(|tr| (tr.takeoff, tr.v_req));
     let sj_hold = sj_active && {
-        match cur_leg.and_then(|l| graph.speed_jump_of_link(l)) {
-            Some(tr) => {
-                let to_edge = tr.takeoff.xy() - origin.xy();
-                (to_edge.length() < 48.0 || to_edge.dot(v_xy) < 0.0) && speed < tr.v_req * 0.9
+        match sj_takeoff {
+            Some((takeoff, v_req)) => {
+                let to_edge = takeoff.xy() - origin.xy();
+                (to_edge.length() < 48.0 || to_edge.dot(v_xy) < 0.0) && speed < v_req * 0.9
             }
             None => false,
         }
     };
+
+    // Drive the hop-cycle controller (see `bot_bhop::Bhop`). On a speed jump the runway is the
+    // run-up to the takeoff edge and the bearing aims straight at the landing so the leap goes
+    // across the gap; otherwise steer toward the look-ahead corridor point (smoother than the 32u
+    // next cell) with as much straight-ish corridor as the route offers.
+    let bhop_cmd = {
+        let dt = frametime.clamp(0.001, 0.05);
+        let accel = host.cvar(c"sv_accelerate");
+        let maxspeed = host.cvar(c"sv_maxspeed");
+        let env = bot_bhop::Env {
+            dt,
+            accel: if accel > 0.0 { accel } else { 10.0 },
+            maxspeed: if maxspeed > 0.0 { maxspeed } else { 320.0 },
+        };
+        let ahead = if sj_active { waypoint.xy() } else { look_point.xy() } - origin.xy();
+        let to_wp = waypoint.xy() - origin.xy();
+        let dir = if ahead.length() > 8.0 { ahead } else { to_wp };
+        let bearing = dir.y.atan2(dir.x).to_degrees();
+        let bhop_runway = match sj_takeoff {
+            Some((takeoff, _)) if sj_active => (takeoff.xy() - origin.xy()).length(),
+            _ => runway_dist,
+        };
+        let phase_was = bot.bhop.phase;
+        let cmd = bot.bhop.step(
+            &bot_bhop::Input {
+                v_xy,
+                on_ground,
+                bearing,
+                runway: bhop_runway,
+                eligible: bhop_entry,
+                sustain: bhop_sustain,
+                veto: bhop_veto,
+                committed: sj_active,
+                hold_jump: sj_hold,
+                now,
+            },
+            &env,
+        );
+        // A phase transition is the interesting diagnostic moment — why a run started or ended.
+        if bot.bhop.phase != phase_was && host.cvar_bool(c"rtx_bot_debug") {
+            let why = if bot.bhop.phase == bot_bhop::Phase::Off {
+                format!(" ({})", bot.bhop.off_reason)
+            } else {
+                String::new()
+            };
+            host.conprint(&cstring(&format!(
+                "rtx bot{client}: bhop {phase_was:?}->{:?}{why} spd={speed:.0} runway={bhop_runway:.0}\n",
+                bot.bhop.phase,
+            )));
+        }
+        cmd
+    };
+    let bhop_active = bhop_cmd.is_some();
 
     // Steering: face the waypoint and run toward it.
     let to_wp = waypoint.xy() - origin.xy();
@@ -857,7 +912,9 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // so a jump that falls short is retried on the next landing instead of the bot getting
     // stuck holding +jump against a ledge.
     if on_ground
-        && (force_jump || (bhop_active && !sj_hold) || matches!(kind, Some(LinkKind::JumpGap | LinkKind::DoubleJump)))
+        && (force_jump
+            || bhop_cmd.is_some_and(|c| c.jump)
+            || matches!(kind, Some(LinkKind::JumpGap | LinkKind::DoubleJump)))
     {
         buttons |= BUTTON_JUMP;
     }
@@ -996,44 +1053,12 @@ fn run_bot(game: &mut GameState, e: EntId) {
 
     // View + move for the frame. Bunnyhopping bypasses the aim spring and the world-move reprojection
     // entirely — an air-strafe needs the view yaw swept *independently* of the travel direction, with
-    // `forward = 0` and one strafe key held, which the reprojection can't express. Otherwise the
-    // normal aim spring smooths the view and the world move is projected onto it.
-    let (view, forward, side) = if bhop_active {
+    // `forward = 0` and one strafe key held, which the reprojection can't express. The controller
+    // already decided the whole cmd (air strafe, landing strafe+jump, or ground prestrafe); consume
+    // it here. Otherwise the normal aim spring smooths the view and the world move is projected onto it.
+    let (view, forward, side) = if let Some(c) = bhop_cmd {
         let dt = frametime.clamp(0.001, 0.05);
-        let accel = {
-            let a = host.cvar(c"sv_accelerate");
-            if a > 0.0 {
-                a
-            } else {
-                10.0
-            }
-        };
-        let maxspeed = {
-            let m = host.cvar(c"sv_maxspeed");
-            if m > 0.0 {
-                m
-            } else {
-                320.0
-            }
-        };
-        let a_max = bot_bhop::air_accel_max(accel, maxspeed, dt);
-        // Steer toward the look-ahead point (smoother than the 32u next cell) — but on a speed jump
-        // aim straight at the landing, so the leap goes across the gap, not off toward a later goal.
-        let ahead = if sj_active { waypoint.xy() } else { look_point.xy() } - origin.xy();
-        let bearing = if ahead.length() > 8.0 {
-            ahead.y.atan2(ahead.x).to_degrees()
-        } else {
-            yaw
-        };
-        let (view_yaw, fwd, sd) = if on_ground {
-            (bearing, MOVE_SPEED as i32, 0) // ground frame between hops: run straight; jump pressed above
-        } else {
-            let prev_sigma = game.entities[e].bot.bhop_dir;
-            let s = bot_bhop::strafe(v_xy, bearing, prev_sigma, a_max);
-            game.entities[e].bot.bhop_dir = s.sigma;
-            (s.view_yaw, 0, s.side.round() as i32)
-        };
-        let view = Vec3::new(look.x, view_yaw, 0.0);
+        let view = Vec3::new(look.x, c.view_yaw, 0.0);
         // Seed the aim spring so combat re-acquisition continues from the real view with a plausible
         // turn rate (a human-like flick) instead of snapping.
         let b = &mut game.entities[e].bot;
@@ -1045,7 +1070,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
         b.bhop_prev_yaw = view.y;
         b.aim = view;
         b.aim_vel = Vec3::new(0.0, yv, 0.0);
-        (view, fwd, sd)
+        (view, c.forward.round() as i32, c.side.round() as i32)
     } else {
         game.entities[e].bot.bhop_prev_yaw = 0.0; // forget the bhop yaw so the next engage seeds clean
         let dt = frametime.clamp(0.001, 0.05);
@@ -1107,10 +1132,15 @@ fn run_bot(game: &mut GameState, e: EntId) {
         let gate = game.entities[e].bot.gate;
         let route = game.entities[e].bot.route.len();
         let hph = game.entities[e].bot.hook_phase;
+        let bh = &game.entities[e].bot.bhop;
         host.conprint(&cstring(&format!(
-            "rtx bot{client}: enemy={} gate={gate:?} hook={hph:?} bhop={bhop_active} spd={speed:.0} \
-             route={route} fwd={forward} side={side} atk={}\n",
+            "rtx bot{client}: enemy={} gate={gate:?} hook={hph:?} bhop={:?} hops={} flips={} peak={:.0} \
+             spd={speed:.0} route={route} fwd={forward} side={side} atk={}\n",
             enemy.is_some(),
+            bh.phase,
+            bh.hops,
+            bh.flips,
+            bh.peak,
             (buttons & BUTTON_ATTACK) != 0,
         )));
     }
@@ -1148,33 +1178,39 @@ fn button_reachable(graph: &NavGraph, from: CellId, gi: usize, gate_closed: &[bo
     }
 }
 
-/// How far, and whether, a bunnyhop runway extends from `route_pos`: sum the lengths of the leading
-/// `Walk`/`Step` legs while each stays within ~20° of the initial heading, stopping at the first
-/// turn, non-ground leg, or route end. Returns `(distance, has_a_straight_leg)`.
-fn runway(graph: &NavGraph, route: &[u32], route_pos: usize, origin: Vec3) -> (f32, bool) {
-    let Some(&first) = route.get(route_pos) else {
-        return (0.0, false);
-    };
-    let base = graph.cell_origin(graph.link_target(first)).xy() - origin.xy();
-    if base.length() < 1.0 {
-        return (0.0, false);
-    }
-    let base_yaw = base.y.atan2(base.x).to_degrees();
-    let (mut dist, mut prev, mut any) = (0.0, origin.xy(), false);
-    for &leg in &route[route_pos..] {
+/// How far a bunnyhop runway extends from `route_pos`: sum the lengths of the leading `Walk`/`Step`
+/// legs while the corridor keeps roughly its heading, stopping at the first sharp turn, non-ground
+/// leg, or route end. Each segment may bend up to ~30° from the *previous* segment — measuring
+/// against the neighbour rather than the initial heading lets a gently curving corridor accumulate
+/// (the weave tracks such bends fine); the old initial-heading test cut real-map runways so short
+/// that bhop barely ever engaged.
+fn runway(graph: &NavGraph, route: &[u32], route_pos: usize, origin: Vec3) -> f32 {
+    // Judge bends on ~chord-length spans, not per 32u leg: grid-quantized cell centres zigzag on
+    // any heading between grid axes, which a per-segment angle test misreads as constant turning.
+    const CHORD: f32 = 96.0;
+    const MAX_BEND: f32 = 35.0;
+    let (mut dist, mut prev) = (0.0, origin.xy());
+    let (mut anchor, mut anchor_dist) = (origin.xy(), 0.0);
+    let mut chord_yaw = None::<f32>;
+    for &leg in route.get(route_pos..).unwrap_or_default() {
         if !matches!(graph.link_kind(leg), LinkKind::Walk | LinkKind::Step) {
             break;
         }
         let tgt = graph.cell_origin(graph.link_target(leg)).xy();
-        let seg = tgt - prev;
-        if seg.length() > 1.0 && wrap180(seg.y.atan2(seg.x).to_degrees() - base_yaw).abs() > 20.0 {
-            break; // the corridor turned — end of the straightaway
-        }
-        dist += seg.length();
+        dist += (tgt - prev).length();
         prev = tgt;
-        any = true;
+        if dist - anchor_dist >= CHORD {
+            let c = tgt - anchor;
+            let yaw = c.y.atan2(c.x).to_degrees();
+            if chord_yaw.is_some_and(|p| wrap180(yaw - p).abs() > MAX_BEND) {
+                return anchor_dist; // the corridor turned somewhere in this chord — stop before it
+            }
+            chord_yaw = Some(yaw);
+            anchor = tgt;
+            anchor_dist = dist;
+        }
     }
-    (dist, any)
+    dist
 }
 
 /// A wander destination for an idle bot with nothing to chase: a random reachable navmesh cell,
@@ -1242,5 +1278,77 @@ fn angle_vectors(angles: Vec3) -> (Vec3, Vec3) {
 pub fn on_disconnect(ent: &mut Entity) {
     if ent.bot.is_bot {
         ent.bot = BotState::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bsp::Bsp;
+    use crate::navmesh::NavGraph;
+
+    /// On a real map, traversal routes must expose usable bhop runways. Regression for the grid
+    /// staircase: cell centres sit on a 32u grid, so any route heading between grid axes zigzags
+    /// (segments alternating 0°/45°), and a naive per-segment bend test reads that as a constant
+    /// sharp turn — truncating every runway to nothing and keeping bhop permanently off in play.
+    /// Run with `RTX_TEST_BSP=…/dm6.bsp`; skipped (vacuously green) when unset.
+    #[test]
+    fn real_map_routes_have_runways() {
+        let Ok(path) = std::env::var("RTX_TEST_BSP") else {
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read bsp");
+        let bsp = Bsp::parse(&bytes).expect("parse bsp");
+        let graph = NavGraph::build(&bsp);
+        // Sample routes between far-apart cell pairs and record the best runway a bot would see
+        // anywhere along each route.
+        let mut best = 0.0f32;
+        let (mut positions, mut kind_ok, mut run_ok, mut entry_ok) = (0u32, 0u32, 0u32, 0u32);
+        let stride = (graph.cells.len() / 64).max(1);
+        let sample: Vec<u32> = (0..graph.cells.len() as u32).step_by(stride).collect();
+        let mut routes = 0;
+        for (i, &a) in sample.iter().enumerate() {
+            for &b in &sample[i + 1..] {
+                let d = (graph.cell_origin(a).xy() - graph.cell_origin(b).xy()).length();
+                if d < 600.0 {
+                    continue;
+                }
+                let Some(route) = graph.find_path(a, b, &[]) else {
+                    continue;
+                };
+                routes += 1;
+                for pos in 0..route.len() {
+                    let origin = graph.cell_origin(graph.link_source(route[pos]));
+                    let r = runway(&graph, &route, pos, origin);
+                    best = best.max(r);
+                    let walkish = matches!(graph.link_kind(route[pos]), LinkKind::Walk | LinkKind::Step);
+                    let goal_far = (graph.cell_origin(b).xy() - origin.xy()).length() > 300.0;
+                    positions += 1;
+                    kind_ok += walkish as u32;
+                    run_ok += (r >= bot_bhop::RUNWAY_ENGAGE) as u32;
+                    entry_ok += (walkish && goal_far && r >= bot_bhop::RUNWAY_ENGAGE) as u32;
+                }
+                if routes >= 40 {
+                    break;
+                }
+            }
+            if routes >= 40 {
+                break;
+            }
+        }
+        assert!(routes > 0, "no long routes found to sample");
+        eprintln!(
+            "runway stats over {routes} routes, {positions} positions: best={best:.0}u \
+             kind_ok={:.0}% runway_ok={:.0}% entry_ok={:.0}%",
+            100.0 * kind_ok as f32 / positions as f32,
+            100.0 * run_ok as f32 / positions as f32,
+            100.0 * entry_ok as f32 / positions as f32,
+        );
+        assert!(
+            best >= 400.0,
+            "best runway across {routes} long routes is only {best:.0}u — real-map corridors \
+             never clear the {:.0}u engage bar",
+            bot_bhop::RUNWAY_ENGAGE
+        );
     }
 }
