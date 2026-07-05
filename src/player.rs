@@ -478,10 +478,9 @@ impl GameState {
             self.reset_grapple(hook);
         }
         self.drop_backpack(e);
-        // A killed flag carrier drops the flag where they fell; a rune-holder drops their rune
-        // (both no-ops outside CTF).
-        self.drop_flag_if_carrying(e);
-        self.drop_runes(e);
+        // Let the mode react to the death (CTF drops the carried flag + held runes here).
+        let mode = self.mode;
+        mode.player_died(self, e);
         let vz = self.entities[e].v.velocity.z;
         let zboost = if vz < 10.0 { self.rng_unit() * 300.0 } else { 0.0 };
         {

@@ -222,6 +222,10 @@ impl GameMode for TeamMatch {
         // waste shots on allies. Falls back to the generic roam when no enemy is in play.
         nearest_enemy(g, bot).map(BotIntent::Fight)
     }
+
+    fn handle_command(&self, g: &mut GameState, _e: EntId, cmd: &str) -> bool {
+        match_handle_command(g, cmd)
+    }
 }
 
 impl MatchMode for TeamMatch {
@@ -253,50 +257,62 @@ impl MatchMode for TeamMatch {
     }
 }
 
+/// Reset (or resume) team-match state on a map (re)load, called from [`super::on_worldspawn`]. A
+/// match-start reload (`resuming`) preserves the locked roster and **arms the countdown**; any other
+/// load — a fresh map or a switch away from a match mode — starts a fresh warmup (keeping the parsed
+/// format). Runs after `refresh_mode` (which owns the alias→config tracking). Shared by team DM and
+/// CTF, since both live on the same [`MatchState`].
+pub(crate) fn on_worldspawn(g: &mut GameState) {
+    if !is_match_mode(g.mode.name()) {
+        g.team_match = MatchState::default();
+        return;
+    }
+    if g.team_match.resuming {
+        g.team_match.resuming = false;
+        let cd = g.host().cvar(c"rtx_match_countdown").max(0.0);
+        g.team_match.phase = MatchPhase::Countdown { until: g.time() + cd };
+        g.team_match.last_count = -1;
+    } else {
+        let cfg = g.team_match.config;
+        g.team_match = MatchState {
+            config: cfg,
+            ..Default::default()
+        };
+    }
+}
+
+/// Begin a match: lock the current roster and reload the map. Dispatched from a mode's
+/// [`GameMode::handle_command`] on the `start` command. The countdown is armed in
+/// [`on_worldspawn`] after the reload (via `resuming`).
+pub(crate) fn start_match(g: &mut GameState) {
+    if !is_match_mode(g.mode.name()) || !matches!(g.team_match.phase, MatchPhase::Warmup) {
+        return;
+    }
+    let roster: Vec<(String, u8)> = players(g)
+        .into_iter()
+        .map(|e| (g.netname_of(e), g.entities[e].arena.team))
+        .collect();
+    if roster.is_empty() {
+        return;
+    }
+    g.team_match.roster = roster;
+    g.team_match.resuming = true;
+    g.broadcast(crate::defs::PrintLevel::High, "Match starting — reloading map…\n");
+    let map = cstring(&g.level.mapname);
+    g.host().changelevel(&map);
+}
+
+/// A match mode's console-command hook: consume `start`. Shared by team DM and CTF.
+pub(crate) fn match_handle_command(g: &mut GameState, cmd: &str) -> bool {
+    if cmd == "start" {
+        start_match(g);
+        true
+    } else {
+        false
+    }
+}
+
 impl TeamMatch {
-    /// Reset (or resume) team-match state on a map (re)load, called from `worldspawn`. A match-start
-    /// reload (`resuming`) preserves the locked roster and **arms the countdown**; any other load —
-    /// a fresh map or a switch away from team mode — starts a fresh warmup (keeping the parsed
-    /// format). Runs after `refresh_mode` (which owns the alias→config tracking).
-    pub(crate) fn on_worldspawn(g: &mut GameState) {
-        if !is_match_mode(g.mode.name()) {
-            g.team_match = MatchState::default();
-            return;
-        }
-        if g.team_match.resuming {
-            g.team_match.resuming = false;
-            let cd = g.host().cvar(c"rtx_match_countdown").max(0.0);
-            g.team_match.phase = MatchPhase::Countdown { until: g.time() + cd };
-            g.team_match.last_count = -1;
-        } else {
-            let cfg = g.team_match.config;
-            g.team_match = MatchState {
-                config: cfg,
-                ..Default::default()
-            };
-        }
-    }
-
-    /// Begin a match: lock the current roster and reload the map. Called from the `start` command.
-    /// The countdown is armed in `on_worldspawn` after the reload (via `resuming`).
-    pub(crate) fn start(g: &mut GameState) {
-        if !is_match_mode(g.mode.name()) || !matches!(g.team_match.phase, MatchPhase::Warmup) {
-            return;
-        }
-        let roster: Vec<(String, u8)> = players(g)
-            .into_iter()
-            .map(|e| (g.netname_of(e), g.entities[e].arena.team))
-            .collect();
-        if roster.is_empty() {
-            return;
-        }
-        g.team_match.roster = roster;
-        g.team_match.resuming = true;
-        g.broadcast(crate::defs::PrintLevel::High, "Match starting — reloading map…\n");
-        let map = cstring(&g.level.mapname);
-        g.host().changelevel(&map);
-    }
-
     /// Broadcast the match result (duel scoreline, or per-team tally). The post-match pause is
     /// entered by the shared [`tick_lifecycle`] machine.
     fn end_match(&self, g: &mut GameState) {

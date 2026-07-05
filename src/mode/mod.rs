@@ -197,6 +197,41 @@ pub(crate) trait GameMode: Sync {
     fn bot_intent(&self, _g: &mut GameState, _bot: EntId) -> Option<BotIntent> {
         None
     }
+
+    /// The active mode's own map-(re)load hook, run by [`on_worldspawn`] after the shared Arena /
+    /// team-match reset. Default: nothing.
+    fn on_worldspawn(&self, _g: &mut GameState) {}
+
+    /// A client is leaving (a human disconnecting, or a bot trimmed by the population manager),
+    /// called before the slot is retired. Used by CTF to drop a carried flag. Default: nothing.
+    fn on_client_disconnect(&self, _g: &mut GameState, _e: EntId) {}
+
+    /// Early in each live player's `PlayerPreThink`, before the death/dying checks. Used by CTF for
+    /// the Regeneration rune's periodic heal. Default: nothing.
+    fn player_prethink(&self, _g: &mut GameState, _e: EntId) {}
+
+    /// The player's body is dying (`player_die`, after the backpack drop and before the corpse is
+    /// tossed). Used by CTF to drop the carried flag and any held runes. Default: nothing.
+    fn player_died(&self, _g: &mut GameState, _e: EntId) {}
+
+    /// Offer a pending player impulse to the mode; return `true` if the mode consumed it (skipping
+    /// the stock impulse table). Used by CTF for the flag/rune toss (impulses 24 / 26). Default:
+    /// `false`.
+    fn handle_impulse(&self, _g: &mut GameState, _e: EntId, _impulse: i32) -> bool {
+        false
+    }
+
+    /// Offer a client console command to the mode; return `true` if the mode consumed it. Used by
+    /// the match modes for `start`. Default: `false`.
+    fn handle_command(&self, _g: &mut GameState, _e: EntId, _cmd: &str) -> bool {
+        false
+    }
+
+    /// Multiplier applied to a freshly-set attack cooldown (`attack_finished`), letting a mode speed
+    /// up or slow down firing. CTF's Haste rune returns `0.5` (fire ~2× as fast). Default: `1.0`.
+    fn attack_cooldown_scale(&self, _g: &GameState, _e: EntId) -> f32 {
+        1.0
+    }
 }
 
 /// The FFA singleton — the baseline mode and the default when `rtx_mode` is unset/unknown.
@@ -268,6 +303,17 @@ impl GameState {
             }
         }
     }
+}
+
+/// Map (re)load housekeeping for the mode layer, called from `worldspawn` after `refresh_mode`.
+/// Resets the per-map round state (Arena) and reconciles the team-match state — which must run for
+/// *every* mode, since switching away from a match mode has to clear it (so it can't hang off the
+/// active mode's own hook). Then the active mode's own [`GameMode::on_worldspawn`] runs.
+pub(crate) fn on_worldspawn(g: &mut GameState) {
+    g.arena = ArenaState::default();
+    team::on_worldspawn(g);
+    let mode = g.mode;
+    mode.on_worldspawn(g);
 }
 
 // --- shared player-roster helpers (used by every mode) -----------------------------------------

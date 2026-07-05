@@ -132,8 +132,10 @@ impl GameState {
         self.broadcast(PrintLevel::High, &message);
         self.host
             .sound(player, Channel::Body, Sound::PLAYER_TORNOFF2, 1.0, Attenuation::None);
-        // Drop a carried flag before `retire_slot` clears the carry marker (no-op outside CTF).
-        self.drop_flag_if_carrying(player);
+        // Let the mode react before `retire_slot` clears its per-player state (CTF drops a carried
+        // flag here).
+        let mode = self.mode;
+        mode.on_client_disconnect(self, player);
         self.retire_slot(player);
     }
 
@@ -275,7 +277,8 @@ impl GameState {
 
         self.check_rules(e);
         self.water_move(e);
-        self.ctf_rune_regen(e); // Regeneration rune (no-op outside CTF)
+        let mode = self.mode;
+        mode.player_prethink(self, e); // CTF Regeneration rune tick
 
         let deadflag = self.entities[e].v.deadflag;
         if deadflag >= DeadFlag::Dead.as_f32() {
@@ -374,10 +377,11 @@ impl GameState {
                 self.client_kill(e);
                 1
             }
-            // Start a team match: lock the roster, reload the map, run the countdown (no-op unless a
-            // team `rtx_mode` is active and we're in warmup). See `crate::mode::team`.
+            // Match-lifecycle commands ("start") are owned by the active mode; consume the token
+            // regardless so a stray "start" in a non-match mode isn't handed to the engine.
             "start" => {
-                crate::mode::TeamMatch::start(self);
+                let mode = self.mode;
+                mode.handle_command(self, e, "start");
                 1
             }
             _ => 0,

@@ -801,11 +801,14 @@ impl GameState {
             }
             _ => {}
         }
-        // CTF Haste rune: halve the remaining attack cooldown (fire ~2× as fast).
-        if self.entities[e].arena.runes & crate::defs::RUNE_HASTE != 0 {
+        // Mode cooldown scaling applied to the cooldown the weapon just set (CTF's Haste rune fires
+        // ~2× as fast).
+        let mode = self.mode;
+        let scale = mode.attack_cooldown_scale(self, e);
+        if scale != 1.0 {
             let af = self.entities[e].combat.attack_finished;
             if af > time {
-                self.entities[e].combat.attack_finished = time + (af - time) * 0.5;
+                self.entities[e].combat.attack_finished = time + (af - time) * scale;
             }
         }
     }
@@ -940,21 +943,23 @@ impl GameState {
         }
     }
 
-    /// `ImpulseCommands` — dispatch the pending impulse, then clear it.
+    /// `ImpulseCommands` — dispatch the pending impulse, then clear it. The active mode gets first
+    /// refusal (CTF claims the flag/rune toss impulses); the stock table handles the rest.
     fn impulse_commands(&mut self, e: EntId) {
         let impulse = self.entities[e].v.impulse as i32;
-        match impulse {
-            1..=8 => self.w_change_weapon(e),
-            9 => self.cheat_command(e),
-            10 => self.cycle_weapon(e, false),
-            11 => self.entities[e].v.team += 1.0, // ServerflagsCommand stand-in
-            12 => self.cycle_weapon(e, true),
-            20 => self.toss_ammo(e),      // drop a capped ammo backpack (rtx_dropitems)
-            21 => self.toss_weapon(e),    // drop your current weapon (rtx_dropitems)
-            22 => self.select_grapple(e), // grappling hook
-            24 => self.toss_rune(e),      // CTF: drop your held rune
-            26 => self.toss_flag(e),      // CTF: toss the enemy flag you carry
-            _ => {}
+        let mode = self.mode;
+        if !mode.handle_impulse(self, e, impulse) {
+            match impulse {
+                1..=8 => self.w_change_weapon(e),
+                9 => self.cheat_command(e),
+                10 => self.cycle_weapon(e, false),
+                11 => self.entities[e].v.team += 1.0, // ServerflagsCommand stand-in
+                12 => self.cycle_weapon(e, true),
+                20 => self.toss_ammo(e),      // drop a capped ammo backpack (rtx_dropitems)
+                21 => self.toss_weapon(e),    // drop your current weapon (rtx_dropitems)
+                22 => self.select_grapple(e), // grappling hook
+                _ => {}
+            }
         }
         self.entities[e].v.impulse = 0.0;
     }

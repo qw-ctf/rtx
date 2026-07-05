@@ -5,7 +5,6 @@
 use crate::assets;
 use crate::entity::EntId;
 use crate::game::GameState;
-use crate::mode::ArenaState;
 
 /// `worldspawn` — global level setup: gravity, precaches, light-style animation tables.
 /// (The QuakeC body's `InitBodyQue`/body-queue setup is deferred to a later milestone.)
@@ -58,12 +57,10 @@ pub fn worldspawn(game: &mut GameState) {
 
     // Pick the game mode from `rtx_mode` now, and re-sync it every frame in `start_frame`.
     game.refresh_mode();
-    // Fresh map = fresh match: reset any round state (refresh_mode only resets on a mode change,
-    // so a same-mode map change would otherwise carry a stale mid-round state over).
-    game.arena = ArenaState::default();
-    // Team-match state is guarded rather than blindly reset: a match-start reload preserves the
-    // locked roster and arms the countdown; any other load starts a fresh warmup.
-    crate::mode::TeamMatch::on_worldspawn(game);
+    // Fresh map = fresh match: reset the mode layer's per-map state. Round state (Arena) is cleared
+    // outright; team-match state is guarded — a match-start reload preserves the locked roster and
+    // arms the countdown, any other load starts a fresh warmup.
+    crate::mode::on_worldspawn(game);
 }
 
 /// `StartFrame` — runs once per server frame. Refreshes match cvars and the frame counter.

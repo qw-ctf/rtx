@@ -22,7 +22,7 @@
 use glam::Vec3;
 
 use super::team::{self, match_weapons_hot, team_spawn, tick_lifecycle, MatchMode};
-use super::{players, BotIntent, GameMode};
+use super::{players, BotIntent, DamageOutcome, GameMode};
 use crate::assets::{Model, Sound};
 use crate::defs::{
     Attenuation, Channel, MoveType, PrintLevel, Solid, RUNE_HASTE, RUNE_MASK, RUNE_REGEN, RUNE_RESISTANCE,
@@ -88,12 +88,84 @@ impl GameMode for Ctf {
         match_weapons_hot(g)
     }
 
+    fn player_damage(
+        &self,
+        g: &mut GameState,
+        targ: EntId,
+        attacker: EntId,
+        _inflictor: EntId,
+        incoming: f32,
+    ) -> DamageOutcome {
+        // Rune damage: Strength doubles the attacker's outgoing damage (after quad); Resistance
+        // halves the target's incoming. Also mark a carrier-defense window when an enemy hurts a
+        // flag carrier (see `ctf_frag_bonuses`). Runes exist only in CTF, so this whole rule lives
+        // here rather than inline in `t_damage`.
+        let mut damage = incoming;
+        if g.entities[attacker].arena.runes & RUNE_STRENGTH != 0 {
+            damage *= 2.0;
+        }
+        if g.entities[targ].arena.runes & RUNE_RESISTANCE != 0 {
+            damage *= 0.5;
+        }
+        if g.entities[targ].arena.carrying != 0
+            && attacker != targ
+            && g.entities[attacker].classname() == Some("player")
+            && g.entities[attacker].arena.team != g.entities[targ].arena.team
+        {
+            g.entities[attacker].arena.last_hurt_carrier = g.time();
+        }
+        DamageOutcome::pass(damage)
+    }
+
     fn bot_intent(&self, g: &mut GameState, bot: EntId) -> Option<BotIntent> {
         ctf_bot_intent(g, bot)
     }
 
     fn on_death(&self, g: &mut GameState, victim: EntId, attacker: EntId) {
         ctf_frag_bonuses(g, victim, attacker);
+    }
+
+    fn on_client_disconnect(&self, g: &mut GameState, e: EntId) {
+        // Drop a carried flag before the slot is retired (its carry marker is about to be cleared).
+        // Runes are intentionally *not* dropped on disconnect (only on death).
+        g.drop_flag_if_carrying(e);
+    }
+
+    fn player_prethink(&self, g: &mut GameState, e: EntId) {
+        g.ctf_rune_regen(e); // Regeneration rune's periodic heal
+    }
+
+    fn player_died(&self, g: &mut GameState, e: EntId) {
+        // A killed carrier drops the flag where they fell; a rune-holder drops their rune.
+        g.drop_flag_if_carrying(e);
+        g.drop_runes(e);
+    }
+
+    fn handle_impulse(&self, g: &mut GameState, e: EntId, impulse: i32) -> bool {
+        match impulse {
+            24 => {
+                g.toss_rune(e); // drop your held rune
+                true
+            }
+            26 => {
+                g.toss_flag(e); // toss the enemy flag you carry
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_command(&self, g: &mut GameState, _e: EntId, cmd: &str) -> bool {
+        team::match_handle_command(g, cmd)
+    }
+
+    fn attack_cooldown_scale(&self, g: &GameState, e: EntId) -> f32 {
+        // Haste rune: fire ~2× as fast.
+        if g.entities[e].arena.runes & RUNE_HASTE != 0 {
+            0.5
+        } else {
+            1.0
+        }
     }
 }
 
@@ -375,10 +447,9 @@ impl GameState {
     /// Impulse 26 — toss the enemy flag you carry (gated by `rtx_ctf_tossflag`). It flies along your
     /// aim and you can't re-grab it for 2 s.
     pub(crate) fn toss_flag(&mut self, player: EntId) {
-        if self.mode.name() != "ctf"
-            || !self.host.cvar_bool(c"rtx_ctf_tossflag")
-            || self.entities[player].arena.carrying == 0
-        {
+        // Reached only via `Ctf::handle_impulse`, so the mode is already CTF; just the cvar gate + a
+        // carry check remain.
+        if !self.host.cvar_bool(c"rtx_ctf_tossflag") || self.entities[player].arena.carrying == 0 {
             return;
         }
         let Some(flag) = self.carried_flag(player) else {
@@ -671,7 +742,8 @@ impl GameState {
 
     /// Impulse 24 — toss your held rune(s) along your aim (gated by `rtx_ctf_tossrune`).
     pub(crate) fn toss_rune(&mut self, player: EntId) {
-        if self.mode.name() != "ctf" || !self.host.cvar_bool(c"rtx_ctf_tossrune") {
+        // Reached only via `Ctf::handle_impulse`; just the cvar gate remains.
+        if !self.host.cvar_bool(c"rtx_ctf_tossrune") {
             return;
         }
         let runes = self.entities[player].arena.runes & RUNE_MASK;
