@@ -19,6 +19,7 @@ pub(crate) mod bhop;
 mod combat;
 pub(crate) mod goals;
 mod grenade;
+mod hook;
 pub(crate) mod state;
 
 use crate::bot::state::{BotState, GrenadePhase, HookPhase};
@@ -781,144 +782,37 @@ fn run_bot(game: &mut GameState, e: EntId) {
         angles
     };
 
-    // --- grappling-hook leg driver -------------------------------------------------------------
-    // Fly a LinkKind::Hook leg: select the grapple, settle the view on the anchor, throw, reel to
-    // build speed, then release into a gravity parabola that lands on the target ledge. All physics
-    // reads come from the `anchor`/`hook_out`/`on_hook` snapshot; graph reads use `cur_leg`'s stored
-    // HookTraversal. `reset_grapple` (needs `&mut game`) is deferred to `hook_reset` and flushed
-    // after the graph borrow ends. Per-phase timeouts are the traversal's own stuck detection.
-    let mut hook_look_target: Option<Vec3> = None; // view override → the anchor / landing
-    let mut hook_stand = false; // hold ground still (reel/parabola own the velocity)
-    let mut hook_approach: Option<Vec3> = None; // Aim: walk toward the throw stance (source cell)
-    let mut hook_select = false; // need to switch to the grapple
-    let mut hook_fire_ready = false; // Aim: eligible to throw once the smoothed view settles
-    let mut hook_hold_fire = false; // Flight/Reel: keep +attack held
-    let mut hook_reset: Option<EntId> = None; // deferred reset_grapple target
-    let mut hook_failed = false;
-    if hook_active {
-        if let Some((leg, tr)) = cur_leg.and_then(|l| graph.hook_of_link(l).copied().map(|t| (l, t))) {
-            let src = graph.cell_origin(graph.link_source(leg));
-            let tgt = graph.cell_origin(graph.link_target(leg));
-            // An enemy in an early phase → let combat win; abort a hook we haven't committed to.
-            if enemy.is_some() && matches!(bot.hook_phase, HookPhase::Idle | HookPhase::Aim) {
-                if hook_out {
-                    hook_reset = Some(grapple_hook);
-                }
-                bot.hook_phase = HookPhase::Idle;
-            } else {
-                if bot.hook_phase == HookPhase::Idle {
-                    if !has_grapple {
-                        hook_failed = true; // no hook to fly this leg (a mode stripped it)
-                    } else {
-                        bot.hook_phase = HookPhase::Aim;
-                        bot.hook_link = leg;
-                        bot.hook_started = now;
-                        bot.hook_release_dist = tr.release_dist;
-                    }
-                }
-                match bot.hook_phase {
-                    HookPhase::Aim => {
-                        hook_look_target = Some(tr.stick);
-                        if weapon != Weapon::Grapple {
-                            hook_select = true;
-                        }
-                        if (origin.xy() - src.xy()).length() <= HOOK_STANCE {
-                            hook_stand = true;
-                            if weapon == Weapon::Grapple && on_ground && !hook_out {
-                                hook_fire_ready = true; // the throw fires post-spring, once aimed
-                            }
-                        } else {
-                            hook_approach = Some(src);
-                        }
-                        if now - bot.hook_started > HOOK_AIM_TIMEOUT {
-                            hook_failed = true;
-                        }
-                    }
-                    HookPhase::Flight => {
-                        hook_look_target = Some(tr.stick);
-                        hook_stand = true;
-                        hook_hold_fire = true;
-                        if on_hook {
-                            if (anchor - tr.stick).length() > HOOK_ANCHOR_DRIFT {
-                                hook_failed = true; // stuck somewhere the solve didn't predict
-                            } else {
-                                bot.hook_phase = HookPhase::Reel;
-                                bot.hook_started = now;
-                                bot.hook_prev_dist = (origin - anchor).length();
-                            }
-                        } else if !hook_out || now - bot.hook_started > HOOK_FLIGHT_TIMEOUT {
-                            hook_failed = true; // throw missed / hit sky (server reset it)
-                        }
-                    }
-                    HookPhase::Reel => {
-                        hook_look_target = Some(tgt); // pre-aim the landing
-                        hook_stand = true;
-                        hook_hold_fire = true;
-                        let d = (origin - anchor).length();
-                        if !on_hook || !hook_out || (anchor - tr.stick).length() > HOOK_ANCHOR_DRIFT {
-                            hook_failed = true; // hook lost or the anchor moved (door/plat/player)
-                        } else if d - reel_half_step <= bot.hook_release_dist {
-                            // Release: drop +attack so `service_grapple` lets go next PreThink.
-                            hook_hold_fire = false;
-                            bot.hook_phase = HookPhase::Ballistic;
-                            bot.hook_started = now;
-                        } else if d > bot.hook_prev_dist - 1.0 && now - bot.hook_started > HOOK_REEL_TIMEOUT {
-                            hook_failed = true; // reel stalled against a lip
-                        } else {
-                            bot.hook_prev_dist = d.min(bot.hook_prev_dist);
-                        }
-                    }
-                    HookPhase::Ballistic => {
-                        hook_look_target = Some(tgt);
-                        hook_stand = true; // zero input: the frictionless arc must match the solve
-                        if on_ground && now - bot.hook_started > 0.1 {
-                            if (origin.xy() - tgt.xy()).length() <= ARRIVE_RADIUS * 2.0 {
-                                bot.hook_fails = 0;
-                            }
-                            bot.route_pos += 1; // clear the hook leg; repath from the landing
-                            bot.hook_phase = HookPhase::Idle;
-                            bot.repath_time = now;
-                        } else if now - bot.hook_started > tr.airtime + HOOK_BALLISTIC_SLACK {
-                            bot.hook_phase = HookPhase::Idle; // never landed cleanly — just repath
-                            bot.repath_time = now;
-                        }
-                    }
-                    HookPhase::Idle => {}
-                }
-            }
-        } else {
-            // hooking but the current leg isn't a solvable hook (route changed under us) — abort.
-            if hook_out {
-                hook_reset = Some(grapple_hook);
-            }
-            bot.hook_phase = HookPhase::Idle;
-        }
-    }
-    if hook_failed {
-        if hook_out {
-            hook_reset = Some(grapple_hook);
-        }
-        bot.hook_phase = HookPhase::Idle;
-        bot.hook_fails = bot.hook_fails.saturating_add(1);
-        bot.repath_time = now;
-        if bot.hook_fails >= 2 {
-            bot.hook_fails = 0;
-            bot.route.clear();
-            if chasing {
-                bot.avoid_item = bot.goal_item;
-                bot.avoid_until = now + GOAL_AVOID_TIME;
-                bot.goal_item = 0;
-                bot.goal_select_time = now;
-            }
-        }
-    }
+    // Grappling-hook leg driver: fly a LinkKind::Hook leg (select the grapple, settle the view on
+    // the anchor, throw, reel to build speed, release into a parabola onto the target ledge). Its
+    // whole state machine lives in `hook::drive_hook`; here we just feed it the frame snapshot and
+    // apply the HookDrive it returns. The deferred `reset` (needs `&mut game`) is flushed later.
+    let hook = hook::drive_hook(
+        graph,
+        bot,
+        hook::HookCtx {
+            hook_active,
+            cur_leg,
+            enemy,
+            hook_out,
+            on_hook,
+            grapple_hook,
+            has_grapple,
+            now,
+            weapon,
+            origin,
+            on_ground,
+            anchor,
+            reel_half_step,
+            chasing,
+        },
+    );
     // Whether the hook is actively steering this frame (survives the abort branches above).
     let hook_engaged = bot.hook_phase != HookPhase::Idle;
     let hook_lock = matches!(
         bot.hook_phase,
         HookPhase::Flight | HookPhase::Reel | HookPhase::Ballistic
     );
-    if let Some(t) = hook_look_target {
+    if let Some(t) = hook.look_target {
         let d = t - eye;
         if d.xy().length() > 1.0 {
             look = Vec3::new(
@@ -1013,13 +907,13 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // Hook override: stand still while reeling/flying (the pull owns velocity; ground input would
     // fight it or, airborne, break the frictionless arc), or walk toward the throw stance in Aim.
     if hook_engaged {
-        move_world = match hook_approach {
-            _ if hook_stand => Vec3::ZERO,
+        move_world = match hook.approach {
+            _ if hook.stand => Vec3::ZERO,
             Some(src) => Vec3::new(src.x - origin.x, src.y - origin.y, 0.0).normalize_or_zero() * MOVE_SPEED,
             None => Vec3::ZERO,
         };
         buttons &= !BUTTON_JUMP;
-        if hook_select {
+        if hook.select {
             impulse = IMPULSE_GRAPPLE;
         }
     }
@@ -1117,7 +1011,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // gating on the raw target would launch the hook while the aim is still swinging. Once thrown we
     // hold +attack every frame through the reel (the engine zeroes the cmd each tick, and a single
     // released frame would drop the hook at impact or unhook mid-reel).
-    if hook_fire_ready {
+    if hook.fire_ready {
         let err = wrap180(view.x - look.x).abs().max(wrap180(view.y - look.y).abs());
         if err < HOOK_AIM_TOL {
             buttons |= BUTTON_ATTACK;
@@ -1125,11 +1019,11 @@ fn run_bot(game: &mut GameState, e: EntId) {
             b.hook_phase = HookPhase::Flight;
             b.hook_started = now;
         }
-    } else if hook_hold_fire {
+    } else if hook.hold_fire {
         buttons |= BUTTON_ATTACK;
     }
     // Flush any deferred hook release now the graph/bot borrows are done.
-    if let Some(h) = hook_reset {
+    if let Some(h) = hook.reset {
         game.reset_grapple(h);
     }
 
