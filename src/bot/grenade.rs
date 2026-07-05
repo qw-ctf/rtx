@@ -2,7 +2,7 @@
 
 //! Bot grenade play — proactively **lobbing** grenades and chaining **lob→shoot combos**, using the
 //! blast's knockback both for airburst damage and to **shove opponents into hazards** (lava, slime,
-//! pits, ledges). It layers on top of [`crate::bot_combat`]: the combat overlay handles the direct
+//! pits, ledges). It layers on top of [`crate::bot::combat`]: the combat overlay handles the direct
 //! gunfight; this module decides when a grenade is the better play, aims the arc, then detonates it
 //! at the moment its blast pushes the enemy where the bot wants them.
 //!
@@ -14,7 +14,7 @@
 use glam::{Vec3, Vec3Swizzles};
 
 use crate::bot::{self, BotCmd};
-use crate::bot_combat::{
+use crate::bot::combat::{
     self, blast_self_damage, can_hit_grenade, hitscan_choice, shoot_grenade, teammate_in_blast, GRENADE_MIN_SHOOT,
     GRENADE_SHOOT_HEALTH_FRAC,
 };
@@ -22,7 +22,8 @@ use crate::defs::{
     Bits, Content, Flags, Items, MoveType, Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK,
     VEC_VIEW_OFS,
 };
-use crate::entity::{EntId, GrenadePhase};
+use crate::bot::state::GrenadePhase;
+use crate::entity::EntId;
 use crate::game::GameState;
 
 /// Impulse that selects the grenade launcher.
@@ -740,7 +741,7 @@ fn lobbed(game: &mut GameState, e: EntId, origin: Vec3, now: f32, cmd: &mut BotC
     }
     let eye = origin + VEC_VIEW_OFS;
     let gpos = game.entities[g].v.origin;
-    cmd.look = bot_combat::angles_to(eye, gpos); // pre-aim the grenade
+    cmd.look = combat::angles_to(eye, gpos); // pre-aim the grenade
 }
 
 /// Detonate the grenade the instant its blast puts the enemy where we want them (Detonate → Idle).
@@ -758,7 +759,7 @@ fn detonate(game: &mut GameState, e: EntId, en: EntId, origin: Vec3, now: f32, c
     let (health, my_team) = (game.entities[e].v.health, game.entities[e].arena.team);
     let gpos = game.entities[g].v.origin;
     let eye = origin + VEC_VIEW_OFS;
-    cmd.look = bot_combat::angles_to(eye, gpos);
+    cmd.look = combat::angles_to(eye, gpos);
 
     // Never blow it up in our own face, or on a teammate. Back away if it's drifted too close.
     let d_self = (gpos - origin).length();
@@ -860,7 +861,7 @@ pub(crate) fn rocket_shove(
         return false; // a wall stops the rocket short of B
     }
     // Aim the rocket at the ground point, select the launcher, and fire once the view is on it.
-    cmd.look = bot_combat::angles_to(eye, aim);
+    cmd.look = combat::angles_to(eye, aim);
     if game.entities[e].v.weapon != Weapon::RocketLauncher {
         cmd.impulse = 7;
         cmd.buttons &= !BUTTON_ATTACK;

@@ -84,7 +84,7 @@ pub(crate) struct ArenaPlayer {
 
 /// A mode's per-frame directive for one bot — the *only* channel through which a mode influences
 /// bot behavior. The generic bot brain ([`crate::bot::run_bot`]) navigates and, for [`Fight`], runs
-/// the shared combat layer ([`crate::bot_combat`]); the mode just says *what* to pursue. This keeps
+/// the shared combat layer ([`crate::bot::combat`]); the mode just says *what* to pursue. This keeps
 /// every mode-specific bot adaptation behind [`GameMode::bot_intent`] rather than in `bot.rs`.
 ///
 /// [`Fight`]: BotIntent::Fight

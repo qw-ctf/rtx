@@ -49,7 +49,7 @@ const MAX_SPEED: f32 = 320.0;
 /// Jump impulse (`velocity.z`) — fixed, so a jump's airtime/apex don't change with horizontal speed;
 /// only the reach does (`speed · airtime`). That's what lets a fast bhopping bot clear a wide gap.
 const JUMP_VZ: f32 = 270.0;
-/// The QW `PM_AirAccelerate` projected-wishspeed cap (mirrors `bot_bhop::AIR_CAP`; cross-checked in a
+/// The QW `PM_AirAccelerate` projected-wishspeed cap (mirrors `bot::bhop::AIR_CAP`; cross-checked in a
 /// test). Bhop speed builds at a rate set by this and the tickrate.
 const SJ_AIR_CAP: f32 = 30.0;
 /// Conservative server tickrate assumed for the bhop acceleration model.
@@ -1535,7 +1535,7 @@ pub struct NavState {
     pub pending: Option<std::sync::mpsc::Receiver<NavBuild>>,
     /// Static catalog of item-goal pickups: `(entity index, nearest cell)`. Built once with the
     /// graph; items don't move, so their cell is fixed. Live availability and desire are read
-    /// fresh at selection time (see [`crate::bot_goals`]).
+    /// fresh at selection time (see [`crate::bot::goals`]).
     pub goals: Vec<(u32, CellId)>,
 }
 
@@ -1908,7 +1908,7 @@ mod tests {
 
         // The build-time model, derated, is conservative vs the actual bhop controller: simulate a
         // real air-strafe over the runway and confirm it reaches at least the planned speed.
-        use crate::bot_bhop::{air_accel_max, apply_airaccel, strafe, wishdir_of};
+        use crate::bot::bhop::{air_accel_max, apply_airaccel, strafe, wishdir_of};
         let dt = 1.0 / 72.0;
         let a_max = air_accel_max(10.0, MAX_SPEED, dt);
         let steps = (800.0 / (MAX_SPEED * dt)) as i32; // ~time to cover the runway, air frames only

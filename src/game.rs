@@ -21,7 +21,8 @@ use crate::game_command::GameCommand;
 use crate::host::{HostApi, SyscallFn};
 use crate::mode::{self, ArenaState, GameMode};
 use crate::world;
-use crate::{bot, bot_goals, defs, ext_field, navmesh};
+use crate::bot::goals as bot_goals;
+use crate::{bot, defs, ext_field, navmesh};
 
 /// Matches `MAX_EDICTS` in `ktx/include/q_shared.h`.
 pub const MAX_EDICTS: usize = 2048;

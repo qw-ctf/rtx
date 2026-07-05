@@ -33,7 +33,7 @@ const SPLASH_RANGE: f32 = 140.0;
 /// How far short of the aim point a projectile may land and still count as a clear shot. A wall
 /// that stops the rocket more than this before `aim` means the muzzle→aim path is blocked (corner
 /// self-splash; blast radius is 160 and attacker self-damage is only halved). Matches the slack in
-/// [`crate::bot_grenade::rocket_shove`].
+/// [`crate::bot::grenade::rocket_shove`].
 const LINE_OF_FIRE_SLACK: f32 = 48.0;
 /// Retreat when hurt below this.
 const LOW_HEALTH: f32 = 40.0;
@@ -478,7 +478,7 @@ pub(crate) fn grenade_tactics(
     }
     let my_team = game.entities[e].arena.team;
     let health = game.entities[e].v.health.max(1.0);
-    // A grenade this bot is running as a lob→shoot combo (see `bot_grenade`): don't let the
+    // A grenade this bot is running as a lob→shoot combo (see `super::grenade`): don't let the
     // opportunistic offence below detonate it early — that would blow it *short* of the enemy and
     // shove them the wrong way. The combo driver detonates it at the right moment itself.
     let combo_grenade = game.entities[e].bot.grenade_ent;

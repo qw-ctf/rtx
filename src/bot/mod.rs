@@ -15,13 +15,17 @@
 
 use glam::{Vec3, Vec3Swizzles};
 
-use crate::bot_bhop;
-use crate::bot_combat;
-use crate::bot_grenade;
+pub(crate) mod bhop;
+mod combat;
+pub(crate) mod goals;
+mod grenade;
+pub(crate) mod state;
+
+use crate::bot::state::{BotState, GrenadePhase, HookPhase};
 use crate::defs::{
     Bits, Flags, Items, Solid, Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP,
 };
-use crate::entity::{BotState, EntId, Entity, GrenadePhase, HookPhase, Touch};
+use crate::entity::{EntId, Entity, Touch};
 use crate::game::{cstring, GameState};
 use crate::mode::BotIntent;
 use crate::navmesh::{CellId, LinkKind, NavGraph};
@@ -63,7 +67,7 @@ const PLAT_RISE_TOL: f32 = 18.0;
 /// flip-flopping between two of similar worth each frame).
 const GOAL_SELECT_INTERVAL: f32 = 1.5;
 /// How long after the last line-of-sight frame the nav view may still point at a Fight enemy's
-/// live origin. Set equal to combat's `HOLD_ANGLE_TIME` (the 2s corner-hold in `bot_combat::engage`):
+/// live origin. Set equal to combat's `HOLD_ANGLE_TIME` (the 2s corner-hold in `combat::engage`):
 /// while that hold owns the view it overrides `look` anyway, so the handoff is seamless — hold the
 /// corner for 2s, then look where we're travelling instead of tracking the enemy through geometry.
 const LOOK_LOS_GRACE: f32 = 2.0;
@@ -261,7 +265,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // now, since the `&mut bot` binding below blocks reading the edict during the move logic.
     let vz = game.entities[e].v.velocity.z;
     let air_jumped = game.entities[e].combat.air_jumped;
-    // When combat last had line of sight (see `bot_combat::engage`) — snapshot for the bhop veto.
+    // When combat last had line of sight (see `combat::engage`) — snapshot for the bhop veto.
     let enemy_seen_time = game.entities[e].bot.enemy_seen_time;
     let v_xy = game.entities[e].v.velocity.xy();
     let speed = v_xy.length();
@@ -563,7 +567,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // carries us up, so XY barely changes.
     // A bunnyhopping bot covers ground fast enough to orbit a 24u waypoint, so widen the arrival gate
     // with speed and also advance once a waypoint slips *behind* the velocity.
-    let arrive_r = if bot.bhop.phase != bot_bhop::Phase::Off || bot.sj_leg.is_some() {
+    let arrive_r = if bot.bhop.phase != bhop::Phase::Off || bot.sj_leg.is_some() {
         ARRIVE_RADIUS.max(2.0 * speed * frametime)
     } else {
         ARRIVE_RADIUS
@@ -579,7 +583,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
             LinkKind::Hook => false,
             _ => {
                 let to = target.xy() - origin.xy();
-                let fast = bot.bhop.phase != bot_bhop::Phase::Off || bot.sj_leg.is_some();
+                let fast = bot.bhop.phase != bhop::Phase::Off || bot.sj_leg.is_some();
                 to.length() <= arrive_r || (fast && to.dot(v_xy) < 0.0 && to.length() <= 64.0)
             }
         };
@@ -646,7 +650,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
 
     // Bunnyhop policy verdicts — everything that needs game state is judged here; *when* each
     // verdict may apply in the hop cycle (engage hysteresis, mid-hop commitment, landing-only
-    // disengage) is `bot_bhop::Bhop::step`'s job. The entry runway bar is deliberately fixed:
+    // disengage) is `bhop::Bhop::step`'s job. The entry runway bar is deliberately fixed:
     // the old `speed·0.9` bar rose as the bot gained speed and cut runs short mid-air.
     let goal_dist = (target_origin.xy() - origin.xy()).length();
     let runway_dist = runway(graph, &bot.route, bot.route_pos, origin);
@@ -666,7 +670,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     let bhop_entry = !final_leg
         && matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
         && goal_dist > 300.0
-        && runway_dist >= bot_bhop::RUNWAY_ENGAGE;
+        && runway_dist >= bhop::RUNWAY_ENGAGE;
     // Lenient continuation gate for taking *another* hop from a landing: leg kinds churn as the
     // route advances, and a run in progress shouldn't be dumped by the stricter entry conditions.
     let bhop_sustain = matches!(kind, Some(LinkKind::Walk | LinkKind::Step)) && goal_dist > 150.0;
@@ -704,7 +708,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
         }
     };
 
-    // Drive the hop-cycle controller (see `bot_bhop::Bhop`). On a speed jump the runway is the
+    // Drive the hop-cycle controller (see `bhop::Bhop`). On a speed jump the runway is the
     // run-up to the takeoff edge and the bearing aims straight at the landing so the leap goes
     // across the gap; otherwise steer toward the look-ahead corridor point (smoother than the 32u
     // next cell) with as much straight-ish corridor as the route offers.
@@ -712,7 +716,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
         let dt = frametime.clamp(0.001, 0.05);
         let accel = host.cvar(c"sv_accelerate");
         let maxspeed = host.cvar(c"sv_maxspeed");
-        let env = bot_bhop::Env {
+        let env = bhop::Env {
             dt,
             accel: if accel > 0.0 { accel } else { 10.0 },
             maxspeed: if maxspeed > 0.0 { maxspeed } else { 320.0 },
@@ -727,7 +731,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
         };
         let phase_was = bot.bhop.phase;
         let cmd = bot.bhop.step(
-            &bot_bhop::Input {
+            &bhop::Input {
                 v_xy,
                 on_ground,
                 bearing,
@@ -743,7 +747,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
         );
         // A phase transition is the interesting diagnostic moment — why a run started or ended.
         if bot.bhop.phase != phase_was && host.cvar_bool(c"rtx_bot_debug") {
-            let why = if bot.bhop.phase == bot_bhop::Phase::Off {
+            let why = if bot.bhop.phase == bhop::Phase::Off {
                 format!(" ({})", bot.bhop.off_reason)
             } else {
                 String::new()
@@ -1029,7 +1033,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // in flight/reel/ballistic lock out combat — an impulse or a dropped +attack there would break
     // the reel/release (the grapple must stay selected and fire held until the release point).
     if let Some(en) = enemy.filter(|_| !hook_lock) {
-        bot_combat::engage(game, e, en, origin, now, &mut cmd);
+        combat::engage(game, e, en, origin, now, &mut cmd);
     }
 
     // Splash-weapon overlays, run after `engage` (they override its aim/movement) and only when not
@@ -1041,16 +1045,16 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // of which splash weapon delivers the blast. Skipped while bunnyhopping (no enemy, view is busy
     // air-strafing).
     if !hook_engaged && !bhop_active {
-        let handled = bot_combat::grenade_tactics(game, e, enemy, origin, &mut cmd);
+        let handled = combat::grenade_tactics(game, e, enemy, origin, &mut cmd);
         if handled {
-            game.entities[e].bot.grenade_phase = crate::entity::GrenadePhase::Idle;
+            game.entities[e].bot.grenade_phase = GrenadePhase::Idle;
         // defence drops a stale combo
         } else {
             // A one-shot rocket shove takes priority over *starting* a grenade combo, but never
             // interrupts one already in progress (the short-circuit keeps a running combo going).
-            let running = game.entities[e].bot.grenade_phase != crate::entity::GrenadePhase::Idle;
-            if running || !bot_grenade::rocket_shove(game, e, enemy, origin, &mut cmd) {
-                bot_grenade::grenade_combo(game, e, enemy, origin, now, &mut cmd);
+            let running = game.entities[e].bot.grenade_phase != GrenadePhase::Idle;
+            if running || !grenade::rocket_shove(game, e, enemy, origin, &mut cmd) {
+                grenade::grenade_combo(game, e, enemy, origin, now, &mut cmd);
             }
         }
     }
@@ -1085,7 +1089,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
         let skill = host.cvar(c"rtx_bot_skill").clamp(0.0, 7.0);
         // Spring stiffness (1/s): sluggish → pro-snappy. Shared with the combat feed-forward,
         // whose lag compensation assumes exactly this spring.
-        let omega = bot_combat::aim_omega(skill);
+        let omega = combat::aim_omega(skill);
         let b = &mut game.entities[e].bot;
         if b.aim == Vec3::ZERO {
             b.aim = v_angle; // seed from the real view so the first frame doesn't snap from zero
@@ -1330,8 +1334,8 @@ mod tests {
                     let goal_far = (graph.cell_origin(b).xy() - origin.xy()).length() > 300.0;
                     positions += 1;
                     kind_ok += walkish as u32;
-                    run_ok += (r >= bot_bhop::RUNWAY_ENGAGE) as u32;
-                    entry_ok += (walkish && goal_far && r >= bot_bhop::RUNWAY_ENGAGE) as u32;
+                    run_ok += (r >= bhop::RUNWAY_ENGAGE) as u32;
+                    entry_ok += (walkish && goal_far && r >= bhop::RUNWAY_ENGAGE) as u32;
                 }
                 if routes >= 40 {
                     break;
@@ -1353,7 +1357,7 @@ mod tests {
             best >= 400.0,
             "best runway across {routes} long routes is only {best:.0}u — real-map corridors \
              never clear the {:.0}u engage bar",
-            bot_bhop::RUNWAY_ENGAGE
+            bhop::RUNWAY_ENGAGE
         );
     }
 }
