@@ -38,7 +38,7 @@ pub(crate) use arena::{Arena, ArenaState};
 pub(crate) use ctf::Ctf;
 pub(crate) use ffa::Ffa;
 pub(crate) use midair::Midair;
-pub(crate) use team::{is_match_mode, MatchPhase, MatchState, TeamMatch};
+pub(crate) use team::{is_match_mode, MatchState, TeamMatch};
 
 /// A player's standing in a round-based mode (Rocket Arena): fighting in the arena, or waiting
 /// in the audience (fresh joiners, and players eliminated until the next round). Stored per

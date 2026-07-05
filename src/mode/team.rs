@@ -108,6 +108,90 @@ pub(crate) fn parse_match_alias(s: &str) -> Option<MatchConfig> {
     })
 }
 
+/// The per-mode variation points of the shared match lifecycle. Team DM and CTF run the identical
+/// warmup → countdown → live → ended machine ([`tick_lifecycle`]); they differ only in the go-live
+/// slate reset, the win condition, and the results line. Implementing this (plus the thin
+/// `GameMode` shims that delegate to the shared helpers below) is all a new match mode needs.
+///
+/// Not a `GameMode` supertrait: a blanket `impl<T: MatchMode> GameMode for T` would collide with the
+/// direct `impl GameMode` on `Ffa`/`Arena`/`Midair` under Rust's coherence rules, so each match mode
+/// keeps a small explicit `GameMode` impl that forwards to `tick_lifecycle`/`team_spawn`/etc.
+pub(crate) trait MatchMode {
+    /// Reset the mode-specific slate when the countdown expires (frags/scores, flags, runes). The
+    /// shared machine then arms the timelimit and flips to Live — so this must *not* touch either.
+    fn on_go_live(&self, g: &mut GameState);
+    /// One Live frame: refresh scores if the mode tallies them here, and report whether the
+    /// frag/capture limit is reached. (The shared machine ends the match on the timelimit itself.)
+    fn limit_reached(&self, g: &mut GameState) -> bool;
+    /// Broadcast the results line as the match ends (the phase transition is handled by the machine).
+    fn announce_result(&self, g: &mut GameState);
+}
+
+/// The shared match lifecycle, advanced once per server frame. Drives the countdown announce
+/// throttle, the go-live handoff (mode slate → timelimit → FIGHT), the per-frame win check, and the
+/// results pause → map-rotate/warmup loop. The three per-mode variation points come from `mode`.
+pub(crate) fn tick_lifecycle<M: MatchMode>(mode: &M, g: &mut GameState) {
+    let now = g.time();
+    match g.team_match.phase {
+        MatchPhase::Warmup => {} // playable; team assignment happens on spawn (apply_loadout)
+        MatchPhase::Countdown { until } => {
+            let remaining = (until - now).ceil() as i32;
+            if remaining != g.team_match.last_count {
+                g.team_match.last_count = remaining;
+                if remaining > 0 {
+                    centerprint_all(g, &format!("{remaining}"));
+                }
+            }
+            if now >= until {
+                // Go live: the mode's own slate reset, then arm the time limit (`timelimit` is in
+                // seconds; 0 = none) and flip to Live.
+                mode.on_go_live(g);
+                let tl = g.level.timelimit;
+                g.team_match.live_until = if tl > 0 { now + tl as f32 } else { 0.0 };
+                g.team_match.phase = MatchPhase::Live;
+                centerprint_all(g, "FIGHT!");
+            }
+        }
+        MatchPhase::Live => {
+            let time_up = g.team_match.live_until > 0.0 && now >= g.team_match.live_until;
+            if mode.limit_reached(g) || time_up {
+                mode.announce_result(g);
+                g.team_match.phase = MatchPhase::Ended { until: now + END_PAUSE };
+            }
+        }
+        MatchPhase::Ended { until } => {
+            if now >= until {
+                // Rotate to the next map in the queue if one is configured; otherwise loop back to
+                // warmup on the same map for another `start`.
+                if g.queued_next_map().is_some() {
+                    g.next_level();
+                } else {
+                    g.team_match.phase = MatchPhase::Warmup;
+                    g.team_match.roster.clear();
+                }
+            }
+        }
+    }
+}
+
+/// Team spawn selection shared by every match mode: prefer this team's dedicated spawns
+/// (`info_player_teamN`), else fall back to the deathmatch spawns.
+pub(crate) fn team_spawn(g: &mut GameState, e: EntId) -> EntId {
+    let team = g.entities[e].arena.team;
+    if team >= 1 {
+        let spot = g.select_spawn_point_of(&format!("info_player_team{team}"));
+        if spot != EntId::WORLD {
+            return spot;
+        }
+    }
+    g.select_spawn_point()
+}
+
+/// Weapons are hot in every match phase except the pre-fight countdown.
+pub(crate) fn match_weapons_hot(g: &GameState) -> bool {
+    !matches!(g.team_match.phase, MatchPhase::Countdown { .. })
+}
+
 impl GameMode for TeamMatch {
     fn name(&self) -> &'static str {
         // Constant (not the alias) so `select_mode` resolves every `NonM…` to this one descriptor;
@@ -116,71 +200,11 @@ impl GameMode for TeamMatch {
     }
 
     fn tick(&self, g: &mut GameState) {
-        let now = g.time();
-        match g.team_match.phase {
-            MatchPhase::Warmup => {} // playable; assignment happens on spawn (apply_loadout)
-            MatchPhase::Countdown { until } => {
-                let remaining = (until - now).ceil() as i32;
-                if remaining != g.team_match.last_count {
-                    g.team_match.last_count = remaining;
-                    if remaining > 0 {
-                        centerprint_all(g, &format!("{remaining}"));
-                    }
-                }
-                if now >= until {
-                    // Go live on a clean slate: zero every player's frags and the team scores, and
-                    // arm the time limit (`timelimit` is in seconds; 0 = none).
-                    for e in players(g) {
-                        g.entities[e].v.frags = 0.0;
-                    }
-                    g.team_match.scores = vec![0; g.team_match.config.teams];
-                    let tl = g.level.timelimit;
-                    g.team_match.live_until = if tl > 0 { now + tl as f32 } else { 0.0 };
-                    g.team_match.phase = MatchPhase::Live;
-                    centerprint_all(g, "FIGHT!");
-                }
-            }
-            MatchPhase::Live => {
-                let teams = g.team_match.config.teams;
-                let mut scores = vec![0i32; teams];
-                for e in players(g) {
-                    let t = g.entities[e].arena.team as usize;
-                    if t >= 1 && t <= teams {
-                        scores[t - 1] += g.entities[e].v.frags as i32;
-                    }
-                }
-                g.team_match.scores = scores.clone();
-                let fl = g.level.fraglimit;
-                let time_up = g.team_match.live_until > 0.0 && now >= g.team_match.live_until;
-                if (fl != 0 && scores.iter().any(|&s| s >= fl)) || time_up {
-                    self.end_match(g, now);
-                }
-            }
-            MatchPhase::Ended { until } => {
-                if now >= until {
-                    // Rotate to the next map in the queue if one is configured; otherwise loop back
-                    // to warmup on the same map for another `start`.
-                    if g.queued_next_map().is_some() {
-                        g.next_level();
-                    } else {
-                        g.team_match.phase = MatchPhase::Warmup;
-                        g.team_match.roster.clear();
-                    }
-                }
-            }
-        }
+        tick_lifecycle(self, g);
     }
 
     fn select_spawn(&self, g: &mut GameState, e: EntId) -> EntId {
-        // Prefer this team's dedicated spawns (`info_player_teamN`), else the deathmatch spawns.
-        let team = g.entities[e].arena.team;
-        if team >= 1 {
-            let spot = g.select_spawn_point_of(&format!("info_player_team{team}"));
-            if spot != EntId::WORLD {
-                return spot;
-            }
-        }
-        g.select_spawn_point()
+        team_spawn(g, e)
     }
 
     fn apply_loadout(&self, g: &mut GameState, e: EntId) {
@@ -190,14 +214,42 @@ impl GameMode for TeamMatch {
     }
 
     fn weapons_hot(&self, g: &GameState) -> bool {
-        // Everything is hot except the pre-fight countdown.
-        !matches!(g.team_match.phase, MatchPhase::Countdown { .. })
+        match_weapons_hot(g)
     }
 
     fn bot_intent(&self, g: &mut GameState, bot: EntId) -> Option<BotIntent> {
         // Hunt the nearest living *enemy* (different team). Teammates are skipped, so bots don't
         // waste shots on allies. Falls back to the generic roam when no enemy is in play.
         nearest_enemy(g, bot).map(BotIntent::Fight)
+    }
+}
+
+impl MatchMode for TeamMatch {
+    fn on_go_live(&self, g: &mut GameState) {
+        // Continuous team DM: zero every player's frags and (re)size the team-score tally.
+        for e in players(g) {
+            g.entities[e].v.frags = 0.0;
+        }
+        g.team_match.scores = vec![0; g.team_match.config.teams];
+    }
+
+    fn limit_reached(&self, g: &mut GameState) -> bool {
+        // Team scores are Σ member frags, recomputed every Live frame for the scoreboard/result.
+        let teams = g.team_match.config.teams;
+        let mut scores = vec![0i32; teams];
+        for e in players(g) {
+            let t = g.entities[e].arena.team as usize;
+            if t >= 1 && t <= teams {
+                scores[t - 1] += g.entities[e].v.frags as i32;
+            }
+        }
+        g.team_match.scores = scores.clone();
+        let fl = g.level.fraglimit;
+        fl != 0 && scores.iter().any(|&s| s >= fl)
+    }
+
+    fn announce_result(&self, g: &mut GameState) {
+        self.end_match(g);
     }
 }
 
@@ -245,8 +297,9 @@ impl TeamMatch {
         g.host().changelevel(&map);
     }
 
-    /// Announce the result and enter the post-match pause.
-    fn end_match(&self, g: &mut GameState, now: f32) {
+    /// Broadcast the match result (duel scoreline, or per-team tally). The post-match pause is
+    /// entered by the shared [`tick_lifecycle`] machine.
+    fn end_match(&self, g: &mut GameState) {
         let scores = g.team_match.scores.clone();
         let config = g.team_match.config;
         if config.teams == 2 && config.size == 1 {
@@ -271,7 +324,6 @@ impl TeamMatch {
             line.push('\n');
             g.broadcast(crate::defs::PrintLevel::High, &line);
         }
-        g.team_match.phase = MatchPhase::Ended { until: now + END_PAUSE };
     }
 }
 

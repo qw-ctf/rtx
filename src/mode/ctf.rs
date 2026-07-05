@@ -21,8 +21,8 @@
 
 use glam::Vec3;
 
-use super::team;
-use super::{centerprint_all, players, BotIntent, GameMode, MatchPhase};
+use super::team::{self, match_weapons_hot, team_spawn, tick_lifecycle, MatchMode};
+use super::{players, BotIntent, GameMode};
 use crate::assets::{Model, Sound};
 use crate::defs::{
     Attenuation, Channel, MoveType, PrintLevel, Solid, RUNE_HASTE, RUNE_MASK, RUNE_REGEN, RUNE_RESISTANCE,
@@ -39,8 +39,6 @@ const RETURN_BONUS: f32 = 1.0;
 const FLAG_RETURN_TIME: f32 = 40.0;
 /// Seconds a rune waits, untouched, before relocating to a fresh spawn.
 const RUNE_RESPAWN_TIME: f32 = 120.0;
-/// Results-screen pause before returning to warmup / rotating.
-const END_PAUSE: f32 = 5.0;
 /// `EF_FLAG1`/`EF_FLAG2` — the client-side "flag on the carrier's back" effect bits.
 const EF_FLAG1: i32 = 16;
 const EF_FLAG2: i32 = 32;
@@ -73,60 +71,11 @@ impl GameMode for Ctf {
     }
 
     fn tick(&self, g: &mut GameState) {
-        let now = g.time();
-        match g.team_match.phase {
-            MatchPhase::Warmup => {} // playable; team assignment happens on spawn (apply_loadout)
-            MatchPhase::Countdown { until } => {
-                let remaining = (until - now).ceil() as i32;
-                if remaining != g.team_match.last_count {
-                    g.team_match.last_count = remaining;
-                    if remaining > 0 {
-                        centerprint_all(g, &format!("{remaining}"));
-                    }
-                }
-                if now >= until {
-                    // Go live on a clean slate: reset capture scores and both flags, arm timelimit.
-                    g.team_match.scores = vec![0; 2];
-                    let tl = g.level.timelimit;
-                    g.team_match.live_until = if tl > 0 { now + tl as f32 } else { 0.0 };
-                    g.reset_flags();
-                    g.spawn_runes();
-                    g.team_match.phase = MatchPhase::Live;
-                    centerprint_all(g, "FIGHT!");
-                }
-            }
-            MatchPhase::Live => {
-                // Capture scores are updated on capture events (`ctf_capture`); here we only check
-                // the end conditions.
-                let cap = g.host().cvar(c"rtx_capturelimit").max(0.0) as i32;
-                let hit = cap > 0 && g.team_match.scores.iter().any(|&s| s >= cap);
-                let time_up = g.team_match.live_until > 0.0 && now >= g.team_match.live_until;
-                if hit || time_up {
-                    self.end_match(g, now);
-                }
-            }
-            MatchPhase::Ended { until } => {
-                if now >= until {
-                    if g.queued_next_map().is_some() {
-                        g.next_level();
-                    } else {
-                        g.team_match.phase = MatchPhase::Warmup;
-                        g.team_match.roster.clear();
-                    }
-                }
-            }
-        }
+        tick_lifecycle(self, g);
     }
 
     fn select_spawn(&self, g: &mut GameState, e: EntId) -> EntId {
-        let team = g.entities[e].arena.team;
-        if team >= 1 {
-            let spot = g.select_spawn_point_of(&format!("info_player_team{team}"));
-            if spot != EntId::WORLD {
-                return spot;
-            }
-        }
-        g.select_spawn_point()
+        team_spawn(g, e)
     }
 
     fn apply_loadout(&self, g: &mut GameState, e: EntId) {
@@ -136,7 +85,7 @@ impl GameMode for Ctf {
     }
 
     fn weapons_hot(&self, g: &GameState) -> bool {
-        !matches!(g.team_match.phase, MatchPhase::Countdown { .. })
+        match_weapons_hot(g)
     }
 
     fn bot_intent(&self, g: &mut GameState, bot: EntId) -> Option<BotIntent> {
@@ -145,6 +94,25 @@ impl GameMode for Ctf {
 
     fn on_death(&self, g: &mut GameState, victim: EntId, attacker: EntId) {
         ctf_frag_bonuses(g, victim, attacker);
+    }
+}
+
+impl MatchMode for Ctf {
+    fn on_go_live(&self, g: &mut GameState) {
+        // Fresh slate: zero the two capture scores, send both flags home, and (re)spawn the runes.
+        g.team_match.scores = vec![0; 2];
+        g.reset_flags();
+        g.spawn_runes();
+    }
+
+    fn limit_reached(&self, g: &mut GameState) -> bool {
+        // Capture scores are updated on capture events (`ctf_capture`); here we only test the limit.
+        let cap = g.host().cvar(c"rtx_capturelimit").max(0.0) as i32;
+        cap > 0 && g.team_match.scores.iter().any(|&s| s >= cap)
+    }
+
+    fn announce_result(&self, g: &mut GameState) {
+        self.end_match(g);
     }
 }
 
@@ -205,11 +173,12 @@ fn ctf_frag_bonuses(g: &mut GameState, victim: EntId, attacker: EntId) {
 }
 
 impl Ctf {
-    fn end_match(&self, g: &mut GameState, now: f32) {
+    /// Broadcast the CTF result (red : blue captures). The post-match pause is entered by the shared
+    /// [`tick_lifecycle`] machine.
+    fn end_match(&self, g: &mut GameState) {
         let red = g.team_match.scores.first().copied().unwrap_or(0);
         let blue = g.team_match.scores.get(1).copied().unwrap_or(0);
         g.broadcast(PrintLevel::High, &format!("Match over — red {red} : {blue} blue\n"));
-        g.team_match.phase = MatchPhase::Ended { until: now + END_PAUSE };
     }
 }
 
