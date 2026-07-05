@@ -15,7 +15,7 @@
 
 use glam::{Vec3, Vec3Swizzles};
 
-use crate::bot;
+use crate::bot::{self, BotCmd};
 use crate::defs::{
     Bits, Flags, Items, Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP,
     VEC_VIEW_OFS,
@@ -173,17 +173,13 @@ pub(crate) fn angles_to(eye: Vec3, point: Vec3) -> Vec3 {
 /// (leading the target, plus a smoothly drifting skill-scaled error), fights for range, and fires;
 /// having *recently* lost sight it holds the angle where the enemy vanished while navigation keeps
 /// it moving; otherwise it leaves the navigation view/movement untouched.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn engage(
     game: &mut GameState,
     e: EntId,
     enemy: EntId,
     origin: Vec3,
     now: f32,
-    look: &mut Vec3,
-    move_world: &mut Vec3,
-    buttons: &mut i32,
-    impulse: &mut i32,
+    cmd: &mut BotCmd,
 ) {
     let my_eye = origin + VEC_VIEW_OFS;
     let enemy_org = game.entities[enemy].v.origin;
@@ -201,7 +197,7 @@ pub(crate) fn engage(
         // view flip-flop while line of sight flickers at an edge.
         let b = &game.entities[e].bot;
         if b.enemy_seen_time > 0.0 && now - b.enemy_seen_time < HOLD_ANGLE_TIME {
-            *look = angles_to(my_eye, b.enemy_seen_at);
+            cmd.look = angles_to(my_eye, b.enemy_seen_at);
         }
         return;
     }
@@ -213,7 +209,7 @@ pub(crate) fn engage(
     // Switch weapon only when we don't already hold the desired one (setting `impulse` re-runs
     // W_ChangeWeapon each frame otherwise).
     if game.entities[e].v.weapon != choice.weapon {
-        *impulse = choice.impulse;
+        cmd.impulse = choice.impulse;
     }
 
     // Predicted velocity for the intercept: a grounded target is led horizontally; an airborne
@@ -292,7 +288,7 @@ pub(crate) fn engage(
         rate * (2.0 / aim_omega(skill)) * (skill / 7.0)
     };
 
-    *look = Vec3::new(clean.x + ff.x + err.x, clean.y + ff.y + err.y, 0.0);
+    cmd.look = Vec3::new(clean.x + ff.x + err.x, clean.y + ff.y + err.y, 0.0);
 
     // Movement (world-space): hold a preferred range and strafe to dodge; retreat when hurt.
     let health = game.entities[e].v.health;
@@ -310,8 +306,8 @@ pub(crate) fn engage(
     };
     let dir = Vec3::new(to_enemy.x, to_enemy.y, 0.0).normalize_or_zero();
     let perp = Vec3::new(-dir.y, dir.x, 0.0);
-    *move_world = dir * want_forward + perp * (strafe_sign * MOVE_SPEED);
-    *buttons &= !BUTTON_JUMP; // don't bunny-hop while dueling
+    cmd.move_world = dir * want_forward + perp * (strafe_sign * MOVE_SPEED);
+    cmd.buttons &= !BUTTON_JUMP; // don't bunny-hop while dueling
 
     // Fire only when the crosshair is on the spot. The shot leaves along the *smoothed* view
     // (`bot.aim`, last frame's spring output) — firing every frame would put rockets wherever the
@@ -352,7 +348,7 @@ pub(crate) fn engage(
     };
     if on_target && lof_clear {
         // The engine paces shots via `attack_finished`; holding fire shoots at the weapon's rate.
-        *buttons |= BUTTON_ATTACK;
+        cmd.buttons |= BUTTON_ATTACK;
     }
 }
 
@@ -425,22 +421,15 @@ pub(crate) fn can_hit_grenade(game: &mut GameState, e: EntId, grenade: EntId) ->
 /// `false` (didn't commit) if the bot has no usable hitscan weapon. The shot leaves along the
 /// *smoothed* view, so it fires only once that view has swung onto the grenade (and the gun is in
 /// hand), matching how `engage` gates its shots.
-pub(crate) fn shoot_grenade(
-    game: &mut GameState,
-    e: EntId,
-    grenade: EntId,
-    look: &mut Vec3,
-    buttons: &mut i32,
-    impulse: &mut i32,
-) -> bool {
+pub(crate) fn shoot_grenade(game: &mut GameState, e: EntId, grenade: EntId, cmd: &mut BotCmd) -> bool {
     let Some((imp, weapon)) = hitscan_choice(game, e) else {
         return false;
     };
     let eye = game.entities[e].v.origin + VEC_VIEW_OFS;
     let gpos = game.entities[grenade].v.origin;
-    *look = angles_to(eye, gpos);
+    cmd.look = angles_to(eye, gpos);
     if game.entities[e].v.weapon != weapon {
-        *impulse = imp; // switching takes a frame; fire once we hold it
+        cmd.impulse = imp; // switching takes a frame; fire once we hold it
         return true;
     }
     // The detonation line check accepts a shot passing within 8u of the grenade — convert that to an
@@ -448,10 +437,10 @@ pub(crate) fn shoot_grenade(
     let dist = (gpos - eye).length().max(1.0);
     let cone = (8.0 / dist).atan().to_degrees().clamp(1.5, 5.0);
     let view = game.entities[e].bot.aim;
-    let dp = bot::wrap180(view.x - look.x);
-    let dy = bot::wrap180(view.y - look.y);
+    let dp = bot::wrap180(view.x - cmd.look.x);
+    let dy = bot::wrap180(view.y - cmd.look.y);
     if view == Vec3::ZERO || (dp * dp + dy * dy).sqrt() <= cone {
-        *buttons |= BUTTON_ATTACK;
+        cmd.buttons |= BUTTON_ATTACK;
     }
     true
 }
@@ -465,18 +454,14 @@ pub(crate) fn shoot_grenade(
 /// - **Offensive** — a grenade sitting on the current enemy (and clear of our teammates): a free
 ///   airburst, shot from outside its blast.
 ///
-/// Everything routes through the normal usercmd (`look`/`move_world`/`buttons`/`impulse`); the shot
-/// detonates the grenade through the engine's `shootable_grenade_on_line`/`t_damage` path.
-#[allow(clippy::too_many_arguments)]
+/// Everything routes through the frame's [`BotCmd`]; the shot detonates the grenade through the
+/// engine's `shootable_grenade_on_line`/`t_damage` path.
 pub(crate) fn grenade_tactics(
     game: &mut GameState,
     e: EntId,
     enemy: Option<EntId>,
     origin: Vec3,
-    look: &mut Vec3,
-    move_world: &mut Vec3,
-    buttons: &mut i32,
-    impulse: &mut i32,
+    cmd: &mut BotCmd,
 ) -> bool {
     if !game.host().cvar_bool(c"rtx_shootable_grenades") {
         return false; // grenades aren't hittable (and are point-size), so there's nothing to exploit
@@ -534,17 +519,16 @@ pub(crate) fn grenade_tactics(
     // Defence takes priority — survival first.
     if let Some((grenade, d)) = threat {
         let safe_to_shoot = d >= GRENADE_MIN_SHOOT && blast_self_damage(d) <= health * GRENADE_SHOOT_HEALTH_FRAC;
-        if safe_to_shoot && can_hit_grenade(game, e, grenade) && shoot_grenade(game, e, grenade, look, buttons, impulse)
-        {
+        if safe_to_shoot && can_hit_grenade(game, e, grenade) && shoot_grenade(game, e, grenade, cmd) {
             return true;
         }
         // Too close (or no clear shot / no hitscan gun): run directly away and hop off the ground —
         // put distance between us and the blast rather than setting it off in our face.
         let gpos = game.entities[grenade].v.origin;
         let away = Vec3::new(origin.x - gpos.x, origin.y - gpos.y, 0.0).normalize_or_zero();
-        *move_world = away * MOVE_SPEED;
+        cmd.move_world = away * MOVE_SPEED;
         if game.entities[e].v.flags.has(Flags::ONGROUND) {
-            *buttons |= BUTTON_JUMP;
+            cmd.buttons |= BUTTON_JUMP;
         }
         return true;
     }
@@ -552,7 +536,7 @@ pub(crate) fn grenade_tactics(
     // Offence: airburst a grenade sitting on the enemy.
     if let Some((grenade, _)) = offense {
         if can_hit_grenade(game, e, grenade) {
-            shoot_grenade(game, e, grenade, look, buttons, impulse);
+            shoot_grenade(game, e, grenade, cmd);
         }
     }
     false

@@ -13,7 +13,7 @@
 
 use glam::{Vec3, Vec3Swizzles};
 
-use crate::bot;
+use crate::bot::{self, BotCmd};
 use crate::bot_combat::{
     self, blast_self_damage, can_hit_grenade, hitscan_choice, shoot_grenade, teammate_in_blast, GRENADE_MIN_SHOOT,
     GRENADE_SHOOT_HEALTH_FRAC,
@@ -483,19 +483,15 @@ fn aim_err(view: Vec3, want: Vec3) -> f32 {
 /// defensive grenade check, which wins). Picks up a fight where a lobbed-and-detonated grenade beats
 /// the gunfight — shoving a grounded enemy into a nearby hazard, or a plain airburst — and runs the
 /// [`GrenadePhase`] machine to aim, fire, track, and detonate it. Everything is written back through
-/// `look`/`move_world`/`buttons`/`impulse`; safety (self-splash, teammates, wrong-way shoves, walls)
-/// is enforced at every step.
-#[allow(clippy::too_many_arguments)]
+/// the frame's [`BotCmd`]; safety (self-splash, teammates, wrong-way shoves, walls) is enforced at
+/// every step.
 pub(crate) fn grenade_combo(
     game: &mut GameState,
     e: EntId,
     enemy: Option<EntId>,
     origin: Vec3,
     now: f32,
-    look: &mut Vec3,
-    move_world: &mut Vec3,
-    buttons: &mut i32,
-    impulse: &mut i32,
+    cmd: &mut BotCmd,
 ) {
     let phase = game.entities[e].bot.grenade_phase;
     // Losing the enemy cancels any in-progress combo (but a lobbed grenade can still fuse-blow).
@@ -507,9 +503,9 @@ pub(crate) fn grenade_combo(
     };
     match phase {
         GrenadePhase::Idle => try_start(game, e, en, origin, now),
-        GrenadePhase::Windup => windup(game, e, now, look, move_world, buttons, impulse),
-        GrenadePhase::Lobbed => lobbed(game, e, origin, now, look, impulse),
-        GrenadePhase::Detonate => detonate(game, e, en, origin, now, look, move_world, buttons, impulse),
+        GrenadePhase::Windup => windup(game, e, now, cmd),
+        GrenadePhase::Lobbed => lobbed(game, e, origin, now, cmd),
+        GrenadePhase::Detonate => detonate(game, e, en, origin, now, cmd),
     }
 }
 
@@ -677,34 +673,26 @@ fn try_start_bank(game: &mut GameState, e: EntId, en: EntId, origin: Vec3, now: 
 }
 
 /// Select the GL, aim the lob, and fire once the smoothed view is on it (Windup → Lobbed).
-fn windup(
-    game: &mut GameState,
-    e: EntId,
-    now: f32,
-    look: &mut Vec3,
-    move_world: &mut Vec3,
-    buttons: &mut i32,
-    impulse: &mut i32,
-) {
+fn windup(game: &mut GameState, e: EntId, now: f32, cmd: &mut BotCmd) {
     if now - game.entities[e].bot.grenade_started > WINDUP_TIMEOUT {
         combo_reset(game, e, now + COMBO_COOLDOWN);
         return;
     }
     let want = game.entities[e].bot.grenade_look;
-    *look = want;
-    *move_world = Vec3::ZERO; // hold the firing stance
-    *buttons &= !BUTTON_ATTACK; // don't fire the current gun at lob pitch
+    cmd.look = want;
+    cmd.move_world = Vec3::ZERO; // hold the firing stance
+    cmd.buttons &= !BUTTON_ATTACK; // don't fire the current gun at lob pitch
     let (weapon, attack_finished) = {
         let ent = &game.entities[e];
         (ent.v.weapon, ent.combat.attack_finished)
     };
     if weapon != Weapon::GrenadeLauncher {
-        *impulse = GL_IMPULSE;
+        cmd.impulse = GL_IMPULSE;
         return;
     }
     // Grenade launcher in hand: fire when the smoothed aim has settled and the GL is off cooldown.
     if now >= attack_finished && aim_err(game.entities[e].bot.aim, want) < LOB_AIM_TOL {
-        *buttons |= BUTTON_ATTACK;
+        cmd.buttons |= BUTTON_ATTACK;
         let b = &mut game.entities[e].bot;
         b.grenade_phase = GrenadePhase::Lobbed;
         b.grenade_started = now; // now the fuse clock
@@ -712,7 +700,7 @@ fn windup(
 }
 
 /// Capture the fired grenade and switch to the detonator (Lobbed → Detonate).
-fn lobbed(game: &mut GameState, e: EntId, origin: Vec3, now: f32, look: &mut Vec3, impulse: &mut i32) {
+fn lobbed(game: &mut GameState, e: EntId, origin: Vec3, now: f32, cmd: &mut BotCmd) {
     if game.entities[e].bot.grenade_ent == 0 {
         match own_live_grenade(game, e, origin) {
             Some(g) => game.entities[e].bot.grenade_ent = g.0,
@@ -742,7 +730,7 @@ fn lobbed(game: &mut GameState, e: EntId, origin: Vec3, now: f32, look: &mut Vec
     // 0.6s cooldown ends, so a one-shot request would be lost.
     if let Some((imp, weapon)) = hitscan_choice(game, e) {
         if game.entities[e].v.weapon != weapon {
-            *impulse = imp;
+            cmd.impulse = imp;
         } else {
             game.entities[e].bot.grenade_phase = GrenadePhase::Detonate;
         }
@@ -752,22 +740,11 @@ fn lobbed(game: &mut GameState, e: EntId, origin: Vec3, now: f32, look: &mut Vec
     }
     let eye = origin + VEC_VIEW_OFS;
     let gpos = game.entities[g].v.origin;
-    *look = bot_combat::angles_to(eye, gpos); // pre-aim the grenade
+    cmd.look = bot_combat::angles_to(eye, gpos); // pre-aim the grenade
 }
 
 /// Detonate the grenade the instant its blast puts the enemy where we want them (Detonate → Idle).
-#[allow(clippy::too_many_arguments)]
-fn detonate(
-    game: &mut GameState,
-    e: EntId,
-    en: EntId,
-    origin: Vec3,
-    now: f32,
-    look: &mut Vec3,
-    move_world: &mut Vec3,
-    buttons: &mut i32,
-    impulse: &mut i32,
-) {
+fn detonate(game: &mut GameState, e: EntId, en: EntId, origin: Vec3, now: f32, cmd: &mut BotCmd) {
     let g = EntId(game.entities[e].bot.grenade_ent);
     if game.entities[e].bot.grenade_ent == 0 || !grenade_live(game, g) {
         combo_reset(game, e, now + COMBO_DONE_COOLDOWN); // detonated (by us or fuse) — done
@@ -781,7 +758,7 @@ fn detonate(
     let (health, my_team) = (game.entities[e].v.health, game.entities[e].arena.team);
     let gpos = game.entities[g].v.origin;
     let eye = origin + VEC_VIEW_OFS;
-    *look = bot_combat::angles_to(eye, gpos);
+    cmd.look = bot_combat::angles_to(eye, gpos);
 
     // Never blow it up in our own face, or on a teammate. Back away if it's drifted too close.
     let d_self = (gpos - origin).length();
@@ -791,7 +768,7 @@ fn detonate(
     {
         if d_self < 200.0 {
             let away = Vec3::new(origin.x - gpos.x, origin.y - gpos.y, 0.0).normalize_or_zero();
-            *move_world = away * MOVE_SPEED;
+            cmd.move_world = away * MOVE_SPEED;
         }
         return; // hold fire; the fuse is the backstop
     }
@@ -810,7 +787,7 @@ fn detonate(
         (gpos - e_center).length() < 100.0
     };
     if fire_ok && can_hit_grenade(game, e, g) {
-        shoot_grenade(game, e, g, look, buttons, impulse);
+        shoot_grenade(game, e, g, cmd);
     }
 }
 
@@ -821,15 +798,12 @@ fn detonate(
 /// spot. That's more flexible than a body shot (a static ground point is easy to hit, and the bot
 /// needn't stand on any particular side) and just as strong. The lob is the fallback for when the
 /// blast has to be *arced over* the enemy instead. Returns whether it took over the frame.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn rocket_shove(
     game: &mut GameState,
     e: EntId,
     enemy: Option<EntId>,
     origin: Vec3,
-    look: &mut Vec3,
-    buttons: &mut i32,
-    impulse: &mut i32,
+    cmd: &mut BotCmd,
 ) -> bool {
     let Some(en) = enemy else {
         return false;
@@ -886,16 +860,16 @@ pub(crate) fn rocket_shove(
         return false; // a wall stops the rocket short of B
     }
     // Aim the rocket at the ground point, select the launcher, and fire once the view is on it.
-    *look = bot_combat::angles_to(eye, aim);
+    cmd.look = bot_combat::angles_to(eye, aim);
     if game.entities[e].v.weapon != Weapon::RocketLauncher {
-        *impulse = 7;
-        *buttons &= !BUTTON_ATTACK;
+        cmd.impulse = 7;
+        cmd.buttons &= !BUTTON_ATTACK;
         return true;
     }
-    if aim_err(game.entities[e].bot.aim, *look) < 4.0 {
-        *buttons |= BUTTON_ATTACK;
+    if aim_err(game.entities[e].bot.aim, cmd.look) < 4.0 {
+        cmd.buttons |= BUTTON_ATTACK;
     } else {
-        *buttons &= !BUTTON_ATTACK;
+        cmd.buttons &= !BUTTON_ATTACK;
     }
     true
 }

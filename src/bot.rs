@@ -79,6 +79,17 @@ const GOAL_AVOID_TIME: f32 = 12.0;
 const GATE_GIVEUP_TIME: f32 = 4.0;
 const GATE_AVOID_TIME: f32 = 6.0;
 
+/// One bot's accumulated frame command: what navigation proposes and the combat/grenade overlays
+/// mutate in turn, before the aim spring and view projection in `run_bot` turn it into the final
+/// `set_bot_cmd`. `look` (desired view angles, pre-spring) and `move_world` (desired world-space
+/// velocity) are deliberately decoupled — the bot can run one way while looking another.
+pub(crate) struct BotCmd {
+    pub look: Vec3,
+    pub move_world: Vec3,
+    pub buttons: i32,
+    pub impulse: i32,
+}
+
 // --- population management (P3) ---
 
 /// Reconcile the live bot count to `rtx_bot_count`, one add/remove per call (called each normal
@@ -1009,23 +1020,16 @@ fn run_bot(game: &mut GameState, e: EntId) {
         }
     }
 
+    // Bundle the frame's decisions into one command for the combat/grenade overlays to mutate.
+    let mut cmd = BotCmd { look, move_world, buttons, impulse };
+
     // Combat overlay: with an enemy in sight, the combat layer picks the look (live aim with a
     // drifting error) and its own movement; having *just lost* sight it holds the angle where the
     // enemy vanished while navigation keeps driving; otherwise navigation's look/move stand. Hooks
     // in flight/reel/ballistic lock out combat — an impulse or a dropped +attack there would break
     // the reel/release (the grapple must stay selected and fire held until the release point).
     if let Some(en) = enemy.filter(|_| !hook_lock) {
-        bot_combat::engage(
-            game,
-            e,
-            en,
-            origin,
-            now,
-            &mut look,
-            &mut move_world,
-            &mut buttons,
-            &mut impulse,
-        );
+        bot_combat::engage(game, e, en, origin, now, &mut cmd);
     }
 
     // Splash-weapon overlays, run after `engage` (they override its aim/movement) and only when not
@@ -1037,16 +1041,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // of which splash weapon delivers the blast. Skipped while bunnyhopping (no enemy, view is busy
     // air-strafing).
     if !hook_engaged && !bhop_active {
-        let handled = bot_combat::grenade_tactics(
-            game,
-            e,
-            enemy,
-            origin,
-            &mut look,
-            &mut move_world,
-            &mut buttons,
-            &mut impulse,
-        );
+        let handled = bot_combat::grenade_tactics(game, e, enemy, origin, &mut cmd);
         if handled {
             game.entities[e].bot.grenade_phase = crate::entity::GrenadePhase::Idle;
         // defence drops a stale combo
@@ -1054,21 +1049,15 @@ fn run_bot(game: &mut GameState, e: EntId) {
             // A one-shot rocket shove takes priority over *starting* a grenade combo, but never
             // interrupts one already in progress (the short-circuit keeps a running combo going).
             let running = game.entities[e].bot.grenade_phase != crate::entity::GrenadePhase::Idle;
-            if running || !bot_grenade::rocket_shove(game, e, enemy, origin, &mut look, &mut buttons, &mut impulse) {
-                bot_grenade::grenade_combo(
-                    game,
-                    e,
-                    enemy,
-                    origin,
-                    now,
-                    &mut look,
-                    &mut move_world,
-                    &mut buttons,
-                    &mut impulse,
-                );
+            if running || !bot_grenade::rocket_shove(game, e, enemy, origin, &mut cmd) {
+                bot_grenade::grenade_combo(game, e, enemy, origin, now, &mut cmd);
             }
         }
     }
+
+    // Overlays done — unpack the command back into the frame's locals for the aim spring / emit.
+    // `buttons` is still touched by the post-spring hook fire below; the rest are read-only now.
+    let BotCmd { look, move_world, mut buttons, impulse } = cmd;
 
     // View + move for the frame. Bunnyhopping bypasses the aim spring and the world-move reprojection
     // entirely — an air-strafe needs the view yaw swept *independently* of the travel direction, with
