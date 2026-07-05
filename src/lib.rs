@@ -17,6 +17,7 @@ use std::sync::OnceLock;
 
 mod abi;
 mod anim;
+mod arsenal;
 mod assets;
 mod bob;
 mod bot;

@@ -717,23 +717,26 @@ impl GameState {
 
     // --- weapon selection & frame loop ---
 
-    /// `W_BestWeapon` — best weapon the player can currently fire.
+    /// `W_BestWeapon` — best weapon the player can currently fire. Walks the arsenal's auto-pick
+    /// chain (LG → SNG → SSG → NG → SG), skipping any the player doesn't own or can't feed; the
+    /// Lightning Gun is additionally gated out underwater (it discharges). Falls back to the axe.
     pub(crate) fn w_best_weapon(&self, e: EntId) -> Weapon {
         let v = &self.entities[e].v;
-        let has = |w: Items| v.items.has(w);
-        if v.waterlevel <= 1.0 && v.ammo_cells >= 1.0 && has(Items::LIGHTNING) {
-            Weapon::Lightning
-        } else if v.ammo_nails >= 2.0 && has(Items::SUPER_NAILGUN) {
-            Weapon::SuperNailgun
-        } else if v.ammo_shells >= 2.0 && has(Items::SUPER_SHOTGUN) {
-            Weapon::SuperShotgun
-        } else if v.ammo_nails >= 1.0 && has(Items::NAILGUN) {
-            Weapon::Nailgun
-        } else if v.ammo_shells >= 1.0 && has(Items::SHOTGUN) {
-            Weapon::Shotgun
-        } else {
-            Weapon::Axe
+        for spec in crate::arsenal::auto_pick_chain() {
+            if !v.items.has(spec.item) {
+                continue;
+            }
+            if spec.item == Items::LIGHTNING && v.waterlevel > 1.0 {
+                continue; // never auto-pick the LG in water — it would discharge
+            }
+            if let Some(kind) = spec.ammo_kind {
+                if crate::arsenal::ammo_count(v, kind) < spec.min_ammo {
+                    continue;
+                }
+            }
+            return Weapon::from(spec.item);
         }
+        Weapon::Axe
     }
 
     /// `W_CheckNoAmmo` — switch off an empty weapon; returns whether we can fire.
@@ -932,14 +935,9 @@ impl GameState {
         if !v.items.has(weapon) {
             return false;
         }
-        match weapon {
-            w if w == Items::SHOTGUN => v.ammo_shells >= 1.0,
-            w if w == Items::SUPER_SHOTGUN => v.ammo_shells >= 2.0,
-            w if w == Items::NAILGUN => v.ammo_nails >= 1.0,
-            w if w == Items::SUPER_NAILGUN => v.ammo_nails >= 2.0,
-            w if w == Items::GRENADE_LAUNCHER || w == Items::ROCKET_LAUNCHER => v.ammo_rockets >= 1.0,
-            w if w == Items::LIGHTNING => v.ammo_cells >= 1.0,
-            _ => true, // axe
+        match crate::arsenal::weapon_spec(weapon).and_then(|s| s.ammo_kind.map(|k| (k, s.min_ammo))) {
+            Some((kind, min)) => crate::arsenal::ammo_count(v, kind) >= min,
+            None => true, // axe / grapple / unknown: no ammo needed
         }
     }
 

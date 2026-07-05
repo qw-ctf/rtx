@@ -17,6 +17,7 @@
 //! once with the navmesh (see `GameState::collect_goals`); the live availability and the bot's
 //! own stats are read fresh each time a goal is chosen.
 
+use crate::arsenal::AmmoKind;
 use crate::defs::{Bits, Items, Solid};
 use crate::entity::{EntId, Think, Touch};
 use crate::game::GameState;
@@ -41,14 +42,6 @@ enum WeaponKind {
     Gl,
     Rl,
     Lg,
-}
-
-#[derive(Clone, Copy)]
-enum AmmoKind {
-    Shells,
-    Nails,
-    Rockets,
-    Cells,
 }
 
 /// What kind of goal an item classname denotes. Armor carries its own absorb parameters so the
