@@ -16,10 +16,10 @@
 
 use glam::Vec3;
 
-use super::{ArenaRole, BotIntent, DamageOutcome, GameMode};
+use super::{centerprint_all, nearest_player_where, players, ArenaRole, BotIntent, DamageOutcome, GameMode};
 use crate::defs::{Items, PrintLevel, Weapon};
 use crate::entity::EntId;
-use crate::game::{cstring, GameState};
+use crate::game::GameState;
 
 /// Where the round is in its lifecycle. The whole mode is this four-state machine, advanced once
 /// per server frame by [`Arena::tick`] and on each kill by [`Arena::on_death`].
@@ -334,15 +334,6 @@ impl Arena {
     }
 }
 
-/// Every connected player edict (humans and bots occupy `1..=maxclients`).
-fn players(g: &GameState) -> Vec<EntId> {
-    let maxclients = g.host().cvar(c"maxclients") as i32;
-    (1..=maxclients as u32)
-        .map(EntId)
-        .filter(|&e| g.entities[e].in_use && g.entities[e].classname() == Some("player"))
-        .collect()
-}
-
 /// Number of connected players (fighter-eligible).
 fn count_players(g: &GameState) -> usize {
     players(g).len()
@@ -371,22 +362,5 @@ fn live_fighters(g: &GameState) -> Vec<EntId> {
 /// last-man-standing round, no teams).
 fn nearest_enemy(g: &GameState, bot: EntId) -> Option<EntId> {
     let origin = g.entities[bot].v.origin;
-    live_fighters(g).into_iter().filter(|&e| e != bot).min_by(|&a, &b| {
-        let da = (g.entities[a].v.origin - origin).length_squared();
-        let db = (g.entities[b].v.origin - origin).length_squared();
-        da.total_cmp(&db)
-    })
-}
-
-/// Center-print a message to every connected human. Bots are fake clients with no connection, so
-/// a unicast to one makes the engine complain ("msg_entity: not a client") — skip them.
-fn centerprint_all(g: &GameState, msg: &str) {
-    let host = *g.host();
-    let cmsg = cstring(msg);
-    for e in players(g) {
-        if g.entities[e].bot.is_bot {
-            continue;
-        }
-        host.centerprint(e, &cmsg);
-    }
+    nearest_player_where(g, origin, bot, |g, e| g.entities[e].arena.role == ArenaRole::Fighter)
 }

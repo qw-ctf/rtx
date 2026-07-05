@@ -269,3 +269,54 @@ impl GameState {
         }
     }
 }
+
+// --- shared player-roster helpers (used by every mode) -----------------------------------------
+
+/// Every connected player edict (humans and bots occupy client slots `1..=maxclients`).
+pub(crate) fn players(g: &GameState) -> Vec<EntId> {
+    let maxclients = g.host().cvar(c"maxclients") as i32;
+    (1..=maxclients as u32)
+        .map(EntId)
+        .filter(|&e| g.entities[e].in_use && g.entities[e].classname() == Some("player"))
+        .collect()
+}
+
+/// The nearest *living* player to `point` that satisfies `pred`, skipping `skip` (pass
+/// [`EntId::WORLD`] to skip nobody). The one min-by-distance loop behind every mode's enemy picker:
+/// FFA/Midair pass `|_, _| true` (everyone's an enemy), Arena filters to live fighters, team modes
+/// filter by opposing team.
+pub(crate) fn nearest_player_where(
+    g: &GameState,
+    point: Vec3,
+    skip: EntId,
+    pred: impl Fn(&GameState, EntId) -> bool,
+) -> Option<EntId> {
+    let mut best: Option<(EntId, f32)> = None;
+    for e in players(g) {
+        if e == skip {
+            continue;
+        }
+        let ent = &g.entities[e];
+        if ent.v.health <= 0.0 || ent.v.deadflag != 0.0 || !pred(g, e) {
+            continue;
+        }
+        let d = (ent.v.origin - point).length_squared();
+        if best.is_none_or(|(_, bd)| d < bd) {
+            best = Some((e, d));
+        }
+    }
+    best.map(|(e, _)| e)
+}
+
+/// Center-print to every connected human (bots are fake clients with no connection — a unicast to
+/// one makes the engine warn "msg_entity: not a client").
+pub(crate) fn centerprint_all(g: &GameState, msg: &str) {
+    let host = *g.host();
+    let cmsg = cstring(msg);
+    for e in players(g) {
+        if g.entities[e].bot.is_bot {
+            continue;
+        }
+        host.centerprint(e, &cmsg);
+    }
+}

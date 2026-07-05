@@ -7,7 +7,7 @@
 //! them from item-collecting wanderers into deathmatch opponents. (The global `rtx_bot_pacifist`
 //! override, which makes bots tail the nearest human in *any* mode, lives in `bot::run_bot`.)
 
-use super::{team, BotIntent, GameMode};
+use super::{nearest_player_where, BotIntent, GameMode};
 use crate::entity::EntId;
 use crate::game::GameState;
 
@@ -33,14 +33,5 @@ impl GameMode for Ffa {
 /// The nearest living *other* player to `bot` — everyone is an enemy in FFA (humans and bots alike).
 fn nearest_player(g: &GameState, bot: EntId) -> Option<EntId> {
     let origin = g.entities[bot].v.origin;
-    team::players(g)
-        .into_iter()
-        .filter(|&e| {
-            let ent = &g.entities[e];
-            e != bot && ent.v.health > 0.0 && ent.v.deadflag == 0.0
-        })
-        .min_by(|&a, &b| {
-            let d = |e: EntId| (g.entities[e].v.origin - origin).length_squared();
-            d(a).total_cmp(&d(b))
-        })
+    nearest_player_where(g, origin, bot, |_, _| true)
 }

@@ -22,7 +22,7 @@
 use glam::Vec3;
 
 use super::team;
-use super::{BotIntent, GameMode, MatchPhase};
+use super::{centerprint_all, players, BotIntent, GameMode, MatchPhase};
 use crate::assets::{Model, Sound};
 use crate::defs::{
     Attenuation, Channel, MoveType, PrintLevel, Solid, RUNE_HASTE, RUNE_MASK, RUNE_REGEN, RUNE_RESISTANCE,
@@ -81,7 +81,7 @@ impl GameMode for Ctf {
                 if remaining != g.team_match.last_count {
                     g.team_match.last_count = remaining;
                     if remaining > 0 {
-                        team::centerprint_all(g, &format!("{remaining}"));
+                        centerprint_all(g, &format!("{remaining}"));
                     }
                 }
                 if now >= until {
@@ -92,7 +92,7 @@ impl GameMode for Ctf {
                     g.reset_flags();
                     g.spawn_runes();
                     g.team_match.phase = MatchPhase::Live;
-                    team::centerprint_all(g, "FIGHT!");
+                    centerprint_all(g, "FIGHT!");
                 }
             }
             MatchPhase::Live => {
@@ -231,7 +231,7 @@ enum CtfRole {
 /// lowest ~third (at least one, once a team has two) defenders, the rest attackers. Deterministic, so
 /// a bot keeps its role frame to frame as long as the roster holds; a lone bot always attacks.
 fn ctf_role(g: &GameState, bot: EntId, team: u8) -> CtfRole {
-    let mut mates: Vec<EntId> = team::players(g)
+    let mut mates: Vec<EntId> = players(g)
         .into_iter()
         .filter(|&e| g.entities[e].arena.team == team && g.entities[e].bot.is_bot)
         .collect();
@@ -479,7 +479,7 @@ impl GameState {
         // Teammates share the capture (+10 each) and cash in any recent return / carrier-frag as an
         // assist; enemies lose their carrier-hurt window (purectf's LoopThroughPlayersAfterCapture).
         let now = self.time();
-        for p in team::players(self) {
+        for p in players(self) {
             if p == carrier {
                 continue;
             }
@@ -604,7 +604,7 @@ impl GameState {
         for r in existing {
             self.free(r);
         }
-        for p in team::players(self) {
+        for p in players(self) {
             self.entities[p].arena.runes = 0;
             self.refresh_haste_speed(p);
         }

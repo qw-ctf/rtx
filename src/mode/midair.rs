@@ -17,7 +17,7 @@
 
 use glam::Vec3;
 
-use super::{BotIntent, DamageOutcome, GameMode};
+use super::{nearest_player_where, BotIntent, DamageOutcome, GameMode};
 use crate::defs::{Bits, Flags, Items, PrintLevel, Weapon};
 use crate::entity::EntId;
 use crate::game::GameState;
@@ -158,25 +158,6 @@ fn airborne(g: &mut GameState, e: EntId, minheight: f32) -> bool {
 /// The nearest living player (human or bot) to `bot`, excluding itself — everyone is an enemy in
 /// this free-for-all. Unlike `bot.rs`'s `nearest_human`, this includes other bots.
 fn nearest_player(g: &GameState, bot: EntId) -> Option<EntId> {
-    let maxclients = g.host().cvar(c"maxclients") as i32;
     let origin = g.entities[bot].v.origin;
-    let mut best: Option<(EntId, f32)> = None;
-    for i in 1..=maxclients as u32 {
-        let e = EntId(i);
-        if e == bot {
-            continue;
-        }
-        let ent = &g.entities[e];
-        if !ent.in_use || ent.classname() != Some("player") {
-            continue;
-        }
-        if ent.v.health <= 0.0 || ent.v.deadflag != 0.0 {
-            continue;
-        }
-        let d = (ent.v.origin - origin).length_squared();
-        if best.is_none_or(|(_, bd)| d < bd) {
-            best = Some((e, d));
-        }
-    }
-    best.map(|(e, _)| e)
+    nearest_player_where(g, origin, bot, |_, _| true)
 }

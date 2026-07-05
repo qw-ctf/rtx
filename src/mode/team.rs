@@ -17,7 +17,7 @@
 
 use glam::Vec3;
 
-use super::{BotIntent, GameMode};
+use super::{centerprint_all, nearest_player_where, players, BotIntent, GameMode};
 use crate::entity::EntId;
 use crate::game::{cstring, GameState};
 
@@ -345,15 +345,6 @@ pub(crate) fn smallest_team(g: &GameState) -> u8 {
     (idx + 1) as u8
 }
 
-/// Every connected player edict (humans and bots, `1..=maxclients`).
-pub(crate) fn players(g: &GameState) -> Vec<EntId> {
-    let maxclients = g.host().cvar(c"maxclients") as i32;
-    (1..=maxclients as u32)
-        .map(EntId)
-        .filter(|&e| g.entities[e].in_use && g.entities[e].classname() == Some("player"))
-        .collect()
-}
-
 /// The nearest living player on a *different* team to `bot` — the team-aware enemy picker (the
 /// teammate filter the FFA/Arena/Midair pickers deliberately lack).
 pub(crate) fn nearest_enemy(g: &GameState, bot: EntId) -> Option<EntId> {
@@ -365,34 +356,7 @@ pub(crate) fn nearest_enemy(g: &GameState, bot: EntId) -> Option<EntId> {
 /// The nearest living player not on `my_team` to an arbitrary `point` — used to pick a target near a
 /// base to defend, not just near the bot itself.
 pub(crate) fn nearest_enemy_to(g: &GameState, my_team: u8, point: Vec3) -> Option<EntId> {
-    let mut best: Option<(EntId, f32)> = None;
-    for e in players(g) {
-        let ent = &g.entities[e];
-        if ent.arena.team == my_team {
-            continue;
-        }
-        if ent.v.health <= 0.0 || ent.v.deadflag != 0.0 {
-            continue;
-        }
-        let d = (ent.v.origin - point).length_squared();
-        if best.is_none_or(|(_, bd)| d < bd) {
-            best = Some((e, d));
-        }
-    }
-    best.map(|(e, _)| e)
-}
-
-/// Center-print to every connected human (bots are fake clients with no connection — a unicast to
-/// one makes the engine warn "msg_entity: not a client").
-pub(crate) fn centerprint_all(g: &GameState, msg: &str) {
-    let host = *g.host();
-    let cmsg = cstring(msg);
-    for e in players(g) {
-        if g.entities[e].bot.is_bot {
-            continue;
-        }
-        host.centerprint(e, &cmsg);
-    }
+    nearest_player_where(g, point, EntId::WORLD, |g, e| g.entities[e].arena.team != my_team)
 }
 
 #[cfg(test)]
