@@ -16,14 +16,13 @@
 use glam::{Vec3, Vec3Swizzles};
 
 use crate::bot;
-use crate::defs::{Bits, Flags, Items, Weapon, VEC_VIEW_OFS};
+use crate::defs::{
+    Bits, Flags, Items, Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP,
+    VEC_VIEW_OFS,
+};
 use crate::entity::EntId;
 use crate::game::GameState;
 
-const BUTTON_ATTACK: i32 = 1;
-const BUTTON_JUMP: i32 = 2;
-/// Move-component scale (as in `bot.rs`: pmove clamps to `sv_maxspeed`).
-const MOVE_SPEED: f32 = 800.0;
 /// Rocket/grenade projectile speed (QuakeWorld `SV_FireRocket`), for target leading.
 const ROCKET_SPEED: f32 = 1000.0;
 /// Preferred fighting distance for the rocket launcher — close enough to hit, far enough to dodge

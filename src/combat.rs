@@ -226,28 +226,6 @@ impl GameState {
         }
     }
 
-    /// `T_BeamDamage` — like radius damage but always centred on (and crediting) `attacker`.
-    /// (A faithful port of the boss shockwave; no ported entity currently calls it.)
-    #[allow(dead_code)]
-    pub(crate) fn t_beam_damage(&mut self, attacker: EntId, damage: f32) {
-        let org = self.entities[attacker].v.origin;
-        for head in self.find_radius(org, damage + 40.0) {
-            if self.entities[head].v.takedamage == 0.0 {
-                continue;
-            }
-            let mut points = damage - 0.5 * (org - self.entities[head].v.origin).length();
-            if points < 0.0 {
-                points = 0.0;
-            }
-            if head == attacker {
-                points *= 0.5;
-            }
-            if points > 0.0 && self.can_damage(head, attacker, attacker) {
-                self.t_damage(head, attacker, attacker, points);
-            }
-        }
-    }
-
     /// `ClientObituary` (compact) — deathmatch frag scoring, logging and a broadcast. The
     /// full per-weapon flavour text lands with the client.qc port; this keeps scores correct.
     pub(crate) fn client_obituary(&mut self, targ: EntId, attacker: EntId) {

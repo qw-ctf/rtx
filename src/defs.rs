@@ -289,6 +289,14 @@ pub const VEC_HULL_MIN: Vec3 = Vec3::new(-16.0, -16.0, -24.0);
 pub const VEC_HULL_MAX: Vec3 = Vec3::new(16.0, 16.0, 32.0);
 pub const VEC_VIEW_OFS: Vec3 = Vec3::new(0.0, 0.0, 22.0);
 
+// --- usercmd button bits (QW `BUTTON_*`) ---
+pub const BUTTON_ATTACK: i32 = 1;
+pub const BUTTON_JUMP: i32 = 2;
+
+/// Bot usercmd move-component scale (matches ktx: project the desired world direction onto the
+/// view vectors and scale by this; pmove then clamps to `sv_maxspeed`).
+pub const BOT_MOVE_SPEED: f32 = 800.0;
+
 /// Declare a `#[repr(i32)]` enum for one of QuakeC's discrete-valued `f32` entity fields
 /// (`.solid`, `.movetype`, `.deadflag`, …), with the `as_f32`/`from_f32` bridge those
 /// engine-shared fields need.

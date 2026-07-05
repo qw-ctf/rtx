@@ -14,9 +14,10 @@
 //! colours and `info_player_teamN` spawns all come from [`super::team`] via [`is_match_mode`]. Only
 //! the win condition (captures, not frags) and the flag entities are CTF-specific.
 //!
-//! Deferred vs purectf (kept simple for a first cut): runes, the proximity defense/assist bonuses,
-//! the voluntary flag toss, and the grapple-only extras (the grapple itself is already handed out by
-//! `put_client_in_server` when `rtx_grapple` is on).
+//! On top of the base flag game this also ports the purectf extras: the four runes
+//! (resistance / strength / haste / regen), the defense/assist frag bonuses, and the voluntary flag
+//! and rune toss (impulses 24 / 26, gated by `rtx_ctf_tossflag` / `rtx_ctf_tossrune`). The grapple
+//! is handed out by `put_client_in_server` when `rtx_grapple` is on.
 
 use glam::Vec3;
 
@@ -88,7 +89,7 @@ impl GameMode for Ctf {
                     g.team_match.scores = vec![0; 2];
                     let tl = g.level.timelimit;
                     g.team_match.live_until = if tl > 0 { now + tl as f32 } else { 0.0 };
-                    reset_flags(g);
+                    g.reset_flags();
                     g.spawn_runes();
                     g.team_match.phase = MatchPhase::Live;
                     team::centerprint_all(g, "FIGHT!");
@@ -573,7 +574,7 @@ impl GameState {
     }
 
     /// Send both flags home and clear every carry — used when a match goes live.
-    fn reset_flags_impl(&mut self) {
+    fn reset_flags(&mut self) {
         let flags: Vec<EntId> = self.find_by_classname("flag").collect();
         for f in flags {
             self.flag_send_home(f);
@@ -773,9 +774,4 @@ fn enemy_flag(g: &GameState, team: u8) -> Option<EntId> {
         let t = g.entities[f].flag.team;
         t != 0 && t != team
     })
-}
-
-/// Send both flags home (free function so `Ctf::tick` can call it without a `self` borrow clash).
-fn reset_flags(g: &mut GameState) {
-    g.reset_flags_impl();
 }

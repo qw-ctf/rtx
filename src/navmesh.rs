@@ -1683,7 +1683,7 @@ mod tests {
         let step = (g.cells.len() / 32).max(1);
         let best = (0..g.cells.len() as u32)
             .step_by(step)
-            .map(|s| directed_reach(s))
+            .map(directed_reach)
             .max_by_key(|o| o.len())
             .unwrap();
         let (start, reached) = (best[0], best.len());

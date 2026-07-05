@@ -18,15 +18,14 @@ use glam::{Vec3, Vec3Swizzles};
 use crate::bot_bhop;
 use crate::bot_combat;
 use crate::bot_grenade;
-use crate::defs::{Bits, Flags, Items, Solid, Weapon};
+use crate::defs::{
+    Bits, Flags, Items, Solid, Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP,
+};
 use crate::entity::{BotState, EntId, Entity, GrenadePhase, HookPhase, Touch};
 use crate::game::{cstring, GameState};
 use crate::mode::BotIntent;
 use crate::navmesh::{CellId, LinkKind, NavGraph};
 
-// usercmd button bits.
-const BUTTON_ATTACK: i32 = 1;
-const BUTTON_JUMP: i32 = 2;
 /// Impulse to select the shotgun (for shooting a health-gated button).
 const IMPULSE_SHOTGUN: i32 = 2;
 /// Impulse to select the grappling hook (for flying a hook leg).
@@ -49,9 +48,6 @@ const HOOK_ANCHOR_DRIFT: f32 = 48.0;
 /// Ballistic watchdog slack added to the solved airtime before we give up waiting to land.
 const HOOK_BALLISTIC_SLACK: f32 = 1.0;
 
-/// Move-component scale (matches ktx: project the desired world direction onto the view
-/// vectors and scale by 800; pmove clamps to `sv_maxspeed`).
-const MOVE_SPEED: f32 = 800.0;
 /// Advance to the next route leg once within this of the current waypoint (≈ ¾ of a grid).
 const ARRIVE_RADIUS: f32 = 24.0;
 /// Stop closing once this near the followed human, so bots tail rather than shove.
@@ -925,7 +921,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // combat layer manages the actual fighting distance once it has line of sight).
     let close_enough = final_leg && !chasing && enemy.is_none() && dist <= POLITE_DIST;
     if !close_enough {
-        let (fwd, right) = angle_vectors(angles);
+        let (fwd, right, _) = angle_vectors(angles);
         let dir = Vec3::new(to_wp.x, to_wp.y, 0.0).normalize_or_zero();
         forward = (fwd.dot(dir) * MOVE_SPEED) as i32;
         side = (right.dot(dir) * MOVE_SPEED) as i32;
@@ -986,7 +982,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
                 }
             } else {
                 // Walk into the button to push it.
-                let (fwd, right) = angle_vectors(Vec3::new(0.0, yaw, 0.0));
+                let (fwd, right, _) = angle_vectors(Vec3::new(0.0, yaw, 0.0));
                 let dir = (g.aim - origin).normalize_or_zero();
                 forward = (fwd.dot(dir) * MOVE_SPEED) as i32;
                 side = (right.dot(dir) * MOVE_SPEED) as i32;
@@ -996,7 +992,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
 
     // The frame's movement as a world-space velocity, decoupled from the view: smoothing the eyes
     // below can't change where the bot goes, and combat can steer independently of its aim.
-    let (nf, nr) = angle_vectors(angles);
+    let (nf, nr, _) = angle_vectors(angles);
     let mut move_world = nf * forward as f32 + nr * side as f32;
 
     // Hook override: stand still while reeling/flying (the pull owns velocity; ground input would
@@ -1106,12 +1102,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
             b.aim = v_angle; // seed from the real view so the first frame doesn't snap from zero
         }
         let spring = |a: f32, v: f32, target: f32| {
-            let mut d = (target - a) % 360.0;
-            if d > 180.0 {
-                d -= 360.0;
-            } else if d < -180.0 {
-                d += 360.0;
-            }
+            let d = wrap180(target - a);
             let v = v + (omega * omega * d - 2.0 * omega * v) * dt;
             (wrap180(a + v * dt), v)
         };
@@ -1120,7 +1111,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
         b.aim = Vec3::new(pitch, yaw, 0.0);
         b.aim_vel = Vec3::new(pv, yv, 0.0);
         let view = b.aim;
-        let (vf, vr) = angle_vectors(view);
+        let (vf, vr, _) = angle_vectors(view);
         (
             view,
             vf.dot(move_world).round() as i32,
@@ -1287,13 +1278,15 @@ fn nearest_human(game: &GameState, bot_e: EntId) -> Option<EntId> {
     best.map(|(e, _)| e)
 }
 
-/// QuakeWorld `AngleVectors` (roll assumed 0): the view's forward and right unit vectors.
-pub(crate) fn angle_vectors(angles: Vec3) -> (Vec3, Vec3) {
+/// QuakeWorld `AngleVectors` (roll assumed 0): the view's forward, right, and up unit vectors —
+/// exactly what the engine's `makevectors` produces and `w_fire_grenade` orients the launch by.
+pub(crate) fn angle_vectors(angles: Vec3) -> (Vec3, Vec3, Vec3) {
     let (sy, cy) = angles.y.to_radians().sin_cos();
     let (sp, cp) = angles.x.to_radians().sin_cos();
     let forward = Vec3::new(cp * cy, cp * sy, -sp);
     let right = Vec3::new(sy, -cy, 0.0);
-    (forward, right)
+    let up = Vec3::new(sp * cy, sp * sy, cp);
+    (forward, right, up)
 }
 
 /// Drop bot bookkeeping when a bot client disconnects (kicked, or removed by the manager), so

@@ -20,13 +20,12 @@
 use glam::Vec2;
 
 use crate::bot::wrap180;
+use crate::defs::BOT_MOVE_SPEED as MOVE_SPEED;
 
 /// The projected-wishspeed cap in QW air acceleration (`PM_AirAccelerate`) — an engine literal
 /// (`movevars_maxairspeed`), not a cvar. Only this much of the wish speed counts against the
 /// current velocity each tick, which is exactly what lets a perpendicular strafe keep gaining.
 const AIR_CAP: f32 = 30.0;
-/// Usercmd move scale (as in `bot.rs`; pmove clamps wish speed to `sv_maxspeed`).
-const MOVE_SPEED: f32 = 800.0;
 
 /// The engine's fixed bot tick (bots run `SV_RunCmd` at ~77 Hz regardless of what we pass as
 /// `msec`), used only to size the weave band. The live accel math uses the real per-frame `dt`.
@@ -304,7 +303,8 @@ impl Bhop {
             return Some(Cmd { view_yaw: s.view_yaw, forward: s.forward, side: s.side, jump: false });
         }
         // Landing (or first) ground frame — the only place a run ends by policy.
-        if !i.committed && !(i.sustain && i.runway >= speed * T_HOP + HOP_MARGIN) {
+        let keep_hopping = i.committed || (i.sustain && i.runway >= speed * T_HOP + HOP_MARGIN);
+        if !keep_hopping {
             self.disengage(if i.sustain { "runway" } else { "leg" });
             return None;
         }

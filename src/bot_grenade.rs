@@ -18,12 +18,13 @@ use crate::bot_combat::{
     self, blast_self_damage, can_hit_grenade, hitscan_choice, shoot_grenade, teammate_in_blast, GRENADE_MIN_SHOOT,
     GRENADE_SHOOT_HEALTH_FRAC,
 };
-use crate::defs::{Bits, Content, Flags, Items, MoveType, Weapon, VEC_VIEW_OFS};
+use crate::defs::{
+    Bits, Content, Flags, Items, MoveType, Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK,
+    VEC_VIEW_OFS,
+};
 use crate::entity::{EntId, GrenadePhase};
 use crate::game::GameState;
 
-const BUTTON_ATTACK: i32 = 1;
-const MOVE_SPEED: f32 = 800.0;
 /// Impulse that selects the grenade launcher.
 const GL_IMPULSE: i32 = 6;
 /// Range band in which a lob combo makes sense (closer = fight; farther = out of GL range).
@@ -59,22 +60,11 @@ pub(crate) const GL_FUSE: f32 = 2.5;
 /// (the GL's own 0.6 s cooldown swallows the switch impulse first).
 const LOB_MAX_FLIGHT: f32 = GL_FUSE - 0.8;
 
-/// QuakeWorld `AngleVectors` (roll 0): the view's forward, right, and up unit vectors. Matches the
-/// engine's `makevectors`, which is what `w_fire_grenade` uses to orient the launch.
-fn view_vectors(angles: Vec3) -> (Vec3, Vec3, Vec3) {
-    let (sp, cp) = angles.x.to_radians().sin_cos();
-    let (sy, cy) = angles.y.to_radians().sin_cos();
-    let forward = Vec3::new(cp * cy, cp * sy, -sp);
-    let right = Vec3::new(sy, -cy, 0.0);
-    let up = Vec3::new(sp * cy, sp * sy, cp);
-    (forward, right, up)
-}
-
 /// The grenade launch velocity for a given view — `600·forward + 200·up`, exactly as
 /// `w_fire_grenade` builds it (minus the ±10 u random spread). Fixed magnitude [`GL_SPEED`] at
 /// [`GL_LOFT_DEG`] above the view-forward.
 pub(crate) fn launch_velocity(view: Vec3) -> Vec3 {
-    let (forward, _right, up) = view_vectors(view);
+    let (forward, _right, up) = crate::bot::angle_vectors(view);
     forward * 600.0 + up * 200.0
 }
 
