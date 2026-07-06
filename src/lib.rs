@@ -44,6 +44,7 @@ mod player;
 mod qphys;
 mod rotate;
 mod server;
+mod spawn;
 mod spectate;
 mod subs;
 mod triggers;
