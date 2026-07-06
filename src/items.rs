@@ -31,6 +31,12 @@ impl GameState {
         ent.think = Think::PlaceItem;
     }
 
+    /// Trigger the client's screen "blend flash" (QuakeC `stuffcmd(e, "bf\n")`) — the pickup /
+    /// powerup screen tint.
+    pub(crate) fn screen_flash(&self, e: EntId) {
+        self.host.stuffcmd(e, c"bf\n");
+    }
+
     /// `PlaceItem` — make the item a wide touch trigger and drop it to the floor.
     pub(crate) fn place_item(&mut self, e: EntId) {
         {
@@ -192,7 +198,7 @@ impl GameState {
         self.sprint_low(other, "You got armor\n");
         self.host
             .sound(other, Channel::Item, Sound::ITEMS_ARMOR1, 1.0, Attenuation::Norm);
-        self.host.stuffcmd(other, c"bf\n");
+        self.screen_flash(other);
         let delay = if self.level.deathmatch != 2 { Some(20.0) } else { None };
         self.pickup_finish(e, other, delay);
     }
@@ -226,7 +232,7 @@ impl GameState {
         self.sprint_low(other, &format!("You got the {netname}\n"));
         self.host
             .sound(other, Channel::Item, Sound::WEAPONS_PKUP, 1.0, Attenuation::Norm);
-        self.host.stuffcmd(other, c"bf\n");
+        self.screen_flash(other);
 
         self.bound_other_ammo(other);
         let old = self.entities[other].v.items;
@@ -277,7 +283,7 @@ impl GameState {
         self.sprint_low(other, &format!("You got the {netname}\n"));
         self.host
             .sound(other, Channel::Item, Sound::WEAPONS_LOCK4, 1.0, Attenuation::Norm);
-        self.host.stuffcmd(other, c"bf\n");
+        self.screen_flash(other);
 
         // Switch up to a better weapon if we were already on our best.
         if self.entities[other].v.weapon == best {
@@ -386,7 +392,7 @@ impl GameState {
         self.sprint_low(other, &format!("You get {netname}\n"));
         self.host
             .sound(other, Channel::Item, Sound::WEAPONS_LOCK4, 1.0, Attenuation::Norm);
-        self.host.stuffcmd(other, c"bf\n");
+        self.screen_flash(other);
 
         self.free(e);
 
@@ -583,7 +589,7 @@ impl GameState {
         if let Some(noise) = self.entities[e].noise {
             self.host.sound(other, chan, noise, 1.0, Attenuation::Norm);
         }
-        self.host.stuffcmd(other, c"bf\n");
+        self.screen_flash(other);
     }
 
     fn infokey_float(&self, e: EntId, key: &CStr, default: f32) -> f32 {

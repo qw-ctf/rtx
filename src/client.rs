@@ -844,12 +844,12 @@ impl GameState {
         };
         if latch == 1.0 {
             self.host.sprint(e, PrintLevel::High, msg);
-            self.host.stuffcmd(e, c"bf\n");
+            self.screen_flash(e);
             self.host.sound(e, Channel::Auto, sound, 1.0, Attenuation::Norm);
             self.set_powerup_time(e, kind, time + 1.0);
         } else if latch < time {
             self.set_powerup_time(e, kind, time + 1.0);
-            self.host.stuffcmd(e, c"bf\n");
+            self.screen_flash(e);
         }
     }
 

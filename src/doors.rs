@@ -369,9 +369,7 @@ impl GameState {
                 ent.mover.dmg = 2.0;
             }
             ent.mover.pos1 = ent.v.origin;
-            let movedir = ent.v.movedir;
-            let size = ent.v.size;
-            ent.mover.pos2 = ent.mover.pos1 + movedir * ((movedir.dot(size)).abs() - ent.mover.lip);
+            ent.mover.pos2 = crate::subs::mover_pos2(ent.mover.pos1, ent.v.movedir, ent.v.size, ent.mover.lip);
         }
 
         if self.entities[e].v.spawnflags.has(DoorFlags::START_OPEN) {

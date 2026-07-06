@@ -126,10 +126,7 @@ impl GameState {
         }
         ent.mover.state = STATE_BOTTOM;
         ent.mover.pos1 = ent.v.origin;
-        let movedir = ent.v.movedir;
-        let size = ent.v.size;
-        let lip = ent.mover.lip;
-        ent.mover.pos2 = ent.mover.pos1 + movedir * ((movedir.dot(size)).abs() - lip);
+        ent.mover.pos2 = crate::subs::mover_pos2(ent.mover.pos1, ent.v.movedir, ent.v.size, ent.mover.lip);
         true
     }
 }

@@ -13,6 +13,12 @@ use crate::defs::*;
 use crate::entity::{EntId, Think, Use};
 use crate::game::GameState;
 
+/// The open position of a sliding mover (door / button): the closed origin displaced along
+/// `movedir` by the brush's extent in that direction, less the `lip` overlap kept at the frame.
+pub(crate) fn mover_pos2(pos1: Vec3, movedir: Vec3, size: Vec3, lip: f32) -> Vec3 {
+    pos1 + movedir * (movedir.dot(size).abs() - lip)
+}
+
 impl GameState {
     /// `SetMovedir` — QuakeEd writes a single yaw float for door/button move direction;
     /// the magic angles `0 -1 0` / `0 -2 0` mean straight up / down.

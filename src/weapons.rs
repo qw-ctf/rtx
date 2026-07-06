@@ -995,7 +995,7 @@ impl GameState {
             return;
         }
         self.entities[e].arena.flash_time = now + 0.5;
-        self.host.stuffcmd(e, c"bf\n");
+        self.screen_flash(e);
     }
 
     // --- small helpers ---
