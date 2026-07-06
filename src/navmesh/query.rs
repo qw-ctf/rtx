@@ -6,7 +6,7 @@
 
 use glam::Vec3;
 
-use super::{floor_grid, CellId, LinkCounts, LinkKind, NavGraph, MAX_SPEED};
+use super::{floor_grid, CellId, LinkCosts, LinkCounts, LinkKind, NavGraph, MAX_SPEED};
 
 impl NavGraph {
     /// Cell whose origin is nearest `pos` (searches outward from `pos`'s grid column). `None`
@@ -32,11 +32,11 @@ impl NavGraph {
     /// indices (each link's `to` is the next cell, its `kind` how to get there). `None` if no
     /// route exists (different connected components). Heuristic = straight-line travel time, an
     /// admissible lower bound on cost, so the path is optimal.
-    /// A* from `start` to `goal`. `gate_closed[i]` marks gate `i`'s door as currently shut; a link
-    /// through a shut gate is charged [`CLOSED_GATE_PENALTY`], so the route bends around closed
-    /// doors when it can and only crosses one (leaving the bot to open it) when there's no other
-    /// way. Pass `&[]` to treat every door as open.
-    pub fn find_path(&self, start: CellId, goal: CellId, gate_closed: &[bool]) -> Option<Vec<u32>> {
+    /// A* from `start` to `goal`. `costs` supplies the live door state plus any per-bot surcharges
+    /// and jitter (see [`LinkCosts`]): a link through a shut gate is charged `CLOSED_GATE_PENALTY`,
+    /// so the route bends around closed doors when it can and only crosses one (leaving the bot to
+    /// open it) when there's no other way. Pass [`LinkCosts::gated`] (or `default`) for gates-only.
+    pub fn find_path(&self, start: CellId, goal: CellId, costs: &LinkCosts) -> Option<Vec<u32>> {
         use std::cmp::Ordering;
         use std::collections::BinaryHeap;
 
@@ -84,7 +84,7 @@ impl NavGraph {
             }
             for &li in &self.adjacency[cell as usize] {
                 let link = self.links[li as usize];
-                let ng = g_cost[cell as usize] + link.cost + self.gate_penalty(li, gate_closed);
+                let ng = g_cost[cell as usize] + link.cost + self.link_extra(li, costs);
                 if ng < g_cost[link.to as usize] {
                     g_cost[link.to as usize] = ng;
                     came_from[link.to as usize] = li;
@@ -102,11 +102,11 @@ impl NavGraph {
     /// `goal` itself can't be reached. Lets a bot head as far toward an unreachable target as the
     /// graph allows — approaching a wall/door/connection to get line of sight — instead of homing
     /// straight into geometry. `None` only if nothing but `start` is reachable.
-    pub fn nearest_reachable_to(&self, start: CellId, goal: CellId, gate_closed: &[bool]) -> Option<CellId> {
-        let costs = self.costs_from(start, gate_closed);
+    pub fn nearest_reachable_to(&self, start: CellId, goal: CellId, costs: &LinkCosts) -> Option<CellId> {
+        let flood = self.costs_from(start, costs);
         let goal_pos = self.cells[goal as usize].origin;
         (0..self.cells.len() as CellId)
-            .filter(|&c| c != start && costs[c as usize].is_finite())
+            .filter(|&c| c != start && flood[c as usize].is_finite())
             .min_by(|&a, &b| {
                 let d = |c: CellId| (self.cells[c as usize].origin - goal_pos).length_squared();
                 d(a).total_cmp(&d(b))
@@ -116,7 +116,7 @@ impl NavGraph {
     /// Dijkstra cost-flood from `start`: the travel-time cost to reach every cell (`INFINITY`
     /// for unreachable ones). One pass answers "how far is each item?" for goal selection, far
     /// cheaper than an A* per candidate. Indexed by [`CellId`].
-    pub fn costs_from(&self, start: CellId, gate_closed: &[bool]) -> Vec<f32> {
+    pub fn costs_from(&self, start: CellId, costs: &LinkCosts) -> Vec<f32> {
         use std::cmp::Ordering;
         use std::collections::BinaryHeap;
 
@@ -151,7 +151,7 @@ impl NavGraph {
             }
             for &li in &self.adjacency[cell as usize] {
                 let link = self.links[li as usize];
-                let ng = g + link.cost + self.gate_penalty(li, gate_closed);
+                let ng = g + link.cost + self.link_extra(li, costs);
                 if ng < cost[link.to as usize] {
                     cost[link.to as usize] = ng;
                     heap.push(Node { g: ng, cell: link.to });

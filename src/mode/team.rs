@@ -413,12 +413,51 @@ pub(crate) fn smallest_team(g: &GameState) -> u8 {
     (idx + 1) as u8
 }
 
-/// The nearest living player on a *different* team to `bot` — the team-aware enemy picker (the
-/// teammate filter the FFA/Arena/Midair pickers deliberately lack).
+/// Beyond this many teammate bots already committed to an enemy, others spread to a fresher target
+/// instead of piling on — so a team splits its attention across the opposing side.
+const MAX_ATTACKERS: u32 = 2;
+
+/// The enemy `bot` should engage. With `rtx_bot_teamwork` (the default) it deconflicts: prefer the
+/// nearest enemy that fewer than [`MAX_ATTACKERS`] teammates are already on, so bots don't dogpile
+/// whoever's closest; if every enemy is saturated it falls back to nearest, so no bot idles. With
+/// teamwork off it's plain nearest-enemy — the team-aware picker the FFA/Arena/Midair ones lack.
 pub(crate) fn nearest_enemy(g: &GameState, bot: EntId) -> Option<EntId> {
     let origin = g.entities[bot].v.origin;
     let my_team = g.entities[bot].mode_p.team;
-    nearest_enemy_to(g, my_team, origin)
+    if !g.host().cvar_bool(c"rtx_bot_teamwork") {
+        return nearest_enemy_to(g, my_team, origin);
+    }
+    let candidates: Vec<(EntId, f32, u32)> = crate::mode::players(g)
+        .into_iter()
+        .filter(|&en| {
+            let e = &g.entities[en];
+            e.v.health > 0.0 && e.v.deadflag == 0.0 && e.mode_p.team != my_team
+        })
+        .map(|en| {
+            let d = (g.entities[en].v.origin - origin).length_squared();
+            (en, d, teammate_attackers(g, bot, my_team, en))
+        })
+        .collect();
+    assign_target(&candidates)
+}
+
+/// How many *other* living teammate bots are currently committed to `enemy` (their perception's
+/// `known_enemy`). The deconfliction signal — who the team is already fighting.
+fn teammate_attackers(g: &GameState, bot: EntId, my_team: u8, enemy: EntId) -> u32 {
+    crate::mode::players(g)
+        .into_iter()
+        .filter(|&t| {
+            let e = &g.entities[t];
+            t != bot && e.bot.is_bot && e.v.health > 0.0 && e.mode_p.team == my_team && e.bot.known_enemy == enemy.0
+        })
+        .count() as u32
+}
+
+/// Pick from `(enemy, dist², attacker_count)`: the nearest enemy under the [`MAX_ATTACKERS`] cap,
+/// else (all saturated) the nearest overall — never `None` when any candidate exists. Pure.
+fn assign_target(candidates: &[(EntId, f32, u32)]) -> Option<EntId> {
+    let nearest = |set: &mut dyn Iterator<Item = &(EntId, f32, u32)>| set.min_by(|a, b| a.1.total_cmp(&b.1)).map(|&(e, _, _)| e);
+    nearest(&mut candidates.iter().filter(|&&(_, _, atk)| atk < MAX_ATTACKERS)).or_else(|| nearest(&mut candidates.iter()))
 }
 
 /// The nearest living player not on `my_team` to an arbitrary `point` — used to pick a target near a
@@ -450,5 +489,21 @@ mod tests {
         for s in ["ffa", "ra", "midair", "2", "", "onon", "2on3", "0on0", "2on0"] {
             assert_eq!(parse_match_alias(s), None, "{s} should not parse");
         }
+    }
+
+    #[test]
+    fn assign_target_deconflicts_then_falls_back() {
+        use super::{assign_target, MAX_ATTACKERS};
+        use crate::entity::EntId;
+        assert_eq!(MAX_ATTACKERS, 2); // the cases below assume this cap
+        assert_eq!(assign_target(&[]), None, "no candidates → no target");
+        // Nearest (A) is saturated → pick the nearest *unsaturated* (C at 150 beats B at 200).
+        let mixed = [(EntId(3), 100.0, 2), (EntId(4), 200.0, 0), (EntId(5), 150.0, 0)];
+        assert_eq!(assign_target(&mixed), Some(EntId(5)));
+        // Every enemy saturated → fall back to nearest overall, never idle.
+        let saturated = [(EntId(3), 300.0, 2), (EntId(4), 100.0, 3)];
+        assert_eq!(assign_target(&saturated), Some(EntId(4)));
+        // One enemy, unsaturated → it, trivially.
+        assert_eq!(assign_target(&[(EntId(9), 500.0, 1)]), Some(EntId(9)));
     }
 }

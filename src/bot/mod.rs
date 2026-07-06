@@ -20,6 +20,7 @@ mod combat;
 pub(crate) mod goals;
 mod grenade;
 mod hook;
+pub(crate) mod perception;
 pub(crate) mod state;
 
 use crate::bot::state::{BotState, GrenadePhase, HookPhase};
@@ -29,7 +30,7 @@ use crate::defs::{
 use crate::entity::{EntId, Entity, Touch};
 use crate::game::{cstring, GameState};
 use crate::mode::BotIntent;
-use crate::navmesh::{CellId, LinkKind, NavGraph};
+use crate::navmesh::{CellId, LinkCosts, LinkKind, NavGraph};
 
 /// Impulse to select the shotgun (for shooting a health-gated button).
 const IMPULSE_SHOTGUN: i32 = 2;
@@ -83,6 +84,20 @@ const GOAL_AVOID_TIME: f32 = 12.0;
 /// on lack of progress, not elapsed time, so a button that's just far away is still pursued.
 const GATE_GIVEUP_TIME: f32 = 4.0;
 const GATE_AVOID_TIME: f32 = 6.0;
+/// Failed-link penalty: when a leg fails (stuck, speed-jump stall, hook give-up) it gets a per-bot
+/// travel-time surcharge in this bot's next A* so the planner *diverts* around it instead of handing
+/// back the identical route to retry forever. Surcharge grows with repeat strikes (`strikes²·STEP`,
+/// capped) and expires after `PENALTY_TTL` with no fresh strike. The cap sits far below the navmesh's
+/// closed-gate penalty, so it reshapes a route without ever forcing one through a shut door — and,
+/// being finite, never makes a cell unreachable (a lone corridor is still taken, just last).
+const PENALTY_STEP: f32 = 4.0;
+const PENALTY_CAP: f32 = 30.0;
+const PENALTY_TTL: f32 = 8.0;
+/// Path-progress watchdog: if the straight-line distance to the goal hasn't improved by at least
+/// `PROGRESS_EPS` for this long, the current leg is failing in a way the displacement stuck-detector
+/// can't see (e.g. orbiting a pillar at full speed) — penalize the leg and re-path.
+const PROGRESS_STALL_TIME: f32 = 2.5;
+const PROGRESS_EPS: f32 = 32.0;
 
 /// One bot's accumulated frame command: what navigation proposes and the combat/grenade overlays
 /// mutate in turn, before the aim spring and view projection in `run_bot` turn it into the final
@@ -207,6 +222,9 @@ pub fn run_bots(game: &mut GameState) {
 /// point and almost never fire.
 const PICKUP_XY: f32 = 40.0;
 const PICKUP_Z: f32 = 48.0;
+/// How long a just-collected goal item stays on the avoid ring, so the bot re-picks a fresh goal
+/// instead of re-fixating on a pickup that respawns (or lingers solid) the same second.
+const PICKUP_AVOID_TIME: f32 = 3.0;
 
 /// Manually collect any item the bot is standing on. The engine doesn't run the trigger-touch
 /// phase for `SetBotCMD` fake clients the way it does for human `SV_RunCmd`, so a bot would walk
@@ -237,9 +255,17 @@ fn bot_pickup_items(game: &mut GameState, e: EntId) {
         (it.touch == Touch::Backpack && it.v.solid == Solid::Trigger && on_item(origin, it.v.origin))
             .then_some(EntId(i as u32))
     }));
+    let now = game.time();
+    let goal_item = game.entities[e].bot.goal_item;
     for item in hits {
         if game.entities[item].v.solid == Solid::Trigger {
             game.run_touch(item, e);
+            // Just collected our goal item — briefly avoid it so an instant-respawn pickup (or a
+            // weapons-stay trigger that lingers solid) can't recapture the goal slot the same second;
+            // the slot frees up for the next-best pickup instead of re-fixating in place.
+            if item.0 == goal_item {
+                game.entities[e].bot.mark_avoid(item.0, now + PICKUP_AVOID_TIME);
+            }
         }
     }
 }
@@ -375,6 +401,25 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     //    needed weapon / big health, ktx-style, without abandoning combat — `enemy` stays set, so
     //    the combat overlay keeps aiming and firing whenever it has line of sight (see below).
     //  - Any other mode intent (a **Move** objective, or Fight with greed off) → no item chase.
+    // Perception gate: a mode nominates a target, but a human-like bot only acts on one it has
+    // actually perceived. Downgrade a Fight the bot is *unaware* of to no intent (so it patrols and
+    // collects until real contact — the biggest believability change); keep an *aware but unseen*
+    // target as Fight but hunt where it was last seen (`combat_last_seen`) rather than its live
+    // origin; leave a *visible* target as-is. Non-Fight intents (Move/None) aren't perceived.
+    let (intent, combat_last_seen) = match intent {
+        Some(BotIntent::Fight(en)) => match perception::perceive(game, e, en, now) {
+            perception::Awareness::Unaware => (None, None),
+            perception::Awareness::Known { last_seen } => (Some(BotIntent::Fight(en)), Some(last_seen)),
+            perception::Awareness::Visible => (Some(BotIntent::Fight(en)), None),
+        },
+        other => {
+            // No combat target this frame: clear the visibility clock so the next engagement starts
+            // with loose first-glimpse aim rather than reading a stale, long-settled duration.
+            game.entities[e].bot.vis_since = 0.0;
+            (other, None)
+        }
+    };
+
     let greedy = matches!(intent, Some(BotIntent::Fight(_))) && host.cvar_bool(c"rtx_bot_greed");
     if intent.is_none() || greedy {
         if now >= game.entities[e].bot.goal_select_time {
@@ -415,8 +460,13 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
             ("human", 0.0, false)
         };
         let own_lg = game.entities[e].v.items.has(Items::LIGHTNING) as i32;
+        let b = &game.entities[e].bot;
+        // Loop-free-nav telemetry: live failed-link penalties and whether the target is currently
+        // perceived (aware of / in memory), so a stuck/looping bot's divert can be watched live.
+        let pen = b.failed_links.iter().filter(|&&(_, until, _)| until > now).count();
+        let aware = (b.known_enemy != 0 && now < b.known_until) as i32;
         let msg = cstring(&format!(
-            "rtx bot{client}: want={goal} dist={dist:.0} on_item={overlap} ownLG={own_lg} cells={:.0}\n",
+            "rtx bot{client}: want={goal} dist={dist:.0} on_item={overlap} ownLG={own_lg} cells={:.0} pen={pen} aware={aware}\n",
             game.entities[e].v.ammo_cells,
         ));
         host.conprint(&msg); // conprint always shows; dprint needs `developer 1`
@@ -441,7 +491,9 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // Where we're headed: the detour item, the mode's target, the chosen item, or the nearest human.
     let (target_origin, item_cell) = match intent {
         Some(BotIntent::Fight(_)) if chasing => goal_item_org,
-        Some(BotIntent::Fight(en)) => (game.entities[en].v.origin, None),
+        // Visible → the enemy's live origin (combat owns aim on sight); aware-but-unseen → the
+        // last-seen spot, so the bot searches where they went instead of tracking through walls.
+        Some(BotIntent::Fight(en)) => (combat_last_seen.unwrap_or(game.entities[en].v.origin), None),
         Some(BotIntent::Move(pos)) => (pos, None),
         None if chasing => goal_item_org,
         None => {
@@ -461,8 +513,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // chain the router can't thread) so we stop circling and go fetch something reachable instead.
     if chasing && game.entities[e].bot.gate.is_none() && now - game.entities[e].bot.goal_started > GOAL_GIVEUP_TIME {
         let b = &mut game.entities[e].bot;
-        b.avoid_item = b.goal_item;
-        b.avoid_until = now + GOAL_AVOID_TIME;
+        b.mark_avoid(b.goal_item, now + GOAL_AVOID_TIME);
         b.goal_item = 0;
         b.goal_select_time = now; // re-pick (skipping the abandoned item) next frame
     }
@@ -621,6 +672,26 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // the nav borrow (it reads the obstruction edicts).
     let gate_closed = game.gate_closed_flags();
 
+    // This bot's live failed-link surcharges: legs it recently failed to traverse (stuck, stalled
+    // speed-jump, given-up hook) cost extra in *its* A* so the planner diverts instead of handing
+    // back the identical dead route to retry until a coarse goal-timeout fires. Built here from an
+    // immutable read so the owned Vecs outlive the disjoint `&mut bot` borrow below; new failures
+    // recorded later this frame apply next frame. Expired entries are dropped as they're gathered.
+    let penalties: Vec<(u32, f32)> = game.entities[e]
+        .bot
+        .failed_links
+        .iter()
+        .filter(|&&(_, until, _)| until > now)
+        .map(|&(li, _, strikes)| (li, link_penalty_secs(strikes)))
+        .collect();
+    // Gates + this bot's penalties + a per-bot jitter seed (so two bots vary otherwise-equal routes
+    // rather than treading an identical line — cheap route variety that also reads as more human).
+    let costs = LinkCosts {
+        gate_closed: &gate_closed,
+        penalties: &penalties,
+        jitter_seed: e.0,
+    };
+
     // Graph queries (borrows game.nav) and bot-state updates (borrows game.entities) are on
     // disjoint fields, so they coexist; `host` is a Copy, no game borrow held across the send.
     let graph = game.nav.graph.as_ref().unwrap();
@@ -670,7 +741,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
             bot.gate = None; // door opened — done
             bot.route.clear();
             bot.repath_time = now;
-        } else if !button_reachable(graph, bot_cell, gi, &gate_closed) {
+        } else if !button_reachable(graph, bot_cell, gi, &costs) {
             give_up(bot); // button is walled off behind this very gate — route around instead
         } else {
             let d = (graph.cell_origin(graph.gate(gi).button_cell).xy() - origin.xy()).length();
@@ -692,20 +763,24 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // Re-path when the route is empty, the goal changed, or the timer elapsed. Frozen mid-hook so
     // the traversal keeps the route that put it on the hook leg.
     if !hooking && !on_sj && (bot.route.is_empty() || bot.goal_cell != goal || now >= bot.repath_time) {
-        let mut route = graph.find_path(bot_cell, goal, &gate_closed).unwrap_or_default();
+        let mut route = graph.find_path(bot_cell, goal, &costs).unwrap_or_default();
         // Goal unreachable from here (behind a shut door with no way around from this spot, or a
         // disconnected pocket)? Don't home straight into a wall — head to the reachable cell
         // nearest the goal, approaching as far as the graph allows (often enough for line of sight
         // or to find a connection). Better than freezing until the target wanders into view.
         if route.is_empty() && bot_cell != goal {
-            if let Some(near) = graph.nearest_reachable_to(bot_cell, goal, &gate_closed) {
-                route = graph.find_path(bot_cell, near, &gate_closed).unwrap_or_default();
+            if let Some(near) = graph.nearest_reachable_to(bot_cell, goal, &costs) {
+                route = graph.find_path(bot_cell, near, &costs).unwrap_or_default();
             }
         }
         bot.route = route;
         bot.route_pos = 0;
         bot.goal_cell = goal;
         bot.repath_time = now + REPATH_INTERVAL;
+        // Restart the progress watchdog against the new route (INFINITY ⇒ the first frame records the
+        // real starting distance rather than reading as an instant stall on an old baseline).
+        bot.progress_best = f32::INFINITY;
+        bot.progress_since = now;
     }
     // If we've fallen off the planned route (missed a jump, got shoved), re-localize next.
     if !hooking && !on_sj && bot.route_pos >= bot.route.len() && bot_cell != goal && now >= bot.repath_time {
@@ -721,12 +796,12 @@ fn run_bot(game: &mut GameState, e: EntId) {
         let block =
             route_blocking_gate(graph, &bot.route, bot.route_pos, &gate_closed).filter(|&gi| gi as i32 != avoid);
         if let Some(gi) = block {
-            if button_reachable(graph, bot_cell, gi, &gate_closed) {
+            if button_reachable(graph, bot_cell, gi, &costs) {
                 let button_cell = graph.gate(gi).button_cell;
                 bot.gate = Some(gi);
                 bot.gate_since = now;
                 bot.gate_best_dist = f32::INFINITY; // first frame records the starting distance
-                bot.route = graph.find_path(bot_cell, button_cell, &gate_closed).unwrap_or_default();
+                bot.route = graph.find_path(bot_cell, button_cell, &costs).unwrap_or_default();
                 bot.route_pos = 0;
                 bot.goal_cell = button_cell;
                 bot.repath_time = now + REPATH_INTERVAL;
@@ -812,6 +887,8 @@ fn run_bot(game: &mut GameState, e: EntId) {
         target_origin
     };
 
+    let goal_dist = (target_origin.xy() - origin.xy()).length();
+
     // Stuck detection. Suppressed mid-hook: standing in the throw stance, reeling, and riding the
     // parabola all look "stuck" to it, and a force-jump/repath there would wreck the traversal — the
     // hook driver's own per-phase timeouts are its stuck detection.
@@ -821,15 +898,41 @@ fn run_bot(game: &mut GameState, e: EntId) {
         bot.stuck_since = now;
     } else if now - bot.stuck_since > STUCK_TIME {
         force_jump = true;
+        // Penalize the leg we're wedged on so the forced re-path actually *diverts* — without this
+        // the deterministic A* hands back the identical route and the bot re-wedges every 0.7s.
+        penalize_leg(bot, cur_leg, kind, now);
         bot.repath_time = now; // re-path next frame
         bot.stuck_since = now;
+    }
+
+    // Path-progress watchdog: catches a bot that *is* moving (so the displacement detector above
+    // stays satisfied) yet makes no headway toward the goal — orbiting a pillar, sliding along a
+    // wall, riding a mis-linked jump back and forth. If the straight-line distance to the goal hasn't
+    // improved by `PROGRESS_EPS` for `PROGRESS_STALL_TIME`, treat the current leg as failing: penalize
+    // it and re-path. Suspended while hooking / on a committed speed-jump / riding a plat (all of which
+    // legitimately hold or reverse XY progress for a while).
+    let plat_leg = matches!(kind, Some(LinkKind::Plat));
+    if !hook_active && !on_sj && !plat_leg {
+        if progress_stalled(bot.progress_best, bot.progress_since, goal_dist, now) {
+            penalize_leg(bot, cur_leg, kind, now);
+            bot.route.clear();
+            bot.repath_time = now;
+            bot.progress_best = goal_dist;
+            bot.progress_since = now;
+        } else if goal_dist < bot.progress_best - PROGRESS_EPS {
+            bot.progress_best = goal_dist;
+            bot.progress_since = now;
+        }
+    } else {
+        // Keep the baseline current so a stall isn't falsely flagged the instant we resume.
+        bot.progress_best = goal_dist;
+        bot.progress_since = now;
     }
 
     // Bunnyhop policy verdicts — everything that needs game state is judged here; *when* each
     // verdict may apply in the hop cycle (engage hysteresis, mid-hop commitment, landing-only
     // disengage) is `bhop::Bhop::step`'s job. The entry runway bar is deliberately fixed:
     // the old `speed·0.9` bar rose as the bot gained speed and cut runs short mid-air.
-    let goal_dist = (target_origin.xy() - origin.xy()).length();
     let runway_dist = runway(graph, &bot.route, bot.route_pos, origin);
     // Combat only vetoes bhop while it *owns the view* — the enemy is in sight (or lost a moment
     // ago), when the eyes must aim, not sweep a strafe. A mere Fight target being chased across
@@ -1153,12 +1256,45 @@ fn route_blocking_gate(graph: &NavGraph, route: &[u32], from: usize, closed: &[b
     })
 }
 
+/// Travel-time surcharge for a link with `strikes` recorded failures (`strikes²·PENALTY_STEP`,
+/// capped). Grows super-linearly so a link that keeps failing is diverted harder each time.
+fn link_penalty_secs(strikes: u8) -> f32 {
+    ((strikes as f32).powi(2) * PENALTY_STEP).min(PENALTY_CAP)
+}
+
+/// Whether the goal-ward distance has stalled: no improvement of at least `PROGRESS_EPS` below the
+/// best-seen (`best`) for at least `PROGRESS_STALL_TIME` since it last improved (`since`). Pure, so
+/// the threshold logic is unit-testable apart from the frame plumbing.
+fn progress_stalled(best: f32, since: f32, remaining: f32, now: f32) -> bool {
+    now - since > PROGRESS_STALL_TIME && remaining > best - PROGRESS_EPS
+}
+
+/// Record that this bot just failed to traverse `link`, so its next A* diverts around it. `Plat`
+/// and `Teleport` legs are exempt: waiting on a lift or standing in a teleport trigger reads as
+/// "stuck" to the watchdogs but is not a routing mistake. Bumps an existing live entry's strike
+/// count (harder divert on repeat) or claims the expired/oldest slot of the fixed ring.
+fn penalize_leg(bot: &mut BotState, link: Option<u32>, kind: Option<LinkKind>, now: f32) {
+    let Some(link) = link else { return };
+    if matches!(kind, Some(LinkKind::Plat | LinkKind::Teleport)) {
+        return;
+    }
+    if let Some(slot) = bot.failed_links.iter_mut().find(|(l, until, _)| *l == link && *until > now) {
+        slot.2 = slot.2.saturating_add(1);
+        slot.1 = now + PENALTY_TTL;
+        return;
+    }
+    // No live entry: reuse the slot expiring soonest (an expired/unused one has the smallest `until`).
+    if let Some(slot) = bot.failed_links.iter_mut().min_by(|a, b| a.1.total_cmp(&b.1)) {
+        *slot = (link, now + PENALTY_TTL, 1);
+    }
+}
+
 /// Whether gate `gi`'s button can be reached from `from` *without* crossing gate `gi`'s own shut
 /// door. False for the chicken-and-egg case (e.g. arenazap's central plate, which opens all four
 /// pillars but sits behind them): a bot outside can't reach it, so committing to that gate is
 /// futile — it should route around the pillar instead. A `None` path counts as unreachable.
-fn button_reachable(graph: &NavGraph, from: CellId, gi: usize, gate_closed: &[bool]) -> bool {
-    match graph.find_path(from, graph.gate(gi).button_cell, gate_closed) {
+fn button_reachable(graph: &NavGraph, from: CellId, gi: usize, costs: &LinkCosts) -> bool {
+    match graph.find_path(from, graph.gate(gi).button_cell, costs) {
         Some(route) => !route.iter().any(|&leg| graph.gate_of_link(leg) == Some(gi)),
         None => false,
     }
@@ -1301,7 +1437,7 @@ mod tests {
                 if d < 600.0 {
                     continue;
                 }
-                let Some(route) = graph.find_path(a, b, &[]) else {
+                let Some(route) = graph.find_path(a, b, &LinkCosts::default()) else {
                     continue;
                 };
                 routes += 1;
@@ -1338,5 +1474,58 @@ mod tests {
              never clear the {:.0}u engage bar",
             bhop::RUNWAY_ENGAGE
         );
+    }
+
+    #[test]
+    fn penalty_scales_with_strikes_and_caps() {
+        assert_eq!(link_penalty_secs(0), 0.0);
+        assert_eq!(link_penalty_secs(1), PENALTY_STEP);
+        assert_eq!(link_penalty_secs(2), 4.0 * PENALTY_STEP);
+        assert_eq!(link_penalty_secs(10), PENALTY_CAP, "surcharge is capped");
+        // The cap must stay far below the navmesh's closed-gate penalty (100_000s) so a failed-link
+        // surcharge only reshapes a route, never forces one through a shut door.
+        const { assert!(PENALTY_CAP < 1_000.0) };
+    }
+
+    #[test]
+    fn progress_stall_thresholds() {
+        // Within the stall window: never flagged, however little progress.
+        assert!(!progress_stalled(100.0, 0.0, 100.0, PROGRESS_STALL_TIME - 0.1));
+        // Past the window with no meaningful improvement: stalled.
+        assert!(progress_stalled(100.0, 0.0, 100.0, PROGRESS_STALL_TIME + 0.1));
+        // Past the window but the remaining distance dropped well below best: not stalled.
+        assert!(!progress_stalled(100.0, 0.0, 100.0 - PROGRESS_EPS - 1.0, PROGRESS_STALL_TIME + 0.1));
+    }
+
+    #[test]
+    fn penalize_leg_bumps_and_exempts() {
+        let mut b = BotState::default();
+        // None link, and Plat/Teleport kinds, are no-ops.
+        penalize_leg(&mut b, None, Some(LinkKind::Walk), 1.0);
+        penalize_leg(&mut b, Some(3), Some(LinkKind::Plat), 1.0);
+        penalize_leg(&mut b, Some(3), Some(LinkKind::Teleport), 1.0);
+        assert!(b.failed_links.iter().all(|&(_, until, _)| until == 0.0), "exempt legs recorded nothing");
+        // A walk leg records one strike; failing it again bumps strikes and refreshes expiry.
+        penalize_leg(&mut b, Some(3), Some(LinkKind::Walk), 1.0);
+        penalize_leg(&mut b, Some(3), Some(LinkKind::Walk), 2.0);
+        let e = b.failed_links.iter().find(|&&(l, _, _)| l == 3).unwrap();
+        assert_eq!((e.1, e.2), (2.0 + PENALTY_TTL, 2), "same leg bumped to 2 strikes, expiry refreshed");
+    }
+
+    #[test]
+    fn avoid_ring_marks_expires_and_evicts() {
+        let mut b = BotState::default();
+        b.mark_avoid(0, 100.0); // the 0 sentinel is ignored
+        assert!(!b.is_avoided(0, 1.0));
+        b.mark_avoid(5, 10.0);
+        assert!(b.is_avoided(5, 9.0));
+        assert!(!b.is_avoided(5, 10.0), "expiry is exclusive");
+        assert!(!b.is_avoided(6, 9.0));
+        // Overfill the 4-slot ring; the soonest-to-expire entry is evicted, later ones survive.
+        for (item, until) in [(11u32, 20.0f32), (12, 30.0), (13, 40.0), (14, 50.0)] {
+            b.mark_avoid(item, until);
+        }
+        assert!(!b.is_avoided(5, 9.0), "the earliest-expiring entry was evicted");
+        assert!(b.is_avoided(14, 49.0) && b.is_avoided(11, 19.0));
     }
 }

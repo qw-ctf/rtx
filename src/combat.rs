@@ -170,6 +170,18 @@ impl GameState {
 
         // Apply.
         self.entities[targ].v.health -= take;
+
+        // Perception "feel": a bot that just took damage instantly knows its attacker (you turn
+        // around when shot in the back), bypassing the view-cone/reaction gate. Perception then reads
+        // `known_enemy`/`known_until` next frame. Skipped for self-damage and world hazards.
+        if self.entities[targ].bot.is_bot && attacker != targ && attacker != EntId::WORLD {
+            let atk_org = self.entities[attacker].v.origin;
+            let b = &mut self.entities[targ].bot;
+            b.known_enemy = attacker.0;
+            b.known_until = time + crate::bot::perception::MEMORY;
+            b.percept_last_seen = atk_org;
+        }
+
         if self.entities[targ].v.health <= 0.0 {
             self.killed(targ, attacker);
             return;

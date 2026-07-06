@@ -194,8 +194,7 @@ pub(crate) fn drive_hook(graph: &NavGraph, bot: &mut BotState, c: HookCtx) -> Ho
             bot.hook_fails = 0;
             bot.route.clear();
             if chasing {
-                bot.avoid_item = bot.goal_item;
-                bot.avoid_until = now + GOAL_AVOID_TIME;
+                bot.mark_avoid(bot.goal_item, now + GOAL_AVOID_TIME);
                 bot.goal_item = 0;
                 bot.goal_select_time = now;
             }

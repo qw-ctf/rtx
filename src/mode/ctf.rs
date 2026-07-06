@@ -286,6 +286,21 @@ fn ctf_role(g: &GameState, bot: EntId, team: u8) -> CtfRole {
     }
 }
 
+/// A living teammate (other than `bot`) carrying the enemy flag — the runner an attacker escorts.
+fn team_carrier(g: &GameState, team: u8, bot: EntId) -> Option<EntId> {
+    players(g).into_iter().find(|&e| {
+        let ent = &g.entities[e];
+        e != bot && ent.mode_p.team == team && ent.v.health > 0.0 && ent.mode_p.ctf.carrying != 0
+    })
+}
+
+/// A per-bot hold post ~150u around the flag (one of three, by id), so defenders spread to cover
+/// approaches instead of stacking on the exact flag point.
+fn defender_offset(bot: EntId) -> Vec3 {
+    let a = (bot.0 % 3) as f32 * std::f32::consts::TAU / 3.0;
+    Vec3::new(a.cos(), a.sin(), 0.0) * 150.0
+}
+
 /// The team-aware CTF bot brain. Carrying the flag always overrides to a run home; otherwise the
 /// bot's [`CtfRole`] picks between pushing the enemy flag and holding our own base. All navigation is
 /// the generic `Move`/`Fight` seam.
@@ -295,6 +310,7 @@ fn ctf_bot_intent(g: &mut GameState, bot: EntId) -> Option<BotIntent> {
         return None;
     }
     let origin = g.entities[bot].v.origin;
+    let teamwork = g.host().cvar_bool(c"rtx_bot_teamwork");
 
     // Carrying the enemy flag → run to our base to capture (all roles; don't stop to fight).
     if g.entities[bot].mode_p.ctf.carrying != 0 {
@@ -321,8 +337,14 @@ fn ctf_bot_intent(g: &mut GameState, bot: EntId) -> Option<BotIntent> {
                     }
                 }
                 // Flag knocked out into the field → go stand on it to return it; else hold at home.
+                // When holding, stagger defenders to per-bot posts around the flag so they cover
+                // approaches instead of stacking on the exact spot.
                 let target = if matches!(phase, FlagPhase::Home) {
-                    home
+                    if teamwork {
+                        home + defender_offset(bot)
+                    } else {
+                        home
+                    }
                 } else {
                     flag_pos
                 };
@@ -330,10 +352,21 @@ fn ctf_bot_intent(g: &mut GameState, bot: EntId) -> Option<BotIntent> {
             }
         }
         CtfRole::Attack => {
-            // A close enemy in the way → fight it, otherwise keep pushing for the enemy flag.
+            // A close enemy in the way → fight it (escorts included), otherwise move.
             if let Some(en) = team::nearest_enemy(g, bot) {
                 if (g.entities[en].v.origin - origin).length_squared() < ATTACK_ENGAGE * ATTACK_ENGAGE {
                     return Some(BotIntent::Fight(en));
+                }
+            }
+            // No close enemy: half the attackers (by id parity) escort a teammate flag carrier home
+            // — trailing between the runner and the enemy base as a rearguard — while the rest keep
+            // pushing the enemy flag. Splits the team into capture pressure *and* carrier protection.
+            if teamwork && bot.0.is_multiple_of(2) {
+                if let Some(carrier) = team_carrier(g, team, bot) {
+                    let carrier_org = g.entities[carrier].v.origin;
+                    let home = base_flag(g, team).map_or(carrier_org, |f| g.entities[f].flag.home);
+                    let back = (carrier_org - home).normalize_or_zero();
+                    return Some(BotIntent::Move(carrier_org + back * 150.0));
                 }
             }
             if let Some(ef) = enemy_flag(g, team) {

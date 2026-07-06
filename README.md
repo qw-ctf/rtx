@@ -134,9 +134,12 @@ through the same player-move code as humans, so gravity, stepping, and jumps com
 |------|---------|--------------|
 | `rtx_bot_count` | `0` | How many bots to keep on the server. The population is reconciled to this count (spawning/removing as needed), leaving room for humans. Bots only spawn once the map's navmesh is built. |
 | `rtx_bot_alone` | `0` | Keep bots on the server even when **no humans** are connected (`0` = bots leave an empty server; `1` = they stay and play it out). |
-| `rtx_bot_skill` | `3` | Bot skill (0–7): tightens aim and speeds how fast a bot turns/tracks. |
+| `rtx_bot_skill` | `3` | Bot skill (0–7): tightens aim, speeds how fast a bot turns/tracks, widens its view cone, and shortens its reaction time. |
 | `rtx_bot_pacifist` | `0` | Make bots **not fight** in **any** mode — they just trail the nearest human around the map (for experimenting). `0` = bots play the mode normally. |
 | `rtx_bot_greed` | `1` | Let a fighting bot **break off to grab a compelling nearby pickup** — a powerup (quad/pent), a weapon it lacks, or a big health/armor swing — while it can't see its target, instead of only chasing the enemy. `0` = bots only pursue items when the mode leaves the brain idle. |
+| `rtx_bot_fov` | `120` | View cone (full angle, degrees) within which a bot can **see** a target; widened with skill. A nominated enemy outside the cone (or behind cover) isn't engaged until seen, heard firing, or felt as damage. `0` = 360° sight (the old always-aware behavior). |
+| `rtx_bot_reaction` | `0.4` | Base **reaction delay** (seconds) a target must stay in sight before the bot acts on it; shortened with skill (floored so even skill 7 isn't instant). `0` = react instantly. |
+| `rtx_bot_teamwork` | `1` | In **team/CTF** modes, coordinate: **spread targets** across the enemy team instead of dogpiling the nearest, **don't race teammates** to the same item, **escort** a friendly flag carrier, and **stagger** defender posts. `0` = each bot decides independently. No effect in FFA. |
 
 In free-for-all each bot **hunts and frags the nearest player** — everyone's an enemy, so a
 bots-only server plays itself — pathing to them and, once in sight, aiming and shooting via the
@@ -144,6 +147,22 @@ shared combat layer (retreating when hurt, grabbing items it passes over). Set `
 — in any mode — and they stop fighting and just tail the nearest human instead. With nothing to
 chase and no human to follow, a bot **roams** to a random reachable spot rather than standing on its
 spawn.
+
+A bot doesn't fight a target it hasn't actually **perceived**: an enemy has to be **seen** (inside
+the bot's view cone `rtx_bot_fov`, with line of sight, held for a `rtx_bot_reaction` beat), **heard**
+firing nearby, or **felt** as incoming damage before the bot engages it — so instead of psychically
+beelining an unseen enemy it patrols and collects until real contact, and when it loses sight it
+**hunts the last spot it saw them** for a few seconds before giving up rather than tracking them
+through walls. Aim is loosest on first glimpse and while moving, tightening as it holds a target in
+view. In **team and CTF** modes (`rtx_bot_teamwork`) a team **spreads its fire** across the enemy
+side instead of all piling on the nearest, **doesn't race itself** to the same pickup, **escorts** a
+teammate carrying the flag, and **staggers** its defenders around the base.
+
+Navigation is **loop-resistant**: when a bot fails to traverse a link (a jump it keeps undershooting,
+a spot it wedges on, a leg that makes no headway toward the goal) that link gets a temporary per-bot
+cost penalty, so its next path **routes around** the trouble instead of the planner handing back the
+identical dead route to retry until a timeout fires. A dash of per-bot path jitter also keeps two
+bots from treading an identical line.
 
 Bots value pickups the way ktx does: each item's **desire** is the marginal effective-HP (health,
 armor), firepower (weapons, ammo), or flat dominance (powerups) it would give *this* bot right now,

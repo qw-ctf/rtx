@@ -21,7 +21,7 @@ use crate::arsenal::AmmoKind;
 use crate::defs::{Bits, Items, Solid};
 use crate::entity::{EntId, Think, Touch};
 use crate::game::GameState;
-use crate::navmesh::CellId;
+use crate::navmesh::{CellId, LinkCosts};
 
 /// Beyond this travel-or-respawn time (seconds) an item isn't worth pursuing.
 pub(crate) const LOOKAHEAD: f32 = 10.0;
@@ -31,6 +31,16 @@ pub(crate) const LOOKAHEAD: f32 = 10.0;
 /// swing clear it, while a minor ammo top-off (≈2.5) doesn't — a bot won't abandon a firefight for
 /// a handful of shells, but it will for the quad, an RL it lacks, or a big health/armor pickup.
 pub(crate) const COMBAT_GREED_MIN_DESIRE: f32 = 40.0;
+
+/// Relative bonus the item a bot is *already* chasing gets in goal scoring, so a marginally-better
+/// alternative doesn't make it flip-flop between two near-equal pickups each re-selection (a loop
+/// the navigation watchdogs can't see, since the bot keeps moving). Q3's goal-selection dampening.
+const GOAL_HYSTERESIS: f32 = 1.3;
+
+/// Score multiplier for an item a teammate bot has already claimed (is fetching), so teammates don't
+/// race the same pickup. Small enough that a powerup's dominating desire still wins it (the quad
+/// stays contested), large enough to discourage two bots converging on one health/armor.
+const CLAIM_DISCOUNT: f32 = 0.3;
 
 /// The weapons a bot can want, and the ammo kinds. Real enums (not raw [`Items`] bits) so the
 /// desire match stays exhaustive.
@@ -420,27 +430,71 @@ impl GameState {
     /// the static catalog and live backpacks. `desire` is returned so callers can apply their own
     /// bar (combat-detour vs. idle pickup). Backpacks are on the floor now, so their `t` is pure
     /// travel; the catalog folds in respawn-wait via [`item_collect_time`].
+    /// Whether a living teammate bot is already fetching item `idx` (its `goal_item`) — the claim
+    /// signal the item-scoring discount reads, so bots on a team don't converge on the same pickup.
+    fn item_claimed_by_teammate(&self, bot_e: EntId, my_team: u8, idx: u32) -> bool {
+        if idx == 0 {
+            return false;
+        }
+        let maxclients = self.host().cvar(c"maxclients") as u32;
+        (1..=maxclients).map(EntId).any(|t| {
+            t != bot_e && {
+                let e = &self.entities[t];
+                e.bot.is_bot && e.v.health > 0.0 && e.mode_p.team == my_team && e.bot.goal_item == idx
+            }
+        })
+    }
+
     fn best_item_goal(&self, bot_e: EntId) -> Option<(EntId, CellId, f32)> {
         let graph = self.nav.graph.as_ref()?;
         let bot_cell = graph.nearest(self.entities[bot_e].v.origin)?;
-        // Gate-aware: items behind a shut door cost more, so a bot prefers ones it can reach now.
-        let gate_closed = self.gate_closed_flags();
-        let costs = graph.costs_from(bot_cell, &gate_closed);
         let now = self.time();
+        // Gate-aware: items behind a shut door cost more, so a bot prefers ones it can reach now.
+        // Also charge this bot's failed-link penalties (jitter off — item scoring stays stable): an
+        // item only reachable via a leg it keeps failing floods to a higher `t` and scores lower, so
+        // it stops re-choosing an item it can path a route to but never actually traverse.
+        let gate_closed = self.gate_closed_flags();
+        let penalties: Vec<(u32, f32)> = self.entities[bot_e]
+            .bot
+            .failed_links
+            .iter()
+            .filter(|&&(_, until, _)| until > now)
+            .map(|&(li, _, strikes)| (li, super::link_penalty_secs(strikes)))
+            .collect();
+        let costs = graph.costs_from(
+            bot_cell,
+            &LinkCosts {
+                gate_closed: &gate_closed,
+                penalties: &penalties,
+                jitter_seed: 0,
+            },
+        );
         let s = self.bot_stats(bot_e);
-        // An item we recently gave up reaching, to skip until its avoid window lapses.
-        let (avoid_item, avoid_until) = {
-            let b = &self.entities[bot_e].bot;
-            (b.avoid_item, b.avoid_until)
+        // The item we're already chasing, for the hysteresis bonus below.
+        let current_goal = self.entities[bot_e].bot.goal_item;
+        // Item claims (teamwork): an item a living teammate bot is already fetching is discounted, so
+        // teammates spread across pickups instead of racing the same one. A powerup's dominating
+        // desire still beats the discount, so the quad stays contested. Off in FFA (no team).
+        let my_team = self.entities[bot_e].mode_p.team;
+        let teamwork = my_team != 0 && self.host().cvar_bool(c"rtx_bot_teamwork");
+        let claim_mult = |idx: u32| {
+            if teamwork && self.item_claimed_by_teammate(bot_e, my_team, idx) {
+                CLAIM_DISCOUNT
+            } else {
+                1.0
+            }
         };
-        let skip = |idx: u32| idx == avoid_item && now < avoid_until;
+        let skip = |idx: u32| self.entities[bot_e].bot.is_avoided(idx, now);
         let score_of = |desire: f32, t: f32| desire * (LOOKAHEAD - t) / (t + 5.0);
 
         // best = (item, cell, desire, score) — score orders the search, desire is handed back.
         let mut best: Option<(EntId, CellId, f32, f32)> = None;
-        let mut consider = |item: EntId, cell: CellId, desire: f32, t: f32| {
+        let mut consider = |item: EntId, cell: CellId, desire: f32, t: f32, mult: f32| {
             if t < LOOKAHEAD {
-                let score = score_of(desire, t);
+                let mut score = score_of(desire, t) * mult;
+                if item.0 == current_goal {
+                    score *= GOAL_HYSTERESIS; // stick with the current goal against a near-tie
+                }
                 if best.is_none_or(|(_, _, _, b)| score > b) {
                     best = Some((item, cell, desire, score));
                 }
@@ -466,7 +520,7 @@ impl GameState {
             let Some(t) = self.item_collect_time(item, travel, now) else {
                 continue;
             };
-            consider(item, cell, desire, t);
+            consider(item, cell, desire, t, claim_mult(idx));
         }
 
         // Live backpacks aren't in the static catalog (they spawn on death / a teammate's toss and
@@ -487,7 +541,7 @@ impl GameState {
             if !travel.is_finite() {
                 continue;
             }
-            consider(item, cell, desire, travel);
+            consider(item, cell, desire, travel, claim_mult(i as u32));
         }
 
         best.map(|(item, cell, desire, _)| (item, cell, desire))

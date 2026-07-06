@@ -260,6 +260,40 @@ pub struct SpeedJumpTraversal {
 /// game engine prices a disabled-but-openable NavMesh link rather than deleting it outright.
 const CLOSED_GATE_PENALTY: f32 = 100_000.0;
 
+/// Peak fraction of a link's own cost added as deterministic per-caller jitter when
+/// [`LinkCosts::jitter_seed`] is set — enough to break ties between near-equal routes (so two bots
+/// vary their paths) without ever reordering genuinely-cheaper alternatives.
+const JITTER_FRAC: f32 = 0.10;
+
+/// Per-query dynamic costs layered on each link's static cost: live gate state, plus an optional
+/// caller-supplied surcharge (a bot's recently-failed links) and deterministic jitter (per-bot
+/// route variety). **Every term is non-negative**, so A*'s straight-line heuristic stays an
+/// admissible lower bound and routes stay optimal-or-diverted, never wrong. Cheap to pass by value.
+#[derive(Default, Clone, Copy)]
+pub struct LinkCosts<'a> {
+    /// `gate_closed[i]` marks gate `i`'s door currently shut; a link through it is charged
+    /// [`CLOSED_GATE_PENALTY`]. Empty slice ⇒ every door treated as open.
+    pub gate_closed: &'a [bool],
+    /// `(link idx, extra seconds)` surcharges — a bot's failed-link penalties. Tiny (≤8 entries),
+    /// scanned linearly. Kept far below [`CLOSED_GATE_PENALTY`] so it diverts a route without ever
+    /// forcing one through a shut door.
+    pub penalties: &'a [(u32, f32)],
+    /// Nonzero ⇒ add `hash(seed ^ link) → [0, JITTER_FRAC]·link.cost` per link, so bots with distinct
+    /// seeds pick different near-equal corridors. Zero ⇒ no jitter (deterministic; tests, non-bots).
+    pub jitter_seed: u32,
+}
+
+/// A cheap integer hash (variant of the SplitMix/Murmur finalizer) for deterministic route jitter.
+#[inline]
+fn hash32(mut x: u32) -> u32 {
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7feb_352d);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x846c_a68b);
+    x ^= x >> 16;
+    x
+}
+
 impl NavGraph {
     /// Build the graph from a parsed BSP's player hull. Pure; safe to run at load time.
     pub fn build(bsp: &Bsp) -> NavGraph {
@@ -796,14 +830,26 @@ impl NavGraph {
         }
     }
 
-    /// Extra A* cost for link `li` given the current door states — [`CLOSED_GATE_PENALTY`] if its
-    /// gate is shut, else nothing.
+    /// Extra A* cost for link `li` under `costs`: closed-gate penalty + this caller's per-link
+    /// surcharge + optional deterministic jitter. All non-negative, keeping the A* heuristic
+    /// admissible (see [`LinkCosts`]).
     #[inline]
-    fn gate_penalty(&self, li: u32, gate_closed: &[bool]) -> f32 {
-        match self.gate_of_link(li) {
-            Some(g) if gate_closed.get(g).copied().unwrap_or(false) => CLOSED_GATE_PENALTY,
+    fn link_extra(&self, li: u32, costs: &LinkCosts) -> f32 {
+        let mut extra = match self.gate_of_link(li) {
+            Some(g) if costs.gate_closed.get(g).copied().unwrap_or(false) => CLOSED_GATE_PENALTY,
             _ => 0.0,
+        };
+        for &(l, sec) in costs.penalties {
+            if l == li {
+                extra += sec;
+                break;
+            }
         }
+        if costs.jitter_seed != 0 {
+            let h = hash32(costs.jitter_seed ^ li.wrapping_mul(0x9e37_79b1));
+            extra += (h as f32 / u32::MAX as f32) * JITTER_FRAC * self.links[li as usize].cost;
+        }
+        extra
     }
 
     // --- entity-independent: grappling-hook swing links ---
@@ -1389,7 +1435,7 @@ mod tests {
         // Assert A* returns a valid chain to the farthest reachable cell.
         let goal = *best.last().unwrap();
         let route = g
-            .find_path(start, goal, &[])
+            .find_path(start, goal, &LinkCosts::default())
             .expect("A* found no route to a reachable cell");
         let mut cell = start;
         for &li in &route {
@@ -1445,7 +1491,11 @@ mod tests {
         assert!(gated_links > 0, "no link tagged by the gate");
         // The state-aware A* still resolves with the gate shut (routes around, or through with the
         // penalty when there's no other way).
-        assert!(g.find_path(start, goal, &[true]).is_some(), "no route with gate shut");
+        let shut = LinkCosts {
+            gate_closed: &[true],
+            ..Default::default()
+        };
+        assert!(g.find_path(start, goal, &shut).is_some(), "no route with gate shut");
         eprintln!(
             "gate splice: {gated_links} gated links, button cell {}",
             g.gate(0).button_cell
@@ -1637,5 +1687,93 @@ mod tests {
             }
         }
         n
+    }
+
+    /// A diamond: two routes from cell 0 to cell 3, one (via 1) slightly cheaper than the other (via
+    /// 2). Enough to exercise per-link penalty diversion and jitter without a BSP.
+    ///   links: 0=(0→1,1.0) 1=(1→3,1.0)  2=(0→2,1.1) 3=(2→3,1.1)
+    fn diamond() -> NavGraph {
+        let cell = |x: f32, y: f32| Cell {
+            origin: Vec3::new(x, y, 0.0),
+            gx: 0,
+            gy: 0,
+        };
+        let link = |from: CellId, to: CellId, cost: f32| Link {
+            from,
+            to,
+            kind: LinkKind::Walk,
+            cost,
+        };
+        NavGraph {
+            cells: vec![cell(0.0, 0.0), cell(100.0, 50.0), cell(100.0, -50.0), cell(200.0, 0.0)],
+            links: vec![link(0, 1, 1.0), link(1, 3, 1.0), link(0, 2, 1.1), link(2, 3, 1.1)],
+            adjacency: vec![vec![0, 2], vec![1], vec![3], vec![]],
+            grid: GridIndex::default(),
+            gates: Vec::new(),
+            gated_links: Vec::new(),
+            hook_links: Vec::new(),
+            hooks: Vec::new(),
+            speed_jump_links: Vec::new(),
+            speed_jumps: Vec::new(),
+        }
+    }
+
+    /// A per-link penalty diverts A* onto the alternate route once it exceeds the route's cost
+    /// margin, and the route reverts the moment the penalty is gone — the loop-free-nav core.
+    #[test]
+    fn penalty_diverts_then_reverts() {
+        let g = diamond();
+        // No penalty → the cheaper route via cell 1.
+        assert_eq!(g.find_path(0, 3, &LinkCosts::default()).unwrap(), vec![0, 1]);
+        // A penalty smaller than the 0.2s route-cost gap doesn't flip it.
+        let tiny = [(0u32, 0.05f32)];
+        let costs = LinkCosts {
+            penalties: &tiny,
+            ..Default::default()
+        };
+        assert_eq!(g.find_path(0, 3, &costs).unwrap(), vec![0, 1]);
+        // A larger penalty on link 0 (0→1) diverts onto the route via cell 2.
+        let big = [(0u32, 5.0f32)];
+        let costs = LinkCosts {
+            penalties: &big,
+            ..Default::default()
+        };
+        assert_eq!(g.find_path(0, 3, &costs).unwrap(), vec![2, 3]);
+        // Penalty expired (absent from the slice) → back to the cheap route.
+        assert_eq!(g.find_path(0, 3, &LinkCosts::default()).unwrap(), vec![0, 1]);
+    }
+
+    /// A finite penalty never disconnects the graph: if the only route runs through the penalized
+    /// link, A* still returns it (finite cost, unlike a closed gate's near-infinite one).
+    #[test]
+    fn penalty_never_disconnects() {
+        let g = diamond();
+        let huge = [(0u32, 999.0f32), (2u32, 999.0f32)]; // penalize both first legs
+        let costs = LinkCosts {
+            penalties: &huge,
+            ..Default::default()
+        };
+        assert!(g.find_path(0, 3, &costs).is_some(), "finite penalties must not sever the route");
+    }
+
+    /// Jitter is deterministic per (seed, link) and bounded to `[0, JITTER_FRAC·cost]`.
+    #[test]
+    fn jitter_bounded_and_deterministic() {
+        let g = diamond();
+        let costs = LinkCosts {
+            jitter_seed: 7,
+            ..Default::default()
+        };
+        for li in 0..g.links.len() as u32 {
+            let a = g.link_extra(li, &costs);
+            assert_eq!(a, g.link_extra(li, &costs), "jitter must be deterministic");
+            assert!(a >= 0.0, "jitter is non-negative (keeps the heuristic admissible)");
+            assert!(
+                a <= JITTER_FRAC * g.links[li as usize].cost + 1e-6,
+                "jitter {a} exceeds the {JITTER_FRAC} cost bound",
+            );
+        }
+        // Zero seed disables jitter entirely.
+        assert_eq!(g.link_extra(0, &LinkCosts::default()), 0.0);
     }
 }

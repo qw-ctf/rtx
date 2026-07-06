@@ -33,15 +33,26 @@ pub struct BotState {
     /// time-on-goal, not distance, so a legitimate route that walks *away* toward a teleporter
     /// isn't mistaken for being stuck.
     pub goal_started: f32,
-    /// An item to skip while picking goals, until `avoid_until` — set when we gave up reaching it,
-    /// so we don't immediately re-fixate on the same unreachable pickup.
-    pub avoid_item: u32,
-    pub avoid_until: f32,
+    /// Items to skip while picking goals, each until its paired expiry — set when we gave up reaching
+    /// one (unreachable pickup) or just collected one (so an instant-respawn item or lingering
+    /// weapons-stay trigger can't re-capture the goal slot the same second). A small ring: a fresh
+    /// entry evicts the soonest-to-expire slot. `(item entid, until)`; a `0` item marks an empty slot.
+    pub avoid_items: [(u32, f32); 4],
+    /// Links this bot recently failed to traverse (stuck, stalled speed-jump, given-up hook), each a
+    /// `(link idx, until, strikes)`: a per-bot A* surcharge (growing with strikes) that makes the
+    /// planner *divert* around a dead leg instead of re-issuing the identical route to retry forever.
+    /// A fixed ring; a fresh failure bumps a matching entry or evicts the soonest-to-expire slot.
+    pub failed_links: [(u32, f32, u8); 8],
     /// Earliest time we may recompute the route (throttles A*).
     pub repath_time: f32,
     /// Stuck detector: where we were when last checked, and since when we've been there.
     pub stuck_origin: Vec3,
     pub stuck_since: f32,
+    /// Path-progress watchdog: the closest straight-line distance to the goal we've reached on the
+    /// current route, and when it last improved. No improvement for a while ⇒ the leg is failing in a
+    /// way the displacement stuck-detector can't see (orbiting, wall-sliding) — penalize and re-path.
+    pub progress_best: f32,
+    pub progress_since: f32,
     /// Origin on the previous bot frame, to detect a teleport (a large instant jump) and
     /// re-path from the landing spot.
     pub last_origin: Vec3,
@@ -63,9 +74,22 @@ pub struct BotState {
     pub aim_err_until: f32,
     /// Where the combat enemy was last actually visible, and when. While line of sight is briefly
     /// lost the bot *holds this angle* (like a player holding a corner) instead of snapping back
-    /// to its navigation view.
+    /// to its navigation view. Written by combat under *true* line of sight only (the bhop veto and
+    /// corner-hold key off it) — perception memory below is separate.
     pub enemy_seen_at: Vec3,
     pub enemy_seen_time: f32,
+    /// Perception ([`crate::bot::perception`]): the target we're currently accruing sight-reaction
+    /// time on and since when (a change of target or a break in sight restarts it); the target we've
+    /// been promoted to *aware of* and the expiry of that awareness memory; where it was last
+    /// perceived (hunted while aware but out of sight); and when continuous line of sight to the
+    /// current target began (drives combat's aim-error convergence). Distinct from `enemy_seen_*`:
+    /// these advance on hear/feel too, so they must not be read where true line of sight is meant.
+    pub percept_ent: u32,
+    pub percept_since: f32,
+    pub known_enemy: u32,
+    pub known_until: f32,
+    pub percept_last_seen: Vec3,
+    pub vis_since: f32,
     /// Last frame's clean firing-solution angles and their timestamp, to estimate how fast the
     /// solution is moving (deg/s). Feeds the aim feed-forward that cancels the spring's tracking
     /// lag against a strafing target.
@@ -129,6 +153,26 @@ pub struct BotState {
     /// committed bhop run-up + leap), and when it began. `None` = not on a speed jump.
     pub sj_leg: Option<u32>,
     pub sj_started: f32,
+}
+
+impl BotState {
+    /// Add `item` to the avoid ring until `until` (bumping a matching entry's expiry, else evicting
+    /// the soonest-to-expire slot). Ignores `0` (the "no item" sentinel).
+    pub fn mark_avoid(&mut self, item: u32, until: f32) {
+        if item == 0 {
+            return;
+        }
+        if let Some(slot) = self.avoid_items.iter_mut().find(|(it, _)| *it == item) {
+            slot.1 = slot.1.max(until);
+        } else if let Some(slot) = self.avoid_items.iter_mut().min_by(|a, b| a.1.total_cmp(&b.1)) {
+            *slot = (item, until);
+        }
+    }
+
+    /// Whether `item` is currently on the avoid ring (an unexpired entry).
+    pub fn is_avoided(&self, item: u32, now: f32) -> bool {
+        self.avoid_items.iter().any(|&(it, until)| it == item && now < until)
+    }
 }
 
 /// Phase of a bot's grenade lob→shoot combo. `Idle` unless a combo is in progress.

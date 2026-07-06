@@ -113,6 +113,16 @@ const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         ("rtx_bot_greed", Bool(true)),
         // Per-bot goal/pickup diagnostics to the server console (off by default).
         ("rtx_bot_debug", Bool(false)),
+        // Perception (human-like targeting). `rtx_bot_fov` is the view cone (full angle, degrees)
+        // within which a bot can *see* a target, widened with skill; 0 = 360° (see everywhere, the
+        // old behavior). `rtx_bot_reaction` is the base delay (seconds) a target must stay seen
+        // before the bot reacts, shortened with skill; 0 = instant. Both 0 ≈ pre-perception bots.
+        ("rtx_bot_fov", Float(120.0)),
+        ("rtx_bot_reaction", Float(0.4)),
+        // Team coordination (team/CTF modes): spread targets across the enemy team instead of
+        // dogpiling the nearest, don't race teammates to the same item, and stagger CTF roles/posts.
+        // 1 = on; 0 = each bot decides independently (the old behavior). No effect in FFA.
+        ("rtx_bot_teamwork", Bool(true)),
     ]
 };
 

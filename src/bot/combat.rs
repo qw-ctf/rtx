@@ -130,6 +130,19 @@ pub(crate) fn aim_omega(skill: f32) -> f32 {
     6.0 + skill * 2.0
 }
 
+/// Multiplier on the base aim spread from three human tracking factors, all ≥ 1 so they only ever
+/// *widen* the error: **convergence** (loose on first sight at `visible_for = 0`, tightening below 1
+/// over ~1.5s of continuous line of sight), **own motion** (worse while running, up to +40% at
+/// 320ups), and **target crossing** (worse the faster the target moves across the line of fire,
+/// `perp_speed/dist` ≈ angular rate). Pure, so the clamps/monotonicity are unit-testable; skill's
+/// contribution stays in the base spread (so skill 7 ⇒ base 0 ⇒ spread 0 regardless of this).
+fn spread_scale(visible_for: f32, own_speed: f32, perp_speed: f32, dist: f32) -> f32 {
+    let converge = 1.6 + (0.7 - 1.6) * (visible_for / 1.5).clamp(0.0, 1.0);
+    let move_factor = 1.0 + 0.4 * (own_speed / 320.0).min(1.0);
+    let track_factor = 1.0 + 0.5 * (perp_speed / dist.max(1.0)).min(1.0);
+    converge * move_factor * track_factor
+}
+
 /// Time for a projectile of speed `s` fired from the origin to meet a target at relative position
 /// `r` moving at constant velocity `v`: the smallest positive root of `|r + v·t| = s·t`
 /// (quadratic `(v·v − s²)t² + 2(r·v)t + r·r = 0`). This is what makes lead *geometry-aware*:
@@ -247,7 +260,27 @@ pub(crate) fn engage(
     // Misses sweep past the target and drift back, like human tracking error. Pitch error is kept
     // smaller than yaw (vertical mouse control is steadier). Skill 7 ⇒ error ≈ 0.
     let skill = game.host().cvar(c"rtx_bot_skill").clamp(0.0, 7.0);
-    let spread = (7.0 - skill).max(0.0); // half-range, degrees
+    // Base half-range shrinks with skill (skill 7 ⇒ 0 ⇒ perfect), then widens with three human
+    // tracking factors, so first-glimpse and running snap-shots are looser than a settled duel:
+    //  • convergence — loose on first sight, tightening over ~1.5s of continuous line of sight
+    //    (`vis_since`, set by perception); the reaction delay already removed the insta-lock tell.
+    //  • own motion — harder to aim while running/bhopping.
+    //  • target crossing — a fast perpendicular mover is harder to track than a stationary one.
+    let base_spread = (7.0 - skill).max(0.0);
+    let visible_for = {
+        let vs = game.entities[e].bot.vis_since;
+        if vs > 0.0 {
+            now - vs
+        } else {
+            0.0
+        }
+    };
+    let own_speed = game.entities[e].v.velocity.xy().length();
+    let perp_speed = {
+        let los_dir = to_enemy / dist;
+        (enemy_vel - los_dir * enemy_vel.dot(los_dir)).length() // target motion across the line of fire
+    };
+    let spread = base_spread * spread_scale(visible_for, own_speed, perp_speed, dist);
     let frametime = game.globals.frametime;
     if now >= game.entities[e].bot.aim_err_until {
         let (r1, r2, r3) = (game.random(), game.random(), game.random());
@@ -579,5 +612,31 @@ mod tests {
 
         // Outrunnable target: no positive intercept.
         assert!(intercept_time(r, Vec3::new(1100.0, 0.0, 0.0), 1000.0).is_none());
+    }
+
+    #[test]
+    fn spread_scale_converges_and_widens() {
+        let dist = 500.0;
+        // First glimpse (visible_for 0), still, target not crossing → the loosest convergence, 1.6×.
+        let first = spread_scale(0.0, 0.0, 0.0, dist);
+        assert!((first - 1.6).abs() < 1e-6);
+        // After sustained sight the convergence bottoms out at 0.7× (tighter than a fresh glimpse).
+        let settled = spread_scale(2.0, 0.0, 0.0, dist);
+        assert!((settled - 0.7).abs() < 1e-6);
+        assert!(settled < first, "sustained sight must tighten aim");
+        // Own motion and target crossing only ever widen the spread, each within its cap.
+        assert!(spread_scale(2.0, 320.0, 0.0, dist) > settled);
+        assert!(spread_scale(2.0, 0.0, 800.0, dist) > settled);
+        let capped = spread_scale(0.0, 9999.0, 9_999_999.0, dist);
+        assert!(capped <= 1.6 * 1.4 * 1.5 + 1e-4, "factors must stay within their caps");
+    }
+
+    #[test]
+    fn spread_scale_never_below_settled_floor() {
+        // The multiplier is bounded below by the fully-converged, still, non-crossing case (0.7),
+        // so a high-skill bot's zero base spread stays zero and a low-skill bot never over-tightens.
+        for &(v, own, perp) in &[(0.0, 0.0, 0.0), (1.5, 100.0, 200.0), (5.0, 320.0, 1000.0)] {
+            assert!(spread_scale(v, own, perp, 400.0) >= 0.7 - 1e-6);
+        }
     }
 }
