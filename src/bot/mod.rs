@@ -24,7 +24,7 @@ pub(crate) mod perception;
 mod rj;
 pub(crate) mod state;
 
-use crate::bot::state::{BotState, GrenadePhase, HookPhase};
+use crate::bot::state::{BotState, GrenadePhase, HookPhase, RjPhase};
 use crate::defs::{
     Bits, Flags, Items, Solid, Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP,
 };
@@ -37,6 +37,8 @@ use crate::navmesh::{CellId, LinkCosts, LinkKind, NavGraph};
 const IMPULSE_SHOTGUN: i32 = 2;
 /// Impulse to select the grappling hook (for flying a hook leg).
 const IMPULSE_GRAPPLE: i32 = 22;
+/// Impulse to select the rocket launcher (for firing a rocket jump).
+const IMPULSE_ROCKET: i32 = 7;
 
 // --- grappling-hook leg execution ---
 
@@ -54,6 +56,20 @@ const HOOK_REEL_TIMEOUT: f32 = 3.0;
 const HOOK_ANCHOR_DRIFT: f32 = 48.0;
 /// Ballistic watchdog slack added to the solved airtime before we give up waiting to land.
 const HOOK_BALLISTIC_SLACK: f32 = 1.0;
+
+// --- rocket-jump leg execution ---
+
+/// Within this of the launch cell counts as "in stance" to jump from — tighter than the hook's
+/// (the solve's ±16u launch perturb bounds how far off the spot the arc still lands).
+const RJ_STANCE: f32 = 16.0;
+/// Fire the jump once the smoothed view is within this many degrees of the solved fire angles.
+const RJ_AIM_TOL: f32 = 2.0;
+/// Give up the stance if the RL/aim/ground alignment hasn't let the jump go within this.
+const RJ_STANCE_TIMEOUT: f32 = 2.5;
+/// If the bot is still on the ground this long after pressing jump, the jump was swallowed — abort.
+const RJ_LIFTOFF_TIMEOUT: f32 = 0.3;
+/// Ballistic watchdog slack added to the solved airtime before we give up waiting to land.
+const RJ_BALLISTIC_SLACK: f32 = 1.0;
 
 /// Advance to the next route leg once within this of the current waypoint (≈ ¾ of a grid).
 const ARRIVE_RADIUS: f32 = 24.0;
@@ -283,6 +299,8 @@ struct Objective {
     hooking: bool,
     /// Currently committed to a speed-jump leg (route frozen, like `hooking`).
     on_sj: bool,
+    /// Currently flying (or committed to) a rocket-jump leg (route frozen, like `hooking`).
+    on_rj: bool,
     /// A mode Fight intent's enemy to engage, if any.
     enemy: Option<EntId>,
     /// Chasing a committed item goal (idle pickup or greedy combat detour).
@@ -322,6 +340,14 @@ struct Sense {
     on_hook: bool,
     anchor: Vec3,
     reel_half_step: f32,
+    // Rocket-jump fitness + fire gating.
+    attack_finished: f32,
+    has_rl: bool,
+    ammo_rockets: f32,
+    health: f32,
+    armortype: f32,
+    armorvalue: f32,
+    quad: bool,
 }
 
 fn sense(game: &GameState, e: EntId) -> Sense {
@@ -358,8 +384,17 @@ fn sense(game: &GameState, e: EntId) -> Sense {
     };
     // Live reel speed, for the release-crossing prediction (half a frame of lookahead).
     let reel_half_step = crate::navmesh::HOOK_PULL_BASE * host.cvar(c"rtx_hook_pull") * game.globals.frametime * 0.5;
+    // Rocket-jump fitness + fire gating (read here so the driver stays a pure snapshot consumer).
+    let attack_finished = game.entities[e].combat.attack_finished;
+    let has_rl = game.entities[e].v.items.has(Items::ROCKET_LAUNCHER);
+    let ammo_rockets = game.entities[e].v.ammo_rockets;
+    let health = game.entities[e].v.health;
+    let armortype = game.entities[e].v.armortype;
+    let armorvalue = game.entities[e].v.armorvalue;
+    let quad = game.entities[e].combat.super_damage_finished > now;
     Sense {
         host, now, frametime, msec, origin, v_angle, client, weapon, on_ground, alive, vz, air_jumped, enemy_seen_time, v_xy, speed, grapple_hook, has_grapple, hook_out, on_hook, anchor, reel_half_step,
+        attack_finished, has_rl, ammo_rockets, health, armortype, armorvalue, quad,
     }
 }
 
@@ -378,9 +413,19 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         game.entities[e].bot.hook_fails = 0;
     }
     let hooking = game.entities[e].bot.hook_phase != HookPhase::Idle;
+    // Rocket-jump invariant net: mid-RJ but the RL or its ammo is gone (dropped, spent, stripped) —
+    // abort so the bot doesn't jump into a shot it can't fire. Timeouts/misfires are the driver's.
+    if game.entities[e].bot.rj_phase != RjPhase::Idle
+        && (!game.entities[e].v.items.has(Items::ROCKET_LAUNCHER) || game.entities[e].v.ammo_rockets < 1.0)
+    {
+        game.entities[e].bot.rj_phase = RjPhase::Idle;
+        game.entities[e].bot.rj_fails = 0;
+    }
     // On a speed-jump leg the route must be frozen: the link's `from` is the runway start, now behind
     // the bot, so a repath would drop the link and turn the bot around at speed. Treated like `hooking`.
     let on_sj = game.entities[e].bot.sj_leg.is_some();
+    // A rocket-jump leg freezes the route the same way (stance stands still, the arc flies fast).
+    let on_rj = game.entities[e].bot.rj_phase != RjPhase::Idle;
 
     // Ask the active mode for this bot's intent. A round mode (Rocket Arena) returns Fight/Move to
     // drive combat or audience-roaming; FFA hunts the nearest player. Every mode-specific bot
@@ -519,7 +564,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         b.goal_select_time = now; // re-pick (skipping the abandoned item) next frame
     }
 
-    Objective { hooking, on_sj, enemy, chasing, target_origin, item_cell }
+    Objective { hooking, on_sj, on_rj, enemy, chasing, target_origin, item_cell }
 }
 
 /// Turn the frame's accumulated decisions into the engine usercmd. Bunnyhopping bypasses the aim
@@ -527,6 +572,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
 /// reprojection can't express); otherwise the critically-damped spring smooths the view and the
 /// world move is projected onto it. The hook fire is decided here, *after* the spring, so the
 /// throw waits for the smoothed view to settle on the anchor.
+#[allow(clippy::too_many_arguments)] // the frame's decision bundle; grouping it would just relocate
 fn emit(
     game: &mut GameState,
     e: EntId,
@@ -534,6 +580,7 @@ fn emit(
     cmd: BotCmd,
     bhop_cmd: Option<bhop::Cmd>,
     hook: &hook::HookDrive,
+    rj: &rj::RjDrive,
     enemy: Option<EntId>,
 ) {
     let Sense { host, now, frametime, v_angle, client, msec, speed, .. } = s;
@@ -604,6 +651,18 @@ fn emit(
     } else if hook.hold_fire {
         buttons |= BUTTON_ATTACK;
     }
+    // Rocket-jump launch, decided *after* the spring like the hook throw: the shot leaves along the
+    // smoothed view, so wait until that view has settled onto the solved fire angles before pressing
+    // jump — pressing early would jump with the aim still swinging and fire the rocket off-angle.
+    if rj.jump_ready {
+        let err = wrap180(view.x - look.x).abs().max(wrap180(view.y - look.y).abs());
+        if err < RJ_AIM_TOL {
+            buttons |= BUTTON_JUMP;
+            let b = &mut game.entities[e].bot;
+            b.rj_phase = RjPhase::Rise;
+            b.rj_jump_time = now;
+        }
+    }
     // Flush any deferred hook release now the graph/bot borrows are done.
     if let Some(h) = hook.reset {
         game.reset_grapple(h);
@@ -615,9 +674,10 @@ fn emit(
         let gate = game.entities[e].bot.gate;
         let route = game.entities[e].bot.route.len();
         let hph = game.entities[e].bot.hook_phase;
+        let rjph = game.entities[e].bot.rj_phase;
         let bh = &game.entities[e].bot.bhop;
         host.conprint(&cstring(&format!(
-            "rtx bot{client}: enemy={} gate={gate:?} hook={hph:?} bhop={:?} hops={} flips={} peak={:.0} \
+            "rtx bot{client}: enemy={} gate={gate:?} hook={hph:?} rj={rjph:?} bhop={:?} hops={} flips={} peak={:.0} \
              spd={speed:.0} route={route} fwd={forward} side={side} atk={}\n",
             enemy.is_some(),
             bh.phase,
@@ -636,7 +696,8 @@ fn run_bot(game: &mut GameState, e: EntId) {
     let Sense {
         host, now, frametime, msec, origin, v_angle, client, weapon, on_ground, alive, vz,
         air_jumped, enemy_seen_time, v_xy, speed, grapple_hook, has_grapple, hook_out, on_hook,
-        anchor, reel_half_step,
+        anchor, reel_half_step, attack_finished, has_rl, ammo_rockets, health, armortype,
+        armorvalue, quad,
     } = s;
     // Flip the per-frame pulse used for press/release-edge buttons.
     let pulse = {
@@ -664,8 +725,15 @@ fn run_bot(game: &mut GameState, e: EntId) {
 
     let idle = |angles: Vec3| host.set_bot_cmd(client, msec, angles, 0, 0, 0, 0, 0);
 
-    let Objective { hooking, on_sj, enemy, chasing, target_origin, item_cell } =
+    let Objective { hooking, on_sj, on_rj, enemy, chasing, target_origin, item_cell } =
         resolve_objective(game, e, now, origin, client);
+
+    // Whether weapons may fire right now (a match-mode countdown locks them out). Read before the nav
+    // borrow: a rocket jump must not jump when the engine would swallow its rocket (jump, no blast).
+    let weapons_hot = {
+        let mode = game.mode;
+        mode.weapons_hot(game)
+    };
 
     // Current door states, for gate-aware pathfinding. A shut gate makes its links expensive, so
     // `find_path` bends the route around a closed door when any open way exists and only crosses
@@ -726,7 +794,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // A teleport (or any large instant displacement) invalidates the planned route — drop it
     // and re-path from where we landed. ~200u in one frame is far beyond running/falling. Skipped
     // mid-hook: the reel and the parabola move fast on purpose and must not clear the hook route.
-    if !hooking && !on_sj && bot.last_origin != Vec3::ZERO && (origin - bot.last_origin).length() > 200.0 {
+    if !hooking && !on_sj && !on_rj && bot.last_origin != Vec3::ZERO && (origin - bot.last_origin).length() > 200.0 {
         bot.route.clear();
         bot.repath_time = now;
     }
@@ -736,7 +804,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // toward its button (stuck at a door whose button we can't actually reach), so we don't camp
     // there. Progress-based, not a flat timeout: a button that's simply far across the map (e.g.
     // when we spawned right next to the door) still gets reached. Suspended mid-hook.
-    if !hooking && !on_sj && bot.gate.is_some() {
+    if !hooking && !on_sj && !on_rj && bot.gate.is_some() {
         let gi = bot.gate.unwrap();
         let give_up = |bot: &mut BotState| {
             bot.avoid_gate = gi as i32;
@@ -770,7 +838,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
 
     // Re-path when the route is empty, the goal changed, or the timer elapsed. Frozen mid-hook so
     // the traversal keeps the route that put it on the hook leg.
-    if !hooking && !on_sj && (bot.route.is_empty() || bot.goal_cell != goal || now >= bot.repath_time) {
+    if !hooking && !on_sj && !on_rj && (bot.route.is_empty() || bot.goal_cell != goal || now >= bot.repath_time) {
         let mut route = graph.find_path(bot_cell, goal, &costs).unwrap_or_default();
         // Goal unreachable from here (behind a shut door with no way around from this spot, or a
         // disconnected pocket)? Don't home straight into a wall — head to the reachable cell
@@ -791,7 +859,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
         bot.progress_since = now;
     }
     // If we've fallen off the planned route (missed a jump, got shoved), re-localize next.
-    if !hooking && !on_sj && bot.route_pos >= bot.route.len() && bot_cell != goal && now >= bot.repath_time {
+    if !hooking && !on_sj && !on_rj && bot.route_pos >= bot.route.len() && bot_cell != goal && now >= bot.repath_time {
         bot.repath_time = now; // force a fresh path next frame
     }
 
@@ -799,7 +867,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // are priced high), so if the chosen route still crosses one, there's no other way in — divert
     // to that gate's button. Skip a gate we recently gave up on (its button was unreachable) so we
     // don't immediately re-camp on it.
-    if !hooking && !on_sj && bot.gate.is_none() {
+    if !hooking && !on_sj && !on_rj && bot.gate.is_none() {
         let avoid = if now < bot.avoid_gate_until { bot.avoid_gate } else { -1 };
         let block =
             route_blocking_gate(graph, &bot.route, bot.route_pos, &gate_closed).filter(|&gi| gi as i32 != avoid);
@@ -841,6 +909,8 @@ fn run_bot(game: &mut GameState, e: EntId) {
             // still at the *bottom* of the swing. The hook driver advances it only once the parabola
             // has landed (see below).
             LinkKind::Hook => false,
+            // Same for a rocket jump — its driver advances on landing, not on passing the target XY.
+            LinkKind::RocketJump => false,
             _ => {
                 let to = target.xy() - origin.xy();
                 let fast = bot.bhop.phase != bhop::Phase::Off || bot.sj_leg.is_some();
@@ -870,6 +940,9 @@ fn run_bot(game: &mut GameState, e: EntId) {
         (target_origin, None, true, None)
     };
     let hook_active = matches!(kind, Some(LinkKind::Hook)) || hooking;
+    // Same for a rocket-jump leg: standing in stance and riding the blast arc must be exempt from the
+    // stuck/progress watchdogs and the bhop veto, exactly like a hook leg.
+    let rj_active = matches!(kind, Some(LinkKind::RocketJump)) || on_rj;
     // Where the *eyes* go while navigating: a couple of legs ahead of the feet (or the final
     // target when the route is short), so the view sweeps down the corridor instead of snapping
     // to every 32u grid cell the bot steps through. Steering still uses `waypoint`.
@@ -901,7 +974,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // parabola all look "stuck" to it, and a force-jump/repath there would wreck the traversal — the
     // hook driver's own per-phase timeouts are its stuck detection.
     let mut force_jump = false;
-    if hook_active || (origin - bot.stuck_origin).length() > STUCK_MOVE {
+    if hook_active || rj_active || (origin - bot.stuck_origin).length() > STUCK_MOVE {
         bot.stuck_origin = origin;
         bot.stuck_since = now;
     } else if now - bot.stuck_since > STUCK_TIME {
@@ -920,7 +993,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // it and re-path. Suspended while hooking / on a committed speed-jump / riding a plat (all of which
     // legitimately hold or reverse XY progress for a while).
     let plat_leg = matches!(kind, Some(LinkKind::Plat));
-    if !hook_active && !on_sj && !plat_leg {
+    if !hook_active && !rj_active && !on_sj && !plat_leg {
         if progress_stalled(bot.progress_best, bot.progress_since, goal_dist, now) {
             penalize_leg(bot, cur_leg, kind, now);
             bot.route.clear();
@@ -953,6 +1026,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     let bhop_veto = !host.cvar_bool(c"rtx_bot_bhop")
         || combat_view
         || hook_active
+        || rj_active
         || bot.gate.is_some()
         || bot.grenade_phase != GrenadePhase::Idle;
     let bhop_entry = !final_leg
@@ -964,7 +1038,8 @@ fn run_bot(game: &mut GameState, e: EntId) {
     let bhop_sustain = matches!(kind, Some(LinkKind::Walk | LinkKind::Step)) && goal_dist > 150.0;
     // A speed-jump leg is a *committed* bhop run-up + leap: engage bhop unconditionally (the link is a
     // pre-verified runway) and track it so the route stays frozen. Latch/clear `sj_leg` on the leg.
-    let mut sj_active = matches!(kind, Some(LinkKind::SpeedJump)) && host.cvar_bool(c"rtx_bot_bhop") && !hook_active;
+    let mut sj_active =
+        matches!(kind, Some(LinkKind::SpeedJump)) && host.cvar_bool(c"rtx_bot_bhop") && !hook_active && !rj_active;
     if sj_active {
         if bot.sj_leg != cur_leg {
             bot.sj_leg = cur_leg;
@@ -1099,7 +1174,50 @@ fn run_bot(game: &mut GameState, e: EntId) {
         bot.hook_phase,
         HookPhase::Flight | HookPhase::Reel | HookPhase::Ballistic
     );
+
+    // Rocket-jump leg driver: walk to the launch cell with the RL out, settle the aim on the solved
+    // fire angles, jump, fire after the solved delay, ride the blast arc onto the ledge. Same shape as
+    // the hook driver — a snapshot in, an `RjDrive` out that the code below applies.
+    let rj = rj::drive_rj(
+        graph,
+        bot,
+        rj::RjCtx {
+            rj_active,
+            cur_leg,
+            enemy,
+            chasing,
+            now,
+            weapon,
+            origin,
+            on_ground,
+            attack_finished,
+            weapons_hot,
+            has_rl,
+            ammo_rockets,
+            health,
+            armortype,
+            armorvalue,
+            quad,
+        },
+    );
+    let rj_engaged = bot.rj_phase != RjPhase::Idle;
+    let rj_lock = matches!(bot.rj_phase, RjPhase::Rise | RjPhase::Ballistic);
+
     if let Some(t) = hook.look_target {
+        let d = t - eye;
+        if d.xy().length() > 1.0 {
+            look = Vec3::new(
+                -d.z.atan2(d.xy().length()).to_degrees(),
+                d.y.atan2(d.x).to_degrees(),
+                0.0,
+            );
+        }
+    }
+    // Rocket-jump look: Stance/Rise hold the solved fire *angles* directly (the shot flies along the
+    // view); Ballistic looks at the landing *point* (reprojected like the hook's).
+    if let Some(a) = rj.look_target_angles {
+        look = a;
+    } else if let Some(t) = rj.look_target {
         let d = t - eye;
         if d.xy().length() > 1.0 {
             look = Vec3::new(
@@ -1205,6 +1323,27 @@ fn run_bot(game: &mut GameState, e: EntId) {
         }
     }
 
+    // Rocket-jump override: walk to the launch cell (Stance), stand and hold the aim (Rise), or ride
+    // the arc with a gentle wish toward the landing (Ballistic — the in-flight air-strafe correction).
+    // The jump itself is pressed post-spring in `emit` (via `rj.jump_ready`); the rocket fires on the
+    // driver's pure-timing `rj.fire`.
+    if rj_engaged {
+        move_world = match rj.approach {
+            _ if rj.stand => Vec3::ZERO,
+            Some(src) => Vec3::new(src.x - origin.x, src.y - origin.y, 0.0).normalize_or_zero() * MOVE_SPEED,
+            None => rj
+                .air_correct
+                .map_or(Vec3::ZERO, |t| Vec3::new(t.x - origin.x, t.y - origin.y, 0.0).normalize_or_zero() * MOVE_SPEED),
+        };
+        buttons &= !BUTTON_JUMP; // the launch jump is pressed only via `emit`'s post-spring gate
+        if rj.select {
+            impulse = IMPULSE_ROCKET;
+        }
+        if rj.fire {
+            buttons |= BUTTON_ATTACK;
+        }
+    }
+
     // Bundle the frame's decisions into one command for the combat/grenade overlays to mutate.
     let mut cmd = BotCmd { look, move_world, buttons, impulse };
 
@@ -1213,7 +1352,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // enemy vanished while navigation keeps driving; otherwise navigation's look/move stand. Hooks
     // in flight/reel/ballistic lock out combat — an impulse or a dropped +attack there would break
     // the reel/release (the grapple must stay selected and fire held until the release point).
-    if let Some(en) = enemy.filter(|_| !hook_lock) {
+    if let Some(en) = enemy.filter(|_| !hook_lock && !rj_lock) {
         combat::engage(game, e, en, origin, now, &mut cmd);
     }
 
@@ -1225,7 +1364,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // a plain airburst). The hazard shove is the generic strategy — the knockback shoves regardless
     // of which splash weapon delivers the blast. Skipped while bunnyhopping (no enemy, view is busy
     // air-strafing).
-    if !hook_engaged && !bhop_active {
+    if !hook_engaged && !rj_engaged && !bhop_active {
         let handled = combat::grenade_tactics(game, e, enemy, origin, &mut cmd);
         if handled {
             game.entities[e].bot.grenade_phase = GrenadePhase::Idle;
@@ -1242,7 +1381,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
 
     // Overlays done — unpack the command back into the frame's locals for the aim spring / emit.
     // `buttons` is still touched by the post-spring hook fire below; the rest are read-only now.
-    emit(game, e, s, cmd, bhop_cmd, &hook, enemy);
+    emit(game, e, s, cmd, bhop_cmd, &hook, &rj, enemy);
 }
 
 /// Wrap an angle into (-180, 180].

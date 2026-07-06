@@ -1138,9 +1138,7 @@ impl NavGraph {
         self.speed_jump_links.push(s);
     }
 
-    /// The solved traversal for rocket-jump link `li`, or `None` for any other link. Consumed by the
-    /// runtime driver (`crate::bot::rj`) in phase 3; `dead_code`-allowed until then.
-    #[allow(dead_code)]
+    /// The solved traversal for rocket-jump link `li`, or `None` for any other link.
     pub fn rocket_jump_of_link(&self, li: u32) -> Option<&RocketJumpTraversal> {
         match self.rocket_jump_links.get(li as usize).copied().unwrap_or(-1) {
             r if r >= 0 => self.rocket_jumps.get(r as usize),
@@ -1246,21 +1244,22 @@ pub struct RocketJumpParams {
 /// `hooks`). Carries the two ingredients the bot fires the shot by — the delay from the jump press
 /// and the view angles — plus the self-damage (the runtime health gate) and the arc data.
 ///
-/// The read fields are consumed by the runtime driver (`crate::bot::rj`); `blast`/`pos_blast`/`v0`
-/// are build/test-only re-flight data. The whole struct is `dead_code`-allowed until that driver
-/// lands.
+/// The runtime driver (`crate::bot::rj`) reads `fire_angles`/`fire_delay`/`airtime`/`self_damage`;
+/// `blast`/`pos_blast`/`v0` are build/test-only re-flight data.
 #[derive(Clone, Copy)]
-#[allow(dead_code)]
 pub struct RocketJumpTraversal {
     /// View angles to fire at (QW pitch positive-down); the shot goes straight along `v_forward`.
     pub fire_angles: Vec3,
     /// Seconds from the jump press to the `+attack` that fires the rocket.
     pub fire_delay: f32,
     /// Where the rocket is expected to explode (telemetry / the runtime doesn't need it).
+    #[allow(dead_code)]
     pub blast: Vec3,
     /// Bot position at the blast — stored so the build/test can re-fly the continuation arc.
+    #[allow(dead_code)]
     pub pos_blast: Vec3,
     /// Continuation velocity just after the blast — re-flown by the build/test.
+    #[allow(dead_code)]
     pub v0: Vec3,
     /// Simulated airtime of the parabola after the blast — the runtime's Ballistic watchdog base.
     pub airtime: f32,

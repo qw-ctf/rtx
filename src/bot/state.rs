@@ -153,6 +153,15 @@ pub struct BotState {
     /// committed bhop run-up + leap), and when it began. `None` = not on a speed jump.
     pub sj_leg: Option<u32>,
     pub sj_started: f32,
+    /// Rocket-jump traversal machine (see [`crate::bot::rj`]): stance → jump → fire → ride the blast
+    /// arc onto a high ledge. `rj_link` is the leg being flown; `rj_started` the per-phase timeout
+    /// base; `rj_jump_time` the moment the jump was pressed (the fire-delay clock); `rj_fails` the
+    /// consecutive-failure count (two aborts avoid the goal, like the hook).
+    pub rj_phase: RjPhase,
+    pub rj_link: u32,
+    pub rj_started: f32,
+    pub rj_jump_time: f32,
+    pub rj_fails: u8,
 }
 
 impl BotState {
@@ -187,6 +196,20 @@ pub enum GrenadePhase {
     Lobbed,
     /// Detonator in hand; shoot the grenade the instant its blast lands the enemy where we want.
     Detonate,
+}
+
+/// Phase of a bot's rocket-jump traversal. `Idle` unless the current route leg is a rocket jump.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RjPhase {
+    /// Not flying a rocket jump.
+    #[default]
+    Idle,
+    /// Walking to the launch cell, RL selected, view settling on the solved fire angles.
+    Stance,
+    /// Jump pressed; holding the aim and counting down `fire_delay` to the shot.
+    Rise,
+    /// Blast taken: riding the arc with gentle air-correction toward the landing.
+    Ballistic,
 }
 
 /// Phase of a bot's grappling-hook traversal. `Idle` unless the current route leg is a hook link.
