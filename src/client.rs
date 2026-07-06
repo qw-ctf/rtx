@@ -15,7 +15,7 @@ use crate::bot;
 use crate::defs::*;
 use crate::entity::{CombatState, Die, EntId, Pain};
 use crate::game::GameState;
-use crate::mode::ArenaPlayer;
+use crate::mode::ModePlayer;
 
 #[derive(Clone, Copy)]
 struct PlayerParms {
@@ -151,7 +151,7 @@ impl GameState {
         let ent = &mut self.entities[e];
         ent.in_use = false;
         ent.classname = None;
-        ent.arena = ArenaPlayer::default();
+        ent.mode_p = ModePlayer::default();
     }
 
     /// `SetNewParms` — default spawn parameters for a fresh player.

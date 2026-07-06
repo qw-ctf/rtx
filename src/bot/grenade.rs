@@ -543,7 +543,7 @@ fn try_start(game: &mut GameState, e: EntId, en: EntId, origin: Vec3, now: f32) 
     if hitscan_choice(game, e).is_none() {
         return; // the LOS combo needs a gun to detonate with (a bank shot uses the fuse)
     }
-    let my_team = game.entities[e].arena.team;
+    let my_team = game.entities[e].mode_p.team;
     let e_feet = e_org - Vec3::new(0.0, 0.0, 24.0);
 
     // Look for a hazard to shove the enemy into; else consider a plain airburst.
@@ -641,7 +641,7 @@ fn try_start_bank(game: &mut GameState, e: EntId, en: EntId, origin: Vec3, now: 
         return;
     }
     // Season it in: an occasional attempt, unless the enemy carries a flag (worth a blind grenade).
-    let carrier = game.entities[en].arena.carrying != 0;
+    let carrier = game.entities[en].mode_p.ctf.carrying != 0;
     if !carrier && (now * 5.0 + e.0 as f32).sin() < 0.7 {
         return;
     }
@@ -657,7 +657,7 @@ fn try_start_bank(game: &mut GameState, e: EntId, en: EntId, origin: Vec3, now: 
         combo_reset(game, e, now + BANK_COOLDOWN);
         return;
     };
-    let my_team = game.entities[e].arena.team;
+    let my_team = game.entities[e].mode_p.team;
     if teammate_in_blast(game, e, my_team, shot.det_pos) {
         combo_reset(game, e, now + BANK_COOLDOWN);
         return;
@@ -756,7 +756,7 @@ fn detonate(game: &mut GameState, e: EntId, en: EntId, origin: Vec3, now: f32, c
         combo_reset(game, e, now + COMBO_DONE_COOLDOWN);
         return;
     }
-    let (health, my_team) = (game.entities[e].v.health, game.entities[e].arena.team);
+    let (health, my_team) = (game.entities[e].v.health, game.entities[e].mode_p.team);
     let gpos = game.entities[g].v.origin;
     let eye = origin + VEC_VIEW_OFS;
     cmd.look = combat::angles_to(eye, gpos);
@@ -811,7 +811,7 @@ pub(crate) fn rocket_shove(
     };
     let (items, ammo, health, my_team) = {
         let ent = &game.entities[e];
-        (ent.v.items, ent.v.ammo_rockets, ent.v.health, ent.arena.team)
+        (ent.v.items, ent.v.ammo_rockets, ent.v.health, ent.mode_p.team)
     };
     if !items.has(Items::ROCKET_LAUNCHER) || ammo < 1.0 {
         return false;

@@ -991,10 +991,10 @@ impl GameState {
             return;
         }
         let now = self.time();
-        if now < self.entities[e].arena.flash_time {
+        if now < self.entities[e].mode_p.arena.flash_time {
             return;
         }
-        self.entities[e].arena.flash_time = now + 0.5;
+        self.entities[e].mode_p.arena.flash_time = now + 0.5;
         self.screen_flash(e);
     }
 

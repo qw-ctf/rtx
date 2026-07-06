@@ -404,7 +404,7 @@ pub(crate) fn teammate_in_blast(g: &GameState, e: EntId, my_team: u8, pos: Vec3)
             && ent.in_use
             && ent.classname() == Some("player")
             && ent.v.health > 0.0
-            && ent.arena.team == my_team
+            && ent.mode_p.team == my_team
             && (ent.v.origin - pos).length() < GRENADE_BLAST_RADIUS
     })
 }
@@ -476,7 +476,7 @@ pub(crate) fn grenade_tactics(
     if live.is_empty() {
         return false;
     }
-    let my_team = game.entities[e].arena.team;
+    let my_team = game.entities[e].mode_p.team;
     let health = game.entities[e].v.health.max(1.0);
     // A grenade this bot is running as a lob→shoot combo (see `super::grenade`): don't let the
     // opportunistic offence below detonate it early — that would blow it *short* of the enemy and
@@ -495,7 +495,7 @@ pub(crate) fn grenade_tactics(
             continue;
         }
         let owner = game.entities[grenade].owner();
-        let ally = owner == e || (my_team != 0 && owner.is_some() && game.entities[owner].arena.team == my_team);
+        let ally = owner == e || (my_team != 0 && owner.is_some() && game.entities[owner].mode_p.team == my_team);
         if !ally {
             // A threat if it's already within our splash, or approaching us from range.
             let approaching = (origin - gpos).dot(gvel) > 0.0;

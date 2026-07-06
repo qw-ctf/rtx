@@ -107,7 +107,7 @@ impl GameMode for Arena {
     }
 
     fn select_spawn(&self, g: &mut GameState, e: EntId) -> EntId {
-        if g.entities[e].arena.role == ArenaRole::Fighter {
+        if g.entities[e].mode_p.arena.role == ArenaRole::Fighter {
             // Fighters spawn inside the arena. On maps without teleport destinations, fall back
             // to the deathmatch spawns so the mode still functions.
             let spot = g.select_spawn_point_of("info_teleport_destination");
@@ -120,7 +120,7 @@ impl GameMode for Arena {
     }
 
     fn apply_loadout(&self, g: &mut GameState, e: EntId) {
-        let fighter = g.entities[e].arena.role == ArenaRole::Fighter;
+        let fighter = g.entities[e].mode_p.arena.role == ArenaRole::Fighter;
         // The lightning gun is off by default (rtx_ra_lightning_gun 0) — a rockets-first arena.
         let lightning = g.host().cvar_bool(c"rtx_ra_lightning_gun");
         let v = &mut g.entities[e].v;
@@ -177,7 +177,7 @@ impl GameMode for Arena {
         }
         // Audience is untouchable; fighters are protected until the round goes live. A blocked hit
         // deals nothing and imparts no knockback (spawn protection), as before.
-        if t.arena.role == ArenaRole::Audience || !matches!(g.arena.round, RoundState::Live) {
+        if t.mode_p.arena.role == ArenaRole::Audience || !matches!(g.arena.round, RoundState::Live) {
             return DamageOutcome::none();
         }
         DamageOutcome::pass(incoming)
@@ -194,7 +194,7 @@ impl GameMode for Arena {
         }
         // Eliminated: drop to the audience. The corpse still runs the normal death-think, so on
         // its next respawn `select_spawn`/`apply_loadout` place it in the stands, not the arena.
-        g.entities[victim].arena.role = ArenaRole::Audience;
+        g.entities[victim].mode_p.arena.role = ArenaRole::Audience;
         if live_fighters(g).len() <= 1 {
             let now = g.time();
             self.end_round(g, now);
@@ -202,7 +202,7 @@ impl GameMode for Arena {
     }
 
     fn bot_intent(&self, g: &mut GameState, bot: EntId) -> Option<BotIntent> {
-        match g.entities[bot].arena.role {
+        match g.entities[bot].mode_p.arena.role {
             ArenaRole::Fighter => {
                 // Before the round goes live (countdown), roam the arena to take up a position,
                 // rather than standing on the spawn (which looks dead and trips the stuck-jumper).
@@ -232,9 +232,9 @@ impl Arena {
     /// fighter now, not waiting); it re-stamps only once eliminated back into the audience.
     fn stamp_audience(&self, g: &mut GameState) {
         for e in players(g) {
-            if g.entities[e].arena.role == ArenaRole::Audience && g.entities[e].arena.queue == 0 {
+            if g.entities[e].mode_p.arena.role == ArenaRole::Audience && g.entities[e].mode_p.arena.queue == 0 {
                 g.arena.serial += 1;
-                g.entities[e].arena.queue = g.arena.serial;
+                g.entities[e].mode_p.arena.queue = g.arena.serial;
             }
         }
     }
@@ -253,7 +253,7 @@ impl Arena {
         // (audience members are alive too, so "alive" alone isn't enough).
         let carried: Vec<EntId> = players(g)
             .into_iter()
-            .filter(|&e| g.entities[e].arena.role == ArenaRole::Fighter)
+            .filter(|&e| g.entities[e].mode_p.arena.role == ArenaRole::Fighter)
             .collect();
 
         // Fill empty fighter slots with the longest-waiting audience members.
@@ -261,11 +261,11 @@ impl Arena {
         while fighters < FIGHTER_SLOTS {
             let next = players(g)
                 .into_iter()
-                .filter(|&e| g.entities[e].arena.role == ArenaRole::Audience && g.entities[e].arena.queue != 0)
-                .min_by_key(|&e| g.entities[e].arena.queue);
+                .filter(|&e| g.entities[e].mode_p.arena.role == ArenaRole::Audience && g.entities[e].mode_p.arena.queue != 0)
+                .min_by_key(|&e| g.entities[e].mode_p.arena.queue);
             let Some(e) = next else { break }; // not enough players to fill the arena
-            g.entities[e].arena.role = ArenaRole::Fighter;
-            g.entities[e].arena.queue = 0;
+            g.entities[e].mode_p.arena.role = ArenaRole::Fighter;
+            g.entities[e].mode_p.arena.queue = 0;
             fighters += 1;
         }
 
@@ -273,7 +273,7 @@ impl Arena {
         // are* and is just topped back up to full — no teleport. Challengers promoted from the
         // audience (and any dead carried-over slot) get a fresh spawn inside the arena.
         for e in players(g) {
-            if g.entities[e].arena.role != ArenaRole::Fighter {
+            if g.entities[e].mode_p.arena.role != ArenaRole::Fighter {
                 continue;
             }
             let winner_stays = carried.contains(&e) && g.entities[e].v.health > 0.0 && g.entities[e].v.deadflag == 0.0;
@@ -294,9 +294,9 @@ impl Arena {
     /// End the round: credit the survivor (if any) and pause briefly before the next.
     fn end_round(&self, g: &mut GameState, now: f32) {
         if let Some(w) = live_fighters(g).first().copied() {
-            g.entities[w].arena.round_wins += 1;
+            g.entities[w].mode_p.arena.round_wins += 1;
             let name = g.netname_of(w);
-            let wins = g.entities[w].arena.round_wins;
+            let wins = g.entities[w].mode_p.arena.round_wins;
             g.broadcast(PrintLevel::High, &format!("{name} wins the round! ({wins} total)\n"));
         } else {
             g.broadcast(PrintLevel::High, "Round over — no survivor\n");
@@ -343,7 +343,7 @@ fn count_players(g: &GameState) -> usize {
 fn fighter_count(g: &GameState) -> usize {
     players(g)
         .into_iter()
-        .filter(|&e| g.entities[e].arena.role == ArenaRole::Fighter)
+        .filter(|&e| g.entities[e].mode_p.arena.role == ArenaRole::Fighter)
         .count()
 }
 
@@ -353,7 +353,7 @@ fn live_fighters(g: &GameState) -> Vec<EntId> {
         .into_iter()
         .filter(|&e| {
             let ent = &g.entities[e];
-            ent.arena.role == ArenaRole::Fighter && ent.v.health > 0.0 && ent.v.deadflag == 0.0
+            ent.mode_p.arena.role == ArenaRole::Fighter && ent.v.health > 0.0 && ent.v.deadflag == 0.0
         })
         .collect()
 }
@@ -362,5 +362,5 @@ fn live_fighters(g: &GameState) -> Vec<EntId> {
 /// last-man-standing round, no teams).
 fn nearest_enemy(g: &GameState, bot: EntId) -> Option<EntId> {
     let origin = g.entities[bot].v.origin;
-    nearest_player_where(g, origin, bot, |g, e| g.entities[e].arena.role == ArenaRole::Fighter)
+    nearest_player_where(g, origin, bot, |g, e| g.entities[e].mode_p.arena.role == ArenaRole::Fighter)
 }

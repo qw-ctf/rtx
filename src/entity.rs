@@ -14,7 +14,7 @@ use glam::Vec3;
 use crate::abi::{EntVars, STRING_REF_COUNT};
 use crate::assets::{Model, Sound};
 use crate::bot::state::BotState;
-use crate::mode::ArenaPlayer;
+use crate::mode::ModePlayer;
 
 /// A `Copy` index handle into the entity array. Never a borrow, so holding one across a
 /// trap call is fine — this is what keeps the safe API free of aliasing hazards.
@@ -388,8 +388,8 @@ pub struct Entity {
     pub refs: CustomRefs,
     pub combat: CombatState,
     pub item: ItemState,
-    /// Per-player game-mode state (arena role / round wins). Default in FFA; read by round modes.
-    pub arena: ArenaPlayer,
+    /// Per-player game-mode state (arena role, team, CTF carry/runes). Default in FFA.
+    pub mode_p: ModePlayer,
     /// CTF flag state — only meaningful on the two flag entities (`flag.team != 0`).
     pub flag: FlagState,
 }

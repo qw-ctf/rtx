@@ -50,10 +50,23 @@ pub(crate) enum ArenaRole {
     Fighter,
 }
 
-/// Per-player mode state carried on every [`crate::entity::Entity`]. Small and mode-agnostic;
-/// only the round-based modes read it.
+/// Per-player mode state carried on every [`crate::entity::Entity`], grouped by the mode family
+/// that reads it so the arena / team / CTF concerns don't pile into one flat struct. Small and
+/// mode-agnostic overall; each nested group is left at its default in modes that don't use it.
 #[derive(Default)]
-pub(crate) struct ArenaPlayer {
+pub(crate) struct ModePlayer {
+    /// Rocket-Arena round standing.
+    pub arena: ArenaSlot,
+    /// Team id in a team match (`1..=N`; `0` = unassigned/none). Only the team modes read it. See
+    /// [`crate::mode::team`].
+    pub team: u8,
+    /// CTF carry / rune / assist bookkeeping.
+    pub ctf: CtfPlayer,
+}
+
+/// A player's Rocket-Arena round standing: fighting in the arena, or waiting in the audience.
+#[derive(Default)]
+pub(crate) struct ArenaSlot {
     pub role: ArenaRole,
     pub round_wins: i32,
     /// Audience queue position (a monotonic stamp; lower = waited longer). `0` means unqueued —
@@ -63,15 +76,18 @@ pub(crate) struct ArenaPlayer {
     /// Throttle for the "can't fire yet" screen blink during the countdown (world time of the last
     /// blink), so a held fire button flashes once in a while rather than every frame.
     pub flash_time: f32,
-    /// Team id in a team match (`1..=N`; `0` = unassigned/none). Only the team modes read it. See
-    /// [`crate::mode::team`].
-    pub team: u8,
-    /// In CTF, the team id of the enemy flag this player is carrying (`0` = not carrying). See
+}
+
+/// A player's CTF state: the flag they carry, their held rune, and the assist/defense windows.
+/// (Rune-item entities also stash their rune bit in `runes`, as they did on the old flat struct.)
+#[derive(Default)]
+pub(crate) struct CtfPlayer {
+    /// The team id of the enemy flag this player is carrying (`0` = not carrying). See
     /// [`crate::mode::ctf`].
     pub carrying: u8,
     /// CTF held-rune bitfield (`crate::defs::RUNE_*`; `0` = none). One rune per player.
     pub runes: u8,
-    // --- CTF assist/defense bookkeeping (world times; `0` = never) ---
+    // --- assist/defense bookkeeping (world times; `0` = never) ---
     /// When this player grabbed the enemy flag (a short grace before a carrier-frag scores).
     pub flag_since: f32,
     /// When this player last returned their own flag (a return→capture assist window).

@@ -177,7 +177,7 @@ pub(crate) fn tick_lifecycle<M: MatchMode>(mode: &M, g: &mut GameState) {
 /// Team spawn selection shared by every match mode: prefer this team's dedicated spawns
 /// (`info_player_teamN`), else fall back to the deathmatch spawns.
 pub(crate) fn team_spawn(g: &mut GameState, e: EntId) -> EntId {
-    let team = g.entities[e].arena.team;
+    let team = g.entities[e].mode_p.team;
     if team >= 1 {
         let spot = g.select_spawn_point_of(&format!("info_player_team{team}"));
         if spot != EntId::WORLD {
@@ -242,7 +242,7 @@ impl MatchMode for TeamMatch {
         let teams = g.team_match.config.teams;
         let mut scores = vec![0i32; teams];
         for e in players(g) {
-            let t = g.entities[e].arena.team as usize;
+            let t = g.entities[e].mode_p.team as usize;
             if t >= 1 && t <= teams {
                 scores[t - 1] += g.entities[e].v.frags as i32;
             }
@@ -290,7 +290,7 @@ pub(crate) fn start_match(g: &mut GameState) {
     }
     let roster: Vec<(String, u8)> = players(g)
         .into_iter()
-        .map(|e| (g.netname_of(e), g.entities[e].arena.team))
+        .map(|e| (g.netname_of(e), g.entities[e].mode_p.team))
         .collect();
     if roster.is_empty() {
         return;
@@ -353,7 +353,7 @@ pub(crate) fn is_match_mode(name: &str) -> bool {
 /// from the locked roster by netname, else auto-balance onto the smallest team; then apply the team
 /// colours/userinfo. Shared by team DM and CTF (called from their `apply_loadout`).
 pub(crate) fn assign_team(g: &mut GameState, e: EntId) {
-    if g.entities[e].arena.team == 0 {
+    if g.entities[e].mode_p.team == 0 {
         let name = g.netname_of(e);
         let team = g
             .team_match
@@ -363,7 +363,7 @@ pub(crate) fn assign_team(g: &mut GameState, e: EntId) {
             .map(|&(_, t)| t)
             .filter(|&t| t >= 1)
             .unwrap_or_else(|| smallest_team(g));
-        g.entities[e].arena.team = team;
+        g.entities[e].mode_p.team = team;
     }
     apply_team_identity(g, e);
 }
@@ -376,7 +376,7 @@ pub(crate) fn team_identity(t: u8) -> (&'static str, &'static str) {
 /// Write player `e`'s team name + shirt/pant colour into userinfo, so friendly fire
 /// (`teamplay_protects`) and the engine scoreboard follow the team, and teammates share a colour.
 pub(crate) fn apply_team_identity(g: &mut GameState, e: EntId) {
-    let (name, color) = team_identity(g.entities[e].arena.team);
+    let (name, color) = team_identity(g.entities[e].mode_p.team);
     let is_bot = g.entities[e].bot.is_bot;
     let host = *g.host();
     let client = e.0 as i32;
@@ -399,7 +399,7 @@ pub(crate) fn smallest_team(g: &GameState) -> u8 {
     let teams = g.team_match.config.teams.max(1);
     let mut counts = vec![0u32; teams];
     for e in players(g) {
-        let t = g.entities[e].arena.team as usize;
+        let t = g.entities[e].mode_p.team as usize;
         if t >= 1 && t <= teams {
             counts[t - 1] += 1;
         }
@@ -417,14 +417,14 @@ pub(crate) fn smallest_team(g: &GameState) -> u8 {
 /// teammate filter the FFA/Arena/Midair pickers deliberately lack).
 pub(crate) fn nearest_enemy(g: &GameState, bot: EntId) -> Option<EntId> {
     let origin = g.entities[bot].v.origin;
-    let my_team = g.entities[bot].arena.team;
+    let my_team = g.entities[bot].mode_p.team;
     nearest_enemy_to(g, my_team, origin)
 }
 
 /// The nearest living player not on `my_team` to an arbitrary `point` — used to pick a target near a
 /// base to defend, not just near the bot itself.
 pub(crate) fn nearest_enemy_to(g: &GameState, my_team: u8, point: Vec3) -> Option<EntId> {
-    nearest_player_where(g, point, EntId::WORLD, |g, e| g.entities[e].arena.team != my_team)
+    nearest_player_where(g, point, EntId::WORLD, |g, e| g.entities[e].mode_p.team != my_team)
 }
 
 #[cfg(test)]

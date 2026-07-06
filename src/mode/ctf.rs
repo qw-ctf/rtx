@@ -101,18 +101,18 @@ impl GameMode for Ctf {
         // flag carrier (see `ctf_frag_bonuses`). Runes exist only in CTF, so this whole rule lives
         // here rather than inline in `t_damage`.
         let mut damage = incoming;
-        if g.entities[attacker].arena.runes & RUNE_STRENGTH != 0 {
+        if g.entities[attacker].mode_p.ctf.runes & RUNE_STRENGTH != 0 {
             damage *= 2.0;
         }
-        if g.entities[targ].arena.runes & RUNE_RESISTANCE != 0 {
+        if g.entities[targ].mode_p.ctf.runes & RUNE_RESISTANCE != 0 {
             damage *= 0.5;
         }
-        if g.entities[targ].arena.carrying != 0
+        if g.entities[targ].mode_p.ctf.carrying != 0
             && attacker != targ
             && g.entities[attacker].classname() == Some("player")
-            && g.entities[attacker].arena.team != g.entities[targ].arena.team
+            && g.entities[attacker].mode_p.team != g.entities[targ].mode_p.team
         {
-            g.entities[attacker].arena.last_hurt_carrier = g.time();
+            g.entities[attacker].mode_p.ctf.last_hurt_carrier = g.time();
         }
         DamageOutcome::pass(damage)
     }
@@ -161,7 +161,7 @@ impl GameMode for Ctf {
 
     fn attack_cooldown_scale(&self, g: &GameState, e: EntId) -> f32 {
         // Haste rune: fire ~2× as fast.
-        if g.entities[e].arena.runes & RUNE_HASTE != 0 {
+        if g.entities[e].mode_p.ctf.runes & RUNE_HASTE != 0 {
             0.5
         } else {
             1.0
@@ -198,22 +198,22 @@ fn ctf_frag_bonuses(g: &mut GameState, victim: EntId, attacker: EntId) {
         return;
     }
     let now = g.time();
-    let a_team = g.entities[attacker].arena.team;
-    let v_team = g.entities[victim].arena.team;
+    let a_team = g.entities[attacker].mode_p.team;
+    let v_team = g.entities[victim].mode_p.team;
     if a_team == 0 {
         return;
     }
     let mut protected_carrier = false;
 
     // Fragged the enemy flag carrier.
-    if g.entities[victim].arena.carrying != 0 && a_team != v_team {
-        g.entities[attacker].arena.last_fragged_carrier = now;
-        if g.entities[victim].arena.flag_since + CARRIER_FLAG_SINCE <= now {
+    if g.entities[victim].mode_p.ctf.carrying != 0 && a_team != v_team {
+        g.entities[attacker].mode_p.ctf.last_fragged_carrier = now;
+        if g.entities[victim].mode_p.ctf.flag_since + CARRIER_FLAG_SINCE <= now {
             g.entities[attacker].v.frags += FRAG_CARRIER_BONUS;
         }
     }
     // Fragged someone who recently hurt your carrier (and you aren't the carrier yourself).
-    if g.entities[victim].arena.last_hurt_carrier + CARRIER_DANGER > now && g.entities[attacker].arena.carrying == 0 {
+    if g.entities[victim].mode_p.ctf.last_hurt_carrier + CARRIER_DANGER > now && g.entities[attacker].mode_p.ctf.carrying == 0 {
         g.entities[attacker].v.frags += CARRIER_DANGER_PROTECT_BONUS;
         protected_carrier = true;
     }
@@ -227,8 +227,8 @@ fn ctf_frag_bonuses(g: &mut GameState, victim: EntId, attacker: EntId) {
             if !protected_carrier
                 && head != attacker
                 && g.entities[head].classname() == Some("player")
-                && g.entities[head].arena.team == a_team
-                && g.entities[head].arena.carrying != 0
+                && g.entities[head].mode_p.team == a_team
+                && g.entities[head].mode_p.ctf.carrying != 0
             {
                 g.entities[attacker].v.frags += CARRIER_PROTECT_BONUS;
                 protected_carrier = true;
@@ -274,7 +274,7 @@ enum CtfRole {
 fn ctf_role(g: &GameState, bot: EntId, team: u8) -> CtfRole {
     let mut mates: Vec<EntId> = players(g)
         .into_iter()
-        .filter(|&e| g.entities[e].arena.team == team && g.entities[e].bot.is_bot)
+        .filter(|&e| g.entities[e].mode_p.team == team && g.entities[e].bot.is_bot)
         .collect();
     mates.sort_unstable_by_key(|e| e.0);
     let defenders = if mates.len() <= 1 { 0 } else { (mates.len() / 3).max(1) };
@@ -290,14 +290,14 @@ fn ctf_role(g: &GameState, bot: EntId, team: u8) -> CtfRole {
 /// bot's [`CtfRole`] picks between pushing the enemy flag and holding our own base. All navigation is
 /// the generic `Move`/`Fight` seam.
 fn ctf_bot_intent(g: &mut GameState, bot: EntId) -> Option<BotIntent> {
-    let team = g.entities[bot].arena.team;
+    let team = g.entities[bot].mode_p.team;
     if team == 0 {
         return None;
     }
     let origin = g.entities[bot].v.origin;
 
     // Carrying the enemy flag → run to our base to capture (all roles; don't stop to fight).
-    if g.entities[bot].arena.carrying != 0 {
+    if g.entities[bot].mode_p.ctf.carrying != 0 {
         if let Some(hf) = base_flag(g, team) {
             return Some(BotIntent::Move(g.entities[hf].flag.home));
         }
@@ -405,14 +405,14 @@ impl GameState {
             return;
         }
         let flag_team = self.entities[flag].flag.team;
-        let player_team = self.entities[other].arena.team;
+        let player_team = self.entities[other].mode_p.team;
         if flag_team == 0 || player_team == 0 {
             return;
         }
         if player_team == flag_team {
             if self.entities[flag].flag.phase == FlagPhase::Home {
                 // Own flag home: capture if we're carrying the enemy flag.
-                if self.entities[other].arena.carrying != 0 {
+                if self.entities[other].mode_p.ctf.carrying != 0 {
                     self.ctf_capture(other);
                 }
             } else {
@@ -449,18 +449,18 @@ impl GameState {
     pub(crate) fn toss_flag(&mut self, player: EntId) {
         // Reached only via `Ctf::handle_impulse`, so the mode is already CTF; just the cvar gate + a
         // carry check remain.
-        if !self.host.cvar_bool(c"rtx_ctf_tossflag") || self.entities[player].arena.carrying == 0 {
+        if !self.host.cvar_bool(c"rtx_ctf_tossflag") || self.entities[player].mode_p.ctf.carrying == 0 {
             return;
         }
         let Some(flag) = self.carried_flag(player) else {
-            self.entities[player].arena.carrying = 0;
+            self.entities[player].mode_p.ctf.carrying = 0;
             return;
         };
         let team = self.entities[flag].flag.team;
         let dir = self.aim_dir(player);
         let origin = self.entities[player].v.origin + Vec3::new(0.0, 0.0, 16.0);
         let time = self.time();
-        self.entities[player].arena.carrying = 0;
+        self.entities[player].mode_p.ctf.carrying = 0;
         self.set_flag_effect(player, team, false);
         {
             let f = &mut self.entities[flag];
@@ -481,12 +481,12 @@ impl GameState {
     /// Drop the flag a player is carrying (called on their death/disconnect), leaving it in the
     /// field to auto-return, be recaptured, or be returned.
     pub(crate) fn drop_flag_if_carrying(&mut self, player: EntId) {
-        if self.entities[player].arena.carrying == 0 {
+        if self.entities[player].mode_p.ctf.carrying == 0 {
             return;
         }
         match self.carried_flag(player) {
             Some(f) => self.flag_drop(f),
-            None => self.entities[player].arena.carrying = 0,
+            None => self.entities[player].mode_p.ctf.carrying = 0,
         }
     }
 
@@ -499,8 +499,8 @@ impl GameState {
             f.v.solid = Solid::Not;
             f.v.modelindex = 0.0;
         }
-        self.entities[other].arena.carrying = team;
-        self.entities[other].arena.flag_since = self.time();
+        self.entities[other].mode_p.ctf.carrying = team;
+        self.entities[other].mode_p.ctf.flag_since = self.time();
         self.set_flag_effect(other, team, true);
         let name = self.netname_of(other);
         let (tname, _) = team::team_identity(team);
@@ -510,7 +510,7 @@ impl GameState {
     }
 
     fn ctf_capture(&mut self, carrier: EntId) {
-        let team = self.entities[carrier].arena.team;
+        let team = self.entities[carrier].mode_p.team;
         let idx = team as usize - 1;
         if idx < self.team_match.scores.len() {
             self.team_match.scores[idx] += 1;
@@ -523,23 +523,23 @@ impl GameState {
             if p == carrier {
                 continue;
             }
-            if self.entities[p].arena.team == team {
+            if self.entities[p].mode_p.team == team {
                 self.entities[p].v.frags += TEAM_CAPTURE_BONUS;
-                if self.entities[p].arena.last_returned_flag + RETURN_ASSIST > now {
+                if self.entities[p].mode_p.ctf.last_returned_flag + RETURN_ASSIST > now {
                     self.entities[p].v.frags += RETURN_ASSIST_BONUS;
                 }
-                if self.entities[p].arena.last_fragged_carrier + FRAG_CARRIER_ASSIST > now {
+                if self.entities[p].mode_p.ctf.last_fragged_carrier + FRAG_CARRIER_ASSIST > now {
                     self.entities[p].v.frags += FRAG_CARRIER_ASSIST_BONUS;
                 }
             } else {
-                self.entities[p].arena.last_hurt_carrier = -5.0;
+                self.entities[p].mode_p.ctf.last_hurt_carrier = -5.0;
             }
         }
         // Send the carried enemy flag home and clear the carry.
         if let Some(f) = self.carried_flag(carrier) {
             self.flag_send_home(f);
         }
-        self.entities[carrier].arena.carrying = 0;
+        self.entities[carrier].mode_p.ctf.carrying = 0;
         let name = self.netname_of(carrier);
         let (tname, _) = team::team_identity(team);
         let score = self.team_match.scores.get(idx).copied().unwrap_or(0);
@@ -554,7 +554,7 @@ impl GameState {
     fn ctf_return_flag(&mut self, flag: EntId, returner: EntId) {
         self.flag_send_home(flag);
         self.entities[returner].v.frags += RETURN_BONUS;
-        self.entities[returner].arena.last_returned_flag = self.time();
+        self.entities[returner].mode_p.ctf.last_returned_flag = self.time();
         let name = self.netname_of(returner);
         let (tname, _) = team::team_identity(self.entities[flag].flag.team);
         self.broadcast(PrintLevel::High, &format!("{name} returned the {tname} flag!\n"));
@@ -572,7 +572,7 @@ impl GameState {
         };
         let team = self.entities[flag].flag.team;
         if carrier != EntId::WORLD {
-            self.entities[carrier].arena.carrying = 0;
+            self.entities[carrier].mode_p.ctf.carrying = 0;
             self.set_flag_effect(carrier, team, false);
         }
         let time = self.time();
@@ -597,7 +597,7 @@ impl GameState {
         let carrier = self.entities[flag].flag.carrier;
         let team = self.entities[flag].flag.team;
         if carrier != EntId::WORLD {
-            self.entities[carrier].arena.carrying = 0;
+            self.entities[carrier].mode_p.ctf.carrying = 0;
             self.set_flag_effect(carrier, team, false);
         }
         let home = self.entities[flag].flag.home;
@@ -645,7 +645,7 @@ impl GameState {
             self.free(r);
         }
         for p in players(self) {
-            self.entities[p].arena.runes = 0;
+            self.entities[p].mode_p.ctf.runes = 0;
             self.refresh_haste_speed(p);
         }
         if self.mode.name() != "ctf" || self.host.cvar(c"rtx_runes") as i32 == 1 {
@@ -667,7 +667,7 @@ impl GameState {
         {
             let ent = &mut self.entities[e];
             ent.classname = Some("item_rune".into());
-            ent.arena.runes = bit; // which rune this item is
+            ent.mode_p.ctf.runes = bit; // which rune this item is
             ent.netname = Some(msg.into());
             ent.v.movetype = MoveType::Toss;
             ent.v.solid = Solid::Trigger;
@@ -698,12 +698,12 @@ impl GameState {
         {
             return;
         }
-        if self.entities[other].arena.runes & RUNE_MASK != 0 {
+        if self.entities[other].mode_p.ctf.runes & RUNE_MASK != 0 {
             self.sprint_to(other, c"You already have a rune (tossrune to drop).\n");
             return;
         }
-        let bit = self.entities[rune].arena.runes;
-        self.entities[other].arena.runes |= bit;
+        let bit = self.entities[rune].mode_p.ctf.runes;
+        self.entities[other].mode_p.ctf.runes |= bit;
         self.refresh_haste_speed(other);
         self.host
             .sound(other, Channel::Item, Sound::WEAPONS_LOCK4, 1.0, Attenuation::Norm);
@@ -713,7 +713,7 @@ impl GameState {
 
     /// `Think::RuneRespawn` — an untouched rune relocates to a fresh spawn.
     pub(crate) fn rune_respawn(&mut self, rune: EntId) {
-        let bit = self.entities[rune].arena.runes;
+        let bit = self.entities[rune].mode_p.ctf.runes;
         let spot = self.select_spawn_point();
         let org = if spot != EntId::WORLD {
             self.entities[spot].v.origin
@@ -726,7 +726,7 @@ impl GameState {
 
     /// Drop the runes a player holds where they are (called on death; owner-locked briefly).
     pub(crate) fn drop_runes(&mut self, player: EntId) {
-        let runes = self.entities[player].arena.runes & RUNE_MASK;
+        let runes = self.entities[player].mode_p.ctf.runes & RUNE_MASK;
         if runes == 0 {
             return;
         }
@@ -736,7 +736,7 @@ impl GameState {
                 self.do_spawn_rune(origin, bit);
             }
         }
-        self.entities[player].arena.runes = 0;
+        self.entities[player].mode_p.ctf.runes = 0;
         self.refresh_haste_speed(player);
     }
 
@@ -746,7 +746,7 @@ impl GameState {
         if !self.host.cvar_bool(c"rtx_ctf_tossrune") {
             return;
         }
-        let runes = self.entities[player].arena.runes & RUNE_MASK;
+        let runes = self.entities[player].mode_p.ctf.runes & RUNE_MASK;
         if runes == 0 {
             return;
         }
@@ -758,7 +758,7 @@ impl GameState {
                 self.entities[r].v.velocity = dir * 300.0 + Vec3::new(0.0, 0.0, 200.0);
             }
         }
-        self.entities[player].arena.runes = 0;
+        self.entities[player].mode_p.ctf.runes = 0;
         self.refresh_haste_speed(player);
     }
 
@@ -774,13 +774,13 @@ impl GameState {
         };
         // Only the "pure" mode (`rtx_runes 0`) grants the speed boost; `2` is haste-attack only.
         let pure = self.host.cvar(c"rtx_runes") as i32 == 0;
-        let haste = pure && self.entities[e].arena.runes & RUNE_HASTE != 0;
+        let haste = pure && self.entities[e].mode_p.ctf.runes & RUNE_HASTE != 0;
         self.entities[e].maxspeed = base * if haste { 1.25 } else { 1.0 };
     }
 
     /// Regeneration rune: heal health/armor toward 150 while held (called each frame in prethink).
     pub(crate) fn ctf_rune_regen(&mut self, e: EntId) {
-        if self.entities[e].arena.runes & RUNE_REGEN == 0 {
+        if self.entities[e].mode_p.ctf.runes & RUNE_REGEN == 0 {
             return;
         }
         let dt = self.globals.frametime;
