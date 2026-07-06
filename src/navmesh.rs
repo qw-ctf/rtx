@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use glam::{Vec2, Vec3, Vec3Swizzles};
 
 use crate::bsp::Bsp;
+use crate::qphys::{AIR_CAP, JUMP_VZ};
 
 // --- player + movement constants (QuakeWorld pmove) ---
 
@@ -46,13 +47,8 @@ const MAX_SPEED: f32 = 320.0;
 
 // --- speed jumps (bunnyhop-carried leaps across wide gaps) ---
 
-/// Jump impulse (`velocity.z`) — fixed, so a jump's airtime/apex don't change with horizontal speed;
-/// only the reach does (`speed · airtime`). That's what lets a fast bhopping bot clear a wide gap.
-const JUMP_VZ: f32 = 270.0;
-/// The QW `PM_AirAccelerate` projected-wishspeed cap (mirrors `bot::bhop::AIR_CAP`; cross-checked in a
-/// test). Bhop speed builds at a rate set by this and the tickrate.
-const SJ_AIR_CAP: f32 = 30.0;
-/// Conservative server tickrate assumed for the bhop acceleration model.
+/// Conservative server tickrate assumed for the bhop acceleration model (see [`crate::qphys`] on why
+/// this deliberately differs from the live controller's ~77 Hz).
 const SJ_TICKRATE: f32 = 72.0;
 /// Speed we'll plan bhop runways up to (reach ≈ `V·0.675` ≈ 600u); real runways bound it further.
 const SPEED_JUMP_V_CAP: f32 = 900.0;
@@ -90,7 +86,7 @@ fn v_required(horiz: f32, dz: f32, gravity: f32) -> f32 {
 /// Bhop speed-gain constant `k`: velocity² grows at `2k` per second while air-strafing. Derived from
 /// the perpendicular air-accel cap and the tickrate (`k = tick · a² / 2`, `a = min(accel·maxspeed/tick, cap)`).
 fn bhop_k(accel: f32, maxspeed: f32) -> f32 {
-    let a = (accel * maxspeed / SJ_TICKRATE).min(SJ_AIR_CAP);
+    let a = (accel * maxspeed / SJ_TICKRATE).min(AIR_CAP);
     SJ_TICKRATE * a * a / 2.0
 }
 

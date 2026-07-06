@@ -40,6 +40,7 @@ mod mode;
 mod navmesh;
 mod plats;
 mod player;
+mod qphys;
 mod rotate;
 mod server;
 mod spectate;

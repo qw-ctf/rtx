@@ -21,11 +21,7 @@ use glam::Vec2;
 
 use crate::bot::wrap180;
 use crate::defs::BOT_MOVE_SPEED as MOVE_SPEED;
-
-/// The projected-wishspeed cap in QW air acceleration (`PM_AirAccelerate`) — an engine literal
-/// (`movevars_maxairspeed`), not a cvar. Only this much of the wish speed counts against the
-/// current velocity each tick, which is exactly what lets a perpendicular strafe keep gaining.
-const AIR_CAP: f32 = 30.0;
+use crate::qphys::AIR_CAP;
 
 /// The engine's fixed bot tick (bots run `SV_RunCmd` at ~77 Hz regardless of what we pass as
 /// `msec`), used only to size the weave band. The live accel math uses the real per-frame `dt`.
