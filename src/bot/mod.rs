@@ -250,7 +250,54 @@ fn on_item(bot_origin: Vec3, item_origin: Vec3) -> bool {
     d.x.abs() <= PICKUP_XY && d.y.abs() <= PICKUP_XY && d.z.abs() <= PICKUP_Z
 }
 
-fn run_bot(game: &mut GameState, e: EntId) {
+/// What the bot is trying to do this frame — the output of [`resolve_objective`].
+struct Objective {
+    /// Currently flying (or committed to) a grappling-hook leg.
+    hooking: bool,
+    /// Currently committed to a speed-jump leg (route frozen, like `hooking`).
+    on_sj: bool,
+    /// A mode Fight intent's enemy to engage, if any.
+    enemy: Option<EntId>,
+    /// Chasing a committed item goal (idle pickup or greedy combat detour).
+    chasing: bool,
+    /// Where to navigate toward this frame.
+    target_origin: Vec3,
+    /// The navmesh cell of the item goal, when chasing one (skips a `nearest` lookup).
+    item_cell: Option<CellId>,
+}
+
+/// Resolve what this bot pursues this frame: reconcile a stale hook, ask the mode for an intent
+/// (or the pacifist override), (re)pick an item goal on a slow cadence, and settle on the world
+/// target to steer toward. Runs while `&mut game` is free — before the navmesh borrow.
+/// The immutable per-frame snapshot of a bot's edict — read once so the later `&mut bot` /
+/// `&mut nav` borrows in `run_bot` don't have to re-borrow the entity to read it (the grapple
+/// fields are set in the previous frame's PlayerPreThink, so they're stable across this frame).
+#[derive(Clone, Copy)]
+struct Sense {
+    host: crate::host::HostApi,
+    now: f32,
+    frametime: f32,
+    msec: i32,
+    origin: Vec3,
+    v_angle: Vec3,
+    client: i32,
+    weapon: Weapon,
+    on_ground: bool,
+    alive: bool,
+    vz: f32,
+    air_jumped: bool,
+    enemy_seen_time: f32,
+    v_xy: glam::Vec2,
+    speed: f32,
+    grapple_hook: EntId,
+    has_grapple: bool,
+    hook_out: bool,
+    on_hook: bool,
+    anchor: Vec3,
+    reel_half_step: f32,
+}
+
+fn sense(game: &GameState, e: EntId) -> Sense {
     let host = *game.host();
     let now = game.time();
     let frametime = game.globals.frametime;
@@ -284,32 +331,13 @@ fn run_bot(game: &mut GameState, e: EntId) {
     };
     // Live reel speed, for the release-crossing prediction (half a frame of lookahead).
     let reel_half_step = crate::navmesh::HOOK_PULL_BASE * host.cvar(c"rtx_hook_pull") * game.globals.frametime * 0.5;
-    // Flip the per-frame pulse used for press/release-edge buttons.
-    let pulse = {
-        let b = &mut game.entities[e].bot;
-        b.pulse = !b.pulse;
-        b.pulse
-    };
-
-    // Connected but never spawned (health 0, not dead): the engine defers `PutClientInServer` — the
-    // full spawn that sets health/loadout — to the bot's spawn on a *bot frame*, which an empty
-    // (bots-only) server never runs. So the bot sits at 0 health forever, and the respawn pulse below
-    // can't help it (`death_think` only runs for `deadflag >= Dead`). Spawn it ourselves; next frame
-    // it's alive and plays normally.
-    if !alive && game.entities[e].v.deadflag == 0.0 {
-        game.put_client_in_server(e);
-        return;
+    Sense {
+        host, now, frametime, msec, origin, v_angle, client, weapon, on_ground, alive, vz, air_jumped, enemy_seen_time, v_xy, speed, grapple_hook, has_grapple, hook_out, on_hook, anchor, reel_half_step,
     }
-    // Genuinely dead (fragged): pulse +attack to respawn. rtx's death-think needs all buttons
-    // *released* (Dead → Respawnable) and then *pressed* again — so the button must be pulsed.
-    if !alive {
-        let buttons = if pulse { BUTTON_ATTACK } else { 0 };
-        host.set_bot_cmd(client, msec, v_angle, 0, 0, 0, buttons, 0);
-        return;
-    }
+}
 
-    let idle = |angles: Vec3| host.set_bot_cmd(client, msec, angles, 0, 0, 0, 0, 0);
-
+fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, client: i32) -> Objective {
+    let host = *game.host();
     // Hook invariant net: if we're mid-hook but no longer hold the grapple (a mode loadout stripped
     // it, e.g. Rocket Arena), abandon the traversal cleanly — release any live hook and reset the
     // phase. Runs before the nav borrow, where `&mut game` is free. Other aborts (leg changed, hook
@@ -438,6 +466,154 @@ fn run_bot(game: &mut GameState, e: EntId) {
         b.goal_item = 0;
         b.goal_select_time = now; // re-pick (skipping the abandoned item) next frame
     }
+
+    Objective { hooking, on_sj, enemy, chasing, target_origin, item_cell }
+}
+
+/// Turn the frame's accumulated decisions into the engine usercmd. Bunnyhopping bypasses the aim
+/// spring (an air-strafe sweeps the view yaw independently of travel, which the world-move
+/// reprojection can't express); otherwise the critically-damped spring smooths the view and the
+/// world move is projected onto it. The hook fire is decided here, *after* the spring, so the
+/// throw waits for the smoothed view to settle on the anchor.
+fn emit(
+    game: &mut GameState,
+    e: EntId,
+    s: Sense,
+    cmd: BotCmd,
+    bhop_cmd: Option<bhop::Cmd>,
+    hook: &hook::HookDrive,
+    enemy: Option<EntId>,
+) {
+    let Sense { host, now, frametime, v_angle, client, msec, speed, .. } = s;
+    let BotCmd { look, move_world, mut buttons, impulse } = cmd;
+
+    // View + move for the frame. Bunnyhopping bypasses the aim spring and the world-move reprojection
+    // entirely — an air-strafe needs the view yaw swept *independently* of the travel direction, with
+    // `forward = 0` and one strafe key held, which the reprojection can't express. The controller
+    // already decided the whole cmd (air strafe, landing strafe+jump, or ground prestrafe); consume
+    // it here. Otherwise the normal aim spring smooths the view and the world move is projected onto it.
+    let (view, forward, side) = if let Some(c) = bhop_cmd {
+        let dt = frametime.clamp(0.001, 0.05);
+        let view = Vec3::new(look.x, c.view_yaw, 0.0);
+        // Seed the aim spring so combat re-acquisition continues from the real view with a plausible
+        // turn rate (a human-like flick) instead of snapping.
+        let b = &mut game.entities[e].bot;
+        let yv = if b.bhop_prev_yaw == 0.0 {
+            0.0
+        } else {
+            (wrap180(view.y - b.bhop_prev_yaw) / dt).clamp(-720.0, 720.0)
+        };
+        b.bhop_prev_yaw = view.y;
+        b.aim = view;
+        b.aim_vel = Vec3::new(0.0, yv, 0.0);
+        (view, c.forward.round() as i32, c.side.round() as i32)
+    } else {
+        game.entities[e].bot.bhop_prev_yaw = 0.0; // forget the bhop yaw so the next engage seeds clean
+        let dt = frametime.clamp(0.001, 0.05);
+        let skill = host.cvar(c"rtx_bot_skill").clamp(0.0, 7.0);
+        // Spring stiffness (1/s): sluggish → pro-snappy. Shared with the combat feed-forward,
+        // whose lag compensation assumes exactly this spring.
+        let omega = combat::aim_omega(skill);
+        let b = &mut game.entities[e].bot;
+        if b.aim == Vec3::ZERO {
+            b.aim = v_angle; // seed from the real view so the first frame doesn't snap from zero
+        }
+        let spring = |a: f32, v: f32, target: f32| {
+            let d = wrap180(target - a);
+            let v = v + (omega * omega * d - 2.0 * omega * v) * dt;
+            (wrap180(a + v * dt), v)
+        };
+        let (pitch, pv) = spring(b.aim.x, b.aim_vel.x, look.x);
+        let (yaw, yv) = spring(b.aim.y, b.aim_vel.y, look.y);
+        b.aim = Vec3::new(pitch, yaw, 0.0);
+        b.aim_vel = Vec3::new(pv, yv, 0.0);
+        let view = b.aim;
+        let (vf, vr, _) = angle_vectors(view);
+        (
+            view,
+            vf.dot(move_world).round() as i32,
+            vr.dot(move_world).round() as i32,
+        )
+    };
+
+    // Hook fire, decided *after* the spring: the hook flies along `v_angle` (the smoothed view we're
+    // about to send), so the throw must wait until that view has actually settled onto the anchor —
+    // gating on the raw target would launch the hook while the aim is still swinging. Once thrown we
+    // hold +attack every frame through the reel (the engine zeroes the cmd each tick, and a single
+    // released frame would drop the hook at impact or unhook mid-reel).
+    if hook.fire_ready {
+        let err = wrap180(view.x - look.x).abs().max(wrap180(view.y - look.y).abs());
+        if err < HOOK_AIM_TOL {
+            buttons |= BUTTON_ATTACK;
+            let b = &mut game.entities[e].bot;
+            b.hook_phase = HookPhase::Flight;
+            b.hook_started = now;
+        }
+    } else if hook.hold_fire {
+        buttons |= BUTTON_ATTACK;
+    }
+    // Flush any deferred hook release now the graph/bot borrows are done.
+    if let Some(h) = hook.reset {
+        game.reset_grapple(h);
+    }
+
+    // Combat/gate diagnostics: what the bot is chasing and whether it's stuck at a gate. Enable
+    // with `rtx_bot_debug 1` (conprint shows without `developer`).
+    if host.cvar_bool(c"rtx_bot_debug") {
+        let gate = game.entities[e].bot.gate;
+        let route = game.entities[e].bot.route.len();
+        let hph = game.entities[e].bot.hook_phase;
+        let bh = &game.entities[e].bot.bhop;
+        host.conprint(&cstring(&format!(
+            "rtx bot{client}: enemy={} gate={gate:?} hook={hph:?} bhop={:?} hops={} flips={} peak={:.0} \
+             spd={speed:.0} route={route} fwd={forward} side={side} atk={}\n",
+            enemy.is_some(),
+            bh.phase,
+            bh.hops,
+            bh.flips,
+            bh.peak,
+            (buttons & BUTTON_ATTACK) != 0,
+        )));
+    }
+
+    host.set_bot_cmd(client, msec, view, forward, side, 0, buttons, impulse);
+}
+
+fn run_bot(game: &mut GameState, e: EntId) {
+    let s = sense(game, e);
+    let Sense {
+        host, now, frametime, msec, origin, v_angle, client, weapon, on_ground, alive, vz,
+        air_jumped, enemy_seen_time, v_xy, speed, grapple_hook, has_grapple, hook_out, on_hook,
+        anchor, reel_half_step,
+    } = s;
+    // Flip the per-frame pulse used for press/release-edge buttons.
+    let pulse = {
+        let b = &mut game.entities[e].bot;
+        b.pulse = !b.pulse;
+        b.pulse
+    };
+
+    // Connected but never spawned (health 0, not dead): the engine defers `PutClientInServer` — the
+    // full spawn that sets health/loadout — to the bot's spawn on a *bot frame*, which an empty
+    // (bots-only) server never runs. So the bot sits at 0 health forever, and the respawn pulse below
+    // can't help it (`death_think` only runs for `deadflag >= Dead`). Spawn it ourselves; next frame
+    // it's alive and plays normally.
+    if !alive && game.entities[e].v.deadflag == 0.0 {
+        game.put_client_in_server(e);
+        return;
+    }
+    // Genuinely dead (fragged): pulse +attack to respawn. rtx's death-think needs all buttons
+    // *released* (Dead → Respawnable) and then *pressed* again — so the button must be pulsed.
+    if !alive {
+        let buttons = if pulse { BUTTON_ATTACK } else { 0 };
+        host.set_bot_cmd(client, msec, v_angle, 0, 0, 0, buttons, 0);
+        return;
+    }
+
+    let idle = |angles: Vec3| host.set_bot_cmd(client, msec, angles, 0, 0, 0, 0, 0);
+
+    let Objective { hooking, on_sj, enemy, chasing, target_origin, item_cell } =
+        resolve_objective(game, e, now, origin, client);
 
     // Current door states, for gate-aware pathfinding. A shut gate makes its links expensive, so
     // `find_path` bends the route around a closed door when any open way exists and only crosses
@@ -955,98 +1131,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
 
     // Overlays done — unpack the command back into the frame's locals for the aim spring / emit.
     // `buttons` is still touched by the post-spring hook fire below; the rest are read-only now.
-    let BotCmd { look, move_world, mut buttons, impulse } = cmd;
-
-    // View + move for the frame. Bunnyhopping bypasses the aim spring and the world-move reprojection
-    // entirely — an air-strafe needs the view yaw swept *independently* of the travel direction, with
-    // `forward = 0` and one strafe key held, which the reprojection can't express. The controller
-    // already decided the whole cmd (air strafe, landing strafe+jump, or ground prestrafe); consume
-    // it here. Otherwise the normal aim spring smooths the view and the world move is projected onto it.
-    let (view, forward, side) = if let Some(c) = bhop_cmd {
-        let dt = frametime.clamp(0.001, 0.05);
-        let view = Vec3::new(look.x, c.view_yaw, 0.0);
-        // Seed the aim spring so combat re-acquisition continues from the real view with a plausible
-        // turn rate (a human-like flick) instead of snapping.
-        let b = &mut game.entities[e].bot;
-        let yv = if b.bhop_prev_yaw == 0.0 {
-            0.0
-        } else {
-            (wrap180(view.y - b.bhop_prev_yaw) / dt).clamp(-720.0, 720.0)
-        };
-        b.bhop_prev_yaw = view.y;
-        b.aim = view;
-        b.aim_vel = Vec3::new(0.0, yv, 0.0);
-        (view, c.forward.round() as i32, c.side.round() as i32)
-    } else {
-        game.entities[e].bot.bhop_prev_yaw = 0.0; // forget the bhop yaw so the next engage seeds clean
-        let dt = frametime.clamp(0.001, 0.05);
-        let skill = host.cvar(c"rtx_bot_skill").clamp(0.0, 7.0);
-        // Spring stiffness (1/s): sluggish → pro-snappy. Shared with the combat feed-forward,
-        // whose lag compensation assumes exactly this spring.
-        let omega = combat::aim_omega(skill);
-        let b = &mut game.entities[e].bot;
-        if b.aim == Vec3::ZERO {
-            b.aim = v_angle; // seed from the real view so the first frame doesn't snap from zero
-        }
-        let spring = |a: f32, v: f32, target: f32| {
-            let d = wrap180(target - a);
-            let v = v + (omega * omega * d - 2.0 * omega * v) * dt;
-            (wrap180(a + v * dt), v)
-        };
-        let (pitch, pv) = spring(b.aim.x, b.aim_vel.x, look.x);
-        let (yaw, yv) = spring(b.aim.y, b.aim_vel.y, look.y);
-        b.aim = Vec3::new(pitch, yaw, 0.0);
-        b.aim_vel = Vec3::new(pv, yv, 0.0);
-        let view = b.aim;
-        let (vf, vr, _) = angle_vectors(view);
-        (
-            view,
-            vf.dot(move_world).round() as i32,
-            vr.dot(move_world).round() as i32,
-        )
-    };
-
-    // Hook fire, decided *after* the spring: the hook flies along `v_angle` (the smoothed view we're
-    // about to send), so the throw must wait until that view has actually settled onto the anchor —
-    // gating on the raw target would launch the hook while the aim is still swinging. Once thrown we
-    // hold +attack every frame through the reel (the engine zeroes the cmd each tick, and a single
-    // released frame would drop the hook at impact or unhook mid-reel).
-    if hook.fire_ready {
-        let err = wrap180(view.x - look.x).abs().max(wrap180(view.y - look.y).abs());
-        if err < HOOK_AIM_TOL {
-            buttons |= BUTTON_ATTACK;
-            let b = &mut game.entities[e].bot;
-            b.hook_phase = HookPhase::Flight;
-            b.hook_started = now;
-        }
-    } else if hook.hold_fire {
-        buttons |= BUTTON_ATTACK;
-    }
-    // Flush any deferred hook release now the graph/bot borrows are done.
-    if let Some(h) = hook.reset {
-        game.reset_grapple(h);
-    }
-
-    // Combat/gate diagnostics: what the bot is chasing and whether it's stuck at a gate. Enable
-    // with `rtx_bot_debug 1` (conprint shows without `developer`).
-    if host.cvar_bool(c"rtx_bot_debug") {
-        let gate = game.entities[e].bot.gate;
-        let route = game.entities[e].bot.route.len();
-        let hph = game.entities[e].bot.hook_phase;
-        let bh = &game.entities[e].bot.bhop;
-        host.conprint(&cstring(&format!(
-            "rtx bot{client}: enemy={} gate={gate:?} hook={hph:?} bhop={:?} hops={} flips={} peak={:.0} \
-             spd={speed:.0} route={route} fwd={forward} side={side} atk={}\n",
-            enemy.is_some(),
-            bh.phase,
-            bh.hops,
-            bh.flips,
-            bh.peak,
-            (buttons & BUTTON_ATTACK) != 0,
-        )));
-    }
-
-    host.set_bot_cmd(client, msec, view, forward, side, 0, buttons, impulse);
+    emit(game, e, s, cmd, bhop_cmd, &hook, enemy);
 }
 
 /// Wrap an angle into (-180, 180].
