@@ -814,7 +814,14 @@ impl GameState {
 
         self.fire_corner_event(e, current);
 
-        // Apply the leaving corner's segment modifiers.
+        let (cur_speed, movetime_flag) = self.apply_leaving_corner(e, current);
+        self.move_to_corner(e, targ, cur_speed, movetime_flag);
+    }
+
+    /// Apply the modifiers the *leaving* corner sets for this segment — an angle snap, a new rotation
+    /// vector, a damage value, and damage-on-targets — and report the corner's `(speed, movetime)`
+    /// for [`Self::move_to_corner`] to solve the travel with.
+    fn apply_leaving_corner(&mut self, e: EntId, current: EntId) -> (f32, bool) {
         let (angles_flag, rotation_flag, damage_flag, set_damage_flag, movetime_flag, cur_speed, cur_rotate, cur_dmg) = {
             let c = &self.entities[current];
             (
@@ -845,7 +852,13 @@ impl GameState {
         if set_damage_flag {
             self.set_damage_on_targets(e, cur_dmg);
         }
+        (cur_speed, movetime_flag)
+    }
 
+    /// Drive the train from its current origin toward corner `targ`: a `speed == -1` warp, an
+    /// already-there idle tick, or a timed slide (a positive corner speed becomes the new cruising
+    /// speed). Sets the mover dest/velocity/endtime that `rotate_train_think` steps.
+    fn move_to_corner(&mut self, e: EntId, targ: EntId, cur_speed: f32, movetime_flag: bool) {
         let t = self.time();
         let (ltime, origin) = {
             let v = &self.entities[e];
