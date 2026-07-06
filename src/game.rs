@@ -113,6 +113,10 @@ const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         ("rtx_bot_greed", Bool(true)),
         // Per-bot goal/pickup diagnostics to the server console (off by default).
         ("rtx_bot_debug", Bool(false)),
+        // Bots rocket-jump to ledges that would otherwise need a long detour (or are unreachable).
+        // Costs health, so a bot only plans one when it clearly beats the walk and it's fit to fly it
+        // (has the RL, a rocket, and the health). On by default.
+        ("rtx_bot_rocketjump", Bool(true)),
         // Perception (human-like targeting). `rtx_bot_fov` is the view cone (full angle, degrees)
         // within which a bot can *see* a target, widened with skill; 0 = 360° (see everywhere, the
         // old behavior). `rtx_bot_reaction` is the base delay (seconds) a target must stay seen

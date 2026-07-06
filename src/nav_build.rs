@@ -94,6 +94,12 @@ impl GameState {
                 }
             },
         });
+        // Rocket-jump links: only when bots may rocket-jump. Snapshot gravity and the `rj` self-boost
+        // cvar (off by default) so the offline blast solve matches the live knockback.
+        let rocket_jump = self.host.cvar_bool(c"rtx_bot_rocketjump").then(|| navmesh::RocketJumpParams {
+            gravity: self.host.cvar(c"sv_gravity").max(1.0),
+            rj_extra: self.host.cvar(c"rj"),
+        });
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(navmesh::build_navmesh(
@@ -104,7 +110,7 @@ impl GameState {
                 hooks,
                 double_jump,
                 speed_jump,
-                None, // rocket jumps wired in phase 4
+                rocket_jump,
             ));
         });
         self.nav.pending = Some(rx);
@@ -135,7 +141,7 @@ impl GameState {
         let goals = self.collect_goals(&graph);
         let msg = cstring(&format!(
             "rtx: navmesh: {} planes, {} clipnodes -> {} cells, {} links \
-             (walk {} step {} drop {} jump {} djump {} sjump {} plat {} tele {} hook {}), {} gates, {} item goals\n",
+             (walk {} step {} drop {} jump {} djump {} sjump {} plat {} tele {} hook {} rjump {}), {} gates, {} item goals\n",
             bsp.planes.len(),
             bsp.clipnodes.len(),
             graph.cells.len(),
@@ -149,6 +155,7 @@ impl GameState {
             counts.plat,
             counts.teleport,
             counts.hook,
+            counts.rocket_jump,
             graph.gate_count(),
             goals.len(),
         ));
