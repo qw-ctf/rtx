@@ -37,6 +37,7 @@ mod host;
 mod items;
 mod misc;
 mod mode;
+mod nav_build;
 mod navmesh;
 mod plats;
 mod player;
