@@ -223,11 +223,7 @@ impl GameState {
             ent.v.nextthink = time + 0.2;
             ent.think = Think::PlayTeleport;
         }
-        self.host.write_te(MsgDest::Multicast, Te::Teleport);
-        self.host.write_coord(MsgDest::Multicast, org.x);
-        self.host.write_coord(MsgDest::Multicast, org.y);
-        self.host.write_coord(MsgDest::Multicast, org.z);
-        self.host.multicast(org, Multicast::Phs);
+        self.temp_entity_point(Te::Teleport, org);
     }
 
     /// `tdeath_touch` — telefrag whoever is at the destination.

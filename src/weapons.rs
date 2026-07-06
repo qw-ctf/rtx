@@ -10,6 +10,7 @@ use core::ffi::CStr;
 
 use glam::Vec3;
 
+use crate::arsenal::AmmoKind;
 use crate::assets::{Model, Sound};
 use crate::defs::*;
 use crate::entity::{Die, EntId, Think, Touch};
@@ -149,6 +150,14 @@ impl GameState {
         self.host.write_coord(to, v.z);
     }
 
+    /// Broadcast a payload-less point temp-entity (an explosion, teleport fog, …) to the PHS: the
+    /// `write_te` → coords → `multicast` ritual every such effect hand-rolls.
+    pub(crate) fn temp_entity_point(&self, te: Te, org: Vec3) {
+        self.host.write_te(MsgDest::Multicast, te);
+        self.write_coords(MsgDest::Multicast, org);
+        self.host.multicast(org, Multicast::Phs);
+    }
+
     // --- axe ---
 
     /// `W_FireAxe` — short melee trace.
@@ -273,11 +282,7 @@ impl GameState {
         self.host
             .sound(e, Channel::Weapon, Sound::WEAPONS_GUNCOCK, 1.0, Attenuation::Norm);
         self.small_kick(e);
-        if self.level.deathmatch != 4 {
-            let ent = &mut self.entities[e];
-            ent.v.ammo_shells -= 1.0;
-            ent.v.currentammo = ent.v.ammo_shells;
-        }
+        self.consume_ammo(e, AmmoKind::Shells, 1.0);
         let dir = self.aim_dir(e);
         self.fire_bullets(e, 6, dir, Vec3::new(0.04, 0.04, 0.0));
     }
@@ -291,11 +296,7 @@ impl GameState {
         self.host
             .sound(e, Channel::Weapon, Sound::WEAPONS_SHOTGN2, 1.0, Attenuation::Norm);
         self.big_kick(e);
-        if self.level.deathmatch != 4 {
-            let ent = &mut self.entities[e];
-            ent.v.ammo_shells -= 2.0;
-            ent.v.currentammo = ent.v.ammo_shells;
-        }
+        self.consume_ammo(e, AmmoKind::Shells, 2.0);
         let dir = self.aim_dir(e);
         self.fire_bullets(e, 14, dir, Vec3::new(0.14, 0.08, 0.0));
     }
@@ -331,19 +332,13 @@ impl GameState {
         let velocity = self.entities[e].v.velocity;
         let org = self.entities[e].v.origin - velocity.normalize_or_zero() * 8.0;
         self.entities[e].v.origin = org;
-        self.host.write_te(MsgDest::Multicast, Te::Explosion);
-        self.write_coords(MsgDest::Multicast, org);
-        self.host.multicast(org, Multicast::Phs);
+        self.temp_entity_point(Te::Explosion, org);
         self.free(e);
     }
 
     /// `W_FireRocket`.
     fn w_fire_rocket(&mut self, e: EntId) {
-        if self.level.deathmatch != 4 {
-            let ent = &mut self.entities[e];
-            ent.v.ammo_rockets -= 1.0;
-            ent.v.currentammo = ent.v.ammo_rockets;
-        }
+        self.consume_ammo(e, AmmoKind::Rockets, 1.0);
         self.host
             .sound(e, Channel::Weapon, Sound::WEAPONS_SGUN1, 1.0, Attenuation::Norm);
         self.small_kick(e);
@@ -458,11 +453,7 @@ impl GameState {
             self.entities[e].mover.t_width = time + 0.6;
         }
         self.small_kick(e);
-        if self.level.deathmatch != 4 {
-            let ent = &mut self.entities[e];
-            ent.v.ammo_cells -= 1.0;
-            ent.v.currentammo = ent.v.ammo_cells;
-        }
+        self.consume_ammo(e, AmmoKind::Cells, 1.0);
 
         let v_angle = self.entities[e].v.v_angle;
         self.host.make_vectors(v_angle);
@@ -493,9 +484,7 @@ impl GameState {
         self.t_radius_damage(e, owner, 120.0, EntId::WORLD, "grenade");
 
         let origin = self.entities[e].v.origin;
-        self.host.write_te(MsgDest::Multicast, Te::Explosion);
-        self.write_coords(MsgDest::Multicast, origin);
-        self.host.multicast(origin, Multicast::Phs);
+        self.temp_entity_point(Te::Explosion, origin);
         self.free(e);
     }
 
@@ -518,11 +507,7 @@ impl GameState {
     /// `W_FireGrenade`.
     fn w_fire_grenade(&mut self, e: EntId) {
         let time = self.time();
-        if self.level.deathmatch != 4 {
-            let ent = &mut self.entities[e];
-            ent.v.ammo_rockets -= 1.0;
-            ent.v.currentammo = ent.v.ammo_rockets;
-        }
+        self.consume_ammo(e, AmmoKind::Rockets, 1.0);
         self.host
             .sound(e, Channel::Weapon, Sound::WEAPONS_GRENADE, 1.0, Attenuation::Norm);
         self.small_kick(e);
@@ -604,11 +589,7 @@ impl GameState {
         self.host
             .sound(e, Channel::Weapon, Sound::WEAPONS_SPIKE2, 1.0, Attenuation::Norm);
         self.entities[e].combat.attack_finished = time + 0.2;
-        if self.level.deathmatch != 4 {
-            let ent = &mut self.entities[e];
-            ent.v.ammo_nails -= 2.0;
-            ent.v.currentammo = ent.v.ammo_nails;
-        }
+        self.consume_ammo(e, AmmoKind::Nails, 2.0);
         let dir = self.aim_dir(e);
         let org = self.entities[e].v.origin + Vec3::new(0.0, 0.0, 16.0);
         let m = self.launch_spike(e, org, dir);
@@ -642,11 +623,7 @@ impl GameState {
         self.host
             .sound(e, Channel::Weapon, Sound::WEAPONS_ROCKET1I, 1.0, Attenuation::Norm);
         self.entities[e].combat.attack_finished = time + 0.2;
-        if self.level.deathmatch != 4 {
-            let ent = &mut self.entities[e];
-            ent.v.ammo_nails -= 1.0;
-            ent.v.currentammo = ent.v.ammo_nails;
-        }
+        self.consume_ammo(e, AmmoKind::Nails, 1.0);
         let dir = self.aim_dir(e);
         let org = self.entities[e].v.origin + Vec3::new(0.0, 0.0, 16.0) + v_right * ox;
         self.launch_spike(e, org, dir);
@@ -687,9 +664,7 @@ impl GameState {
             self.entities[other].deathtype = Some(dtype.into());
             self.t_damage(other, e, owner, damage);
         } else {
-            self.host.write_te(MsgDest::Multicast, te);
-            self.write_coords(MsgDest::Multicast, origin);
-            self.host.multicast(origin, Multicast::Phs);
+            self.temp_entity_point(te, origin);
         }
         self.free(e);
     }
@@ -737,6 +712,34 @@ impl GameState {
             return Weapon::from(spec.item);
         }
         Weapon::Axe
+    }
+
+    /// Spend `n` rounds from the `kind` pool and re-sync `currentammo` — the stock `player.qc`
+    /// decrement each `w_fire_*` does, skipped in deathmatch 4 (infinite ammo).
+    fn consume_ammo(&mut self, e: EntId, kind: AmmoKind, n: f32) {
+        if self.level.deathmatch == 4 {
+            return;
+        }
+        let v = &mut self.entities[e].v;
+        let remaining = match kind {
+            AmmoKind::Shells => {
+                v.ammo_shells -= n;
+                v.ammo_shells
+            }
+            AmmoKind::Nails => {
+                v.ammo_nails -= n;
+                v.ammo_nails
+            }
+            AmmoKind::Rockets => {
+                v.ammo_rockets -= n;
+                v.ammo_rockets
+            }
+            AmmoKind::Cells => {
+                v.ammo_cells -= n;
+                v.ammo_cells
+            }
+        };
+        v.currentammo = remaining;
     }
 
     /// `W_CheckNoAmmo` — switch off an empty weapon; returns whether we can fire.
