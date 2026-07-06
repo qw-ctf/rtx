@@ -9,8 +9,9 @@
 //! into [`Link`]s (walk / step / drop / jump). Costs are travel times, so A* over the graph
 //! yields fast routes (P2).
 //!
-//! Staged per the plan: this first cut emits `Walk`/`Step`/`Drop`/`JumpGap`. `CurveJump`,
-//! `RocketJump`, water, and entity-derived (teleport/plat/door) links land iteratively on top.
+//! The static-hull cut emits `Walk`/`Step`/`Drop`/`JumpGap`; on top of it come `DoubleJump`,
+//! `SpeedJump`, `Hook`, and `RocketJump` movement links (each solved offline against the same
+//! solidity oracle), and the entity-derived `Plat`/`Teleport`/gate splices.
 
 use std::collections::HashMap;
 
@@ -18,11 +19,13 @@ use glam::{Vec2, Vec3, Vec3Swizzles};
 
 mod hook;
 mod query;
+mod rocketjump;
 
 pub(crate) use hook::arc_land;
 use hook::{hook_cost, march_to_solid, perturb_ok, HOOK_PITCHES};
 #[cfg(test)]
 use hook::{simulate_arc, ArcResult};
+use rocketjump::{rj_perturb_ok, rocket_jump_cost, simulate_rocket_jump, RJ_DELAYS, RJ_PITCHES};
 
 use crate::bsp::Bsp;
 use crate::qphys::{AIR_CAP, JUMP_VZ};
@@ -149,6 +152,23 @@ const HOOK_OVERHEAD: f32 = 1.2;
 /// At most this many hook links per source cell (post octant/elevation dedup), to bound explosion.
 const HOOK_MAX_PER_CELL: usize = 4;
 
+// --- rocket jumps (blast-launched leaps up to high ledges) ---
+
+/// Max horizontal reach of a rocket-jump link. A floor-fired RJ is mostly vertical, so the reach is
+/// tighter than a hook's — an RJ that also travels far is rare and fragile.
+const RJ_RANGE_XY: f32 = 400.0;
+/// Highest rise a rocket-jump link may climb — the realistic apex (~280u) plus landing slack.
+const RJ_MAX_RISE: f32 = 320.0;
+/// Lowest a target may sit above the source and still be worth a rocket jump (below this a jump or
+/// double jump already reaches — see the useful-gate).
+const RJ_MIN_RISE: f32 = 40.0;
+/// Landing acceptance window (XY / Z above the target cell), like the hook's.
+const RJ_LAND_XY: f32 = 24.0;
+const RJ_LAND_Z: f32 = 48.0;
+/// At most this many rocket-jump links per source cell — kept small (each costs the bot ~50HP to
+/// fly, so a map wants a handful of genuinely-useful ones, not a spray).
+const RJ_MAX_PER_CELL: usize = 2;
+
 // --- grid ---
 
 /// XY sampling step. 32 = the player's full width: one column per body. Coarser than the
@@ -210,6 +230,13 @@ pub enum LinkKind {
     /// table, see [`NavGraph::hook_of_link`]) carries the anchor and the release distance the bot
     /// needs to reproduce the arc. Only emitted when the map hands out the hook (`rtx_grapple`).
     Hook,
+    /// A **rocket jump**: the bot jumps, and at a solved moment in the rise fires a rocket at the
+    /// floor below it; the blast knockback flings it up onto a ledge no jump reaches. The two solved
+    /// ingredients — the delay from jump to fire, and the fire direction — plus the self-damage live
+    /// in the [`RocketJumpTraversal`] side table ([`NavGraph::rocket_jump_of_link`]). Costs the bot
+    /// health, so it's planned only when it clearly beats the detour (a big cost surcharge) and a bot
+    /// unfit to fly it (no RL / rocket / health) prices it away. Only emitted when `rtx_bot_rocketjump`.
+    RocketJump,
 }
 
 /// A directed edge between two cells, with its traversal kind and travel-time cost.
@@ -244,6 +271,10 @@ pub struct NavGraph {
     /// takeoff point + required entry speed the bot executor needs.
     speed_jump_links: Vec<i32>,
     speed_jumps: Vec<SpeedJumpTraversal>,
+    /// Per-link rocket-jump payload index (parallel to `links`, `-1` for non-rocket-jump links) — the
+    /// fire delay + angles + self-damage the bot executor needs.
+    rocket_jump_links: Vec<i32>,
+    rocket_jumps: Vec<RocketJumpTraversal>,
 }
 
 /// A solved speed jump: where the takeoff ledge is and the horizontal speed needed there, so the
@@ -309,6 +340,8 @@ impl NavGraph {
             hooks: Vec::new(),
             speed_jump_links: Vec::new(),
             speed_jumps: Vec::new(),
+            rocket_jump_links: Vec::new(),
+            rocket_jumps: Vec::new(),
         };
         graph.link_cells(bsp);
         graph
@@ -894,7 +927,7 @@ impl NavGraph {
                 let (sp, cp) = pitch.sin_cos();
                 let (sy, cy) = yaw.sin_cos();
                 let dir = Vec3::new(cp * cy, cp * sy, sp);
-                let Some(stick) = march_to_solid(bsp, launch, dir, HOOK_ROPE_MAX) else {
+                let Some(stick) = march_to_solid(|p| bsp.is_solid(p), launch, dir, HOOK_ROPE_MAX) else {
                     continue;
                 };
                 let rope = (stick - launch).length();
@@ -956,6 +989,94 @@ impl NavGraph {
         out.extend(chosen.into_iter().map(|(_, link, tr)| (link, tr)));
     }
 
+    /// Splice rocket-jump links: for each cell, fire a rocket at a solved delay/angle during a jump
+    /// and keep the launches that land on a higher ledge no cheaper move reaches. `double_jump` gates
+    /// the useful height. See [`super::rocketjump`] for the two-phase ballistics.
+    pub fn add_rocket_jumps(&mut self, bsp: &Bsp, params: RocketJumpParams, double_jump: bool) {
+        if self.rocket_jump_links.len() != self.links.len() {
+            self.rocket_jump_links.resize(self.links.len(), -1);
+        }
+        // Solve per source cell first (immutable borrow), then splice (push needs `&mut`).
+        let mut pending: Vec<(Link, RocketJumpTraversal)> = Vec::new();
+        for from in 0..self.cells.len() as CellId {
+            self.solve_rocket_jumps_from(bsp, from, params, double_jump, &mut pending);
+        }
+        for (link, tr) in pending {
+            self.push_rocket_jump(link, tr);
+        }
+    }
+
+    /// Solve the rocket-jump links leaving cell `from`, appending accepted `(Link, RocketJumpTraversal)`
+    /// to `out`. Unlike hooks there's no ledge-edge skip — the classic RJ launches from flat ground up
+    /// a wall face — so all eight travel octants are tried, firing opposite the travel direction.
+    fn solve_rocket_jumps_from(
+        &self,
+        bsp: &Bsp,
+        from: CellId,
+        params: RocketJumpParams,
+        double_jump: bool,
+        out: &mut Vec<(Link, RocketJumpTraversal)>,
+    ) {
+        let a = self.cells[from as usize].origin;
+        let is_solid = |p: Vec3| bsp.is_solid(p);
+        // Height an RJ must clear to earn its health cost: past a plain (or double) jump's apex.
+        let useful_apex = if double_jump { DOUBLE_JUMP_APEX } else { JUMP_APEX };
+        // best per (compass octant, 128u elevation band): (cost, link, traversal)
+        let mut best: HashMap<(usize, i32), (f32, Link, RocketJumpTraversal)> = HashMap::new();
+
+        for (dgx, dgy) in COMPASS {
+            // Fire opposite the travel direction: the blast lands behind-and-below, shoving the bot
+            // up and toward the ledge.
+            let fire_yaw = (dgy as f32).atan2(dgx as f32).to_degrees() + 180.0;
+            for pitch in RJ_PITCHES {
+                for delay in RJ_DELAYS {
+                    let angles = Vec3::new(pitch, fire_yaw, 0.0);
+                    let Some(s) = simulate_rocket_jump(is_solid, a, angles, delay, params) else {
+                        continue;
+                    };
+                    let Some(to) = self.nearest_within(s.land, RJ_LAND_XY, RJ_LAND_Z) else {
+                        continue;
+                    };
+                    if to == from {
+                        continue;
+                    }
+                    let b = self.cells[to as usize].origin;
+                    let dz = b.z - a.z;
+                    let horiz = (b.xy() - a.xy()).length();
+                    let useful = dz > useful_apex; // height is the whole point of an RJ in v1
+                    let in_range = (RJ_MIN_RISE..=RJ_MAX_RISE).contains(&dz) && horiz <= RJ_RANGE_XY;
+                    if useful
+                        && in_range
+                        && !self.has_direct_link(from, to)
+                        && rj_perturb_ok(is_solid, a, angles, delay, params, b)
+                    {
+                        let cost = rocket_jump_cost(s.t_blast, s.airtime, s.vz_land, s.self_damage);
+                        let key = (dir_bucket(dgx, dgy), (dz / 128.0).floor() as i32);
+                        if best.get(&key).is_none_or(|(bc, _, _)| cost < *bc) {
+                            let link = Link { from, to, kind: LinkKind::RocketJump, cost };
+                            let tr = RocketJumpTraversal {
+                                fire_angles: angles,
+                                fire_delay: delay,
+                                blast: s.blast,
+                                pos_blast: s.pos_blast,
+                                v0: s.v0,
+                                airtime: s.airtime,
+                                self_damage: s.self_damage,
+                            };
+                            best.insert(key, (cost, link, tr));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Keep the cheapest few per cell.
+        let mut chosen: Vec<(f32, Link, RocketJumpTraversal)> = best.into_values().collect();
+        chosen.sort_by(|x, y| x.0.total_cmp(&y.0));
+        chosen.truncate(RJ_MAX_PER_CELL);
+        out.extend(chosen.into_iter().map(|(_, link, tr)| (link, tr)));
+    }
+
     /// Whether `from` already has a direct (non-hook) link to `to` — such a target needs no hook.
     fn has_direct_link(&self, from: CellId, to: CellId) -> bool {
         self.adjacency[from as usize]
@@ -999,6 +1120,27 @@ impl NavGraph {
         self.speed_jumps.push(traversal);
         self.push_link(link);
         self.speed_jump_links.push(s);
+    }
+
+    /// The solved traversal for rocket-jump link `li`, or `None` for any other link. Consumed by the
+    /// runtime driver (`crate::bot::rj`) in phase 3; `dead_code`-allowed until then.
+    #[allow(dead_code)]
+    pub fn rocket_jump_of_link(&self, li: u32) -> Option<&RocketJumpTraversal> {
+        match self.rocket_jump_links.get(li as usize).copied().unwrap_or(-1) {
+            r if r >= 0 => self.rocket_jumps.get(r as usize),
+            _ => None,
+        }
+    }
+
+    /// Push a rocket-jump link with its traversal, keeping the side table in step.
+    fn push_rocket_jump(&mut self, link: Link, traversal: RocketJumpTraversal) {
+        if self.rocket_jump_links.len() != self.links.len() {
+            self.rocket_jump_links.resize(self.links.len(), -1);
+        }
+        let r = self.rocket_jumps.len() as i32;
+        self.rocket_jumps.push(traversal);
+        self.push_link(link);
+        self.rocket_jump_links.push(r);
     }
 
     /// Append a free-standing cell (not from the column carve) and index it. Used for plat
@@ -1075,6 +1217,41 @@ pub struct HookTraversal {
     pub airtime: f32,
 }
 
+/// Live physics the rocket-jump solver needs, gathered from cvars at build time: gravity (fixes both
+/// the jump ascent and the post-blast parabola) and the `rj` self-boost cvar (off by default; when a
+/// server sets it > 1, a self-rocket adds an extra `dir·points·rj` impulse — see `t_damage`).
+#[derive(Clone, Copy)]
+pub struct RocketJumpParams {
+    pub gravity: f32,
+    pub rj_extra: f32,
+}
+
+/// A solved rocket jump, stored per rocket-jump link in a side table (parallel to `links`, like
+/// `hooks`). Carries the two ingredients the bot fires the shot by — the delay from the jump press
+/// and the view angles — plus the self-damage (the runtime health gate) and the arc data.
+///
+/// The read fields are consumed by the runtime driver (`crate::bot::rj`); `blast`/`pos_blast`/`v0`
+/// are build/test-only re-flight data. The whole struct is `dead_code`-allowed until that driver
+/// lands.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub struct RocketJumpTraversal {
+    /// View angles to fire at (QW pitch positive-down); the shot goes straight along `v_forward`.
+    pub fire_angles: Vec3,
+    /// Seconds from the jump press to the `+attack` that fires the rocket.
+    pub fire_delay: f32,
+    /// Where the rocket is expected to explode (telemetry / the runtime doesn't need it).
+    pub blast: Vec3,
+    /// Bot position at the blast — stored so the build/test can re-fly the continuation arc.
+    pub pos_blast: Vec3,
+    /// Continuation velocity just after the blast — re-flown by the build/test.
+    pub v0: Vec3,
+    /// Simulated airtime of the parabola after the blast — the runtime's Ballistic watchdog base.
+    pub airtime: f32,
+    /// Pre-armor self-damage points from the blast — the runtime's health gate.
+    pub self_damage: f32,
+}
+
 /// The two standing positions a `func_plat` connects: the player-origin spot on the plat
 /// surface at the bottom of travel (`board`) and at the top (`exit`).
 pub struct PlatInfo {
@@ -1129,6 +1306,7 @@ pub struct LinkCounts {
     pub plat: u32,
     pub teleport: u32,
     pub hook: u32,
+    pub rocket_jump: u32,
 }
 
 /// Travel-time cost of a link: horizontal distance / speed, plus risk/effort penalties so A*
@@ -1151,6 +1329,9 @@ fn link_cost(kind: LinkKind, horiz: f32, dz: f32) -> f32 {
         // Hook costs (throw + reel + parabola airtime + overhead) are computed at splice time from
         // the solved trajectory; this fallback should never actually be priced.
         LinkKind::Hook => base + HOOK_OVERHEAD,
+        // Rocket-jump costs (rise-to-blast + arc airtime + overhead + health surcharge) are computed
+        // at splice time; this fallback should never actually be priced.
+        LinkKind::RocketJump => base + 4.0,
     }
 }
 
@@ -1280,6 +1461,7 @@ pub struct NavState {
 /// Build a navmesh off the main thread from pre-gathered, `Send` inputs: the raw BSP bytes plus the
 /// entity-derived plat/teleport/gate info. Pure — no engine or game-state access — so it runs
 /// safely on a worker thread whose result the main thread swaps in when ready.
+#[allow(clippy::too_many_arguments)] // the per-map build knobs; a params struct would just relocate them
 pub fn build_navmesh(
     bytes: Vec<u8>,
     plats: Vec<PlatInfo>,
@@ -1288,6 +1470,7 @@ pub fn build_navmesh(
     hooks: Option<HookParams>,
     double_jump: bool,
     speed_jump: Option<SpeedJumpParams>,
+    rocket_jump: Option<RocketJumpParams>,
 ) -> NavBuild {
     let bsp = Bsp::parse(&bytes)?;
     let mut graph = NavGraph::build(&bsp);
@@ -1305,6 +1488,11 @@ pub fn build_navmesh(
     // plat surfaces off hook endpoints and lets `add_gates` tag any hook link crossing a door.
     if let Some(params) = hooks {
         graph.add_hooks(&bsp, params);
+    }
+    // Rocket jumps after hooks: `has_direct_link` then skips any ledge a (free, cheaper) hook already
+    // reaches, so an RJ link is only spent where nothing else gets there.
+    if let Some(params) = rocket_jump {
+        graph.add_rocket_jumps(&bsp, params, double_jump);
     }
     graph.add_plats(&bsp, &plats);
     graph.add_teleports(&teleports);
@@ -1630,6 +1818,61 @@ mod tests {
             assert!(back + GRID >= need, "runway too short: {back} < {need}");
         }
         eprintln!("speed-jump splice: {sjumps} links");
+
+        // Rocket-jump splice: blast-launched leaps up to high ledges. Every emitted link must clear
+        // more than a single jump's apex (else a jump covers it), sit within the RJ envelope, and its
+        // stored (pos_blast, v0) arc must re-simulate onto the target — the offline solve and the
+        // runtime re-flight must agree. Default-mode physics (gravity 800, no `rj` boost).
+        let rjp = RocketJumpParams { gravity: 800.0, rj_extra: 0.0 };
+        let mut gr = NavGraph::build(&bsp);
+        let reach_before = {
+            let step = (gr.cells.len() / 32).max(1);
+            (0..gr.cells.len() as u32)
+                .step_by(step)
+                .map(|s| directed_reach_len(&gr, s))
+                .max()
+                .unwrap_or(0)
+        };
+        gr.add_rocket_jumps(&bsp, rjp, false);
+        let rjumps = gr.summary().rocket_jump;
+        for li in 0..gr.links.len() as u32 {
+            if gr.link_kind(li) != LinkKind::RocketJump {
+                continue;
+            }
+            let tr = *gr.rocket_jump_of_link(li).expect("rocket-jump link missing its traversal");
+            let a = gr.cell_origin(gr.link_source(li));
+            let b = gr.cell_origin(gr.link_target(li));
+            let dz = b.z - a.z;
+            let horiz = (b.xy() - a.xy()).length();
+            assert!(
+                (RJ_MIN_RISE..=RJ_MAX_RISE).contains(&dz) && horiz <= RJ_RANGE_XY,
+                "rocket-jump link out of envelope: dz={dz} horiz={horiz}"
+            );
+            assert!(dz > JUMP_APEX, "rocket-jump link a single jump could make: dz={dz}");
+            assert!(tr.self_damage > 0.0, "rocket-jump link with no self-blast");
+            // Re-fly the stored continuation arc onto the target corridor.
+            match simulate_arc(|p| bsp.is_solid(p), tr.pos_blast, tr.v0, rjp.gravity) {
+                ArcResult::Land { pos, .. } => {
+                    let d = (pos.xy() - b.xy()).length();
+                    assert!(d <= RJ_LAND_XY * 2.0, "stored RJ arc lands {d} from target (li {li})");
+                }
+                _ => panic!("stored rocket-jump arc no longer lands (li {li})"),
+            }
+        }
+        // Determinism.
+        let mut gr2 = NavGraph::build(&bsp);
+        gr2.add_rocket_jumps(&bsp, rjp, false);
+        assert_eq!(gr2.summary().rocket_jump, rjumps, "rocket-jump build not deterministic");
+        let reach_after = {
+            let step = (gr.cells.len() / 32).max(1);
+            (0..gr.cells.len() as u32)
+                .step_by(step)
+                .map(|s| directed_reach_len(&gr, s))
+                .max()
+                .unwrap_or(0)
+        };
+        assert!(reach_after >= reach_before, "rocket jumps reduced reachability");
+        eprintln!("rocket-jump splice: {rjumps} links; best directed reach {reach_before} -> {reach_after}");
     }
 
     /// The speed-jump ballistic + runway model, and its agreement with the real bhop controller.
@@ -1715,6 +1958,8 @@ mod tests {
             hooks: Vec::new(),
             speed_jump_links: Vec::new(),
             speed_jumps: Vec::new(),
+            rocket_jump_links: Vec::new(),
+            rocket_jumps: Vec::new(),
         }
     }
 

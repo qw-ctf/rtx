@@ -104,6 +104,7 @@ impl GameState {
                 hooks,
                 double_jump,
                 speed_jump,
+                None, // rocket jumps wired in phase 4
             ));
         });
         self.nav.pending = Some(rx);

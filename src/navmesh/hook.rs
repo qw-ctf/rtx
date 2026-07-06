@@ -62,15 +62,17 @@ pub(crate) fn arc_land(bsp: &Bsp, r: Vec3, v0: Vec3, gravity: f32) -> Option<(Ve
 }
 
 /// March a ray from `from` along unit `dir` until it strikes solid, returning the last empty point
-/// (the surface the hook would stick to), or `None` within `max`. Bisected for a tight surface.
-pub(super) fn march_to_solid(bsp: &Bsp, from: Vec3, dir: Vec3, max: f32) -> Option<Vec3> {
+/// (the surface the hook would stick to / the rocket would explode on), or `None` within `max`.
+/// Bisected for a tight surface. Takes the solidity oracle as a closure so the rocket-jump solver
+/// reuses it against a synthetic floor in tests, not just `&Bsp`.
+pub(super) fn march_to_solid(is_solid: impl Fn(Vec3) -> bool, from: Vec3, dir: Vec3, max: f32) -> Option<Vec3> {
     let mut d = HOOK_SAMPLE;
     while d <= max {
-        if bsp.is_solid(from + dir * d) {
+        if is_solid(from + dir * d) {
             let (mut lo, mut hi) = (d - HOOK_SAMPLE, d);
             for _ in 0..4 {
                 let mid = (lo + hi) * 0.5;
-                if bsp.is_solid(from + dir * mid) {
+                if is_solid(from + dir * mid) {
                     hi = mid;
                 } else {
                     lo = mid;
