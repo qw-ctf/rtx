@@ -160,6 +160,12 @@ pub struct BotState {
     /// committed bhop run-up + leap), and when it began. `None` = not on a speed jump.
     pub sj_leg: Option<u32>,
     pub sj_started: f32,
+    /// The plain jump leg (JumpGap/DoubleJump) currently being flown, and when the commitment began.
+    /// Latched at takeoff, it freezes the route and locks out combat until landing — so an enemy
+    /// appearing mid-arc can't flip the goal, replace the route, and yank the bot off the jump (the
+    /// `sj_leg`/rocket-jump commitment, which plain jumps previously lacked). `None` = not committed.
+    pub air_leg: Option<u32>,
+    pub air_started: f32,
     /// Rocket-jump traversal machine (see [`crate::bot::rj`]): stance → jump → fire → ride the blast
     /// arc onto a high ledge. `rj_link` is the leg being flown; `rj_started` the per-phase timeout
     /// base; `rj_jump_time` the moment the jump was pressed (the fire-delay clock); `rj_fails` the

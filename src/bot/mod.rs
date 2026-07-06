@@ -97,6 +97,13 @@ const LOOK_LOS_GRACE: f32 = 2.0;
 /// detours away — riding an elevator, walking to a teleporter — isn't mistaken for being stuck.
 const GOAL_GIVEUP_TIME: f32 = 10.0;
 const GOAL_AVOID_TIME: f32 = 12.0;
+/// Airborne jump commitment (`air_leg`): once committed, still on the ground after this long means we
+/// either landed or never got airborne — release and let normal navigation resume. Covers the one or
+/// two ground frames at takeoff without oscillating.
+const AIR_COMMIT_GRACE: f32 = 0.2;
+/// And if we're *still airborne* after this long, no real jump arc lasts that long — we fell into the
+/// void or wedged. Abandon the leg (penalize + re-path), the speed-jump watchdog's shape.
+const AIR_COMMIT_MAX: f32 = 2.5;
 /// Gate errand give-up: if a bot goes this long without getting any closer to a gate's button, the
 /// button is out of reach (or unusable) — abandon and avoid the gate for `GATE_AVOID_TIME`. Keyed
 /// on lack of progress, not elapsed time, so a button that's just far away is still pursued.
@@ -740,10 +747,14 @@ fn run_bot(game: &mut GameState, e: EntId) {
         b.pulse
     };
 
-    // A dead bot holds nothing — drop any handoff reservation so it doesn't resume after respawn.
-    if !alive && game.entities[e].bot.hold_item != 0 {
+    // A dead bot holds nothing and isn't mid-jump — drop the handoff reservation and any airborne
+    // commitment so neither resumes after respawn.
+    if !alive {
         let b = &mut game.entities[e].bot;
-        (b.hold_item, b.hold_for, b.hold_until) = (0, 0, 0.0);
+        if b.hold_item != 0 {
+            (b.hold_item, b.hold_for, b.hold_until) = (0, 0, 0.0);
+        }
+        b.air_leg = None;
     }
 
     // Connected but never spawned (health 0, not dead): the engine defers `PutClientInServer` — the
@@ -832,6 +843,11 @@ fn run_bot(game: &mut GameState, e: EntId) {
 
     let bot = &mut game.entities[e].bot;
 
+    // Airborne jump commitment (latched last frame at takeoff): while flying a plain jump leg, freeze
+    // the route and lock out combat so an enemy appearing mid-arc can't flip the goal and yank us off
+    // the jump. Read here (before the repath gate and leg-advance) like `on_sj`/`on_rj`.
+    let on_air = bot.air_leg.is_some();
+
     // A teleport (or any large instant displacement) invalidates the planned route — drop it
     // and re-path from where we landed. ~200u in one frame is far beyond running/falling. Skipped
     // mid-hook: the reel and the parabola move fast on purpose and must not clear the hook route.
@@ -877,9 +893,10 @@ fn run_bot(game: &mut GameState, e: EntId) {
         None => goal_cell,
     };
 
-    // Re-path when the route is empty, the goal changed, or the timer elapsed. Frozen mid-hook so
-    // the traversal keeps the route that put it on the hook leg.
-    if !hooking && !on_sj && !on_rj && (bot.route.is_empty() || bot.goal_cell != goal || now >= bot.repath_time) {
+    // Re-path when the route is empty, the goal changed, or the timer elapsed. Frozen mid-hook, on a
+    // speed/rocket jump, or committed to a plain jump arc, so the traversal keeps the route that put
+    // it on that leg (a goal flip mid-air must not replace the route and turn the bot around).
+    if !hooking && !on_sj && !on_rj && !on_air && (bot.route.is_empty() || bot.goal_cell != goal || now >= bot.repath_time) {
         let mut route = graph.find_path(bot_cell, goal, &costs).unwrap_or_default();
         // Goal unreachable from here (behind a shut door with no way around from this spot, or a
         // disconnected pocket)? Don't home straight into a wall — head to the reachable cell
@@ -900,7 +917,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
         bot.progress_since = now;
     }
     // If we've fallen off the planned route (missed a jump, got shoved), re-localize next.
-    if !hooking && !on_sj && !on_rj && bot.route_pos >= bot.route.len() && bot_cell != goal && now >= bot.repath_time {
+    if !hooking && !on_sj && !on_rj && !on_air && bot.route_pos >= bot.route.len() && bot_cell != goal && now >= bot.repath_time {
         bot.repath_time = now; // force a fresh path next frame
     }
 
@@ -908,7 +925,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // are priced high), so if the chosen route still crosses one, there's no other way in — divert
     // to that gate's button. Skip a gate we recently gave up on (its button was unreachable) so we
     // don't immediately re-camp on it.
-    if !hooking && !on_sj && !on_rj && bot.gate.is_none() {
+    if !hooking && !on_sj && !on_rj && !on_air && bot.gate.is_none() {
         let avoid = if now < bot.avoid_gate_until { bot.avoid_gate } else { -1 };
         let block =
             route_blocking_gate(graph, &bot.route, bot.route_pos, &gate_closed).filter(|&gi| gi as i32 != avoid);
@@ -941,7 +958,11 @@ fn run_bot(game: &mut GameState, e: EntId) {
     } else {
         ARRIVE_RADIUS
     };
-    while bot.route_pos < bot.route.len() {
+    // While committed to a plain jump arc and still airborne, don't advance the leg: keep `kind` and
+    // the waypoint pinned to the jump so steering stays on the landing point and the air-jump
+    // undershoot recovery keeps firing (the leg advances naturally once we land). Like Hook/RocketJump,
+    // whose drivers advance on landing, not on passing the target XY.
+    while (on_ground || !on_air) && bot.route_pos < bot.route.len() {
         let leg = bot.route[bot.route_pos];
         let target = graph.cell_origin(graph.link_target(leg));
         let arrived = match graph.link_kind(leg) {
@@ -1015,7 +1036,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // parabola all look "stuck" to it, and a force-jump/repath there would wreck the traversal — the
     // hook driver's own per-phase timeouts are its stuck detection.
     let mut force_jump = false;
-    if hook_active || rj_active || (origin - bot.stuck_origin).length() > STUCK_MOVE {
+    if hook_active || rj_active || on_air || (origin - bot.stuck_origin).length() > STUCK_MOVE {
         bot.stuck_origin = origin;
         bot.stuck_since = now;
     } else if now - bot.stuck_since > STUCK_TIME {
@@ -1034,7 +1055,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // it and re-path. Suspended while hooking / on a committed speed-jump / riding a plat (all of which
     // legitimately hold or reverse XY progress for a while).
     let plat_leg = matches!(kind, Some(LinkKind::Plat));
-    if !hook_active && !rj_active && !on_sj && !plat_leg {
+    if !hook_active && !rj_active && !on_sj && !on_air && !plat_leg {
         if progress_stalled(bot.progress_best, bot.progress_since, goal_dist, now) {
             penalize_leg(bot, cur_leg, kind, now);
             bot.route.clear();
@@ -1096,6 +1117,27 @@ fn run_bot(game: &mut GameState, e: EntId) {
         }
     } else if bot.sj_leg.is_some() {
         bot.sj_leg = None;
+    }
+    // Airborne commitment for a plain jump leg (JumpGap/DoubleJump): latch it (like `sj_leg`) so the
+    // route stays frozen and combat locked until we land. Latched whenever we're on such a leg (the
+    // grace in the release decision absorbs the one or two ground frames at takeoff); released on
+    // landing, on advancing off the leg, or by the watchdog if we never come down.
+    let on_jump_leg = matches!(kind, Some(LinkKind::JumpGap | LinkKind::DoubleJump));
+    if on_jump_leg && bot.air_leg != cur_leg {
+        bot.air_leg = cur_leg;
+        bot.air_started = now;
+    }
+    if let Some(committed) = bot.air_leg {
+        match air_commit_decision(on_ground, on_jump_leg, now - bot.air_started) {
+            AirRelease::Keep => {}
+            AirRelease::Land => bot.air_leg = None,
+            AirRelease::Timeout => {
+                penalize_leg(bot, Some(committed), kind, now);
+                bot.air_leg = None;
+                bot.route.clear();
+                bot.repath_time = now;
+            }
+        }
     }
     // "Don't leap to your death": if we somehow reach the takeoff edge too slow to clear the gap,
     // hold the jump (keep accelerating) rather than launching short into it.
@@ -1390,10 +1432,17 @@ fn run_bot(game: &mut GameState, e: EntId) {
 
     // Combat overlay: with an enemy in sight, the combat layer picks the look (live aim with a
     // drifting error) and its own movement; having *just lost* sight it holds the angle where the
-    // enemy vanished while navigation keeps driving; otherwise navigation's look/move stand. Hooks
-    // in flight/reel/ballistic lock out combat — an impulse or a dropped +attack there would break
-    // the reel/release (the grapple must stay selected and fire held until the release point).
-    if let Some(en) = enemy.filter(|_| !hook_lock && !rj_lock) {
+    // enemy vanished while navigation keeps driving; otherwise navigation's look/move stand.
+    // Traversal-critical legs lock out combat because `engage` owns movement and clears +jump; doing
+    // that during a gap/double/speed jump cancels the route even though the planner chose it.
+    let traversal_lock = hook_lock
+        || rj_lock
+        || on_air
+        || matches!(
+            kind,
+            Some(LinkKind::JumpGap | LinkKind::DoubleJump | LinkKind::SpeedJump)
+        );
+    if let Some(en) = enemy.filter(|_| !traversal_lock) {
         combat::engage(game, e, en, origin, now, &mut cmd);
     }
 
@@ -1403,9 +1452,9 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // lob→shoot combo; (3) a one-shot rocket **hazard shove** when the bot is already positioned for
     // it (cheaper than a lob); (4) otherwise start a grenade combo (hazard shove via a lobbed arc, or
     // a plain airburst). The hazard shove is the generic strategy — the knockback shoves regardless
-    // of which splash weapon delivers the blast. Skipped while bunnyhopping (no enemy, view is busy
-    // air-strafing).
-    if !hook_engaged && !rj_engaged && !bhop_active {
+    // of which splash weapon delivers the blast. Skipped while bunnyhopping or locked into a jump
+    // traversal, where movement/buttons are already spoken for.
+    if !hook_engaged && !rj_engaged && !bhop_active && !traversal_lock {
         let handled = combat::grenade_tactics(game, e, enemy, origin, &mut cmd);
         if handled {
             game.entities[e].bot.grenade_phase = GrenadePhase::Idle;
@@ -1461,6 +1510,29 @@ fn progress_stalled(best: f32, since: f32, remaining: f32, now: f32) -> bool {
 /// and `Teleport` legs are exempt: waiting on a lift or standing in a teleport trigger reads as
 /// "stuck" to the watchdogs but is not a routing mistake. Bumps an existing live entry's strike
 /// count (harder divert on repeat) or claims the expired/oldest slot of the fixed ring.
+/// The fate of an airborne jump commitment this frame (see [`AIR_COMMIT_GRACE`]/[`AIR_COMMIT_MAX`]).
+#[derive(Debug, PartialEq)]
+enum AirRelease {
+    /// Stay committed — freeze the route and lock out combat.
+    Keep,
+    /// Landed (or advanced off the jump leg): release; normal navigation/stuck handling resumes.
+    Land,
+    /// Still airborne well past any real arc: abandon the leg (penalize + re-path).
+    Timeout,
+}
+
+/// Pure core of the airborne-commitment lifecycle. `on_jump_leg` is whether the current leg is still a
+/// JumpGap/DoubleJump; `elapsed` is time since the commitment latched.
+fn air_commit_decision(on_ground: bool, on_jump_leg: bool, elapsed: f32) -> AirRelease {
+    if !on_jump_leg || (on_ground && elapsed > AIR_COMMIT_GRACE) {
+        AirRelease::Land
+    } else if elapsed > AIR_COMMIT_MAX {
+        AirRelease::Timeout
+    } else {
+        AirRelease::Keep
+    }
+}
+
 fn penalize_leg(bot: &mut BotState, link: Option<u32>, kind: Option<LinkKind>, now: f32) {
     let Some(link) = link else { return };
     if matches!(kind, Some(LinkKind::Plat | LinkKind::Teleport)) {
@@ -1721,6 +1793,20 @@ mod tests {
         if climb_in == 0 {
             eprintln!("  KNOWN GAP: no inbound climb link onto the quad platform — bots cannot route to the quad");
         }
+    }
+
+    #[test]
+    fn air_commit_lifecycle() {
+        // Airborne on the jump leg, within the arc window → stay committed.
+        assert_eq!(air_commit_decision(false, true, 0.5), AirRelease::Keep);
+        // On the takeoff frame (grounded, tiny elapsed) → still committed (grace absorbs it).
+        assert_eq!(air_commit_decision(true, true, 0.1), AirRelease::Keep);
+        // Landed (grounded past the grace) → release.
+        assert_eq!(air_commit_decision(true, true, 0.3), AirRelease::Land);
+        // Advanced off the jump leg (kind no longer a jump) → release regardless of ground state.
+        assert_eq!(air_commit_decision(false, false, 0.5), AirRelease::Land);
+        // Still airborne long past any real arc → watchdog timeout.
+        assert_eq!(air_commit_decision(false, true, 3.0), AirRelease::Timeout);
     }
 
     #[test]
