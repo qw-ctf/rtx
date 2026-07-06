@@ -38,6 +38,21 @@ const LINE_OF_FIRE_SLACK: f32 = 48.0;
 /// Retreat when hurt below this.
 const LOW_HEALTH: f32 = 40.0;
 
+/// Opponent-model "press the advantage" thresholds. When the current enemy is believed to be on a
+/// finishable stack (below [`FINISH_STACK`] — under one rocket even through green armor), the belief
+/// is fresh (younger than [`FINISH_FRESH`]; a stale estimate has drifted and shouldn't buy risk), and
+/// the bot itself isn't critical (health ≥ [`PRESS_FLOOR`]), the bot lowers its own retreat threshold
+/// and closes in to finish the kill instead of holding range — the deathmatch-1 "he's low, go get
+/// him" read the user asked for.
+const FINISH_STACK: f32 = 35.0;
+const FINISH_FRESH: f32 = 4.0;
+const PRESS_FLOOR: f32 = 20.0;
+
+/// Whether to press a finishable kill rather than retreat — see the threshold constants above. Pure.
+fn press_advantage(own_health: f32, enemy_stack: f32, est_age: f32) -> bool {
+    enemy_stack < FINISH_STACK && est_age < FINISH_FRESH && own_health >= PRESS_FLOOR
+}
+
 /// A weapon choice for the current range: the impulse that selects it, the [`Weapon`] it yields
 /// (to avoid re-selecting what we already hold), and its projectile speed (`0` = hitscan, so no
 /// target leading).
@@ -330,10 +345,19 @@ pub(crate) fn engage(
     } else {
         -1.0
     };
-    let want_forward = if health < LOW_HEALTH || dist < PREFERRED_RANGE - 100.0 {
-        -MOVE_SPEED // back off
-    } else if dist > PREFERRED_RANGE + 100.0 {
-        MOVE_SPEED // close in
+    // Opponent modeling: if the enemy is believed finishable (and the belief is fresh, and we're not
+    // ourselves critical), press — retreat only when badly hurt and close in to finish rather than
+    // hold range. `press` is false when modeling is off, so the range logic below is unchanged then.
+    let press = game
+        .opponent_est(e, enemy, now)
+        .is_some_and(|est| {
+            press_advantage(health, crate::bot::model::est_strength(&est, now), now - est.last_update)
+        });
+    let retreat_health = if press { LOW_HEALTH / 2.0 } else { LOW_HEALTH };
+    let want_forward = if health < retreat_health || dist < PREFERRED_RANGE - 100.0 {
+        -MOVE_SPEED // back off (too hurt, or inside self-splash range)
+    } else if dist > PREFERRED_RANGE + 100.0 || press {
+        MOVE_SPEED // close in — normally only when far, but also to finish a pressed kill
     } else {
         0.0 // hold and strafe
     };
@@ -612,6 +636,18 @@ mod tests {
 
         // Outrunnable target: no positive intercept.
         assert!(intercept_time(r, Vec3::new(1100.0, 0.0, 0.0), 1000.0).is_none());
+    }
+
+    #[test]
+    fn press_advantage_bounds() {
+        // Fresh belief of a finishable stack, healthy bot → press.
+        assert!(press_advantage(100.0, 20.0, 1.0));
+        // Stale belief → don't buy risk on a drifted estimate.
+        assert!(!press_advantage(100.0, 20.0, 5.0));
+        // Enemy not actually low → no press.
+        assert!(!press_advantage(100.0, 60.0, 1.0));
+        // Bot itself critical → don't press even a finishable kill.
+        assert!(!press_advantage(15.0, 20.0, 1.0));
     }
 
     #[test]

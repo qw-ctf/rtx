@@ -31,7 +31,29 @@ impl GameMode for Ffa {
 }
 
 /// The nearest living *other* player to `bot` — everyone is an enemy in FFA (humans and bots alike).
+/// With opponent modeling on, the pick is weighted toward weaker (and, in a no-weapons-stay game,
+/// better-armed) targets via the shared FFA-collective pool: a finishable frag beats a marginally
+/// closer fresh one. Falls back to plain nearest when modeling is off.
 fn nearest_player(g: &GameState, bot: EntId) -> Option<EntId> {
     let origin = g.entities[bot].v.origin;
-    nearest_player_where(g, origin, bot, |_, _| true)
+    if !g.host().cvar_bool(c"rtx_bot_model") {
+        return nearest_player_where(g, origin, bot, |_, _| true);
+    }
+    let now = g.time();
+    let weapons_stay = matches!(g.level.deathmatch, 2 | 3 | 5);
+    crate::mode::players(g)
+        .into_iter()
+        .filter(|&en| {
+            en != bot && {
+                let e = &g.entities[en];
+                e.v.health > 0.0 && e.v.deadflag == 0.0
+            }
+        })
+        .map(|en| {
+            let d = (g.entities[en].v.origin - origin).length_squared()
+                * g.target_dist_bias(bot, en, now, weapons_stay);
+            (en, d)
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(en, _)| en)
 }

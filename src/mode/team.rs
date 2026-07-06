@@ -427,6 +427,11 @@ pub(crate) fn nearest_enemy(g: &GameState, bot: EntId) -> Option<EntId> {
     if !g.host().cvar_bool(c"rtx_bot_teamwork") {
         return nearest_enemy_to(g, my_team, origin);
     }
+    // Opponent modeling nudges the choice toward weaker / better-armed enemies (a finishable frag,
+    // and in deathmatch 1 a kill that resets an armed player's kit). The bias is a distance²
+    // multiplier that returns 1.0 when modeling is off, so this stays plain nearest then.
+    let now = g.time();
+    let weapons_stay = matches!(g.level.deathmatch, 2 | 3 | 5);
     let candidates: Vec<(EntId, f32, u32)> = crate::mode::players(g)
         .into_iter()
         .filter(|&en| {
@@ -434,7 +439,8 @@ pub(crate) fn nearest_enemy(g: &GameState, bot: EntId) -> Option<EntId> {
             e.v.health > 0.0 && e.v.deadflag == 0.0 && e.mode_p.team != my_team
         })
         .map(|en| {
-            let d = (g.entities[en].v.origin - origin).length_squared();
+            let d = (g.entities[en].v.origin - origin).length_squared()
+                * g.target_dist_bias(bot, en, now, weapons_stay);
             (en, d, teammate_attackers(g, bot, my_team, en))
         })
         .collect();

@@ -42,6 +42,16 @@ const GOAL_HYSTERESIS: f32 = 1.3;
 /// stays contested), large enough to discourage two bots converging on one health/armor.
 const CLAIM_DISCOUNT: f32 = 0.3;
 
+/// Desire *floor* for a big weapon (RL/LG) the enemy side is believed to lack, in a game where
+/// weapons don't stay — item denial, the deathmatch-1 team play (weapons hide and respawn in 30 s,
+/// so taking one keeps it out of the enemy's hands). 30 is chosen to sit:
+///  - above every ammo/minor top-off desire (≈2.5–20), so an otherwise-idle bot spends the time
+///    denying a weapon spawn instead of grabbing shells;
+///  - below [`COMBAT_GREED_MIN_DESIRE`] (40), so a bot never breaks off a firefight to go camp one;
+///  - far below a genuinely needed weapon (a missing RL scores ≈100−firepower) or a powerup (200+),
+///    so real needs always outrank denial.
+const DENIAL_DESIRE: f32 = 30.0;
+
 /// The weapons a bot can want, and the ammo kinds. Real enums (not raw [`Items`] bits) so the
 /// desire match stays exhaustive.
 #[derive(Clone, Copy)]
@@ -124,6 +134,19 @@ pub(crate) fn is_goal_classname(classname: &str) -> bool {
 /// capped by health-plus-armor. The currency ktx weights health/armor pickups in.
 pub(crate) fn total_strength(health: f32, armor_value: f32, armor_type: f32) -> f32 {
     (health / (1.0 - armor_type)).min(health + armor_value).max(0.0)
+}
+
+/// The denial desire floor for a weapon pickup: [`DENIAL_DESIRE`] for a rocket launcher or lightning
+/// gun the enemy side provably lacks in a no-weapons-stay game, else `0` (nothing to deny). Only the
+/// two big weapons are worth denying — the lesser guns don't swing a fight enough to camp a spawn.
+fn denial_floor(kind: WeaponKind, weapons_stay: bool, enemy_side_has_bit: bool) -> f32 {
+    if weapons_stay || enemy_side_has_bit {
+        return 0.0;
+    }
+    match kind {
+        WeaponKind::Rl | WeaponKind::Lg => DENIAL_DESIRE,
+        _ => 0.0,
+    }
 }
 
 /// The `Items` bit a weapon pickup grants (to check whether the bot already owns it).
@@ -445,6 +468,23 @@ impl GameState {
         })
     }
 
+    /// Whether any living enemy player is believed — in this bot's shared opponent-model pool — to
+    /// hold weapon `bit`. The signal [`denial_floor`] reads: an unheld big weapon on the enemy side
+    /// is worth denying. `false` when opponent modeling is off (`opponent_est` yields nothing), so the
+    /// caller must gate denial on the cvar itself rather than treat "no belief" as "enemy lacks it".
+    fn enemy_side_has_weapon(&self, bot_e: EntId, my_team: u8, bit: Items, now: f32) -> bool {
+        let maxclients = self.host().cvar(c"maxclients") as u32;
+        (1..=maxclients).map(EntId).any(|t| {
+            let e = &self.entities[t];
+            e.classname() == Some("player")
+                && e.v.health > 0.0
+                && e.mode_p.team != my_team
+                && self
+                    .opponent_est(bot_e, t, now)
+                    .is_some_and(|est| est.items.has(bit))
+        })
+    }
+
     fn best_item_goal(&self, bot_e: EntId) -> Option<(EntId, CellId, f32)> {
         let graph = self.nav.graph.as_ref()?;
         let bot_cell = graph.nearest(self.entities[bot_e].v.origin)?;
@@ -485,6 +525,10 @@ impl GameState {
         // desire still beats the discount, so the quad stays contested. Off in FFA (no team).
         let my_team = self.entities[bot_e].mode_p.team;
         let teamwork = my_team != 0 && self.host().cvar_bool(c"rtx_bot_teamwork");
+        // Item denial (opponent modeling): raise the desire to hold a big weapon the enemy side is
+        // believed to lack, so a team secures/guards the RL and LG spawns. Team play only, and only
+        // when modeling is on (else "no belief" would masquerade as "enemy lacks it").
+        let deny = teamwork && self.host().cvar_bool(c"rtx_bot_model");
         let claim_mult = |idx: u32| {
             if teamwork && self.item_claimed_by_teammate(bot_e, my_team, idx) {
                 CLAIM_DISCOUNT
@@ -517,7 +561,16 @@ impl GameState {
             let Some(cat) = self.entities[item].classname().and_then(category) else {
                 continue;
             };
-            let desire = self.item_desire(&s, item, cat);
+            let mut desire = self.item_desire(&s, item, cat);
+            // Denial floor: an owned RL/LG normally scores ~0 desire, but if the enemy side lacks it
+            // and it won't stay on the map, holding it still has value. Applied before the >0 gate so
+            // an already-owned weapon isn't skipped.
+            if deny {
+                if let Category::Weapon(w) = cat {
+                    let enemy_has = self.enemy_side_has_weapon(bot_e, my_team, weapon_bit(w), now);
+                    desire = desire.max(denial_floor(w, s.weapons_stay, enemy_has));
+                }
+            }
             if desire <= 0.0 {
                 continue;
             }
@@ -553,5 +606,27 @@ impl GameState {
         }
 
         best.map(|(item, cell, desire, _)| (item, cell, desire))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn denial_floor_gates() {
+        // A big weapon the enemy lacks, no weapons-stay → the denial floor.
+        assert_eq!(denial_floor(WeaponKind::Rl, false, false), DENIAL_DESIRE);
+        assert_eq!(denial_floor(WeaponKind::Lg, false, false), DENIAL_DESIRE);
+        // Lesser weapons aren't worth denying.
+        assert_eq!(denial_floor(WeaponKind::Ssg, false, false), 0.0);
+        assert_eq!(denial_floor(WeaponKind::Gl, false, false), 0.0);
+        // Enemy already has it → nothing to deny.
+        assert_eq!(denial_floor(WeaponKind::Rl, false, true), 0.0);
+        // Weapons-stay (dm 2/3/5): the item lingers, so denial is meaningless.
+        assert_eq!(denial_floor(WeaponKind::Rl, true, false), 0.0);
+        // The floor sits below the combat-detour bar (so a bot never breaks off a fight to camp) and
+        // above minor top-offs.
+        assert!(denial_floor(WeaponKind::Rl, false, false) < COMBAT_GREED_MIN_DESIRE);
     }
 }

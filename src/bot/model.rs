@@ -52,18 +52,13 @@ const MAX_SLOTS: usize = 33;
 /// so this is the same earshot perception already treats as audible.
 const WITNESS_RADIUS: f32 = 1000.0;
 
-// (The drift constants and the read-side estimate API below are consumed by the Phase 2/3 consumers
-// — target selection, combat risk, and the powerup handoff — so they read as dead in the dormant
-// store-only build.)
 /// A below-prior health estimate only starts drifting back up after this many unobserved seconds —
 /// the same object-permanence window as [`perception::MEMORY`](crate::bot::perception). Inside it the
 /// last read still stands.
-#[allow(dead_code)]
 const DRIFT_GRACE: f32 = 5.0;
 /// Then the estimate rises toward the 100 prior at this rate: an unseen player is presumed to be
 /// picking health back up. 2 hp/s means a 30 hp survivor reads as recovered ~40 s later — about two
 /// health-respawn cycles plus travel, the human "he's probably healed by now".
-#[allow(dead_code)]
 const DRIFT_RATE: f32 = 2.0;
 
 /// How long a witnessed quad/pentagram is believed to last (matches the powerup grant in `items.rs`).
@@ -141,7 +136,6 @@ impl OpponentModel {
     }
 
     /// Read a drifted-nothing snapshot of what `pool` believes about `target` (defaults if OOB).
-    #[allow(dead_code)] // consumed by the Phase 2/3 read paths
     pub(crate) fn entry(&self, pool: usize, target: EntId) -> OpponentEstimate {
         let slot = target.0 as usize;
         if pool >= MAX_POOLS || slot == 0 || slot >= MAX_SLOTS {
@@ -244,7 +238,6 @@ pub(crate) fn baseline_for_mode(name: &str) -> OpponentEstimate {
 /// [`DRIFT_GRACE`] seconds without a fresh observation — an unseen player is presumed to be topping
 /// up. Estimates at or above the prior (including witnessed megahealth overheal) are left alone;
 /// megahealth rots on its own and modeling that would be false precision.
-#[allow(dead_code)] // consumed by the Phase 2/3 read paths
 pub(crate) fn drifted_health(health: f32, last_update: f32, now: f32) -> f32 {
     if health >= 100.0 {
         return health;
@@ -273,10 +266,20 @@ pub(crate) fn apply_damage(mut est: OpponentEstimate, damage: f32) -> OpponentEs
 
 /// The estimated effective hit points (`TotalStrength`): drifted health run through the estimated
 /// armor. The single number the strength consumers rank opponents by.
-#[allow(dead_code)] // consumed by the Phase 2/3 read paths
 pub(crate) fn est_strength(est: &OpponentEstimate, now: f32) -> f32 {
     let health = drifted_health(est.health, est.last_update, now);
     crate::bot::goals::total_strength(health, est.armor_value, est.armor_type)
+}
+
+/// Distance² multiplier for weighing a candidate target: a weak stack scores as if nearer, a strong
+/// one as if farther, and a target believed to hold a big weapon in a no-weapons-stay game is nudged
+/// preferred (killing them resets their kit — a real swing in deathmatch 1). Clamped so the bias
+/// only reorders near-ties; it never lets a distant target leapfrog a much closer one.
+///   strength: 30 hp naked → 0.4×; a full 100/200-red stack → 2.5×.
+pub(crate) fn target_bias(est_strength: f32, armed_big: bool, weapons_stay: bool) -> f32 {
+    let strength_mult = (est_strength / 100.0).clamp(0.4, 2.5);
+    let armed_mult = if armed_big && !weapons_stay { 0.8 } else { 1.0 };
+    strength_mult * armed_mult
 }
 
 /// The `Items` bit a fired active weapon proves ownership of, or `None` for Axe / Grapple / no weapon
@@ -342,7 +345,6 @@ impl GameState {
     /// What `observer`'s pool believes about `target` right now (drift applied to health). `None` when
     /// modeling is off or the observer has no pool (a team-0 human). The returned copy keeps
     /// `last_update` intact so a consumer can age the belief; only `health` is drifted.
-    #[allow(dead_code)] // consumed by the Phase 2/3 read paths
     pub(crate) fn opponent_est(
         &self,
         observer: EntId,
@@ -416,6 +418,26 @@ impl GameState {
         let mask = self.witness_pools(org);
         for pool in iter_pools(mask) {
             self.opponents.note_pickup(pool, picker, kind, now);
+        }
+    }
+
+    /// The distance² weighting for choosing `target` from `observer`'s view under opponent modeling:
+    /// [`target_bias`] fed by the shared estimate, or `1.0` when there's no belief (or modeling is
+    /// off), so a caller can multiply its raw dist² unconditionally and get plain nearest when off.
+    pub(crate) fn target_dist_bias(
+        &self,
+        observer: EntId,
+        target: EntId,
+        now: f32,
+        weapons_stay: bool,
+    ) -> f32 {
+        match self.opponent_est(observer, target, now) {
+            Some(est) => {
+                let armed_big =
+                    est.items.has(Items::ROCKET_LAUNCHER) || est.items.has(Items::LIGHTNING);
+                target_bias(est_strength(&est, now), armed_big, weapons_stay)
+            }
+            None => 1.0,
         }
     }
 
@@ -564,5 +586,21 @@ mod tests {
     fn iter_pools_walks_set_bits() {
         let mask = (1 << 0) | (1 << 3) | (1 << 8);
         assert_eq!(iter_pools(mask).collect::<Vec<_>>(), vec![0, 3, 8]);
+    }
+
+    #[test]
+    fn target_bias_orders_weak_first() {
+        // A weak stack reads as nearer, a strong one as farther: a weak enemy at distance 200 should
+        // outrank (lower biased dist²) a full-stack enemy at 150.
+        let weak = 200.0_f32.powi(2) * target_bias(30.0, false, false);
+        let strong = 150.0_f32.powi(2) * target_bias(200.0, false, false);
+        assert!(weak < strong);
+        // Clamps: 30 hp → 0.4×, a 250 overheal stack → 2.5× (no further).
+        assert_eq!(target_bias(30.0, false, false), 0.4);
+        assert_eq!(target_bias(250.0, false, false), 2.5);
+        // A big-armed target is nudged preferred (×0.8) only when weapons don't stay (killing them
+        // resets the kit); under weapons-stay there's nothing to deny, so no nudge.
+        assert_eq!(target_bias(100.0, true, false), 0.8);
+        assert_eq!(target_bias(100.0, true, true), 1.0);
     }
 }
