@@ -742,9 +742,10 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // Connected but never spawned (health 0, not dead): the engine defers `PutClientInServer` — the
     // full spawn that sets health/loadout — to the bot's spawn on a *bot frame*, which an empty
     // (bots-only) server never runs. So the bot sits at 0 health forever, and the respawn pulse below
-    // can't help it (`death_think` only runs for `deadflag >= Dead`). Spawn it ourselves; next frame
-    // it's alive and plays normally.
+    // can't help it (`death_think` only runs for `deadflag >= Dead`). Seed fresh spawn parms before
+    // spawning; FFA/team keep those decoded parms, while fixed-kit modes overwrite them.
     if !alive && game.entities[e].v.deadflag == 0.0 {
+        game.set_new_parms();
         game.put_client_in_server(e);
         return;
     }
