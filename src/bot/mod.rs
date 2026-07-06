@@ -525,8 +525,21 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         // perceived (aware of / in memory), so a stuck/looping bot's divert can be watched live.
         let pen = b.failed_links.iter().filter(|&&(_, until, _)| until > now).count();
         let aware = (b.known_enemy != 0 && now < b.known_until) as i32;
+        let hold = b.hold_item;
+        // Opponent-model telemetry: this bot's current hypothesis of the enemy it's aware of — the
+        // estimated health/armor stack and believed arsenal bits — so the shared read can be watched
+        // converge and reset live. Blank (`est=-`) when there's no belief / modeling is off.
+        let est = if b.known_enemy != 0 && now < b.known_until {
+            game.opponent_est(e, EntId(b.known_enemy), now)
+        } else {
+            None
+        };
+        let est = est.map_or_else(
+            || "-".to_string(),
+            |o| format!("H{:.0}/A{:.0} ars={:03x}", o.health, o.armor_value, o.items as u32),
+        );
         let msg = cstring(&format!(
-            "rtx bot{client}: want={goal} dist={dist:.0} on_item={overlap} ownLG={own_lg} cells={:.0} pen={pen} aware={aware}\n",
+            "rtx bot{client}: want={goal} dist={dist:.0} on_item={overlap} ownLG={own_lg} cells={:.0} pen={pen} aware={aware} est={est} hold={hold}\n",
             game.entities[e].v.ammo_cells,
         ));
         host.conprint(&msg); // conprint always shows; dprint needs `developer 1`
