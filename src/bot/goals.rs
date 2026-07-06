@@ -461,12 +461,20 @@ impl GameState {
             .filter(|&&(_, until, _)| until > now)
             .map(|&(li, _, strikes)| (li, super::link_penalty_secs(strikes)))
             .collect();
+        // The rocket-jump fitness gate too, so an item only reachable via a rocket jump scores as
+        // (near-)unreachable for a bot that can't currently make one — it stops choosing it.
+        let rj_extra = super::rj::rocket_jump_extra(
+            &self.entities[bot_e].v,
+            self.entities[bot_e].combat.super_damage_finished,
+            now,
+        );
         let costs = graph.costs_from(
             bot_cell,
             &LinkCosts {
                 gate_closed: &gate_closed,
                 penalties: &penalties,
                 jitter_seed: 0,
+                rocket_jump_extra: rj_extra,
             },
         );
         let s = self.bot_stats(bot_e);

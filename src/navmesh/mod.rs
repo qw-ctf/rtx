@@ -291,6 +291,13 @@ pub struct SpeedJumpTraversal {
 /// game engine prices a disabled-but-openable NavMesh link rather than deleting it outright.
 const CLOSED_GATE_PENALTY: f32 = 100_000.0;
 
+/// Extra travel-time charged to every [`LinkKind::RocketJump`] link when the querying bot is unfit
+/// to fly one (no rocket launcher, no rocket, too little health, or quad running — see
+/// [`crate::bot::rj::rocket_jump_extra`]). Same magnitude as [`CLOSED_GATE_PENALTY`]: the planner
+/// diverts around rocket jumps it can't make, yet — being finite — still takes one as a last resort
+/// down a sole corridor rather than treating the graph as severed.
+pub const RJ_UNFIT_PENALTY: f32 = 100_000.0;
+
 /// Peak fraction of a link's own cost added as deterministic per-caller jitter when
 /// [`LinkCosts::jitter_seed`] is set — enough to break ties between near-equal routes (so two bots
 /// vary their paths) without ever reordering genuinely-cheaper alternatives.
@@ -312,6 +319,12 @@ pub struct LinkCosts<'a> {
     /// Nonzero ⇒ add `hash(seed ^ link) → [0, JITTER_FRAC]·link.cost` per link, so bots with distinct
     /// seeds pick different near-equal corridors. Zero ⇒ no jitter (deterministic; tests, non-bots).
     pub jitter_seed: u32,
+    /// Nonzero ⇒ charge every [`LinkKind::RocketJump`] link this many extra seconds — the per-bot
+    /// capability gate. A bot currently unable to rocket-jump sets it to [`RJ_UNFIT_PENALTY`] so it
+    /// plans around them; `0` (the default) leaves rocket jumps at their solved cost. The only price
+    /// term that depends on *who* is asking (the others are world state), because unlike the grapple
+    /// — a server-wide cvar — a bot's rockets and health vary moment to moment.
+    pub rocket_jump_extra: f32,
 }
 
 /// A cheap integer hash (variant of the SplitMix/Murmur finalizer) for deterministic route jitter.
@@ -881,6 +894,9 @@ impl NavGraph {
         if costs.jitter_seed != 0 {
             let h = hash32(costs.jitter_seed ^ li.wrapping_mul(0x9e37_79b1));
             extra += (h as f32 / u32::MAX as f32) * JITTER_FRAC * self.links[li as usize].cost;
+        }
+        if costs.rocket_jump_extra > 0.0 && self.links[li as usize].kind == LinkKind::RocketJump {
+            extra += costs.rocket_jump_extra;
         }
         extra
     }
@@ -1986,6 +2002,25 @@ mod tests {
         assert_eq!(g.find_path(0, 3, &costs).unwrap(), vec![2, 3]);
         // Penalty expired (absent from the slice) → back to the cheap route.
         assert_eq!(g.find_path(0, 3, &LinkCosts::default()).unwrap(), vec![0, 1]);
+    }
+
+    /// The rocket-jump fitness gate surcharges *only* RocketJump links: a bot unfit to rocket-jump
+    /// diverts around a cheap-branch RJ leg, and a fit bot (no surcharge) still takes it.
+    #[test]
+    fn rocket_jump_fitness_gate_diverts() {
+        let mut g = diamond();
+        g.links[0].kind = LinkKind::RocketJump; // make the cheap branch's first leg (0→1) an RJ
+        // Fit bot: no surcharge → the cheap route via cell 1.
+        assert_eq!(g.find_path(0, 3, &LinkCosts::default()).unwrap(), vec![0, 1]);
+        // Unfit bot: every RJ link costs RJ_UNFIT_PENALTY → diverts onto the route via cell 2.
+        let costs = LinkCosts {
+            rocket_jump_extra: RJ_UNFIT_PENALTY,
+            ..Default::default()
+        };
+        assert_eq!(g.find_path(0, 3, &costs).unwrap(), vec![2, 3]);
+        // The surcharge hits only RJ links: a Walk-only diamond is unaffected by it.
+        let g2 = diamond();
+        assert_eq!(g2.find_path(0, 3, &costs).unwrap(), vec![0, 1]);
     }
 
     /// A finite penalty never disconnects the graph: if the only route runs through the penalized

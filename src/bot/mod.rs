@@ -21,6 +21,7 @@ pub(crate) mod goals;
 mod grenade;
 mod hook;
 pub(crate) mod perception;
+mod rj;
 pub(crate) mod state;
 
 use crate::bot::state::{BotState, GrenadePhase, HookPhase};
@@ -685,11 +686,18 @@ fn run_bot(game: &mut GameState, e: EntId) {
         .map(|&(li, _, strikes)| (li, link_penalty_secs(strikes)))
         .collect();
     // Gates + this bot's penalties + a per-bot jitter seed (so two bots vary otherwise-equal routes
-    // rather than treading an identical line — cheap route variety that also reads as more human).
+    // rather than treading an identical line — cheap route variety that also reads as more human) +
+    // the rocket-jump fitness gate (so a bot with no RL / rocket / health plans around RJ links).
+    let rj_extra = rj::rocket_jump_extra(
+        &game.entities[e].v,
+        game.entities[e].combat.super_damage_finished,
+        now,
+    );
     let costs = LinkCosts {
         gate_closed: &gate_closed,
         penalties: &penalties,
         jitter_seed: e.0,
+        rocket_jump_extra: rj_extra,
     };
 
     // Graph queries (borrows game.nav) and bot-state updates (borrows game.entities) are on
