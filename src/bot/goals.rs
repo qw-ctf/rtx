@@ -122,7 +122,7 @@ pub(crate) fn is_goal_classname(classname: &str) -> bool {
 
 /// `TotalStrength` — a fighter's *effective* hit points: health scaled by armor absorption,
 /// capped by health-plus-armor. The currency ktx weights health/armor pickups in.
-fn total_strength(health: f32, armor_value: f32, armor_type: f32) -> f32 {
+pub(crate) fn total_strength(health: f32, armor_value: f32, armor_type: f32) -> f32 {
     (health / (1.0 - armor_type)).min(health + armor_value).max(0.0)
 }
 

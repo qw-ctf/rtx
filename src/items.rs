@@ -10,6 +10,7 @@ use glam::Vec3;
 
 use crate::arsenal::{weapon_spec, weapon_spec_for_classname, AmmoKind, WeaponSpec};
 use crate::assets::{Model, Sound};
+use crate::bot::model::PickupKind;
 use crate::defs::*;
 use crate::entity::{EntId, Think, Touch};
 use crate::game::{self, GameState};
@@ -128,6 +129,14 @@ impl GameState {
         self.sprint_low(other, &format!("You receive {} health\n", healamount as i32));
         self.item_pickup_sound(e, other, Channel::Item);
 
+        // Opponent modeling: any side within earshot of the pickup learns this player topped up.
+        let kind = if healtype == 2.0 {
+            PickupKind::Mega
+        } else {
+            PickupKind::Health(healamount)
+        };
+        self.model_note_pickup(other, kind);
+
         let time = self.time();
         if healtype == 2.0 {
             // Megahealth: rot back down later, no normal respawn.
@@ -195,6 +204,7 @@ impl GameState {
             v.armorvalue = value;
             v.items = v.items.without(Items::ARMOR1 | Items::ARMOR2 | Items::ARMOR3).with(bit);
         }
+        self.model_note_pickup(other, PickupKind::Armor { value, atype: type_ });
         self.sprint_low(other, "You got armor\n");
         self.host
             .sound(other, Channel::Item, Sound::ITEMS_ARMOR1, 1.0, Attenuation::Norm);
@@ -237,6 +247,10 @@ impl GameState {
         self.bound_other_ammo(other);
         let old = self.entities[other].v.items;
         self.entities[other].v.items = old.with(new);
+
+        // Opponent modeling: the pickup is world-audible; a witnessing side learns this weapon is now
+        // held (recorded before the weapons-stay early return so stay-item grabs are witnessed too).
+        self.model_note_pickup(other, PickupKind::Weapon(spec.item));
 
         if self.weapon_code(new) <= w_switch {
             let in_water = self.entities[other].v.flags.has(Flags::INWATER);
@@ -353,6 +367,13 @@ impl GameState {
             }
             _ => {}
         }
+        // Opponent modeling: quad glows/hums and pentagram flashes — a witnessing side notes the
+        // powerup and its ~30 s window (envirosuit/ring carry no combat weight, so they're ignored).
+        match class.as_deref() {
+            Some("item_artifact_super_damage") => self.model_note_pickup(other, PickupKind::Quad),
+            Some("item_artifact_invulnerability") => self.model_note_pickup(other, PickupKind::Pent),
+            _ => {}
+        }
         let delay = if long { Some(60.0 * 5.0) } else { Some(60.0) };
         self.pickup_finish(e, other, delay);
     }
@@ -387,6 +408,11 @@ impl GameState {
         let old = self.entities[other].v.items;
         self.entities[other].v.items = old.with(new_bits);
         self.bound_other_ammo(other);
+
+        // Opponent modeling: a picked-up backpack's weapon is now held; witnessing sides learn it.
+        if new_bits != 0.0 {
+            self.model_note_pickup(other, PickupKind::Backpack(new_bits));
+        }
 
         let netname = self.netname_of(e);
         self.sprint_low(other, &format!("You get {netname}\n"));

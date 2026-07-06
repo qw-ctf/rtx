@@ -20,6 +20,7 @@ mod combat;
 pub(crate) mod goals;
 mod grenade;
 mod hook;
+pub(crate) mod model;
 pub(crate) mod perception;
 mod rj;
 pub(crate) mod state;

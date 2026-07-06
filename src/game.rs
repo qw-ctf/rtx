@@ -127,6 +127,13 @@ const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // dogpiling the nearest, don't race teammates to the same item, and stagger CTF roles/posts.
         // 1 = on; 0 = each bot decides independently (the old behavior). No effect in FFA.
         ("rtx_bot_teamwork", Bool(true)),
+        // Opponent modeling: bots keep a shared, observation-gated hypothesis of each opponent's
+        // health/armor stack and arsenal (per-team blackboards; the FFA bots share one), reset on
+        // death, updated only from events a bot could witness (pickups/gunfire in earshot, damage it
+        // dealt). Feeds item denial, target selection, and combat risk. The team-only consumers
+        // (weapon denial, powerup handoff) additionally require rtx_bot_teamwork. 0 = the old
+        // estimate-free behavior.
+        ("rtx_bot_model", Bool(true)),
     ]
 };
 
@@ -209,6 +216,9 @@ pub struct GameState {
     ext_fields: ext_field::ExtFields,
     /// Auto-generated navmesh for the current map (bot navigation). Rebuilt each map load.
     pub(crate) nav: navmesh::NavState,
+    /// Shared, observation-gated opponent hypotheses (per-side strength/arsenal estimates). Reset to
+    /// the mode's spawn kit each map load in `mode::on_worldspawn`. See [`crate::bot::model`].
+    pub(crate) opponents: bot::model::OpponentModel,
     /// Set by each engine **bot frame** (`GAME_START_FRAME` with `is_bot_frame`) and cleared by the
     /// next normal frame. The engine only issues bot frames once a real client is connected, so on an
     /// empty (bots-only) server this stays clear and the normal frame drives the bots itself. See
@@ -270,6 +280,7 @@ impl GameState {
             rng: 0x2545_f491, // nonzero default; reseeded in GAME_INIT
             ext_fields: ext_field::ExtFields::default(),
             nav: navmesh::NavState::default(),
+            opponents: bot::model::OpponentModel::default(),
             bot_frame_seen: false,
             normal_bot_drive_logged: false,
             dyn_assets: DynAssets::default(),

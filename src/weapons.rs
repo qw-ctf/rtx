@@ -764,6 +764,10 @@ impl GameState {
         self.host.make_vectors(v_angle);
         self.entities[e].combat.show_hostile = time + 1.0;
 
+        // Opponent modeling: a genuine shot (ammo checked) is world-audible, so any side with a bot in
+        // earshot learns which weapon the firer holds. No-op when modeling is off.
+        self.model_note_weapon_fire(e);
+
         match self.entities[e].v.weapon {
             w if w == Weapon::Axe => {
                 self.entities[e].combat.attack_finished = time + 0.5;

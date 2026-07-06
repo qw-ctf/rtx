@@ -327,6 +327,9 @@ impl GameState {
 /// active mode's own hook). Then the active mode's own [`GameMode::on_worldspawn`] runs.
 pub(crate) fn on_worldspawn(g: &mut GameState) {
     g.arena = ArenaState::default();
+    // Fresh opponent hypotheses, seeded with this mode's spawn kit (Arena/Midair hand out fixed
+    // arsenals; everything else starts at the stock respawn kit).
+    g.opponents = crate::bot::model::OpponentModel::new(crate::bot::model::baseline_for_mode(g.mode.name()));
     team::on_worldspawn(g);
     let mode = g.mode;
     mode.on_worldspawn(g);

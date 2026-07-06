@@ -231,6 +231,11 @@ impl GameState {
         mode.apply_loadout(self, player);
         self.w_set_current_ammo(player);
 
+        // Opponent modeling: a (re)spawn hands out a fresh loadout, so reset every side's hypothesis
+        // of this player to the mode's spawn-kit baseline. Covers connect and mode kit re-grants
+        // without relying on the death path. No-op when modeling is off.
+        self.model_reset_target(player);
+
         // The mode chooses the spawn point (arena vs. audience in Rocket Arena; a plain DM spawn
         // otherwise).
         let spot = mode.select_spawn(self, player);

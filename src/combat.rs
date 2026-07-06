@@ -62,6 +62,10 @@ impl GameState {
 
         self.entities[targ].set_enemy(attacker);
 
+        // Opponent modeling: death is public (the frag is broadcast), so every side's hypothesis of
+        // this player resets to the spawn kit — they'll respawn fresh. No-op unless it's a player.
+        self.model_reset_target(targ);
+
         // The mode may print its own scoring/announcement (Midair's airshot tiers) in place of the
         // stock obituary; otherwise the default obituary runs.
         let mode = self.mode;
@@ -170,6 +174,21 @@ impl GameState {
 
         // Apply.
         self.entities[targ].v.health -= take;
+
+        // Opponent modeling: the attacker's side learns `targ` lost roughly `damage` off its stack
+        // (they saw the hit land — run the delivered, pre-armor amount through the estimate's own
+        // armor). And an identifiable projectile proves the attacker owns that weapon, which the
+        // victim's side felt. Ambiguous inflictors (spikes: nailgun vs super-nailgun) are left to the
+        // fire-heard hook. Both are no-ops when opponent modeling is off.
+        self.model_note_damage(attacker, targ, damage);
+        let inflictor_weapon = match self.entities[inflictor].classname() {
+            Some("rocket") => Some(Items::ROCKET_LAUNCHER),
+            Some("grenade") => Some(Items::GRENADE_LAUNCHER),
+            _ => None,
+        };
+        if let Some(bit) = inflictor_weapon {
+            self.model_note_weapon_of_attacker(targ, attacker, bit);
+        }
 
         // Perception "feel": a bot that just took damage instantly knows its attacker (you turn
         // around when shot in the back), bypassing the view-cone/reaction gate. Perception then reads
