@@ -667,7 +667,7 @@ impl GameState {
         {
             let ent = &mut self.entities[e];
             ent.classname = Some("item_rune".into());
-            ent.mode_p.ctf.runes = bit; // which rune this item is
+            ent.item.rune_bit = bit; // which rune this item is
             ent.netname = Some(msg.into());
             ent.v.movetype = MoveType::Toss;
             ent.v.solid = Solid::Trigger;
@@ -702,7 +702,7 @@ impl GameState {
             self.sprint_to(other, c"You already have a rune (tossrune to drop).\n");
             return;
         }
-        let bit = self.entities[rune].mode_p.ctf.runes;
+        let bit = self.entities[rune].item.rune_bit;
         self.entities[other].mode_p.ctf.runes |= bit;
         self.refresh_haste_speed(other);
         self.host
@@ -713,7 +713,7 @@ impl GameState {
 
     /// `Think::RuneRespawn` — an untouched rune relocates to a fresh spawn.
     pub(crate) fn rune_respawn(&mut self, rune: EntId) {
-        let bit = self.entities[rune].mode_p.ctf.runes;
+        let bit = self.entities[rune].item.rune_bit;
         let spot = self.select_spawn_point();
         let org = if spot != EntId::WORLD {
             self.entities[spot].v.origin

@@ -79,7 +79,7 @@ pub(crate) struct ArenaSlot {
 }
 
 /// A player's CTF state: the flag they carry, their held rune, and the assist/defense windows.
-/// (Rune-item entities also stash their rune bit in `runes`, as they did on the old flat struct.)
+/// (A rune *pickup* entity keeps its own bit in [`crate::entity::ItemState::rune_bit`], not here.)
 #[derive(Default)]
 pub(crate) struct CtfPlayer {
     /// The team id of the enemy flag this player is carrying (`0` = not carrying). See

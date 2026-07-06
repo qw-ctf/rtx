@@ -555,6 +555,9 @@ pub struct ItemState {
     pub items2: f32,
     pub aflag2: f32,
     pub last_pickup_msg: f32,
+    /// On a CTF `item_rune` pickup, which rune this is (`crate::defs::RUNE_*`); `0` on everything
+    /// else. Separate from a *player's* held rune (`ModePlayer::ctf.runes`).
+    pub rune_bit: u8,
 }
 
 /// A CTF flag's phase (on the flag entity).
