@@ -275,7 +275,14 @@ fn bot_pickup_items(game: &mut GameState, e: EntId) {
     }));
     let now = game.time();
     let goal_item = game.entities[e].bot.goal_item;
+    let hold_item = game.entities[e].bot.hold_item;
+    let holding = hold_item != 0 && now < game.entities[e].bot.hold_until;
     for item in hits {
+        // Handoff hold: don't pick up the weapon we're reserving for a powerup-carrying teammate
+        // (the engine never fires trigger touches for fake clients, so skipping here is sufficient).
+        if holding && item.0 == hold_item {
+            continue;
+        }
         if game.entities[item].v.solid == Solid::Trigger {
             game.run_touch(item, e);
             // Just collected our goal item — briefly avoid it so an instant-respawn pickup (or a
@@ -468,7 +475,13 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     };
 
     let greedy = matches!(intent, Some(BotIntent::Fight(_))) && host.cvar_bool(c"rtx_bot_greed");
-    if intent.is_none() || greedy {
+    // Handoff hold: an idle bot may reserve a spawned RL/LG for a powerup-carrying teammate (standing
+    // on it without taking it). While holding, the reservation owns `goal_item`, pre-empting normal
+    // item selection; a fight or move objective (idle == false) drops the hold inside this call.
+    let holding = game.update_handoff_hold(e, now, intent.is_none());
+    if holding {
+        // `update_handoff_hold` set `goal_item` to the held weapon — nothing else to pick this frame.
+    } else if intent.is_none() || greedy {
         if now >= game.entities[e].bot.goal_select_time {
             let pick = if greedy {
                 game.select_combat_item(e)
@@ -706,6 +719,12 @@ fn run_bot(game: &mut GameState, e: EntId) {
         b.pulse = !b.pulse;
         b.pulse
     };
+
+    // A dead bot holds nothing — drop any handoff reservation so it doesn't resume after respawn.
+    if !alive && game.entities[e].bot.hold_item != 0 {
+        let b = &mut game.entities[e].bot;
+        (b.hold_item, b.hold_for, b.hold_until) = (0, 0, 0.0);
+    }
 
     // Connected but never spawned (health 0, not dead): the engine defers `PutClientInServer` — the
     // full spawn that sets health/loadout — to the bot's spawn on a *bot frame*, which an empty

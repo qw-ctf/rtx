@@ -25,6 +25,13 @@ pub struct BotState {
     /// it sits in. See [`crate::bot::goals`].
     pub goal_item: u32,
     pub goal_item_cell: u32,
+    /// Handoff hold (team opponent modeling): a spawned RL/LG this bot stands on but deliberately does
+    /// **not** pick up (`bot_pickup_items` skips it), reserving it for a powerup-carrying teammate that
+    /// lacks it. `0` = not holding. `hold_for` is that teammate; `hold_until` the hard deadline after
+    /// which the bot takes the weapon itself (denial beats a handoff that never arrives).
+    pub hold_item: u32,
+    pub hold_for: u32,
+    pub hold_until: f32,
     /// Earliest time the bot may re-pick its item goal (throttles the catalog scan).
     pub goal_select_time: f32,
     /// When the bot began chasing its current item goal. If it's *still* chasing the same item

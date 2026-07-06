@@ -149,6 +149,41 @@ fn denial_floor(kind: WeaponKind, weapons_stay: bool, enemy_side_has_bit: bool) 
     }
 }
 
+/// How long a bot will hold a weapon for a powerup carrier before taking it itself. Under a third of
+/// the 30 s powerup window, so the carrier still profits from what's left, yet long enough to cross a
+/// map's mid.
+const HOLD_MAX: f32 = 9.0;
+/// A carrier is only worth holding for if its powerup has at least this long left — no point reserving
+/// a weapon for a quad that's about to expire before the carrier can arrive and use it.
+const HOLD_MATE_MIN_POWER: f32 = 3.0;
+/// How near a spawned RL/LG a bot must be to take up the hold — a positioning nudge, not a cross-map
+/// march (the carrier, not the holder, is the one that should travel).
+const HOLD_REACH: f32 = 700.0;
+/// A perceived enemy within this range of the held weapon contests it: the bot takes it (denial)
+/// rather than leave it on the floor for the enemy.
+const HOLD_CONTEST_RANGE: f32 = 400.0;
+
+/// Pure core of the handoff-hold "keep going?" decision: a hold runs only while the deadline is in the
+/// future, the weapon is still on the floor, and the carrier is still alive, still powered, and still
+/// lacking it — with no enemy contesting the spot. Any failed condition ends the hold, at which point
+/// a bot standing on the (still-solid) weapon grabs it (denial) and otherwise re-picks a goal.
+fn hold_continues(
+    now: f32,
+    hold_until: f32,
+    item_on_floor: bool,
+    mate_alive: bool,
+    mate_powered: bool,
+    mate_has_weapon: bool,
+    enemy_contesting: bool,
+) -> bool {
+    now < hold_until
+        && item_on_floor
+        && mate_alive
+        && mate_powered
+        && !mate_has_weapon
+        && !enemy_contesting
+}
+
 /// The `Items` bit a weapon pickup grants (to check whether the bot already owns it).
 fn weapon_bit(w: WeaponKind) -> Items {
     match w {
@@ -416,6 +451,11 @@ impl GameState {
     /// trigger forever — without it a bot that just grabbed the weapon would keep homing onto the
     /// now-worthless pickup and circle it until the throttled re-select kicked in.
     pub(crate) fn item_goal_valid(&self, bot_e: EntId, item: EntId, now: f32) -> bool {
+        // A weapon held for a powerup carrier (handoff) is a valid goal while it's still on the floor,
+        // even though the holder may already own it (so its ordinary item_desire is 0).
+        if item.0 != 0 && item.0 == self.entities[bot_e].bot.hold_item {
+            return self.entities[item].v.solid == Solid::Trigger;
+        }
         let ent = &self.entities[item];
         // A backpack has no goal classname and never respawns: it's valid while it's still on the
         // floor (solid) and still carries something this bot wants.
@@ -483,6 +523,146 @@ impl GameState {
                     .opponent_est(bot_e, t, now)
                     .is_some_and(|est| est.items.has(bit))
         })
+    }
+
+    /// Maintain or begin a **handoff hold**: an idle bot may reserve a spawned RL/LG for a
+    /// powerup-carrying teammate that lacks it — standing on the weapon without taking it until the
+    /// carrier arrives, or taking it itself when the reservation lapses (denial beats a no-show).
+    /// Returns whether the bot is holding this frame (its `goal_item` then points at the weapon and
+    /// `bot_pickup_items` suppresses the grab). Team modes only, gated by `rtx_bot_model` +
+    /// `rtx_bot_teamwork`; a non-idle bot (one with a fight or a move objective) never holds.
+    pub(crate) fn update_handoff_hold(&mut self, e: EntId, now: f32, idle: bool) -> bool {
+        let enabled = idle
+            && self.entities[e].mode_p.team != 0
+            && self.host().cvar_bool(c"rtx_bot_model")
+            && self.host().cvar_bool(c"rtx_bot_teamwork");
+        if !enabled {
+            self.clear_hold(e);
+            return false;
+        }
+        let held = self.entities[e].bot.hold_item;
+        if held != 0 {
+            if self.hold_should_continue(e, EntId(held), now) {
+                self.pin_hold_goal(e, EntId(held));
+                return true;
+            }
+            // Abort (deadline, carrier gone/expired/armed, item taken, or an enemy contest): drop the
+            // reservation. If the item's still on the floor and the bot is on it, the next
+            // `bot_pickup_items` grabs it (denial); if it's gone, normal selection re-picks.
+            self.clear_hold(e);
+            return false;
+        }
+        if let Some((item, mate)) = self.handoff_hold_target(e, now) {
+            {
+                let b = &mut self.entities[e].bot;
+                b.hold_item = item.0;
+                b.hold_for = mate.0;
+                b.hold_until = now + HOLD_MAX;
+                b.goal_started = now;
+            }
+            self.pin_hold_goal(e, item);
+            return true;
+        }
+        false
+    }
+
+    /// Point the bot's movement goal at the held weapon (navigation carries it there and keeps it
+    /// standing on the spot).
+    fn pin_hold_goal(&mut self, e: EntId, item: EntId) {
+        let cell = self
+            .nav
+            .graph
+            .as_ref()
+            .and_then(|g| g.nearest(self.entities[item].v.origin));
+        let b = &mut self.entities[e].bot;
+        b.goal_item = item.0;
+        if let Some(c) = cell {
+            b.goal_item_cell = c;
+        }
+    }
+
+    fn clear_hold(&mut self, e: EntId) {
+        let b = &mut self.entities[e].bot;
+        if b.hold_item != 0 {
+            (b.hold_item, b.hold_for, b.hold_until) = (0, 0, 0.0);
+        }
+    }
+
+    /// Whether an active hold should keep running: gathers the live facts and defers to the pure
+    /// [`hold_continues`]. Any failed condition ends the hold (see [`update_handoff_hold`]).
+    fn hold_should_continue(&self, e: EntId, item: EntId, now: f32) -> bool {
+        let it = &self.entities[item];
+        let item_on_floor = it.v.solid == Solid::Trigger;
+        let Some(Category::Weapon(w)) = it.classname().and_then(category) else {
+            return false;
+        };
+        let mate = EntId(self.entities[e].bot.hold_for);
+        let m = &self.entities[mate];
+        let mate_alive = mate.0 != 0 && m.classname() == Some("player") && m.v.health > 0.0;
+        let mate_powered =
+            m.combat.super_damage_finished > now || m.combat.invincible_finished > now;
+        let mate_has_weapon = m.v.items.has(weapon_bit(w));
+        // Contest: a perceived, living enemy near the weapon means "take it rather than leave it".
+        let known = self.entities[e].bot.known_enemy;
+        let enemy_contesting = known != 0 && now < self.entities[e].bot.known_until && {
+            let ent = &self.entities[EntId(known)];
+            ent.v.health > 0.0
+                && (ent.v.origin - it.v.origin).length_squared()
+                    < HOLD_CONTEST_RANGE * HOLD_CONTEST_RANGE
+        };
+        hold_continues(
+            now,
+            self.entities[e].bot.hold_until,
+            item_on_floor,
+            mate_alive,
+            mate_powered,
+            mate_has_weapon,
+            enemy_contesting,
+        )
+    }
+
+    /// A handoff opportunity: a living powerup-carrying teammate that lacks RL and/or LG, plus a
+    /// spawned copy of a weapon they lack within reach. Own-team arsenals are read directly — that
+    /// truthful sharing between teammates *is* the coordination the feature is about.
+    fn handoff_hold_target(&self, bot: EntId, now: f32) -> Option<(EntId, EntId)> {
+        let my_team = self.entities[bot].mode_p.team;
+        let bot_org = self.entities[bot].v.origin;
+        let maxclients = self.host().cvar(c"maxclients") as u32;
+        let mate = (1..=maxclients).map(EntId).find(|&t| {
+            t != bot && {
+                let m = &self.entities[t];
+                m.classname() == Some("player")
+                    && m.v.health > 0.0
+                    && m.mode_p.team == my_team
+                    && (m.combat.super_damage_finished > now + HOLD_MATE_MIN_POWER
+                        || m.combat.invincible_finished > now + HOLD_MATE_MIN_POWER)
+                    && (!m.v.items.has(Items::ROCKET_LAUNCHER) || !m.v.items.has(Items::LIGHTNING))
+            }
+        })?;
+        let mate_items = self.entities[mate].v.items;
+        let graph = self.nav.graph.as_ref()?;
+        let mut best: Option<(EntId, f32)> = None;
+        for &(idx, _) in &self.nav.goals {
+            let item = EntId(idx);
+            let it = &self.entities[item];
+            if it.v.solid != Solid::Trigger {
+                continue;
+            }
+            let Some(Category::Weapon(w)) = it.classname().and_then(category) else {
+                continue;
+            };
+            if !matches!(w, WeaponKind::Rl | WeaponKind::Lg) || mate_items.has(weapon_bit(w)) {
+                continue;
+            }
+            if self.item_claimed_by_teammate(bot, my_team, idx) || graph.nearest(it.v.origin).is_none() {
+                continue;
+            }
+            let d = (it.v.origin - bot_org).length_squared();
+            if d <= HOLD_REACH * HOLD_REACH && best.is_none_or(|(_, bd)| d < bd) {
+                best = Some((item, d));
+            }
+        }
+        best.map(|(item, _)| (item, mate))
     }
 
     fn best_item_goal(&self, bot_e: EntId) -> Option<(EntId, CellId, f32)> {
@@ -628,5 +808,19 @@ mod tests {
         // The floor sits below the combat-detour bar (so a bot never breaks off a fight to camp) and
         // above minor top-offs.
         assert!(denial_floor(WeaponKind::Rl, false, false) < COMBAT_GREED_MIN_DESIRE);
+    }
+
+    #[test]
+    fn hold_continues_until_an_abort() {
+        // The happy path: before the deadline, weapon down, carrier alive/powered/lacking it, no
+        // contest → keep holding.
+        assert!(hold_continues(5.0, 9.0, true, true, true, false, false));
+        // Each abort condition ends the hold.
+        assert!(!hold_continues(9.0, 9.0, true, true, true, false, false)); // deadline reached
+        assert!(!hold_continues(5.0, 9.0, false, true, true, false, false)); // weapon taken
+        assert!(!hold_continues(5.0, 9.0, true, false, true, false, false)); // carrier died
+        assert!(!hold_continues(5.0, 9.0, true, true, false, false, false)); // powerup expired
+        assert!(!hold_continues(5.0, 9.0, true, true, true, true, false)); // carrier armed elsewhere
+        assert!(!hold_continues(5.0, 9.0, true, true, true, false, true)); // enemy contesting
     }
 }
