@@ -18,7 +18,7 @@ use crate::abi::{
 use crate::assets::{DynAssets, Model};
 use crate::entity::{EntId, Entities, Entity};
 use crate::game_command::GameCommand;
-use crate::host::{HostApi, SyscallFn};
+use crate::host::{CvarValue, HostApi, SyscallFn};
 use crate::mode::{self, ArenaState, GameMode};
 use crate::world;
 use crate::{bot, defs, ext_field, navmesh};
@@ -27,6 +27,94 @@ use crate::{bot, defs, ext_field, navmesh};
 pub const MAX_EDICTS: usize = 2048;
 /// Matches `GAME_API_VERSION` in `ktx/include/g_public.h`.
 pub const GAME_API_VERSION: i32 = 16;
+
+/// A default value for one rtx tunable — bundles the three [`CvarValue`] kinds so the whole tunable
+/// set can register from one table ([`RTX_CVAR_DEFAULTS`]). Its token is identical to calling
+/// `cvar_default` with the underlying `bool`/`f32`/`&str` directly.
+#[derive(Clone, Copy)]
+enum CvarSeed {
+    Bool(bool),
+    Float(f32),
+    Str(&'static str),
+}
+
+impl CvarValue for CvarSeed {
+    fn cvar_token(&self) -> String {
+        match self {
+            CvarSeed::Bool(b) => b.cvar_token(),
+            CvarSeed::Float(f) => f.cvar_token(),
+            CvarSeed::Str(s) => s.cvar_token(),
+        }
+    }
+}
+
+/// The rtx tunables and their first-run defaults, registered in [`GameState::init`]. `cvar_default`
+/// only seeds a cvar that's unset, so a value from `server.cfg` (or a `set` before `map`) survives
+/// each `GAME_INIT`. Declared as data so the tunables read as one registry.
+const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
+    use CvarSeed::{Bool, Float, Str};
+    &[
+        // Mid-air double jump, on by default (set `rtx_doublejump 0` to disable).
+        ("rtx_doublejump", Bool(true)),
+        // Bots bunnyhop (air-strafe to build speed) on open stretches; on by default.
+        ("rtx_bot_bhop", Bool(true)),
+        // Wall jump (kick off a wall you jump into), on by default (`rtx_walljump 0` to disable).
+        ("rtx_walljump", Bool(true)),
+        // Elevator jump: a rising lift boosts your jump by `lift_speed * rtx_elevator_jump`. A
+        // multiplier (0 disables, 1 = add the lift's true speed, 2 = double it, …).
+        ("rtx_elevator_jump", Float(2.0)),
+        // Shoot live grenades to detonate them early, on by default (`rtx_shootable_grenades 0`
+        // to restore classic non-shootable grenades).
+        ("rtx_shootable_grenades", Bool(true)),
+        // Grappling hook (purectf port), on by default — every player spawns with it (impulse 22
+        // to select). `rtx_grapple 0` to disable.
+        ("rtx_grapple", Bool(true)),
+        // Hook throw / reel-in speed multipliers (purectf's `localinfo hookspeed`/`hookpull`), each
+        // scaling its base `× sv_maxspeed`. Defaults match purectf's shipped server.cfg.
+        ("rtx_hook_speed", Float(1.25)),
+        ("rtx_hook_pull", Float(1.0)),
+        // Game mode: `ffa` (free-for-all deathmatch, the default), `ra` (Rocket Arena), `midair`,
+        // a team alias, or `ctf`. Read live each frame. A string cvar. See `crate::mode`.
+        ("rtx_mode", Str("ffa")),
+        // Rocket Arena: seconds of spawn-protected countdown before "FIGHT". (Always a 1v1 duel.)
+        ("rtx_ra_countdown", Float(3.0)),
+        // Rocket Arena: include the lightning gun in the arena arsenal (off = leave it out).
+        ("rtx_ra_lightning_gun", Bool(false)),
+        // Team match (`rtx_mode 1on1`/`2on2`/…): seconds of spawn-protected countdown after the
+        // match-start map reload before "FIGHT".
+        ("rtx_match_countdown", Float(3.0)),
+        // CTF: captures a team needs to win the match (`0` = no limit, ends on timelimit only).
+        ("rtx_capturelimit", Float(8.0)),
+        // CTF runes: `0` = on (with the Haste speed boost), `1` = off, `2` = on without the speed
+        // boost (Haste is attack-rate only). Runes spawn only in CTF.
+        ("rtx_runes", Float(0.0)),
+        // CTF: allow voluntarily tossing your carried flag (impulse 26) / held rune (impulse 24).
+        ("rtx_ctf_tossflag", Bool(false)),
+        ("rtx_ctf_tossrune", Bool(false)),
+        // Any mode: let players drop items for teammates — a capped ammo backpack (impulse 20) and
+        // the current weapon (impulse 21), as in purectf. `0` disables both.
+        ("rtx_dropitems", Bool(false)),
+        // Midair: minimum height above the floor (units) for a victim to count as airborne, and the
+        // knockback multipliers for airborne (`kb_air`) vs grounded (`kb_ground`) rocket hits — the
+        // ground value is bigger to pop grounded players up into the air.
+        ("rtx_midair_minheight", Float(40.0)),
+        ("rtx_midair_kb_ground", Float(6.0)),
+        ("rtx_midair_kb_air", Float(3.0)),
+        // Navmesh bots: how many to keep on the server (0 = none), and their skill. Bots only spawn
+        // once a map's navmesh is built.
+        ("rtx_bot_count", Float(0.0)),
+        ("rtx_bot_skill", Float(3.0)),
+        // Keep bots on the server even with no humans connected (default off).
+        ("rtx_bot_alone", Bool(false)),
+        // Pacifist bots: in FFA, don't fight — just trail the nearest human (for experimenting).
+        ("rtx_bot_pacifist", Bool(false)),
+        // Greedy bots: let a fighting bot break off to grab a compelling nearby pickup (powerup, a
+        // weapon it lacks, big health/armor) instead of only chasing the enemy — ktx-style item play.
+        ("rtx_bot_greed", Bool(true)),
+        // Per-bot goal/pickup diagnostics to the server console (off by default).
+        ("rtx_bot_debug", Bool(false)),
+    ]
+};
 
 /// A single entity's parsed key/value pairs from the map's entity string.
 pub(crate) type SpawnFields = Vec<(String, String)>;
@@ -399,79 +487,10 @@ impl GameState {
         // matching how ktx re-runs `G_InitExtensions` each `GAME_INIT`.
         self.ext_fields = ext_field::ExtFields::default();
 
-        // rtx tunables below use `cvar_default*`, not `cvar_set*`: `GAME_INIT` runs on every map
-        // load, so a forced set would wipe any value the user put in `server.cfg` (or a `set`
-        // before `map`) each time. Registering the default only when the cvar is unset preserves
-        // the user's value while still seeding a first-run default.
-
-        // Mid-air double jump, on by default (set `rtx_doublejump 0` to disable).
-        self.host.cvar_default("rtx_doublejump", true);
-        // Bots bunnyhop (air-strafe to build speed) on open stretches; on by default.
-        self.host.cvar_default("rtx_bot_bhop", true);
-
-        // Wall jump (kick off a wall you jump into), on by default (`rtx_walljump 0` to disable).
-        self.host.cvar_default("rtx_walljump", true);
-
-        // Elevator jump: a rising lift boosts your jump by `lift_speed * rtx_elevator_jump`.
-        // It's a multiplier (0 disables, 1 = add the lift's true speed, 2 = double it, …).
-        self.host.cvar_default("rtx_elevator_jump", 2.0);
-
-        // Shoot live grenades to detonate them early, on by default (`rtx_shootable_grenades 0`
-        // to restore classic non-shootable grenades).
-        self.host.cvar_default("rtx_shootable_grenades", true);
-
-        // Grappling hook (purectf port), on by default — every player spawns with it (impulse 22
-        // to select). `rtx_grapple 0` to disable.
-        self.host.cvar_default("rtx_grapple", true);
-        // Hook throw / reel-in speed multipliers (purectf's `localinfo hookspeed`/`hookpull`),
-        // each scaling its base `× sv_maxspeed`. Defaults match purectf's shipped server.cfg.
-        self.host.cvar_default("rtx_hook_speed", 1.25);
-        self.host.cvar_default("rtx_hook_pull", 1.0);
-
-        // Game mode: `ffa` (free-for-all deathmatch, the default), `ra` (Rocket Arena), or
-        // `midair` (airborne-only rocket DM). Read live each frame. A string cvar. See `crate::mode`.
-        self.host.cvar_default("rtx_mode", "ffa");
-        // Rocket Arena: seconds of spawn-protected countdown before "FIGHT". (The arena is always
-        // a 1v1 duel — the fighter count isn't a cvar.)
-        self.host.cvar_default("rtx_ra_countdown", 3.0);
-        // Rocket Arena: include the lightning gun in the arena arsenal (off = leave it out).
-        self.host.cvar_default("rtx_ra_lightning_gun", false);
-        // Team match (`rtx_mode 1on1`/`2on2`/`2on2on2`/…): seconds of spawn-protected countdown after
-        // the match-start map reload before "FIGHT".
-        self.host.cvar_default("rtx_match_countdown", 3.0);
-        // CTF: captures a team needs to win the match (`0` = no limit, ends on timelimit only).
-        self.host.cvar_default("rtx_capturelimit", 8.0);
-        // CTF runes: `0` = on (with the Haste speed boost), `1` = off, `2` = on without the speed
-        // boost (Haste is attack-rate only). Runes spawn only in CTF.
-        self.host.cvar_default("rtx_runes", 0.0);
-        // CTF: allow voluntarily tossing your carried flag (impulse 26) / held rune (impulse 24).
-        self.host.cvar_default("rtx_ctf_tossflag", false);
-        self.host.cvar_default("rtx_ctf_tossrune", false);
-        // Any mode: let players drop items for teammates — a capped ammo backpack (impulse 20) and
-        // the current weapon (impulse 21), as in purectf. `0` disables both.
-        self.host.cvar_default("rtx_dropitems", false);
-        // Midair: minimum height above the floor (units) for a victim to count as airborne, and the
-        // knockback multipliers for airborne (`kb_air`) vs grounded (`kb_ground`) rocket hits — the
-        // ground value is bigger to pop grounded players up into the air. Tunables over rtx's bare
-        // `damage*8` knockback base, so they don't match KTX's raw c1/c2 literals.
-        self.host.cvar_default("rtx_midair_minheight", 40.0);
-        self.host.cvar_default("rtx_midair_kb_ground", 6.0);
-        self.host.cvar_default("rtx_midair_kb_air", 3.0);
-
-        // Navmesh bots: how many to keep on the server (0 = none), and their skill (reserved
-        // for combat tuning later). Bots only spawn once a map's navmesh is built.
-        self.host.cvar_default("rtx_bot_count", 0.0);
-        self.host.cvar_default("rtx_bot_skill", 3.0);
-        // Keep bots on the server even with no humans connected (default off: bots leave an empty
-        // server).
-        self.host.cvar_default("rtx_bot_alone", false);
-        // Pacifist bots: in FFA, don't fight — just trail the nearest human (for experimenting).
-        self.host.cvar_default("rtx_bot_pacifist", false);
-        // Greedy bots: let a fighting bot break off to grab a compelling nearby pickup (powerup, a
-        // weapon it lacks, big health/armor) instead of only chasing the enemy — ktx-style item play.
-        self.host.cvar_default("rtx_bot_greed", true);
-        // Per-bot goal/pickup diagnostics to the server console (off by default).
-        self.host.cvar_default("rtx_bot_debug", false);
+        // Seed the rtx tunables from the registry (see `RTX_CVAR_DEFAULTS` for each cvar's meaning).
+        for &(name, seed) in RTX_CVAR_DEFAULTS {
+            self.host.cvar_default(name, seed);
+        }
 
         // conprint (not dprint) so it shows without `developer 1` — lets you confirm at a glance
         // that the freshly built module is the one actually loaded.
