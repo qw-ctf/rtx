@@ -15,7 +15,8 @@
 
 use glam::{Vec3, Vec3Swizzles};
 
-use crate::bot::{self, BotCmd};
+use crate::bot::state::GrenadePhase;
+use crate::bot::{self, grenade, BotCmd};
 use crate::defs::{
     Bits, Flags, Items, Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP,
     VEC_VIEW_OFS,
@@ -55,18 +56,33 @@ fn press_advantage(own_health: f32, enemy_stack: f32, est_age: f32) -> bool {
 
 /// A weapon choice for the current range: the impulse that selects it, the [`Weapon`] it yields
 /// (to avoid re-selecting what we already hold), and its projectile speed (`0` = hitscan, so no
-/// target leading).
+/// target leading). `grenade_arc` marks a *lobbed* grenade solution (airborne intercept or grounded
+/// lead-lob) whose view angles come pre-solved from the ballistic solver — the aim code fires along
+/// them directly instead of pointing straight at the target.
 struct WeaponChoice {
     impulse: i32,
     weapon: Weapon,
     projectile_speed: f32,
+    grenade_arc: bool,
 }
 
-/// Pick a weapon for `dist`, given what the bot owns and has ammo for.
-fn choose_weapon(g: &GameState, e: EntId, dist: f32) -> WeaponChoice {
+/// Pick a weapon for `dist`, given what the bot owns and has ammo for. `gl_air`/`gl_ground` are set
+/// by [`engage`] once it has a *validated* grenade-arc solution (an airborne intercept, or a
+/// grounded lead-lob used when the RL is absent) — when either holds, the grenade launcher wins.
+fn choose_weapon(g: &GameState, e: EntId, dist: f32, gl_air: bool, gl_ground: bool) -> WeaponChoice {
     let v = &g.entities[e].v;
     let items = v.items;
     let have = |bit: Items| items.has(bit);
+
+    // A solved airborne grenade intercept takes precedence: it's the shot we came here to take.
+    if gl_air {
+        return WeaponChoice {
+            impulse: grenade::GL_IMPULSE,
+            weapon: Weapon::GrenadeLauncher,
+            projectile_speed: grenade::GL_SPEED,
+            grenade_arc: true,
+        };
+    }
 
     // Point blank: the super shotgun (hitscan, no self-splash). Fall back to the axe if somehow
     // unarmed (audience never gets here).
@@ -76,6 +92,7 @@ fn choose_weapon(g: &GameState, e: EntId, dist: f32) -> WeaponChoice {
                 impulse: 3,
                 weapon: Weapon::SuperShotgun,
                 projectile_speed: 0.0,
+                grenade_arc: false,
             };
         }
         if have(Items::SHOTGUN) && v.ammo_shells >= 1.0 {
@@ -83,6 +100,7 @@ fn choose_weapon(g: &GameState, e: EntId, dist: f32) -> WeaponChoice {
                 impulse: 2,
                 weapon: Weapon::Shotgun,
                 projectile_speed: 0.0,
+                grenade_arc: false,
             };
         }
     }
@@ -93,6 +111,7 @@ fn choose_weapon(g: &GameState, e: EntId, dist: f32) -> WeaponChoice {
             impulse: 8,
             weapon: Weapon::Lightning,
             projectile_speed: 0.0,
+            grenade_arc: false,
         };
     }
 
@@ -102,6 +121,18 @@ fn choose_weapon(g: &GameState, e: EntId, dist: f32) -> WeaponChoice {
             impulse: 7,
             weapon: Weapon::RocketLauncher,
             projectile_speed: ROCKET_SPEED,
+            grenade_arc: false,
+        };
+    }
+    // No rocket launcher but a solved grenade lob at a grounded target: prefer the arc over the
+    // shotgun at range (the GL reaches where the SSG can't). `engage` only sets this when a lob
+    // actually solves, so we never pick it hopelessly.
+    if gl_ground {
+        return WeaponChoice {
+            impulse: grenade::GL_IMPULSE,
+            weapon: Weapon::GrenadeLauncher,
+            projectile_speed: grenade::GL_SPEED,
+            grenade_arc: true,
         };
     }
     // Ammo-starved fallbacks: pick the best owned gun with ammo before resorting to the axe. This
@@ -112,6 +143,7 @@ fn choose_weapon(g: &GameState, e: EntId, dist: f32) -> WeaponChoice {
             impulse: 3,
             weapon: Weapon::SuperShotgun,
             projectile_speed: 0.0,
+            grenade_arc: false,
         };
     }
     if have(Items::LIGHTNING) && v.ammo_cells >= 1.0 {
@@ -119,6 +151,7 @@ fn choose_weapon(g: &GameState, e: EntId, dist: f32) -> WeaponChoice {
             impulse: 8,
             weapon: Weapon::Lightning,
             projectile_speed: 0.0,
+            grenade_arc: false,
         };
     }
     if have(Items::SHOTGUN) && v.ammo_shells >= 1.0 {
@@ -126,12 +159,14 @@ fn choose_weapon(g: &GameState, e: EntId, dist: f32) -> WeaponChoice {
             impulse: 2,
             weapon: Weapon::Shotgun,
             projectile_speed: 0.0,
+            grenade_arc: false,
         };
     }
     WeaponChoice {
         impulse: 1,
         weapon: Weapon::Axe,
         projectile_speed: 0.0,
+        grenade_arc: false,
     }
 }
 
@@ -163,8 +198,9 @@ fn spread_scale(visible_for: f32, own_speed: f32, perp_speed: f32, dist: f32) ->
 /// (quadratic `(v·v − s²)t² + 2(r·v)t + r·r = 0`). This is what makes lead *geometry-aware*:
 /// motion perpendicular to the line of fire lengthens the flight and shifts the aim a lot, motion
 /// straight toward/away barely does. `None` when no positive intercept exists (target outrunning
-/// the projectile).
-fn intercept_time(r: Vec3, v: Vec3, s: f32) -> Option<f32> {
+/// the projectile). Shared with the grenade airborne solver (`grenade::solve_air_intercept`), where
+/// gravity cancels between projectile and free-falling target so the meet reduces to this linear one.
+pub(crate) fn intercept_time(r: Vec3, v: Vec3, s: f32) -> Option<f32> {
     let a = v.dot(v) - s * s;
     let b = 2.0 * r.dot(v);
     let c = r.dot(r);
@@ -185,6 +221,102 @@ fn intercept_time(r: Vec3, v: Vec3, s: f32) -> Option<f32> {
         }
     }
     best.is_finite().then_some(best)
+}
+
+/// Where and when a free-falling target's parabola first meets the world, within `horizon`
+/// seconds — the landing spot for the aim clamp below. Integrated through the `trace` oracle
+/// (hull1, the player hull) exactly like [`crate::bot::grenade::simulate_bounce`] so the discrete
+/// step matches the engine's `SV_Physics_Toss`; a non-floor hit (wall/ceiling) just clips the
+/// velocity and the fall continues. `None` when it's still airborne at the horizon. Pure over the
+/// oracle, so it's unit-testable against a synthetic floor.
+pub(crate) fn fall_land(
+    trace: &impl Fn(Vec3, Vec3) -> crate::bsp::HullTrace,
+    p0: Vec3,
+    v0: Vec3,
+    gravity: f32,
+    horizon: f32,
+) -> Option<(f32, Vec3)> {
+    let (mut p, mut v, mut t) = (p0, v0, 0.0f32);
+    // Step cap: a fall wedged into a corner can slide in tiny sub-steps that barely advance `t`;
+    // bound the work and treat an unresolved fall as "still airborne" (no clamp), like the horizon.
+    for _ in 0..512 {
+        if t >= horizon {
+            break;
+        }
+        let dt = (16.0 / v.length().max(1.0)).min(0.02);
+        v.z -= gravity * dt; // SV_AddGravity before the move
+        let target = p + v * dt;
+        let tr = trace(p, target);
+        if tr.fraction < 1.0 {
+            if tr.plane_normal.z > 0.7 {
+                return Some((t + tr.fraction * dt, tr.endpos)); // rests on a floor
+            }
+            // Wall/ceiling: slide along it (kill the into-surface component) and keep falling.
+            p = tr.endpos + tr.plane_normal * 0.25;
+            v -= v.dot(tr.plane_normal) * tr.plane_normal;
+            t += tr.fraction * dt;
+        } else {
+            p = target;
+            t += dt;
+        }
+    }
+    None
+}
+
+/// A free-falling target's origin at time `t`: the parabola `p0 + v0·t − ½g·t²·ẑ` until it lands,
+/// then held at the landing point drifting at the ground horizontal speed. The clamp is the whole
+/// point — without it a rocket aimed at a jumping enemy near the floor is led *through* the floor,
+/// to a point the enemy will never occupy because they'll be standing on the ground when it arrives.
+pub(crate) fn ballistic_pos(p0: Vec3, v0: Vec3, gravity: f32, land: Option<(f32, Vec3)>, t: f32) -> Vec3 {
+    if let Some((t_land, land_pos)) = land {
+        if t >= t_land {
+            return land_pos + Vec3::new(v0.x, v0.y, 0.0) * (t - t_land);
+        }
+    }
+    p0 + v0 * t - Vec3::new(0.0, 0.0, 0.5 * gravity * t * t)
+}
+
+/// Flight time (and meet point) for a straight projectile of speed `s` from `from` to intercept a
+/// target whose position at time `t` is `pos_at(t)` — used for rockets, whose flat flight can't be
+/// folded into gravity the way a grenade's can. Fixed-point `t ← |pos_at(t) − from| / s` seeded by
+/// the gravity-free linear intercept; five rounds converge to well under a unit at rocket speeds.
+/// `None` if it doesn't settle onto the projectile sphere (a target falling away faster than the
+/// rocket closes), so the caller can fall back to a plain linear lead.
+fn ballistic_intercept(from: Vec3, pos_at: &impl Fn(f32) -> Vec3, s: f32, seed: f32) -> Option<(f32, Vec3)> {
+    let mut t = seed.max(0.0);
+    for _ in 0..5 {
+        t = (pos_at(t) - from).length() / s;
+    }
+    let meet = pos_at(t);
+    let residual = (meet - from).length() - s * t;
+    (t > 0.0 && residual.abs() < 1.0).then_some((t, meet))
+}
+
+/// Lateral world-space miss at `range` for the angular gap between the smoothed view and the clean
+/// firing solution (`miss ≈ sin(Δ)·range`). Gating fire on *distance off the target* rather than a
+/// fixed angular cone keeps a skill-7 solve honest: 4° of slack is ~28u at 400u — a whole player
+/// width — while 16u is a guaranteed hull hit regardless of range. The angle is clamped to 90°
+/// before the `sin`: past a quarter turn the crosshair is nowhere near the target and any real
+/// tolerance is tens of units, so saturating at the full `range` keeps the gate monotone (an
+/// unclamped `sin` dips back toward zero — even negative past 180° — and would wrongly pass a shot
+/// aimed the opposite way, e.g. mid-flick onto an enemy that just appeared behind the bot).
+fn miss_distance(view: Vec3, clean: Vec3, range: f32) -> f32 {
+    let dp = bot::wrap180(view.x - clean.x).to_radians();
+    let dy = bot::wrap180(view.y - clean.y).to_radians();
+    (dp * dp + dy * dy).sqrt().min(std::f32::consts::FRAC_PI_2).sin() * range
+}
+
+/// Fire-gate tolerance (world units) at the intercept range. A **direct** hit must land inside the
+/// ±16u hull (16u at skill 7); a **splash** shot rides the 160u blast, so it fires far looser (40u
+/// at skill 7). Both widen with `(7 − skill)` so a low-skill bot still fires — loose, and misses —
+/// rather than freezing when its lagging aim never quite reaches the tight cone.
+fn fire_tolerance(skill: f32, direct: bool) -> f32 {
+    let s = skill.clamp(0.0, 7.0);
+    if direct {
+        16.0 + (7.0 - s) * 18.0
+    } else {
+        40.0 + (7.0 - s) * 25.0
+    }
 }
 
 /// View angles (pitch, yaw, 0) from `eye` toward `point`.
@@ -232,7 +364,83 @@ pub(crate) fn engage(
 
     let to_enemy = enemy_eye - my_eye;
     let dist = to_enemy.length().max(1.0);
-    let choice = choose_weapon(game, e, dist);
+    let skill = game.host().cvar(c"rtx_bot_skill").clamp(0.0, 7.0);
+    let gravity = game.host().cvar(c"sv_gravity");
+
+    // Target motion state: a grounded target is led horizontally; a swimmer moves freely but does
+    // *not* free-fall (no gravity term); an airborne one is on a gravity parabola we solve exactly.
+    let grounded = game.entities[enemy].v.flags.has(Flags::ONGROUND);
+    let swimming = game.entities[enemy].v.waterlevel >= 2.0;
+    let airborne = !grounded && !swimming;
+
+    // Weapon inventory relevant to the projectile choice (RL and GL share the rocket ammo pool).
+    let (has_rl, has_gl) = {
+        let v = &game.entities[e].v;
+        (
+            v.items.has(Items::ROCKET_LAUNCHER) && v.ammo_rockets >= 1.0,
+            v.items.has(Items::GRENADE_LAUNCHER) && v.ammo_rockets >= 1.0,
+        )
+    };
+    let idle = game.entities[e].bot.grenade_phase == GrenadePhase::Idle;
+    // The lob→shoot combo (`grenade::grenade_combo`, run after us) owns grounded grenade offence when
+    // shootable grenades are enabled. So engage only ground-lobs as the fallback when the combo is
+    // off — otherwise both would throw at the same grounded enemy and the combo could adopt our
+    // grenade as its own. The airborne intercept below is engage-exclusive (the combo never does it).
+    let combos_on = game.host().cvar_bool(c"rtx_shootable_grenades");
+
+    // Ballistic planning against real geometry (needs the BSP hull), all inside one immutable borrow
+    // of the navmesh BSP, then handed back as plain data:
+    //  • `land` — where an airborne enemy would touch down, so the rocket lead clamps at the floor
+    //    instead of aiming through it;
+    //  • `air_gl` — a *validated* airborne grenade intercept (still airborne at the meet, far enough
+    //    that its blast doesn't catch us, and a real bounce sim confirms the arc reaches them);
+    //  • `gl_ground_sol` — the RL-less grounded lead-lob, arc-cleared like the combo's `try_start`.
+    let mut land: Option<(f32, Vec3)> = None;
+    let mut air_gl: Option<(Vec3, f32, Vec3)> = None;
+    let mut gl_ground_sol: Option<(Vec3, f32, Vec3)> = None;
+    if let Some(bsp) = game.nav.bsp.as_ref() {
+        let trace = |a: Vec3, b: Vec3| bsp.hull1_trace(a, b);
+        if airborne {
+            land = fall_land(&trace, enemy_org, enemy_vel, gravity, grenade::GL_FUSE);
+            // Only bother solving the grenade arc when it could actually be chosen — the RL is the
+            // better airborne weapon whenever it's in hand, so a grenade intercept is a *fallback*.
+            if has_gl && !has_rl && idle {
+                if let Some((look, t, meet)) = grenade::solve_air_intercept(origin, enemy_org, enemy_vel, gravity) {
+                    let airborne_at_meet = land.is_none_or(|(t_land, _)| t < t_land);
+                    // Keep the blast off ourselves: the meet must sit a full blast radius away.
+                    let safe_range = (meet - origin).length() >= GRENADE_BLAST_RADIUS;
+                    let enemy_at =
+                        |tt: f32| ballistic_pos(enemy_org, enemy_vel, gravity, land, tt) + Vec3::new(0.0, 0.0, 4.0);
+                    let sim = grenade::simulate_bounce(&trace, origin, grenade::launch_velocity(look), gravity, &enemy_at);
+                    if airborne_at_meet && safe_range && sim.hit_enemy {
+                        air_gl = Some((look, t, meet));
+                    }
+                }
+            }
+        } else if !swimming && has_gl && !has_rl && idle && !combos_on {
+            // Grounded lead-lob (RL gone, GL stocked, combo off): two-round lead so a strafer stays in the blast,
+            // then verify the arc actually clears geometry onto the led point — a purely ballistic
+            // solve would happily hurl the grenade into a low ceiling and bounce it back onto us.
+            let feet = enemy_org - Vec3::new(0.0, 0.0, 24.0);
+            let vel_xy = Vec3::new(enemy_vel.x, enemy_vel.y, 0.0);
+            if let Some((look, flight, led)) = grenade::solve_ground_lead(origin, feet, vel_xy, gravity) {
+                let clear = crate::navmesh::arc_land(bsp, origin, grenade::launch_velocity(look), gravity)
+                    .is_some_and(|(land_pt, _, _)| (land_pt.xy() - led.xy()).length() < grenade::LOB_LAND_TOL);
+                if clear {
+                    gl_ground_sol = Some((look, flight, led));
+                }
+            }
+        }
+    }
+
+    // Take the airborne grenade intercept only when the RL is unavailable. Keeping the choice keyed
+    // solely on inventory (not a clock or geometry threshold) means it can't flip mid-jump and re-slew
+    // the aim off the shot — and since RL/GL share the ammo pool, the only transition is running that
+    // pool dry, which grounds both at once. Midair's RL-only loadout never reaches the grenade path.
+    let gl_air = air_gl.is_some(); // `air_gl` is already gated on `!has_rl` above
+    let gl_ground = gl_ground_sol.is_some();
+
+    let choice = choose_weapon(game, e, dist, gl_air, gl_ground);
 
     // Switch weapon only when we don't already hold the desired one (setting `impulse` re-runs
     // W_ChangeWeapon each frame otherwise).
@@ -240,41 +448,63 @@ pub(crate) fn engage(
         cmd.impulse = choice.impulse;
     }
 
-    // Predicted velocity for the intercept: a grounded target is led horizontally; an airborne
-    // one with its full velocity (plus the ballistic correction below — gravity isn't in the
-    // linear solve).
-    let grounded = game.entities[enemy].v.flags.has(Flags::ONGROUND);
-    let pred_vel = if grounded {
-        Vec3::new(enemy_vel.x, enemy_vel.y, 0.0)
-    } else {
-        enemy_vel
-    };
-
-    // Aim point. For projectiles, solve the true intercept — where the enemy *will be* when the
-    // rocket arrives — instead of offsetting by the flight time to where they are *now* (which
-    // under-leads exactly when it matters most: motion perpendicular to the line of fire).
-    let aim = if choice.projectile_speed > 0.0 {
-        let s = choice.projectile_speed;
-        let t = intercept_time(enemy_eye - my_eye, pred_vel, s).unwrap_or(dist / s);
-        let mut aim = enemy_eye + pred_vel * t;
-        if !grounded {
-            // Ballistic correction: an airborne enemy falls under gravity during the flight.
-            aim.z -= 0.5 * game.host().cvar(c"sv_gravity") * t * t;
-        } else if choice.weapon == Weapon::RocketLauncher && pred_vel.xy().length() > 150.0 {
-            // A grounded strafer is hard to hit directly — aim at the shins so a near miss
-            // becomes floor splash (the human counter to a strafing target).
-            aim.z -= 38.0; // eye (+22 over origin) → shin (−16)
+    // Aim point and clean firing angles. Projectiles solve the true intercept — where the enemy
+    // *will be* when the shot arrives — not where they are now. `gate_direct` marks a shot that
+    // needs a direct hull hit (airborne) vs. one that can lean on splash (grounded/hitscan).
+    let muzzle_base = origin + Vec3::new(0.0, 0.0, 16.0); // rocket/grenade spawn height (w_fire_rocket)
+    let s = choice.projectile_speed;
+    let (aim, clean, gate_direct) = if choice.grenade_arc {
+        // Lobbed grenade: the solver already produced the launch view; fire straight along it. The
+        // meet point is only for aim memory and the fire gate.
+        let (look, meet) = if airborne {
+            let (l, _t, m) = air_gl.expect("gl_air ⇒ air_gl set");
+            (l, m)
+        } else {
+            let (l, _t, m) = gl_ground_sol.expect("gl_ground ⇒ solved");
+            (l, m)
+        };
+        (meet, look, airborne)
+    } else if s > 0.0 {
+        if airborne {
+            // Consistent ballistic intercept: iterate the flight time against the gravity-displaced,
+            // floor-clamped target, solved from the muzzle. Falls back to a linear lead if it can't
+            // settle. Aim at the hull centre (origin +4) — the most direct-hit margin for an airshot.
+            let seed =
+                intercept_time(enemy_org - muzzle_base, enemy_vel, s).unwrap_or((enemy_org - muzzle_base).length() / s);
+            let pos_at = |t: f32| ballistic_pos(enemy_org, enemy_vel, gravity, land, t);
+            // Fallback (fixed point didn't settle — a target falling away near projectile speed):
+            // the linear-seed flight time evaluated on the *clamped* `pos_at`, so a target that lands
+            // mid-flight still resolves to the landing spot rather than a point below the floor.
+            let (_t, meet) =
+                ballistic_intercept(muzzle_base, &pos_at, s, seed).unwrap_or((seed, pos_at(seed)));
+            let aim = meet + Vec3::new(0.0, 0.0, 4.0);
+            (aim, angles_to(muzzle_base, aim), true)
+        } else {
+            // Grounded or swimming: linear lead from the eye (unchanged behaviour). A grounded
+            // strafer gets the shin-drop so a near miss becomes floor splash; a swimmer is led in
+            // full 3D with no gravity term (water isn't free-fall).
+            let pred_vel = if swimming {
+                enemy_vel
+            } else {
+                Vec3::new(enemy_vel.x, enemy_vel.y, 0.0)
+            };
+            let t = intercept_time(enemy_eye - my_eye, pred_vel, s).unwrap_or(dist / s);
+            let mut aim = enemy_eye + pred_vel * t;
+            if !swimming && choice.weapon == Weapon::RocketLauncher && pred_vel.xy().length() > 150.0 {
+                aim.z -= 38.0; // eye (+22 over origin) → shin (−16)
+            }
+            (aim, angles_to(my_eye, aim), false)
         }
-        aim
     } else {
-        enemy_eye
+        // Hitscan: no lead.
+        (enemy_eye, angles_to(my_eye, enemy_eye), false)
     };
 
     // Skill-scaled *drifting* aim error: the error wanders smoothly toward a periodically
     // resampled offset (never a fresh random per frame — white noise reads as jitter on the view).
     // Misses sweep past the target and drift back, like human tracking error. Pitch error is kept
     // smaller than yaw (vertical mouse control is steadier). Skill 7 ⇒ error ≈ 0.
-    let skill = game.host().cvar(c"rtx_bot_skill").clamp(0.0, 7.0);
+    //
     // Base half-range shrinks with skill (skill 7 ⇒ 0 ⇒ perfect), then widens with three human
     // tracking factors, so first-glimpse and running snap-shots are looser than a settled duel:
     //  • convergence — loose on first sight, tightening over ~1.5s of continuous line of sight
@@ -313,8 +543,6 @@ pub(crate) fn engage(
         b.aim_err
     };
 
-    let clean = angles_to(my_eye, aim);
-
     // Feed-forward: the aim spring tracks a moving solution with a steady-state lag of
     // 2·rate/ω, so on a constant strafer the crosshair would trail forever. Estimate how fast the
     // solution is moving (from last frame's clean angles) and aim ahead by the expected lag —
@@ -322,14 +550,19 @@ pub(crate) fn engage(
     let ff = {
         let b = &mut game.entities[e].bot;
         let dt = now - b.look_prev_time;
-        let rate = if b.look_prev_time > 0.0 && dt > 1e-3 && dt < 0.25 {
-            Vec3::new(
-                (bot::wrap180(clean.x - b.look_prev.x) / dt).clamp(-180.0, 180.0),
-                (bot::wrap180(clean.y - b.look_prev.y) / dt).clamp(-180.0, 180.0),
-                0.0,
-            )
+        let raw = if b.look_prev_time > 0.0 && dt > 1e-3 && dt < 0.25 {
+            Vec3::new(bot::wrap180(clean.x - b.look_prev.x) / dt, bot::wrap180(clean.y - b.look_prev.y) / dt, 0.0)
         } else {
             Vec3::ZERO // stale/first sample (just acquired the target) — no estimate yet
+        };
+        // A jump too fast for human tracking is a discontinuity, not motion (a target/weapon-kind
+        // switch — e.g. the ~18° step from rocket angles to the grenade loft — or a teleport). Don't
+        // feed-forward a phantom slew; treat it as a fresh sample. Genuine crossing tops out near
+        // 230°/s even up close, well under this.
+        let rate = if raw.x.abs() > 360.0 || raw.y.abs() > 360.0 {
+            Vec3::ZERO
+        } else {
+            Vec3::new(raw.x.clamp(-180.0, 180.0), raw.y.clamp(-180.0, 180.0), 0.0)
         };
         b.look_prev = clean;
         b.look_prev_time = now;
@@ -369,41 +602,47 @@ pub(crate) fn engage(
     // Fire only when the crosshair is on the spot. The shot leaves along the *smoothed* view
     // (`bot.aim`, last frame's spring output) — firing every frame would put rockets wherever the
     // lagging view happens to point, i.e. behind a strafer no matter how good the intercept is.
-    // Humans fire when the crosshair reaches the target; the cone is weapon-based plus low-skill
-    // leniency (a low-skill bot fires looser and misses, rather than never firing).
+    // For projectiles we gate on the predicted *miss distance* at the intercept range rather than a
+    // fixed angular cone, so a good solve isn't wasted by ~28u of angular slack at long range; a
+    // direct-hit shot (airborne) needs the hull, a splash shot leans on the blast. Hitscan keeps the
+    // simple weapon cone plus low-skill leniency (a low-skill bot fires looser and misses).
     let view = game.entities[e].bot.aim;
-    let base_cone = match choice.weapon {
-        Weapon::Lightning => 2.5,
-        Weapon::RocketLauncher => 4.0,
-        _ => 5.0,
+    let on_target = if s > 0.0 {
+        let launch = if choice.grenade_arc { origin } else { muzzle_base };
+        let range = (aim - launch).length().max(1.0);
+        view == Vec3::ZERO || miss_distance(view, clean, range) <= fire_tolerance(skill, gate_direct)
+    } else {
+        // Original per-weapon base cone, minus the RL (now a projectile, gated above): the lightning
+        // beam is tight, the shotguns/axe looser — plus low-skill leniency.
+        let base_cone = if choice.weapon == Weapon::Lightning { 2.5 } else { 5.0 };
+        let cone = base_cone + (7.0 - skill);
+        let dp = bot::wrap180(view.x - clean.x);
+        let dy = bot::wrap180(view.y - clean.y);
+        view == Vec3::ZERO || (dp * dp + dy * dy).sqrt() <= cone
     };
-    let cone = base_cone + (7.0 - skill);
-    let dp = bot::wrap180(view.x - clean.x);
-    let dy = bot::wrap180(view.y - clean.y);
-    let on_target = view == Vec3::ZERO || (dp * dp + dy * dy).sqrt() <= cone;
 
-    // Line-of-fire clearance for projectiles (in practice only the RL — LG/SG are hitscan, speed 0).
-    // The eye→enemy_eye gate at the top says the *enemy* is visible, but the rocket doesn't leave
-    // the eye: it spawns at the muzzle (`origin + fwd*8 + (0,0,16)`; see weapons.rs `w_fire_rocket`)
-    // and flies at the led/shin-dropped `aim` point, not the enemy's eyes. A peeker around a corner
-    // can pass the eye ray while the muzzle→aim path clips the corner and self-splashes. So trace
-    // the real line of fire and hold fire when a wall stops the rocket short of `aim`.
-    //
-    // Trace along `clean` (the geometric muzzle→aim direction), not the smoothed `bot.aim`: this
-    // judges the *intended* shot and stays steady frame-to-frame rather than chattering with the aim
-    // spring's lag and drifting error. `on_target` already keeps the emitted view within `cone` of
-    // `clean`, so over the 8u muzzle offset the two directions differ by well under a unit.
-    let lof_clear = if choice.projectile_speed > 0.0 {
+    // Don't fire the *currently held* gun along a grenade-loft view while the weapon switch to the GL
+    // is still pending — the rocket would leave ~18° high. `impulse` above requests the switch; hold
+    // fire until we actually hold the GL (mirrors the grenade combo's `windup`).
+    let switching_to_gl = choice.grenade_arc && game.entities[e].v.weapon != Weapon::GrenadeLauncher;
+
+    // Line-of-fire clearance. For a rocket, trace the real muzzle→aim line (the eye→enemy LoS at the
+    // top doesn't cover the muzzle, so a peeker around a corner could self-splash): trace along
+    // `clean` (the geometric direction), not the smoothed view, so it stays steady frame-to-frame. A
+    // grenade arc already carries its own geometry check — the airborne intercept via its bounce sim,
+    // the grounded lob via `arc_land` — so it skips the straight-line trace (which a lofted arc,
+    // rising well above the muzzle→target chord, would spuriously fail).
+    let lof_clear = if choice.grenade_arc {
+        true
+    } else if s > 0.0 {
         let fwd = bot::angle_vectors(clean).0;
         let muzzle = origin + fwd * 8.0 + Vec3::new(0.0, 0.0, 16.0);
         let tr = game.traceline(muzzle, aim, false, e);
-        // Enemy body in the way ⇒ a direct hit, clear. Otherwise clear only if nothing stopped the
-        // rocket appreciably short of `aim`.
         tr.ent == enemy || (muzzle + (aim - muzzle) * tr.fraction - aim).length() <= LINE_OF_FIRE_SLACK
     } else {
         true // hitscan: the eye-ray LoS above already governs the shot
     };
-    if on_target && lof_clear {
+    if on_target && lof_clear && !switching_to_gl {
         // The engine paces shots via `attack_finished`; holding fire shoots at the weapon's rate.
         cmd.buttons |= BUTTON_ATTACK;
     }
@@ -673,6 +912,67 @@ mod tests {
         // so a high-skill bot's zero base spread stays zero and a low-skill bot never over-tightens.
         for &(v, own, perp) in &[(0.0, 0.0, 0.0), (1.5, 100.0, 200.0), (5.0, 320.0, 1000.0)] {
             assert!(spread_scale(v, own, perp, 400.0) >= 0.7 - 1e-6);
+        }
+    }
+
+    #[test]
+    fn ballistic_intercept_hits_falling_target() {
+        // A crossing, rising target that then falls under gravity; rocket at 1000 ups from below.
+        let from = Vec3::new(0.0, 0.0, 40.0);
+        let g = 800.0;
+        let p0 = Vec3::new(500.0, 0.0, 300.0);
+        let v0 = Vec3::new(0.0, 300.0, 100.0);
+        let s = 1000.0;
+        let pos_at = |t: f32| ballistic_pos(p0, v0, g, None, t);
+        let seed = intercept_time(p0 - from, v0, s).unwrap();
+        let (t, meet) = ballistic_intercept(from, &pos_at, s, seed).expect("intercept");
+        // The meet sits exactly on the projectile sphere |meet − from| = s·t.
+        let residual = ((meet - from).length() - s * t).abs();
+        assert!(residual < 0.1, "off the projectile sphere by {residual}");
+        assert!(t > 0.0);
+    }
+
+    #[test]
+    fn ballistic_pos_lands_and_runs() {
+        let g = 800.0;
+        let p0 = Vec3::new(0.0, 0.0, 100.0);
+        let v0 = Vec3::new(200.0, 0.0, 0.0); // horizontal, falls to the floor at t = 0.5 (x = 100)
+        let land = Some((0.5, Vec3::new(100.0, 0.0, 0.0)));
+        // Before landing: on the parabola, between launch height and the floor.
+        let mid = ballistic_pos(p0, v0, g, land, 0.25);
+        assert!(mid.z > 0.0 && mid.z < 100.0, "mid z {}", mid.z);
+        // After landing: clamped to the floor height, drifting on at the ground speed.
+        let after = ballistic_pos(p0, v0, g, land, 1.0);
+        assert_eq!(after.z, 0.0);
+        assert!((after.x - (100.0 + 200.0 * 0.5)).abs() < 1e-3, "x {}", after.x);
+        // Never predicted below the floor — the whole point of the clamp.
+        assert!(ballistic_pos(p0, v0, g, land, 5.0).z >= 0.0);
+    }
+
+    #[test]
+    fn fire_tolerance_monotonic_and_tight_at_seven() {
+        assert!((fire_tolerance(7.0, true) - 16.0).abs() < 1e-6); // ±hull at skill 7
+        assert!((fire_tolerance(7.0, false) - 40.0).abs() < 1e-6);
+        assert!(fire_tolerance(0.0, true) > fire_tolerance(7.0, true)); // widens as skill drops
+        assert!(fire_tolerance(3.0, true) < fire_tolerance(3.0, false)); // direct tighter than splash
+    }
+
+    #[test]
+    fn miss_distance_small_angle() {
+        // 1° of yaw at 400u ≈ sin(1°)·400 ≈ 6.98u.
+        let m = miss_distance(Vec3::new(0.0, 1.0, 0.0), Vec3::ZERO, 400.0);
+        assert!((m - 6.98).abs() < 0.05, "miss {m}");
+        assert_eq!(miss_distance(Vec3::ZERO, Vec3::ZERO, 400.0), 0.0); // on target
+    }
+
+    #[test]
+    fn miss_distance_saturates_past_quarter_turn() {
+        // The bug this guards: an unclamped sin dips back toward zero (and goes negative past 180°),
+        // so a view aimed away from the solution would read as a *hit*. Any gap ≥90° must saturate to
+        // the full range so the fire gate can never pass a back-to-front shot.
+        for &(dp, dy) in &[(0.0, 175.0), (0.0, 180.0), (60.0, 170.0), (90.0, 90.0)] {
+            let m = miss_distance(Vec3::new(dp, dy, 0.0), Vec3::ZERO, 400.0);
+            assert!((m - 400.0).abs() < 1e-3, "off by {dp},{dy} should saturate to range, got {m}");
         }
     }
 }

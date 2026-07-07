@@ -27,12 +27,12 @@ use crate::entity::EntId;
 use crate::game::GameState;
 
 /// Impulse that selects the grenade launcher.
-const GL_IMPULSE: i32 = 6;
+pub(crate) const GL_IMPULSE: i32 = 6;
 /// Range band in which a lob combo makes sense (closer = fight; farther = out of GL range).
 const LOB_MIN_RANGE: f32 = 200.0;
 const LOB_MAX_RANGE: f32 = 500.0;
 /// Accepted miss of the simulated lob arc vs. the target, for the clearance check.
-const LOB_LAND_TOL: f32 = 48.0;
+pub(crate) const LOB_LAND_TOL: f32 = 48.0;
 /// Blast offset behind the enemy (toward the near side, away from the hazard) so the outward
 /// knockback drives them into it.
 const SHOVE_OFFSET: f32 = 72.0;
@@ -52,7 +52,7 @@ const LOB_AIM_TOL: f32 = 2.5;
 // --- grenade launcher physics (mirrors `w_fire_grenade`, weapons.rs) ---
 
 /// Grenade launch speed: `|(600 forward, 200 up)| = √(600² + 200²)`.
-const GL_SPEED: f32 = 632.455_5;
+pub(crate) const GL_SPEED: f32 = 632.455_5;
 /// Fixed loft of the launch above the view-forward direction: `atan2(200, 600)`.
 const GL_LOFT_DEG: f32 = 18.434_95;
 /// Grenade fuse (seconds) before it self-detonates.
@@ -104,6 +104,50 @@ pub(crate) fn solve_lob(p0: Vec3, b: Vec3, s: f32, g: f32, high: bool) -> Option
     }
     let yaw = to.y.atan2(to.x).to_degrees();
     Some((Vec3::new(pitch.clamp(-80.0, 80.0), yaw, 0.0), flight))
+}
+
+/// Solve the view angles that intercept a **free-falling** enemy with a grenade. The trick: gravity
+/// pulls the grenade and the airborne enemy down by the same `½g·t²`, so it *cancels* in relative
+/// motion — the meet reduces to the straight-line intercept ([`combat::intercept_time`]) at the
+/// fixed launch speed [`GL_SPEED`]. The required launch velocity is then `v_g = (e_pos − p0)/t +
+/// e_vel` (its magnitude is `GL_SPEED` by that construction), and the view pitch removes the fixed
+/// [`GL_LOFT_DEG`] loft just like [`solve_lob`] (`pitch = loft − elevation`). Grenades spawn at the
+/// player origin, so `p0` is exact. Returns `(look, flight_time, meet_point)`; `None` when the
+/// enemy outruns the grenade, the flight can't finish before the fuse, or the view pitch clamps.
+///
+/// The engine adds a ±10 u launch spread (`w_fire_grenade`) — about 0.9°, ~6 u at 400 u, inside the
+/// ±16 u hull at airshot ranges — so the closed-form solve lands the touch explosion in practice.
+pub(crate) fn solve_air_intercept(p0: Vec3, e_pos: Vec3, e_vel: Vec3, g: f32) -> Option<(Vec3, f32, Vec3)> {
+    let t = crate::bot::combat::intercept_time(e_pos - p0, e_vel, GL_SPEED)?;
+    // The grenade touch-explodes on the enemy, so only the fuse bounds the flight; leave a margin.
+    if !(0.1..(GL_FUSE - 0.15)).contains(&t) {
+        return None;
+    }
+    let v_g = (e_pos - p0) / t + e_vel;
+    let horiz = v_g.xy().length();
+    let elev = v_g.z.atan2(horiz.max(1.0)); // launch elevation above horizontal (radians)
+    let mut pitch = GL_LOFT_DEG - elev.to_degrees();
+    if pitch == 0.0 {
+        pitch = -0.01; // v_angle.x == 0 takes a different velocity branch in w_fire_grenade
+    }
+    if !(-80.0..=80.0).contains(&pitch) {
+        return None; // out of the view-pitch range; the loft would bend the solution
+    }
+    let yaw = v_g.y.atan2(v_g.x).to_degrees();
+    // Where they actually meet in the world (both dropped by ½g·t²) — for aim memory and the gate.
+    let meet = e_pos + e_vel * t - Vec3::new(0.0, 0.0, 0.5 * g * t * t);
+    Some((Vec3::new(pitch, yaw, 0.0), t, meet))
+}
+
+/// Solve a flat lob onto a **grounded, moving** target's feet, leading its horizontal motion over
+/// the flight: solve once to get the flight time, advance the feet by `vel_xy·flight`, re-solve. Two
+/// rounds settle a strafing target well inside the blast. Returns `(look, flight_time, led_feet)`;
+/// `None` when even the static lob is out of range. Used as the RL-less fallback in [`combat::engage`].
+pub(crate) fn solve_ground_lead(p0: Vec3, feet: Vec3, vel_xy: Vec3, g: f32) -> Option<(Vec3, f32, Vec3)> {
+    let (_, flight) = solve_lob(p0, feet, GL_SPEED, g, false)?;
+    let led = feet + vel_xy * flight;
+    let (look, flight) = solve_lob(p0, led, GL_SPEED, g, false)?;
+    Some((look, flight, led))
 }
 
 /// Estimate whether the knockback from a blast at `b` actually carries the enemy across the hazard
@@ -1111,5 +1155,68 @@ mod tests {
         assert!(!shove_reaches(ec, eo, b, dir, 400.0), "shouldn't clear a 400u edge");
         // Wrong-direction hazard: pushing +x doesn't help a −x hazard.
         assert!(!shove_reaches(ec, eo, b, Vec3::new(-1.0, 0.0, 0.0), 50.0));
+    }
+
+    /// End-to-end proof of the gravity-cancellation trick: integrate the solved launch *and* the
+    /// free-falling enemy under the same gravity to the solved flight time — they should meet.
+    /// Repeated at g=800 and g=100 (e1m8) to show the solve is gravity-value-independent.
+    #[test]
+    fn air_intercept_meets_falling_enemy() {
+        for &g in &[800.0f32, 100.0] {
+            let p0 = Vec3::new(0.0, 0.0, 40.0);
+            for &(e_pos, e_vel) in &[
+                (Vec3::new(400.0, 0.0, 120.0), Vec3::new(0.0, 200.0, 250.0)), // rising + crossing
+                (Vec3::new(300.0, 150.0, 200.0), Vec3::new(-100.0, 0.0, -150.0)), // falling
+                (Vec3::new(250.0, -200.0, 90.0), Vec3::new(120.0, 60.0, 0.0)), // level dash
+            ] {
+                let (look, t, _meet) = solve_air_intercept(p0, e_pos, e_vel, g).expect("intercept exists");
+                let drop = Vec3::new(0.0, 0.0, 0.5 * g * t * t);
+                let grenade = p0 + launch_velocity(look) * t - drop;
+                let enemy = e_pos + e_vel * t - drop;
+                assert!(
+                    (grenade - enemy).length() < 5.0,
+                    "g={g}: grenade and enemy miss by {} at t={t}",
+                    (grenade - enemy).length()
+                );
+            }
+        }
+    }
+
+    /// The solved view really does launch along the required velocity (the loft subtraction, incl.
+    /// the pitch-0 nudge, is exact).
+    #[test]
+    fn air_intercept_view_roundtrip() {
+        let p0 = Vec3::new(0.0, 0.0, 40.0);
+        let e_pos = Vec3::new(350.0, 120.0, 160.0);
+        let e_vel = Vec3::new(-80.0, 40.0, 120.0);
+        let (look, t, _) = solve_air_intercept(p0, e_pos, e_vel, G).unwrap();
+        let want = (e_pos - p0) / t + e_vel; // required launch velocity
+        let got = launch_velocity(look);
+        assert!((got - want).length() < 1.0, "launch {got:?} vs required {want:?}");
+    }
+
+    #[test]
+    fn air_intercept_rejects_unreachable() {
+        let p0 = Vec3::ZERO;
+        // Receding straight away faster than the grenade flies → no positive intercept.
+        assert!(solve_air_intercept(p0, Vec3::new(400.0, 0.0, 0.0), Vec3::new(900.0, 0.0, 0.0), G).is_none());
+        // Very far → the flight exceeds the fuse window.
+        assert!(solve_air_intercept(p0, Vec3::new(4000.0, 0.0, 0.0), Vec3::ZERO, G).is_none());
+    }
+
+    /// The grounded lead-lob lands on the *led* point (where a strafing target will be), not where
+    /// it started.
+    #[test]
+    fn lead_lob_lands_on_moving_target() {
+        let p0 = Vec3::new(0.0, 0.0, 0.0);
+        let feet = Vec3::new(350.0, 0.0, 0.0);
+        let vel = Vec3::new(0.0, 150.0, 0.0); // strafing sideways
+        let (look, flight, led) = solve_ground_lead(p0, feet, vel, G).expect("solves");
+        let landed = p0 + launch_velocity(look) * flight - Vec3::new(0.0, 0.0, 0.5 * G * flight * flight);
+        assert!(
+            (landed.xy() - led.xy()).length() < LOB_LAND_TOL,
+            "landed {landed:?} vs led {led:?}"
+        );
+        assert!(led.y > feet.y, "must lead the +y strafe");
     }
 }
