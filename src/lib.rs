@@ -43,6 +43,7 @@ mod obituary;
 mod plats;
 mod player;
 mod qphys;
+mod race;
 mod rotate;
 mod server;
 mod spawn;

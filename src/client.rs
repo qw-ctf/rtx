@@ -519,7 +519,12 @@ impl GameState {
             // ground jump's impulse is applied by the engine's pmove, but nothing lifts us
             // mid-air, so both set velocity themselves.
             if !self.try_wall_jump(e) {
-                if self.entities[e].combat.air_jumped || !self.host.cvar_bool(c"rtx_doublejump") {
+                // The double jump is off in stock-movement modes (race) — its maps are authored
+                // without it, and bots' undershoot-recovery air jump flows through here too.
+                if self.entities[e].combat.air_jumped
+                    || !self.host.cvar_bool(c"rtx_doublejump")
+                    || self.mode.stock_movement_only()
+                {
                     return;
                 }
                 // Don't double-jump when about to land (or just after takeoff) — preserves bunny
@@ -600,7 +605,7 @@ impl GameState {
         /// How long after last riding a rising lift a jump still gets the boost.
         const GRACE: f32 = 0.4;
         let mult = self.host.cvar(c"rtx_elevator_jump");
-        if mult == 0.0 {
+        if mult == 0.0 || self.mode.stock_movement_only() {
             return false;
         }
         let now = self.time();
@@ -634,7 +639,7 @@ impl GameState {
         /// Upward velocity imparted by the kick.
         const UP: f32 = 270.0;
 
-        if !self.host.cvar_bool(c"rtx_walljump") {
+        if !self.host.cvar_bool(c"rtx_walljump") || self.mode.stock_movement_only() {
             return false;
         }
         let (origin, vel) = {

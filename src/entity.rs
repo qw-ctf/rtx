@@ -392,6 +392,9 @@ pub struct Entity {
     pub mode_p: ModePlayer,
     /// CTF flag state — only meaningful on the two flag entities (`flag.team != 0`).
     pub flag: FlagState,
+    /// Race-route map keys — only meaningful on `race_route_start`/`race_route_marker`
+    /// entities, which live just long enough to be folded into `GameState.race` at load.
+    pub race: RaceEnt,
 }
 
 #[derive(Default)]
@@ -588,6 +591,30 @@ pub struct FlagState {
     /// World time a dropped flag auto-returns.
     pub return_at: f32,
     pub phase: FlagPhase,
+}
+
+/// Race-route entity data (`race_route_start`/`race_route_marker` map keys), carried only
+/// long enough for `load_race_routes` to fold the markers into [`crate::race::RaceState`]
+/// at the end of entity spawn — the marker entities are freed right after. See [`crate::race`].
+#[derive(Default)]
+pub struct RaceEnt {
+    /// `race_route_name` / `race_route_description` — route identity (both mandatory in ktx).
+    pub name: Option<Box<str>>,
+    pub desc: Option<Box<str>>,
+    /// `race_route_timeout` — seconds allowed for a run.
+    pub timeout: f32,
+    /// `race_route_weapon_mode` / `race_route_falsestart_mode` — ktx enum ints, validated
+    /// when the route is built.
+    pub weapon_mode: f32,
+    pub falsestart_mode: f32,
+    /// `race_route_start_yaw` / `race_route_start_pitch` — the racer's spawn view angles.
+    pub start_yaw: f32,
+    pub start_pitch: f32,
+    /// The `size` map key — a marker's touch-box extent (kept off `v.mins`/`v.maxs`; these
+    /// markers never enter collision).
+    pub size: Vec3,
+    /// `race_flags` — ktx teleport touch flags; parked for a future full race ruleset.
+    pub flags: f32,
 }
 
 // The engine writes 8-byte native pointers into `string_refs` via unaligned-looking but

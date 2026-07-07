@@ -21,7 +21,7 @@ use crate::game_command::GameCommand;
 use crate::host::{CvarValue, HostApi, SyscallFn};
 use crate::mode::{self, ArenaState, GameMode};
 use crate::world;
-use crate::{bot, defs, ext_field, navmesh};
+use crate::{bot, defs, ext_field, navmesh, race};
 
 /// Matches `MAX_EDICTS` in `ktx/include/q_shared.h`.
 pub const MAX_EDICTS: usize = 2048;
@@ -76,6 +76,10 @@ const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // Game mode (ruleset): `dm` (deathmatch, the default), `ra` (Rocket Arena), `midair`, or
         // `ctf`. Read live each frame. A string cvar. See `crate::mode`.
         ("rtx_mode", Str("dm")),
+        // Race (`rtx_mode race`): which of the map's routes is being run (0-based index into the
+        // loaded routes, clamped; see `crate::race`). Read live — changing it mid-map moves
+        // everyone to the new route's start.
+        ("rtx_race_route", Float(0.0)),
         // Match composition (organization), orthogonal to the mode: `""` (auto — the mode's natural
         // default), `ffa` (open free-for-all), or a team format `1on1`/`duel`/`2on2`/`2on2on2`/…
         // (a locked N×M match). `ra` ignores this (its 1v1 round queue is fixed). See `crate::mode`.
@@ -225,6 +229,9 @@ pub struct GameState {
     ext_fields: ext_field::ExtFields,
     /// Auto-generated navmesh for the current map (bot navigation). Rebuilt each map load.
     pub(crate) nav: navmesh::NavState,
+    /// The map's KTX race routes (from `race/routes/*.route` and/or embedded
+    /// `race_route_*` entities), loaded at the end of `load_entities`. See [`crate::race`].
+    pub(crate) race: race::RaceState,
     /// Shared, observation-gated opponent hypotheses (per-side strength/arsenal estimates). Reset to
     /// the mode's spawn kit each map load in `mode::on_worldspawn`. See [`crate::bot::model`].
     pub(crate) opponents: bot::model::OpponentModel,
@@ -296,6 +303,7 @@ impl GameState {
             rng: 0x2545_f491, // nonzero default; reseeded in GAME_INIT
             ext_fields: ext_field::ExtFields::default(),
             nav: navmesh::NavState::default(),
+            race: race::RaceState::default(),
             opponents: bot::model::OpponentModel::default(),
             bot_frame_seen: false,
             map_spawned: false,
@@ -573,8 +581,10 @@ impl GameState {
     fn load_entities(&mut self) -> isize {
         self.level.deathmatch = self.host.cvar(c"deathmatch") as i32;
         self.level.skill = self.host.cvar(c"skill") as i32;
-        // Fresh map: drop any prior navmesh so it's rebuilt lazily when bots are next wanted.
+        // Fresh map: drop any prior navmesh so it's rebuilt lazily when bots are next wanted,
+        // and the previous map's race routes with it.
         self.nav = navmesh::NavState::default();
+        self.race = race::RaceState::default();
 
         // The worldspawn block configures `world` and runs the global precaches.
         let Some(world_fields) = self.parse_block() else {
@@ -593,6 +603,9 @@ impl GameState {
             self.spawn_entity(&fields);
             self.host.flush_signon();
         }
+        // Fold any race-route data (route file and/or embedded marker entities) into
+        // `self.race` — mirrors ktx loading routes at the end of G_SpawnEntitiesFromString.
+        self.load_race_routes();
         // Precaches issued and entities spawned — frames may now spawn players/bots safely.
         self.map_spawned = true;
         1

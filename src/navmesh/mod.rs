@@ -36,9 +36,16 @@ use crate::qphys::{AIR_CAP, JUMP_VZ};
 const STEP_HEIGHT: f32 = 18.0;
 /// Height delta treated as effectively flat ground (a `Walk`).
 const WALK_DZ: f32 = 8.0;
-/// Largest one-way drop we'll encode as a `Drop` link (taller falls are pruned, not least
-/// because fall damage starts to bite — handled in cost).
-const MAX_DROP: f32 = 240.0;
+/// Largest one-way fall we'll encode as a landing (`Drop` links, and `JumpGap` links that leap
+/// out and plunge). Deliberately huge: QW fall damage is a flat 5 HP past the 650 u/s landing
+/// threshold, and deliberate multi-thousand-unit plunges are core movement — race maps are
+/// *built* around them. The cost carries the real fall time (see `link_cost`), so a bot never
+/// prefers a pit over a lift without reason.
+const MAX_DROP: f32 = 4096.0;
+/// Double jumps keep the old, shallow landing floor: descent is already covered by the cheaper
+/// Drop/JumpGap kinds, and the double-jump dedup is per-octant *without* elevation bands — a
+/// deep pit target would shadow the level crossing the link kind exists for.
+const DJ_MAX_DROP: f32 = 240.0;
 /// Fall height beyond which QW fall damage applies (`MAX_SAFE_FALL` ≈ when speed > 580).
 const SAFE_FALL: f32 = 88.0;
 /// Apex a standing jump adds: `jump_vel² / (2·gravity)` = `270² / 1600`.
@@ -64,13 +71,23 @@ const SJ_TICKRATE: f32 = 72.0;
 /// Speed we'll plan bhop runways up to (reach ≈ `V·0.675` ≈ 600u); real runways bound it further.
 const SPEED_JUMP_V_CAP: f32 = 900.0;
 /// Derate the ideal bhop model to attainable speed (the S-weave + a friction frame per landing).
+/// Calibrated against the controller's own pmove-oracle sim (`bhop::sim`): a 10s run covers
+/// ~4500u and lands at ~0.75 of the ideal `(v0³+3k·len)^⅓` — 0.8 rides just above it, with
+/// [`SJ_MARGIN`] absorbing the difference.
 const BHOP_EFF: f32 = 0.8;
-/// Longest runway we bother measuring.
-const RUNWAY_MAX: f32 = 2048.0;
+/// Longest runway we bother measuring. Sized so the model can credit the speeds the controller
+/// demonstrably reaches (its sim sustains gains past 550 u/s over ~4500u): at 4096u the
+/// effective takeoff is ~605 u/s — flat gaps to ~350u, dropping gaps to ~620u — where the old
+/// 2048 cap forfeited everything past ~490 u/s. Race maps are what need the far end.
+const RUNWAY_MAX: f32 = 4096.0;
 /// The measured runway must reach this multiple of the jump's required entry speed.
 const SJ_MARGIN: f32 = 1.15;
 /// Walkable floor must continue this far past the landing (the takeoff-phase window).
 const SJ_LANDING_DEPTH: f32 = 96.0;
+/// Speed-jump landing floor — separate from (and smaller than) [`MAX_DROP`] because the
+/// target-scan radius grows with fall airtime (`reach = v · t`): 1024 quadruples the old 240
+/// envelope while keeping the per-ledge scan bounded.
+const SJ_MAX_DROP: f32 = 1024.0;
 /// At most this many speed-jump links per source cell.
 const SPEED_JUMP_MAX_PER_CELL: usize = 3;
 
@@ -434,10 +451,26 @@ impl NavGraph {
         self.links.push(link);
     }
 
-    /// A grounded move (walk/step/drop) to a grid-adjacent cell, if the path is clear.
+    /// A grounded move (walk/step/drop) to a grid-adjacent cell, if the path is clear. An
+    /// adjacent rise between step height and a standing jump's apex — a knee-high ledge or a
+    /// slope too steep for a free step — is a short **hop up** (a `JumpGap`): pmove needs a jump
+    /// to mount it, but it's basic movement (all modes), not a gap leap. Taller rises need the
+    /// windowed ledge jumps in [`find_jumps`].
     fn classify_grounded(&self, bsp: &Bsp, from: CellId, to: CellId) -> Option<Link> {
         let (a, b) = (self.cells[from as usize], self.cells[to as usize]);
         let dz = b.origin.z - a.origin.z;
+        if dz > STEP_HEIGHT && dz <= JUMP_APEX {
+            // Hop up onto the adjacent higher footing; clear the standing-jump arc to it.
+            return arc_clear(bsp, a.origin, b.origin).then(|| {
+                let horiz = (b.origin.xy() - a.origin.xy()).length();
+                Link {
+                    from,
+                    to,
+                    kind: LinkKind::JumpGap,
+                    cost: link_cost(LinkKind::JumpGap, horiz, dz),
+                }
+            });
+        }
         let kind = if dz.abs() <= WALK_DZ {
             LinkKind::Walk
         } else if dz.abs() <= STEP_HEIGHT {
@@ -445,7 +478,7 @@ impl NavGraph {
         } else if (-MAX_DROP..-STEP_HEIGHT).contains(&dz) {
             LinkKind::Drop
         } else {
-            return None; // up beyond step height — needs a jump, handled separately
+            return None; // up beyond a jump's apex — needs the windowed ledge jumps
         };
         if !path_clear(bsp, a.origin, b.origin) {
             return None;
@@ -488,7 +521,14 @@ impl NavGraph {
             if self.has_ground_near(a.gx + dgx.signum(), a.gy + dgy.signum(), a.origin.z) {
                 continue;
             }
-            if !arc_clear(bsp, a.origin, b.origin) {
+            // Shallow crossings check the symmetric hop parabola; a deep plunge flies a very
+            // different path (out at run speed, then mostly straight down), so sample that.
+            let clear = if dz < -JUMP_ELEV_SPAN {
+                ballistic_clear(bsp, a.origin, b.origin)
+            } else {
+                arc_clear(bsp, a.origin, b.origin)
+            };
+            if !clear {
                 continue;
             }
             let slot = &mut best[dir_bucket(dgx, dgy)][jump_elev_band(dz)];
@@ -527,7 +567,7 @@ impl NavGraph {
                 }
                 let dz = b.origin.z - a.origin.z;
                 let horiz = (b.origin.xy() - a.origin.xy()).length();
-                if !(-MAX_DROP..=DOUBLE_JUMP_APEX).contains(&dz) || horiz > DOUBLE_JUMP_REACH {
+                if !(-DJ_MAX_DROP..=DOUBLE_JUMP_APEX).contains(&dz) || horiz > DOUBLE_JUMP_REACH {
                     continue;
                 }
                 // Only worthwhile beyond a single jump — otherwise `find_jumps` already linked it.
@@ -567,6 +607,12 @@ impl NavGraph {
     /// runway feeding it, cap the attainable speed to that, and link the widest reachable targets —
     /// but with `from` set to the *runway start* so A* commits the whole run-up (the bot is thus
     /// guaranteed the speed). Only where a plain/double jump can't already make it. Gated on bhop.
+    /// Known limitation: each link's speed budget assumes the run starts at `sv_maxspeed` on
+    /// this runway — speed carried in from a *previous* speed jump's landing is not credited,
+    /// so a chain of gaps with only a short platform between them models as unroutable even
+    /// though a human carries the first jump's speed straight into the second. Crediting it
+    /// needs speed-state-aware pathfinding, not a per-link tweak; the race mode's routability
+    /// report names the exact legs that would need it.
     pub fn add_speed_jumps(&mut self, bsp: &Bsp, params: SpeedJumpParams, double_jump: bool) {
         let k = bhop_k(params.accel, params.maxspeed);
         let mut pending: Vec<(Link, SpeedJumpTraversal)> = Vec::new();
@@ -600,7 +646,7 @@ impl NavGraph {
             if v_max * jump_airtime(0.0, params.gravity) <= JUMP_REACH + 1.0 {
                 continue; // this runway buys nothing past a normal jump
             }
-            let reach_cap = v_max * jump_airtime(-MAX_DROP, params.gravity);
+            let reach_cap = v_max * jump_airtime(-SJ_MAX_DROP, params.gravity);
             let scan = ((reach_cap / GRID).ceil() as i32).max(1);
             let mut best: Option<(f32, Link, SpeedJumpTraversal)> = None;
             for to in self.neighbors_within(a.gx, a.gy, scan) {
@@ -614,7 +660,7 @@ impl NavGraph {
                 }
                 let dz = b.origin.z - a.origin.z;
                 let horiz = (b.origin.xy() - a.origin.xy()).length();
-                if !(-MAX_DROP..=JUMP_APEX).contains(&dz) || horiz <= JUMP_REACH {
+                if !(-SJ_MAX_DROP..=JUMP_APEX).contains(&dz) || horiz <= JUMP_REACH {
                     continue;
                 }
                 // Skip what a double jump already covers (when enabled), and any existing direct link.
@@ -1398,11 +1444,19 @@ pub struct LinkCounts {
 /// prefers grounded routes and avoids damaging falls.
 fn link_cost(kind: LinkKind, horiz: f32, dz: f32) -> f32 {
     let base = horiz.max(GRID) / MAX_SPEED;
+    // A landing below the takeoff adds its real ballistic fall time (nominal gravity), plus a
+    // beat past SAFE_FALL for the hard-landing tax (the flat 5 HP + the recovery stumble) — so
+    // a 2000u plunge prices its ~2.2s honestly instead of looking free.
+    let fall = if -dz > SAFE_FALL {
+        (2.0 * -dz / 800.0).sqrt() + 0.4
+    } else {
+        0.0
+    };
     match kind {
         LinkKind::Walk => base,
         LinkKind::Step => base * 1.1,
-        LinkKind::Drop => base + if -dz > SAFE_FALL { 1.0 } else { 0.1 },
-        LinkKind::JumpGap => base + 0.3,
+        LinkKind::Drop => base + 0.1 + fall,
+        LinkKind::JumpGap => base + 0.3 + fall,
         // A double jump is a touch pricier — a harder maneuver (two timed jumps) than a single hop.
         LinkKind::DoubleJump => base + 0.6,
         // Speed-jump costs (runway run-up + flight + commitment) are computed at splice time.
@@ -1450,6 +1504,26 @@ fn path_clear(bsp: &Bsp, a: Vec3, b: Vec3) -> bool {
 /// above the higher endpoint and require every point to be open.
 fn arc_clear(bsp: &Bsp, a: Vec3, b: Vec3) -> bool {
     arc_clear_peak(bsp, a, b, JUMP_APEX, 8)
+}
+
+/// Clearance along the **true ballistic path** of a run-jump onto a target far below. The
+/// symmetric parabola of [`arc_clear_peak`] interpolates z against *horizontal* progress, which
+/// on a deep plunge dives toward the floor midway — the real jump keeps most of its height
+/// early (constant horizontal speed, quadratic fall), so sample z(t) with nominal gravity and
+/// xy linear in t.
+fn ballistic_clear(bsp: &Bsp, a: Vec3, b: Vec3) -> bool {
+    let t_land = jump_airtime(b.z - a.z, 800.0);
+    if t_land <= 0.0 {
+        return false;
+    }
+    let steps = ((a.distance(b) / 64.0).ceil() as i32).clamp(8, 48);
+    (0..=steps).all(|i| {
+        let f = i as f32 / steps as f32;
+        let t = t_land * f;
+        let xy = a.xy().lerp(b.xy(), f);
+        let z = a.z + JUMP_VZ * t - 400.0 * t * t; // ½·800·t²
+        !bsp.is_solid(Vec3::new(xy.x, xy.y, z))
+    })
 }
 
 /// [`arc_clear`] with a caller-chosen apex height (for the taller double-jump arc) and step count.
@@ -1522,15 +1596,15 @@ fn dir_bucket(dgx: i32, dgy: i32) -> usize {
 /// walk on); a band apart they are distinct destinations that must not shadow each other.
 const JUMP_ELEV_SPAN: f32 = 128.0;
 /// Band indices a jump target can occupy: `round(dz / JUMP_ELEV_SPAN)` over the jump's dz gate
-/// `[-MAX_DROP, JUMP_APEX]` = `[-240, 45]` gives `{-2, -1, 0}`.
-const JUMP_ELEV_BANDS: usize = 3;
+/// `[-MAX_DROP, JUMP_APEX]` — bands `{-(MAX_DROP/SPAN) .. 0}`, sized from the constants.
+const JUMP_ELEV_BANDS: usize = (MAX_DROP / JUMP_ELEV_SPAN) as usize + 1;
 
 /// Elevation band of a jump target's height delta, as an index into `0..JUMP_ELEV_BANDS`.
-/// `round`, not `floor`, so band 0 is centred on "level with the takeoff": a −16u ledge-to-ledge
-/// crossing and a −128u drop to the pit floor under it must land in different bands (with
-/// `floor` both would hit band −1 and the nearer pit drop would win the dedup).
+/// `round`, not `floor`, so the top band is centred on "level with the takeoff": a −16u
+/// ledge-to-ledge crossing and a −128u drop to the pit floor under it must land in different
+/// bands (with `floor` both would hit the same band and the nearer pit drop would win the dedup).
 fn jump_elev_band(dz: f32) -> usize {
-    (((dz / JUMP_ELEV_SPAN).round() as i32) + 2).clamp(0, JUMP_ELEV_BANDS as i32 - 1) as usize
+    (((dz / JUMP_ELEV_SPAN).round() as i32) + JUMP_ELEV_BANDS as i32 - 1).clamp(0, JUMP_ELEV_BANDS as i32 - 1) as usize
 }
 
 /// Per-map navigation state, reset each map load. Lives on `GameState`.
@@ -1895,7 +1969,7 @@ mod tests {
             let dz = b.z - a.z;
             let horiz = (b.xy() - a.xy()).length();
             assert!(
-                horiz <= DOUBLE_JUMP_REACH && (-MAX_DROP..=DOUBLE_JUMP_APEX).contains(&dz),
+                horiz <= DOUBLE_JUMP_REACH && (-DJ_MAX_DROP..=DOUBLE_JUMP_APEX).contains(&dz),
                 "double-jump link out of envelope: dz={dz} horiz={horiz}"
             );
             assert!(

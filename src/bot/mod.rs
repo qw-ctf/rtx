@@ -358,6 +358,11 @@ struct Objective {
     enemy: Option<EntId>,
     /// Chasing a committed item goal (idle pickup or greedy combat detour).
     chasing: bool,
+    /// Stop [`POLITE_DIST`] short of the destination — set only when tailing a human (the
+    /// pacifist override / no-goal follow fallback) or idle-roaming. A mode-issued Move must be
+    /// walked all the way onto: a race checkpoint is a hull-sized touch box, and stopping 64u
+    /// out would park the runner just outside it forever.
+    polite: bool,
     /// Standing vigil over an uncollectable goal item (cruising/scanning near it) — exempts the
     /// stuck/progress watchdogs and drives the eyes with the scan sweep.
     vigil: bool,
@@ -490,11 +495,15 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // drive combat or audience-roaming; FFA hunts the nearest player. Every mode-specific bot
     // adaptation lives behind this one hook — the rest of run_bot stays mode-agnostic and reusable.
     let mode = game.mode;
+    // Whether to stop politely short of the destination (see `Objective::polite`) — flagged at
+    // the arms that tail a human or roam, never for a mode-issued intent.
+    let mut polite = false;
     let intent = if crate::mode::team::benched(game, e) {
         // Benched spectator (structured match, off the locked roster): stroll the stands, no fighting.
         Some(BotIntent::Move(crate::mode::wander_point(game, e, "info_player_deathmatch", |_| None)))
     } else if host.cvar_bool(c"rtx_bot_pacifist") {
         // Global override, any mode: don't fight — just tail the nearest human around the map.
+        polite = true;
         nearest_human(game, e).map(|h| BotIntent::Move(game.entities[h].v.origin))
     } else {
         mode.bot_intent(game, e)
@@ -639,6 +648,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         Some(BotIntent::Spectate { goal, .. }) => (goal, None),
         None if chasing => vigil.unwrap_or(goal_item_org),
         None => {
+            polite = true; // following / roaming: no need to stand on the exact spot
             if let Some(h) = nearest_human(game, e) {
                 (game.entities[h].v.origin, None)
             } else {
@@ -675,7 +685,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         _ => None,
     };
 
-    Objective { hooking, on_sj, on_rj, enemy, chasing, vigil: vigil.is_some(), target_origin, item_cell, watch_point }
+    Objective { hooking, on_sj, on_rj, enemy, chasing, polite, target_origin, item_cell, watch_point, vigil: vigil.is_some() }
 }
 
 /// Turn the frame's accumulated decisions into the engine usercmd. Bunnyhopping bypasses the aim
@@ -847,7 +857,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
 
     let idle = |angles: Vec3| host.set_bot_cmd(client, msec, angles, 0, 0, 0, 0, 0);
 
-    let Objective { hooking, on_sj, on_rj, enemy, chasing, vigil, target_origin, item_cell, watch_point } =
+    let Objective { hooking, on_sj, on_rj, enemy, chasing, polite, vigil, target_origin, item_cell, watch_point } =
         resolve_objective(game, e, now, origin, client);
 
     // Whether weapons may fire right now (a match-mode countdown locks them out). Read before the nav
@@ -1484,11 +1494,13 @@ fn run_bot(game: &mut GameState, e: EntId) {
     }
 
     let (mut forward, mut side, mut buttons, mut impulse) = (0, 0, 0, 0);
-    // Politely stop short only when tailing a human; when fetching an item, walk right onto it so
-    // the pickup's touch fires — and when hunting an enemy, never stop short (otherwise the bot
-    // halts 64u away and just stands there, e.g. right at a door between it and its target; the
-    // combat layer manages the actual fighting distance once it has line of sight).
-    let close_enough = final_leg && !chasing && enemy.is_none() && dist <= POLITE_DIST;
+    // Politely stop short only when tailing a human or roaming (`Objective::polite`). Everything
+    // else walks all the way in: an item pickup needs its touch to fire, a race checkpoint is a
+    // hull-sized touch box, and when hunting an enemy stopping short would halt the bot 64u out
+    // — e.g. right at a door between it and its target (the combat layer manages the actual
+    // fighting distance once it has line of sight). `polite` is never set alongside a chase or
+    // a Fight intent, so it alone decides.
+    let close_enough = final_leg && polite && dist <= POLITE_DIST;
     if !close_enough {
         let (fwd, right, _) = angle_vectors(angles);
         let dir = Vec3::new(to_wp.x, to_wp.y, 0.0).normalize_or_zero();

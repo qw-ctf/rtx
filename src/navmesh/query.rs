@@ -189,6 +189,11 @@ impl NavGraph {
         self.links[link_idx as usize].kind
     }
 
+    /// A link's base travel-time cost in seconds (no live gate/per-bot surcharges).
+    pub fn link_cost(&self, link_idx: u32) -> f32 {
+        self.links[link_idx as usize].cost
+    }
+
     /// The standing player-origin position of a cell (the point a bot steers toward).
     pub fn cell_origin(&self, cell: CellId) -> Vec3 {
         self.cells[cell as usize].origin

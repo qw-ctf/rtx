@@ -89,16 +89,20 @@ impl GameState {
         let plats = self.collect_plats();
         let teleports = self.collect_teleports();
         let gates = self.collect_gates();
+        // A stock-movement mode (race) bans grapple / double-jump / rocket-jump traversal, so
+        // their links must not exist in the graph at all — bots then can't plan them, and a
+        // failed pathfind (the race routability check) is a truthful "not traversable".
+        let stock = self.mode.stock_movement_only();
         // Hook links are only worth building when the map hands out the grapple. Snapshot the live
         // physics (gravity is 100 on e1m8; the hook speeds are tunable) so the arc solver on the
         // worker thread matches how the hook will actually fly in-game.
-        let hooks = self.host.cvar_bool(c"rtx_grapple").then(|| navmesh::HookParams {
+        let hooks = (!stock && self.host.cvar_bool(c"rtx_grapple")).then(|| navmesh::HookParams {
             gravity: self.host.cvar(c"sv_gravity").max(1.0),
             pull: navmesh::HOOK_PULL_BASE * self.host.cvar(c"rtx_hook_pull"),
             throw: navmesh::HOOK_THROW_BASE * self.host.cvar(c"rtx_hook_speed"),
         });
         // Double-jump links: only when the map allows the mid-air jump, so bots plan the wider gaps.
-        let double_jump = self.host.cvar_bool(c"rtx_doublejump");
+        let double_jump = !stock && self.host.cvar_bool(c"rtx_doublejump");
         // Speed-jump links (bhop-carried leaps): only when bots bunnyhop, with the physics that turn
         // a runway length into attainable speed.
         let speed_jump = self.host.cvar_bool(c"rtx_bot_bhop").then(|| navmesh::SpeedJumpParams {
@@ -122,7 +126,7 @@ impl GameState {
         });
         // Rocket-jump links: only when bots may rocket-jump. Snapshot gravity and the `rj` self-boost
         // cvar (off by default) so the offline blast solve matches the live knockback.
-        let rocket_jump = self.host.cvar_bool(c"rtx_bot_rocketjump").then(|| navmesh::RocketJumpParams {
+        let rocket_jump = (!stock && self.host.cvar_bool(c"rtx_bot_rocketjump")).then(|| navmesh::RocketJumpParams {
             gravity: self.host.cvar(c"sv_gravity").max(1.0),
             rj_extra: self.host.cvar(c"rj"),
         });

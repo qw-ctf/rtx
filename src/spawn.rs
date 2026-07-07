@@ -238,6 +238,10 @@ impl GameState {
             // path_corner waypoints are inert markers used by trains.
             "path_corner" => SpawnAction::Keep,
 
+            // race.rs — embedded race-route data carriers, folded into `GameState.race` (and
+            // freed) by `load_race_routes` at the end of entity spawn.
+            "race_route_start" | "race_route_marker" => SpawnAction::Keep,
+
             // rotate.rs — Hipnotic rotating brushes
             "func_rotate_entity" => SpawnAction::Spawn(GameState::spawn_func_rotate_entity),
             "func_rotate_train" => SpawnAction::Spawn(GameState::spawn_func_rotate_train),
@@ -351,6 +355,18 @@ impl GameState {
             "path" => ent.path = Some(value.into()),
             "event" => ent.event = Some(value.into()),
             "group" => ent.group = Some(value.into()),
+            // race.rs keys (race_route_start / race_route_marker data carriers).
+            "race_route_name" => ent.race.name = Some(value.into()),
+            "race_route_description" => ent.race.desc = Some(value.into()),
+            "race_route_timeout" => ent.race.timeout = parse_f32(value),
+            "race_route_weapon_mode" => ent.race.weapon_mode = parse_f32(value),
+            "race_route_falsestart_mode" => ent.race.falsestart_mode = parse_f32(value),
+            "race_route_start_yaw" => ent.race.start_yaw = parse_f32(value),
+            // ktx's field table aliases pitch onto yaw (g_spawn.c:150) — a latent bug we
+            // deliberately don't replicate; every shipped map uses 0/0 anyway.
+            "race_route_start_pitch" => ent.race.start_pitch = parse_f32(value),
+            "race_flags" => ent.race.flags = parse_f32(value),
+            "size" => ent.race.size = parse_vec3(value),
             _ => {}
         }
     }

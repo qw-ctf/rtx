@@ -65,7 +65,7 @@ mode doesn't touch the generic gameplay or bot code.
 
 | cvar | default | what it does |
 |------|---------|--------------|
-| `rtx_mode` | `dm` | Ruleset: `dm` = deathmatch (stock behaviour). `ra` = Rocket Arena. `midair` = airborne-only rocket DM. `ctf` = Capture the Flag. |
+| `rtx_mode` | `dm` | Ruleset: `dm` = deathmatch (stock behaviour). `ra` = Rocket Arena. `midair` = airborne-only rocket DM. `ctf` = Capture the Flag. `race` = timed KTX race routes (bhop/speed-jump harness). |
 | `rtx_match` | *(auto)* | Composition, orthogonal to the mode. Empty = the mode's natural default (dm → open FFA, ctf → open 2-team pickup, midair → 1on1 duel). `ffa` = open free-for-all. A **team format** (`1on1`/`duel`, `2on2`, `2on2on2`, any `NonM…`) = a locked N×M match. Ignored by `ra`; CTF clamps it to 2 teams. |
 | `rtx_ra_countdown` | `3` | Rocket Arena: seconds of spawn-protected countdown before "FIGHT". |
 | `rtx_ra_lightning_gun` | `0` | Rocket Arena: include the lightning gun in the arena arsenal (`0` leaves it out). |
@@ -73,6 +73,7 @@ mode doesn't touch the generic gameplay or bot code.
 | `rtx_midair_kb_ground` / `rtx_midair_kb_air` | `6` / `3` | Midair: rocket knockback multipliers for grounded vs airborne victims (ground is stronger, to launch players up). |
 | `rtx_match_countdown` | `3` | Team match (`rtx_match` format) / CTF: seconds of spawn-protected countdown after the match-start map reload before "FIGHT". |
 | `rtx_capturelimit` | `8` | CTF: captures a team needs to win (`0` = no limit, ends on `timelimit`). |
+| `rtx_race_route` | `0` | Race: which of the current map's routes to run (0-based, clamped). Read live — changing it moves everyone to the new route's start. |
 | `rtx_runes` | `0` | CTF runes: `0` = on (Haste adds move speed), `1` = off, `2` = on without the speed boost. |
 | `rtx_ctf_tossflag` / `rtx_ctf_tossrune` | `0` / `0` | CTF: allow tossing your carried flag (impulse 26) / held rune (impulse 24). |
 | `rtx_dropitems` | `0` | Any mode: let players hand items to teammates — a **capped ammo backpack** (impulse 20; up to 20 shells / 20 nails / 10 rockets / 20 cells, deducted from you) and your **current weapon** (impulse 21; drops it as a pickup and switches you to your next-best gun — the axe, single shotgun, and grapple stay). Ported from purectf. |
@@ -133,6 +134,28 @@ capture +15, teammates +10, plus the frag-carrier, carrier-protect, flag-defense
 at DM points, one per player, dropped on death; the flag and rune can be tossed (`rtx_ctf_tossflag`
 / `rtx_ctf_tossrune`, impulse 26 / 24). CTF requires the flag model **`progs/flag.mdl`** (and the
 rune models `progs/end1-4.mdl`) in the gamedir.
+
+**`race` — timed KTX race routes.** Run a course from its **start pad** through its **checkpoints**
+to the **finish**, timed per runner — and, first and foremost, a **sanity harness** for the bot
+movement system: most race routes are unfinishable without bunnyhop-accumulated speed, so a bot
+finishing (or **timing out on a named leg**) is a live regression check on the speed-jump / bhop
+machinery. Routes load from two sources, exactly as [KTX](https://github.com/QW-Group/ktx) does:
+`race_route_start` / `race_route_marker` **entities embedded in the map** (race11–20, race32c), and
+external **`race/routes/{mapname}.route`** command files (race1–10, ztricks, ztricks2 — copy KTX's
+examples into the gamedir). Everyone spawns on the active route's start pad (**axe only**, KTX
+`raceWeaponNo`); the clock starts when the runner leaves the start box, checkpoints must be touched
+**in order**, the finish broadcasts the time, and `race_route_timeout` without finishing resets the
+run. Because race maps are authored for **stock movement + bunnyhop only**, the mode reports
+`stock_movement_only`: double jump, wall jump, elevator jump, grapple and rocket jumps are switched
+**off** — both as live mechanics and as navmesh links — so bots must reach everything by bhop and
+speed jumps, and a failed pathfind is honest. At map load the mode prints a **routability report**,
+one `PASS`/`FAIL` line per route, answering whether every leg is traversable with race-legal
+movement (needs `rtx_bot_bhop 1` for the speed-jump links; it warns if that's off). Switch routes
+live with `rtx_race_route`. **Known gap:** routes that gain height via a **slope launch** (hitting an
+angled ramp at tremendous bhop speed, the engine redirecting horizontal velocity upward) or that
+chain **speed carried between jumps** across a long traverse are not yet modelled in the navmesh —
+the routability report names the exact legs — so those `FAIL` today; that's the next feature, best
+built and tuned against a live server.
 
 ## Bots
 

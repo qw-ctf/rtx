@@ -123,7 +123,9 @@ pub(crate) fn parse_match_alias(s: &str) -> Option<MatchConfig> {
 pub(crate) fn resolve_composition(mode: &str, alias: &str) -> MatchConfig {
     const OPEN: MatchConfig = MatchConfig { teams: 0, size: 0 };
     const CTF_PICKUP: MatchConfig = MatchConfig { teams: 2, size: 0 };
-    if mode == "ra" {
+    // ra's 1v1 round queue is its composition; race is per-runner timed play — neither has a
+    // team lifecycle, ever.
+    if mode == "ra" || mode == "race" {
         return OPEN;
     }
     match alias {

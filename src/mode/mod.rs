@@ -40,12 +40,14 @@ mod arena;
 mod ctf;
 mod dm;
 mod midair;
+mod race;
 pub(crate) mod team;
 
 pub(crate) use arena::{Arena, ArenaState};
 pub(crate) use ctf::Ctf;
 pub(crate) use dm::Dm;
 pub(crate) use midair::Midair;
+pub(crate) use race::{Race, RaceSlot};
 pub(crate) use team::{MatchPhase, MatchState};
 
 /// A player's standing in a round-based mode (Rocket Arena): fighting in the arena, or waiting
@@ -70,6 +72,8 @@ pub(crate) struct ModePlayer {
     pub team: u8,
     /// CTF carry / rune / assist bookkeeping.
     pub ctf: CtfPlayer,
+    /// Race run progress (next node / clock / best time). See [`crate::mode::race`].
+    pub race: RaceSlot,
 }
 
 /// A player's Rocket-Arena round standing: fighting in the arena, or waiting in the audience.
@@ -261,6 +265,15 @@ pub(crate) trait GameMode: Sync {
         1.0
     }
 
+    /// Whether this mode restricts movement to stock QW plus bunnyhop: no double jump, no wall
+    /// jump, no elevator jump, no grapple, no rocket jumps — neither as live mechanics
+    /// (`check_jump` and friends consult this) nor as navmesh links (`ensure_navmesh` skips
+    /// generating them, so bots can't plan them and a failed pathfind is honest). Race uses it:
+    /// its maps are authored for exactly that movement set. Default: everything stays on.
+    fn stock_movement_only(&self) -> bool {
+        false
+    }
+
     // --- structured-match variation points (only reached when a team match is active) ---
 
     /// Reset the mode's slate when a match countdown expires: frags/scores for team DM, plus flags
@@ -292,6 +305,8 @@ static ARENA: Arena = Arena;
 static MIDAIR: Midair = Midair;
 /// The Capture-the-Flag singleton (`rtx_mode ctf`) — reuses the match lifecycle + team layer.
 static CTF: Ctf = Ctf;
+/// The Race singleton (`rtx_mode race`) — timed KTX race routes; also the bot bhop harness.
+static RACE: Race = Race;
 
 /// The default mode used before a map selects one (matches `rtx_mode dm`).
 pub(crate) fn default_mode() -> &'static dyn GameMode {
@@ -305,6 +320,7 @@ pub(crate) fn select_mode(name: &str) -> &'static dyn GameMode {
         "ra" => &ARENA,
         "midair" => &MIDAIR,
         "ctf" => &CTF,
+        "race" => &RACE,
         _ => &DM,
     }
 }
@@ -330,9 +346,9 @@ impl GameState {
         // (These read/write self fields but not the cvar buffers, so no borrow conflict.)
         if self.mode_cvar != mode_name {
             self.mode_cvar = mode_name.to_string();
-            if !matches!(mode_name, "dm" | "ra" | "midair" | "ctf") {
+            if !matches!(mode_name, "dm" | "ra" | "midair" | "ctf" | "race") {
                 host.conprint(&cstring(&format!(
-                    "rtx: unknown rtx_mode \"{mode_name}\" — modes are dm|ra|midair|ctf; team formats like 2on2 are now rtx_match. Using dm.\n"
+                    "rtx: unknown rtx_mode \"{mode_name}\" — modes are dm|ra|midair|ctf|race; team formats like 2on2 are now rtx_match. Using dm.\n"
                 )));
             }
         }
@@ -341,6 +357,10 @@ impl GameState {
             if next.name() == "ra" && !match_alias.is_empty() {
                 host.conprint(&cstring(
                     "rtx: rtx_match is ignored in Rocket Arena — its 1v1 round queue is its composition.\n",
+                ));
+            } else if next.name() == "race" && !match_alias.is_empty() {
+                host.conprint(&cstring(
+                    "rtx: rtx_match is ignored in race — runs are timed per player, no teams.\n",
                 ));
             } else if !matches!(match_alias, "" | "ffa") && team::parse_match_alias(match_alias).is_none() {
                 host.conprint(&cstring(&format!(
