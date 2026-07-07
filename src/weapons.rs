@@ -15,6 +15,7 @@ use crate::assets::{Model, Sound};
 use crate::defs::*;
 use crate::entity::{Die, EntId, Think, Touch};
 use crate::game::GameState;
+use crate::obituary::DeathType;
 
 /// QuakeC `crandom` — a float in `[-1, 1)`.
 fn crandom(game: &mut GameState) -> f32 {
@@ -182,6 +183,7 @@ impl GameState {
             self.entities[tr.ent].combat.axhitme = 1.0;
             self.spawn_blood(org, 20);
             let dmg = if self.level.deathmatch > 3 { 75.0 } else { 20.0 };
+            self.entities[tr.ent].deathtype = DeathType::Axe;
             self.t_damage(tr.ent, e, e, dmg);
         } else {
             self.host
@@ -197,7 +199,7 @@ impl GameState {
 
     /// `FireBullets` (+ `TraceAttack`/multi-damage) — fire `shotcount` pellets in a cone,
     /// combining hits on the same target into one `T_Damage` call.
-    fn fire_bullets(&mut self, e: EntId, shotcount: i32, dir: Vec3, spread: Vec3) {
+    fn fire_bullets(&mut self, e: EntId, shotcount: i32, dir: Vec3, spread: Vec3, dtype: DeathType) {
         let v_angle = self.entities[e].v.v_angle;
         self.host.make_vectors(v_angle);
         let v_right = self.globals.v_right;
@@ -247,6 +249,7 @@ impl GameState {
                 blood_org = org;
                 if tr.ent != multi_ent {
                     if multi_ent != EntId::WORLD {
+                        self.entities[multi_ent].deathtype = dtype;
                         self.t_damage(multi_ent, e, e, multi_damage);
                     }
                     multi_damage = 4.0;
@@ -259,6 +262,7 @@ impl GameState {
             }
         }
         if multi_ent != EntId::WORLD {
+            self.entities[multi_ent].deathtype = dtype;
             self.t_damage(multi_ent, e, e, multi_damage);
         }
 
@@ -284,7 +288,7 @@ impl GameState {
         self.small_kick(e);
         self.consume_ammo(e, AmmoKind::Shells, 1.0);
         let dir = self.aim_dir(e);
-        self.fire_bullets(e, 6, dir, Vec3::new(0.04, 0.04, 0.0));
+        self.fire_bullets(e, 6, dir, Vec3::new(0.04, 0.04, 0.0), DeathType::Shotgun);
     }
 
     /// `W_FireSuperShotgun`.
@@ -298,7 +302,7 @@ impl GameState {
         self.big_kick(e);
         self.consume_ammo(e, AmmoKind::Shells, 2.0);
         let dir = self.aim_dir(e);
-        self.fire_bullets(e, 14, dir, Vec3::new(0.14, 0.08, 0.0));
+        self.fire_bullets(e, 14, dir, Vec3::new(0.14, 0.08, 0.0), DeathType::SuperShotgun);
     }
 
     // --- rockets ---
@@ -324,10 +328,10 @@ impl GameState {
         if self.try_detonate_shootable_grenade(other) {
             // The rocket still explodes below; the grenade detonation keeps its own owner credit.
         } else if self.entities[other].v.health != 0.0 {
-            self.entities[other].deathtype = Some("rocket".into());
+            self.entities[other].deathtype = DeathType::Rocket;
             self.t_damage(other, e, owner, damg);
         }
-        self.t_radius_damage(e, owner, 120.0, other, "rocket");
+        self.t_radius_damage(e, owner, 120.0, other, DeathType::Rocket);
 
         let velocity = self.entities[e].v.velocity;
         let org = self.entities[e].v.origin - velocity.normalize_or_zero() * 8.0;
@@ -379,6 +383,7 @@ impl GameState {
         self.host.write_te(MsgDest::Multicast, Te::LightningBlood);
         self.write_coords(MsgDest::Multicast, endpos);
         self.host.multicast(endpos, Multicast::Pvs);
+        self.entities[trace_ent].deathtype = DeathType::LightningBeam;
         self.t_damage(trace_ent, from, from, damage);
     }
 
@@ -443,7 +448,7 @@ impl GameState {
             let cells = self.entities[e].v.ammo_cells;
             self.entities[e].v.ammo_cells = 0.0;
             self.w_set_current_ammo(e);
-            self.t_radius_damage(e, e, 35.0 * cells, EntId::WORLD, "");
+            self.t_radius_damage(e, e, 35.0 * cells, EntId::WORLD, DeathType::Discharge);
             return;
         }
 
@@ -481,7 +486,7 @@ impl GameState {
         }
         self.entities[e].combat.voided = 1.0;
         let owner = self.entities[e].owner();
-        self.t_radius_damage(e, owner, 120.0, EntId::WORLD, "grenade");
+        self.t_radius_damage(e, owner, 120.0, EntId::WORLD, DeathType::Grenade);
 
         let origin = self.entities[e].v.origin;
         self.temp_entity_point(Te::Explosion, origin);
@@ -650,9 +655,9 @@ impl GameState {
 
         let owner = self.entities[e].owner();
         let (damage, dtype, te) = if super_spike {
-            (18.0, "supernail", Te::SuperSpike)
+            (18.0, DeathType::SuperNailgun, Te::SuperSpike)
         } else {
-            (9.0, "nail", Te::Spike)
+            (9.0, DeathType::Nailgun, Te::Spike)
         };
 
         if self.entities[other].v.takedamage != 0.0 {
@@ -661,7 +666,7 @@ impl GameState {
                 return;
             }
             self.spawn_touchblood(e, damage);
-            self.entities[other].deathtype = Some(dtype.into());
+            self.entities[other].deathtype = dtype;
             self.t_damage(other, e, owner, damage);
         } else {
             self.temp_entity_point(te, origin);

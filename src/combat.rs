@@ -12,6 +12,7 @@ use crate::assets::Sound;
 use crate::defs::*;
 use crate::entity::{EntId, Touch};
 use crate::game::{self, GameState};
+use crate::obituary::DeathType;
 
 impl GameState {
     /// `CanDamage` — can `inflictor` reach `targ` with a clear trace (corners are tried for
@@ -216,7 +217,7 @@ impl GameState {
         attacker: EntId,
         damage: f32,
         ignore: EntId,
-        dtype: &str,
+        dtype: DeathType,
     ) {
         let org = self.entities[inflictor].v.origin;
         for head in self.find_radius(org, damage + 40.0) {
@@ -235,41 +236,10 @@ impl GameState {
                 points *= 0.5;
             }
             if points > 0.0 && self.can_damage(head, inflictor, inflictor) {
-                self.entities[head].deathtype = Some(dtype.into());
+                self.entities[head].deathtype = dtype;
                 self.t_damage(head, inflictor, attacker, points);
             }
         }
-    }
-
-    /// `ClientObituary` (compact) — deathmatch frag scoring, logging and a broadcast. The
-    /// full per-weapon flavour text lands with the client.qc port; this keeps scores correct.
-    pub(crate) fn client_obituary(&mut self, targ: EntId, attacker: EntId) {
-        if self.entities[targ].classname() != Some("player") {
-            return;
-        }
-        let targ_name = self.netname_of(targ);
-
-        if self.entities[attacker].classname() == Some("player") {
-            if targ == attacker {
-                self.entities[targ].v.frags -= 1.0;
-                self.broadcast(PrintLevel::Medium, &format!("{targ_name} suicides\n"));
-                self.host.logfrag(targ, targ);
-                return;
-            }
-            let attacker_name = self.netname_of(attacker);
-            self.entities[attacker].v.frags += 1.0;
-            self.host.logfrag(attacker, targ);
-            self.broadcast(
-                PrintLevel::Medium,
-                &format!("{targ_name} was killed by {attacker_name}\n"),
-            );
-            return;
-        }
-
-        // Environmental / world death.
-        self.entities[targ].v.frags -= 1.0;
-        self.host.logfrag(targ, targ);
-        self.broadcast(PrintLevel::Medium, &format!("{targ_name} died\n"));
     }
 
     // --- small helpers ---
@@ -283,6 +253,11 @@ impl GameState {
 
     /// Whether teamplay rules make `attacker`'s damage to `targ` a no-op.
     fn teamplay_protects(&self, targ: EntId, attacker: EntId, inflictor: EntId) -> bool {
+        // A telefrag is never blocked — a protected teammate would otherwise be stuck inside you
+        // forever (KTX `!TELEDEATH(targ)`, combat.c:752).
+        if self.entities[targ].deathtype.is_telefrag() {
+            return false;
+        }
         let tp = self.level.teamplay;
         if tp != 1 && tp != 3 {
             return false;
@@ -303,7 +278,7 @@ impl GameState {
     }
 
     /// The "team" userinfo value for a client.
-    fn team_of(&self, ent: EntId) -> String {
+    pub(crate) fn team_of(&self, ent: EntId) -> String {
         let mut buf = [0u8; 32];
         self.host.infokey(ent, c"team", &mut buf).to_owned()
     }

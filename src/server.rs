@@ -6,6 +6,7 @@
 use crate::defs::*;
 use crate::entity::{EntId, Think, Touch};
 use crate::game::{cstring, GameState};
+use crate::obituary::DeathType;
 
 impl GameState {
     /// `NextLevel` — queue the next map and start intermission once a rule limit is hit.
@@ -135,6 +136,7 @@ impl GameState {
         }
         let samelevel = self.host.cvar(c"samelevel") as i32;
         if samelevel == 2 || (samelevel == 3 && self.level.mapname != "start") {
+            self.entities[other].deathtype = DeathType::Changelevel;
             self.t_damage(other, e, e, 50000.0);
             return;
         }

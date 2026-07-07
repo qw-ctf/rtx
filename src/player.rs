@@ -396,7 +396,7 @@ impl GameState {
         if health < 0.0 {
             return;
         }
-        if self.entities[self.damage_attacker].classname() == Some("teledeath") {
+        if self.entities[e].deathtype.is_telefrag() {
             self.host
                 .sound(e, Channel::Voice, Sound::PLAYER_TELEDTH1, 1.0, Attenuation::None);
             return;
@@ -624,7 +624,7 @@ impl GameState {
         self.throw_gib(e, Model::PROGS_GIB2, health);
         self.throw_gib(e, Model::PROGS_GIB3, health);
         self.entities[e].v.deadflag = DeadFlag::Dead.as_f32();
-        if self.entities[self.damage_attacker].classname() == Some("teledeath") {
+        if self.entities[e].deathtype.is_telefrag() {
             self.host
                 .sound(e, Channel::Voice, Sound::PLAYER_TELEDTH1, 1.0, Attenuation::None);
             return;

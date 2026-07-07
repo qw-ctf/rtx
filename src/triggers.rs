@@ -9,6 +9,7 @@ use crate::assets::Sound;
 use crate::defs::*;
 use crate::entity::{Die, EntId, Think, Touch, Use};
 use crate::game::GameState;
+use crate::obituary::DeathType;
 
 impl GameState {
     // --- trigger_multiple / once / secret / counter / relay ---
@@ -237,22 +238,25 @@ impl GameState {
             let other_inv = self.entities[other].combat.invincible_finished > time;
             let owner_inv = self.entities[owner].combat.invincible_finished > time;
             if other_inv && owner_inv {
-                self.entities[e].classname = Some("teledeath3".into());
+                // Two pentagram carriers: both die, each credited to the other.
                 self.entities[other].combat.invincible_finished = 0.0;
                 self.entities[owner].combat.invincible_finished = 0.0;
-                self.t_damage(other, e, e, 50000.0);
-                self.entities[e].set_owner(other);
-                self.t_damage(owner, e, e, 50000.0);
+                self.entities[other].deathtype = DeathType::TelefragMutual;
+                self.entities[owner].deathtype = DeathType::TelefragMutual;
+                self.t_damage(other, e, owner, 50000.0);
+                self.t_damage(owner, e, other, 50000.0);
                 return;
             }
             if other_inv {
-                self.entities[e].classname = Some("teledeath2".into());
-                self.t_damage(owner, e, e, 50000.0);
+                // The teleporting `owner` telefrags a protected player and dies instead.
+                self.entities[owner].deathtype = DeathType::TelefragDeflected;
+                self.t_damage(owner, e, other, 50000.0);
                 return;
             }
         }
         if self.entities[other].v.health != 0.0 {
-            self.t_damage(other, e, e, 50000.0);
+            self.entities[other].deathtype = DeathType::Telefrag;
+            self.t_damage(other, e, owner, 50000.0);
         }
     }
 
@@ -387,6 +391,7 @@ impl GameState {
         if self.entities[other].v.takedamage != 0.0 {
             let dmg = self.entities[e].mover.dmg;
             self.entities[e].v.solid = Solid::Not;
+            self.entities[other].deathtype = DeathType::TriggerHurt;
             self.t_damage(other, e, e, dmg);
             let time = self.time();
             let ent = &mut self.entities[e];

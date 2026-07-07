@@ -11,6 +11,7 @@ use crate::assets::{Model, Sound};
 use crate::defs::*;
 use crate::entity::{Die, EntId, Use};
 use crate::game::GameState;
+use crate::obituary::DeathType;
 
 impl GameState {
     /// `info_null` — a target placeholder that removes itself.
@@ -126,7 +127,7 @@ impl GameState {
             ent.v.takedamage = TakeDamage::No.as_f32();
             ent.classname = Some("explo_box".into());
         }
-        self.t_radius_damage(e, e, 160.0, EntId::WORLD, "");
+        self.t_radius_damage(e, e, 160.0, EntId::WORLD, DeathType::ExploBox);
         let mut origin = self.entities[e].v.origin;
         origin.z += 32.0;
         self.host.write_te(MsgDest::Multicast, Te::Explosion);

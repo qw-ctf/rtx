@@ -10,6 +10,7 @@ use crate::assets::Sound;
 use crate::defs::*;
 use crate::entity::{Blocked, Die, EntId, Think, Touch, Use, STATE_BOTTOM, STATE_DOWN, STATE_TOP, STATE_UP};
 use crate::game::GameState;
+use crate::obituary::DeathType;
 
 impl GameState {
     // --- think functions ---
@@ -20,7 +21,7 @@ impl GameState {
             let v = &self.entities[e];
             (v.goalentity(), v.mover.dmg, v.mover.wait, v.mover.state)
         };
-        self.entities[other].deathtype = Some("squish".into());
+        self.entities[other].deathtype = DeathType::Squish;
         self.t_damage(other, e, goal, dmg);
         if wait >= 0.0 {
             if state == STATE_DOWN {

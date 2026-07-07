@@ -15,6 +15,7 @@ use crate::bot;
 use crate::defs::*;
 use crate::entity::{CombatState, Die, EntId, Pain};
 use crate::game::GameState;
+use crate::obituary::DeathType;
 use crate::mode::ModePlayer;
 
 #[derive(Clone, Copy)]
@@ -278,7 +279,7 @@ impl GameState {
         }
         let v_angle = self.entities[e].v.v_angle;
         self.host.make_vectors(v_angle);
-        self.entities[e].deathtype = None;
+        self.entities[e].deathtype = DeathType::None;
 
         self.check_rules(e);
         self.water_move(e);
@@ -344,7 +345,7 @@ impl GameState {
                 self.host
                     .sound(e, Channel::Body, Sound::PLAYER_H2OJUMP, 1.0, Attenuation::Norm);
             } else if jump_flag < -650.0 {
-                self.entities[e].deathtype = Some("falling".into());
+                self.entities[e].deathtype = DeathType::Fall;
                 self.t_damage(e, EntId::WORLD, EntId::WORLD, 5.0);
                 self.host
                     .sound(e, Channel::Voice, Sound::PLAYER_LAND2, 1.0, Attenuation::Norm);
@@ -393,14 +394,14 @@ impl GameState {
         }
     }
 
-    /// `ClientKill` — the `kill` suicide command.
+    /// `ClientKill` — the `kill` suicide command. We can't route KTX's self-`T_Damage` here (the
+    /// mode damage hooks — Midair, Arena — would swallow it), so drive the respawn directly but let
+    /// the obituary own the "{name} suicides" message and the -2 frag penalty.
     fn client_kill(&mut self, e: EntId) {
-        let name = self.netname_of(e);
-        self.broadcast(PrintLevel::Medium, &format!("{name} suicides\n"));
+        self.entities[e].deathtype = DeathType::Suicide;
+        self.client_obituary(e, e);
         self.set_suicide_frame(e);
         self.entities[e].v.modelindex = self.level.modelindex_player;
-        self.host.logfrag(e, e);
-        self.entities[e].v.frags -= 2.0;
         self.respawn(e);
     }
 
@@ -693,6 +694,14 @@ impl GameState {
             }
             let dmg = ent.mover.dmg;
             ent.combat.pain_finished = time + 1.0;
+            // You can drown in lava or slime too — credit the liquid (KTX client.c:2795).
+            self.entities[e].deathtype = if watertype.is(Content::Lava) {
+                DeathType::Lava
+            } else if watertype.is(Content::Slime) {
+                DeathType::Slime
+            } else {
+                DeathType::Water
+            };
             self.t_damage(e, EntId::WORLD, EntId::WORLD, dmg);
         }
 
@@ -713,9 +722,11 @@ impl GameState {
         };
         if watertype.is(Content::Lava) && dmgtime < time {
             self.entities[e].combat.dmgtime = if radsuit > time { time + 1.0 } else { time + 0.2 };
+            self.entities[e].deathtype = DeathType::Lava;
             self.t_damage(e, EntId::WORLD, EntId::WORLD, 10.0 * waterlevel);
         } else if watertype.is(Content::Slime) && dmgtime < time && radsuit < time {
             self.entities[e].combat.dmgtime = time + 1.0;
+            self.entities[e].deathtype = DeathType::Slime;
             self.t_damage(e, EntId::WORLD, EntId::WORLD, 4.0 * waterlevel);
         }
 

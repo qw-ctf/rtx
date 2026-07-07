@@ -39,6 +39,7 @@ mod misc;
 mod mode;
 mod nav_build;
 mod navmesh;
+mod obituary;
 mod plats;
 mod player;
 mod qphys;

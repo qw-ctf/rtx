@@ -26,6 +26,7 @@ use crate::assets::{Model, Sound};
 use crate::defs::*;
 use crate::entity::{EntId, Think, Touch};
 use crate::game::GameState;
+use crate::obituary::DeathType;
 
 /// QuakeWorld default player speed, the base the hook speeds scale off (purectf's `self.maxspeed`).
 const MAXSPEED: f32 = 320.0;
@@ -103,7 +104,7 @@ impl GameState {
         if self.entities[other].classname() == Some("player") {
             self.host
                 .sound(hook, Channel::Weapon, Sound::PLAYER_AXHIT1, 1.0, Attenuation::Norm);
-            self.entities[other].deathtype = Some("grapple".into());
+            self.entities[other].deathtype = DeathType::Hook;
             self.t_damage(other, hook, owner, 10.0);
             // Hide the hook — we pull straight at the hooked player rather than match its velocity.
             self.entities[hook].v.model = 0;

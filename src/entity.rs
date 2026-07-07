@@ -357,7 +357,7 @@ pub struct Entity {
     pub noise2: Option<Sound>,
     pub noise3: Option<Sound>,
     pub noise4: Option<Sound>,
-    pub deathtype: Option<Box<str>>,
+    pub deathtype: crate::obituary::DeathType,
     pub mdl: Option<Box<str>>,
     /// `trigger_changelevel`'s destination map name.
     pub map: Option<Box<str>>,

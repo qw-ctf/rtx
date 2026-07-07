@@ -9,6 +9,7 @@ use crate::assets::Sound;
 use crate::defs::*;
 use crate::entity::{Blocked, EntId, Think, Touch, Use, STATE_BOTTOM, STATE_DOWN, STATE_TOP, STATE_UP};
 use crate::game::GameState;
+use crate::obituary::DeathType;
 
 impl GameState {
     // --- plats ---
@@ -97,7 +98,7 @@ impl GameState {
 
     /// `plat_crush` (`blocked`).
     pub(crate) fn plat_crush(&mut self, e: EntId, other: EntId) {
-        self.entities[other].deathtype = Some("squish".into());
+        self.entities[other].deathtype = DeathType::Squish;
         self.t_damage(other, e, e, 1.0);
         let state = self.entities[e].mover.state;
         if state == STATE_UP {
@@ -222,7 +223,7 @@ impl GameState {
         }
         self.entities[e].combat.attack_finished = time + 0.5;
         let dmg = self.entities[e].mover.dmg;
-        self.entities[other].deathtype = Some("squish".into());
+        self.entities[other].deathtype = DeathType::Squish;
         self.t_damage(other, e, e, dmg);
     }
 
