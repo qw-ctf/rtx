@@ -162,11 +162,20 @@ impl GameState {
             }
         };
         self.nav.pending = None;
-        let Some((bsp, graph)) = built else {
+        let Some((bsp, mut graph)) = built else {
             self.host
                 .dprint(c"rtx: navmesh: unsupported/malformed BSP; bots disabled\n");
             return;
         };
+        // Bias routes away from lava/slime edges. Done here, not in the pure worker build: the clip
+        // hull the build reads carries no liquid contents, so we need the engine's `pointcontents`
+        // (which reads the render hull) — available only on the main thread once the graph lands.
+        {
+            let host = self.host();
+            let is_solid = |p: Vec3| bsp.is_solid(p);
+            let contents = |p: Vec3| host.pointcontents(p);
+            graph.surcharge_hazard_links(&is_solid, &contents);
+        }
         let counts = graph.summary();
         let goals = self.collect_goals(&graph);
         let msg = cstring(&format!(

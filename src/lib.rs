@@ -33,6 +33,7 @@ mod ext_field;
 mod game;
 mod game_command;
 mod grapple;
+mod hazard;
 mod host;
 mod items;
 mod misc;

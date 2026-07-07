@@ -327,6 +327,72 @@ pub(crate) fn angles_to(eye: Vec3, point: Vec3) -> Vec3 {
     Vec3::new(pitch, yaw, 0.0)
 }
 
+/// Choose the safest combat move near a hazard. Candidates are tried in priority order — the wanted
+/// move, the wanted move with the strafe flipped, each strafe alone, then the forward/backpedal
+/// component alone — and the first that doesn't step toward lava/slime/a pit wins; if every option is
+/// unsafe the bot holds ground rather than walking off. `unsafe_dir` reports whether a horizontal
+/// move heads into a hazard. Backpedal is dropped before the strafe, so a bot pinned at a lava edge
+/// sidesteps rather than backing in. Pure over the oracle, so the priority order is unit-testable.
+fn safe_combat_move(
+    unsafe_dir: &impl Fn(Vec3) -> bool,
+    dir: Vec3,
+    perp: Vec3,
+    want_forward: f32,
+    strafe_sign: f32,
+) -> Vec3 {
+    let fwd = dir * want_forward;
+    let strafe = perp * (strafe_sign * MOVE_SPEED);
+    for mv in [fwd + strafe, fwd - strafe, strafe, -strafe, fwd] {
+        if !unsafe_dir(mv) {
+            return mv;
+        }
+    }
+    Vec3::ZERO
+}
+
+/// A fleeing bot's move away from a threat at heading `away` (a horizontal unit vector), kept off
+/// hazards: straight away when that's clear, else the safer perpendicular, else hold ground. The
+/// returned bool is whether the bot may still hop to clear the blast — suppressed when every escape
+/// is unsafe, since a jump surrenders the ground control needed to stop at an edge. Used by the
+/// grenade-flee in [`grenade::grenade_tactics`].
+fn safe_flee_move(game: &GameState, e: EntId, origin: Vec3, away: Vec3) -> (Vec3, bool) {
+    let grounded = game.entities[e].v.flags.has(Flags::ONGROUND);
+    let Some(bsp) = game.nav.bsp.as_ref() else {
+        return (away * MOVE_SPEED, grounded);
+    };
+    let host = game.host();
+    let is_solid = |p: Vec3| bsp.is_solid(p);
+    let contents = |p: Vec3| host.pointcontents(p);
+    let feet = origin - Vec3::new(0.0, 0.0, 24.0);
+    let hazardous = |d: Vec3| {
+        let n = Vec3::new(d.x, d.y, 0.0).normalize_or_zero();
+        n != Vec3::ZERO && crate::hazard::hazard_ahead(&is_solid, &contents, feet, n).is_some()
+    };
+    if !hazardous(away) {
+        return (away * MOVE_SPEED, grounded);
+    }
+    let perp = Vec3::new(-away.y, away.x, 0.0);
+    for cand in [perp, -perp] {
+        if !hazardous(cand) {
+            return (cand * MOVE_SPEED, grounded);
+        }
+    }
+    (Vec3::ZERO, false) // hazards on every side — hold, don't hop off the edge
+}
+
+/// Verdict on one line-of-fire trace for a splash projectile. Clear when the shot reached the enemy,
+/// or flew *unobstructed* (an open shot — an intended miss beside a strafer is fine), or stopped
+/// essentially at the aim point (near-target splash still lands). Blocked only when it strikes a wall
+/// short of the target *and inside our own blast radius* — the corner self-splash this whole gate
+/// exists to stop (the rocket blast is [`GRENADE_BLAST_RADIUS`]; attacker self-damage is merely
+/// halved). `impact` is where the trace stopped; `obstructed` is whether it hit anything at all.
+fn lof_verdict(origin: Vec3, aim: Vec3, impact: Vec3, hit_enemy: bool, obstructed: bool) -> bool {
+    if hit_enemy || !obstructed {
+        return true;
+    }
+    (impact - aim).length() <= LINE_OF_FIRE_SLACK && (impact - origin).length() >= GRENADE_BLAST_RADIUS
+}
+
 /// Overlay combat onto the frame's decisions. `look` is the desired view (smoothed downstream by
 /// the aim spring in `bot.rs`); `move_world` is the desired world-space velocity — the two are
 /// independent, so the bot can run one way while looking another. With line of sight it aims
@@ -596,7 +662,25 @@ pub(crate) fn engage(
     };
     let dir = Vec3::new(to_enemy.x, to_enemy.y, 0.0).normalize_or_zero();
     let perp = Vec3::new(-dir.y, dir.x, 0.0);
-    cmd.move_world = dir * want_forward + perp * (strafe_sign * MOVE_SPEED);
+    // Don't strafe or backpedal into lava/slime or off a ledge. Only guarded when grounded (an
+    // airborne foot probe is meaningless and pmove owns the arc) and a map is loaded; otherwise the
+    // original blind composition. The probes reuse the offensive-shove oracles — clip-hull solidity
+    // plus the engine's `pointcontents`, the only hull that reports liquids.
+    let grounded_self = game.entities[e].v.flags.has(Flags::ONGROUND);
+    cmd.move_world = match (grounded_self, game.nav.bsp.as_ref()) {
+        (true, Some(bsp)) => {
+            let host = game.host();
+            let is_solid = |p: Vec3| bsp.is_solid(p);
+            let contents = |p: Vec3| host.pointcontents(p);
+            let feet = origin - Vec3::new(0.0, 0.0, 24.0);
+            let unsafe_dir = |mv: Vec3| {
+                let d = Vec3::new(mv.x, mv.y, 0.0).normalize_or_zero();
+                d != Vec3::ZERO && crate::hazard::hazard_ahead(&is_solid, &contents, feet, d).is_some()
+            };
+            safe_combat_move(&unsafe_dir, dir, perp, want_forward, strafe_sign)
+        }
+        _ => dir * want_forward + perp * (strafe_sign * MOVE_SPEED),
+    };
     cmd.buttons &= !BUTTON_JUMP; // don't bunny-hop while dueling
 
     // Fire only when the crosshair is on the spot. The shot leaves along the *smoothed* view
@@ -626,19 +710,30 @@ pub(crate) fn engage(
     // fire until we actually hold the GL (mirrors the grenade combo's `windup`).
     let switching_to_gl = choice.grenade_arc && game.entities[e].v.weapon != Weapon::GrenadeLauncher;
 
-    // Line-of-fire clearance. For a rocket, trace the real muzzle→aim line (the eye→enemy LoS at the
-    // top doesn't cover the muzzle, so a peeker around a corner could self-splash): trace along
-    // `clean` (the geometric direction), not the smoothed view, so it stays steady frame-to-frame. A
-    // grenade arc already carries its own geometry check — the airborne intercept via its bounce sim,
-    // the grounded lob via `arc_land` — so it skips the straight-line trace (which a lofted arc,
-    // rising well above the muzzle→target chord, would spuriously fail).
+    // Line-of-fire clearance. For a rocket we trace the real muzzle→aim line (the eye→enemy LoS at
+    // the top doesn't cover the muzzle, so a peeker around a corner could self-splash) *twice*, and
+    // require both clear:
+    //   • the steady geometric ray along `clean`, which doesn't flicker frame-to-frame; and
+    //   • the ray the rocket will *actually* fly this frame — along the smoothed view (`bot.aim`),
+    //     which the fire gate above tolerates several degrees off `clean`.
+    // Near a corner `clean` can pass while the real shot clips the wall — gating on both is the
+    // corner-self-splash fix. Muzzle matches `w_fire_rocket` (origin + forward·8 + 16 up), taken
+    // from each ray's own forward. A grenade arc keeps its own geometry check (bounce sim / arc_land)
+    // and skips the straight-line trace, which its lofted path would spuriously fail.
+    let mut ray_clear = |ang: Vec3| {
+        let fwd = bot::angle_vectors(ang).0;
+        let muzzle = origin + fwd * 8.0 + Vec3::new(0.0, 0.0, 16.0);
+        let end = muzzle + fwd * (aim - muzzle).length();
+        let tr = game.traceline(muzzle, end, false, e);
+        let impact = muzzle + (end - muzzle) * tr.fraction;
+        lof_verdict(origin, aim, impact, tr.ent == enemy, tr.fraction < 1.0)
+    };
     let lof_clear = if choice.grenade_arc {
         true
     } else if s > 0.0 {
-        let fwd = bot::angle_vectors(clean).0;
-        let muzzle = origin + fwd * 8.0 + Vec3::new(0.0, 0.0, 16.0);
-        let tr = game.traceline(muzzle, aim, false, e);
-        tr.ent == enemy || (muzzle + (aim - muzzle) * tr.fraction - aim).length() <= LINE_OF_FIRE_SLACK
+        // The view ray needs a spring sample; on the first frame (view == ZERO, the same guard as
+        // `on_target`) lean on the clean ray alone.
+        ray_clear(clean) && (view == Vec3::ZERO || ray_clear(view))
     } else {
         true // hitscan: the eye-ray LoS above already governs the shot
     };
@@ -818,12 +913,14 @@ pub(crate) fn grenade_tactics(
         if safe_to_shoot && can_hit_grenade(game, e, grenade) && shoot_grenade(game, e, grenade, cmd) {
             return true;
         }
-        // Too close (or no clear shot / no hitscan gun): run directly away and hop off the ground —
-        // put distance between us and the blast rather than setting it off in our face.
+        // Too close (or no clear shot / no hitscan gun): run away and hop off the ground to put
+        // distance between us and the blast — but not into lava or off a ledge. Sidestep along a
+        // hazard, and hold (no hop) when every escape is unsafe rather than leaping into the pit.
         let gpos = game.entities[grenade].v.origin;
         let away = Vec3::new(origin.x - gpos.x, origin.y - gpos.y, 0.0).normalize_or_zero();
-        cmd.move_world = away * MOVE_SPEED;
-        if game.entities[e].v.flags.has(Flags::ONGROUND) {
+        let (mv, may_hop) = safe_flee_move(game, e, origin, away);
+        cmd.move_world = mv;
+        if may_hop {
             cmd.buttons |= BUTTON_JUMP;
         }
         return true;
@@ -841,6 +938,78 @@ pub(crate) fn grenade_tactics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Combat-move geometry for the hazard-guard tests: enemy along +x, so `dir = +x`, `perp = +y`.
+    const DIR: Vec3 = Vec3::new(1.0, 0.0, 0.0);
+    const PERP: Vec3 = Vec3::new(0.0, 1.0, 0.0);
+
+    #[test]
+    fn safe_combat_move_passes_through_when_clear() {
+        // Nothing unsafe → the exact original composition (dir·forward + perp·strafe·speed).
+        let never = |_: Vec3| false;
+        let mv = safe_combat_move(&never, DIR, PERP, MOVE_SPEED, 1.0);
+        assert_eq!(mv, DIR * MOVE_SPEED + PERP * MOVE_SPEED);
+    }
+
+    #[test]
+    fn safe_combat_move_prefers_flip() {
+        // Holding range (no forward), strafing +y is unsafe → flip to −y, same speed.
+        let unsafe_plus_y = |mv: Vec3| mv.y > 0.0;
+        let mv = safe_combat_move(&unsafe_plus_y, DIR, PERP, 0.0, 1.0);
+        assert_eq!(mv, PERP * -MOVE_SPEED);
+    }
+
+    #[test]
+    fn safe_combat_move_drops_backpedal_before_strafe() {
+        // Retreating (−x) is unsafe but the strafe is fine → take the strafe alone, no backpedal.
+        let unsafe_back = |mv: Vec3| mv.x < 0.0;
+        let mv = safe_combat_move(&unsafe_back, DIR, PERP, -MOVE_SPEED, 1.0);
+        assert_eq!(mv, PERP * MOVE_SPEED); // strafe only, no −x component
+        assert_eq!(mv.x, 0.0);
+    }
+
+    #[test]
+    fn safe_combat_move_holds_ground_when_surrounded() {
+        // Every candidate steps toward a hazard → hold ground rather than walk into it.
+        let all_unsafe = |mv: Vec3| mv != Vec3::ZERO;
+        let mv = safe_combat_move(&all_unsafe, DIR, PERP, -MOVE_SPEED, 1.0);
+        assert_eq!(mv, Vec3::ZERO);
+    }
+
+    // Line-of-fire verdict: bot at the origin, aim 400u downrange along +x unless noted.
+    const AIM: Vec3 = Vec3::new(400.0, 0.0, 0.0);
+
+    #[test]
+    fn lof_verdict_hits_enemy_always_clear() {
+        // A hull hit is clear even point-blank (the super-shotgun-fallback close shot).
+        assert!(lof_verdict(Vec3::ZERO, AIM, Vec3::new(60.0, 0.0, 0.0), true, true));
+    }
+
+    #[test]
+    fn lof_verdict_open_shot_is_clear() {
+        // Flew unobstructed but 80u wide of the target — an intended low-skill miss, not a corner.
+        assert!(lof_verdict(Vec3::ZERO, AIM, Vec3::new(400.0, 80.0, 0.0), false, false));
+    }
+
+    #[test]
+    fn lof_verdict_wall_near_aim_is_clear() {
+        // Wall 40u short of a distant aim point: the blast still lands on the target, safe for us.
+        assert!(lof_verdict(Vec3::ZERO, AIM, Vec3::new(360.0, 0.0, 0.0), false, true));
+    }
+
+    #[test]
+    fn lof_verdict_corner_blocks() {
+        // Wall 300u short of the target — a corner the rocket would detonate on, missing the enemy.
+        assert!(!lof_verdict(Vec3::ZERO, AIM, Vec3::new(100.0, 0.0, 0.0), false, true));
+    }
+
+    #[test]
+    fn lof_verdict_self_splash_blocks() {
+        // Impact within 48u of a *close* aim (150u) but only 120u from us — inside our own blast
+        // radius. Cleared under the old aim-point-only slack; the self-splash guard now blocks it.
+        let aim = Vec3::new(150.0, 0.0, 0.0);
+        assert!(!lof_verdict(Vec3::ZERO, aim, Vec3::new(120.0, 0.0, 0.0), false, true));
+    }
 
     /// Blast falloff: full damage at the centre, tapering to zero at the radius, matching
     /// `t_radius_damage`'s `120 - 0.5·dist`.

@@ -775,6 +775,53 @@ impl NavGraph {
         out
     }
 
+    /// Surcharge links that route a bot alongside a lava or slime pool, so the planner keeps its
+    /// distance whenever a comparable safe route exists. For each cell we probe its *open* compass
+    /// sides — those with no walkable neighbour, i.e. an edge — a stride out and down; a liquid
+    /// below flags the cell, and every link *entering* a flagged cell pays [`HAZARD_LINK_EXTRA`].
+    ///
+    /// Pits are deliberately not flagged here (every balcony/ledge cell borders a drop — that would
+    /// surcharge half the map); the runtime combat guard [`crate::hazard::hazard_ahead`] keeps bots
+    /// from stepping off edges in a fight. Only *liquids* get a routing bias, and the pure
+    /// worker-thread build can't see them — the clip hull it reads carries no liquid contents — so
+    /// this takes the engine's `pointcontents` as `contents` and runs at graph-swap time (see
+    /// [`crate::game::GameState`]'s navmesh poll) rather than inside [`build_navmesh`].
+    pub fn surcharge_hazard_links(&mut self, is_solid: &impl Fn(Vec3) -> bool, contents: &impl Fn(Vec3) -> f32) {
+        let hazard: Vec<bool> = (0..self.cells.len() as CellId)
+            .map(|id| self.cell_on_liquid_edge(id, is_solid, contents))
+            .collect();
+        for link in &mut self.links {
+            if hazard[link.to as usize] {
+                link.cost += HAZARD_LINK_EXTRA;
+            }
+        }
+    }
+
+    /// Whether cell `id` sits on the edge of a lava or slime pool: for each compass direction with
+    /// no walkable neighbour (an open side), probe a stride out at foot height and check for a
+    /// liquid below. A drop to lower ground, plain water, or a wall all read as safe.
+    fn cell_on_liquid_edge(
+        &self,
+        id: CellId,
+        is_solid: &impl Fn(Vec3) -> bool,
+        contents: &impl Fn(Vec3) -> f32,
+    ) -> bool {
+        let c = self.cells[id as usize];
+        // Standing player feet sit 24u below the origin (player `mins.z`); probe from there.
+        let feet = c.origin - Vec3::new(0.0, 0.0, 24.0);
+        let step = |v: f32| if v > 0.1 { 1 } else if v < -0.1 { -1 } else { 0 };
+        crate::hazard::HAZARD_DIRS.iter().any(|&(dx, dy)| {
+            if self.has_ground_near(c.gx + step(dx), c.gy + step(dy), c.origin.z) {
+                return false; // walkable ground continues this way — not an edge
+            }
+            let p = feet + Vec3::new(dx, dy, 0.0) * HAZARD_PROBE_R + Vec3::new(0.0, 0.0, 8.0);
+            matches!(
+                crate::hazard::hazard_below(is_solid, contents, p),
+                Some(crate::hazard::HazardKind::Lava | crate::hazard::HazardKind::Slime)
+            )
+        })
+    }
+
 
     // --- entity-derived links: func_plat (built after the static graph, from spawned ents) ---
 
@@ -1439,6 +1486,15 @@ pub struct LinkCounts {
     pub hook: u32,
     pub rocket_jump: u32,
 }
+
+/// Radius out from a cell probed for an adjacent lava/slime surface — a stride (1.5 grid columns)
+/// past the cell, so a bot skirting the edge is caught without flagging cells a safe walkway away.
+const HAZARD_PROBE_R: f32 = 48.0;
+/// Extra travel-time charged to every link *entering* a cell on a lava/slime edge (see
+/// [`NavGraph::surcharge_hazard_links`]). Moderate — a few walk-links' worth — so the planner takes
+/// a parallel safe corridor when one exists within a short detour, yet still crosses a lava bridge
+/// that is the only way; finite, so it never disconnects the graph (like the gate/RJ penalties).
+const HAZARD_LINK_EXTRA: f32 = 0.5;
 
 /// Travel-time cost of a link: horizontal distance / speed, plus risk/effort penalties so A*
 /// prefers grounded routes and avoids damaging falls.
@@ -2235,5 +2291,92 @@ mod tests {
         }
         // Zero seed disables jitter entirely.
         assert_eq!(g.link_extra(0, &LinkCosts::default()), 0.0);
+    }
+
+    /// `surcharge_hazard_links` flags a cell on a lava edge and bumps the cost of links *into* it,
+    /// while leaving an interior link untouched — over synthetic solid/liquid oracles, no BSP.
+    #[test]
+    fn surcharge_flags_lava_edge_only() {
+        // Two adjacent floor cells in a row; open lava sits past the +x cell (grid column 2 has no
+        // ground, and lava lurks below the probe there). Solid floor a short step under both cells.
+        let cell = |x: f32, gx: i32| Cell {
+            origin: Vec3::new(x, 0.0, 0.0),
+            gx,
+            gy: 0,
+        };
+        let link = |from: CellId, to: CellId| Link {
+            from,
+            to,
+            kind: LinkKind::Walk,
+            cost: 1.0,
+        };
+        let mut grid = GridIndex::default();
+        grid.insert((0, 0), vec![0]);
+        grid.insert((1, 0), vec![1]);
+        let mut g = NavGraph {
+            cells: vec![cell(0.0, 0), cell(32.0, 1)],
+            links: vec![link(0, 1), link(1, 0)],
+            adjacency: vec![vec![0], vec![1]],
+            grid,
+            gates: Vec::new(),
+            gated_links: Vec::new(),
+            hook_links: Vec::new(),
+            hooks: Vec::new(),
+            speed_jump_links: Vec::new(),
+            speed_jumps: Vec::new(),
+            rocket_jump_links: Vec::new(),
+            rocket_jumps: Vec::new(),
+            plats: Vec::new(),
+            plat_links: Vec::new(),
+        };
+        // Floor a short step (z ≤ −40) below the cells for x ≤ 60; lava fills x > 60 under z = 0.
+        let is_solid = |p: Vec3| p.x <= 60.0 && p.z <= -40.0;
+        let contents = |p: Vec3| {
+            if p.x > 60.0 && p.z < 0.0 {
+                crate::defs::Content::Lava.as_f32()
+            } else {
+                crate::defs::Content::Empty.as_f32()
+            }
+        };
+        g.surcharge_hazard_links(&is_solid, &contents);
+        // Link 0→1 enters the lava-edge cell 1 → surcharged; link 1→0 enters interior cell 0 → not.
+        assert!(
+            (g.links[0].cost - (1.0 + HAZARD_LINK_EXTRA)).abs() < 1e-6,
+            "into-edge link not surcharged: {}",
+            g.links[0].cost
+        );
+        assert_eq!(g.links[1].cost, 1.0, "interior link must be unchanged");
+    }
+
+    /// The surcharge diverts A* off a lava-edge route the same way a penalty does: flagging the
+    /// cheap branch's middle cell (via a localized lava pool) flips the route onto the safe branch,
+    /// and the graph is never severed. Reuses [`diamond`] (empty grid ⇒ every side is an edge, so
+    /// the oracle alone decides), with `is_solid` false everywhere so non-lava probes read as a
+    /// *pit* — which the surcharge deliberately ignores, leaving only the lava-flagged cell charged.
+    #[test]
+    fn surcharge_diverts_off_lava_route() {
+        let mut g = diamond();
+        // Baseline: cheaper route via cell 1.
+        assert_eq!(g.find_path(0, 3, &LinkCosts::default()).unwrap(), vec![0, 1]);
+        // A lava pool localized around cell 1's origin (100, 50); nothing else is near it.
+        let is_solid = |_: Vec3| false;
+        let lava_at = |cx: f32, cy: f32| {
+            move |p: Vec3| {
+                if (p.x - cx).abs() < 40.0 && (p.y - cy).abs() < 40.0 && p.z < 0.0 {
+                    crate::defs::Content::Lava.as_f32()
+                } else {
+                    crate::defs::Content::Empty.as_f32()
+                }
+            }
+        };
+        g.surcharge_hazard_links(&is_solid, &lava_at(100.0, 50.0));
+        // Cell 1 now sits on lava, so 0→1 costs more → A* takes the (now cheaper) route via cell 2.
+        assert_eq!(g.find_path(0, 3, &LinkCosts::default()).unwrap(), vec![2, 3]);
+        // Flag the other branch too: both first legs charged, but finite — a route still exists.
+        g.surcharge_hazard_links(&is_solid, &lava_at(100.0, -50.0));
+        assert!(
+            g.find_path(0, 3, &LinkCosts::default()).is_some(),
+            "the moderate surcharge must never sever the graph"
+        );
     }
 }
