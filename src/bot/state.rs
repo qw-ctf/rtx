@@ -129,6 +129,11 @@ pub struct BotState {
     pub gate_since: f32,
     pub avoid_gate: i32,
     pub avoid_gate_until: f32,
+    /// Plat standoff: the navmesh plat index we're holding off from while it's raised, and when the
+    /// hold began (the give-up timeout base). Keyed on the plat index, not the leg, so the 0.4s
+    /// repath churn doesn't reset the timer. `None` = not waiting on a lift.
+    pub plat_wait: Option<usize>,
+    pub plat_wait_since: f32,
     /// Grappling-hook traversal state machine (see [`crate::bot`]), driven when the current route leg
     /// is a [`LinkKind::Hook`](crate::navmesh::LinkKind::Hook): aim at the anchor, throw, reel to
     /// build speed, release into a parabola, ride it to the target.

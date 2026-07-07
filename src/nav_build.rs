@@ -13,6 +13,14 @@ use crate::entity::EntId;
 use crate::game::{cstring, GameState};
 use crate::navmesh;
 
+/// Live status of a navmesh plat, for plat-aware boarding: whether it currently rests at its
+/// bottom (safe to walk aboard) and the Z of its top surface (to tell an approaching bot from one
+/// already riding). A freed plat reports as down so a bot never waits on a lift that's gone.
+pub(crate) struct PlatStatus {
+    pub down: bool,
+    pub surface_z: f32,
+}
+
 impl GameState {
     /// Build the bot navmesh for the current map on demand — the first time bots are wanted —
     /// then cache it. Attempted at most once per map (a failed read won't retry every frame).
@@ -31,6 +39,24 @@ impl GameState {
                 let g = graph.gate(gi);
                 let obs = &self.entities[EntId(g.obstruction)];
                 obs.in_use && (obs.v.origin - g.closed_origin).length() < 8.0
+            })
+            .collect()
+    }
+
+    /// Live status for every navmesh plat, in `plat_of_link` index order — the runtime uses it to
+    /// hold a standoff outside a raised lift's inner trigger (which resets its lower-timer while any
+    /// live player stands inside) and to board only once it's down. A freed lift reads as down.
+    pub(crate) fn plat_statuses(&self) -> Vec<PlatStatus> {
+        let Some(graph) = self.nav.graph.as_ref() else {
+            return Vec::new();
+        };
+        (0..graph.plat_count())
+            .map(|pi| {
+                let p = &self.entities[EntId(graph.plat(pi).entity)];
+                PlatStatus {
+                    down: !p.in_use || p.mover.state == crate::entity::STATE_BOTTOM,
+                    surface_z: p.v.origin.z + p.v.maxs.z,
+                }
             })
             .collect()
     }
@@ -197,6 +223,10 @@ impl GameState {
                 navmesh::PlatInfo {
                     board: Vec3::new(cx, cy, pos2.z + maxs.z + 24.0),
                     exit: Vec3::new(cx, cy, pos1.z + maxs.z + 24.0),
+                    entity: e.0,
+                    // World-XY footprint of the brush (XY is the same at pos1/pos2 — travel is Z-only).
+                    fp_min: glam::Vec2::new(pos1.x + mins.x, pos1.y + mins.y),
+                    fp_max: glam::Vec2::new(pos1.x + maxs.x, pos1.y + maxs.y),
                 }
             })
             .collect()

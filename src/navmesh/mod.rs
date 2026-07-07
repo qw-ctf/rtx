@@ -275,6 +275,12 @@ pub struct NavGraph {
     /// fire delay + angles + self-damage the bot executor needs.
     rocket_jump_links: Vec<i32>,
     rocket_jumps: Vec<RocketJumpTraversal>,
+    /// Spliced `func_plat` lifts (entity id + footprint), and a per-link tag (parallel to `links`,
+    /// `-1` for untagged) marking the ride link and every jump-aboard link that boards each plat —
+    /// same side-table pattern as `gated_links`, so the runtime can find which lift a leg boards and
+    /// hold a standoff while it's raised.
+    plats: Vec<Plat>,
+    plat_links: Vec<i32>,
 }
 
 /// A solved speed jump: where the takeoff ledge is and the horizontal speed needed there, so the
@@ -355,6 +361,8 @@ impl NavGraph {
             speed_jumps: Vec::new(),
             rocket_jump_links: Vec::new(),
             rocket_jumps: Vec::new(),
+            plats: Vec::new(),
+            plat_links: Vec::new(),
         };
         graph.link_cells(bsp);
         graph
@@ -735,14 +743,25 @@ impl NavGraph {
             let Some(top) = self.nearest_within(p.exit, GRID * 3.0, STEP_HEIGHT * 2.0) else {
                 continue;
             };
+            // Register the plat only once its top wired in (skipped plats never register — same as
+            // gates), so `plat_of_link` indices stay dense and match `plats`.
+            let pi = self.plats.len() as i32;
+            self.plats.push(Plat {
+                entity: p.entity,
+                fp_min: p.fp_min,
+                fp_max: p.fp_max,
+            });
             let board = self.add_cell(p.board);
             let ride = (p.exit.z - p.board.z).max(0.0);
-            self.push_link(Link {
-                from: board,
-                to: top,
-                kind: LinkKind::Plat,
-                cost: ride / MAX_SPEED + 1.0, // ride time + boarding/trigger overhead
-            });
+            self.push_plat_link(
+                Link {
+                    from: board,
+                    to: top,
+                    kind: LinkKind::Plat,
+                    cost: ride / MAX_SPEED + 1.0, // ride time + boarding/trigger overhead
+                },
+                pi,
+            );
             // Jump-aboard links from the surrounding lower floor.
             for c in self.cells_near(p.board.xy(), GRID * 3.0) {
                 if c == board {
@@ -752,14 +771,44 @@ impl NavGraph {
                 let dz = p.board.z - from.z;
                 if dz.abs() <= JUMP_APEX && arc_clear(bsp, from, p.board) {
                     let horiz = (p.board.xy() - from.xy()).length();
-                    self.push_link(Link {
-                        from: c,
-                        to: board,
-                        kind: LinkKind::JumpGap,
-                        cost: link_cost(LinkKind::JumpGap, horiz, dz),
-                    });
+                    self.push_plat_link(
+                        Link {
+                            from: c,
+                            to: board,
+                            kind: LinkKind::JumpGap,
+                            cost: link_cost(LinkKind::JumpGap, horiz, dz),
+                        },
+                        pi,
+                    );
                 }
             }
+        }
+    }
+
+    /// Push a plat-related link (the ride or a jump-aboard), tagging it with plat index `pi` so the
+    /// runtime can look the lift up via [`plat_of_link`](Self::plat_of_link). Keeps `plat_links` in
+    /// step with `links`, mirroring [`push_hook`](Self::push_hook).
+    fn push_plat_link(&mut self, link: Link, pi: i32) {
+        if self.plat_links.len() != self.links.len() {
+            self.plat_links.resize(self.links.len(), -1);
+        }
+        self.push_link(link);
+        self.plat_links.push(pi);
+    }
+
+    pub fn plat_count(&self) -> usize {
+        self.plats.len()
+    }
+
+    pub fn plat(&self, i: usize) -> &Plat {
+        &self.plats[i]
+    }
+
+    /// The plat (if any) that link `li` boards or rides.
+    pub fn plat_of_link(&self, li: u32) -> Option<usize> {
+        match self.plat_links.get(li as usize).copied().unwrap_or(-1) {
+            p if p >= 0 => Some(p as usize),
+            _ => None,
         }
     }
 
@@ -1271,10 +1320,17 @@ pub struct RocketJumpTraversal {
 }
 
 /// The two standing positions a `func_plat` connects: the player-origin spot on the plat
-/// surface at the bottom of travel (`board`) and at the top (`exit`).
+/// surface at the bottom of travel (`board`) and at the top (`exit`), plus the edict id and
+/// the plat brush's world-XY footprint so the runtime can read the lift's live state and hold
+/// a standoff outside its inner trigger (see [`Plat`]).
 pub struct PlatInfo {
     pub board: Vec3,
     pub exit: Vec3,
+    /// The `func_plat` edict, to read its live mover state at runtime.
+    pub entity: u32,
+    /// World-XY footprint of the plat brush (XY is travel-invariant), for the standoff box.
+    pub fp_min: Vec2,
+    pub fp_max: Vec2,
 }
 
 /// A `trigger_teleport`: its world-space trigger box (`tmin`/`tmax`) and the player-origin
@@ -1298,6 +1354,17 @@ pub struct Gate {
     pub button_cell: CellId,
     pub aim: Vec3,
     pub shoot: bool,
+}
+
+/// A spliced `func_plat`: the edict whose live mover state gates boarding, and the plat brush's
+/// world-XY footprint. The inner trigger is this footprint shrunk 25u in XY, spanning the full
+/// travel height, so a live player standing on the ground *under* a raised plat is inside it and
+/// keeps resetting its lower-timer — hence the bot must hold a standoff outside this box until the
+/// lift is down (see the plat-hold logic in `bot::run_bot`).
+pub struct Plat {
+    pub entity: u32,
+    pub fp_min: Vec2,
+    pub fp_max: Vec2,
 }
 
 /// Inputs for [`NavGraph::add_gates`], gathered from spawned obstruction/activator entities: the
@@ -1678,9 +1745,28 @@ mod tests {
         let (links_before, cells_before) = (g.links.len(), g.cells.len());
         let board = g.cells[start as usize].origin + Vec3::Z * 24.0;
         let exit = g.cells[goal as usize].origin;
-        g.add_plats(&bsp, &[PlatInfo { board, exit }]);
+        g.add_plats(
+            &bsp,
+            &[PlatInfo {
+                board,
+                exit,
+                entity: 7,
+                fp_min: board.xy() - Vec2::splat(32.0),
+                fp_max: board.xy() + Vec2::splat(32.0),
+            }],
+        );
         assert_eq!(g.summary().plat, 1, "plat ride not added");
         assert_eq!(g.cells.len(), cells_before + 1, "board cell not added");
+        // The lift registered, and its ride link (the first link added) plus every jump-aboard link
+        // carries the plat tag, while a pre-existing static link does not.
+        assert_eq!(g.plat_count(), 1, "plat not registered");
+        assert_eq!(g.plat(0).entity, 7, "plat entity id not stored");
+        assert_eq!(g.plat_of_link(links_before as u32), Some(0), "ride link not tagged");
+        let tagged = (links_before as u32..g.links.len() as u32)
+            .filter(|&li| g.plat_of_link(li) == Some(0))
+            .count();
+        assert_eq!(tagged, g.links.len() - links_before, "all plat links tagged");
+        assert_eq!(g.plat_of_link(0), None, "static link wrongly tagged");
         eprintln!("plat splice: {} jump-aboard links", g.links.len() - links_before - 1);
 
         // Teleport splice: a trigger box around a well-connected cell warping to another cell.
@@ -1994,6 +2080,8 @@ mod tests {
             speed_jumps: Vec::new(),
             rocket_jump_links: Vec::new(),
             rocket_jumps: Vec::new(),
+            plats: Vec::new(),
+            plat_links: Vec::new(),
         }
     }
 

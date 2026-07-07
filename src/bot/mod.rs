@@ -13,7 +13,7 @@
 //!
 //! [navmesh]: crate::navmesh
 
-use glam::{Vec3, Vec3Swizzles};
+use glam::{Vec2, Vec3, Vec3Swizzles};
 
 pub(crate) mod bhop;
 mod combat;
@@ -84,6 +84,18 @@ const STUCK_MOVE: f32 = 16.0;
 const STUCK_TIME: f32 = 0.7;
 /// A plat ride is "done" once we've risen to within this of the exit-floor height.
 const PLAT_RISE_TOL: f32 = 18.0;
+/// While an upcoming leg boards a raised plat, hold this far outside the plat's XY footprint.
+/// The inner trigger is the footprint shrunk 25u in XY, so a 40u standoff keeps the bot's
+/// 16u-half-width body well clear of holding the lift up.
+const PLAT_STANDOFF: f32 = 40.0;
+/// Engage the standoff hold only once this near the footprint — further out, just keep walking in.
+const PLAT_ENGAGE: f32 = 96.0;
+/// Give up on a raised plat that never descends (a camped lift, or a targeted plat that only its
+/// own trigger lowers): strike the ride link and re-path.
+const PLAT_WAIT_TIMEOUT: f32 = 8.0;
+/// How many upcoming route legs to scan for a plat tag — the walk-in legs before the tagged
+/// boarding leg sit within a cell or two of it, so a small window covers the approach.
+const PLAT_LOOKAHEAD: usize = 4;
 /// Minimum seconds between item-goal re-selections (so a bot commits to a pickup rather than
 /// flip-flopping between two of similar worth each frame).
 const GOAL_SELECT_INTERVAL: f32 = 1.5;
@@ -851,6 +863,11 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // the nav borrow (it reads the obstruction edicts).
     let gate_closed = game.gate_closed_flags();
 
+    // Live lift states, for the plat standoff. A bot approaching a raised `func_plat` must hold
+    // outside its inner trigger — standing under it resets the lift's lower-timer and it never comes
+    // down (see `plat_statuses`). Read before the nav borrow (it reads the plat edicts).
+    let plat_status = game.plat_statuses();
+
     // This bot's live failed-link surcharges: legs it recently failed to traverse (stuck, stalled
     // speed-jump, given-up hook) cost extra in *its* A* so the planner diverts instead of handing
     // back the identical dead route to retry until a coarse goal-timeout fires. Built here from an
@@ -1059,6 +1076,61 @@ fn run_bot(game: &mut GameState, e: EntId) {
     } else {
         (target_origin, None, true, None)
     };
+
+    // Plat standoff. If an upcoming leg boards/rides a func_plat that isn't at its bottom, and we're
+    // not already aboard it, walking to the board point would put us inside the lift's inner trigger
+    // (the footprint shrunk 25u, spanning the full travel height) — and `plat_center_touch` resets
+    // the lower-timer for any live player inside, so a bot waiting there would hold the lift raised
+    // forever (and can wedge under a non-solid one). Instead hold a standoff outside the footprint
+    // until it descends. The board leg itself may be a couple of Walk legs ahead, so scan a small
+    // window and gate on proximity — the walk-in cells sit inside the full-height trigger too.
+    let plat_hold: Option<usize> = bot
+        .route
+        .get(bot.route_pos..)
+        .into_iter()
+        .flatten()
+        .take(PLAT_LOOKAHEAD)
+        .find_map(|&l| graph.plat_of_link(l))
+        .filter(|&pi| {
+            let st = &plat_status[pi];
+            let p = graph.plat(pi);
+            let riding =
+                origin.z > st.surface_z + 8.0 && in_footprint(origin.xy(), p.fp_min, p.fp_max, 0.0);
+            !st.down && !riding && in_footprint(origin.xy(), p.fp_min, p.fp_max, PLAT_ENGAGE)
+        });
+    // While holding, steer to the standoff point and borrow the Plat leg's driver treatment (no
+    // jump-press, no bhop entry, no air-latch, progress-watchdog exempt) by presenting `kind` as Plat.
+    let (waypoint, kind) = match plat_hold {
+        Some(pi) => {
+            let p = graph.plat(pi);
+            (plat_standoff(origin, p.fp_min, p.fp_max), Some(LinkKind::Plat))
+        }
+        None => (waypoint, kind),
+    };
+    // Plat-wait timeout: keyed on the plat index (not the leg, which the 0.4s repath churn rebuilds),
+    // give up on a lift that never descends — a camped one, or a targeted plat only its own trigger
+    // lowers — by striking its ride link so this bot's A* diverts, then re-path.
+    match plat_hold {
+        Some(pi) => {
+            if bot.plat_wait != Some(pi) {
+                bot.plat_wait = Some(pi);
+                bot.plat_wait_since = now;
+            } else if now - bot.plat_wait_since > PLAT_WAIT_TIMEOUT {
+                let ride = bot.route[bot.route_pos..]
+                    .iter()
+                    .copied()
+                    .find(|&l| graph.link_kind(l) == LinkKind::Plat && graph.plat_of_link(l) == Some(pi));
+                if let Some(ride) = ride {
+                    penalize_link(bot, ride, now);
+                }
+                bot.plat_wait = None;
+                bot.route.clear();
+                bot.repath_time = now;
+            }
+        }
+        None => bot.plat_wait = None,
+    }
+
     let hook_active = matches!(kind, Some(LinkKind::Hook)) || hooking;
     // Same for a rocket-jump leg: standing in stance and riding the blast arc must be exempt from the
     // stuck/progress watchdogs and the bhop veto, exactly like a hook leg.
@@ -1079,6 +1151,15 @@ fn run_bot(game: &mut GameState, e: EntId) {
         // This drives the perception cone too (perception reads `bot.aim`), so it's real scouting;
         // combat's `engage` still overrides the moment a target comes into sight.
         bot.scan_point
+    } else if let Some(pi) = plat_hold {
+        // Holding off a raised lift: watch it, so we notice it descend (and combat's `engage` still
+        // overrides the instant a target comes into sight).
+        let p = graph.plat(pi);
+        Vec3::new(
+            (p.fp_min.x + p.fp_max.x) * 0.5,
+            (p.fp_min.y + p.fp_max.y) * 0.5,
+            plat_status[pi].surface_z + 24.0,
+        )
     } else if bot.route_pos + 2 < bot.route.len() {
         graph.cell_origin(graph.link_target(bot.route[bot.route_pos + 2]))
     } else if combat_blind {
@@ -1099,7 +1180,13 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // parabola all look "stuck" to it, and a force-jump/repath there would wreck the traversal — the
     // hook driver's own per-phase timeouts are its stuck detection.
     let mut force_jump = false;
-    if hook_active || rj_active || on_air || vigil || (origin - bot.stuck_origin).length() > STUCK_MOVE {
+    if hook_active
+        || rj_active
+        || on_air
+        || vigil
+        || plat_hold.is_some()
+        || (origin - bot.stuck_origin).length() > STUCK_MOVE
+    {
         bot.stuck_origin = origin;
         bot.stuck_since = now;
     } else if now - bot.stuck_since > STUCK_TIME {
@@ -1591,6 +1678,42 @@ fn progress_stalled(best: f32, since: f32, remaining: f32, now: f32) -> bool {
     now - since > PROGRESS_STALL_TIME && remaining > best - PROGRESS_EPS
 }
 
+/// Whether `p` lies within the box `[fp_min, fp_max]` grown by `margin` on every side.
+fn in_footprint(p: Vec2, fp_min: Vec2, fp_max: Vec2, margin: f32) -> bool {
+    p.x >= fp_min.x - margin
+        && p.x <= fp_max.x + margin
+        && p.y >= fp_min.y - margin
+        && p.y <= fp_max.y + margin
+}
+
+/// Where to stand while a raised plat comes down: the bot's current spot if it's already at least
+/// [`PLAT_STANDOFF`] clear of the footprint (so it holds still — no jitter), else the nearest point
+/// pushed just past that boundary along whichever face it's closest to escaping, so it steps
+/// straight back out of the trigger the way it came rather than crossing under the lift. Z is kept
+/// at the bot's own height.
+fn plat_standoff(origin: Vec3, fp_min: Vec2, fp_max: Vec2) -> Vec3 {
+    if !in_footprint(origin.xy(), fp_min, fp_max, PLAT_STANDOFF) {
+        return origin;
+    }
+    // How far to move outward to clear the standoff boundary across each of the four faces.
+    let out_min_x = origin.x - (fp_min.x - PLAT_STANDOFF);
+    let out_max_x = (fp_max.x + PLAT_STANDOFF) - origin.x;
+    let out_min_y = origin.y - (fp_min.y - PLAT_STANDOFF);
+    let out_max_y = (fp_max.y + PLAT_STANDOFF) - origin.y;
+    let m = out_min_x.min(out_max_x).min(out_min_y).min(out_max_y);
+    let (mut x, mut y) = (origin.x, origin.y);
+    if m == out_min_x {
+        x = fp_min.x - PLAT_STANDOFF;
+    } else if m == out_max_x {
+        x = fp_max.x + PLAT_STANDOFF;
+    } else if m == out_min_y {
+        y = fp_min.y - PLAT_STANDOFF;
+    } else {
+        y = fp_max.y + PLAT_STANDOFF;
+    }
+    Vec3::new(x, y, origin.z)
+}
+
 /// Record that this bot just failed to traverse `link`, so its next A* diverts around it. `Plat`
 /// and `Teleport` legs are exempt: waiting on a lift or standing in a teleport trigger reads as
 /// "stuck" to the watchdogs but is not a routing mistake. Bumps an existing live entry's strike
@@ -1623,6 +1746,14 @@ fn penalize_leg(bot: &mut BotState, link: Option<u32>, kind: Option<LinkKind>, n
     if matches!(kind, Some(LinkKind::Plat | LinkKind::Teleport)) {
         return;
     }
+    penalize_link(bot, link, now);
+}
+
+/// Record a failed `link` unconditionally — the ring-insert core of [`penalize_leg`], without its
+/// `None`/`Plat`/`Teleport` guards. The plat-wait timeout calls this directly: it *must* strike a
+/// `Plat` link, the very kind `penalize_leg` exempts (the ordinary watchdogs misread waiting on a
+/// lift as failure, but an 8s hold with no descent is a genuine one worth diverting from).
+fn penalize_link(bot: &mut BotState, link: u32, now: f32) {
     if let Some(slot) = bot.failed_links.iter_mut().find(|(l, until, _)| *l == link && *until > now) {
         slot.2 = slot.2.saturating_add(1);
         slot.1 = now + PENALTY_TTL;
@@ -1965,6 +2096,43 @@ mod tests {
         penalize_leg(&mut b, Some(3), Some(LinkKind::Walk), 2.0);
         let e = b.failed_links.iter().find(|&&(l, _, _)| l == 3).unwrap();
         assert_eq!((e.1, e.2), (2.0 + PENALTY_TTL, 2), "same leg bumped to 2 strikes, expiry refreshed");
+    }
+
+    #[test]
+    fn penalize_link_records_plat_leg() {
+        // The plat-wait timeout must strike a Plat link directly — the kind `penalize_leg` exempts.
+        let mut b = BotState::default();
+        penalize_leg(&mut b, Some(9), Some(LinkKind::Plat), 1.0);
+        assert!(b.failed_links.iter().all(|&(_, until, _)| until == 0.0), "penalize_leg still exempts Plat");
+        penalize_link(&mut b, 9, 1.0);
+        let e = b.failed_links.iter().find(|&&(l, _, _)| l == 9).expect("plat link recorded");
+        assert_eq!((e.1, e.2), (1.0 + PENALTY_TTL, 1), "plat link struck once");
+    }
+
+    #[test]
+    fn in_footprint_margins() {
+        let (lo, hi) = (Vec2::new(-16.0, -16.0), Vec2::new(16.0, 16.0));
+        assert!(in_footprint(Vec2::ZERO, lo, hi, 0.0), "centre is inside");
+        assert!(!in_footprint(Vec2::new(20.0, 0.0), lo, hi, 0.0), "20u past +X face is outside");
+        assert!(in_footprint(Vec2::new(20.0, 0.0), lo, hi, 8.0), "within an 8u margin it's inside");
+        assert!(!in_footprint(Vec2::new(25.0, 0.0), lo, hi, 8.0), "past the margin it's outside again");
+    }
+
+    #[test]
+    fn plat_standoff_pushes_out_and_holds() {
+        let (lo, hi) = (Vec2::new(-16.0, -16.0), Vec2::new(16.0, 16.0));
+        // Already clear of the footprint + standoff: hold still (return the origin unchanged).
+        let clear = Vec3::new(80.0, 0.0, 24.0);
+        assert_eq!(plat_standoff(clear, lo, hi), clear, "outside the standoff, stand still");
+        // Just inside the +X side: pushed straight out past fp_max.x + PLAT_STANDOFF, Z preserved.
+        let near = Vec3::new(10.0, 2.0, 24.0);
+        let out = plat_standoff(near, lo, hi);
+        assert_eq!(out.x, 16.0 + PLAT_STANDOFF, "pushed past the +X face");
+        assert_eq!(out.z, 24.0, "keeps the bot's own height");
+        assert!(!in_footprint(out.xy(), lo, hi, PLAT_STANDOFF - 0.01), "result clears the standoff box");
+        // Dead centre is degenerate (all faces equal) but must still resolve to a point outside.
+        let centre = plat_standoff(Vec3::new(0.0, 0.0, 24.0), lo, hi);
+        assert!(!in_footprint(centre.xy(), lo, hi, PLAT_STANDOFF - 0.01), "centre still escapes");
     }
 
     #[test]
