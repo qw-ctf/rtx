@@ -202,15 +202,20 @@ impl GameState {
             self.model_note_weapon_of_attacker(targ, attacker, bit);
         }
 
-        // Perception "feel": a bot that just took damage instantly knows its attacker (you turn
-        // around when shot in the back), bypassing the view-cone/reaction gate. Perception then reads
+        // Perception "feel": a bot that just took damage instantly registers its attacker (you turn
+        // toward the hit when shot in the back), bypassing the view-cone/reaction gate. Like sound,
+        // this reveals only a *direction* — the bot hunts a hypothesised point along the bearing the
+        // hit came from, not the shooter's exact spot (only sight pins that). Perception then reads
         // `known_enemy`/`known_until` next frame. Skipped for self-damage and world hazards.
         if self.entities[targ].bot.is_bot && attacker != targ && attacker != EntId::WORLD {
+            let targ_org = self.entities[targ].v.origin;
             let atk_org = self.entities[attacker].v.origin;
+            let (r_lat, r_dist) = (self.random(), self.random());
+            let pt = crate::bot::perception::heard_hypothesis(targ_org, atk_org, r_lat, r_dist);
             let b = &mut self.entities[targ].bot;
             b.known_enemy = attacker.0;
             b.known_until = time + crate::bot::perception::MEMORY;
-            b.percept_last_seen = atk_org;
+            b.percept_last_seen = pt; // felt the hit's direction, not the shooter's exact position
         }
 
         if self.entities[targ].v.health <= 0.0 {

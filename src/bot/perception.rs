@@ -8,10 +8,15 @@
 //! few seconds ([`MEMORY`]) so a bot that loses sight hunts the last-seen spot instead of tracking a
 //! target through walls, then gives up — the believability win the plan calls out.
 //!
+//! Only **sight** yields an exact position: line of sight through the view frustum pins the enemy's
+//! true origin. The non-visual channels reveal a **direction**, not a place — hearing gunfire or
+//! feeling a hit tells the bot roughly *which way* an opponent is, and it investigates a hypothesised
+//! point along that bearing (see [`heard_hypothesis`]) rather than beelining the true coordinate.
+//!
 //! One [`perceive`] call per bot per frame, from [`resolve_objective`](super::resolve_objective),
 //! advances the reaction/memory clocks and returns this frame's [`Awareness`]. The "feel" channel is
 //! pushed the other way: [`GameState::t_damage`](crate::game::GameState) stamps `known_enemy` on a
-//! hurt bot directly, so getting shot in the back turns it around without waiting to see the shooter.
+//! hurt bot directly, so getting shot in the back turns it toward the hit without seeing the shooter.
 
 use glam::Vec3;
 
@@ -24,6 +29,41 @@ use crate::game::GameState;
 pub(crate) const MEMORY: f32 = 5.0;
 /// A bot hears a target's gunfire within this range (no line of sight required).
 const HEAR_RADIUS: f32 = 1000.0;
+/// Coarse distance grain for a non-visual cue: the guessed range is snapped to this bucket, so a bot
+/// can tell roughly how far a sound is by ear, never exactly.
+const CUE_DIST_BUCKET: f32 = 256.0;
+/// Lateral spread of a heard/felt guess, as a fraction of true distance — the guess lands on a short
+/// arc across the bearing, not a pinpoint on the line to the target.
+const CUE_LATERAL: f32 = 0.15;
+
+/// A hypothesis of where an unseen opponent is, from a non-visual cue (sound / damage). The
+/// **direction** from `listener` to `source` is exact; the **distance** is quantized to
+/// [`CUE_DIST_BUCKET`] and jittered, and a lateral offset scatters the point off the exact ray — so
+/// the bot investigates the right general direction without wall-hacking the true position. `r_lat`,
+/// `r_dist` are two `game.random()` draws in `0.0..1.0` (drawn by the caller before it borrows
+/// `&mut bot`). Degenerate (coincident) input returns `source`.
+pub(crate) fn heard_hypothesis(listener: Vec3, source: Vec3, r_lat: f32, r_dist: f32) -> Vec3 {
+    let to = source - listener;
+    let bearing = to.normalize_or_zero();
+    if bearing == Vec3::ZERO {
+        return source;
+    }
+    let true_dist = to.length();
+    // Rough range: snap to the bucket (floored at one bucket so a close cue isn't guessed at 0), plus
+    // up to ±half a bucket of jitter.
+    let rough = ((true_dist / CUE_DIST_BUCKET).round().max(1.0)) * CUE_DIST_BUCKET + (r_dist - 0.5) * CUE_DIST_BUCKET;
+    // Horizontal perpendicular to the bearing (fall back to X if the bearing is near-vertical).
+    let right = {
+        let r = bearing.cross(Vec3::Z);
+        if r.length_squared() < 1e-4 {
+            Vec3::X
+        } else {
+            r.normalize()
+        }
+    };
+    let lateral = right * (r_lat - 0.5) * 2.0 * CUE_LATERAL * true_dist;
+    listener + bearing * rough + lateral
+}
 
 /// What a bot knows about a nominated target this frame.
 pub(crate) enum Awareness {
@@ -79,8 +119,11 @@ pub(crate) fn perceive(game: &mut GameState, e: EntId, enemy: EntId, now: f32) -
     let can_see = los && in_fov;
 
     // Hear: the target fired recently (its attack cooldown is still running) within earshot. A cheap
-    // stand-in for a full sound-event bus — no line of sight, so it turns a bot toward nearby fire.
+    // stand-in for a full sound-event bus — no line of sight, so it reveals only a *direction*: the
+    // bot investigates a hypothesised point along the bearing, never the true origin. Draw the guess
+    // now, before the `&mut bot` borrow (`game.random()` needs `&mut game`).
     let heard = (enemy_org - my_origin).length() < HEAR_RADIUS && game.entities[enemy].combat.attack_finished > now;
+    let heard_pt = heard.then(|| heard_hypothesis(my_origin, enemy_org, game.random(), game.random()));
 
     let b = &mut game.entities[e].bot;
     let same_target = b.percept_ent == enemy.0;
@@ -112,10 +155,10 @@ pub(crate) fn perceive(game: &mut GameState, e: EntId, enemy: EntId, now: f32) -
         if b.percept_ent == enemy.0 {
             b.percept_ent = 0; // lost sight — the next sighting starts a fresh reaction beat
         }
-        if heard {
+        if let Some(pt) = heard_pt {
             b.known_enemy = enemy.0;
             b.known_until = now + MEMORY;
-            b.percept_last_seen = enemy_org;
+            b.percept_last_seen = pt; // direction-only hypothesis, not the true origin
         }
     }
 
@@ -150,5 +193,46 @@ mod tests {
         assert!(reaction_time(0.4, 7.0) < reaction_time(0.4, 0.0), "skill shortens reaction");
         assert!(reaction_time(0.4, 7.0) >= 0.05, "but never below the floor");
         assert_eq!(reaction_time(0.01, 7.0), 0.05, "the floor also catches a tiny base");
+    }
+
+    #[test]
+    fn hypothesis_keeps_the_bearing() {
+        let listener = Vec3::new(0.0, 0.0, 0.0);
+        let source = Vec3::new(600.0, 0.0, 0.0); // due +X, not on a bucket edge
+        // Sweep the random draws: the guess must always point the same general way as the source.
+        for &r_lat in &[0.0, 0.5, 1.0] {
+            for &r_dist in &[0.0, 0.5, 1.0] {
+                let g = heard_hypothesis(listener, source, r_lat, r_dist) - listener;
+                let dir = (source - listener).normalize();
+                assert!(g.normalize().dot(dir) > 0.9, "guess {g:?} must hug the source bearing");
+            }
+        }
+    }
+
+    #[test]
+    fn hypothesis_is_never_the_exact_spot() {
+        let listener = Vec3::new(10.0, 20.0, 30.0);
+        let source = Vec3::new(610.0, 20.0, 30.0); // 600u away, off a bucket multiple
+        let g = heard_hypothesis(listener, source, 0.5, 0.5);
+        assert!((g - source).length() > 1.0, "a heard guess must not land on the true origin");
+    }
+
+    #[test]
+    fn hypothesis_snaps_range_to_the_bucket() {
+        let listener = Vec3::ZERO;
+        // 800u away: nearest bucket multiple is 768 (3×256); jitter is ±128, so range ∈ [640, 896].
+        let source = Vec3::new(800.0, 0.0, 0.0);
+        for &r_dist in &[0.0, 0.5, 1.0] {
+            let range = (heard_hypothesis(listener, source, 0.5, r_dist) - listener).length();
+            assert!((640.0..=896.0).contains(&range), "range {range} outside the bucket ± jitter band");
+        }
+    }
+
+    #[test]
+    fn hypothesis_handles_coincident_input() {
+        let p = Vec3::new(5.0, 5.0, 5.0);
+        let g = heard_hypothesis(p, p, 0.5, 0.5);
+        assert_eq!(g, p, "coincident listener/source returns the source without NaN");
+        assert!(g.is_finite(), "no NaN from a zero bearing");
     }
 }
