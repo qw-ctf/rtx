@@ -584,7 +584,14 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // Goal watchdog: while chasing an item and *not* already detouring to open a gate, give up on
     // one we've chased too long without collecting (behind an elevator/button/movewall/teleporter
     // chain the router can't thread) so we stop circling and go fetch something reachable instead.
-    if chasing && game.entities[e].bot.gate.is_none() && now - game.entities[e].bot.goal_started > GOAL_GIVEUP_TIME {
+    // A powerup goal gets a longer leash — a cross-map quad/pent run legitimately outlasts the
+    // ordinary give-up time (the progress watchdog still catches a genuinely stuck bot sooner).
+    let giveup = if game.is_powerup_item(EntId(game.entities[e].bot.goal_item)) {
+        goals::POWERUP_GIVEUP
+    } else {
+        GOAL_GIVEUP_TIME
+    };
+    if chasing && game.entities[e].bot.gate.is_none() && now - game.entities[e].bot.goal_started > giveup {
         let b = &mut game.entities[e].bot;
         b.mark_avoid(b.goal_item, now + GOAL_AVOID_TIME);
         b.goal_item = 0;
@@ -1655,6 +1662,65 @@ mod tests {
              never clear the {:.0}u engage bar",
             bhop::RUNWAY_ENGAGE
         );
+    }
+
+    /// Bravado quad **reachability gap** (env-gated on `RTX_TEST_BSP=…/bravado.bsp`; vacuously green
+    /// when unset). The quad platform is reached in-game by a jump / double-jump / rocket-jump onto
+    /// it, but nav-build currently builds *no inbound climb link* onto that platform — so from most
+    /// of the map the routing flood can't reach it and bots never take the quad. This test measures
+    /// and prints the gap (a regression guard for the nav-build fix that adds the inbound link); it
+    /// asserts only what holds today: the quad has a nav cell and the broader upper level is reachable.
+    #[test]
+    fn bravado_quad_reachability() {
+        let Ok(path) = std::env::var("RTX_TEST_BSP") else {
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read bsp");
+        let bsp = Bsp::parse(&bytes).expect("parse bsp");
+        let graph = NavGraph::build(&bsp);
+        let n = graph.cells.len();
+        // Quad spawn from the bravado entity lump: item_artifact_super_damage "752 24 288".
+        let quad_origin = Vec3::new(752.0, 24.0, 288.0);
+        let quad_cell = graph.nearest(quad_origin).expect("quad spawn has a nav cell");
+
+        // How many cells can route TO the quad (inbound reachability), and to the broader upper level.
+        let reaches = |target: CellId| {
+            (0..n as u32)
+                .filter(|&c| graph.costs_from(c, &LinkCosts::default())[target as usize].is_finite())
+                .count()
+        };
+        let to_quad = reaches(quad_cell);
+        let upper: Vec<u32> = (0..n as u32).filter(|&i| graph.cell_origin(i).z >= 260.0).collect();
+        let to_upper = (0..n as u32)
+            .filter(|&c| {
+                let costs = graph.costs_from(c, &LinkCosts::default());
+                upper.iter().any(|&u| costs[u as usize].is_finite())
+            })
+            .count();
+        // Inbound climb links (from a lower cell) onto the quad platform, by kind.
+        let plat: std::collections::HashSet<u32> = (0..n as u32)
+            .filter(|&i| {
+                let o = graph.cell_origin(i);
+                (o - graph.cell_origin(quad_cell)).length() <= 96.0
+            })
+            .collect();
+        let climb_in = (0..graph.links.len() as u32)
+            .filter(|&li| {
+                plat.contains(&graph.link_target(li))
+                    && graph.cell_origin(graph.link_source(li)).z
+                        < graph.cell_origin(graph.link_target(li)).z - 8.0
+            })
+            .count();
+        eprintln!(
+            "bravado quad: {n} cells; reachable IN from {to_quad}/{n} (upper level {to_upper}/{n}); \
+             inbound climb links onto platform = {climb_in}"
+        );
+        // Invariants that hold today (the reachability fix will additionally lift `to_quad`).
+        assert!(to_upper > n / 2, "upper level unreachable — mesh broken, not just the quad");
+        // The known gap, documented so the fix has a clear before/after (do not let it regress worse).
+        if climb_in == 0 {
+            eprintln!("  KNOWN GAP: no inbound climb link onto the quad platform — bots cannot route to the quad");
+        }
     }
 
     #[test]

@@ -17,14 +17,32 @@
 //! once with the navmesh (see `GameState::collect_goals`); the live availability and the bot's
 //! own stats are read fresh each time a goal is chosen.
 
+use glam::Vec3;
+
 use crate::arsenal::AmmoKind;
 use crate::defs::{Bits, Items, Solid};
 use crate::entity::{EntId, Think, Touch};
 use crate::game::GameState;
 use crate::navmesh::{CellId, LinkCosts};
 
-/// Beyond this travel-or-respawn time (seconds) an item isn't worth pursuing.
+/// Beyond this travel-or-respawn time (seconds) an *ordinary* item isn't worth pursuing.
 pub(crate) const LOOKAHEAD: f32 = 10.0;
+
+/// Powerups (quad/pentagram) are planned much farther out than ordinary pickups: a powerup is worth
+/// crossing the map for and worth *waiting at* (arrive early, deny the enemy its timing). 30 s covers
+/// any trek plus the tail of the 60 s quad respawn, while ordinary items keep the tight [`LOOKAHEAD`]
+/// so a bot doesn't detour half a minute for a shard.
+const POWERUP_LOOKAHEAD: f32 = 30.0;
+
+/// Give-up leash for a *powerup* goal (bot/mod.rs's `GOAL_GIVEUP_TIME` for ordinary items is 10 s).
+/// A cross-map quad run legitimately takes longer than that; the progress watchdog still catches a
+/// genuinely stuck bot far sooner. Sized to [`POWERUP_LOOKAHEAD`] plus a margin.
+pub(crate) const POWERUP_GIVEUP: f32 = 35.0;
+
+/// Powerup team-split threshold: a teammate counts as "so much nearer that I should take something
+/// else" once they're within this fraction of the bot's own distance to the powerup. Below 1.0 so a
+/// near-tie still lets both press it (redundancy against a contest) but a clear lead defers cleanly.
+const POWERUP_DEFER_RATIO: f32 = 0.7;
 
 /// Minimum *desire* an item must have for a bot to break off combat and detour for it (the
 /// `rtx_bot_greed` behavior). Set so powerups (200+) and a genuinely wanted weapon/health/armor
@@ -462,14 +480,21 @@ impl GameState {
         if ent.touch == Touch::Backpack {
             return ent.v.solid == Solid::Trigger && self.backpack_desire(&self.bot_stats(bot_e), item) > 0.0;
         }
-        let reachable_soon = ent.v.solid == Solid::Trigger
-            || (matches!(ent.think, Think::SubRegen) && ent.v.nextthink - now < LOOKAHEAD);
-        if !reachable_soon {
-            return false;
-        }
         let Some(cat) = ent.classname().and_then(category) else {
             return false;
         };
+        // A powerup respawning within the wider powerup horizon is a valid standing goal (arrive
+        // early and wait); ordinary items use the tight LOOKAHEAD.
+        let horizon = if matches!(cat, Category::Powerup) {
+            POWERUP_LOOKAHEAD
+        } else {
+            LOOKAHEAD
+        };
+        let reachable_soon = ent.v.solid == Solid::Trigger
+            || (matches!(ent.think, Think::SubRegen) && ent.v.nextthink - now < horizon);
+        if !reachable_soon {
+            return false;
+        }
         self.item_desire(&self.bot_stats(bot_e), item, cat) > 0.0
     }
 
@@ -717,13 +742,12 @@ impl GameState {
             }
         };
         let skip = |idx: u32| self.entities[bot_e].bot.is_avoided(idx, now);
-        let score_of = |desire: f32, t: f32| desire * (LOOKAHEAD - t) / (t + 5.0);
 
         // best = (item, cell, desire, score) — score orders the search, desire is handed back.
         let mut best: Option<(EntId, CellId, f32, f32)> = None;
-        let mut consider = |item: EntId, cell: CellId, desire: f32, t: f32, mult: f32| {
-            if t < LOOKAHEAD {
-                let mut score = score_of(desire, t) * mult;
+        let mut consider = |item: EntId, cell: CellId, desire: f32, t: f32, mult: f32, powerup: bool| {
+            if let Some(base) = item_score(desire, t, powerup) {
+                let mut score = base * mult;
                 if item.0 == current_goal {
                     score *= GOAL_HYSTERESIS; // stick with the current goal against a near-tie
                 }
@@ -741,6 +765,20 @@ impl GameState {
             let Some(cat) = self.entities[item].classname().and_then(category) else {
                 continue;
             };
+            let powerup = matches!(cat, Category::Powerup);
+            // Powerup team-split: the quad/pent is dominant, so left alone every team bot would
+            // dogpile it. Instead a bot *defers* — skips it entirely — when a teammate has already
+            // claimed it or is substantially nearer, and then picks the next-best item (armor/weapon
+            // control). "You take quad, I take RA." Team modes only; FFA keeps everyone contesting.
+            if powerup && teamwork {
+                let item_org = self.entities[item].v.origin;
+                let my_dist = (item_org - self.entities[bot_e].v.origin).length();
+                let mate_dist = self.nearest_teammate_dist(bot_e, my_team, item_org);
+                let claimed = self.item_claimed_by_teammate(bot_e, my_team, idx);
+                if defer_powerup_to_teammate(claimed, my_dist, mate_dist) {
+                    continue;
+                }
+            }
             let mut desire = self.item_desire(&s, item, cat);
             // Denial floor: an owned RL/LG normally scores ~0 desire, but if the enemy side lacks it
             // and it won't stay on the map, holding it still has value. Applied before the >0 gate so
@@ -761,7 +799,7 @@ impl GameState {
             let Some(t) = self.item_collect_time(item, travel, now) else {
                 continue;
             };
-            consider(item, cell, desire, t, claim_mult(idx));
+            consider(item, cell, desire, t, claim_mult(idx), powerup);
         }
 
         // Live backpacks aren't in the static catalog (they spawn on death / a teammate's toss and
@@ -782,10 +820,55 @@ impl GameState {
             if !travel.is_finite() {
                 continue;
             }
-            consider(item, cell, desire, travel, claim_mult(i as u32));
+            consider(item, cell, desire, travel, claim_mult(i as u32), false);
         }
 
         best.map(|(item, cell, desire, _)| (item, cell, desire))
+    }
+
+    /// The distance from the nearest living teammate (excluding `bot_e`, humans included) to `point`,
+    /// or `None` if the bot has no living teammate. The powerup team-split reads this against the
+    /// bot's own distance so the team spreads instead of dogpiling the quad.
+    fn nearest_teammate_dist(&self, bot_e: EntId, my_team: u8, point: Vec3) -> Option<f32> {
+        let maxclients = self.host().cvar(c"maxclients") as u32;
+        (1..=maxclients)
+            .map(EntId)
+            .filter(|&t| {
+                t != bot_e && {
+                    let e = &self.entities[t];
+                    e.classname() == Some("player") && e.v.health > 0.0 && e.mode_p.team == my_team
+                }
+            })
+            .map(|t| (self.entities[t].v.origin - point).length())
+            .min_by(f32::total_cmp)
+    }
+
+    /// Whether an item entity is a powerup pickup (quad/pentagram/ring) — the goal watchdog gives
+    /// these a longer leash ([`POWERUP_GIVEUP`]) since a cross-map powerup run is legitimately slow.
+    pub(crate) fn is_powerup_item(&self, item: EntId) -> bool {
+        self.entities[item]
+            .classname()
+            .and_then(category)
+            .is_some_and(|c| matches!(c, Category::Powerup))
+    }
+}
+
+/// Pure core of the powerup team-split: defer (skip the powerup as a goal) when a teammate has
+/// already claimed it, or the nearest teammate is within [`POWERUP_DEFER_RATIO`] of the bot's own
+/// distance to it. A clear teammate lead defers; a near-tie lets both press it.
+fn defer_powerup_to_teammate(claimed: bool, my_dist: f32, best_mate_dist: Option<f32>) -> bool {
+    claimed || best_mate_dist.is_some_and(|d| d < POWERUP_DEFER_RATIO * my_dist)
+}
+
+/// The goal score for an item, or `None` beyond its horizon. Ordinary items decay to zero at
+/// [`LOOKAHEAD`]; a powerup is scored out to the wider [`POWERUP_LOOKAHEAD`] with a dominant,
+/// gently-decaying numerator so it stays positive and outranks every ordinary item at any reachable
+/// collect time `t` (with desire ≈ 200+). Higher is better; callers multiply claim/hysteresis factors.
+fn item_score(desire: f32, t: f32, powerup: bool) -> Option<f32> {
+    if powerup {
+        (t < POWERUP_LOOKAHEAD).then(|| desire * POWERUP_LOOKAHEAD / (t + 5.0))
+    } else {
+        (t < LOOKAHEAD).then(|| desire * (LOOKAHEAD - t) / (t + 5.0))
     }
 }
 
@@ -822,5 +905,30 @@ mod tests {
         assert!(!hold_continues(5.0, 9.0, true, true, false, false, false)); // powerup expired
         assert!(!hold_continues(5.0, 9.0, true, true, true, true, false)); // carrier armed elsewhere
         assert!(!hold_continues(5.0, 9.0, true, true, true, false, true)); // enemy contesting
+    }
+
+    #[test]
+    fn powerup_score_dominates_and_reaches_far() {
+        // A quad (desire ~207) at t=20 must outrank a nearby health pack (desire ~50 at t=1) and a
+        // nearby armor (desire ~80 at t=3) — the "MUST get" directive as arithmetic.
+        let quad = item_score(207.0, 20.0, true).unwrap();
+        let health = item_score(50.0, 1.0, false).unwrap();
+        let armor = item_score(80.0, 3.0, false).unwrap();
+        assert!(quad > health && quad > armor, "quad {quad} vs health {health}, armor {armor}");
+        // An ordinary item past LOOKAHEAD is dropped; a powerup at the same t is still a candidate.
+        assert!(item_score(200.0, 12.0, false).is_none());
+        assert!(item_score(200.0, 12.0, true).is_some());
+        // A powerup past its own (wider) horizon is dropped.
+        assert!(item_score(200.0, POWERUP_LOOKAHEAD, true).is_none());
+    }
+
+    #[test]
+    fn powerup_defer_splits_the_team() {
+        // A teammate claim, or one substantially nearer, defers this bot to something else.
+        assert!(defer_powerup_to_teammate(true, 100.0, None)); // claimed
+        assert!(defer_powerup_to_teammate(false, 1000.0, Some(500.0))); // mate at 0.5× my dist
+        // A near-tie (mate at 0.9×) or no teammate → both press it / this bot pursues.
+        assert!(!defer_powerup_to_teammate(false, 1000.0, Some(900.0)));
+        assert!(!defer_powerup_to_teammate(false, 1000.0, None));
     }
 }
