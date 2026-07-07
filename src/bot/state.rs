@@ -106,6 +106,16 @@ pub struct BotState {
     /// Only used while the mode marks this bot as an audience/spectator; zero otherwise.
     pub wander_target: Vec3,
     pub wander_time: f32,
+    /// Item vigil ([`crate::bot::vigil`]): while waiting on an uncollectable goal item (mid-respawn,
+    /// or a handoff-held weapon) the bot cruises a short walk away and scans the room. `vigil_post` is
+    /// the current cruise spot (`ZERO` = none / heading back to the item) with its re-pick deadline;
+    /// `scan_point` is the world point the eyes sweep to, held until `scan_until`. Disjoint from
+    /// `wander_*` (roam needs `goal_item == 0`; audience wander needs a Move intent — a vigil bot is
+    /// by definition chasing an item), so the two never overlap despite the similar shape.
+    pub vigil_post: Vec3,
+    pub vigil_post_until: f32,
+    pub scan_point: Vec3,
+    pub scan_until: f32,
     /// Gate-errand progress watchdog: the closest we've gotten to the target button and the time
     /// we last got closer. If we stop making progress (stuck at a door we can't reach the button
     /// of) we give up — a flat timeout would wrongly abandon a button that's simply far away. Plus

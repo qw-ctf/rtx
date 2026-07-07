@@ -168,7 +168,10 @@ Bots value pickups the way ktx does: each item's **desire** is the marginal effe
 armor), firepower (weapons, ammo), or flat dominance (powerups) it would give *this* bot right now,
 weighted by how soon it can reach and collect it (`desire × (lookahead − t) / (t + 5)`) — so they
 skip health at full, weapons they own, and ammo they're capped on, time an item's respawn, and prize
-the **quad/pent** above almost anything. Dropped **backpacks** (a dead player's weapon + ammo, or a
+the **quad/pent** above almost anything. When a bot reaches an item that hasn't respawned yet, it
+doesn't stand and twitch on the spot — it **cruises** a short walk around the spawn, panning the view
+to **scan for enemies** (which genuinely widens what it can see), and heads back to stand on the point
+just as the item returns. Dropped **backpacks** (a dead player's weapon + ammo, or a
 teammate's toss) are sought and collected the same way. With `rtx_bot_greed` on (the default), a bot
 in the thick of a fight will **detour for the quad, a weapon it's missing, or a big health/armor
 pickup** whenever its target slips out of sight — the enemy is just one more goal competing with the

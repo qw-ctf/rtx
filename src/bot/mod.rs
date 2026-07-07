@@ -24,6 +24,7 @@ pub(crate) mod model;
 pub(crate) mod perception;
 mod rj;
 pub(crate) mod state;
+mod vigil;
 
 use crate::bot::state::{BotState, GrenadePhase, HookPhase, RjPhase};
 use crate::defs::{
@@ -320,6 +321,9 @@ struct Objective {
     enemy: Option<EntId>,
     /// Chasing a committed item goal (idle pickup or greedy combat detour).
     chasing: bool,
+    /// Standing vigil over an uncollectable goal item (cruising/scanning near it) — exempts the
+    /// stuck/progress watchdogs and drives the eyes with the scan sweep.
+    vigil: bool,
     /// Where to navigate toward this frame.
     target_origin: Vec3,
     /// The navmesh cell of the item goal, when chasing one (skips a `nearest` lookup).
@@ -512,6 +516,15 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         game.entities[e].bot.goal_item = 0; // a Move objective supersedes any item chase
     }
 
+    // Item vigil: if the goal item isn't collectable yet (mid-respawn, or a weapon held for a
+    // teammate) and we're already standing near it, cruise a short walk off and scan the room instead
+    // of twitching on the spot. Returns the overridden navigation target; `None` = carry on normally.
+    let vigil = if game.entities[e].bot.goal_item != 0 {
+        vigil::maybe(game, e, origin, holding, now)
+    } else {
+        None
+    };
+
     // Opt-in diagnostics (`rtx_bot_debug 1`): one throttled line per bot — what it wants, how far,
     // whether it's standing on that item, and whether it owns the LG. Pinpoints pickup-vs-desire.
     if host.cvar_bool(c"rtx_bot_debug") && now >= game.entities[e].bot.repath_time {
@@ -545,8 +558,9 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
             || "-".to_string(),
             |o| format!("H{:.0}/A{:.0} ars={:03x}", o.health, o.armor_value, o.items as u32),
         );
+        let vig = vigil.is_some() as i32;
         let msg = cstring(&format!(
-            "rtx bot{client}: want={goal} dist={dist:.0} on_item={overlap} ownLG={own_lg} cells={:.0} pen={pen} aware={aware} est={est} hold={hold}\n",
+            "rtx bot{client}: want={goal} dist={dist:.0} on_item={overlap} ownLG={own_lg} cells={:.0} pen={pen} aware={aware} est={est} hold={hold} vig={vig}\n",
             game.entities[e].v.ammo_cells,
         ));
         host.conprint(&msg); // conprint always shows; dprint needs `developer 1`
@@ -568,14 +582,15 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         let it = EntId(game.entities[e].bot.goal_item);
         (game.entities[it].v.origin, Some(game.entities[e].bot.goal_item_cell))
     };
-    // Where we're headed: the detour item, the mode's target, the chosen item, or the nearest human.
+    // Where we're headed: the vigil post (waiting on an uncollectable item), the detour item, the
+    // mode's target, the chosen item, or the nearest human.
     let (target_origin, item_cell) = match intent {
-        Some(BotIntent::Fight(_)) if chasing => goal_item_org,
+        Some(BotIntent::Fight(_)) if chasing => vigil.unwrap_or(goal_item_org),
         // Visible → the enemy's live origin (combat owns aim on sight); aware-but-unseen → the
         // last-seen spot, so the bot searches where they went instead of tracking through walls.
         Some(BotIntent::Fight(en)) => (combat_last_seen.unwrap_or(game.entities[en].v.origin), None),
         Some(BotIntent::Move(pos)) => (pos, None),
-        None if chasing => goal_item_org,
+        None if chasing => vigil.unwrap_or(goal_item_org),
         None => {
             if let Some(h) = nearest_human(game, e) {
                 (game.entities[h].v.origin, None)
@@ -605,7 +620,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         b.goal_select_time = now; // re-pick (skipping the abandoned item) next frame
     }
 
-    Objective { hooking, on_sj, on_rj, enemy, chasing, target_origin, item_cell }
+    Objective { hooking, on_sj, on_rj, enemy, chasing, vigil: vigil.is_some(), target_origin, item_cell }
 }
 
 /// Turn the frame's accumulated decisions into the engine usercmd. Bunnyhopping bypasses the aim
@@ -777,7 +792,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
 
     let idle = |angles: Vec3| host.set_bot_cmd(client, msec, angles, 0, 0, 0, 0, 0);
 
-    let Objective { hooking, on_sj, on_rj, enemy, chasing, target_origin, item_cell } =
+    let Objective { hooking, on_sj, on_rj, enemy, chasing, vigil, target_origin, item_cell } =
         resolve_objective(game, e, now, origin, client);
 
     // Whether weapons may fire right now (a match-mode countdown locks them out). Read before the nav
@@ -1016,7 +1031,12 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // greedy detour (`chasing`) — are exactly where we want to look, so they keep `target_origin`.
     let combat_blind =
         enemy.is_some() && !chasing && (enemy_seen_time <= 0.0 || now - enemy_seen_time > LOOK_LOS_GRACE);
-    let look_point = if bot.route_pos + 2 < bot.route.len() {
+    let look_point = if vigil && bot.scan_point != Vec3::ZERO {
+        // Standing vigil: sweep the eyes across the room (the scan point the aim spring pans to).
+        // This drives the perception cone too (perception reads `bot.aim`), so it's real scouting;
+        // combat's `engage` still overrides the moment a target comes into sight.
+        bot.scan_point
+    } else if bot.route_pos + 2 < bot.route.len() {
         graph.cell_origin(graph.link_target(bot.route[bot.route_pos + 2]))
     } else if combat_blind {
         // Past the route's end `waypoint` *is* `target_origin` (the enemy), so there fall through
@@ -1036,7 +1056,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // parabola all look "stuck" to it, and a force-jump/repath there would wreck the traversal — the
     // hook driver's own per-phase timeouts are its stuck detection.
     let mut force_jump = false;
-    if hook_active || rj_active || on_air || (origin - bot.stuck_origin).length() > STUCK_MOVE {
+    if hook_active || rj_active || on_air || vigil || (origin - bot.stuck_origin).length() > STUCK_MOVE {
         bot.stuck_origin = origin;
         bot.stuck_since = now;
     } else if now - bot.stuck_since > STUCK_TIME {
@@ -1055,7 +1075,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // it and re-path. Suspended while hooking / on a committed speed-jump / riding a plat (all of which
     // legitimately hold or reverse XY progress for a while).
     let plat_leg = matches!(kind, Some(LinkKind::Plat));
-    if !hook_active && !rj_active && !on_sj && !on_air && !plat_leg {
+    if !hook_active && !rj_active && !on_sj && !on_air && !plat_leg && !vigil {
         if progress_stalled(bot.progress_best, bot.progress_since, goal_dist, now) {
             penalize_leg(bot, cur_leg, kind, now);
             bot.route.clear();
@@ -1214,17 +1234,24 @@ fn run_bot(game: &mut GameState, e: EntId) {
     let mut angles = Vec3::new(0.0, yaw, 0.0);
 
     // Nav look target: eyes on the look-ahead point down the corridor (combat/gate may override
-    // below). Falls back to the steering yaw when the look point is on top of us.
+    // below). When the look point is basically on top of us (standing on the goal/waypoint), both it
+    // and the steering yaw degenerate — `atan2` on a near-zero vector jitters frame to frame, which is
+    // the source of the on-the-spot twitch — so hold the current smoothed view instead of chasing
+    // noise. 48u guard (not 8) so a bot idling at a pickup doesn't re-solve a garbage angle.
     let eye = origin + Vec3::new(0.0, 0.0, 22.0);
     let to_look = look_point - eye;
-    let mut look = if to_look.xy().length() > 8.0 {
+    let mut look = if to_look.xy().length() > 48.0 {
         Vec3::new(
             -to_look.z.atan2(to_look.xy().length()).to_degrees(),
             to_look.y.atan2(to_look.x).to_degrees(),
             0.0,
         )
+    } else if dist > 8.0 {
+        angles // steering yaw is still meaningful — look where we're walking
+    } else if bot.aim != Vec3::ZERO {
+        bot.aim // standing still on the point — hold the current view, don't snap to yaw 0
     } else {
-        angles
+        v_angle
     };
 
     // Grappling-hook leg driver: fly a LinkKind::Hook leg (select the grapple, settle the view on
