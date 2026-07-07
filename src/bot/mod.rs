@@ -165,6 +165,14 @@ pub fn manage_population(game: &mut GameState) {
         0
     };
 
+    // In a structured match, cap the fill to the empty seats during warmup and freeze the roster once
+    // the match is under way — see `bot_target`.
+    let in_warmup = matches!(game.team_match.phase, crate::mode::MatchPhase::Warmup);
+    let want = match bot_target(want, humans, game.team_match.config, in_warmup) {
+        Some(w) => w,
+        None => return, // structured match live — don't add or trim (would bench noise / drop a rostered bot)
+    };
+
     // Build the navmesh on demand the first time bots are actually wanted.
     if want > 0 {
         game.ensure_navmesh();
@@ -181,6 +189,23 @@ pub fn manage_population(game: &mut GameState) {
             game.retire_slot(e); // fully retire the slot (bot state + in_use/classname/arena)
         }
     }
+}
+
+/// How many bots to field this frame, given the raw `cvar_want`, the human count, the resolved
+/// composition, and whether a team match is in warmup. Open play (and CTF pickup) passes `cvar_want`
+/// through. A **structured** match caps the fill to the empty seats during warmup — so bots exactly
+/// top up teams×size around the humans — and returns `None` (freeze: don't add or trim) once the
+/// match is live, since a fresh bot would only be benched and a trim could drop a rostered one. Pure.
+fn bot_target(cvar_want: i32, humans: i32, cfg: crate::mode::team::MatchConfig, in_warmup: bool) -> Option<i32> {
+    let structured = cfg.teams >= 2 && cfg.size >= 1;
+    if !structured {
+        return Some(cvar_want);
+    }
+    if !in_warmup {
+        return None;
+    }
+    let seats = (cfg.teams * cfg.size) as i32;
+    Some(cvar_want.min((seats - humans).max(0)))
 }
 
 /// Spawn one bot. `add_bot` runs the module's ClientConnect + PutClientInServer for the new
@@ -453,7 +478,10 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // drive combat or audience-roaming; FFA hunts the nearest player. Every mode-specific bot
     // adaptation lives behind this one hook — the rest of run_bot stays mode-agnostic and reusable.
     let mode = game.mode;
-    let intent = if host.cvar_bool(c"rtx_bot_pacifist") {
+    let intent = if crate::mode::team::benched(game, e) {
+        // Benched spectator (structured match, off the locked roster): stroll the stands, no fighting.
+        Some(BotIntent::Move(crate::mode::wander_point(game, e, "info_player_deathmatch", |_| None)))
+    } else if host.cvar_bool(c"rtx_bot_pacifist") {
         // Global override, any mode: don't fight — just tail the nearest human around the map.
         nearest_human(game, e).map(|h| BotIntent::Move(game.entities[h].v.origin))
     } else {
@@ -1726,7 +1754,24 @@ pub fn on_disconnect(ent: &mut Entity) {
 mod tests {
     use super::*;
     use crate::bsp::Bsp;
+    use crate::mode::team::MatchConfig;
     use crate::navmesh::NavGraph;
+
+    #[test]
+    fn bot_target_caps_in_warmup_and_freezes_live() {
+        let open = MatchConfig { teams: 0, size: 0 };
+        let pickup = MatchConfig { teams: 2, size: 0 }; // CTF: not structured
+        let two_by_two = MatchConfig { teams: 2, size: 2 };
+        // Open play and open team pickup pass the cvar through, warmup or not.
+        assert_eq!(bot_target(5, 1, open, true), Some(5));
+        assert_eq!(bot_target(5, 1, pickup, false), Some(5));
+        // Structured warmup caps the fill to the empty seats (4 seats − 1 human = 3).
+        assert_eq!(bot_target(5, 1, two_by_two, true), Some(3));
+        assert_eq!(bot_target(2, 1, two_by_two, true), Some(2), "cvar below empty seats wins");
+        assert_eq!(bot_target(5, 4, two_by_two, true), Some(0), "humans fill every seat");
+        // Structured live → freeze (no add, no trim).
+        assert_eq!(bot_target(5, 1, two_by_two, false), None);
+    }
 
     /// On a real map, traversal routes must expose usable bhop runways. Regression for the grid
     /// staircase: cell centres sit on a 32u grid, so any route heading between grid axes zigzags

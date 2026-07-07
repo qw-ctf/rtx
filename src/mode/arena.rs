@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Rocket Arena (`rtx_mode ra`) — the first mode layered on the [`Ffa`](super::Ffa) baseline.
+//! Rocket Arena (`rtx_mode ra`) — a round-based duel mode on the [`Dm`](super::Dm) baseline. Its 1v1
+//! round queue *is* its composition, so it ignores `rtx_match` (see [`resolve_composition`]).
+//!
+//! [`resolve_composition`]: super::team::resolve_composition
 //!
 //! This follows the "rocket arena part" of the reference Frogbot-Rocket-Arena QuakeC
 //! (`fbra/src/arena.qc`): round-based play where everyone spawns with a **full loadout**,
 //! fighters duel **inside the arena** while eliminated/waiting players roam the **audience**,
 //! damage is off during a short spawn-protected countdown, and the last player standing wins the
 //! round. We deliberately drop FBRA's clan-arena machinery (color/shirt teams, team menus,
-//! series-to-N-wins) — that granularity belongs to the future 1on1/2on2/4on4 modes.
+//! series-to-N-wins) — structured team play is the separate `rtx_match` composition axis.
 //!
 //! The arena/audience split reuses FBRA's spawn-point trick (`arena.qc:set_a_spawn`): fighters
 //! spawn at `info_teleport_destination` (inside the arena on a Rocket-Arena map), audience at
@@ -132,45 +135,34 @@ impl GameMode for Arena {
     }
 
     fn apply_loadout(&self, g: &mut GameState, e: EntId) {
-        let fighter = g.entities[e].mode_p.arena.role == ArenaRole::Fighter;
+        if g.entities[e].mode_p.arena.role != ArenaRole::Fighter {
+            // Audience: the shared harmless-spectator loadout (axe only, no ammo, damage refused).
+            super::audience_loadout(g, e);
+            return;
+        }
         // The lightning gun is off by default (rtx_ra_lightning_gun 0) — a rockets-first arena.
         let lightning = g.host().cvar_bool(c"rtx_ra_lightning_gun");
+        // Full arsenal + full ammo + red armor, mirroring arena.qc:a_newitems defaults.
+        let arsenal = Items::AXE
+            | Items::SHOTGUN
+            | Items::SUPER_SHOTGUN
+            | Items::NAILGUN
+            | Items::SUPER_NAILGUN
+            | Items::GRENADE_LAUNCHER
+            | Items::ROCKET_LAUNCHER
+            | Items::ARMOR3;
+        let arsenal = if lightning { arsenal | Items::LIGHTNING } else { arsenal };
         let v = &mut g.entities[e].v;
-        if fighter {
-            // Full arsenal + full ammo + red armor, mirroring arena.qc:a_newitems defaults.
-            let arsenal = Items::AXE
-                | Items::SHOTGUN
-                | Items::SUPER_SHOTGUN
-                | Items::NAILGUN
-                | Items::SUPER_NAILGUN
-                | Items::GRENADE_LAUNCHER
-                | Items::ROCKET_LAUNCHER
-                | Items::ARMOR3;
-            let arsenal = if lightning { arsenal | Items::LIGHTNING } else { arsenal };
-            v.items = arsenal.as_f32();
-            v.health = 100.0;
-            v.max_health = 100.0;
-            v.armorvalue = 200.0;
-            v.armortype = 0.8; // red armor
-            v.ammo_shells = 250.0;
-            v.ammo_nails = 250.0;
-            v.ammo_rockets = 200.0;
-            v.ammo_cells = if lightning { 200.0 } else { 0.0 };
-            v.weapon = Weapon::RocketLauncher;
-        } else {
-            // Audience: axe only, no ammo — harmless spectators wandering the stands (damage to
-            // them is refused, see `player_damage`). Health/armor must stay positive: a client
-            // (and the bot AI) treats 0 health as dead and locks movement, so they'd freeze.
-            v.items = Items::AXE.as_f32();
-            v.health = 100.0;
-            v.armorvalue = 100.0;
-            v.armortype = 0.8;
-            v.ammo_shells = 0.0;
-            v.ammo_nails = 0.0;
-            v.ammo_rockets = 0.0;
-            v.ammo_cells = 0.0;
-            v.weapon = Weapon::Axe;
-        }
+        v.items = arsenal.as_f32();
+        v.health = 100.0;
+        v.max_health = 100.0;
+        v.armorvalue = 200.0;
+        v.armortype = 0.8; // red armor
+        v.ammo_shells = 250.0;
+        v.ammo_nails = 250.0;
+        v.ammo_rockets = 200.0;
+        v.ammo_cells = if lightning { 200.0 } else { 0.0 };
+        v.weapon = Weapon::RocketLauncher;
     }
 
     fn player_damage(
@@ -219,11 +211,11 @@ impl GameMode for Arena {
                 // Before the round goes live (countdown), roam the arena to take up a position,
                 // rather than standing on the spawn (which looks dead and trips the stuck-jumper).
                 if !matches!(g.arena.round, RoundState::Live) {
-                    return Some(BotIntent::Move(self.wander_point(g, bot, "info_teleport_destination", &[])));
+                    return Some(BotIntent::Move(super::wander_point(g, bot, "info_teleport_destination", |_| None)));
                 }
                 Some(match nearest_enemy(g, bot) {
                     Some(enemy) => BotIntent::Fight(enemy),
-                    None => BotIntent::Move(self.wander_point(g, bot, "info_teleport_destination", &[])),
+                    None => BotIntent::Move(super::wander_point(g, bot, "info_teleport_destination", |_| None)),
                 })
             }
             // Eliminated / waiting: mill around the audience (the stands) but *watch the duel* —
@@ -243,7 +235,9 @@ impl GameMode for Arena {
                 } else {
                     Vec::new()
                 };
-                let goal = self.wander_point(g, bot, "info_player_deathmatch", &fighters);
+                let goal = super::wander_point(g, bot, "info_player_deathmatch", |g| {
+                    Self::vantage_spot(g, "info_player_deathmatch", &fighters)
+                });
                 Some(match self.watch_target(g, bot, &fighters) {
                     Some(w) => BotIntent::Spectate { goal, watch: w },
                     None => BotIntent::Move(goal),
@@ -337,36 +331,6 @@ impl Arena {
         g.arena.round = RoundState::Ended {
             until: now + ROUND_END_PAUSE,
         };
-    }
-
-    /// A roaming destination among `classname` spawns for a bot that has no one to fight — the
-    /// audience stands (`info_player_deathmatch`) for waiting players, or the arena
-    /// (`info_teleport_destination`) for fighters during the countdown. Re-picked on a staggered
-    /// timer *or* once we're nearly there, so the bot keeps strolling between vantage points
-    /// instead of freezing on the spot (a frozen bot also trips the stuck-jumper). Kept here, out
-    /// of the generic bot code.
-    fn wander_point(&self, g: &mut GameState, bot: EntId, classname: &str, vantage: &[(EntId, Vec3)]) -> Vec3 {
-        let now = g.time();
-        let origin = g.entities[bot].v.origin;
-        let target = g.entities[bot].bot.wander_target;
-        let (dx, dy) = (target.x - origin.x, target.y - origin.y);
-        let arrived = target != Vec3::ZERO && (dx * dx + dy * dy).sqrt() < 48.0;
-        if now >= g.entities[bot].bot.wander_time || target == Vec3::ZERO || arrived {
-            // Prefer a spot that overlooks a fighter (audience spectating); fall back to any spawn.
-            let next = Self::vantage_spot(g, classname, vantage).unwrap_or_else(|| {
-                let spot = g.select_spawn_point_of(classname);
-                if spot != EntId::WORLD {
-                    g.entities[spot].v.origin
-                } else {
-                    origin
-                }
-            });
-            let jitter = g.random();
-            let b = &mut g.entities[bot].bot;
-            b.wander_target = next;
-            b.wander_time = now + 3.0 + jitter * 3.0;
-        }
-        g.entities[bot].bot.wander_target
     }
 
     /// A `classname` spawn whose eye position has line of sight to one of the `targets` (live

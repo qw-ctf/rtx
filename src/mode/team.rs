@@ -1,23 +1,29 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Generic team match coordination (`rtx_mode 1on1|duel|2on2|2on2on2|NonM…`).
+//! The **match-composition layer** — the second axis, orthogonal to the game mode (`rtx_mode`).
 //!
-//! A *reusable* team layer, not a one-off mode: it manages **N teams of size M** (an arbitrary
-//! number of teams, uniform size) selected by an alias — `duel`/`1on1` (2 teams of 1), `2on2`
-//! (2 of 2), `2on2on2` (3 of 2), or any `NonMon…`. The first consumer is a **continuous team
-//! deathmatch**: teams frag to the fraglimit, friendly fire follows `teamplay`, and the team
-//! primitives (roster, team-aware targeting, colours) are here for future team modes to reuse.
+//! `rtx_mode` picks the *ruleset* (dm / ra / midair / ctf); `rtx_match` picks how the match is
+//! *organized*, resolved by [`resolve_composition`] into a [`MatchConfig`] of **N teams of size M**:
 //!
-//! Match lifecycle (KTX-inspired): **Warmup** (playable; joiners auto-balanced onto the smallest
-//! team) → an explicit **`start`** command **reloads the map** (fresh entities) and runs a
-//! **countdown** → **Live** (team frags to the limit) → **Ended** (results) → Warmup. The roster
-//! locks at start; players who drop and reconnect are **reattached to their team by netname**, and
-//! the whole match state survives the start-reload because it lives on the process-lifetime
-//! [`GameState`] (guarded in `worldspawn`).
+//! - **Open** (`{teams: 0}`) — no teams, no lifecycle: plain free-for-all (dm/midair default).
+//! - **Open team pickup** (`{teams: 2, size: 0}`) — teams + lifecycle, unbounded roster,
+//!   auto-balanced joiners (CTF's default; public team play).
+//! - **Structured** (`{teams: N, size: M ≥ 1}`) — a locked N×M match: `1on1`/`duel`, `2on2`,
+//!   `2on2on2`, any `NonMon…`. Overflow / late joiners are **benched** (see [`benched`]).
+//!
+//! Any composition with `teams ≥ 2` ([`lifecycle_active`]) drives the KTX-inspired match lifecycle,
+//! shared by team-DM (the trait defaults) and CTF alike: **Warmup** (playable; joiners
+//! auto-balanced) → an explicit **`start`** command (strict roster: [`pick_roster`]) **reloads the
+//! map** and runs a **countdown** → **Live** (frag / capture limit) → **Ended** (results) → Warmup.
+//! The roster locks at start; players who drop and reconnect are **reattached by netname**, and the
+//! whole match state survives the start-reload because it lives on the process-lifetime
+//! [`GameState`] (guarded in `worldspawn`). The mode supplies only the go-live slate, win condition,
+//! and result line via the three `on_match_*` [`GameMode`](super::GameMode) hooks.
 
 use glam::Vec3;
 
-use super::{centerprint_all, nearest_player_where, players, BotIntent, GameMode};
+use super::{centerprint_all, nearest_player_where, players};
+use crate::defs::PrintLevel;
 use crate::entity::EntId;
 use crate::game::{cstring, GameState};
 
@@ -85,9 +91,6 @@ pub(crate) struct MatchState {
     pub live_until: f32,
 }
 
-/// The team-match mode descriptor. Stateless — the config/lifecycle live in [`MatchState`].
-pub(crate) struct TeamMatch;
-
 /// Parse an `rtx_mode` alias into a team format, or `None` if it isn't one. `duel`/`1on1` → 2×1;
 /// otherwise a `NonMon…` chain of equal sizes (`2on2on2` → 3×2). Ragged sizes and zero are rejected.
 pub(crate) fn parse_match_alias(s: &str) -> Option<MatchConfig> {
@@ -108,32 +111,131 @@ pub(crate) fn parse_match_alias(s: &str) -> Option<MatchConfig> {
     })
 }
 
-/// The per-mode variation points of the shared match lifecycle. Team DM and CTF run the identical
-/// warmup → countdown → live → ended machine ([`tick_lifecycle`]); they differ only in the go-live
-/// slate reset, the win condition, and the results line. Implementing this (plus the thin
-/// `GameMode` shims that delegate to the shared helpers below) is all a new match mode needs.
+/// Resolve the two cvars (`rtx_mode` ruleset + `rtx_match` alias) into a composition. This is the one
+/// place the two axes meet:
 ///
-/// Not a `GameMode` supertrait: a blanket `impl<T: MatchMode> GameMode for T` would collide with the
-/// direct `impl GameMode` on `Ffa`/`Arena`/`Midair` under Rust's coherence rules, so each match mode
-/// keeps a small explicit `GameMode` impl that forwards to `tick_lifecycle`/`team_spawn`/etc.
-pub(crate) trait MatchMode {
-    /// Reset the mode-specific slate when the countdown expires (frags/scores, flags, runes). The
-    /// shared machine then arms the timelimit and flips to Live — so this must *not* touch either.
-    fn on_go_live(&self, g: &mut GameState);
-    /// One Live frame: refresh scores if the mode tallies them here, and report whether the
-    /// frag/capture limit is reached. (The shared machine ends the match on the timelimit itself.)
-    fn limit_reached(&self, g: &mut GameState) -> bool;
-    /// Broadcast the results line as the match ends (the phase transition is handled by the machine).
-    fn announce_result(&self, g: &mut GameState);
+/// - **ra** ignores `rtx_match` entirely — its 1v1 round queue *is* its composition (always Open).
+/// - `""` (auto) picks the mode's natural composition: CTF → open 2-team pickup, midair → a 1on1
+///   duel, everything else → Open free-for-all.
+/// - `ffa` forces open play (CTF stays 2-team so its flags have owners; everyone else Open).
+/// - a parsed `NonMon…` is taken as-is, except CTF clamps it to 2 teams (flags are red/blue).
+/// - anything unparseable falls back to the mode's auto default (the caller hints once).
+pub(crate) fn resolve_composition(mode: &str, alias: &str) -> MatchConfig {
+    const OPEN: MatchConfig = MatchConfig { teams: 0, size: 0 };
+    const CTF_PICKUP: MatchConfig = MatchConfig { teams: 2, size: 0 };
+    if mode == "ra" {
+        return OPEN;
+    }
+    match alias {
+        "" => match mode {
+            "ctf" => CTF_PICKUP,
+            "midair" => MatchConfig { teams: 2, size: 1 },
+            _ => OPEN,
+        },
+        "ffa" => {
+            if mode == "ctf" {
+                CTF_PICKUP
+            } else {
+                OPEN
+            }
+        }
+        _ => match parse_match_alias(alias) {
+            Some(cfg) if mode == "ctf" => MatchConfig { teams: 2, size: cfg.size },
+            Some(cfg) => cfg,
+            None => resolve_composition(mode, ""),
+        },
+    }
 }
 
-/// The shared match lifecycle, advanced once per server frame. Drives the countdown announce
-/// throttle, the go-live handoff (mode slate → timelimit → FIGHT), the per-frame win check, and the
-/// results pause → map-rotate/warmup loop. The three per-mode variation points come from `mode`.
-pub(crate) fn tick_lifecycle<M: MatchMode>(mode: &M, g: &mut GameState) {
+/// Whether the resolved composition runs the team match lifecycle (teams + warmup→live machine).
+/// True for structured matches *and* open team pickup (CTF); false for plain free-for-all.
+pub(crate) fn lifecycle_active(g: &GameState) -> bool {
+    g.team_match.config.teams >= 2
+}
+
+/// Whether the composition is a **structured** N×M match — a locked roster with a fixed seat count,
+/// as opposed to open team pickup (unbounded roster). Only structured matches bench overflow players.
+pub(crate) fn structured(g: &GameState) -> bool {
+    let c = g.team_match.config;
+    c.teams >= 2 && c.size >= 1
+}
+
+/// A short human-readable label for a composition (`duel`, `2on2`, `2on2on2`, or `open`), for the
+/// console format line and the `start`-refused message.
+pub(crate) fn format_label(cfg: MatchConfig) -> String {
+    if cfg.size == 0 {
+        "open".to_string()
+    } else if cfg.teams == 2 && cfg.size == 1 {
+        "duel".to_string()
+    } else {
+        vec![cfg.size.to_string(); cfg.teams].join("on")
+    }
+}
+
+/// Whether player `e` is currently **benched** — a structured match is under way (past warmup) and
+/// they aren't on the locked roster (a late joiner, or an overflow beyond teams×size). Benched
+/// players sit out as harmless spectators until the next warmup. Derived from the roster (not a
+/// stored flag), so it survives the match-start reload for free. Cheap in open/warmup play (the
+/// `structured` gate short-circuits before the netname lookup allocates).
+pub(crate) fn benched(g: &GameState, e: EntId) -> bool {
+    structured(g)
+        && !matches!(g.team_match.phase, MatchPhase::Warmup)
+        && {
+            let name = g.netname_of(e);
+            !g.team_match.roster.iter().any(|(rn, _)| *rn == name)
+        }
+}
+
+/// Seat the warmup membership into exactly `teams × size` slots for a structured `start`. Humans are
+/// seated before bots; a player keeps their current team while it has a free seat, otherwise they're
+/// moved to the lowest-numbered team with room (there's no join-team command, so rebalancing here —
+/// rather than refusing an imbalanced warmup — is what lets a match start after disconnects skew the
+/// sides). `Err(n)` means the warmup is `n` players short of a full format. Pure and unit-tested.
+pub(crate) fn pick_roster(members: &[(EntId, u8, bool)], cfg: MatchConfig) -> Result<Vec<(EntId, u8)>, usize> {
+    let seats = cfg.teams * cfg.size;
+    // Humans first (index by is_bot == false), then bots, each in input order.
+    let ordered: Vec<&(EntId, u8, bool)> = members
+        .iter()
+        .filter(|m| !m.2)
+        .chain(members.iter().filter(|m| m.2))
+        .collect();
+    if ordered.len() < seats {
+        return Err(seats - ordered.len());
+    }
+    let mut counts = vec![0usize; cfg.teams];
+    let mut out: Vec<(EntId, u8)> = Vec::with_capacity(seats);
+    for &&(e, cur, _) in &ordered {
+        if out.len() == seats {
+            break;
+        }
+        let keep = cur >= 1 && (cur as usize) <= cfg.teams && counts[cur as usize - 1] < cfg.size;
+        let team = if keep {
+            cur as usize - 1
+        } else {
+            match counts.iter().position(|&c| c < cfg.size) {
+                Some(i) => i,
+                None => break, // unreachable: total capacity == seats, and out.len() < seats here
+            }
+        };
+        counts[team] += 1;
+        out.push((e, (team + 1) as u8));
+    }
+    Ok(out)
+}
+
+/// The shared match lifecycle, advanced once per server frame from `start_frame` (a no-op unless
+/// [`lifecycle_active`]). Drives the countdown announce throttle, the go-live handoff (mode slate →
+/// timelimit → FIGHT), the per-frame win check, and the results pause → map-rotate/warmup loop. The
+/// three per-mode variation points are [`GameMode`](super::GameMode) hooks on the active mode
+/// (`on_match_go_live` / `match_limit_reached` / `announce_match_result`), whose defaults reproduce
+/// team deathmatch (see the free fns below); CTF overrides all three.
+pub(crate) fn tick_lifecycle(g: &mut GameState) {
+    if !lifecycle_active(g) {
+        return;
+    }
     let now = g.time();
     match g.team_match.phase {
-        MatchPhase::Warmup => {} // playable; team assignment happens on spawn (apply_loadout)
+        MatchPhase::Warmup => {} // playable; team assignment happens on spawn (put_client_in_server)
         MatchPhase::Countdown { until } => {
             let remaining = (until - now).ceil() as i32;
             if remaining != g.team_match.last_count {
@@ -145,7 +247,8 @@ pub(crate) fn tick_lifecycle<M: MatchMode>(mode: &M, g: &mut GameState) {
             if now >= until {
                 // Go live: the mode's own slate reset, then arm the time limit (`timelimit` is in
                 // seconds; 0 = none) and flip to Live.
-                mode.on_go_live(g);
+                let mode = g.mode;
+                mode.on_match_go_live(g);
                 let tl = g.level.timelimit;
                 g.team_match.live_until = if tl > 0 { now + tl as f32 } else { 0.0 };
                 g.team_match.phase = MatchPhase::Live;
@@ -154,8 +257,9 @@ pub(crate) fn tick_lifecycle<M: MatchMode>(mode: &M, g: &mut GameState) {
         }
         MatchPhase::Live => {
             let time_up = g.team_match.live_until > 0.0 && now >= g.team_match.live_until;
-            if mode.limit_reached(g) || time_up {
-                mode.announce_result(g);
+            let mode = g.mode;
+            if mode.match_limit_reached(g) || time_up {
+                mode.announce_match_result(g);
                 g.team_match.phase = MatchPhase::Ended { until: now + END_PAUSE };
             }
         }
@@ -166,11 +270,84 @@ pub(crate) fn tick_lifecycle<M: MatchMode>(mode: &M, g: &mut GameState) {
                 if g.queued_next_map().is_some() {
                     g.next_level();
                 } else {
+                    // Re-admit any benched spectators: snapshot them *before* clearing the roster
+                    // (bench is derived from it), drop to warmup, then respawn each so they rejoin
+                    // with a real loadout/team.
+                    let benched_players: Vec<EntId> = if structured(g) {
+                        players(g).into_iter().filter(|&e| benched(g, e)).collect()
+                    } else {
+                        Vec::new()
+                    };
                     g.team_match.phase = MatchPhase::Warmup;
                     g.team_match.roster.clear();
+                    for e in benched_players {
+                        g.put_client_in_server(e);
+                    }
                 }
             }
         }
+    }
+}
+
+/// Default `on_match_go_live` (continuous team DM): zero every player's frags and (re)size the
+/// per-team score tally. The shared machine then arms the timelimit and flips to Live.
+pub(crate) fn default_go_live(g: &mut GameState) {
+    for e in players(g) {
+        g.entities[e].v.frags = 0.0;
+    }
+    g.team_match.scores = vec![0; g.team_match.config.teams];
+}
+
+/// Default `match_limit_reached` (team DM): team scores are Σ member frags, recomputed every Live
+/// frame for the scoreboard/result; the match ends when any team reaches `fraglimit`.
+pub(crate) fn frag_limit_reached(g: &mut GameState) -> bool {
+    let teams = g.team_match.config.teams;
+    let mut scores = vec![0i32; teams];
+    for e in players(g) {
+        let t = g.entities[e].mode_p.team as usize;
+        if t >= 1 && t <= teams {
+            scores[t - 1] += g.entities[e].v.frags as i32;
+        }
+    }
+    g.team_match.scores = scores.clone();
+    let fl = g.level.fraglimit;
+    fl != 0 && scores.iter().any(|&s| s >= fl)
+}
+
+/// Default `announce_match_result` (team DM): a duel scoreline, or a per-team tally. The post-match
+/// pause is entered by the shared [`tick_lifecycle`] machine.
+pub(crate) fn announce_team_result(g: &mut GameState) {
+    let scores = g.team_match.scores.clone();
+    let config = g.team_match.config;
+    if config.teams == 2 && config.size == 1 {
+        // Duel: name each duelist from the *locked roster* (not `players()` order, which now
+        // includes any benched spectators), paired to their team's score.
+        let name_of = |t: u8| {
+            g.team_match
+                .roster
+                .iter()
+                .find(|(_, tt)| *tt == t)
+                .map(|(n, _)| n.clone())
+                .unwrap_or_default()
+        };
+        g.broadcast(
+            PrintLevel::High,
+            &format!(
+                "Duel over — {} {} : {} {}\n",
+                name_of(1),
+                scores.first().unwrap_or(&0),
+                scores.get(1).unwrap_or(&0),
+                name_of(2)
+            ),
+        );
+    } else {
+        let mut line = String::from("Match over —");
+        for (i, s) in scores.iter().enumerate() {
+            let (name, _) = TEAM_IDENTITY[i % MAX_TEAMS];
+            line.push_str(&format!(" {name} {s}"));
+        }
+        line.push('\n');
+        g.broadcast(PrintLevel::High, &line);
     }
 }
 
@@ -192,78 +369,12 @@ pub(crate) fn match_weapons_hot(g: &GameState) -> bool {
     !matches!(g.team_match.phase, MatchPhase::Countdown { .. })
 }
 
-impl GameMode for TeamMatch {
-    fn name(&self) -> &'static str {
-        // Constant (not the alias) so `select_mode` resolves every `NonM…` to this one descriptor;
-        // `refresh_mode` tracks the actual config separately. See `crate::mode::refresh_mode`.
-        "team"
-    }
-
-    fn tick(&self, g: &mut GameState) {
-        tick_lifecycle(self, g);
-    }
-
-    fn select_spawn(&self, g: &mut GameState, e: EntId) -> EntId {
-        team_spawn(g, e)
-    }
-
-    fn apply_loadout(&self, g: &mut GameState, e: EntId) {
-        // Assign/reattach the team + colours; weapons/ammo stay the decoded DM parms (shotgun + axe,
-        // plus the grapple handout) — a standard team-DM start.
-        assign_team(g, e);
-    }
-
-    fn weapons_hot(&self, g: &GameState) -> bool {
-        match_weapons_hot(g)
-    }
-
-    fn bot_intent(&self, g: &mut GameState, bot: EntId) -> Option<BotIntent> {
-        // Hunt the nearest living *enemy* (different team). Teammates are skipped, so bots don't
-        // waste shots on allies. Falls back to the generic roam when no enemy is in play.
-        nearest_enemy(g, bot).map(BotIntent::Fight)
-    }
-
-    fn handle_command(&self, g: &mut GameState, _e: EntId, cmd: &str) -> bool {
-        match_handle_command(g, cmd)
-    }
-}
-
-impl MatchMode for TeamMatch {
-    fn on_go_live(&self, g: &mut GameState) {
-        // Continuous team DM: zero every player's frags and (re)size the team-score tally.
-        for e in players(g) {
-            g.entities[e].v.frags = 0.0;
-        }
-        g.team_match.scores = vec![0; g.team_match.config.teams];
-    }
-
-    fn limit_reached(&self, g: &mut GameState) -> bool {
-        // Team scores are Σ member frags, recomputed every Live frame for the scoreboard/result.
-        let teams = g.team_match.config.teams;
-        let mut scores = vec![0i32; teams];
-        for e in players(g) {
-            let t = g.entities[e].mode_p.team as usize;
-            if t >= 1 && t <= teams {
-                scores[t - 1] += g.entities[e].v.frags as i32;
-            }
-        }
-        g.team_match.scores = scores.clone();
-        let fl = g.level.fraglimit;
-        fl != 0 && scores.iter().any(|&s| s >= fl)
-    }
-
-    fn announce_result(&self, g: &mut GameState) {
-        self.end_match(g);
-    }
-}
-
 /// Reset (or resume) team-match state on a map (re)load, called from [`super::on_worldspawn`]. A
 /// match-start reload (`resuming`) preserves the locked roster and **arms the countdown**; any other
-/// load — a fresh map or a switch away from a match mode — starts a fresh warmup (keeping the parsed
-/// format). Runs after `refresh_mode` (which owns the alias→config tracking). Shared by team DM and
-/// CTF, since both live on the same [`MatchState`].
+/// load — a fresh map, or a switch to a composition with no team lifecycle — starts a fresh warmup
+/// (keeping the resolved format). Runs after `refresh_mode` (which owns the alias→config tracking).
 pub(crate) fn on_worldspawn(g: &mut GameState) {
-    if !is_match_mode(g.mode.name()) {
+    if !lifecycle_active(g) {
         g.team_match = MatchState::default();
         return;
     }
@@ -281,72 +392,55 @@ pub(crate) fn on_worldspawn(g: &mut GameState) {
     }
 }
 
-/// Begin a match: lock the current roster and reload the map. Dispatched from a mode's
-/// [`GameMode::handle_command`] on the `start` command. The countdown is armed in
-/// [`on_worldspawn`] after the reload (via `resuming`).
+/// Begin a match: lock the roster and reload the map. Dispatched from `client_command` on the `start`
+/// console command; a no-op unless the lifecycle is active and we're in warmup. A **structured**
+/// match seats exactly teams×size via [`pick_roster`] (refusing, with a message, if the warmup is
+/// short) and re-teams any moved players; an **open** team pickup (CTF) locks everyone currently in.
+/// The countdown is armed in [`on_worldspawn`] after the reload (via `resuming`).
 pub(crate) fn start_match(g: &mut GameState) {
-    if !is_match_mode(g.mode.name()) || !matches!(g.team_match.phase, MatchPhase::Warmup) {
+    if !lifecycle_active(g) || !matches!(g.team_match.phase, MatchPhase::Warmup) {
         return;
     }
-    let roster: Vec<(String, u8)> = players(g)
-        .into_iter()
-        .map(|e| (g.netname_of(e), g.entities[e].mode_p.team))
-        .collect();
-    if roster.is_empty() {
-        return;
-    }
+    let cfg = g.team_match.config;
+    let roster: Vec<(String, u8)> = if structured(g) {
+        let members: Vec<(EntId, u8, bool)> = players(g)
+            .into_iter()
+            .map(|e| (e, g.entities[e].mode_p.team, g.entities[e].bot.is_bot))
+            .collect();
+        match pick_roster(&members, cfg) {
+            Ok(seated) => {
+                // Re-team any player the seating moved, then lock the roster by netname.
+                for &(e, team) in &seated {
+                    if g.entities[e].mode_p.team != team {
+                        g.entities[e].mode_p.team = team;
+                        apply_team_identity(g, e);
+                    }
+                }
+                seated.iter().map(|&(e, team)| (g.netname_of(e), team)).collect()
+            }
+            Err(short) => {
+                g.broadcast(
+                    PrintLevel::High,
+                    &format!("start: {} needs {short} more player(s)\n", format_label(cfg)),
+                );
+                return;
+            }
+        }
+    } else {
+        let r: Vec<(String, u8)> = players(g)
+            .into_iter()
+            .map(|e| (g.netname_of(e), g.entities[e].mode_p.team))
+            .collect();
+        if r.is_empty() {
+            return;
+        }
+        r
+    };
     g.team_match.roster = roster;
     g.team_match.resuming = true;
-    g.broadcast(crate::defs::PrintLevel::High, "Match starting — reloading map…\n");
+    g.broadcast(PrintLevel::High, "Match starting — reloading map…\n");
     let map = cstring(&g.level.mapname);
     g.host().changelevel(&map);
-}
-
-/// A match mode's console-command hook: consume `start`. Shared by team DM and CTF.
-pub(crate) fn match_handle_command(g: &mut GameState, cmd: &str) -> bool {
-    if cmd == "start" {
-        start_match(g);
-        true
-    } else {
-        false
-    }
-}
-
-impl TeamMatch {
-    /// Broadcast the match result (duel scoreline, or per-team tally). The post-match pause is
-    /// entered by the shared [`tick_lifecycle`] machine.
-    fn end_match(&self, g: &mut GameState) {
-        let scores = g.team_match.scores.clone();
-        let config = g.team_match.config;
-        if config.teams == 2 && config.size == 1 {
-            // Duel: name the two duelists on one line.
-            let names: Vec<String> = players(g).into_iter().map(|e| g.netname_of(e)).collect();
-            let a = names.first().cloned().unwrap_or_default();
-            let b = names.get(1).cloned().unwrap_or_default();
-            g.broadcast(
-                crate::defs::PrintLevel::High,
-                &format!(
-                    "Duel over — {a} {} : {} {b}\n",
-                    scores.first().unwrap_or(&0),
-                    scores.get(1).unwrap_or(&0)
-                ),
-            );
-        } else {
-            let mut line = String::from("Match over —");
-            for (i, s) in scores.iter().enumerate() {
-                let (name, _) = TEAM_IDENTITY[i % MAX_TEAMS];
-                line.push_str(&format!(" {name} {s}"));
-            }
-            line.push('\n');
-            g.broadcast(crate::defs::PrintLevel::High, &line);
-        }
-    }
-}
-
-/// Whether `name` is one of the match-lifecycle modes (team DM or CTF) that share `MatchState`, the
-/// warmup→start→countdown→live→ended machine, the locked roster, and the team-coordination helpers.
-pub(crate) fn is_match_mode(name: &str) -> bool {
-    name == "team" || name == "ctf"
 }
 
 /// Assign player `e` a team the first time they're placed (team `0`): reattach a reconnecting player
@@ -478,6 +572,72 @@ mod tests {
 
     fn cfg(teams: usize, size: usize) -> Option<MatchConfig> {
         Some(MatchConfig { teams, size })
+    }
+
+    #[test]
+    fn resolves_composition_per_mode() {
+        use super::resolve_composition as r;
+        let open = MatchConfig { teams: 0, size: 0 };
+        let ctf_pickup = MatchConfig { teams: 2, size: 0 };
+        // Auto ("") picks each mode's natural composition.
+        assert_eq!(r("dm", ""), open);
+        assert_eq!(r("ctf", ""), ctf_pickup);
+        assert_eq!(r("midair", ""), MatchConfig { teams: 2, size: 1 });
+        // ra ignores rtx_match entirely.
+        assert_eq!(r("ra", ""), open);
+        assert_eq!(r("ra", "2on2"), open);
+        assert_eq!(r("ra", "ffa"), open);
+        // "ffa" forces open play; CTF stays 2-team so its flags have owners.
+        assert_eq!(r("dm", "ffa"), open);
+        assert_eq!(r("ctf", "ffa"), ctf_pickup);
+        // Parsed formats pass through; CTF clamps to 2 teams keeping the size.
+        assert_eq!(r("dm", "2on2"), MatchConfig { teams: 2, size: 2 });
+        assert_eq!(r("midair", "2on2"), MatchConfig { teams: 2, size: 2 });
+        assert_eq!(r("ctf", "2on2on2"), MatchConfig { teams: 2, size: 2 });
+        assert_eq!(r("dm", "duel"), MatchConfig { teams: 2, size: 1 });
+        // Unparseable falls back to the mode's auto default.
+        assert_eq!(r("dm", "garbage"), open);
+        assert_eq!(r("ctf", "garbage"), ctf_pickup);
+    }
+
+    #[test]
+    fn pick_roster_seats_humans_first_and_rebalances() {
+        use super::pick_roster;
+        use crate::entity::EntId;
+        let two_by_two = MatchConfig { teams: 2, size: 2 };
+        // Humans (false) seated before bots (true), regardless of input order.
+        let members = [
+            (EntId(1), 0u8, true),  // bot
+            (EntId(2), 0u8, false), // human
+            (EntId(3), 0u8, true),  // bot
+            (EntId(4), 0u8, false), // human
+        ];
+        let seated = pick_roster(&members, two_by_two).unwrap();
+        assert_eq!(seated.len(), 4);
+        // Humans are seated before bots (so a human is never benched while a bot plays); unassigned
+        // players then fill team 1 before team 2, so the two humans (2, 4) land ahead of the bots.
+        let team_of = |e: EntId| seated.iter().find(|&&(x, _)| x == e).unwrap().1;
+        assert!(seated.iter().take(2).all(|&(e, _)| e == EntId(2) || e == EntId(4)), "humans seated first");
+        assert_eq!(team_of(EntId(2)), 1);
+        assert_eq!(team_of(EntId(4)), 1);
+        assert_eq!(team_of(EntId(1)), 2);
+        assert_eq!(team_of(EntId(3)), 2);
+        // A player keeps their current team while it has room, else moves to a team with a free seat.
+        let skewed = [
+            (EntId(1), 1, false),
+            (EntId(2), 1, false),
+            (EntId(3), 1, false), // team 1 is full after two → this one rebalances to team 2
+            (EntId(4), 2, false),
+        ];
+        let seated = pick_roster(&skewed, two_by_two).unwrap();
+        let team_of = |e: EntId| seated.iter().find(|&&(x, _)| x == e).unwrap().1;
+        assert_eq!(team_of(EntId(1)), 1);
+        assert_eq!(team_of(EntId(2)), 1);
+        assert_eq!(team_of(EntId(3)), 2, "overflow of team 1 rebalances to team 2");
+        assert_eq!(team_of(EntId(4)), 2);
+        // Short warmup → Err(n) with how many more are needed.
+        let short = [(EntId(1), 0, false), (EntId(2), 0, false)];
+        assert_eq!(pick_roster(&short, two_by_two), Err(2));
     }
 
     #[test]

@@ -1,13 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Pluggable game modes.
+//! Pluggable game modes, on two orthogonal axes.
 //!
-//! rtx started life as a single implicit mode: free-for-all deathmatch. To make room for the
-//! modes coming next (1on1/2on2/4on4, timed matches, CTF, instagib) without scattering
-//! `if arena { … }` branches across the codebase — the `#ifdef ARENA` sprawl the reference
-//! Frogbot-Rocket-Arena QuakeC suffers from — the mode is factored behind one small trait,
-//! [`GameMode`], whose hooks the generic lifecycle code (spawn, death, respawn, damage,
-//! per-frame tick, bot think) calls at a handful of well-defined seams.
+//! Gameplay splits into a **game mode** (the ruleset — `rtx_mode`) and a **match composition** (how
+//! the match is organized — `rtx_match`). They're independent: deathmatch and CTF each run under any
+//! composition (open free-for-all, or a locked `2on2`/`4on4`/…), while Rocket Arena and midair are
+//! inherently duel rulesets. Keeping them separate avoids the `#ifdef ARENA` sprawl the reference
+//! Frogbot-Rocket-Arena QuakeC suffers from.
+//!
+//! - **Game mode** is factored behind one small trait, [`GameMode`], whose hooks the generic
+//!   lifecycle code (spawn, death, respawn, damage, per-frame tick, bot think) calls at a handful of
+//!   well-defined seams. There are four: [`Dm`] (the baseline — every hook is the default, so plain
+//!   deathmatch plays as before), [`Arena`] (`ra`), [`Midair`], and [`Ctf`], each overriding only
+//!   the hooks it changes. Adding one = a struct + `impl GameMode` + a line in [`select_mode`].
+//! - **Match composition** lives in [`team`]: `rtx_match` resolves to a `MatchConfig` of N teams of
+//!   size M, which drives (for `teams ≥ 2`) the shared warmup→start→countdown→live match lifecycle
+//!   and the team layer (assignment, colours, team-aware bot targeting). A structured match's three
+//!   variation points — go-live slate, win condition, result line — are the `on_match_*` hooks,
+//!   whose defaults are team deathmatch, so [`Dm`]/[`Midair`] get structured play for free and
+//!   [`Ctf`] overrides them.
 //!
 //! A mode is a **stateless behavior descriptor** (a zero-sized struct) exposed as
 //! `&'static dyn GameMode`; all mutable per-match state lives in [`GameState`]. Because a
@@ -18,27 +29,24 @@
 //! let mode = self.mode;   // copies the fat pointer — no borrow of self
 //! mode.tick(self);        // now free to take &mut self
 //! ```
-//!
-//! [`Ffa`] is the baseline (every hook is the current default), so today's gameplay is
-//! unchanged; [`Arena`] (`rtx_mode ra`) is the first mode layered on top and overrides only the
-//! hooks it needs. Adding a mode = one struct + `impl GameMode` + a line in [`select_mode`].
 
 use glam::Vec3;
 
+use crate::defs::{Items, Weapon};
 use crate::entity::EntId;
 use crate::game::{cstring, GameState};
 
 mod arena;
 mod ctf;
-mod ffa;
+mod dm;
 mod midair;
-mod team;
+pub(crate) mod team;
 
 pub(crate) use arena::{Arena, ArenaState};
 pub(crate) use ctf::Ctf;
-pub(crate) use ffa::Ffa;
+pub(crate) use dm::Dm;
 pub(crate) use midair::Midair;
-pub(crate) use team::{is_match_mode, MatchState, TeamMatch};
+pub(crate) use team::{MatchPhase, MatchState};
 
 /// A player's standing in a round-based mode (Rocket Arena): fighting in the arena, or waiting
 /// in the audience (fresh joiners, and players eliminated until the next round). Stored per
@@ -143,8 +151,8 @@ impl DamageOutcome {
     }
 }
 
-/// The behavior of one game mode. Every hook has a default that reproduces stock FFA deathmatch,
-/// so a mode only overrides the policy pieces it changes:
+/// The behavior of one game mode. Every hook has a default that reproduces stock deathmatch, so a
+/// mode only overrides the policy pieces it changes:
 ///
 /// - **Ruleset** — [`tick`](GameMode::tick), [`player_damage`](GameMode::player_damage),
 ///   [`weapons_hot`](GameMode::weapons_hot), [`on_death`](GameMode::on_death),
@@ -152,22 +160,27 @@ impl DamageOutcome {
 /// - **Spawns** — [`select_spawn`](GameMode::select_spawn).
 /// - **Loadout** — [`apply_loadout`](GameMode::apply_loadout).
 /// - **Bots** — [`bot_intent`](GameMode::bot_intent).
+/// - **Structured match** — [`on_match_go_live`](GameMode::on_match_go_live),
+///   [`match_limit_reached`](GameMode::match_limit_reached),
+///   [`announce_match_result`](GameMode::announce_match_result). Defaults are team deathmatch.
 pub(crate) trait GameMode: Sync {
     /// The `rtx_mode` value that selects this mode.
     fn name(&self) -> &'static str;
 
     /// Per-frame state machine (round countdown / fight / reset). Runs once per normal server
-    /// frame. Default: nothing.
+    /// frame. Default: nothing. (The team-match lifecycle is driven separately, off `rtx_match`.)
     fn tick(&self, _g: &mut GameState) {}
 
-    /// Choose the spawn point entity for (re)spawning player `e`. Default: a standard free
-    /// `info_player_deathmatch` (the stock rule).
-    fn select_spawn(&self, g: &mut GameState, _e: EntId) -> EntId {
-        g.select_spawn_point()
+    /// Choose the spawn point entity for (re)spawning player `e`. Default: this player's team spawn
+    /// (`info_player_teamN`) in a team composition, falling back to a standard free
+    /// `info_player_deathmatch` — which is exactly the stock rule when the player has no team.
+    fn select_spawn(&self, g: &mut GameState, e: EntId) -> EntId {
+        team::team_spawn(g, e)
     }
 
     /// Set weapons / ammo / armor / health after `DecodeLevelParms`. Default: keep the decoded
-    /// spawn parms (stock FFA loadout).
+    /// spawn parms (stock deathmatch loadout). Team assignment is applied generically before this,
+    /// so a mode's loadout composes with any team composition.
     fn apply_loadout(&self, _g: &mut GameState, _e: EntId) {}
 
     /// Shape one hit landing on `targ` — the mode's damage ruleset, consulted in `t_damage` after
@@ -188,9 +201,10 @@ pub(crate) trait GameMode: Sync {
     }
 
     /// May weapons fire right now? Gates the actual shot (muzzle/projectile), not just damage —
-    /// used to lock out firing before "FIGHT" in a round mode. Default: yes.
-    fn weapons_hot(&self, _g: &GameState) -> bool {
-        true
+    /// used to lock out firing before "FIGHT". Default: hot except during a team-match countdown
+    /// (in open play the phase never leaves warmup, so this is always hot). Arena overrides it.
+    fn weapons_hot(&self, g: &GameState) -> bool {
+        team::match_weapons_hot(g)
     }
 
     /// Print the mode's own kill announcement / scoring instead of the default obituary. Called in
@@ -241,94 +255,136 @@ pub(crate) trait GameMode: Sync {
         false
     }
 
-    /// Offer a client console command to the mode; return `true` if the mode consumed it. Used by
-    /// the match modes for `start`. Default: `false`.
-    fn handle_command(&self, _g: &mut GameState, _e: EntId, _cmd: &str) -> bool {
-        false
-    }
-
     /// Multiplier applied to a freshly-set attack cooldown (`attack_finished`), letting a mode speed
     /// up or slow down firing. CTF's Haste rune returns `0.5` (fire ~2× as fast). Default: `1.0`.
     fn attack_cooldown_scale(&self, _g: &GameState, _e: EntId) -> f32 {
         1.0
     }
+
+    // --- structured-match variation points (only reached when a team match is active) ---
+
+    /// Reset the mode's slate when a match countdown expires: frags/scores for team DM, plus flags
+    /// and runes for CTF. The shared machine then arms the timelimit and flips to Live, so this must
+    /// *not* touch either. Default: team deathmatch (see [`team::default_go_live`]).
+    fn on_match_go_live(&self, g: &mut GameState) {
+        team::default_go_live(g);
+    }
+
+    /// One Live frame: refresh scores if the mode tallies them here, and report whether the win
+    /// limit (frags / captures) is reached — the shared machine ends the match on the timelimit
+    /// itself. Default: team deathmatch fraglimit (see [`team::frag_limit_reached`]).
+    fn match_limit_reached(&self, g: &mut GameState) -> bool {
+        team::frag_limit_reached(g)
+    }
+
+    /// Broadcast the result line as a match ends (the phase transition is the machine's job).
+    /// Default: the team deathmatch scoreline (see [`team::announce_team_result`]).
+    fn announce_match_result(&self, g: &mut GameState) {
+        team::announce_team_result(g);
+    }
 }
 
-/// The FFA singleton — the baseline mode and the default when `rtx_mode` is unset/unknown.
-static FFA: Ffa = Ffa;
+/// The deathmatch singleton — the baseline mode and the default when `rtx_mode` is unset/unknown.
+static DM: Dm = Dm;
 /// The Rocket Arena singleton (`rtx_mode ra`).
 static ARENA: Arena = Arena;
 /// The Midair singleton (`rtx_mode midair`).
 static MIDAIR: Midair = Midair;
-/// The team-match singleton — every team alias (`1on1`/`duel`/`2on2`/`2on2on2`/`NonM…`) resolves to
-/// it; the parsed format lives in [`GameState::team_match`], not the descriptor.
-static TEAM: TeamMatch = TeamMatch;
 /// The Capture-the-Flag singleton (`rtx_mode ctf`) — reuses the match lifecycle + team layer.
 static CTF: Ctf = Ctf;
 
-/// The default mode used before a map selects one (matches `rtx_mode ffa`).
+/// The default mode used before a map selects one (matches `rtx_mode dm`).
 pub(crate) fn default_mode() -> &'static dyn GameMode {
-    &FFA
+    &DM
 }
 
-/// Resolve an `rtx_mode` string to its mode descriptor. Any team format alias resolves to the
-/// shared team-match descriptor; unknown values fall back to FFA.
+/// Resolve an `rtx_mode` string to its ruleset descriptor. Unknown values (including the old team
+/// aliases, now moved to `rtx_match`) fall back to deathmatch; `refresh_mode` hints about it once.
 pub(crate) fn select_mode(name: &str) -> &'static dyn GameMode {
     match name {
         "ra" => &ARENA,
         "midair" => &MIDAIR,
         "ctf" => &CTF,
-        _ if team::parse_match_alias(name).is_some() => &TEAM,
-        _ => &FFA,
+        _ => &DM,
     }
 }
 
 impl GameState {
-    /// Sync the active mode to the `rtx_mode` cvar. Read live every frame (like every other rtx
-    /// cvar) so a mode change takes effect without a map reload. Re-selecting only on an actual
-    /// change keeps round/match state from resetting every frame; switching modes deliberately does
-    /// reset it (a fresh match). `rtx_mode` is preserved across a map reload (`cvar_default` only
-    /// seeds an unset cvar), so the team-match start-reload keeps its alias.
+    /// Sync the active mode + composition to the `rtx_mode` / `rtx_match` cvars. Read live every
+    /// frame (like every other rtx cvar) so a change takes effect without a map reload. State is
+    /// reset only on an actual change — switching the *ruleset* abandons a running match; changing
+    /// the *format* starts a fresh warmup — so an in-progress match isn't wiped every frame. Both
+    /// cvars survive a map reload (`cvar_default` only seeds an unset cvar), so the match-start
+    /// reload (where neither changes) preserves the locked roster and `resuming` flag.
     pub(crate) fn refresh_mode(&mut self) {
         let host = self.host;
-        let mut buf = [0u8; 16];
-        let name = host.cvar_string(c"rtx_mode", &mut buf);
-        let next = select_mode(name);
-        // The team descriptor's `name()` is a constant, so switching format (`2on2`→`3on3`) isn't a
-        // descriptor change — track the parsed format separately (below).
-        let team_config = team::parse_match_alias(name);
+        let mut mbuf = [0u8; 16];
+        let mut fbuf = [0u8; 32]; // room for a long `NonMon…` chain
+        let mode_name = host.cvar_string(c"rtx_mode", &mut mbuf);
+        let match_alias = host.cvar_string(c"rtx_match", &mut fbuf);
+        let next = select_mode(mode_name);
+        let cfg = team::resolve_composition(next.name(), match_alias);
+
+        // One-shot hints, fired when either *raw* string changes — an unknown/renamed value may
+        // resolve to the same descriptor/config, so detect the raw change, not just the resolved one.
+        // (These read/write self fields but not the cvar buffers, so no borrow conflict.)
+        if self.mode_cvar != mode_name {
+            self.mode_cvar = mode_name.to_string();
+            if !matches!(mode_name, "dm" | "ra" | "midair" | "ctf") {
+                host.conprint(&cstring(&format!(
+                    "rtx: unknown rtx_mode \"{mode_name}\" — modes are dm|ra|midair|ctf; team formats like 2on2 are now rtx_match. Using dm.\n"
+                )));
+            }
+        }
+        if self.match_cvar != match_alias {
+            self.match_cvar = match_alias.to_string();
+            if next.name() == "ra" && !match_alias.is_empty() {
+                host.conprint(&cstring(
+                    "rtx: rtx_match is ignored in Rocket Arena — its 1v1 round queue is its composition.\n",
+                ));
+            } else if !matches!(match_alias, "" | "ffa") && team::parse_match_alias(match_alias).is_none() {
+                host.conprint(&cstring(&format!(
+                    "rtx: unknown rtx_match \"{match_alias}\" — try ffa or a format like 2on2. Using the mode default.\n"
+                )));
+            } else if next.name() == "ctf" {
+                if let Some(p) = team::parse_match_alias(match_alias) {
+                    if p.teams != 2 {
+                        host.conprint(&cstring("rtx: CTF is always 2 teams — clamping the format to 2 sides.\n"));
+                    }
+                }
+            }
+        }
+
+        // The cvar-buffer borrows (`mode_name`/`match_alias`) are read-only above and `next`/`cfg`
+        // are `Copy`, so we're free to take `&mut self` now.
         if next.name() != self.mode.name() {
             self.mode = next;
             self.arena = ArenaState::default();
-            host.conprint(&cstring(&format!("rtx: game mode = {}\n", next.name())));
-        }
-        // `name`'s borrow of `buf` is done (config is Copy); free to take `&mut self`. Both match
-        // modes carry their format in `MatchState` (the descriptor `name()` is constant): team DM
-        // parses the alias; CTF is a fixed 2-team format. A changed format is a fresh match.
-        if is_match_mode(next.name()) {
-            let cfg = if next.name() == "ctf" {
-                team::MatchConfig { teams: 2, size: 0 }
-            } else {
-                team_config.unwrap_or_default()
+            self.team_match = MatchState {
+                config: cfg,
+                ..Default::default()
             };
-            if cfg != self.team_match.config {
-                self.team_match = MatchState {
-                    config: cfg,
-                    ..Default::default()
-                };
+            host.conprint(&cstring(&format!("rtx: game mode = {}\n", next.name())));
+        } else if cfg != self.team_match.config {
+            self.team_match = MatchState {
+                config: cfg,
+                ..Default::default()
+            };
+            if cfg.teams >= 2 {
+                host.conprint(&cstring(&format!("rtx: match format = {}\n", team::format_label(cfg))));
             }
-            // Team play needs friendly-fire protection on (the `"team"` userinfo does the rest).
-            if host.cvar(c"teamplay") == 0.0 {
-                host.cvar_set(c"teamplay", c"1");
-            }
+        }
+        // Team play needs friendly-fire protection on (the `"team"` userinfo does the rest).
+        if cfg.teams >= 2 && host.cvar(c"teamplay") == 0.0 {
+            host.cvar_set(c"teamplay", c"1");
         }
     }
 }
 
 /// Map (re)load housekeeping for the mode layer, called from `worldspawn` after `refresh_mode`.
-/// Resets the per-map round state (Arena) and reconciles the team-match state — which must run for
-/// *every* mode, since switching away from a match mode has to clear it (so it can't hang off the
-/// active mode's own hook). Then the active mode's own [`GameMode::on_worldspawn`] runs.
+/// Resets the per-map round state (Arena) and reconciles the team-match state — which must run
+/// regardless of mode, since switching away from a team composition has to clear it (so it can't
+/// hang off the active mode's own hook). Then the active mode's own [`GameMode::on_worldspawn`] runs.
 pub(crate) fn on_worldspawn(g: &mut GameState) {
     g.arena = ArenaState::default();
     // Fresh opponent hypotheses, seeded with this mode's spawn kit (Arena/Midair hand out fixed
@@ -388,4 +444,58 @@ pub(crate) fn centerprint_all(g: &GameState, msg: &str) {
         }
         host.centerprint(e, &cmsg);
     }
+}
+
+// --- shared spectator/audience helpers -----------------------------------------------------------
+
+/// The harmless-spectator loadout: axe only, no ammo, positive health/armor. Shared by Rocket
+/// Arena's audience and a structured match's benched late-joiners; damage to (and from) these
+/// players is refused by the bench/audience damage gates. Health/armor must stay positive — a
+/// client (and the bot AI) treats 0 health as dead and locks movement, freezing the spectator.
+pub(crate) fn audience_loadout(g: &mut GameState, e: EntId) {
+    let v = &mut g.entities[e].v;
+    v.items = Items::AXE.as_f32();
+    v.health = 100.0;
+    v.armorvalue = 100.0;
+    v.armortype = 0.8;
+    v.ammo_shells = 0.0;
+    v.ammo_nails = 0.0;
+    v.ammo_rockets = 0.0;
+    v.ammo_cells = 0.0;
+    v.weapon = Weapon::Axe;
+}
+
+/// A roaming destination among `classname` spawns for a bot with nothing to fight — re-picked on a
+/// staggered timer or once it has nearly arrived, so the bot keeps strolling between points instead
+/// of freezing on the spot (a frozen bot also trips the stuck-jumper). `prefer` is consulted at the
+/// moment of re-pick for a smarter destination (Rocket Arena's audience picks a spot overlooking the
+/// duel); it's evaluated lazily so any line-of-sight traces it runs happen only when actually
+/// re-picking, and `None` falls back to a random `classname` spawn. Shared by Arena's fighter /
+/// audience roam and a benched player's idle wander.
+pub(crate) fn wander_point(
+    g: &mut GameState,
+    bot: EntId,
+    classname: &str,
+    prefer: impl FnOnce(&mut GameState) -> Option<Vec3>,
+) -> Vec3 {
+    let now = g.time();
+    let origin = g.entities[bot].v.origin;
+    let target = g.entities[bot].bot.wander_target;
+    let (dx, dy) = (target.x - origin.x, target.y - origin.y);
+    let arrived = target != Vec3::ZERO && (dx * dx + dy * dy).sqrt() < 48.0;
+    if now >= g.entities[bot].bot.wander_time || target == Vec3::ZERO || arrived {
+        let next = prefer(g).unwrap_or_else(|| {
+            let spot = g.select_spawn_point_of(classname);
+            if spot != EntId::WORLD {
+                g.entities[spot].v.origin
+            } else {
+                origin
+            }
+        });
+        let jitter = g.random();
+        let b = &mut g.entities[bot].bot;
+        b.wander_target = next;
+        b.wander_time = now + 3.0 + jitter * 3.0;
+    }
+    g.entities[bot].bot.wander_target
 }

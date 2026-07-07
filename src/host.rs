@@ -222,7 +222,7 @@ impl HostApi {
     /// map load, so a plain `cvar_set` there would overwrite a value the user put in `server.cfg`
     /// (or a `set` before `map`) each time — this preserves an existing value and only seeds the
     /// default when the cvar is unset (empty string). Generic over the value type so string,
-    /// numeric, and boolean defaults read the same, e.g. `cvar_default("rtx_mode", "ffa")`,
+    /// numeric, and boolean defaults read the same, e.g. `cvar_default("rtx_mode", "dm")`,
     /// `cvar_default("rtx_bot_count", 0.0)`, and `cvar_default("rtx_grapple", true)`.
     pub fn cvar_default<V: CvarValue>(&self, name: &str, default: V) {
         // Preserve any existing value (server.cfg, or a prior map) — only seed when unset.

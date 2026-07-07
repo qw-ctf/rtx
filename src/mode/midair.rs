@@ -132,8 +132,12 @@ impl GameMode for Midair {
     }
 
     fn bot_intent(&self, g: &mut GameState, bot: EntId) -> Option<BotIntent> {
-        // Free-for-all: hunt the nearest living player. The shared combat overlay leads airborne
-        // targets; a bot rocketing a grounded enemy launches them, then airshots — emergent.
+        // Hunt the nearest enemy — team-aware under a team composition (a 2on2 midair), else the
+        // nearest living player in a free-for-all. The shared combat overlay leads airborne targets;
+        // a bot rocketing a grounded enemy launches them, then airshots — emergent.
+        if crate::mode::team::lifecycle_active(g) {
+            return crate::mode::team::nearest_enemy(g, bot).map(BotIntent::Fight);
+        }
         nearest_player(g, bot).map(BotIntent::Fight)
     }
 }

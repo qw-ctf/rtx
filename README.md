@@ -55,19 +55,23 @@ hook links a bot swings across.
 
 ## Game modes
 
-The game mode is selected with **`rtx_mode`**, read at map load. Modes are pluggable: each one
-overrides only the policy it changes — **ruleset** (round/damage/respawn rules), **spawns**,
-**loadout**, and the **bot brain** — behind a small `GameMode` trait (`src/mode/`). Free-for-all
-is just the baseline mode, so adding a mode doesn't touch the generic gameplay or bot code.
+Gameplay has **two orthogonal axes**. The **game mode** (`rtx_mode`) is the ruleset; the **match
+composition** (`rtx_match`) is how the match is organized. They're independent: deathmatch and CTF
+each run under any composition (open free-for-all, or a locked `2on2`/`4on4`/…), while Rocket Arena
+and midair are inherently duel rulesets. Modes are pluggable: each one overrides only the policy it
+changes — **ruleset** (round/damage/respawn rules), **spawns**, **loadout**, and the **bot brain** —
+behind a small `GameMode` trait (`src/mode/`). Deathmatch is just the baseline mode, so adding a
+mode doesn't touch the generic gameplay or bot code.
 
 | cvar | default | what it does |
 |------|---------|--------------|
-| `rtx_mode` | `ffa` | `ffa` = free-for-all deathmatch (stock behaviour). `ra` = Rocket Arena. `midair` = airborne-only rocket DM. `ctf` = Capture the Flag. A **team format** (`1on1`/`duel`, `2on2`, `2on2on2`, any `NonM…`) = team deathmatch. |
+| `rtx_mode` | `dm` | Ruleset: `dm` = deathmatch (stock behaviour). `ra` = Rocket Arena. `midair` = airborne-only rocket DM. `ctf` = Capture the Flag. |
+| `rtx_match` | *(auto)* | Composition, orthogonal to the mode. Empty = the mode's natural default (dm → open FFA, ctf → open 2-team pickup, midair → 1on1 duel). `ffa` = open free-for-all. A **team format** (`1on1`/`duel`, `2on2`, `2on2on2`, any `NonM…`) = a locked N×M match. Ignored by `ra`; CTF clamps it to 2 teams. |
 | `rtx_ra_countdown` | `3` | Rocket Arena: seconds of spawn-protected countdown before "FIGHT". |
 | `rtx_ra_lightning_gun` | `0` | Rocket Arena: include the lightning gun in the arena arsenal (`0` leaves it out). |
 | `rtx_midair_minheight` | `40` | Midair: minimum height (units) above the floor for a victim to count as airborne. |
 | `rtx_midair_kb_ground` / `rtx_midair_kb_air` | `6` / `3` | Midair: rocket knockback multipliers for grounded vs airborne victims (ground is stronger, to launch players up). |
-| `rtx_match_countdown` | `3` | Team match / CTF: seconds of spawn-protected countdown after the match-start map reload before "FIGHT". |
+| `rtx_match_countdown` | `3` | Team match (`rtx_match` format) / CTF: seconds of spawn-protected countdown after the match-start map reload before "FIGHT". |
 | `rtx_capturelimit` | `8` | CTF: captures a team needs to win (`0` = no limit, ends on `timelimit`). |
 | `rtx_runes` | `0` | CTF runes: `0` = on (Haste adds move speed), `1` = off, `2` = on without the speed boost. |
 | `rtx_ctf_tossflag` / `rtx_ctf_tossrune` | `0` / `0` | CTF: allow tossing your carried flag (impulse 26) / held rune (impulse 24). |
@@ -93,21 +97,27 @@ health, at normal gravity. A direct rocket on an **airborne** victim is an **ins
 — so you rocket someone up, then airshot them out of the air. Non-rocket damage is harmless, and
 your own rockets never hurt you but still fling you (free rocket-jumps). Kills score by **how high
 the victim was** (vertical distance from where you fired): **bronze/silver/gold/platinum** for
-**+1/+2/+4/+8** at `>0/256/512/1024` units, announced as an airshot line. Bots play it — they hunt
-the nearest player, launch grounded targets and airshot them.
+**+1/+2/+4/+8** at `>0/256/512/1024` units, announced as an airshot line. By default midair runs as
+a **1on1 duel** (a structured match — see below); set `rtx_match ffa` for a continuous free-for-all,
+or a team format like `2on2`. Bots play it — they hunt the nearest enemy, launch grounded targets
+and airshot them.
 
-**Team formats — `1on1`/`duel`, `2on2`, `2on2on2`, any `NonM…`.** A generic team-match layer: the
-alias picks **N teams of size M** (`2on2on2` = three teams of two). It's a **continuous team
-deathmatch** — teams frag to the `fraglimit`, friendly fire follows `teamplay`, and each team gets a
-colour (red/blue/green/…) and its `info_player_teamN` spawns (DM spawns as fallback). The lifecycle
-is warmup → **`start`** → live → results: in **warmup** everyone plays and is auto-balanced onto the
-smallest team; typing **`start`** in the console **reloads the map** (fresh entities) and runs a
-countdown, **locking the roster**; play then runs to the limit and returns to warmup. Players who
-drop and reconnect are **reattached to their team**. Bots fill and play the teams, targeting only
-the other side. The team primitives are reusable — CTF (below) is the second consumer, and a future
-round-based team mode builds on the same layer.
+**Match composition — `rtx_match`.** Orthogonal to the mode, this picks how the match is organized.
+Empty (the default) uses the mode's natural composition; `ffa` forces open free-for-all; a **team
+format** (`1on1`/`duel`, `2on2`, `2on2on2`, any `NonM…`) picks **N teams of size M** (`2on2on2` =
+three teams of two) and applies to deathmatch and CTF alike. A team composition gives each team a
+colour (red/blue/green/…) and its `info_player_teamN` spawns (DM spawns as fallback), turns on
+friendly fire (`teamplay`), and — for a plain **team deathmatch** — has teams frag to the
+`fraglimit`. The lifecycle is warmup → **`start`** → live → results: in **warmup** everyone plays and
+is auto-balanced onto the smallest team; typing **`start`** in the console **reloads the map** (fresh
+entities) and runs a countdown, **locking the roster**; play then runs to the limit and returns to
+warmup. A **structured** format (`teams × size`) locks **exactly that many seats** at `start` (humans
+before bots, rebalancing the sides); anyone over the count — and any **late joiner** — is **benched**
+as a harmless spectator (axe only, damage refused, roaming the stands) until the next warmup. Bots
+fill exactly the empty seats and freeze once the match is live. Players who drop and reconnect are
+**reattached to their team**. Bots target only the other side.
 
-**`ctf` — Capture the Flag** (modeled on **purectf**), built on the team layer above. Two teams
+**`ctf` — Capture the Flag** (modeled on **purectf**), built on the composition layer above. Two teams
 (red/blue) each own a flag at a base (`item_flag_team1`/`item_flag_team2`). Grab the **enemy** flag,
 carry it to **your** base while **your** flag is home, and it's a **capture** (+1 to your team, +15
 frags to the carrier). Touch your **own** flag where it lies to **return** it (+1); a dropped flag
@@ -139,9 +149,9 @@ through the same player-move code as humans, so gravity, stepping, and jumps com
 | `rtx_bot_greed` | `1` | Let a fighting bot **break off to grab a compelling nearby pickup** — a powerup (quad/pent), a weapon it lacks, or a big health/armor swing — while it can't see its target, instead of only chasing the enemy. `0` = bots only pursue items when the mode leaves the brain idle. |
 | `rtx_bot_fov` | `120` | View cone (full angle, degrees) within which a bot can **see** a target; widened with skill. A nominated enemy outside the cone (or behind cover) isn't engaged until seen, heard firing, or felt as damage. `0` = 360° sight (the old always-aware behavior). |
 | `rtx_bot_reaction` | `0.4` | Base **reaction delay** (seconds) a target must stay in sight before the bot acts on it; shortened with skill (floored so even skill 7 isn't instant). `0` = react instantly. |
-| `rtx_bot_teamwork` | `1` | In **team/CTF** modes, coordinate: **spread targets** across the enemy team instead of dogpiling the nearest, **don't race teammates** to the same item, **escort** a friendly flag carrier, and **stagger** defender posts. `0` = each bot decides independently. No effect in FFA. |
+| `rtx_bot_teamwork` | `1` | In **team compositions / CTF**, coordinate: **spread targets** across the enemy team instead of dogpiling the nearest, **don't race teammates** to the same item, **escort** a friendly flag carrier, and **stagger** defender posts. `0` = each bot decides independently. No effect in open free-for-all. |
 
-In free-for-all each bot **hunts and frags the nearest player** — everyone's an enemy, so a
+In open play each bot **hunts and frags the nearest player** — everyone's an enemy, so a
 bots-only server plays itself — pathing to them and, once in sight, aiming and shooting via the
 shared combat layer (retreating when hurt, grabbing items it passes over). Set `rtx_bot_pacifist 1`
 — in any mode — and they stop fighting and just tail the nearest human instead. With nothing to

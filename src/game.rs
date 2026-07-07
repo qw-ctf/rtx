@@ -73,14 +73,18 @@ const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // scaling its base `× sv_maxspeed`. Defaults match purectf's shipped server.cfg.
         ("rtx_hook_speed", Float(1.25)),
         ("rtx_hook_pull", Float(1.0)),
-        // Game mode: `ffa` (free-for-all deathmatch, the default), `ra` (Rocket Arena), `midair`,
-        // a team alias, or `ctf`. Read live each frame. A string cvar. See `crate::mode`.
-        ("rtx_mode", Str("ffa")),
+        // Game mode (ruleset): `dm` (deathmatch, the default), `ra` (Rocket Arena), `midair`, or
+        // `ctf`. Read live each frame. A string cvar. See `crate::mode`.
+        ("rtx_mode", Str("dm")),
+        // Match composition (organization), orthogonal to the mode: `""` (auto — the mode's natural
+        // default), `ffa` (open free-for-all), or a team format `1on1`/`duel`/`2on2`/`2on2on2`/…
+        // (a locked N×M match). `ra` ignores this (its 1v1 round queue is fixed). See `crate::mode`.
+        ("rtx_match", Str("")),
         // Rocket Arena: seconds of spawn-protected countdown before "FIGHT". (Always a 1v1 duel.)
         ("rtx_ra_countdown", Float(3.0)),
         // Rocket Arena: include the lightning gun in the arena arsenal (off = leave it out).
         ("rtx_ra_lightning_gun", Bool(false)),
-        // Team match (`rtx_mode 1on1`/`2on2`/…): seconds of spawn-protected countdown after the
+        // Team match (`rtx_match 1on1`/`2on2`/…): seconds of spawn-protected countdown after the
         // match-start map reload before "FIGHT".
         ("rtx_match_countdown", Float(3.0)),
         // CTF: captures a team needs to win the match (`0` = no limit, ends on timelimit only).
@@ -191,14 +195,19 @@ pub struct GameState {
     /// Match-wide state.
     pub level: Level,
     /// The active game mode (`rtx_mode`) — a stateless behavior descriptor. Reselected each map
-    /// load in `worldspawn`; defaults to FFA. See [`crate::mode`].
+    /// load in `worldspawn`; defaults to deathmatch. See [`crate::mode`].
     pub mode: &'static dyn GameMode,
+    /// The raw `rtx_mode` / `rtx_match` cvar strings as last read, so `refresh_mode` can detect a
+    /// *raw* change (and fire its one-shot console hints) even when the value resolves to the same
+    /// descriptor/config — e.g. an unknown mode that falls back to `dm`. See [`GameState::refresh_mode`].
+    pub mode_cvar: String,
+    pub match_cvar: String,
     /// Rocket-Arena round-state machine. Only meaningful while `mode` is the arena; otherwise
     /// left at its default. See [`crate::mode::ArenaState`].
     pub arena: ArenaState,
-    /// Team-match state (config + lifecycle + locked roster). Only meaningful while a team `rtx_mode`
-    /// alias is active. Lives here (not on the mode descriptor) so it survives the match-start map
-    /// reload. See [`crate::mode::MatchState`].
+    /// Match-composition state (resolved `rtx_match` config + lifecycle + locked roster). Meaningful
+    /// while a team composition is active (`teams >= 2`). Lives here (not on the mode descriptor) so
+    /// it survives the match-start map reload. See [`crate::mode::MatchState`].
     pub team_match: crate::mode::MatchState,
     /// QuakeC transient globals threaded through target-firing and damage (`activator`,
     /// `damage_attacker`, `damage_inflictor`). Set at the top of the relevant callbacks.
@@ -275,6 +284,8 @@ impl GameState {
             game_data,
             level: Level::default(),
             mode: mode::default_mode(),
+            mode_cvar: String::new(),
+            match_cvar: String::new(),
             arena: ArenaState::default(),
             team_match: crate::mode::MatchState::default(),
             activator: EntId::WORLD,
@@ -599,9 +610,12 @@ impl GameState {
             world::start_frame(self);
             // Auto-advance a configured map rotation past the intermission scoreboard.
             self.map_queue_frame();
-            // Drive the active mode's per-frame state machine (round countdown/fight/reset).
+            // Drive the active mode's per-frame state machine (Rocket Arena's round countdown/fight/
+            // reset), then the composition layer's match lifecycle (a no-op unless a team match is
+            // active — team DM / CTF share it, keyed off `rtx_match`, not the mode).
             let mode = self.mode;
             mode.tick(self);
+            crate::mode::team::tick_lifecycle(self);
             bot::manage_population(self);
             // The engine only issues bot frames (below) once a real client is connected. On an empty
             // bots-only server those never arrive, so if no bot frame ran since the last normal frame,

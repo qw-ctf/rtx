@@ -9,10 +9,11 @@
 //! a dropped flag also **auto-returns** after 40 s, and a killed carrier **drops** it where they
 //! died. Teams win at `rtx_capturelimit`. Friendly fire follows `teamplay`.
 //!
-//! CTF reuses the team layer's lifecycle wholesale: the warmup → **`start`** (map reload +
+//! CTF reuses the composition layer's lifecycle wholesale: the warmup → **`start`** (map reload +
 //! countdown) → live → results machine, the locked roster + reconnect-reattach, team assignment,
-//! colours and `info_player_teamN` spawns all come from [`super::team`] via [`is_match_mode`]. Only
-//! the win condition (captures, not frags) and the flag entities are CTF-specific.
+//! colours and `info_player_teamN` spawns all come from [`super::team`] (CTF resolves to a 2-team
+//! composition). Only the win condition (captures, not frags — the `on_match_*` hooks) and the flag
+//! entities are CTF-specific.
 //!
 //! On top of the base flag game this also ports the purectf extras: the four runes
 //! (resistance / strength / haste / regen), the defense/assist frag bonuses, and the voluntary flag
@@ -21,7 +22,7 @@
 
 use glam::Vec3;
 
-use super::team::{self, match_weapons_hot, team_spawn, tick_lifecycle, MatchMode};
+use super::team;
 use super::{players, BotIntent, DamageOutcome, GameMode};
 use crate::assets::{Model, Sound};
 use crate::defs::{
@@ -68,24 +69,6 @@ pub(crate) struct Ctf;
 impl GameMode for Ctf {
     fn name(&self) -> &'static str {
         "ctf"
-    }
-
-    fn tick(&self, g: &mut GameState) {
-        tick_lifecycle(self, g);
-    }
-
-    fn select_spawn(&self, g: &mut GameState, e: EntId) -> EntId {
-        team_spawn(g, e)
-    }
-
-    fn apply_loadout(&self, g: &mut GameState, e: EntId) {
-        // Team assignment + colours; weapons stay the decoded DM parms (+ the grapple handout,
-        // which is CTF's signature movement tool).
-        team::assign_team(g, e);
-    }
-
-    fn weapons_hot(&self, g: &GameState) -> bool {
-        match_weapons_hot(g)
     }
 
     fn player_damage(
@@ -155,10 +138,6 @@ impl GameMode for Ctf {
         }
     }
 
-    fn handle_command(&self, g: &mut GameState, _e: EntId, cmd: &str) -> bool {
-        team::match_handle_command(g, cmd)
-    }
-
     fn attack_cooldown_scale(&self, g: &GameState, e: EntId) -> f32 {
         // Haste rune: fire ~2× as fast.
         if g.entities[e].mode_p.ctf.runes & RUNE_HASTE != 0 {
@@ -167,23 +146,21 @@ impl GameMode for Ctf {
             1.0
         }
     }
-}
 
-impl MatchMode for Ctf {
-    fn on_go_live(&self, g: &mut GameState) {
+    fn on_match_go_live(&self, g: &mut GameState) {
         // Fresh slate: zero the two capture scores, send both flags home, and (re)spawn the runes.
         g.team_match.scores = vec![0; 2];
         g.reset_flags();
         g.spawn_runes();
     }
 
-    fn limit_reached(&self, g: &mut GameState) -> bool {
+    fn match_limit_reached(&self, g: &mut GameState) -> bool {
         // Capture scores are updated on capture events (`ctf_capture`); here we only test the limit.
         let cap = g.host().cvar(c"rtx_capturelimit").max(0.0) as i32;
         cap > 0 && g.team_match.scores.iter().any(|&s| s >= cap)
     }
 
-    fn announce_result(&self, g: &mut GameState) {
+    fn announce_match_result(&self, g: &mut GameState) {
         self.end_match(g);
     }
 }

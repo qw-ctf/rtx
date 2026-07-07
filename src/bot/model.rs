@@ -204,10 +204,10 @@ impl OpponentModel {
     }
 }
 
-/// The estimate every entry resets to for the active mode. FFA / team / CTF spawn the stock fresh kit
-/// (their `apply_loadout` only assigns teams); Midair is the fixed RL kit (RL+axe, 250 hp, red armor);
-/// Arena fighters get the full arsenal + red armor. In those fixed-kit modes the arsenal hypothesis is
-/// trivially correct and the strength consumers still work from the right starting stack.
+/// The estimate every entry resets to for the active mode. Deathmatch / team / CTF spawn the stock
+/// fresh kit (their loadout only assigns teams); Midair is the fixed RL kit (RL+axe, 250 hp, red
+/// armor); Arena (`ra`) fighters get the full arsenal + red armor. In those fixed-kit modes the
+/// arsenal hypothesis is trivially correct and the strength consumers work from the right stack.
 pub(crate) fn baseline_for_mode(name: &str) -> OpponentEstimate {
     let mut est = OpponentEstimate::default();
     match name {
@@ -217,7 +217,7 @@ pub(crate) fn baseline_for_mode(name: &str) -> OpponentEstimate {
             est.armor_value = 200.0;
             est.armor_type = 0.8;
         }
-        "arena" => {
+        "ra" => {
             est.items = (Items::AXE
                 | Items::SHOTGUN
                 | Items::SUPER_SHOTGUN
@@ -483,13 +483,13 @@ mod tests {
         assert!(midair.items.has(Items::ROCKET_LAUNCHER));
         assert_eq!(midair.armor_type, 0.8);
 
-        let arena = baseline_for_mode("arena");
+        let arena = baseline_for_mode("ra");
         assert!(arena.items.has(Items::ROCKET_LAUNCHER) && arena.items.has(Items::SUPER_NAILGUN));
         assert_eq!(arena.armor_value, 200.0);
 
         // Everything else is the stock kit.
-        assert_eq!(baseline_for_mode("ffa"), OpponentEstimate::default());
-        assert_eq!(baseline_for_mode("teamplay"), OpponentEstimate::default());
+        assert_eq!(baseline_for_mode("dm"), OpponentEstimate::default());
+        assert_eq!(baseline_for_mode("ctf"), OpponentEstimate::default());
     }
 
     #[test]

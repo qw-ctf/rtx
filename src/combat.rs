@@ -107,6 +107,17 @@ impl GameState {
             damage *= if self.level.deathmatch == 4 { 8.0 } else { 4.0 };
         }
 
+        // Benched spectators (a structured match's non-roster late-joiners) neither deal nor take
+        // player damage — the same hard gate Rocket Arena applies to its audience. Guard the
+        // attacker check to player attackers so world hits (fall/lava/drowning) aren't blocked.
+        if self.entities[targ].classname() == Some("player") {
+            let att_benched = self.entities[attacker].classname() == Some("player")
+                && crate::mode::team::benched(self, attacker);
+            if att_benched || crate::mode::team::benched(self, targ) {
+                return;
+            }
+        }
+
         // Mode damage ruleset (Rocket Arena countdown/audience protection; Midair airborne-only
         // kills + launch knockback; CTF rune Strength/Resistance scaling + the carrier-defense
         // window), applied after quad and before armor. A fully-blocked hit — no health *and* no

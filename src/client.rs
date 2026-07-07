@@ -225,11 +225,21 @@ impl GameState {
             ent.v.items = ent.v.items.with(Items::GRAPPLE);
             ent.v.weapon = Weapon::Grapple;
         }
-        // The active mode has the final say on the loadout (e.g. Rocket Arena's fixed arsenal —
-        // rocket launcher active, no grapple / an audience player's empty hands), so it runs after
-        // the grapple handout and overrides it. FFA leaves the decoded parms + grapple as-is.
+        // In a structured match, a late joiner not on the locked roster sits out as a harmless
+        // spectator (axe only, damage refused) until the next warmup. Everyone else gets their team
+        // assignment first (in any team composition), then the mode's loadout on top — so the mode's
+        // fixed kit (Rocket Arena's arsenal, Midair's RL) composes with teams. Deathmatch leaves the
+        // decoded parms + grapple as-is.
         let mode = self.mode;
-        mode.apply_loadout(self, player);
+        let benched = crate::mode::team::benched(self, player);
+        if benched {
+            crate::mode::audience_loadout(self, player);
+        } else {
+            if crate::mode::team::lifecycle_active(self) {
+                crate::mode::team::assign_team(self, player);
+            }
+            mode.apply_loadout(self, player);
+        }
         self.w_set_current_ammo(player);
 
         // Opponent modeling: a (re)spawn hands out a fresh loadout, so reset every side's hypothesis
@@ -238,8 +248,12 @@ impl GameState {
         self.model_reset_target(player);
 
         // The mode chooses the spawn point (arena vs. audience in Rocket Arena; a plain DM spawn
-        // otherwise).
-        let spot = mode.select_spawn(self, player);
+        // otherwise). Benched spectators go to the stands (plain DM spawns), not the mode's logic.
+        let spot = if benched {
+            self.select_spawn_point()
+        } else {
+            mode.select_spawn(self, player)
+        };
         let origin = self.entities[spot].v.origin + Vec3::new(0.0, 0.0, 1.0);
         let angles = self.entities[spot].v.angles;
         {
@@ -266,6 +280,11 @@ impl GameState {
         // Telefrag anyone already standing here, then kick off the idle animation loop.
         self.spawn_tdeath(origin, player);
         self.player_stand1(player);
+
+        // Tell a benched human why they're spectating (bots have no connection to print to).
+        if benched && !self.entities[player].bot.is_bot {
+            self.sprint_to(player, c"Match in progress — you'll join at the next warmup.\n");
+        }
     }
 
     /// `PlayerPreThink` — runs before engine physics: rules, water, death/respawn, jump.
@@ -383,11 +402,10 @@ impl GameState {
                 self.client_kill(e);
                 1
             }
-            // Match-lifecycle commands ("start") are owned by the active mode; consume the token
-            // regardless so a stray "start" in a non-match mode isn't handed to the engine.
+            // The match-lifecycle "start" command begins a team match (a no-op in open/non-team
+            // play). Consume the token regardless so a stray "start" isn't handed to the engine.
             "start" => {
-                let mode = self.mode;
-                mode.handle_command(self, e, "start");
+                crate::mode::team::start_match(self);
                 1
             }
             _ => 0,
@@ -414,9 +432,9 @@ impl GameState {
 
     /// `CheckRules` — end the level on time/frag limit.
     fn check_rules(&mut self, e: EntId) {
-        // Team/CTF matches own their limits (team score / capture limit, in the mode's `tick`) —
-        // don't let an individual player's frags trip the stock intermission path.
-        if crate::mode::is_match_mode(self.mode.name()) {
+        // Team matches (team DM / CTF) own their limits (team score / capture limit, in the shared
+        // lifecycle) — don't let an individual player's frags trip the stock intermission path.
+        if crate::mode::team::lifecycle_active(self) {
             return;
         }
         let frags = self.entities[e].v.frags;
