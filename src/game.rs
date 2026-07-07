@@ -512,6 +512,22 @@ impl GameState {
         // matching how ktx re-runs `G_InitExtensions` each `GAME_INIT`.
         self.ext_fields = ext_field::ExtFields::default();
 
+        // Retire the previous map's bots. The map change that precedes this `GAME_INIT` runs the
+        // engine's `SV_SpawnServer`, which *frees every bot client* (clearing its `isBot`) but — by
+        // design — does **not** run our `ClientDisconnect` for them. Our `GameState` is process-global
+        // and outlives the map, so those slots would otherwise stay `is_bot == true` here with no bot
+        // behind them: `run_bots` would drive freed slots (the engine rejects each command — "tried
+        // to set cmd a non-botclient N") and `manage_population`, counting the phantoms as present,
+        // would never re-add real bots. Clear them so the roster rebuilds fresh on the new map.
+        // Human clients are never `is_bot`, so they're untouched — the engine keeps them across the
+        // change and re-runs their spawn.
+        let maxclients = self.host.cvar(c"maxclients").max(0.0) as u32;
+        for i in 1..=maxclients {
+            if self.entities[EntId(i)].bot.is_bot {
+                self.retire_slot(EntId(i));
+            }
+        }
+
         // Seed the rtx tunables from the registry (see `RTX_CVAR_DEFAULTS` for each cvar's meaning).
         for &(name, seed) in RTX_CVAR_DEFAULTS {
             self.host.cvar_default(name, seed);
