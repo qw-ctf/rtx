@@ -17,7 +17,7 @@
 use glam::Vec3;
 
 use super::{centerprint_all, nearest_player_where, players, ArenaRole, BotIntent, DamageOutcome, GameMode};
-use crate::defs::{Items, PrintLevel, Weapon};
+use crate::defs::{Items, PrintLevel, Weapon, VEC_VIEW_OFS};
 use crate::entity::EntId;
 use crate::game::GameState;
 
@@ -55,6 +55,18 @@ pub(crate) struct Arena;
 const ROUND_END_PAUSE: f32 = 3.0;
 /// Players in the arena at once — Rocket Arena is a 1v1 duel; everyone else waits in the audience.
 const FIGHTER_SLOTS: usize = 2;
+
+/// Audience spectating: how many candidate stands spawns to line-of-sight test when re-picking a
+/// vantage point (from a random start offset), capping the tracelines per re-pick — mirrors vigil's
+/// `MAX_POST_TRIES`. With up to two fighters that's ≤12 traces, only every few seconds.
+const VANTAGE_TRIES: usize = 6;
+/// Hold a chosen fighter this long (+jitter) before re-picking, so the gaze doesn't ping-pong
+/// between the two duelists — mirrors vigil's scan-hold cadence.
+const WATCH_HOLD: f32 = 1.2;
+const WATCH_JITTER: f32 = 0.8;
+/// When no fighter is visible, wait this long before re-testing — so a spectator behind an occluder
+/// doesn't pay a traceline per fighter every frame just to keep coming up empty.
+const WATCH_RETRY: f32 = 0.4;
 
 impl GameMode for Arena {
     fn name(&self) -> &'static str {
@@ -207,15 +219,36 @@ impl GameMode for Arena {
                 // Before the round goes live (countdown), roam the arena to take up a position,
                 // rather than standing on the spawn (which looks dead and trips the stuck-jumper).
                 if !matches!(g.arena.round, RoundState::Live) {
-                    return Some(BotIntent::Move(self.wander_point(g, bot, "info_teleport_destination")));
+                    return Some(BotIntent::Move(self.wander_point(g, bot, "info_teleport_destination", &[])));
                 }
                 Some(match nearest_enemy(g, bot) {
                     Some(enemy) => BotIntent::Fight(enemy),
-                    None => BotIntent::Move(self.wander_point(g, bot, "info_teleport_destination")),
+                    None => BotIntent::Move(self.wander_point(g, bot, "info_teleport_destination", &[])),
                 })
             }
-            // Eliminated / waiting: mill around the audience (the deathmatch spawns / stands).
-            ArenaRole::Audience => Some(BotIntent::Move(self.wander_point(g, bot, "info_player_deathmatch"))),
+            // Eliminated / waiting: mill around the audience (the stands) but *watch the duel* —
+            // stroll to a spot that overlooks the arena and keep the eyes on a live fighter. Only
+            // once there's something to watch (a formed round with fighters still up); Warmup keeps
+            // the plain wander.
+            ArenaRole::Audience => {
+                let watching = matches!(
+                    g.arena.round,
+                    RoundState::Countdown { .. } | RoundState::Live | RoundState::Ended { .. }
+                );
+                let fighters: Vec<(EntId, Vec3)> = if watching {
+                    live_fighters(g)
+                        .into_iter()
+                        .map(|f| (f, g.entities[f].v.origin + VEC_VIEW_OFS))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let goal = self.wander_point(g, bot, "info_player_deathmatch", &fighters);
+                Some(match self.watch_target(g, bot, &fighters) {
+                    Some(w) => BotIntent::Spectate { goal, watch: w },
+                    None => BotIntent::Move(goal),
+                })
+            }
         }
     }
 }
@@ -312,19 +345,22 @@ impl Arena {
     /// timer *or* once we're nearly there, so the bot keeps strolling between vantage points
     /// instead of freezing on the spot (a frozen bot also trips the stuck-jumper). Kept here, out
     /// of the generic bot code.
-    fn wander_point(&self, g: &mut GameState, bot: EntId, classname: &str) -> Vec3 {
+    fn wander_point(&self, g: &mut GameState, bot: EntId, classname: &str, vantage: &[(EntId, Vec3)]) -> Vec3 {
         let now = g.time();
         let origin = g.entities[bot].v.origin;
         let target = g.entities[bot].bot.wander_target;
         let (dx, dy) = (target.x - origin.x, target.y - origin.y);
         let arrived = target != Vec3::ZERO && (dx * dx + dy * dy).sqrt() < 48.0;
         if now >= g.entities[bot].bot.wander_time || target == Vec3::ZERO || arrived {
-            let spot = g.select_spawn_point_of(classname);
-            let next = if spot != EntId::WORLD {
-                g.entities[spot].v.origin
-            } else {
-                origin
-            };
+            // Prefer a spot that overlooks a fighter (audience spectating); fall back to any spawn.
+            let next = Self::vantage_spot(g, classname, vantage).unwrap_or_else(|| {
+                let spot = g.select_spawn_point_of(classname);
+                if spot != EntId::WORLD {
+                    g.entities[spot].v.origin
+                } else {
+                    origin
+                }
+            });
             let jitter = g.random();
             let b = &mut g.entities[bot].bot;
             b.wander_target = next;
@@ -332,6 +368,106 @@ impl Arena {
         }
         g.entities[bot].bot.wander_target
     }
+
+    /// A `classname` spawn whose eye position has line of sight to one of the `targets` (live
+    /// fighters, `(entity, eye)`), so an audience bot strolls to a spot overlooking the duel. Tries
+    /// up to [`VANTAGE_TRIES`] spots from a random offset; `None` (no target, or none with a clear
+    /// view) leaves the caller on its plain random wander. Traces run only at re-pick time.
+    fn vantage_spot(g: &mut GameState, classname: &str, targets: &[(EntId, Vec3)]) -> Option<Vec3> {
+        if targets.is_empty() {
+            return None;
+        }
+        // Snapshot the spawn origins before tracing — `find_by_classname` borrows `&g` immutably,
+        // while `traceline` needs `&mut g`.
+        let spots: Vec<Vec3> = g.find_by_classname(classname).map(|s| g.entities[s].v.origin).collect();
+        if spots.is_empty() {
+            return None;
+        }
+        let start = (g.random() * spots.len() as f32) as usize;
+        pick_vantage(&spots, start, VANTAGE_TRIES, |eye| {
+            targets.iter().any(|&(f, feye)| Self::sees(g, eye, f, feye))
+        })
+    }
+
+    /// Choose which live fighter an audience bot's eyes track this frame. Keep the currently held
+    /// fighter while it's still live and visible and the hold hasn't lapsed; otherwise re-pick the
+    /// nearest *visible* fighter. `None` (no fighter in sight) drops the watch — the eyes fall back
+    /// to the walk corridor rather than tracking a duelist through walls — and throttles the next
+    /// re-test by [`WATCH_RETRY`] so a blocked view doesn't cost a trace per fighter every frame.
+    fn watch_target(&self, g: &mut GameState, bot: EntId, fighters: &[(EntId, Vec3)]) -> Option<EntId> {
+        let now = g.time();
+        let (held, watch_time) = {
+            let b = &g.entities[bot].bot;
+            (b.watch_ent, b.watch_time)
+        };
+        let eye = g.entities[bot].v.origin + VEC_VIEW_OFS;
+
+        // Keep the held fighter if it's still a live target, still in sight, and the hold is unexpired.
+        let held_ok = held != 0
+            && now < watch_time
+            && fighters.iter().any(|&(f, feye)| f.0 == held && Self::sees(g, eye, f, feye));
+        if held_ok {
+            return Some(EntId(held));
+        }
+
+        // Re-pick: nearest fighter we can actually see.
+        let candidates: Vec<(EntId, f32, bool)> = fighters
+            .iter()
+            .map(|&(f, feye)| {
+                let dist = (g.entities[f].v.origin - g.entities[bot].v.origin).length();
+                (f, dist, Self::sees(g, eye, f, feye))
+            })
+            .collect();
+        let pick = pick_watch(&candidates);
+        let jitter = g.random();
+        let b = &mut g.entities[bot].bot;
+        match pick {
+            Some(w) => {
+                b.watch_ent = w.0;
+                b.watch_time = now + WATCH_HOLD + jitter * WATCH_JITTER;
+                Some(w)
+            }
+            None => {
+                b.watch_ent = 0;
+                b.watch_time = now + WATCH_RETRY;
+                None
+            }
+        }
+    }
+
+    /// Clear line of sight from `eye` to fighter `f`'s eye — the perception LOS test (a trace that
+    /// stops on the fighter, or gets ≥95% of the way).
+    fn sees(g: &mut GameState, eye: Vec3, f: EntId, feye: Vec3) -> bool {
+        let tr = g.traceline(eye, feye, false, EntId::WORLD);
+        tr.ent == f || tr.fraction > 0.95
+    }
+}
+
+/// First of `spots` (scanning up to `tries` from `start`, wrapping) whose eye point satisfies
+/// `sees`. Eye = spot + [`VEC_VIEW_OFS`]. `None` if none in the window has a view. Pure but for the
+/// caller's `sees` closure, so the try-window / wrap / offset logic is unit-testable.
+fn pick_vantage(spots: &[Vec3], start: usize, tries: usize, mut sees: impl FnMut(Vec3) -> bool) -> Option<Vec3> {
+    if spots.is_empty() {
+        return None;
+    }
+    let start = start % spots.len();
+    for i in 0..tries.min(spots.len()) {
+        let spot = spots[(start + i) % spots.len()];
+        if sees(spot + VEC_VIEW_OFS) {
+            return Some(spot);
+        }
+    }
+    None
+}
+
+/// The nearest *visible* fighter among `(entity, distance, visible)` candidates — the one the eyes
+/// should track. `None` when none is visible (drop the watch).
+fn pick_watch(cands: &[(EntId, f32, bool)]) -> Option<EntId> {
+    cands
+        .iter()
+        .filter(|&&(_, _, vis)| vis)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|&(f, _, _)| f)
 }
 
 /// Number of connected players (fighter-eligible).
@@ -363,4 +499,48 @@ fn live_fighters(g: &GameState) -> Vec<EntId> {
 fn nearest_enemy(g: &GameState, bot: EntId) -> Option<EntId> {
     let origin = g.entities[bot].v.origin;
     nearest_player_where(g, origin, bot, |g, e| g.entities[e].mode_p.arena.role == ArenaRole::Fighter)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vantage_returns_first_visible_from_offset() {
+        // Spots 0 and 2 have a clear view; from start=1 the scan hits spot 2 first.
+        let spots = [Vec3::new(0.0, 0.0, 0.0), Vec3::new(100.0, 0.0, 0.0), Vec3::new(200.0, 0.0, 0.0)];
+        let sees = |eye: Vec3| eye.x < 50.0 || eye.x > 150.0;
+        let pick = pick_vantage(&spots, 1, VANTAGE_TRIES, sees);
+        assert_eq!(pick, Some(spots[2]), "wraps from the offset and takes the first visible");
+        // The eye offset is applied, not the raw origin.
+        let mut seen_eye = Vec3::ZERO;
+        pick_vantage(&spots, 0, 1, |eye| {
+            seen_eye = eye;
+            true
+        });
+        assert_eq!(seen_eye, spots[0] + VEC_VIEW_OFS, "tests eye height, not the floor");
+    }
+
+    #[test]
+    fn vantage_none_when_all_blind_and_respects_try_budget() {
+        let spots = [Vec3::ZERO, Vec3::new(100.0, 0.0, 0.0), Vec3::new(200.0, 0.0, 0.0)];
+        assert_eq!(pick_vantage(&spots, 0, VANTAGE_TRIES, |_| false), None, "no view anywhere → None");
+        // Only spot 2 is visible; a 2-try budget from start 0 never reaches it.
+        let sees = |eye: Vec3| eye.x > 150.0;
+        assert_eq!(pick_vantage(&spots, 0, 2, sees), None, "try budget caps the scan window");
+        assert_eq!(pick_vantage(&spots, 0, 3, sees), Some(spots[2]), "a wider budget finds it");
+        assert_eq!(pick_vantage(&[], 0, VANTAGE_TRIES, |_| true), None, "no spots → None");
+    }
+
+    #[test]
+    fn watch_prefers_nearest_visible() {
+        let a = EntId(3);
+        let b = EntId(4);
+        let c = EntId(5);
+        // b is nearer than a but hidden; a (visible, farther) wins over the hidden nearer one.
+        let cands = [(a, 300.0, true), (b, 100.0, false), (c, 500.0, true)];
+        assert_eq!(pick_watch(&cands), Some(a), "nearest *visible*, skipping the hidden nearer fighter");
+        assert_eq!(pick_watch(&[(a, 100.0, false), (b, 200.0, false)]), None, "all hidden → drop the watch");
+        assert_eq!(pick_watch(&[]), None, "no fighters → None");
+    }
 }

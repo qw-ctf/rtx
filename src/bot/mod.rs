@@ -28,7 +28,7 @@ mod vigil;
 
 use crate::bot::state::{BotState, GrenadePhase, HookPhase, RjPhase};
 use crate::defs::{
-    Bits, Flags, Items, Solid, Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP,
+    Bits, Flags, Items, Solid, Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP, VEC_VIEW_OFS,
 };
 use crate::entity::{EntId, Entity, Touch};
 use crate::game::{cstring, GameState};
@@ -328,6 +328,9 @@ struct Objective {
     target_origin: Vec3,
     /// The navmesh cell of the item goal, when chasing one (skips a `nearest` lookup).
     item_cell: Option<CellId>,
+    /// Fighter eye point an arena audience bot holds its eyes on (a `Spectate` intent); `None`
+    /// otherwise, leaving the eyes on the walk corridor.
+    watch_point: Option<Vec3>,
 }
 
 /// Resolve what this bot pursues this frame: reconcile a stale hook, ask the mode for an intent
@@ -559,8 +562,10 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
             |o| format!("H{:.0}/A{:.0} ars={:03x}", o.health, o.armor_value, o.items as u32),
         );
         let vig = vigil.is_some() as i32;
+        // Arena spectating: which fighter (edict) this bot is watching, `0` = none.
+        let wat = if let Some(BotIntent::Spectate { watch, .. }) = intent { watch.0 } else { 0 };
         let msg = cstring(&format!(
-            "rtx bot{client}: want={goal} dist={dist:.0} on_item={overlap} ownLG={own_lg} cells={:.0} pen={pen} aware={aware} est={est} hold={hold} vig={vig}\n",
+            "rtx bot{client}: want={goal} dist={dist:.0} on_item={overlap} ownLG={own_lg} cells={:.0} pen={pen} aware={aware} est={est} hold={hold} vig={vig} watch={wat}\n",
             game.entities[e].v.ammo_cells,
         ));
         host.conprint(&msg); // conprint always shows; dprint needs `developer 1`
@@ -590,6 +595,8 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         // last-seen spot, so the bot searches where they went instead of tracking through walls.
         Some(BotIntent::Fight(en)) => (combat_last_seen.unwrap_or(game.entities[en].v.origin), None),
         Some(BotIntent::Move(pos)) => (pos, None),
+        // Spectate navigates exactly like Move; the watched fighter only redirects the eyes (below).
+        Some(BotIntent::Spectate { goal, .. }) => (goal, None),
         None if chasing => vigil.unwrap_or(goal_item_org),
         None => {
             if let Some(h) = nearest_human(game, e) {
@@ -620,7 +627,15 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         b.goal_select_time = now; // re-pick (skipping the abandoned item) next frame
     }
 
-    Objective { hooking, on_sj, on_rj, enemy, chasing, vigil: vigil.is_some(), target_origin, item_cell }
+    // Audience watch (arena Spectate): snapshot the chosen fighter's eye point so the look override
+    // in `run_bot` — deep inside the `&mut bot` / `&nav` borrow — can point the eyes there without
+    // re-reading another entity. `None` for every other intent leaves the eyes on the corridor.
+    let watch_point = match intent {
+        Some(BotIntent::Spectate { watch, .. }) => Some(game.entities[watch].v.origin + VEC_VIEW_OFS),
+        _ => None,
+    };
+
+    Objective { hooking, on_sj, on_rj, enemy, chasing, vigil: vigil.is_some(), target_origin, item_cell, watch_point }
 }
 
 /// Turn the frame's accumulated decisions into the engine usercmd. Bunnyhopping bypasses the aim
@@ -792,7 +807,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
 
     let idle = |angles: Vec3| host.set_bot_cmd(client, msec, angles, 0, 0, 0, 0, 0);
 
-    let Objective { hooking, on_sj, on_rj, enemy, chasing, vigil, target_origin, item_cell } =
+    let Objective { hooking, on_sj, on_rj, enemy, chasing, vigil, target_origin, item_cell, watch_point } =
         resolve_objective(game, e, now, origin, client);
 
     // Whether weapons may fire right now (a match-mode countdown locks them out). Read before the nav
@@ -1109,6 +1124,9 @@ fn run_bot(game: &mut GameState, e: EntId) {
         || combat_view
         || hook_active
         || rj_active
+        // Spectating: a bhop cmd would overwrite the view yaw in `emit` and clobber the watch —
+        // and a spectator strolling the stands shouldn't be bunnyhopping anyway.
+        || watch_point.is_some()
         || bot.gate.is_some()
         || bot.grenade_phase != GrenadePhase::Idle;
     let bhop_entry = !final_leg
@@ -1335,6 +1353,18 @@ fn run_bot(game: &mut GameState, e: EntId) {
                 d.y.atan2(d.x).to_degrees(),
                 0.0,
             );
+        }
+    }
+    // Audience watch (arena Spectate): eyes on the fighter the mode chose — already LOS-validated
+    // there and held ~1-2s. Post-hoc like the hook/rj overrides, so bhop steering and the route
+    // look-ahead stay untouched; the aim spring in `emit` turns it into a human pan and perception
+    // follows through `bot.aim`. Same 48u degenerate-angle guard as the nav look. Audience bots
+    // have no grapple/RL, so the hook/rj guard is belt-and-braces.
+    if !hook_engaged && !rj_engaged {
+        if let Some(t) = watch_point {
+            if (t - eye).xy().length() > 48.0 {
+                look = combat::angles_to(eye, t);
+            }
         }
     }
 

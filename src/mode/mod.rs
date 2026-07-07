@@ -110,6 +110,10 @@ pub(crate) enum BotIntent {
     Fight(EntId),
     /// Roam toward this world position without fighting (e.g. an arena audience member).
     Move(Vec3),
+    /// Roam toward `goal` while keeping the eyes on `watch` — an arena audience member spectating
+    /// the live fighters. Navigation is exactly [`Move`](BotIntent::Move)`(goal)`; only the look is
+    /// redirected (a post-hoc override in `run_bot`), so movement and bunnyhop steering are untouched.
+    Spectate { goal: Vec3, watch: EntId },
 }
 
 /// How a mode shapes one hit's effect on a player (see [`GameMode::player_damage`]). `health` is

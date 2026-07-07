@@ -106,6 +106,11 @@ pub struct BotState {
     /// Only used while the mode marks this bot as an audience/spectator; zero otherwise.
     pub wander_target: Vec3,
     pub wander_time: f32,
+    /// Audience watch (Rocket Arena): the live fighter this bot's eyes are held on, and when to
+    /// re-pick (or retry after losing sight). Chosen and LOS-validated by the mode; `0` = nobody.
+    /// Held ~1-2s so the gaze doesn't ping-pong between duelists or flicker when sight blinks.
+    pub watch_ent: u32,
+    pub watch_time: f32,
     /// Item vigil ([`crate::bot::vigil`]): while waiting on an uncollectable goal item (mid-respawn,
     /// or a handoff-held weapon) the bot cruises a short walk away and scans the room. `vigil_post` is
     /// the current cruise spot (`ZERO` = none / heading back to the item) with its re-pick deadline;
