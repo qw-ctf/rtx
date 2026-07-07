@@ -224,6 +224,11 @@ pub struct GameState {
     /// empty (bots-only) server this stays clear and the normal frame drives the bots itself. See
     /// `start_frame`. Frame-based, not time-based, so it doesn't depend on the clock advancing.
     bot_frame_seen: bool,
+    /// Whether the current map has finished `GAME_LOADENTS` (worldspawn precaches + entity spawn).
+    /// Cleared at `GAME_INIT`, set at the end of `load_entities`. `start_frame` no-ops until it's set
+    /// so nothing spawns a player/bot — whose `PutClientInServer` does `setmodel("progs/eyes.mdl")` —
+    /// before worldspawn has precached that model, which the engine rejects fatally ("no precache").
+    map_spawned: bool,
     /// One-shot: whether we've logged that the normal frame is driving the bots (diagnostic).
     normal_bot_drive_logged: bool,
     /// Escape hatch for string-declared sounds (precache-and-intern at load time). Empty for the
@@ -282,6 +287,7 @@ impl GameState {
             nav: navmesh::NavState::default(),
             opponents: bot::model::OpponentModel::default(),
             bot_frame_seen: false,
+            map_spawned: false,
             normal_bot_drive_logged: false,
             dyn_assets: DynAssets::default(),
         }
@@ -512,6 +518,11 @@ impl GameState {
         // matching how ktx re-runs `G_InitExtensions` each `GAME_INIT`.
         self.ext_fields = ext_field::ExtFields::default();
 
+        // Not spawned until `load_entities` (worldspawn) has re-issued this map's precaches. Guards
+        // `start_frame` from spawning any player/bot — whose `setmodel("progs/eyes.mdl")` would hit
+        // the engine's fatal "no precache" — before the model is precached on the new map.
+        self.map_spawned = false;
+
         // Retire the previous map's bots. The map change that precedes this `GAME_INIT` runs the
         // engine's `SV_SpawnServer`, which *frees every bot client* (clearing its `isBot`) but — by
         // design — does **not** run our `ClientDisconnect` for them. Our `GameState` is process-global
@@ -571,11 +582,19 @@ impl GameState {
             self.spawn_entity(&fields);
             self.host.flush_signon();
         }
+        // Precaches issued and entities spawned — frames may now spawn players/bots safely.
+        self.map_spawned = true;
         1
     }
 
     /// `GAME_START_FRAME` — once per server frame. `is_bot_frame` runs only bot logic.
     fn start_frame(&mut self, _level_time: i32, is_bot_frame: i32) -> isize {
+        // A frame before `load_entities` has run (worldspawn precaches) must not spawn anything — the
+        // arena round machine and bot population both reach `PutClientInServer` → `setmodel(eyes)`,
+        // which the engine rejects fatally until eyes is precached on this map. Wait for spawn.
+        if !self.map_spawned {
+            return 1;
+        }
         if is_bot_frame == 0 {
             world::start_frame(self);
             // Auto-advance a configured map rotation past the intermission scoreboard.
