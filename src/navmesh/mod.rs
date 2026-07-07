@@ -453,12 +453,15 @@ impl NavGraph {
 
     /// Jump links out of `from`: only from a **ledge edge** (the adjacent column toward the
     /// target has no walkable ground, i.e. a gap/pit), within run-jump reach and apex, with a
-    /// clear arc. Deduped to the single nearest target per compass octant so a ledge sprouts a
-    /// handful of jumps, not hundreds of redundant parallel ones.
+    /// clear arc. Deduped to the single nearest target per (compass octant, elevation band) so a
+    /// ledge sprouts a handful of jumps, not hundreds of redundant parallel ones — banded by
+    /// elevation because targets a storey apart are distinct destinations: without the band, a
+    /// short descending jump into the pit under a gap shadows the level jump *across* it onto a
+    /// separate ledge, and the pit floor doesn't lead back up to that ledge.
     fn find_jumps(&self, bsp: &Bsp, from: CellId) -> Vec<Link> {
         let a = self.cells[from as usize];
-        // best (distance, link) per compass direction bucket (3×3, center unused)
-        let mut best: [Option<(f32, Link)>; 9] = Default::default();
+        // best (distance, link) per compass direction bucket (3×3, center unused) × elevation band
+        let mut best = [[None::<(f32, Link)>; JUMP_ELEV_BANDS]; 9];
         for to in self.neighbors_within(a.gx, a.gy, jump_grid_radius()) {
             let b = self.cells[to as usize];
             let (dgx, dgy) = (b.gx - a.gx, b.gy - a.gy);
@@ -480,9 +483,9 @@ impl NavGraph {
             if !arc_clear(bsp, a.origin, b.origin) {
                 continue;
             }
-            let oct = dir_bucket(dgx, dgy);
-            if best[oct].is_none_or(|(d, _)| horiz < d) {
-                best[oct] = Some((
+            let slot = &mut best[dir_bucket(dgx, dgy)][jump_elev_band(dz)];
+            if slot.is_none_or(|(d, _)| horiz < d) {
+                *slot = Some((
                     horiz,
                     Link {
                         from,
@@ -493,7 +496,7 @@ impl NavGraph {
                 ));
             }
         }
-        best.into_iter().flatten().map(|(_, l)| l).collect()
+        best.into_iter().flatten().flatten().map(|(_, l)| l).collect()
     }
 
     /// Splice **double-jump** links: gaps/ledges beyond a single jump's reach but within a double
@@ -1445,6 +1448,22 @@ fn double_jump_grid_radius() -> i32 {
 /// dedup. Distinct for all 8 surrounding directions — opposite directions never collide.
 fn dir_bucket(dgx: i32, dgy: i32) -> usize {
     ((dgx.signum() + 1) + (dgy.signum() + 1) * 3) as usize
+}
+
+/// Height span of one jump-dedup elevation band — one "storey", matching the hook pass's 128u
+/// elevation banding. Same-octant targets within a band are true duplicates (land on the nearer,
+/// walk on); a band apart they are distinct destinations that must not shadow each other.
+const JUMP_ELEV_SPAN: f32 = 128.0;
+/// Band indices a jump target can occupy: `round(dz / JUMP_ELEV_SPAN)` over the jump's dz gate
+/// `[-MAX_DROP, JUMP_APEX]` = `[-240, 45]` gives `{-2, -1, 0}`.
+const JUMP_ELEV_BANDS: usize = 3;
+
+/// Elevation band of a jump target's height delta, as an index into `0..JUMP_ELEV_BANDS`.
+/// `round`, not `floor`, so band 0 is centred on "level with the takeoff": a −16u ledge-to-ledge
+/// crossing and a −128u drop to the pit floor under it must land in different bands (with
+/// `floor` both would hit band −1 and the nearer pit drop would win the dedup).
+fn jump_elev_band(dz: f32) -> usize {
+    (((dz / JUMP_ELEV_SPAN).round() as i32) + 2).clamp(0, JUMP_ELEV_BANDS as i32 - 1) as usize
 }
 
 /// Per-map navigation state, reset each map load. Lives on `GameState`.

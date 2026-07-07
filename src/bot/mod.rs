@@ -1736,65 +1736,85 @@ mod tests {
         );
     }
 
-    /// Bravado quad **reachability gap** (env-gated on `RTX_TEST_BSP=…/bravado.bsp`; vacuously green
-    /// when unset). The quad platform is reached in-game by a jump / double-jump / rocket-jump onto
-    /// it, but nav-build currently builds *no inbound climb link* onto that platform — so from most
-    /// of the map the routing flood can't reach it and bots never take the quad. This test measures
-    /// and prints the gap (a regression guard for the nav-build fix that adds the inbound link); it
-    /// asserts only what holds today: the quad has a nav cell and the broader upper level is reachable.
+    /// On bravado, the quad platform must be broadly reachable. Regression for jump-link octant
+    /// dedup: the platform is an island whose only inbound route is a level ~192u jump from a
+    /// nearby ledge, and the nearest-per-octant dedup let a short descending jump into the pit
+    /// below shadow that crossing — leaving the island with zero inbound climb links, so bots
+    /// never went for the quad. Run with `RTX_TEST_BSP=…/bravado.bsp`; skipped (vacuously green)
+    /// when unset or when the map isn't bravado.
     #[test]
     fn bravado_quad_reachability() {
         let Ok(path) = std::env::var("RTX_TEST_BSP") else {
             return;
         };
+        if !path.to_lowercase().contains("bravado") {
+            return; // map-specific geometry — other RTX_TEST_BSP maps can't run it
+        }
         let bytes = std::fs::read(&path).expect("read bsp");
         let bsp = Bsp::parse(&bytes).expect("parse bsp");
         let graph = NavGraph::build(&bsp);
-        let n = graph.cells.len();
-        // Quad spawn from the bravado entity lump: item_artifact_super_damage "752 24 288".
-        let quad_origin = Vec3::new(752.0, 24.0, 288.0);
-        let quad_cell = graph.nearest(quad_origin).expect("quad spawn has a nav cell");
+        let quad = graph.nearest(Vec3::new(752.0, 24.0, 288.0)).expect("no cell near the quad");
 
-        // How many cells can route TO the quad (inbound reachability), and to the broader upper level.
-        let reaches = |target: CellId| {
-            (0..n as u32)
-                .filter(|&c| graph.costs_from(c, &LinkCosts::default())[target as usize].is_finite())
-                .count()
-        };
-        let to_quad = reaches(quad_cell);
-        let upper: Vec<u32> = (0..n as u32).filter(|&i| graph.cell_origin(i).z >= 260.0).collect();
-        let to_upper = (0..n as u32)
-            .filter(|&c| {
-                let costs = graph.costs_from(c, &LinkCosts::default());
-                upper.iter().any(|&u| costs[u as usize].is_finite())
-            })
-            .count();
-        // Inbound climb links (from a lower cell) onto the quad platform, by kind.
-        let plat: std::collections::HashSet<u32> = (0..n as u32)
-            .filter(|&i| {
-                let o = graph.cell_origin(i);
-                (o - graph.cell_origin(quad_cell)).length() <= 96.0
-            })
-            .collect();
-        let climb_in = (0..graph.links.len() as u32)
-            .filter(|&li| {
-                plat.contains(&graph.link_target(li))
-                    && graph.cell_origin(graph.link_source(li)).z
-                        < graph.cell_origin(graph.link_target(li)).z - 8.0
+        // The platform proper: the walk/step-connected plateau containing the quad cell (jump
+        // links excluded, so the launch ledge across the void doesn't count as "on it").
+        let mut on_platform = vec![false; graph.cells.len()];
+        let mut stack = vec![quad];
+        on_platform[quad as usize] = true;
+        while let Some(c) = stack.pop() {
+            for l in &graph.links {
+                let walkish = matches!(l.kind, LinkKind::Walk | LinkKind::Step);
+                for (a, b) in [(l.from, l.to), (l.to, l.from)] {
+                    if walkish && a == c && !on_platform[b as usize] {
+                        on_platform[b as usize] = true;
+                        stack.push(b);
+                    }
+                }
+            }
+        }
+
+        // Directed reachability *to* the quad: reverse flood over links.
+        let mut reaches = vec![false; graph.cells.len()];
+        let mut stack = vec![quad];
+        reaches[quad as usize] = true;
+        while let Some(c) = stack.pop() {
+            for l in &graph.links {
+                if l.to == c && !reaches[l.from as usize] {
+                    reaches[l.from as usize] = true;
+                    stack.push(l.from);
+                }
+            }
+        }
+        let reachable = reaches.iter().filter(|&&r| r).count();
+
+        // Inbound climb links: non-drop links landing on the platform from off it.
+        let climbs = graph
+            .links
+            .iter()
+            .filter(|l| {
+                on_platform[l.to as usize]
+                    && !on_platform[l.from as usize]
+                    && !matches!(l.kind, LinkKind::Drop)
             })
             .count();
         eprintln!(
-            "bravado quad: {n} cells; reachable IN from {to_quad}/{n} (upper level {to_upper}/{n}); \
-             inbound climb links onto platform = {climb_in}"
+            "quad platform: {} cells; reachable IN from {reachable}/{} cells; \
+             inbound climb links onto platform = {climbs}",
+            on_platform.iter().filter(|&&p| p).count(),
+            graph.cells.len(),
         );
-        // Invariants that hold today (the reachability fix will additionally lift `to_quad`).
-        assert!(to_upper > n / 2, "upper level unreachable — mesh broken, not just the quad");
-        // The known gap, documented so the fix has a clear before/after (do not let it regress worse).
-        if climb_in == 0 {
-            eprintln!("  KNOWN GAP: no inbound climb link onto the quad platform — bots cannot route to the quad");
-        }
+        assert!(climbs >= 1, "no inbound climb link onto the quad platform");
+        assert!(
+            reachable * 2 > graph.cells.len(),
+            "quad reachable from only {reachable}/{} cells",
+            graph.cells.len()
+        );
     }
 
+    /// On a real map, traversal routes must expose usable bhop runways. Regression for the grid
+    /// staircase: cell centres sit on a 32u grid, so any route heading between grid axes zigzags
+    /// (segments alternating 0°/45°), and a naive per-segment bend test reads that as a constant
+    /// sharp turn — truncating every runway to nothing and keeping bhop permanently off in play.
+    /// Run with `RTX_TEST_BSP=…/dm6.bsp`; skipped (vacuously green) when unset.
     #[test]
     fn air_commit_lifecycle() {
         // Airborne on the jump leg, within the arc window → stay committed.
