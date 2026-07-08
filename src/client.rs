@@ -240,6 +240,17 @@ impl GameState {
             }
             mode.apply_loadout(self, player);
         }
+        // rtx_weapons: a disabled weapon is never carried — mask it out of the granted kit (decoded
+        // parms, the grapple grant, and the mode loadout, all applied above) and re-pick if the
+        // currently-held weapon just got stripped. Only weapon bits are touched; ammo/armor/powerups
+        // are left alone.
+        let disabled = crate::arsenal::all_weapon_bits().difference(self.enabled_weapon_mask());
+        self.entities[player].v.items = self.entities[player].v.items.without(disabled);
+        let held = self.entities[player].v.weapon;
+        if held != Weapon::None && !self.entities[player].v.items.has(held.item()) {
+            let best = self.w_best_weapon(player);
+            self.entities[player].v.weapon = best;
+        }
         self.w_set_current_ammo(player);
 
         // Opponent modeling: a (re)spawn hands out a fresh loadout, so reset every side's hypothesis

@@ -44,6 +44,7 @@ the old looping chain rattle.
 | cvar | default | what it does |
 |------|---------|--------------|
 | `rtx_grapple` | `1` | Every player **spawns holding** a grappling hook (no ammo). Fire to throw it; the hook sticks to walls — or players, who get dragged and lightly damaged — and reels you toward it while you hold fire (a moving anchor carries you along). Select it with **impulse 22** or by **double-tapping impulse 1** (toggles axe ↔ hook). `0` disables it. |
+| `rtx_weapons` | `axe hook sg ssg ng sng gl rl lg` | The weapons the server runs with, as a space-separated token list (`axe`, `hook`, `sg`, `ssg`, `ng`, `sng`, `gl`, `rl`, `lg`). A weapon **absent from the list is removed everywhere**: its map pickup (`weapon_*`) never spawns and it's stripped from every spawn kit, so it can't be picked up or fired (bots included). Set e.g. `rtx_weapons "axe sg rl"` for a rockets-first server. Unknown tokens (e.g. `coil`) are ignored; `hook` composes with `rtx_grapple` (both must allow it). Map pickups update on the next **map load**, spawn kits on the next **respawn**. |
 
 Throw and reel speeds are tunable via `rtx_hook_speed` (default `1.25`) and `rtx_hook_pull`
 (default `1.0`) — purectf's `hookspeed`/`hookpull`, each a multiplier on its base speed.
@@ -68,7 +69,6 @@ mode doesn't touch the generic gameplay or bot code.
 | `rtx_mode` | `dm` | Ruleset: `dm` = deathmatch (stock behaviour). `ra` = Rocket Arena. `midair` = airborne-only rocket DM. `ctf` = Capture the Flag. `race` = timed KTX race routes (bhop/speed-jump harness). |
 | `rtx_match` | *(auto)* | Composition, orthogonal to the mode. Empty = the mode's natural default (dm → open FFA, ctf → open 2-team pickup, midair → 1on1 duel). `ffa` = open free-for-all. A **team format** (`1on1`/`duel`, `2on2`, `2on2on2`, any `NonM…`) = a locked N×M match. Ignored by `ra`; CTF clamps it to 2 teams. |
 | `rtx_ra_countdown` | `3` | Rocket Arena: seconds of spawn-protected countdown before "FIGHT". |
-| `rtx_ra_lightning_gun` | `0` | Rocket Arena: include the lightning gun in the arena arsenal (`0` leaves it out). |
 | `rtx_midair_minheight` | `40` | Midair: minimum height (units) above the floor for a victim to count as airborne. |
 | `rtx_midair_kb_ground` / `rtx_midair_kb_air` | `6` / `3` | Midair: rocket knockback multipliers for grounded vs airborne victims (ground is stronger, to launch players up). |
 | `rtx_match_countdown` | `3` | Team match (`rtx_match` format) / CTF: seconds of spawn-protected countdown after the match-start map reload before "FIGHT". |

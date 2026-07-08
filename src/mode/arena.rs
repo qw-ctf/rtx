@@ -140,9 +140,9 @@ impl GameMode for Arena {
             super::audience_loadout(g, e);
             return;
         }
-        // The lightning gun is off by default (rtx_ra_lightning_gun 0) — a rockets-first arena.
-        let lightning = g.host().cvar_bool(c"rtx_ra_lightning_gun");
-        // Full arsenal + full ammo + red armor, mirroring arena.qc:a_newitems defaults.
+        // A rockets-first arena: the full arsenal minus the lightning gun (no cells), mirroring
+        // arena.qc:a_newitems defaults. Weapons the server disables via `rtx_weapons` are stripped
+        // afterward in put_client_in_server, so this is only the arena's own baseline.
         let arsenal = Items::AXE
             | Items::SHOTGUN
             | Items::SUPER_SHOTGUN
@@ -151,7 +151,6 @@ impl GameMode for Arena {
             | Items::GRENADE_LAUNCHER
             | Items::ROCKET_LAUNCHER
             | Items::ARMOR3;
-        let arsenal = if lightning { arsenal | Items::LIGHTNING } else { arsenal };
         let v = &mut g.entities[e].v;
         v.items = arsenal.as_f32();
         v.health = 100.0;
@@ -161,7 +160,7 @@ impl GameMode for Arena {
         v.ammo_shells = 250.0;
         v.ammo_nails = 250.0;
         v.ammo_rockets = 200.0;
-        v.ammo_cells = if lightning { 200.0 } else { 0.0 };
+        v.ammo_cells = 0.0;
         v.weapon = Weapon::RocketLauncher;
     }
 

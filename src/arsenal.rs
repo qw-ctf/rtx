@@ -24,6 +24,8 @@ pub(crate) enum AmmoKind {
 pub(crate) struct WeaponSpec {
     /// The `Items` ownership bit (and the `.weapon` selection value).
     pub item: Items,
+    /// Short console token for the `rtx_weapons` enable-list (e.g. `"rl"`, `"lg"`, `"hook"`).
+    pub token: &'static str,
     /// Map pickup classname (`None` for the axe/shotgun starting kit and the rtx grapple).
     pub classname: Option<&'static str>,
     /// World pickup model (`None` when not a map pickup).
@@ -57,6 +59,7 @@ pub(crate) struct WeaponSpec {
 pub(crate) const WEAPON_SPECS: &[WeaponSpec] = &[
     WeaponSpec {
         item: Items::AXE,
+        token: "axe",
         classname: None,
         pickup_model: None,
         pickup_name: "Axe",
@@ -72,6 +75,7 @@ pub(crate) const WEAPON_SPECS: &[WeaponSpec] = &[
     },
     WeaponSpec {
         item: Items::SHOTGUN,
+        token: "sg",
         classname: None,
         pickup_model: None,
         pickup_name: "Shotgun",
@@ -87,6 +91,7 @@ pub(crate) const WEAPON_SPECS: &[WeaponSpec] = &[
     },
     WeaponSpec {
         item: Items::SUPER_SHOTGUN,
+        token: "ssg",
         classname: Some("weapon_supershotgun"),
         pickup_model: Some(Model::PROGS_G_SHOT),
         pickup_name: "Double-barrelled Shotgun",
@@ -102,6 +107,7 @@ pub(crate) const WEAPON_SPECS: &[WeaponSpec] = &[
     },
     WeaponSpec {
         item: Items::NAILGUN,
+        token: "ng",
         classname: Some("weapon_nailgun"),
         pickup_model: Some(Model::PROGS_G_NAIL),
         pickup_name: "nailgun",
@@ -117,6 +123,7 @@ pub(crate) const WEAPON_SPECS: &[WeaponSpec] = &[
     },
     WeaponSpec {
         item: Items::SUPER_NAILGUN,
+        token: "sng",
         classname: Some("weapon_supernailgun"),
         pickup_model: Some(Model::PROGS_G_NAIL2),
         pickup_name: "Super Nailgun",
@@ -132,6 +139,7 @@ pub(crate) const WEAPON_SPECS: &[WeaponSpec] = &[
     },
     WeaponSpec {
         item: Items::GRENADE_LAUNCHER,
+        token: "gl",
         classname: Some("weapon_grenadelauncher"),
         pickup_model: Some(Model::PROGS_G_ROCK),
         pickup_name: "Grenade Launcher",
@@ -147,6 +155,7 @@ pub(crate) const WEAPON_SPECS: &[WeaponSpec] = &[
     },
     WeaponSpec {
         item: Items::ROCKET_LAUNCHER,
+        token: "rl",
         classname: Some("weapon_rocketlauncher"),
         pickup_model: Some(Model::PROGS_G_ROCK2),
         pickup_name: "Rocket Launcher",
@@ -162,6 +171,7 @@ pub(crate) const WEAPON_SPECS: &[WeaponSpec] = &[
     },
     WeaponSpec {
         item: Items::LIGHTNING,
+        token: "lg",
         classname: Some("weapon_lightning"),
         pickup_model: Some(Model::PROGS_G_LIGHT),
         pickup_name: "Thunderbolt",
@@ -179,6 +189,7 @@ pub(crate) const WEAPON_SPECS: &[WeaponSpec] = &[
     // selected by impulse, so it has no `classname`/pickup. Uses the hook viewmodel and no ammo.
     WeaponSpec {
         item: Items::GRAPPLE,
+        token: "hook",
         classname: None,
         pickup_model: None,
         pickup_name: "Grappling Hook",
@@ -202,6 +213,21 @@ pub(crate) fn weapon_spec(item: Items) -> Option<&'static WeaponSpec> {
 /// The spec for a map pickup classname (`weapon_*`), if any.
 pub(crate) fn weapon_spec_for_classname(classname: &str) -> Option<&'static WeaponSpec> {
     WEAPON_SPECS.iter().find(|spec| spec.classname == Some(classname))
+}
+
+/// Every weapon ownership bit (axe, both shotguns, both nailguns, GL, RL, LG, grapple) as one mask
+/// — the bits `rtx_weapons` filters. Non-weapon `Items` (ammo, armor, powerups, keys) are excluded.
+pub(crate) fn all_weapon_bits() -> Items {
+    WEAPON_SPECS.iter().fold(Items::empty(), |mask, spec| mask | spec.item)
+}
+
+/// Parse an `rtx_weapons` token list (e.g. `"axe hook sg rl lg"`) into the mask of enabled weapon
+/// [`Items`] bits. Unknown tokens (a not-yet-existing `"coil"`, typos) are silently ignored, so the
+/// list stays forward-compatible with weapons added later.
+pub(crate) fn enabled_weapons(list: &str) -> Items {
+    list.split_whitespace()
+        .filter_map(|tok| WEAPON_SPECS.iter().find(|spec| spec.token == tok))
+        .fold(Items::empty(), |mask, spec| mask | spec.item)
 }
 
 /// Current amount held in an ammo pool.
@@ -243,6 +269,19 @@ mod tests {
         for (item, min) in expect {
             assert_eq!(weapon_spec(item).unwrap().min_ammo, min, "min_ammo for {item:?}");
         }
+    }
+
+    /// `rtx_weapons` token parsing: known tokens fold into their `Items` bits, unknown tokens
+    /// (e.g. a not-yet-existing "coil") are ignored, and an empty list enables nothing.
+    #[test]
+    fn enabled_weapons_parses_tokens() {
+        assert_eq!(enabled_weapons("rl lg"), Items::ROCKET_LAUNCHER | Items::LIGHTNING);
+        assert_eq!(enabled_weapons("hook"), Items::GRAPPLE);
+        // Unknown tokens are dropped; known ones still register.
+        assert_eq!(enabled_weapons("coil rl plasma"), Items::ROCKET_LAUNCHER);
+        assert_eq!(enabled_weapons(""), Items::empty());
+        // The default roster enables exactly the full weapon set.
+        assert_eq!(enabled_weapons("axe hook sg ssg ng sng gl rl lg"), all_weapon_bits());
     }
 
     /// Pins `W_BestWeapon`'s auto-pick order: Lightning, Super Nailgun, Super Shotgun, Nailgun,

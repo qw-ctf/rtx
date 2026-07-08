@@ -73,6 +73,12 @@ const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // scaling its base `× sv_maxspeed`. Defaults match purectf's shipped server.cfg.
         ("rtx_hook_speed", Float(1.25)),
         ("rtx_hook_pull", Float(1.0)),
+        // Enabled weapons: a space-separated list of weapon tokens the server runs with —
+        // `axe hook sg ssg ng sng gl rl lg` (the full roster, the default = no change). A weapon
+        // whose token is absent is removed everywhere: its map pickup (`weapon_*`) is dropped at map
+        // load and it's stripped from every spawn kit (so it can never be picked up or fired).
+        // Unknown tokens are ignored. `hook` composes with `rtx_grapple` (both must allow it).
+        ("rtx_weapons", Str("axe hook sg ssg ng sng gl rl lg")),
         // Game mode (ruleset): `dm` (deathmatch, the default), `ra` (Rocket Arena), `midair`, or
         // `ctf`. Read live each frame. A string cvar. See `crate::mode`.
         ("rtx_mode", Str("dm")),
@@ -86,8 +92,6 @@ const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         ("rtx_match", Str("")),
         // Rocket Arena: seconds of spawn-protected countdown before "FIGHT". (Always a 1v1 duel.)
         ("rtx_ra_countdown", Float(3.0)),
-        // Rocket Arena: include the lightning gun in the arena arsenal (off = leave it out).
-        ("rtx_ra_lightning_gun", Bool(false)),
         // Team match (`rtx_match 1on1`/`2on2`/…): seconds of spawn-protected countdown after the
         // match-start map reload before "FIGHT".
         ("rtx_match_countdown", Float(3.0)),
@@ -697,6 +701,14 @@ impl GameState {
     pub(crate) fn free(&mut self, id: EntId) {
         self.entities[id].in_use = false;
         self.host.remove(id);
+    }
+
+    /// The mask of weapons enabled by `rtx_weapons`. Read live; a weapon absent from it has no map
+    /// pickups (dropped at map load) and is stripped from every spawn kit (so it can't be fired).
+    pub(crate) fn enabled_weapon_mask(&self) -> defs::Items {
+        let mut buf = [0u8; 128];
+        let list = self.host.cvar_string(c"rtx_weapons", &mut buf);
+        crate::arsenal::enabled_weapons(list)
     }
 
     // --- entity access (index handles only; no references escape) ---

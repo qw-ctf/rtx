@@ -684,6 +684,11 @@ impl GameState {
         let Some(spec) = weapon_spec_for_classname(classname) else {
             return false;
         };
+        // rtx_weapons: a weapon absent from the enabled list has no map pickups. Returning false
+        // frees the slot via the spawn path, as CTF flags do outside CTF.
+        if !self.enabled_weapon_mask().contains(spec.item) {
+            return false;
+        }
         self.spawn_weapon(e, spec)
     }
 
