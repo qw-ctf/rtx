@@ -1261,6 +1261,15 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // Lenient continuation gate for taking *another* hop from a landing: leg kinds churn as the
     // route advances, and a run in progress shouldn't be dumped by the stricter entry conditions.
     let bhop_sustain = matches!(kind, Some(LinkKind::Walk | LinkKind::Step)) && goal_dist > 150.0;
+    // Ground zigzag: a corridor too short for a hop ([`bhop::RUNWAY_ENGAGE`]) but straight and long
+    // enough ([`bhop::ZIGZAG_ENGAGE`]) to gain speed from the circle-strafe alone. The controller
+    // hands off to the hop cycle if `bhop_entry` opens up mid-run, and `bhop_veto` (which includes
+    // `!rtx_bot_bhop`) still gates it, so this is purely a sub-toggle on the same controller.
+    let zigzag_ok = host.cvar_bool(c"rtx_bot_zigzag")
+        && matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
+        && !final_leg
+        && goal_dist > 150.0
+        && runway_dist >= bhop::ZIGZAG_ENGAGE;
     // A speed-jump leg is a *committed* bhop run-up + leap: engage bhop unconditionally (the link is a
     // pre-verified runway) and track it so the route stays frozen. Latch/clear `sj_leg` on the leg.
     let mut sj_active =
@@ -1346,6 +1355,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
                 bearing,
                 runway: bhop_runway,
                 eligible: bhop_entry,
+                zigzag: zigzag_ok,
                 sustain: bhop_sustain,
                 veto: bhop_veto,
                 committed: sj_active,

@@ -50,6 +50,16 @@ pub const RUNWAY_ENGAGE: f32 = 256.0;
 /// Slack beyond the current hop's flight distance when deciding whether another hop fits.
 const HOP_MARGIN: f32 = 64.0;
 
+/// Minimum corridor (≈3 grid cells) to bother with a ground zigzag: too short for a hop
+/// ([`RUNWAY_ENGAGE`]) but long and straight enough to profit from the circle-strafe. The caller
+/// gates on this; the controller just runs the strafe until the corridor bends or a hop fits.
+pub const ZIGZAG_ENGAGE: f32 = 96.0;
+/// Cap the weave band on a ground zigzag. The ground-optimal angle `θg = acos(u*/v)` grows toward
+/// ~55° near the friction equilibrium, and an uncapped serpentine sweeps too wide for a 3-cell
+/// corridor — clamp the deadband so the S-curve stays inside the walls. Launch prestrafe (which
+/// has a long runway by construction) is left uncapped.
+const ZIGZAG_BAND_CAP: f32 = 15.0;
+
 /// The most air speed a single tick can add along the wish direction: `accel · maxspeed · dt`. At any
 /// sane tickrate this exceeds [`AIR_CAP`], putting the optimum at a perpendicular strafe.
 pub fn air_accel_max(accel: f32, maxspeed: f32, dt: f32) -> f32 {
@@ -135,7 +145,7 @@ pub fn strafe(v_xy: Vec2, wp_bearing: f32, prev_sigma: f32, a_max: f32) -> Straf
 /// Unlike the air strafe the **view stays on the bearing** and the angle is expressed through the
 /// forward/side split instead (`wishvel = forward·fwd + side·right` rotates by `δ` exactly), so
 /// engaging/disengaging and sign flips never move the view — no snap, just a curving run.
-pub fn prestrafe(v_xy: Vec2, bearing: f32, prev_sigma: f32, a_g: f32, maxspeed: f32) -> Strafe {
+pub fn prestrafe(v_xy: Vec2, bearing: f32, prev_sigma: f32, a_g: f32, maxspeed: f32, band_cap: f32) -> Strafe {
     let speed = v_xy.length();
     // Below the angling threshold (or barely moving) there's nothing to exploit: run at the
     // bearing to build base speed. Also avoids steering off a garbage yaw from a ~zero velocity.
@@ -145,7 +155,7 @@ pub fn prestrafe(v_xy: Vec2, bearing: f32, prev_sigma: f32, a_g: f32, maxspeed: 
     }
     let vel_yaw = v_xy.y.atan2(v_xy.x).to_degrees();
     let err = wrap180(bearing - vel_yaw);
-    let sigma = weave_sigma(err, prev_sigma, weave_band(speed));
+    let sigma = weave_sigma(err, prev_sigma, weave_band(speed).min(band_cap));
     let theta_g = (u_star / speed).clamp(0.0, 1.0).acos().to_degrees();
     let delta = wrap180(vel_yaw + sigma * theta_g - bearing); // wish yaw relative to the view
     let (ds, dc) = delta.to_radians().sin_cos();
@@ -169,6 +179,10 @@ pub enum Phase {
     Prestrafe,
     /// The hop loop: air-strafing, and strafe+jump on each landing frame.
     Hop,
+    /// A standalone ground circle-strafe on a corridor too short to hop: gain toward the friction
+    /// equilibrium without leaving the ground, and hand off to [`Phase::Hop`] the moment a runway
+    /// opens. Same math as [`Phase::Prestrafe`] but with a capped weave band and no launch.
+    Zigzag,
 }
 
 /// Physics inputs the controller needs each frame, read from cvars by the caller.
@@ -194,6 +208,9 @@ pub struct Input {
     pub runway: f32,
     /// Entry conditions hold (leg kind, goal distance, runway ≥ [`RUNWAY_ENGAGE`]).
     pub eligible: bool,
+    /// A ground zigzag is worth running: a straight Walk/Step corridor ≥ [`ZIGZAG_ENGAGE`] but too
+    /// short to satisfy `eligible`. Ignored once a hop engages; superseded by `eligible`/`committed`.
+    pub zigzag: bool,
     /// Lenient conditions to take *another* hop from a landing (leg kind still ok, goal ahead).
     pub sustain: bool,
     /// Hard off — combat/hook/gate/grenade wants the view, or the cvar is off. The only thing
@@ -265,15 +282,37 @@ impl Bhop {
                 self.eligible_since = 0.0;
                 false
             };
-            if !engage {
+            if engage {
+                self.engage(i);
+            } else if i.zigzag && i.on_ground {
+                // No hop yet, but a short straight corridor is worth a ground circle-strafe.
+                self.enter_zigzag(i);
+            } else {
                 return None;
             }
-            self.engage(i);
         }
         let speed = i.v_xy.length();
         self.peak = self.peak.max(speed);
         let a_max = air_accel_max(env.accel, env.maxspeed, env.dt);
         let a_g = a_max; // same cap formula on the ground; only the addspeed limit differs
+
+        if self.phase == Phase::Zigzag {
+            // A real runway opened (or a SpeedJump leg committed): promote to the hop cycle,
+            // carrying the speed we built — `engage` picks Prestrafe vs Hop by speed/runway.
+            if i.eligible || i.committed {
+                self.engage(i);
+            } else if !i.zigzag {
+                // Corridor bent or ran out (`runway()` stops at bends), so corners exit cleanly.
+                self.disengage("zigzag");
+                return None;
+            } else if !i.on_ground {
+                // Tolerate the 1–2 airborne frames pmove yields stepping down a Step leg: hold the
+                // bearing rather than applying ground math mid-air or disengaging.
+                return Some(Cmd { view_yaw: i.bearing, forward: MOVE_SPEED, side: 0.0, jump: false });
+            } else {
+                return Some(self.ground_cmd(i, a_g, env.maxspeed, ZIGZAG_BAND_CAP));
+            }
+        }
 
         if self.phase == Phase::Prestrafe {
             let launch = !i.on_ground
@@ -281,7 +320,7 @@ impl Bhop {
                 || i.now - self.phase_start > PRESTRAFE_MAX_T
                 || i.runway < speed * T_HOP * 2.0 + HOP_MARGIN; // keep room to actually hop
             if !launch {
-                return Some(self.ground_cmd(i, a_g, env.maxspeed));
+                return Some(self.ground_cmd(i, a_g, env.maxspeed, f32::INFINITY));
             }
             self.phase = Phase::Hop;
             self.phase_start = i.now;
@@ -306,7 +345,7 @@ impl Bhop {
         }
         if i.hold_jump {
             // Too slow at the takeoff edge: keep gaining on the ground instead of leaping short.
-            return Some(self.ground_cmd(i, a_g, maxspeed));
+            return Some(self.ground_cmd(i, a_g, maxspeed, f32::INFINITY));
         }
         let jump = !self.jump_prev;
         self.jump_prev = jump;
@@ -316,14 +355,15 @@ impl Bhop {
             Some(Cmd { view_yaw: s.view_yaw, forward: s.forward, side: s.side, jump: true })
         } else {
             // The pulse-release frame after a press that didn't take: still gain on the ground.
-            Some(self.ground_cmd(i, a_g, maxspeed))
+            Some(self.ground_cmd(i, a_g, maxspeed, f32::INFINITY))
         }
     }
 
-    /// A prestrafe cmd, with sigma/flip bookkeeping.
-    fn ground_cmd(&mut self, i: &Input, a_g: f32, maxspeed: f32) -> Cmd {
+    /// A prestrafe cmd, with sigma/flip bookkeeping. `band_cap` clamps the weave deadband — `∞` for
+    /// the launch prestrafe (long runway), [`ZIGZAG_BAND_CAP`] for a tight zigzag corridor.
+    fn ground_cmd(&mut self, i: &Input, a_g: f32, maxspeed: f32, band_cap: f32) -> Cmd {
         self.jump_prev = false;
-        let s = self.weave(prestrafe(i.v_xy, i.bearing, self.sigma, a_g, maxspeed));
+        let s = self.weave(prestrafe(i.v_xy, i.bearing, self.sigma, a_g, maxspeed, band_cap));
         Cmd { view_yaw: s.view_yaw, forward: s.forward, side: s.side, jump: false }
     }
 
@@ -343,6 +383,18 @@ impl Bhop {
         } else {
             Phase::Hop
         };
+        self.phase_start = i.now;
+        self.sigma = 0.0;
+        self.jump_prev = false;
+        self.hops = 0;
+        self.flips = 0;
+        self.peak = 0.0;
+    }
+
+    /// Enter a standalone ground zigzag. Same bookkeeping reset as [`Self::engage`]; the phase is
+    /// held until a hop engages (`eligible`/`committed`) or the corridor bends (`!zigzag`).
+    fn enter_zigzag(&mut self, i: &Input) {
+        self.phase = Phase::Zigzag;
         self.phase_start = i.now;
         self.sigma = 0.0;
         self.jump_prev = false;
@@ -586,6 +638,7 @@ mod sim {
             bearing,
             runway,
             eligible: true,
+            zigzag: false,
             sustain: true,
             veto: false,
             committed: false,
@@ -597,6 +650,25 @@ mod sim {
     /// While the controller is Off, the bot runs at the bearing through the normal steering path.
     fn run_cmd(bearing: f32) -> Cmd {
         Cmd { view_yaw: bearing, forward: MOVE_SPEED, side: 0.0, jump: false }
+    }
+
+    /// An input with `eligible`/`zigzag`/`on_ground` under test control (the default `input` fixes
+    /// `eligible = true`, which would hop immediately and never exercise the zigzag phase).
+    #[allow(clippy::too_many_arguments)]
+    fn zz_input(v: Vec2, on_ground: bool, bearing: f32, runway: f32, eligible: bool, zigzag: bool, now: f32) -> Input {
+        Input {
+            v_xy: v,
+            on_ground,
+            bearing,
+            runway,
+            eligible,
+            zigzag,
+            sustain: true,
+            veto: false,
+            committed: false,
+            hold_jump: false,
+            now,
+        }
     }
 
     fn mean_heading(tail: &[Vec2]) -> f32 {
@@ -726,7 +798,7 @@ mod sim {
         let a_g = air_accel_max(ENV.accel, ENV.maxspeed, DT);
         let mut at_1s = 0.0;
         for f in 0..231 {
-            let s = prestrafe(v, 0.0, sigma, a_g, ENV.maxspeed);
+            let s = prestrafe(v, 0.0, sigma, a_g, ENV.maxspeed, f32::INFINITY);
             sigma = s.sigma;
             v = apply_friction(v, FRICTION, STOPSPEED, DT);
             let wishdir = wishdir_fs(s.view_yaw, s.forward, s.side);
@@ -738,5 +810,88 @@ mod sim {
         }
         assert!(at_1s >= 440.0, "only {at_1s} ups after 1s of prestrafe");
         assert!(v.length() < 520.0, "prestrafe equilibrium implausibly high: {}", v.length());
+    }
+
+    #[test]
+    fn zigzag_gains_past_maxspeed_in_short_corridor() {
+        // A corridor too short to hop (runway < RUNWAY_ENGAGE) but zigzag-eligible: the ground
+        // circle-strafe alone should push well past maxspeed while staying inside the corridor.
+        let mut w = World::grounded(320.0);
+        let mut b = Bhop::default();
+        let mut max_lat = 0.0f32;
+        for f in 0..116 {
+            // ~1.5s
+            let now = f as f32 * DT;
+            let cmd = b
+                .step(&zz_input(w.v, w.on_ground, 0.0, 180.0, false, true, now), &ENV)
+                .expect("zigzag should own the frame");
+            assert_eq!(b.phase, Phase::Zigzag, "left the zigzag phase at t={now}");
+            pm_frame(&mut w, &cmd, false);
+            max_lat = max_lat.max(w.pos.y.abs());
+        }
+        assert!(w.v.length() >= 430.0, "zigzag only reached {} ups in 1.5s", w.v.length());
+        assert!(max_lat <= 96.0, "zigzag swept {max_lat}u off the corridor centerline (band cap failed)");
+    }
+
+    #[test]
+    fn zigzag_hands_off_to_hop() {
+        // Start on a short corridor (zigzag only); after 1s the runway opens and the hop cycle
+        // takes over. The transition must go Zigzag -> Prestrafe/Hop directly — never through Off —
+        // and must not shed the speed the zigzag built.
+        let mut w = World::grounded(320.0);
+        let mut b = Bhop::default();
+        let mut saw_zigzag = false;
+        let mut engaged_yet = false;
+        for f in 0..770 {
+            let now = f as f32 * DT;
+            let eligible = now >= 1.0;
+            let runway = if eligible { 4096.0 } else { 180.0 };
+            let cmd = b
+                .step(&zz_input(w.v, w.on_ground, 0.0, runway, eligible, true, now), &ENV)
+                .expect("controller engaged the whole run");
+            if b.phase == Phase::Zigzag {
+                saw_zigzag = true;
+            }
+            if b.phase != Phase::Off {
+                engaged_yet = true;
+            }
+            assert!(!(engaged_yet && b.phase == Phase::Off), "fell back to Off at t={now}");
+            pm_frame(&mut w, &cmd, false);
+        }
+        assert!(saw_zigzag, "never entered the zigzag phase");
+        assert_eq!(b.phase, Phase::Hop, "never handed off to the hop cycle: {:?}", b.phase);
+        assert!(w.v.length() >= 430.0, "lost speed across the handoff: {} ups", w.v.length());
+    }
+
+    #[test]
+    fn zigzag_exits_on_bend() {
+        // Enter the zigzag, then the corridor bends (`runway()` returns `zigzag = false`): the next
+        // ground frame disengages cleanly rather than fighting the corner.
+        let mut b = Bhop::default();
+        let v = Vec2::new(400.0, 0.0);
+        let engaged = b.step(&zz_input(v, true, 0.0, 180.0, false, true, 0.0), &ENV);
+        assert!(engaged.is_some() && b.phase == Phase::Zigzag);
+        let bent = b.step(&zz_input(v, true, 0.0, 180.0, false, false, DT), &ENV);
+        assert!(bent.is_none(), "kept strafing past the bend");
+        assert_eq!(b.phase, Phase::Off);
+        assert_eq!(b.off_reason, "zigzag");
+    }
+
+    #[test]
+    fn zigzag_tolerates_air_frames() {
+        // A Step leg can yield a frame or two airborne; the zigzag must stay engaged (holding the
+        // bearing) rather than disengaging or applying ground math mid-air.
+        let mut b = Bhop::default();
+        let v = Vec2::new(400.0, 0.0);
+        assert!(b.step(&zz_input(v, true, 0.0, 180.0, false, true, 0.0), &ENV).is_some());
+        assert_eq!(b.phase, Phase::Zigzag);
+        for f in 1..=2 {
+            let now = f as f32 * DT;
+            let cmd = b
+                .step(&zz_input(v, false, 0.0, 180.0, false, true, now), &ENV)
+                .expect("stayed engaged through the air frame");
+            assert_eq!(b.phase, Phase::Zigzag, "disengaged on an air frame");
+            assert!(!cmd.jump && cmd.side == 0.0, "air frame should be a plain bearing-run");
+        }
     }
 }

@@ -58,6 +58,9 @@ const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         ("rtx_doublejump", Bool(true)),
         // Bots bunnyhop (air-strafe to build speed) on open stretches; on by default.
         ("rtx_bot_bhop", Bool(true)),
+        // Bots ground-zigzag (circle-strafe) on straight corridors too short to hop; on by default.
+        // A sub-toggle of the bhop controller — `rtx_bot_bhop 0` disables it regardless.
+        ("rtx_bot_zigzag", Bool(true)),
         // Wall jump (kick off a wall you jump into), on by default (`rtx_walljump 0` to disable).
         ("rtx_walljump", Bool(true)),
         // Elevator jump: a rising lift boosts your jump by `lift_speed * rtx_elevator_jump`. A
