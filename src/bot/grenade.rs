@@ -455,13 +455,19 @@ fn try_start(game: &mut GameState, e: EntId, en: EntId, origin: Vec3, now: f32) 
     if now < game.entities[e].bot.grenade_next_try || !host.cvar_bool(c"rtx_shootable_grenades") {
         return;
     }
-    let (items, ammo_rockets, health) = {
+    let (items, ammo_rockets, ammo_cells, health) = {
         let v = &game.entities[e].v;
-        (v.items, v.ammo_rockets, v.health)
+        (v.items, v.ammo_rockets, v.ammo_cells, v.health)
     };
     if !items.has(Items::GRENADE_LAUNCHER) || ammo_rockets < 1.0 || health < 50.0 {
         return;
     }
+    // Is the GL the bot's *best* weapon (no fireable RL or LG)? Then the lob→shoot combo is the gun
+    // game, not a garnish — fire it freely below instead of throttling the plain airburst. (RL and
+    // GL share the rocket pool, so owning the RL with rockets in hand means it's fireable.)
+    let has_rl = items.has(Items::ROCKET_LAUNCHER) && ammo_rockets >= 1.0;
+    let has_lg = items.has(Items::LIGHTNING) && ammo_cells >= 1.0;
+    let gl_is_best = !has_rl && !has_lg;
     let e_org = game.entities[en].v.origin;
     let dist = (e_org - origin).length();
     if !(LOB_MIN_RANGE..=LOB_MAX_RANGE).contains(&dist) {
@@ -489,11 +495,15 @@ fn try_start(game: &mut GameState, e: EntId, en: EntId, origin: Vec3, now: f32) 
     let (target, shove_dir, shove_edge) = match enemy_hazard(game, en) {
         Some(h) => (e_feet - h.dir * SHOVE_OFFSET, h.dir, h.edge_dist),
         None => {
-            // Plain airburst: throttled so it seasons fights rather than replacing the gun game
-            // (skill-gated; low-skill bots don't bother). Land it at the enemy's feet.
-            let skill = host.cvar(c"rtx_bot_skill");
-            if skill < 3.0 || (now * 7.0 + e.0 as f32).sin() < 0.6 {
-                return;
+            // Plain airburst at the enemy's feet. Normally throttled so it seasons fights rather
+            // than replacing the gun game (skill-gated; low-skill bots don't bother) — but when the
+            // GL is the bot's best weapon (e.g. an `rtx_weapons "sg gl"` server) the combo *is* the
+            // gun game, so skip the throttle and lob→shoot as the primary attack.
+            if !gl_is_best {
+                let skill = host.cvar(c"rtx_bot_skill");
+                if skill < 3.0 || (now * 7.0 + e.0 as f32).sin() < 0.6 {
+                    return;
+                }
             }
             (e_feet, Vec3::ZERO, 0.0)
         }

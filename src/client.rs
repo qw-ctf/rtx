@@ -178,6 +178,29 @@ impl GameState {
         parms.apply_to(v);
     }
 
+    /// Strip weapons disabled by `rtx_weapons` from a just-equipped player, re-picking the held
+    /// weapon if it was one of them. Only weapon bits are touched; ammo/armor/powerups are left
+    /// alone. Shared by every loadout path — the spawn in [`Self::put_client_in_server`] and Rocket
+    /// Arena's winner-stays re-equip — so a disabled weapon can't slip through any of them.
+    pub(crate) fn filter_disabled_weapons(&mut self, e: EntId) {
+        let disabled = crate::arsenal::all_weapon_bits().difference(self.enabled_weapon_mask());
+        self.entities[e].v.items = self.entities[e].v.items.without(disabled);
+        let held = self.entities[e].v.weapon;
+        if held != Weapon::None && !self.entities[e].v.items.has(held.item()) {
+            // W_BestWeapon never auto-selects the explosives, so a player left with only a GL or RL
+            // would otherwise fall back to the axe. Prefer a fireable RL, then GL, before that.
+            let v = &self.entities[e].v;
+            let best = if v.items.has(Items::ROCKET_LAUNCHER) && v.ammo_rockets >= 1.0 {
+                Weapon::RocketLauncher
+            } else if v.items.has(Items::GRENADE_LAUNCHER) && v.ammo_rockets >= 1.0 {
+                Weapon::GrenadeLauncher
+            } else {
+                self.w_best_weapon(e)
+            };
+            self.entities[e].v.weapon = best;
+        }
+    }
+
     /// `PutClientInServer` — set up (or respawn) the player entity at a spawn point.
     pub(crate) fn put_client_in_server(&mut self, player: EntId) {
         let time = self.globals.time;
@@ -240,26 +263,9 @@ impl GameState {
             }
             mode.apply_loadout(self, player);
         }
-        // rtx_weapons: a disabled weapon is never carried — mask it out of the granted kit (decoded
-        // parms, the grapple grant, and the mode loadout, all applied above) and re-pick if the
-        // currently-held weapon just got stripped. Only weapon bits are touched; ammo/armor/powerups
-        // are left alone.
-        let disabled = crate::arsenal::all_weapon_bits().difference(self.enabled_weapon_mask());
-        self.entities[player].v.items = self.entities[player].v.items.without(disabled);
-        let held = self.entities[player].v.weapon;
-        if held != Weapon::None && !self.entities[player].v.items.has(held.item()) {
-            // W_BestWeapon never auto-selects the explosives, so a player left with only a GL or RL
-            // would otherwise spawn holding the axe. Prefer a fireable RL, then GL, before that.
-            let v = &self.entities[player].v;
-            let best = if v.items.has(Items::ROCKET_LAUNCHER) && v.ammo_rockets >= 1.0 {
-                Weapon::RocketLauncher
-            } else if v.items.has(Items::GRENADE_LAUNCHER) && v.ammo_rockets >= 1.0 {
-                Weapon::GrenadeLauncher
-            } else {
-                self.w_best_weapon(player)
-            };
-            self.entities[player].v.weapon = best;
-        }
+        // rtx_weapons: strip any disabled weapon from the granted kit (decoded parms, the grapple
+        // grant, and the mode loadout, all applied above).
+        self.filter_disabled_weapons(player);
         self.w_set_current_ammo(player);
 
         // Opponent modeling: a (re)spawn hands out a fresh loadout, so reset every side's hypothesis

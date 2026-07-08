@@ -305,6 +305,10 @@ impl Arena {
             let winner_stays = carried.contains(&e) && g.entities[e].v.health > 0.0 && g.entities[e].v.deadflag == 0.0;
             if winner_stays {
                 self.apply_loadout(g, e);
+                // The winner is re-equipped here, not through `put_client_in_server`, so apply the
+                // `rtx_weapons` filter ourselves — otherwise a disabled weapon (e.g. the RL) would
+                // leak back into the carried-over arsenal each round.
+                g.filter_disabled_weapons(e);
                 g.w_set_current_ammo(e);
             } else {
                 g.put_client_in_server(e);
