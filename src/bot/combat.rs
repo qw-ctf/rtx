@@ -15,6 +15,7 @@
 
 use glam::{Vec3, Vec3Swizzles};
 
+use crate::abi::EntVars;
 use crate::bot::state::GrenadePhase;
 use crate::bot::{self, grenade, BotCmd};
 use crate::defs::{
@@ -26,6 +27,8 @@ use crate::game::GameState;
 
 /// Rocket/grenade projectile speed (QuakeWorld `SV_FireRocket`), for target leading.
 const ROCKET_SPEED: f32 = 1000.0;
+/// Nail (spike) projectile speed (`launch_spike`, weapons.rs) — nailguns fire straight, no gravity.
+const NAIL_SPEED: f32 = 1000.0;
 /// Preferred fighting distance for the rocket launcher — close enough to hit, far enough to dodge
 /// the reply and not splash ourselves.
 const PREFERRED_RANGE: f32 = 400.0;
@@ -66,14 +69,59 @@ struct WeaponChoice {
     grenade_arc: bool,
 }
 
+/// A bot's weapon inventory and ammo pools — the pure inputs to weapon selection, so [`choose_weapon`]
+/// and [`Loadout::gl_primary`] can be unit-tested without a live [`GameState`].
+#[derive(Clone, Copy)]
+struct Loadout {
+    items: Items,
+    shells: f32,
+    nails: f32,
+    rockets: f32,
+    cells: f32,
+}
+
+impl Loadout {
+    fn of(v: &EntVars) -> Loadout {
+        Loadout {
+            items: Items::from_f32(v.items),
+            shells: v.ammo_shells,
+            nails: v.ammo_nails,
+            rockets: v.ammo_rockets,
+            cells: v.ammo_cells,
+        }
+    }
+
+    fn has(&self, bit: Items) -> bool {
+        self.items.contains(bit)
+    }
+
+    /// A fireable super-shotgun / lightning / super-nailgun / nailgun / shotgun — any hitscan or nail
+    /// gun [`choose_weapon`] can pick before the axe. Used to decide whether the GL is the bot's
+    /// *only* real weapon.
+    fn has_direct_gun(&self) -> bool {
+        (self.has(Items::SUPER_SHOTGUN) && self.shells >= 2.0)
+            || (self.has(Items::LIGHTNING) && self.cells >= 1.0)
+            || (self.has(Items::SUPER_NAILGUN) && self.nails >= 2.0)
+            || (self.has(Items::NAILGUN) && self.nails >= 1.0)
+            || (self.has(Items::SHOTGUN) && self.shells >= 1.0)
+    }
+
+    /// The grenade launcher is the bot's only offensive gun: a fireable GL, no RL, and no direct gun.
+    /// (RL and GL share the rocket pool, so a fireable GL + no RL owned ⇒ no fireable RL.) When true,
+    /// [`engage`] solves the grenade arc itself even with shootable grenades on — the lob→shoot combo
+    /// can't help (it has no hitscan detonator), so the bot would otherwise be stuck on the axe.
+    fn gl_primary(&self) -> bool {
+        self.has(Items::GRENADE_LAUNCHER)
+            && self.rockets >= 1.0
+            && !self.has(Items::ROCKET_LAUNCHER)
+            && !self.has_direct_gun()
+    }
+}
+
 /// Pick a weapon for `dist`, given what the bot owns and has ammo for. `gl_air`/`gl_ground` are set
 /// by [`engage`] once it has a *validated* grenade-arc solution (an airborne intercept, or a
-/// grounded lead-lob used when the RL is absent) — when either holds, the grenade launcher wins.
-fn choose_weapon(g: &GameState, e: EntId, dist: f32, gl_air: bool, gl_ground: bool) -> WeaponChoice {
-    let v = &g.entities[e].v;
-    let items = v.items;
-    let have = |bit: Items| items.has(bit);
-
+/// grounded lead-lob) — when either holds, the grenade launcher wins.
+fn choose_weapon(inv: Loadout, dist: f32, gl_air: bool, gl_ground: bool) -> WeaponChoice {
     // A solved airborne grenade intercept takes precedence: it's the shot we came here to take.
     if gl_air {
         return WeaponChoice {
@@ -87,7 +135,7 @@ fn choose_weapon(g: &GameState, e: EntId, dist: f32, gl_air: bool, gl_ground: bo
     // Point blank: the super shotgun (hitscan, no self-splash). Fall back to the axe if somehow
     // unarmed (audience never gets here).
     if dist < SPLASH_RANGE {
-        if have(Items::SUPER_SHOTGUN) && v.ammo_shells >= 2.0 {
+        if inv.has(Items::SUPER_SHOTGUN) && inv.shells >= 2.0 {
             return WeaponChoice {
                 impulse: 3,
                 weapon: Weapon::SuperShotgun,
@@ -95,7 +143,7 @@ fn choose_weapon(g: &GameState, e: EntId, dist: f32, gl_air: bool, gl_ground: bo
                 grenade_arc: false,
             };
         }
-        if have(Items::SHOTGUN) && v.ammo_shells >= 1.0 {
+        if inv.has(Items::SHOTGUN) && inv.shells >= 1.0 {
             return WeaponChoice {
                 impulse: 2,
                 weapon: Weapon::Shotgun,
@@ -106,7 +154,7 @@ fn choose_weapon(g: &GameState, e: EntId, dist: f32, gl_air: bool, gl_ground: bo
     }
 
     // Mid range: the lightning gun (fast, high DPS) when fed.
-    if dist < PREFERRED_RANGE + 150.0 && have(Items::LIGHTNING) && v.ammo_cells >= 1.0 {
+    if dist < PREFERRED_RANGE + 150.0 && inv.has(Items::LIGHTNING) && inv.cells >= 1.0 {
         return WeaponChoice {
             impulse: 8,
             weapon: Weapon::Lightning,
@@ -116,7 +164,7 @@ fn choose_weapon(g: &GameState, e: EntId, dist: f32, gl_air: bool, gl_ground: bo
     }
 
     // Default: the rocket launcher (projectile, lead the target).
-    if have(Items::ROCKET_LAUNCHER) && v.ammo_rockets >= 1.0 {
+    if inv.has(Items::ROCKET_LAUNCHER) && inv.rockets >= 1.0 {
         return WeaponChoice {
             impulse: 7,
             weapon: Weapon::RocketLauncher,
@@ -124,9 +172,9 @@ fn choose_weapon(g: &GameState, e: EntId, dist: f32, gl_air: bool, gl_ground: bo
             grenade_arc: false,
         };
     }
-    // No rocket launcher but a solved grenade lob at a grounded target: prefer the arc over the
-    // shotgun at range (the GL reaches where the SSG can't). `engage` only sets this when a lob
-    // actually solves, so we never pick it hopelessly.
+    // No rocket launcher but a solved grenade lob: prefer the arc over the shotgun at range (the GL
+    // reaches where the SSG can't). `engage` only sets this when a lob actually solves, so we never
+    // pick it hopelessly.
     if gl_ground {
         return WeaponChoice {
             impulse: grenade::GL_IMPULSE,
@@ -138,7 +186,9 @@ fn choose_weapon(g: &GameState, e: EntId, dist: f32, gl_air: bool, gl_ground: bo
     // Ammo-starved fallbacks: pick the best owned gun with ammo before resorting to the axe. This
     // is also the *only* branch a bot with just the stock loadout (shotgun + axe) reaches at range,
     // so without the shotgun/lightning arms here it would roam throwing the axe at distant enemies.
-    if have(Items::SUPER_SHOTGUN) && v.ammo_shells >= 2.0 {
+    // The nailguns sit here too (never preferred over the RL/SSG/LG), so a bot restricted to a
+    // nailgun via `rtx_weapons` still fights with it instead of the axe.
+    if inv.has(Items::SUPER_SHOTGUN) && inv.shells >= 2.0 {
         return WeaponChoice {
             impulse: 3,
             weapon: Weapon::SuperShotgun,
@@ -146,7 +196,7 @@ fn choose_weapon(g: &GameState, e: EntId, dist: f32, gl_air: bool, gl_ground: bo
             grenade_arc: false,
         };
     }
-    if have(Items::LIGHTNING) && v.ammo_cells >= 1.0 {
+    if inv.has(Items::LIGHTNING) && inv.cells >= 1.0 {
         return WeaponChoice {
             impulse: 8,
             weapon: Weapon::Lightning,
@@ -154,7 +204,23 @@ fn choose_weapon(g: &GameState, e: EntId, dist: f32, gl_air: bool, gl_ground: bo
             grenade_arc: false,
         };
     }
-    if have(Items::SHOTGUN) && v.ammo_shells >= 1.0 {
+    if inv.has(Items::SUPER_NAILGUN) && inv.nails >= 2.0 {
+        return WeaponChoice {
+            impulse: 5,
+            weapon: Weapon::SuperNailgun,
+            projectile_speed: NAIL_SPEED,
+            grenade_arc: false,
+        };
+    }
+    if inv.has(Items::NAILGUN) && inv.nails >= 1.0 {
+        return WeaponChoice {
+            impulse: 4,
+            weapon: Weapon::Nailgun,
+            projectile_speed: NAIL_SPEED,
+            grenade_arc: false,
+        };
+    }
+    if inv.has(Items::SHOTGUN) && inv.shells >= 1.0 {
         return WeaponChoice {
             impulse: 2,
             weapon: Weapon::Shotgun,
@@ -440,18 +506,20 @@ pub(crate) fn engage(
     let airborne = !grounded && !swimming;
 
     // Weapon inventory relevant to the projectile choice (RL and GL share the rocket ammo pool).
-    let (has_rl, has_gl) = {
-        let v = &game.entities[e].v;
-        (
-            v.items.has(Items::ROCKET_LAUNCHER) && v.ammo_rockets >= 1.0,
-            v.items.has(Items::GRENADE_LAUNCHER) && v.ammo_rockets >= 1.0,
-        )
-    };
+    let inv = Loadout::of(&game.entities[e].v);
+    let (has_rl, has_gl) = (
+        inv.has(Items::ROCKET_LAUNCHER) && inv.rockets >= 1.0,
+        inv.has(Items::GRENADE_LAUNCHER) && inv.rockets >= 1.0,
+    );
+    // The GL is the bot's only offensive gun (no RL, no direct gun): the combo can't drive it (no
+    // hitscan detonator), so engage must ground-lob it even with shootable grenades on.
+    let gl_primary = inv.gl_primary();
     let idle = game.entities[e].bot.grenade_phase == GrenadePhase::Idle;
     // The lob→shoot combo (`grenade::grenade_combo`, run after us) owns grounded grenade offence when
     // shootable grenades are enabled. So engage only ground-lobs as the fallback when the combo is
     // off — otherwise both would throw at the same grounded enemy and the combo could adopt our
-    // grenade as its own. The airborne intercept below is engage-exclusive (the combo never does it).
+    // grenade as its own — *unless* the GL is our only weapon (`gl_primary`), where the combo bails
+    // and engage is the only driver. The airborne intercept below is engage-exclusive.
     let combos_on = game.host().cvar_bool(c"rtx_shootable_grenades");
 
     // Ballistic planning against real geometry (needs the BSP hull), all inside one immutable borrow
@@ -483,8 +551,9 @@ pub(crate) fn engage(
                     }
                 }
             }
-        } else if !swimming && has_gl && !has_rl && idle && !combos_on {
-            // Grounded lead-lob (RL gone, GL stocked, combo off): two-round lead so a strafer stays in the blast,
+        } else if !swimming && has_gl && !has_rl && idle && (!combos_on || gl_primary) {
+            // Grounded lead-lob (RL gone, GL stocked, combo off *or* GL is our only weapon): two-round
+            // lead so a strafer stays in the blast,
             // then verify the arc actually clears geometry onto the led point — a purely ballistic
             // solve would happily hurl the grenade into a low ceiling and bounce it back onto us.
             let feet = enemy_org - Vec3::new(0.0, 0.0, 24.0);
@@ -506,7 +575,7 @@ pub(crate) fn engage(
     let gl_air = air_gl.is_some(); // `air_gl` is already gated on `!has_rl` above
     let gl_ground = gl_ground_sol.is_some();
 
-    let choice = choose_weapon(game, e, dist, gl_air, gl_ground);
+    let choice = choose_weapon(inv, dist, gl_air, gl_ground);
 
     // Switch weapon only when we don't already hold the desired one (setting `impulse` re-runs
     // W_ChangeWeapon each frame otherwise).
@@ -546,9 +615,10 @@ pub(crate) fn engage(
             let aim = meet + Vec3::new(0.0, 0.0, 4.0);
             (aim, angles_to(muzzle_base, aim), true)
         } else {
-            // Grounded or swimming: linear lead from the eye (unchanged behaviour). A grounded
-            // strafer gets the shin-drop so a near miss becomes floor splash; a swimmer is led in
-            // full 3D with no gravity term (water isn't free-fall).
+            // Grounded or swimming: linear lead from the eye. A grounded strafer gets the shin-drop so
+            // a near miss becomes floor splash; a swimmer is led in full 3D with no gravity term (water
+            // isn't free-fall). The RL leans on its blast (`gate_direct` false), but the nailguns have
+            // no splash — they need a direct hit, so they gate like an airborne shot.
             let pred_vel = if swimming {
                 enemy_vel
             } else {
@@ -559,7 +629,7 @@ pub(crate) fn engage(
             if !swimming && choice.weapon == Weapon::RocketLauncher && pred_vel.xy().length() > 150.0 {
                 aim.z -= 38.0; // eye (+22 over origin) → shin (−16)
             }
-            (aim, angles_to(my_eye, aim), false)
+            (aim, angles_to(my_eye, aim), choice.weapon != Weapon::RocketLauncher)
         }
     } else {
         // Hitscan: no lead.
@@ -1143,5 +1213,57 @@ mod tests {
             let m = miss_distance(Vec3::new(dp, dy, 0.0), Vec3::ZERO, 400.0);
             assert!((m - 400.0).abs() < 1e-3, "off by {dp},{dy} should saturate to range, got {m}");
         }
+    }
+
+    /// A loadout with the given weapon bits and every ammo pool full — the ammo count is what most
+    /// `choose_weapon` branches gate on, so tests that want a weapon *fireable* start here and drain
+    /// what they mean to.
+    fn armed(items: Items) -> Loadout {
+        Loadout { items, shells: 100.0, nails: 100.0, rockets: 100.0, cells: 100.0 }
+    }
+
+    #[test]
+    fn choose_weapon_falls_back_to_nailguns() {
+        // A bot restricted to a nailgun (via rtx_weapons) must fire it, not the axe. Super first.
+        let sng = choose_weapon(armed(Items::SUPER_NAILGUN), 400.0, false, false);
+        assert_eq!(sng.weapon, Weapon::SuperNailgun);
+        assert_eq!(sng.projectile_speed, NAIL_SPEED);
+        let ng = choose_weapon(armed(Items::NAILGUN), 400.0, false, false);
+        assert_eq!(ng.weapon, Weapon::Nailgun);
+        // Out of nails → nothing else to fire → the axe.
+        let dry = Loadout { nails: 0.0, ..armed(Items::SUPER_NAILGUN | Items::NAILGUN) };
+        assert_eq!(choose_weapon(dry, 400.0, false, false).weapon, Weapon::Axe);
+    }
+
+    #[test]
+    fn choose_weapon_gl_needs_a_solution() {
+        // A GL-only bot only fires the GL when engage supplies an arc (gl_ground/gl_air); with no
+        // solution there's nothing else to fire, so it holds the axe (never lobs blindly).
+        let gl = armed(Items::GRENADE_LAUNCHER);
+        assert_eq!(choose_weapon(gl, 400.0, false, false).weapon, Weapon::Axe);
+        assert_eq!(choose_weapon(gl, 400.0, false, true).weapon, Weapon::GrenadeLauncher);
+        assert_eq!(choose_weapon(gl, 400.0, true, false).weapon, Weapon::GrenadeLauncher);
+    }
+
+    #[test]
+    fn choose_weapon_full_arsenal_unchanged() {
+        // Regression guard: with everything, the range order is still SSG (point-blank <140) / LG
+        // (mid <550) / RL (beyond) — the nailgun fallbacks never pre-empt it.
+        let all = armed(Items::all());
+        assert_eq!(choose_weapon(all, 100.0, false, false).weapon, Weapon::SuperShotgun);
+        assert_eq!(choose_weapon(all, 400.0, false, false).weapon, Weapon::Lightning);
+        assert_eq!(choose_weapon(all, 600.0, false, false).weapon, Weapon::RocketLauncher);
+    }
+
+    #[test]
+    fn gl_primary_only_when_gl_is_the_only_gun() {
+        // GL alone (with rockets) → primary; out of rockets → not (can't fire it).
+        assert!(armed(Items::GRENADE_LAUNCHER).gl_primary());
+        assert!(!Loadout { rockets: 0.0, ..armed(Items::GRENADE_LAUNCHER) }.gl_primary());
+        // Any other fireable gun, or the RL, disqualifies it (the combo / the RL take over).
+        assert!(!armed(Items::GRENADE_LAUNCHER | Items::SHOTGUN).gl_primary());
+        assert!(!armed(Items::GRENADE_LAUNCHER | Items::ROCKET_LAUNCHER).gl_primary());
+        // A GL + an *empty* shotgun is still GL-primary (the shotgun can't fire).
+        assert!(Loadout { shells: 0.0, ..armed(Items::GRENADE_LAUNCHER | Items::SHOTGUN) }.gl_primary());
     }
 }

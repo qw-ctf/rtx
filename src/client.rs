@@ -248,7 +248,16 @@ impl GameState {
         self.entities[player].v.items = self.entities[player].v.items.without(disabled);
         let held = self.entities[player].v.weapon;
         if held != Weapon::None && !self.entities[player].v.items.has(held.item()) {
-            let best = self.w_best_weapon(player);
+            // W_BestWeapon never auto-selects the explosives, so a player left with only a GL or RL
+            // would otherwise spawn holding the axe. Prefer a fireable RL, then GL, before that.
+            let v = &self.entities[player].v;
+            let best = if v.items.has(Items::ROCKET_LAUNCHER) && v.ammo_rockets >= 1.0 {
+                Weapon::RocketLauncher
+            } else if v.items.has(Items::GRENADE_LAUNCHER) && v.ammo_rockets >= 1.0 {
+                Weapon::GrenadeLauncher
+            } else {
+                self.w_best_weapon(player)
+            };
             self.entities[player].v.weapon = best;
         }
         self.w_set_current_ammo(player);
