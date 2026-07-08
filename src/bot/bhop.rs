@@ -218,6 +218,10 @@ pub struct Input {
     pub veto: bool,
     /// A `SpeedJump` leg: the runway is pre-verified, so bypass entry/continuation checks.
     pub committed: bool,
+    /// The banded planner routed this run to carry speed here (a leg's planned band ≥ 1). Licenses
+    /// engaging straight into the hop cycle when already fast (don't ground into friction to
+    /// prestrafe) and keeping the chain alive across leg-kind churn without a runway re-check.
+    pub carry: bool,
     /// At the takeoff edge too slow to clear the gap (`sj_hold`): keep building, don't leap.
     pub hold_jump: bool,
     /// Game time (s).
@@ -283,7 +287,7 @@ impl Bhop {
                 false
             };
             if engage {
-                self.engage(i);
+                self.engage(i, env.maxspeed);
             } else if i.zigzag && i.on_ground {
                 // No hop yet, but a short straight corridor is worth a ground circle-strafe.
                 self.enter_zigzag(i);
@@ -300,7 +304,7 @@ impl Bhop {
             // A real runway opened (or a SpeedJump leg committed): promote to the hop cycle,
             // carrying the speed we built — `engage` picks Prestrafe vs Hop by speed/runway.
             if i.eligible || i.committed {
-                self.engage(i);
+                self.engage(i, env.maxspeed);
             } else if !i.zigzag {
                 // Corridor bent or ran out (`runway()` stops at bends), so corners exit cleanly.
                 self.disengage("zigzag");
@@ -337,8 +341,10 @@ impl Bhop {
             let s = self.weave(strafe(i.v_xy, i.bearing, self.sigma, a_max));
             return Some(Cmd { view_yaw: s.view_yaw, forward: s.forward, side: s.side, jump: false });
         }
-        // Landing (or first) ground frame — the only place a run ends by policy.
-        let keep_hopping = i.committed || (i.sustain && i.runway >= speed * T_HOP + HOP_MARGIN);
+        // Landing (or first) ground frame — the only place a run ends by policy. A planned carry
+        // keeps the chain alive across leg-kind churn even where the per-landing runway arithmetic
+        // would give up (the planner already proved speed belongs here).
+        let keep_hopping = i.committed || i.carry || (i.sustain && i.runway >= speed * T_HOP + HOP_MARGIN);
         if !keep_hopping {
             self.disengage(if i.sustain { "runway" } else { "leg" });
             return None;
@@ -376,9 +382,13 @@ impl Bhop {
         s
     }
 
-    fn engage(&mut self, i: &Input) {
+    fn engage(&mut self, i: &Input, maxspeed: f32) {
         let speed = i.v_xy.length();
-        self.phase = if i.on_ground && speed < PRESTRAFE_TARGET && i.runway > PRESTRAFE_MIN_RUNWAY {
+        // Prestrafe only from a genuine standing-ish start with runway to spare. If the planner
+        // routed a carry here and we're already at speed, skip straight to the hop cycle — grounding
+        // to prestrafe would bleed the carried speed to friction, the opposite of the intent.
+        let hot_carry = i.carry && speed >= maxspeed;
+        self.phase = if i.on_ground && !hot_carry && speed < PRESTRAFE_TARGET && i.runway > PRESTRAFE_MIN_RUNWAY {
             Phase::Prestrafe
         } else {
             Phase::Hop
@@ -642,6 +652,7 @@ mod sim {
             sustain: true,
             veto: false,
             committed: false,
+            carry: false,
             hold_jump: false,
             now,
         }
@@ -666,6 +677,7 @@ mod sim {
             sustain: true,
             veto: false,
             committed: false,
+            carry: false,
             hold_jump: false,
             now,
         }

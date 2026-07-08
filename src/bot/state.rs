@@ -17,6 +17,11 @@ pub struct BotState {
     /// Current A* route as link indices into the navmesh, and our leg within it.
     pub route: Vec<u32>,
     pub route_pos: usize,
+    /// Planned entry speed band per leg (parallel to `route`), from the banded planner
+    /// ([`crate::navmesh::NavGraph::find_path_banded`]); all-zero when speed-band planning is off.
+    /// A band ≥ 1 on the current or next leg tells the bhop controller to carry speed through the
+    /// waypoint instead of disengaging (see `carry` in [`crate::bot::bhop::Input`]).
+    pub route_bands: Vec<u8>,
     /// The cell we last routed toward (`u32::MAX` = none), to detect when to re-path.
     pub goal_cell: u32,
     /// The gate currently being opened as an errand (`None` = following the human normally).

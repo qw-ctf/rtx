@@ -1124,7 +1124,13 @@ race_set_teleport_flags_by_name odd RACEFLAG_BOGUS
                 continue;
             };
             for (ri, route) in routes.iter().enumerate() {
-                let mut verdict = format!("PASS ({} legs)", route.nodes.len() - 1);
+                let costs = crate::navmesh::LinkCosts::default();
+                // Two verdicts side by side: the plain cell A* vs the speed-band planner (which
+                // carries speed between legs — the exit band of one leg feeds the next). Banded
+                // should route a superset of the legs the unbanded search can (never fewer).
+                let mut unbanded = format!("PASS ({} legs)", route.nodes.len() - 1);
+                let mut banded = unbanded.clone();
+                let mut carry = crate::navmesh::BAND_FLOOR[0];
                 for (i, pair) in route.nodes.windows(2).enumerate() {
                     let snap = |n: &RaceRouteNode| {
                         graph
@@ -1132,14 +1138,15 @@ race_set_teleport_flags_by_name odd RACEFLAG_BOGUS
                             .filter(|&c| (graph.cell_origin(c) - n.origin).length() <= 80.0)
                     };
                     let (Some(a), Some(b)) = (snap(&pair[0]), snap(&pair[1])) else {
-                        verdict = format!("FAIL at leg {} (node off the navmesh)", i + 1);
+                        let msg = format!("FAIL at leg {} (node off the navmesh)", i + 1);
+                        (unbanded, banded) = (msg.clone(), msg);
                         break;
                     };
-                    if graph.find_path(a, b, &crate::navmesh::LinkCosts::default()).is_none() {
+                    if unbanded.starts_with("PASS") && graph.find_path(a, b, &costs).is_none() {
                         // Diagnose the break: how close does reachability get to the goal, and
                         // what does the remaining hop look like (distance and height delta)?
                         let frontier = graph
-                            .nearest_reachable_to(a, b, &crate::navmesh::LinkCosts::default())
+                            .nearest_reachable_to(a, b, &costs)
                             .map(|c| {
                                 let (fo, go) = (graph.cell_origin(c), graph.cell_origin(b));
                                 let dxy = glam::Vec2::new(go.x - fo.x, go.y - fo.y).length();
@@ -1150,19 +1157,25 @@ race_set_teleport_flags_by_name odd RACEFLAG_BOGUS
                                 )
                             })
                             .unwrap_or_else(|| "nothing reachable from the start at all".into());
-                        verdict = format!("FAIL at leg {} (no path; {frontier})", i + 1);
-                        break;
+                        unbanded = format!("FAIL at leg {} (no path; {frontier})", i + 1);
+                    }
+                    match graph.find_path_banded(a, b, carry, &costs) {
+                        Some(r) => carry = crate::navmesh::BAND_FLOOR[r.end_band as usize],
+                        None if banded.starts_with("PASS") => banded = format!("FAIL at leg {} (no banded path)", i + 1),
+                        None => {}
                     }
                 }
-                if verdict.starts_with("PASS") {
+                let (up, bp) = (unbanded.starts_with("PASS"), banded.starts_with("PASS"));
+                if bp {
                     legs_pass += 1;
                 } else {
                     legs_fail += 1;
                 }
-                eprintln!("{name}: route {ri} \"{}\": {verdict}", route.name);
+                assert!(!up || bp, "{name} route {ri}: unbanded PASS but banded FAIL — banding lost a route");
+                eprintln!("{name}: route {ri} \"{}\": unbanded {unbanded} | banded {banded}", route.name);
             }
         }
-        eprintln!("--- {maps_with_routes} maps with routes: {legs_pass} routes PASS, {legs_fail} routes FAIL ---");
+        eprintln!("--- {maps_with_routes} maps with routes: {legs_pass} routes PASS (banded), {legs_fail} FAIL ---");
         assert!(maps_with_routes > 0, "no routes found on any map — wrong RTX_TEST_MAPS/RTX_TEST_ROUTES?");
     }
 }

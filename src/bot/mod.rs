@@ -796,10 +796,12 @@ fn emit(
         let route = game.entities[e].bot.route.len();
         let hph = game.entities[e].bot.hook_phase;
         let rjph = game.entities[e].bot.rj_phase;
+        let bpos = game.entities[e].bot.route_pos;
+        let band = game.entities[e].bot.route_bands.get(bpos).copied().unwrap_or(0);
         let bh = &game.entities[e].bot.bhop;
         host.conprint(&cstring(&format!(
             "rtx bot{client}: enemy={} gate={gate:?} hook={hph:?} rj={rjph:?} bhop={:?} hops={} flips={} peak={:.0} \
-             spd={speed:.0} route={route} fwd={forward} side={side} atk={}\n",
+             spd={speed:.0} route={route} band={band} fwd={forward} side={side} atk={}\n",
             enemy.is_some(),
             bh.phase,
             bh.hops,
@@ -982,17 +984,35 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // speed/rocket jump, or committed to a plain jump arc, so the traversal keeps the route that put
     // it on that leg (a goal flip mid-air must not replace the route and turn the bot around).
     if !hooking && !on_sj && !on_rj && !on_air && (bot.route.is_empty() || bot.goal_cell != goal || now >= bot.repath_time) {
-        let mut route = graph.find_path(bot_cell, goal, &costs).unwrap_or_default();
+        // Speed-band planning credits the speed a bot carries between legs (chained speed jumps,
+        // cheaper hot Walk legs) — gated on bhop being on (no speed-jump links otherwise) plus its
+        // own escape-hatch cvar. `speed` seeds the start band, so a mid-run re-path keeps a hop
+        // chain alive. Falls back to the plain cell A* (bands all-zero) when off.
+        let use_bands = host.cvar_bool(c"rtx_bot_bhop") && host.cvar_bool(c"rtx_bot_bandplan");
+        let banded = |from, to| use_bands.then(|| graph.find_path_banded(from, to, speed, &costs)).flatten();
+        let (mut route, mut bands) = match banded(bot_cell, goal) {
+            Some(r) => (r.links, r.bands),
+            None if use_bands => (Vec::new(), Vec::new()),
+            None => (graph.find_path(bot_cell, goal, &costs).unwrap_or_default(), Vec::new()),
+        };
         // Goal unreachable from here (behind a shut door with no way around from this spot, or a
         // disconnected pocket)? Don't home straight into a wall — head to the reachable cell
         // nearest the goal, approaching as far as the graph allows (often enough for line of sight
         // or to find a connection). Better than freezing until the target wanders into view.
         if route.is_empty() && bot_cell != goal {
             if let Some(near) = graph.nearest_reachable_to(bot_cell, goal, &costs) {
-                route = graph.find_path(bot_cell, near, &costs).unwrap_or_default();
+                match banded(bot_cell, near) {
+                    Some(r) => (route, bands) = (r.links, r.bands),
+                    None => route = graph.find_path(bot_cell, near, &costs).unwrap_or_default(),
+                }
             }
         }
+        // Keep `route_bands` parallel to `route`: zero-fill when unbanded (or on any length mismatch).
+        if bands.len() != route.len() {
+            bands = vec![0u8; route.len()];
+        }
         bot.route = route;
+        bot.route_bands = bands;
         bot.route_pos = 0;
         bot.goal_cell = goal;
         bot.repath_time = now + REPATH_INTERVAL;
@@ -1021,6 +1041,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
                 bot.gate_since = now;
                 bot.gate_best_dist = f32::INFINITY; // first frame records the starting distance
                 bot.route = graph.find_path(bot_cell, button_cell, &costs).unwrap_or_default();
+                bot.route_bands = vec![0u8; bot.route.len()]; // a walking errand, no carried speed
                 bot.route_pos = 0;
                 bot.goal_cell = button_cell;
                 bot.repath_time = now + REPATH_INTERVAL;
@@ -1254,13 +1275,20 @@ fn run_bot(game: &mut GameState, e: EntId) {
         || watch_point.is_some()
         || bot.gate.is_some()
         || bot.grenade_phase != GrenadePhase::Idle;
+    // The banded planner's intent for this run: a band ≥ 1 on the current or next leg means the
+    // route was planned to carry speed here, so admit bhop even on a short leg (the goal-distance
+    // gates below exist to avoid hopping on trivial approaches — the plan overrides that judgment)
+    // and tell the controller to hold the chain across the waypoint rather than disengage per leg.
+    let planned_band = bot.route_bands.get(bot.route_pos).copied().unwrap_or(0);
+    let carry = planned_band >= 1 || bot.route_bands.get(bot.route_pos + 1).copied().unwrap_or(0) >= 1;
     let bhop_entry = !final_leg
         && matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
-        && goal_dist > 300.0
+        && (goal_dist > 300.0 || planned_band >= 1)
         && runway_dist >= bhop::RUNWAY_ENGAGE;
     // Lenient continuation gate for taking *another* hop from a landing: leg kinds churn as the
     // route advances, and a run in progress shouldn't be dumped by the stricter entry conditions.
-    let bhop_sustain = matches!(kind, Some(LinkKind::Walk | LinkKind::Step)) && goal_dist > 150.0;
+    let bhop_sustain =
+        matches!(kind, Some(LinkKind::Walk | LinkKind::Step)) && (goal_dist > 150.0 || planned_band >= 1);
     // Ground zigzag: a corridor too short for a hop ([`bhop::RUNWAY_ENGAGE`]) but straight and long
     // enough ([`bhop::ZIGZAG_ENGAGE`]) to gain speed from the circle-strafe alone. The controller
     // hands off to the hop cycle if `bhop_entry` opens up mid-run, and `bhop_veto` (which includes
@@ -1359,6 +1387,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
                 sustain: bhop_sustain,
                 veto: bhop_veto,
                 committed: sj_active,
+                carry,
                 hold_jump: sj_hold,
                 now,
             },

@@ -88,8 +88,40 @@ const SJ_LANDING_DEPTH: f32 = 96.0;
 /// target-scan radius grows with fall airtime (`reach = v · t`): 1024 quadruples the old 240
 /// envelope while keeping the per-ledge scan bounded.
 const SJ_MAX_DROP: f32 = 1024.0;
-/// At most this many speed-jump links per source cell.
+/// At most this many stand-start speed-jump links per source cell.
 const SPEED_JUMP_MAX_PER_CELL: usize = 3;
+/// At most this many *chained* speed-jump links per source cell — kept separate (and small) so a
+/// chained candidate never evicts a self-contained stand-start jump from the per-cell budget.
+const SPEED_JUMP_CHAINED_MAX_PER_CELL: usize = 2;
+
+// --- speed bands (kinodynamic planning over (cell, band); see `find_path_banded`) ---
+
+/// Coarse entry-speed classes for the banded planner. A route's carried speed changes both the
+/// feasibility of a leg (a chained speed jump needs a minimum band) and its cost (a fast band
+/// covers a Walk leg quicker). Four bands keep the search state at `cells · 4`.
+/// `BAND_EDGES[i]` is the upper edge of band `i`: `<340 → 0`, `<430 → 1`, `<540 → 2`, else `3`.
+pub const BAND_EDGES: [f32; 3] = [340.0, 430.0, 540.0];
+/// Number of speed bands.
+pub const NBANDS: usize = 4;
+/// The speed *credited* to a band — its lower edge. Feasibility and cost always use this floor,
+/// never a midpoint, so the planner never assumes more speed than a band guarantees.
+pub const BAND_FLOOR: [f32; NBANDS] = [MAX_SPEED, 340.0, 430.0, 540.0];
+/// Planning speed ceiling — the banded heuristic's denominator (matches [`SPEED_JUMP_V_CAP`]).
+/// Larger than [`MAX_SPEED`], so the banded heuristic is *smaller* (more conservative) than the
+/// cell-only one — at worst it expands more nodes, never less optimal than the existing search.
+pub const BAND_V_MAX: f32 = SPEED_JUMP_V_CAP;
+/// Runway a standing start (band 0) must spend spinning up before air-strafe gains begin, charged
+/// against a Walk/Step leg's length. Mirrors the controller's [`crate::bot::bhop`] engage runway.
+const BAND_SPINUP: f32 = 256.0;
+/// A carried-speed leg only counts if the corridor continues roughly straight: if the turn from the
+/// link that *reached* a cell to the candidate link exceeds this, the planner treats the entry as
+/// band 0 (speed is not carried around a sharp corner).
+const SPEED_CONE_DEG: f32 = 45.0;
+
+/// The speed band a given horizontal speed falls into (`0..NBANDS`).
+pub fn band_of(speed: f32) -> u8 {
+    BAND_EDGES.iter().position(|&e| speed < e).unwrap_or(NBANDS - 1) as u8
+}
 
 /// Airtime of a jump reaching a target `dz` above (or below) the takeoff, at gravity `g`: the
 /// descending root of `JUMP_VZ·t − ½g·t² = dz`. `0` if `dz` is unreachable (above the apex).
@@ -298,6 +330,10 @@ pub struct NavGraph {
     /// hold a standoff while it's raised.
     plats: Vec<Plat>,
     plat_links: Vec<i32>,
+    /// The bhop speed-gain constant `k` for this map's movement cvars ([`bhop_k`]), captured when
+    /// speed jumps are spliced (or left at the stock default). The banded planner reads it to price
+    /// speed carried between links; keeping it here avoids re-reading cvars at query time.
+    sj_k: f32,
 }
 
 /// A solved speed jump: where the takeoff ledge is and the horizontal speed needed there, so the
@@ -306,6 +342,13 @@ pub struct NavGraph {
 pub struct SpeedJumpTraversal {
     pub takeoff: Vec3,
     pub v_req: f32,
+    /// Flight time of the leap (s), so the banded planner can price a hot entry (the runway term
+    /// shrinks with carried speed while the airtime is fixed).
+    pub airtime: f32,
+    /// A **chained** speed jump: it has no self-contained runway (the `from` cell *is* the ledge),
+    /// so it is only traversable when the planner proves the entry band already carries `v_req`
+    /// (see [`NavGraph::find_path_banded`]). Unbanded queries price it away via [`NavGraph::link_extra`].
+    pub chained: bool,
 }
 
 /// Extra travel-time cost charged to a link whose gate is currently shut. Large enough that the
@@ -380,6 +423,7 @@ impl NavGraph {
             rocket_jumps: Vec::new(),
             plats: Vec::new(),
             plat_links: Vec::new(),
+            sj_k: bhop_k(10.0, MAX_SPEED), // stock default until add_speed_jumps captures live cvars
         };
         graph.link_cells(bsp);
         graph
@@ -607,14 +651,18 @@ impl NavGraph {
     /// runway feeding it, cap the attainable speed to that, and link the widest reachable targets —
     /// but with `from` set to the *runway start* so A* commits the whole run-up (the bot is thus
     /// guaranteed the speed). Only where a plain/double jump can't already make it. Gated on bhop.
-    /// Known limitation: each link's speed budget assumes the run starts at `sv_maxspeed` on
-    /// this runway — speed carried in from a *previous* speed jump's landing is not credited,
-    /// so a chain of gaps with only a short platform between them models as unroutable even
-    /// though a human carries the first jump's speed straight into the second. Crediting it
-    /// needs speed-state-aware pathfinding, not a per-link tweak; the race mode's routability
-    /// report names the exact legs that would need it.
+    ///
+    /// A jump with no self-contained runway also emits a **chained** variant (`from` = the ledge
+    /// itself) for the case a human relies on: a chain of gaps with only a short platform between
+    /// them, where speed carried from the previous jump's landing clears the next. These have no
+    /// runway budget of their own, so they are traversable only by the speed-band planner
+    /// ([`Self::find_path_banded`]), which proves the entry band carries `v_req`; the speed-unaware
+    /// `find_path`/`costs_from` price them away ([`Self::chained_block`]) since a standing start
+    /// can't make them. Chained candidates use a separate small per-cell cap so they never evict a
+    /// self-contained jump.
     pub fn add_speed_jumps(&mut self, bsp: &Bsp, params: SpeedJumpParams, double_jump: bool) {
         let k = bhop_k(params.accel, params.maxspeed);
+        self.sj_k = k; // the banded planner prices carried speed with this map's k
         let mut pending: Vec<(Link, SpeedJumpTraversal)> = Vec::new();
         for ledge in 0..self.cells.len() as CellId {
             self.solve_speed_jumps_from(bsp, ledge, params, k, double_jump, &mut pending);
@@ -635,20 +683,27 @@ impl NavGraph {
         out: &mut Vec<(Link, SpeedJumpTraversal)>,
     ) {
         let a = self.cells[ledge as usize];
-        let mut cands: Vec<(f32, Link, SpeedJumpTraversal)> = Vec::new(); // (v_req, link, traversal)
+        let mut cands: Vec<(f32, Link, SpeedJumpTraversal)> = Vec::new(); // stand-start (v_req, link, tr)
+        let mut cands_chained: Vec<(f32, Link, SpeedJumpTraversal)> = Vec::new(); // chained
+        // The most speed a chained entry can ever carry into a jump (the top band's floor); a jump
+        // needing more than this is unroutable even chained, so it bounds the chained target scan.
+        let v_chain_max = BAND_FLOOR[NBANDS - 1] / SJ_MARGIN;
         for (dgx, dgy) in COMPASS {
-            // Take off from a ledge edge, and only where a straight runway can feed the jump.
+            // Take off from a ledge edge (a runway only *helps* — a chained jump needs none).
             if self.has_ground_near(a.gx + dgx.signum(), a.gy + dgy.signum(), a.origin.z) {
                 continue;
             }
             let runway = self.measure_runway(bsp, &a, dgx, dgy);
             let v_max = SPEED_JUMP_V_CAP.min(BHOP_EFF * attainable_speed(MAX_SPEED, runway, k));
-            if v_max * jump_airtime(0.0, params.gravity) <= JUMP_REACH + 1.0 {
-                continue; // this runway buys nothing past a normal jump
+            // Scan out to whatever the better of a self-contained runway or a carried entry reaches.
+            let v_scan = v_max.max(v_chain_max);
+            if v_scan * jump_airtime(0.0, params.gravity) <= JUMP_REACH + 1.0 {
+                continue; // neither a runway nor a carried entry buys anything past a normal jump
             }
-            let reach_cap = v_max * jump_airtime(-SJ_MAX_DROP, params.gravity);
+            let reach_cap = v_scan * jump_airtime(-SJ_MAX_DROP, params.gravity);
             let scan = ((reach_cap / GRID).ceil() as i32).max(1);
-            let mut best: Option<(f32, Link, SpeedJumpTraversal)> = None;
+            let mut best: Option<(f32, Link, SpeedJumpTraversal)> = None; // stand-start
+            let mut best_chained: Option<(f32, Link, SpeedJumpTraversal)> = None;
             for to in self.neighbors_within(a.gx, a.gy, scan) {
                 if to == ledge {
                     continue;
@@ -671,11 +726,10 @@ impl NavGraph {
                 }
                 let airtime = jump_airtime(dz, params.gravity);
                 let v_req = v_required(horiz, dz, params.gravity);
-                if airtime <= 0.0 || v_req * SJ_MARGIN > v_max {
-                    continue;
+                if airtime <= 0.0 || v_req * SJ_MARGIN > v_scan {
+                    continue; // beyond even a carried entry
                 }
-                // Flat-long arc clearance, a landing with room to slide out at speed, and a
-                // runway-start cell to anchor from.
+                // Arc clearance and a landing with room to slide out — required for either form.
                 let steps = ((horiz / 24.0).ceil() as i32).max(8);
                 let depth_cols = (SJ_LANDING_DEPTH / GRID).ceil() as i32;
                 let landing_ok = (1..=depth_cols)
@@ -683,36 +737,47 @@ impl NavGraph {
                 if !arc_clear_peak(bsp, a.origin, b.origin, JUMP_APEX, steps) || !landing_ok {
                     continue;
                 }
-                let need = runway_len_for(v_req * SJ_MARGIN, MAX_SPEED, k);
-                let dir = Vec3::new(dgx.signum() as f32, dgy.signum() as f32, 0.0).normalize_or_zero();
-                let Some(start) = self.nearest_within(a.origin - dir * need, GRID * 1.5, STEP_HEIGHT * 3.0) else {
-                    continue;
-                };
-                if start == to {
-                    continue;
+                // Stand-start form: a runway long enough behind the ledge to build v_req from a walk.
+                if v_req * SJ_MARGIN <= v_max {
+                    let need = runway_len_for(v_req * SJ_MARGIN, MAX_SPEED, k);
+                    let dir = Vec3::new(dgx.signum() as f32, dgy.signum() as f32, 0.0).normalize_or_zero();
+                    if let Some(start) = self.nearest_within(a.origin - dir * need, GRID * 1.5, STEP_HEIGHT * 3.0) {
+                        if start != to {
+                            let cost = runway_time(v_req * SJ_MARGIN, MAX_SPEED, k) + airtime + 1.0;
+                            let link = Link { from: start, to, kind: LinkKind::SpeedJump, cost };
+                            let tr = SpeedJumpTraversal { takeoff: a.origin, v_req, airtime, chained: false };
+                            if best.is_none_or(|(bv, _, _)| v_req < bv) {
+                                best = Some((v_req, link, tr));
+                            }
+                            continue; // a self-contained jump covers this target; no chained dup
+                        }
+                    }
                 }
-                let cost = runway_time(v_req * SJ_MARGIN, MAX_SPEED, k) + airtime + 1.0;
-                let link = Link {
-                    from: start,
-                    to,
-                    kind: LinkKind::SpeedJump,
-                    cost,
-                };
-                let tr = SpeedJumpTraversal {
-                    takeoff: a.origin,
-                    v_req,
-                };
-                if best.is_none_or(|(bv, _, _)| v_req < bv) {
-                    best = Some((v_req, link, tr));
+                // Chained form: no runway of its own — take off from the ledge itself, feasible only
+                // when a prior jump delivers ≥ v_req (the banded planner proves it; unbanded queries
+                // price it away). Bounded to what the top band can carry.
+                if v_req * SJ_MARGIN <= v_chain_max {
+                    let cost = airtime + 1.0;
+                    let link = Link { from: ledge, to, kind: LinkKind::SpeedJump, cost };
+                    let tr = SpeedJumpTraversal { takeoff: a.origin, v_req, airtime, chained: true };
+                    if best_chained.is_none_or(|(bv, _, _)| v_req < bv) {
+                        best_chained = Some((v_req, link, tr));
+                    }
                 }
             }
             if let Some(c) = best {
                 cands.push(c);
             }
+            if let Some(c) = best_chained {
+                cands_chained.push(c);
+            }
         }
         cands.sort_by(|x, y| x.0.total_cmp(&y.0));
         cands.truncate(SPEED_JUMP_MAX_PER_CELL);
+        cands_chained.sort_by(|x, y| x.0.total_cmp(&y.0));
+        cands_chained.truncate(SPEED_JUMP_CHAINED_MAX_PER_CELL);
         out.extend(cands.into_iter().map(|(_, l, t)| (l, t)));
+        out.extend(cands_chained.into_iter().map(|(_, l, t)| (l, t)));
     }
 
     /// Measure the straight, flat, hop-wide runway feeding ledge cell `a` from behind (opposite the
@@ -1044,6 +1109,67 @@ impl NavGraph {
             extra += costs.rocket_jump_extra;
         }
         extra
+    }
+
+    /// The block a *speed-unaware* query (`find_path`, `costs_from`) must add to a chained speed
+    /// jump: it has no self-contained runway, so a route that doesn't reason about carried speed can
+    /// never take one. Large enough to sever it in practice, finite so it never poisons `g` beyond
+    /// the existing [`CLOSED_GATE_PENALTY`] scale. The banded planner ([`Self::find_path_banded`])
+    /// bypasses this and gates chained jumps on the entry band instead.
+    pub(super) fn chained_block(&self, li: u32) -> f32 {
+        match self.speed_jump_of_link(li) {
+            Some(t) if t.chained => CLOSED_GATE_PENALTY,
+            _ => 0.0,
+        }
+    }
+
+    /// The banded transition for link `li` entered at speed band `entry`: its travel-time cost and
+    /// the band the bot arrives in, or `None` if the leg is infeasible at this entry speed (a
+    /// chained speed jump the carried speed can't satisfy). Conservative by construction — speeds
+    /// are band *floors*, gains are derated ([`BHOP_EFF`]), and no leg demotes a carried band except
+    /// where physics forces it (a hard fall, or a teleport/plat/hook/rocket that resets speed).
+    /// Every cost is floored at `horiz / BAND_V_MAX`, keeping the banded heuristic admissible.
+    pub fn banded_step(&self, li: u32, entry: u8) -> Option<(f32, u8)> {
+        let link = self.links[li as usize];
+        let from = self.cells[link.from as usize].origin;
+        let to = self.cells[link.to as usize].origin;
+        let horiz = (to.xy() - from.xy()).length();
+        let dz = to.z - from.z;
+        let floor_cost = horiz / BAND_V_MAX;
+        let v_in = BAND_FLOOR[entry as usize].max(MAX_SPEED);
+        Some(match link.kind {
+            LinkKind::Walk | LinkKind::Step => {
+                // Already moving (band ≥ 1): carry speed and climb. From a standstill spend a
+                // spin-up runway before gains begin. `.max(v_in)` never demotes a band on a short leg.
+                let usable = if entry >= 1 { horiz } else { (horiz - BAND_SPINUP).max(0.0) };
+                let v_out = v_in.max(BHOP_EFF * attainable_speed(v_in, usable, self.sj_k));
+                let avg = ((v_in + v_out) * 0.5).max(MAX_SPEED);
+                ((horiz / avg).max(floor_cost), band_of(v_out))
+            }
+            LinkKind::SpeedJump => {
+                let (v_req, airtime, chained) = self
+                    .speed_jump_of_link(li)
+                    .map(|t| (t.v_req, t.airtime, t.chained))
+                    .unwrap_or((MAX_SPEED, 0.0, false));
+                // A chained jump has no runway: traversable only if the entry band already carries it.
+                if chained && v_in < v_req * SJ_MARGIN {
+                    return None;
+                }
+                // The runway run-up shrinks with carried speed (0 once at v_req); airtime is fixed.
+                let runway_t = runway_time(v_req * SJ_MARGIN, v_in, self.sj_k);
+                // Horizontal speed is conserved through the leap: the bot lands carrying whatever it
+                // took off with — the carried entry (chained) or the runway-built v_req (stand start),
+                // whichever is greater. So a chain of jumps sustains its band instead of decaying.
+                let v_exit = v_in.max(v_req * SJ_MARGIN);
+                ((runway_t + airtime + 1.0).max(floor_cost), band_of(v_exit))
+            }
+            // A hard fall stumbles to a standstill; a short drop keeps the band.
+            LinkKind::Drop => (link.cost, if -dz <= SAFE_FALL { entry } else { 0 }),
+            LinkKind::JumpGap => (link.cost, entry),
+            LinkKind::DoubleJump => (link.cost, entry.saturating_sub(1)),
+            // Teleport / plat ride / hook / rocket jump all deliver the bot at a standstill.
+            LinkKind::Teleport | LinkKind::Plat | LinkKind::Hook | LinkKind::RocketJump => (link.cost, 0),
+        })
     }
 
     // --- entity-independent: grappling-hook swing links ---
@@ -2212,6 +2338,7 @@ mod tests {
             rocket_jumps: Vec::new(),
             plats: Vec::new(),
             plat_links: Vec::new(),
+            sj_k: bhop_k(10.0, MAX_SPEED),
         }
     }
 
@@ -2328,6 +2455,7 @@ mod tests {
             rocket_jumps: Vec::new(),
             plats: Vec::new(),
             plat_links: Vec::new(),
+            sj_k: bhop_k(10.0, MAX_SPEED),
         };
         // Floor a short step (z ≤ −40) below the cells for x ≤ 60; lava fills x > 60 under z = 0.
         let is_solid = |p: Vec3| p.x <= 60.0 && p.z <= -40.0;
@@ -2377,6 +2505,164 @@ mod tests {
         assert!(
             g.find_path(0, 3, &LinkCosts::default()).is_some(),
             "the moderate surcharge must never sever the graph"
+        );
+    }
+
+    // --- speed-band planning (Phase B) ---
+
+    /// Build a synthetic graph for banded-planner tests: cells at the given origins, directed links
+    /// `(from, to, kind, cost)`, and speed-jump side entries `(link index, v_req, airtime, chained)`.
+    fn banded_graph(
+        origins: &[Vec3],
+        links: &[(CellId, CellId, LinkKind, f32)],
+        sjs: &[(usize, f32, f32, bool)],
+    ) -> NavGraph {
+        let cells = origins
+            .iter()
+            .map(|&o| Cell { origin: o, gx: 0, gy: 0 })
+            .collect::<Vec<_>>();
+        let mut adjacency = vec![Vec::new(); cells.len()];
+        let links = links
+            .iter()
+            .enumerate()
+            .map(|(li, &(from, to, kind, cost))| {
+                adjacency[from as usize].push(li as u32);
+                Link { from, to, kind, cost }
+            })
+            .collect::<Vec<_>>();
+        let mut speed_jump_links = vec![-1i32; links.len()];
+        let mut speed_jumps = Vec::new();
+        for &(li, v_req, airtime, chained) in sjs {
+            speed_jump_links[li] = speed_jumps.len() as i32;
+            speed_jumps.push(SpeedJumpTraversal { takeoff: origins[links[li].from as usize], v_req, airtime, chained });
+        }
+        NavGraph {
+            cells,
+            links,
+            adjacency,
+            grid: GridIndex::default(),
+            gates: Vec::new(),
+            gated_links: Vec::new(),
+            hook_links: Vec::new(),
+            hooks: Vec::new(),
+            speed_jump_links,
+            speed_jumps,
+            rocket_jump_links: Vec::new(),
+            rocket_jumps: Vec::new(),
+            plats: Vec::new(),
+            plat_links: Vec::new(),
+            sj_k: bhop_k(10.0, MAX_SPEED),
+        }
+    }
+
+    /// Every banded step costs at least `horiz / BAND_V_MAX` — the floor that keeps the banded
+    /// heuristic (`dist / BAND_V_MAX`) admissible — across every link kind and entry band.
+    #[test]
+    fn banded_cost_is_admissible() {
+        let origins = [
+            Vec3::ZERO,
+            Vec3::new(300.0, 0.0, 0.0),
+            Vec3::new(600.0, 0.0, -200.0),
+            Vec3::new(900.0, 0.0, 0.0),
+        ];
+        let kinds = [
+            LinkKind::Walk,
+            LinkKind::Step,
+            LinkKind::Drop,
+            LinkKind::JumpGap,
+            LinkKind::DoubleJump,
+            LinkKind::SpeedJump,
+            LinkKind::Teleport,
+        ];
+        for kind in kinds {
+            let g = banded_graph(
+                &origins,
+                &[(0, 1, kind, 3.0)],
+                if kind == LinkKind::SpeedJump { &[(0, 350.0, 0.7, false)] } else { &[] },
+            );
+            let horiz = (origins[1].xy() - origins[0].xy()).length();
+            for band in 0..NBANDS as u8 {
+                if let Some((cost, _)) = g.banded_step(0, band) {
+                    assert!(
+                        cost + 1e-4 >= horiz / BAND_V_MAX,
+                        "{kind:?} band {band}: cost {cost} below the admissibility floor {}",
+                        horiz / BAND_V_MAX,
+                    );
+                }
+            }
+        }
+    }
+
+    /// A longer straight Walk leg exits in a higher band, and a standing start (band 0) pays a
+    /// spin-up runway before it gains — so a short leg from a standstill stays in band 0.
+    #[test]
+    fn banded_walk_exit_bands_monotone() {
+        let g = banded_graph(
+            &[Vec3::ZERO, Vec3::new(200.0, 0.0, 0.0), Vec3::new(2400.0, 0.0, 0.0)],
+            &[(0, 1, LinkKind::Walk, 0.6), (0, 2, LinkKind::Walk, 7.5)],
+            &[],
+        );
+        let (_, short) = g.banded_step(0, 0).unwrap(); // 200u from a standstill: below the spin-up
+        let (_, long) = g.banded_step(1, 0).unwrap(); // 2400u from a standstill: builds real speed
+        assert_eq!(short, 0, "a short standing-start leg should not leave band 0");
+        assert!(long > short, "a long leg should exit a higher band than a short one ({long} vs {short})");
+    }
+
+    /// A chain of speed jumps with only a short platform between them: unroutable to a speed-unaware
+    /// query (chained links priced away), routable to the banded planner when fed from a runway, and
+    /// still unroutable from a standstill mid-chain (the carried band can't satisfy the next jump).
+    #[test]
+    fn banded_chain_needs_carried_speed() {
+        // R --walk 2000--> A --chained SJ--> B --walk 200--> B2 --chained SJ--> C
+        let g = banded_graph(
+            &[
+                Vec3::ZERO,                       // 0 R (runway start)
+                Vec3::new(2000.0, 0.0, 0.0),      // 1 A (ledge)
+                Vec3::new(2300.0, 0.0, 0.0),      // 2 B (landing)
+                Vec3::new(2500.0, 0.0, 0.0),      // 3 B2 (short platform)
+                Vec3::new(2800.0, 0.0, 0.0),      // 4 C (final landing)
+            ],
+            &[
+                (0, 1, LinkKind::Walk, 6.25),
+                (1, 2, LinkKind::SpeedJump, 1.7),
+                (2, 3, LinkKind::Walk, 0.625),
+                (3, 4, LinkKind::SpeedJump, 1.7),
+            ],
+            &[(1, 350.0, 0.7, true), (3, 350.0, 0.7, true)],
+        );
+        // Speed-unaware: the chained legs are priced away, so C is effectively unreachable.
+        let flood = g.costs_from(0, &LinkCosts::default());
+        assert!(flood[4] >= CLOSED_GATE_PENALTY, "unbanded query must treat the chain as blocked");
+        // Banded, fed from the runway: the walk builds a band that carries both jumps.
+        let route = g.find_path_banded(0, 4, MAX_SPEED, &LinkCosts::default()).expect("banded route exists");
+        assert_eq!(route.links, vec![0, 1, 2, 3], "banded route should run the whole chain");
+        // From a standstill mid-chain (on B2), the next chained jump is infeasible → no route.
+        assert!(
+            g.find_path_banded(3, 4, 0.0, &LinkCosts::default()).is_none(),
+            "a standing start can't satisfy a chained speed jump"
+        );
+    }
+
+    /// Carried speed only survives a corner within the heading cone: a straight approach reaches a
+    /// chained speed jump feasibly, an L-shaped one arrives demoted to band 0 and can't take it.
+    #[test]
+    fn banded_corner_demotes_carry() {
+        let long_walk = |to_x: f32, to_y: f32| {
+            [Vec3::ZERO, Vec3::new(2000.0, 0.0, 0.0), Vec3::new(to_x, to_y, 0.0)]
+        };
+        let links = [(0, 1, LinkKind::Walk, 6.25), (1, 2, LinkKind::SpeedJump, 1.7)];
+        let sj = [(1usize, 350.0, 0.7, true)];
+        // Straight: R→M→C all along +x — the carried band satisfies the chained jump.
+        let straight = banded_graph(&long_walk(2300.0, 0.0), &links, &sj);
+        assert!(
+            straight.find_path_banded(0, 2, 0.0, &LinkCosts::default()).is_some(),
+            "a straight approach should carry speed into the chained jump"
+        );
+        // Corner: R→M along +x, then the jump heads +y (90° turn) — carry is demoted, jump infeasible.
+        let corner = banded_graph(&long_walk(2000.0, 300.0), &links, &sj);
+        assert!(
+            corner.find_path_banded(0, 2, 0.0, &LinkCosts::default()).is_none(),
+            "a sharp corner should demote the carried band below the jump's requirement"
         );
     }
 }

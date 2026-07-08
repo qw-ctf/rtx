@@ -4,9 +4,24 @@
 //! (`find_path`, `nearest_reachable_to`, `costs_from`), plus the small link/cell accessors bots read
 //! routes through. Split out of the graph *build* (`super`) — this is the read-only side.
 
-use glam::Vec3;
+use glam::{Vec2, Vec3, Vec3Swizzles};
 
-use super::{floor_grid, CellId, LinkCosts, LinkCounts, LinkKind, NavGraph, MAX_SPEED};
+use super::{
+    band_of, floor_grid, CellId, LinkCosts, LinkCounts, LinkKind, NavGraph, BAND_V_MAX, MAX_SPEED, NBANDS,
+    SPEED_CONE_DEG,
+};
+
+/// A route from the banded planner: link indices plus the planned *entry* speed band for each leg
+/// (parallel to `links`), so the runtime knows where it is meant to arrive carrying speed.
+pub struct BandedRoute {
+    pub links: Vec<u32>,
+    pub bands: Vec<u8>,
+    /// Total banded travel-time cost of the route (seconds).
+    pub cost: f32,
+    /// The speed band the bot arrives in at the goal — the carry into whatever comes next (e.g. the
+    /// next race leg, since a checkpoint touch doesn't stop the runner).
+    pub end_band: u8,
+}
 
 impl NavGraph {
     /// Cell whose origin is nearest `pos` (searches outward from `pos`'s grid column). `None`
@@ -84,7 +99,7 @@ impl NavGraph {
             }
             for &li in &self.adjacency[cell as usize] {
                 let link = self.links[li as usize];
-                let ng = g_cost[cell as usize] + link.cost + self.link_extra(li, costs);
+                let ng = g_cost[cell as usize] + link.cost + self.link_extra(li, costs) + self.chained_block(li);
                 if ng < g_cost[link.to as usize] {
                     g_cost[link.to as usize] = ng;
                     came_from[link.to as usize] = li;
@@ -96,6 +111,132 @@ impl NavGraph {
             }
         }
         None
+    }
+
+    /// Speed-band A\*: like [`find_path`](Self::find_path) but planning over `(cell, speed band)`
+    /// states, so carried bhop speed changes both which legs are feasible (a chained speed jump
+    /// needs a minimum entry band) and their cost (a fast band covers a Walk leg quicker). Returns
+    /// the link route plus the planned entry band per leg. `start_speed` seeds the starting band, so
+    /// a bot re-pathing mid-run keeps credit for a hop chain already in progress.
+    ///
+    /// The state space is `cells · NBANDS`; expansion iterates the existing per-cell adjacency and
+    /// calls [`banded_step`](Self::banded_step) on the fly (no 4× graph is materialized), composing
+    /// `link_extra` on top unchanged. Carried speed only survives a corner within [`SPEED_CONE_DEG`]
+    /// of the incoming heading — so the recorded cost depends mildly on the predecessor and the
+    /// search is not strictly optimal, but every approximation is *conservative* (it never credits
+    /// speed it might not have), so routes stay feasible. The heuristic (`dist / BAND_V_MAX`) is
+    /// smaller than [`find_path`]'s, so this never returns a *less* optimal route, only expands more.
+    pub fn find_path_banded(
+        &self,
+        start: CellId,
+        goal: CellId,
+        start_speed: f32,
+        costs: &LinkCosts,
+    ) -> Option<BandedRoute> {
+        use std::cmp::Ordering;
+        use std::collections::BinaryHeap;
+
+        if start == goal {
+            return Some(BandedRoute { links: Vec::new(), bands: Vec::new(), cost: 0.0, end_band: band_of(start_speed) });
+        }
+        let nb = NBANDS as u32;
+        let nstates = self.cells.len() * NBANDS;
+        let h = |cell: CellId| {
+            (self.cells[goal as usize].origin - self.cells[cell as usize].origin).length() / BAND_V_MAX
+        };
+
+        struct Node {
+            f: f32,
+            state: u32,
+        }
+        impl PartialEq for Node {
+            fn eq(&self, o: &Self) -> bool {
+                self.f == o.f
+            }
+        }
+        impl Eq for Node {}
+        impl PartialOrd for Node {
+            fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+                Some(self.cmp(o))
+            }
+        }
+        impl Ord for Node {
+            fn cmp(&self, o: &Self) -> Ordering {
+                o.f.partial_cmp(&self.f).unwrap_or(Ordering::Equal) // min-heap on f
+            }
+        }
+
+        let mut g_cost = vec![f32::INFINITY; nstates];
+        let mut came_link = vec![u32::MAX; nstates]; // link used to reach this state
+        let mut came_state = vec![u32::MAX; nstates]; // predecessor state
+        let mut heap = BinaryHeap::new();
+        let s0 = start * nb + band_of(start_speed) as u32;
+        g_cost[s0 as usize] = 0.0;
+        heap.push(Node { f: h(start), state: s0 });
+
+        while let Some(Node { state, .. }) = heap.pop() {
+            let cell = state / nb;
+            let band = (state % nb) as u8;
+            if cell == goal {
+                let mut route = self.reconstruct_banded(&came_link, &came_state, state);
+                route.cost = g_cost[state as usize];
+                route.end_band = band;
+                return Some(route);
+            }
+            // The heading we arrived along, for the carry-around-corners test.
+            let in_link = came_link[state as usize];
+            let in_dir = (in_link != u32::MAX).then(|| self.link_dir(in_link));
+            for &li in &self.adjacency[cell as usize] {
+                // Carried speed only counts if the corridor continues within the cone.
+                let entry = match in_dir {
+                    Some(d) if d.length_squared() > 0.01 => {
+                        let cos = d.dot(self.link_dir(li)).clamp(-1.0, 1.0);
+                        if cos.acos().to_degrees() > SPEED_CONE_DEG {
+                            0
+                        } else {
+                            band
+                        }
+                    }
+                    _ => band,
+                };
+                let Some((step_cost, exit)) = self.banded_step(li, entry) else {
+                    continue; // infeasible at this entry speed (a chained jump we can't satisfy)
+                };
+                let ng = g_cost[state as usize] + step_cost + self.link_extra(li, costs);
+                let ns = self.links[li as usize].to * nb + exit as u32;
+                if ng < g_cost[ns as usize] {
+                    g_cost[ns as usize] = ng;
+                    came_link[ns as usize] = li;
+                    came_state[ns as usize] = state;
+                    heap.push(Node { f: ng + h(self.links[li as usize].to), state: ns });
+                }
+            }
+        }
+        None
+    }
+
+    /// Walk the banded `came_*` tables back from a goal state into a forward route with per-leg
+    /// entry bands. Stops at the seeded start state (its `came_link` is `u32::MAX`).
+    fn reconstruct_banded(&self, came_link: &[u32], came_state: &[u32], goal_state: u32) -> BandedRoute {
+        let nb = NBANDS as u32;
+        let mut links = Vec::new();
+        let mut bands = Vec::new();
+        let mut state = goal_state;
+        while came_link[state as usize] != u32::MAX {
+            let prev = came_state[state as usize];
+            links.push(came_link[state as usize]);
+            bands.push((prev % nb) as u8); // entry band = the band of the leg's source state
+            state = prev;
+        }
+        links.reverse();
+        bands.reverse();
+        BandedRoute { links, bands, cost: 0.0, end_band: 0 } // cost/end_band filled by the caller
+    }
+
+    /// Unit horizontal heading of a link (source cell → target cell), or zero for a degenerate link.
+    fn link_dir(&self, li: u32) -> Vec2 {
+        let l = self.links[li as usize];
+        (self.cells[l.to as usize].origin.xy() - self.cells[l.from as usize].origin.xy()).normalize_or_zero()
     }
 
     /// The reachable cell (per current door states) whose origin is closest to `goal`'s, when
@@ -151,7 +292,7 @@ impl NavGraph {
             }
             for &li in &self.adjacency[cell as usize] {
                 let link = self.links[li as usize];
-                let ng = g + link.cost + self.link_extra(li, costs);
+                let ng = g + link.cost + self.link_extra(li, costs) + self.chained_block(li);
                 if ng < cost[link.to as usize] {
                     cost[link.to as usize] = ng;
                     heap.push(Node { g: ng, cell: link.to });
@@ -187,11 +328,6 @@ impl NavGraph {
     /// How a link is traversed (walk/step/drop/jump).
     pub fn link_kind(&self, link_idx: u32) -> LinkKind {
         self.links[link_idx as usize].kind
-    }
-
-    /// A link's base travel-time cost in seconds (no live gate/per-bot surcharges).
-    pub fn link_cost(&self, link_idx: u32) -> f32 {
-        self.links[link_idx as usize].cost
     }
 
     /// The standing player-origin position of a cell (the point a bot steers toward).

@@ -27,7 +27,7 @@ use super::{BotIntent, DamageOutcome, GameMode};
 use crate::defs::{Items, PrintLevel, Weapon, VEC_HULL_MAX, VEC_HULL_MIN};
 use crate::entity::EntId;
 use crate::game::{cstring, GameState};
-use crate::navmesh::{LinkCosts, LinkKind};
+use crate::navmesh::{LinkCosts, LinkKind, BAND_FLOOR};
 use crate::race::{RaceNodeType, RaceRoute, RaceRouteNode};
 
 /// The Race mode descriptor.
@@ -312,6 +312,9 @@ impl Race {
         for (ri, route) in g.race.routes.iter().enumerate() {
             let label = format!("route {ri} \"{}\"", route.name);
             let mut est = 0.0f32;
+            // Speed carried between legs: a checkpoint touch doesn't stop the runner, so a leg's
+            // exit band feeds the next leg's entry speed. The first leg starts at run speed.
+            let mut carry = BAND_FLOOR[0];
             let mut verdict: Option<String> = None; // None = passing so far
             for (i, pair) in route.nodes.windows(2).enumerate() {
                 let leg = format!("leg {} ({} -> {})", i + 1, node_label(&pair[0], i), node_label(&pair[1], i + 1));
@@ -323,11 +326,14 @@ impl Race {
                     verdict = Some(format!("FAIL at {leg}: node off the navmesh"));
                     break;
                 };
-                let Some(links) = graph.find_path(a, b, &LinkCosts::default()) else {
+                // Banded so a leg reachable only by carrying speed from the previous one (a chained
+                // speed jump) is credited — the whole point race maps exercise.
+                let Some(route) = graph.find_path_banded(a, b, carry, &LinkCosts::default()) else {
                     verdict = Some(format!("FAIL at {leg}: no path"));
                     break;
                 };
-                if links
+                if route
+                    .links
                     .iter()
                     .any(|&li| matches!(graph.link_kind(li), LinkKind::Hook | LinkKind::RocketJump | LinkKind::DoubleJump))
                 {
@@ -336,7 +342,8 @@ impl Race {
                     ));
                     break;
                 }
-                est += links.iter().map(|&li| graph.link_cost(li)).sum::<f32>();
+                est += route.cost;
+                carry = BAND_FLOOR[route.end_band as usize];
             }
             let line = match verdict {
                 None => {
