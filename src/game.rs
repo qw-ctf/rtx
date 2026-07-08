@@ -92,6 +92,13 @@ const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // loaded routes, clamped; see `crate::race`). Read live — changing it mid-map moves
         // everyone to the new route's start.
         ("rtx_race_route", Float(0.0)),
+        // Offline racing-line optimizer (race mode): iterations *in thousands* to spend TAS'ing each
+        // route's line on a worker thread at map load. `0` (default) = off — bots bhop the plain
+        // navmesh route. See `crate::raceline`.
+        ("rtx_race_optimize", Float(0.0)),
+        // Race bots track the offline-optimized line (when one exists); on by default, but inert
+        // unless `rtx_race_optimize` produced a line. `0` = always follow the plain navmesh route.
+        ("rtx_race_line", Bool(true)),
         // Match composition (organization), orthogonal to the mode: `""` (auto — the mode's natural
         // default), `ffa` (open free-for-all), or a team format `1on1`/`duel`/`2on2`/`2on2on2`/…
         // (a locked N×M match). `ra` ignores this (its 1v1 round queue is fixed). See `crate::mode`.

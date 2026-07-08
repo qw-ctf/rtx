@@ -65,6 +65,25 @@ pub struct RaceRouteNode {
     pub size: Vec3,
 }
 
+/// A node's touch box in world space: KTX gives sized nodes a box of `origin ± size/2` and
+/// default (zero-size) nodes the player hull box (ktx race.c:1705-1712). Shared by the live touch
+/// machine ([`crate::mode::race`]) and the offline race-line rollout ([`crate::raceline`]).
+pub fn node_box(node: &RaceRouteNode) -> (Vec3, Vec3) {
+    if node.size == Vec3::ZERO {
+        (node.origin + defs::VEC_HULL_MIN, node.origin + defs::VEC_HULL_MAX)
+    } else {
+        (node.origin - node.size * 0.5, node.origin + node.size * 0.5)
+    }
+}
+
+/// Whether a player standing at `origin` touches `node` — the player hull box overlapping the
+/// node's box, the same predicate the engine's trigger touch would use.
+pub fn touching(origin: Vec3, node: &RaceRouteNode) -> bool {
+    let (pmin, pmax) = (origin + defs::VEC_HULL_MIN, origin + defs::VEC_HULL_MAX);
+    let (nmin, nmax) = node_box(node);
+    pmin.x <= nmax.x && pmax.x >= nmin.x && pmin.y <= nmax.y && pmax.y >= nmin.y && pmin.z <= nmax.z && pmax.z >= nmin.z
+}
+
 /// One start→finish course. `timeout` is seconds allowed for a run (ktx clamps to 1..=999).
 #[derive(Clone, Debug)]
 pub struct RaceRoute {
@@ -100,6 +119,13 @@ pub struct RaceState {
     pub active: usize,
     /// One-shot latch for the race mode's navmesh routability report.
     pub routability_reported: bool,
+    /// Offline-optimized racing lines, parallel to `routes` (empty until the optimizer runs — only
+    /// when `rtx_race_optimize > 0`). Bots track their active route's line when `rtx_race_line` is on.
+    pub lines: Vec<crate::raceline::RaceLine>,
+    /// In-flight racing-line optimization on a worker thread (`(route index, line)` per route), and a
+    /// one-shot latch so it's kicked at most once per map. See [`crate::mode::race`].
+    pub opt_pending: Option<std::sync::mpsc::Receiver<Vec<(usize, crate::raceline::RaceLine)>>>,
+    pub opt_started: bool,
 }
 
 // --- route file parsing (`race/routes/{mapname}.route`) ---

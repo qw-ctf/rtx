@@ -16,3 +16,7 @@ pub const AIR_CAP: f32 = 30.0;
 /// speed; only the reach does (`speed · airtime`), which is what lets a fast bhopper clear a wide
 /// gap.
 pub const JUMP_VZ: f32 = 270.0;
+
+/// The tallest lip pmove steps over without a jump (`MAX_STEP_HEIGHT`). Shared by the navmesh
+/// (what counts as a walkable step vs a ledge) and the offline pmove sim ([`crate::pmove_sim`]).
+pub const STEP_HEIGHT: f32 = 18.0;

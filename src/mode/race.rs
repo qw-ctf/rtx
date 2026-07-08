@@ -24,11 +24,14 @@
 use glam::Vec3;
 
 use super::{BotIntent, DamageOutcome, GameMode};
-use crate::defs::{Items, PrintLevel, Weapon, VEC_HULL_MAX, VEC_HULL_MIN};
+use crate::bsp::Bsp;
+use crate::defs::{Items, PrintLevel, Weapon};
 use crate::entity::EntId;
 use crate::game::{cstring, GameState};
 use crate::navmesh::{LinkCosts, LinkKind, BAND_FLOOR};
-use crate::race::{RaceNodeType, RaceRoute, RaceRouteNode};
+use crate::pmove_sim::PmParams;
+use crate::race::{touching, RaceNodeType, RaceRoute, RaceRouteNode};
+use crate::raceline::{self, RaceLine};
 
 /// The Race mode descriptor.
 pub(crate) struct Race;
@@ -74,6 +77,7 @@ impl GameMode for Race {
             }
         }
         self.report_routability(g);
+        self.maybe_optimize_lines(g);
         self.run_touch_machine(g);
     }
 
@@ -359,6 +363,154 @@ impl Race {
             host.conprint(&cstring(&line));
         }
     }
+
+    /// Offline racing-line optimization (`rtx_race_optimize` iterations, in thousands): once per map,
+    /// after the navmesh and routability report land, TAS a line for each route on a worker thread
+    /// (same background pattern as the navmesh build) and poll it in. Default off (`0`), so this is
+    /// inert unless an admin opts in. Lines live in memory for the map's lifetime; a disk cache
+    /// (`race/lines/{map}.line`) is deferred pending a verified module file-write ABI.
+    fn maybe_optimize_lines(&self, g: &mut GameState) {
+        // Poll an in-flight optimization.
+        if let Some(rx) = g.race.opt_pending.as_ref() {
+            match rx.try_recv() {
+                Ok(lines) => {
+                    g.race.opt_pending = None;
+                    let mut out = vec![RaceLine::default(); g.race.routes.len()];
+                    let mut done = 0;
+                    for (ri, line) in lines {
+                        if ri < out.len() && line.points.len() >= 2 {
+                            out[ri] = line;
+                            done += 1;
+                        }
+                    }
+                    g.race.lines = out;
+                    g.host
+                        .conprint(&cstring(&format!("rtx: race: optimized {done} racing line(s)\n")));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => g.race.opt_pending = None,
+            }
+            return;
+        }
+        // Kick once, after the routability report, when opted in and the graph is ready.
+        let iters = (g.host.cvar(c"rtx_race_optimize").max(0.0) * 1000.0) as u32;
+        if g.race.opt_started || iters == 0 || !g.race.routability_reported || g.nav.graph.is_none() {
+            return;
+        }
+        g.race.opt_started = true;
+
+        // Build each route's control polyline from the banded path (main thread — needs the graph),
+        // threading each leg's exit band into the next leg's entry speed like the routability report.
+        let graph = g.nav.graph.as_ref().unwrap();
+        let mut jobs: Vec<OptJob> = Vec::new();
+        for (ri, route) in g.race.routes.iter().enumerate() {
+            let mut poly = route.nodes.first().map(|n| vec![n.origin]).unwrap_or_default();
+            let mut carry = BAND_FLOOR[0];
+            let mut ok = !route.nodes.is_empty();
+            for pair in route.nodes.windows(2) {
+                let snap = |n: &RaceRouteNode| {
+                    graph.nearest(n.origin).filter(|&c| (graph.cell_origin(c) - n.origin).length() <= 80.0)
+                };
+                let (Some(a), Some(b)) = (snap(&pair[0]), snap(&pair[1])) else {
+                    ok = false;
+                    break;
+                };
+                let Some(r) = graph.find_path_banded(a, b, carry, &LinkCosts::default()) else {
+                    ok = false;
+                    break;
+                };
+                poly.extend(r.links.iter().map(|&li| graph.cell_origin(graph.link_target(li))));
+                poly.push(pair[1].origin);
+                carry = BAND_FLOOR[r.end_band as usize];
+            }
+            if ok && poly.len() >= 2 {
+                // FNV-1a over the map name, mixed with the route index → deterministic per-map seed.
+                let seed = route
+                    .name
+                    .bytes()
+                    .chain(g.level.mapname.bytes())
+                    .fold(2166136261u32, |h, b| (h ^ b as u32).wrapping_mul(16777619))
+                    ^ ri as u32;
+                jobs.push((ri, poly, route.nodes.clone(), route.timeout, seed));
+            }
+        }
+        if jobs.is_empty() {
+            return;
+        }
+
+        let pm = PmParams {
+            gravity: g.host.cvar(c"sv_gravity").max(1.0),
+            accel: pos_or(g.host.cvar(c"sv_accelerate"), 10.0),
+            friction: pos_or(g.host.cvar(c"sv_friction"), 4.0),
+            stopspeed: pos_or(g.host.cvar(c"sv_stopspeed"), 100.0),
+            maxspeed: pos_or(g.host.cvar(c"sv_maxspeed"), 320.0),
+        };
+        let Some(bytes) = g.host.read_file(&cstring(&format!("maps/{}.bsp", g.level.mapname))) else {
+            return;
+        };
+        let njobs = jobs.len();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let lines = match Bsp::parse(&bytes) {
+                Some(bsp) => jobs
+                    .iter()
+                    .map(|(ri, poly, nodes, timeout, seed)| {
+                        (*ri, raceline::optimize_route(&bsp, poly, nodes, &pm, *timeout, *seed, iters))
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
+            let _ = tx.send(lines);
+        });
+        g.race.opt_pending = Some(rx);
+        g.host
+            .dprint(&cstring(&format!("rtx: race: optimizing {njobs} racing line(s) in background...\n")));
+    }
+}
+
+/// A positive cvar value, or a fallback when it's unset/nonpositive.
+fn pos_or(v: f32, fallback: f32) -> f32 {
+    if v > 0.0 {
+        v
+    } else {
+        fallback
+    }
+}
+
+/// How far a bot may drift from the optimized line before it's abandoned for navmesh recovery.
+const RACE_LINE_STRAY: f32 = 160.0;
+
+/// One racing-line optimization job handed to the worker: `(route index, control polyline, route
+/// nodes, timeout seconds, deterministic seed)`.
+type OptJob = (usize, Vec<Vec3>, Vec<RaceRouteNode>, f32, u32);
+
+impl GameState {
+    /// The look-ahead point on the active route's optimized racing line for a bot at `origin`, or
+    /// `None` when there's no line, the feature is off, or the bot has strayed too far (recover on
+    /// the navmesh instead). Consulted by `run_bot` to bias the bhop bearing in race mode. Inert
+    /// unless `rtx_race_optimize` produced a line — the data's presence is the gate, so this stays
+    /// `None` in every non-race mode (their `race.lines` is empty).
+    pub(crate) fn race_line_lookahead(&self, origin: Vec3) -> Option<Vec3> {
+        if !self.host.cvar_bool(c"rtx_race_line") {
+            return None;
+        }
+        let line = self.race.lines.get(self.race.active)?;
+        if line.points.len() < 2 {
+            return None;
+        }
+        let (mut bi, mut bd) = (0usize, f32::INFINITY);
+        for (i, p) in line.points.iter().enumerate() {
+            let d = (p.pos - origin).length_squared();
+            if d < bd {
+                bd = d;
+                bi = i;
+            }
+        }
+        if bd > RACE_LINE_STRAY * RACE_LINE_STRAY {
+            return None; // off the line — let the navmesh route recover it
+        }
+        Some(line.points[(bi + 2).min(line.points.len() - 1)].pos)
+    }
 }
 
 /// Reset a runner's progress to "standing on the start pad, clock not running". Their best
@@ -367,24 +519,6 @@ fn reset_run(g: &mut GameState, e: EntId) {
     let slot = &mut g.entities[e].mode_p.race;
     slot.next = 1;
     slot.run_start = 0.0;
-}
-
-/// A node's touch box in world space: KTX gives sized nodes a box of `origin ± size/2` and
-/// default (zero-size) nodes the player hull box (ktx race.c:1705-1712).
-fn node_box(node: &RaceRouteNode) -> (Vec3, Vec3) {
-    if node.size == Vec3::ZERO {
-        (node.origin + VEC_HULL_MIN, node.origin + VEC_HULL_MAX)
-    } else {
-        (node.origin - node.size * 0.5, node.origin + node.size * 0.5)
-    }
-}
-
-/// Whether a player standing at `origin` touches `node` — the player hull box overlapping the
-/// node's box, the same predicate the engine's trigger touch would use.
-fn touching(origin: Vec3, node: &RaceRouteNode) -> bool {
-    let (pmin, pmax) = (origin + VEC_HULL_MIN, origin + VEC_HULL_MAX);
-    let (nmin, nmax) = node_box(node);
-    pmin.x <= nmax.x && pmax.x >= nmin.x && pmin.y <= nmax.y && pmax.y >= nmin.y && pmin.z <= nmax.z && pmax.z >= nmin.z
 }
 
 /// A human-readable node name for the routability report ("start", "checkpoint 2", "finish").
@@ -399,6 +533,7 @@ fn node_label(node: &RaceRouteNode, index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::race::node_box;
 
     fn node(origin: Vec3, size: Vec3) -> RaceRouteNode {
         RaceRouteNode {

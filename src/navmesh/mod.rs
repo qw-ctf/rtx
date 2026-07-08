@@ -28,12 +28,11 @@ use hook::{simulate_arc, ArcResult};
 use rocketjump::{rj_perturb_ok, rocket_jump_cost, simulate_rocket_jump, RJ_DELAYS, RJ_PITCHES};
 
 use crate::bsp::Bsp;
-use crate::qphys::{AIR_CAP, JUMP_VZ};
+use crate::qphys::{AIR_CAP, JUMP_VZ, STEP_HEIGHT};
 
 // --- player + movement constants (QuakeWorld pmove) ---
+// `STEP_HEIGHT` (pmove's free step-up) is shared from `crate::qphys` (imported above).
 
-/// `STEPSIZE` — pmove climbs steps up to this for free, no jump needed.
-const STEP_HEIGHT: f32 = 18.0;
 /// Height delta treated as effectively flat ground (a `Walk`).
 const WALK_DZ: f32 = 8.0;
 /// Largest one-way fall we'll encode as a landing (`Drop` links, and `JumpGap` links that leap

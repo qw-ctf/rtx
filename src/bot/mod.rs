@@ -919,6 +919,11 @@ fn run_bot(game: &mut GameState, e: EntId) {
         return;
     };
 
+    // Race mode: the offline-optimized racing line's look-ahead point to bias the bhop bearing
+    // toward (`None` outside race, with the feature off, or when the bot has strayed off the line —
+    // then it recovers on the plain navmesh route). Computed here while only `graph` is borrowed.
+    let race_line_ahead = game.race_line_lookahead(origin);
+
     // Whether each gate's activator can be triggered right now: a shoot activator is "ready" only
     // while it takes damage — re-triggerable triggers go dead during their cooldown.
     let gate_ready: Vec<bool> = (0..graph.gate_count())
@@ -1367,7 +1372,13 @@ fn run_bot(game: &mut GameState, e: EntId) {
             accel: if accel > 0.0 { accel } else { 10.0 },
             maxspeed: if maxspeed > 0.0 { maxspeed } else { 320.0 },
         };
-        let ahead = if sj_active { waypoint.xy() } else { look_point.xy() } - origin.xy();
+        // A committed speed jump aims at its gap; otherwise steer toward the racing-line look-ahead
+        // (race mode, when a line exists) or the navmesh corridor look-ahead point.
+        let ahead = match race_line_ahead {
+            Some(lp) if !sj_active => lp.xy() - origin.xy(),
+            _ if sj_active => waypoint.xy() - origin.xy(),
+            _ => look_point.xy() - origin.xy(),
+        };
         let to_wp = waypoint.xy() - origin.xy();
         let dir = if ahead.length() > 8.0 { ahead } else { to_wp };
         let bearing = dir.y.atan2(dir.x).to_degrees();
