@@ -536,6 +536,10 @@ impl NavGraph {
             if self.has_ground_near(a.gx + dgx.signum(), a.gy + dgy.signum(), a.origin.z) {
                 return None;
             }
+            // And the hull must actually fit down into the target — not a slot too small for it.
+            if !descent_clear(bsp, a.origin.z, b.origin) {
+                return None;
+            }
             LinkKind::Drop
         } else {
             return None; // up beyond a jump's apex — needs the windowed ledge jumps
@@ -594,6 +598,11 @@ impl NavGraph {
             if !clear {
                 continue;
             }
+            // A jump *down* must land in a spot the hull can descend into — arc sampling can skip a
+            // thin floor lip (a slot too small for the hull) that the vertical hull trace catches.
+            if dz < 0.0 && !descent_clear(bsp, a.origin.z, b.origin) {
+                continue;
+            }
             let slot = &mut best[dir_bucket(dgx, dgy)][jump_elev_band(dz)];
             if slot.is_none_or(|(d, _)| horiz < d) {
                 *slot = Some((
@@ -644,6 +653,7 @@ impl NavGraph {
                 // static graph already provides (walk/step/jump).
                 if self.has_ground_near(a.gx + dgx.signum(), a.gy + dgy.signum(), a.origin.z)
                     || !arc_clear_peak(bsp, a.origin, b.origin, DOUBLE_ARC_PEAK, 12)
+                    || (dz < 0.0 && !descent_clear(bsp, a.origin.z, b.origin))
                     || self.has_direct_link(from, to)
                 {
                     continue;
@@ -1696,6 +1706,18 @@ fn bisect_floor(bsp: &Bsp, x: f32, y: f32, z_solid: f32, z_empty: f32) -> f32 {
         }
     }
     hi
+}
+
+/// Whether the standing player hull can actually **descend** into `to` from height `from_z`: trace
+/// the hull straight down the column above `to`. A floor gap too small for the ±16 hull — a grate or
+/// slot you can see the water through but can't fit through — blocks the trace, so no drop / down-jump
+/// link is generated into it. Point-sampled floor finding falls through such slots; this doesn't.
+fn descent_clear(bsp: &Bsp, from_z: f32, to: Vec3) -> bool {
+    if from_z <= to.z {
+        return true; // not a descent
+    }
+    let tr = bsp.hull1_trace(Vec3::new(to.x, to.y, from_z), to);
+    !tr.start_solid && tr.fraction > 0.99
 }
 
 /// Whether the straight segment between two standing origins is free of solid (sampled at the

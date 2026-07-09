@@ -680,6 +680,24 @@ mod tests {
         }
         eprintln!("{path}: {submerged}/{} cells submerged", graph.cells.len());
 
+        // No down-link (drop / down-jump) may land where the hull can't descend — a floor slot too
+        // small for the hull. Trace the hull straight down the column above each landing.
+        for link in &graph.links {
+            let a = graph.cell_origin(link.from);
+            let b = graph.cell_origin(link.to);
+            let dz = b.z - a.z;
+            let down = matches!(link.kind, LinkKind::Drop | LinkKind::JumpGap | LinkKind::DoubleJump);
+            if down && dz < -18.0 {
+                let tr = bsp.hull1_trace(glam::Vec3::new(b.x, b.y, a.z), b);
+                assert!(
+                    !tr.start_solid && tr.fraction > 0.99,
+                    "{:?} {a:?}->{b:?} lands where the hull can't descend (frac {:.2})",
+                    link.kind,
+                    tr.fraction
+                );
+            }
+        }
+
         let surface = nav_surface(&graph);
         assert_eq!(surface.len(), graph.cells.len() * 6, "surface should be 2 triangles per cell");
         assert!(surface.iter().all(|v| v.color == link_color(LinkKind::Walk)), "surface tiles are Walk-green");
