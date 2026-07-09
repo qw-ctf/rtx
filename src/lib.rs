@@ -86,7 +86,18 @@ pub extern "C" fn vmMain(cmd: i32, arg0: i32, arg1: i32, arg2: i32) -> isize {
         return 0;
     };
     let cell = GAME.get().expect("vmMain called before dllEntry");
-    // SAFETY: single-threaded engine; no other live borrow of the GameState exists.
-    let game = unsafe { &mut *cell.0.get() };
-    game.dispatch(cmd, arg0, arg1, arg2)
+    // SAFETY: single-threaded engine; no other live borrow of the GameState exists. The borrow is
+    // confined to this block and dropped before `drain_roster` runs.
+    let ret = {
+        let game = unsafe { &mut *cell.0.get() };
+        game.dispatch(cmd, arg0, arg1, arg2)
+    };
+    // Apply any bot add/remove queued during the frame *now*, with no `&mut GameState` borrow live.
+    // `add_bot`/`remove_bot` run the module's client callbacks synchronously and re-entrantly; doing
+    // this here (rather than inline in `manage_population`) keeps the re-entered `vmMain`'s borrow
+    // the sole one, instead of aliasing a live outer borrow. See [`crate::bot::drain_roster`].
+    // SAFETY: single-threaded; the block above dropped its borrow, so no reference into the
+    // GameState is live across the re-entrant trap this fires.
+    unsafe { crate::bot::drain_roster(cell.0.get()) };
+    ret
 }

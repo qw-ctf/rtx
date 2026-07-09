@@ -13,6 +13,8 @@
 //!
 //! [navmesh]: crate::navmesh
 
+use std::ffi::CString;
+
 use glam::{Vec2, Vec3, Vec3Swizzles};
 
 pub(crate) mod bhop;
@@ -193,12 +195,70 @@ pub fn manage_population(game: &mut GameState) {
         }
     }
 
+    // Queue at most one population change per frame; `vmMain` applies it via `drain_roster` once
+    // this frame's `&mut GameState` is released, so the trap's re-entrant client callbacks hold the
+    // sole borrow instead of aliasing ours. `add_bot`/`remove_bot` must not be called here directly.
     if count < want {
-        add_one_bot(game, count);
+        queue_add_bot(game, count);
     } else if count > want {
         if let Some(e) = last_bot {
-            host.remove_bot(game.entities[e].bot.client);
-            game.retire_slot(e); // fully retire the slot (bot state + in_use/classname/arena)
+            let client = game.entities[e].bot.client;
+            game.pending_roster = Some(RosterOp::Remove { client, slot: e });
+        }
+    }
+}
+
+/// A population change [`manage_population`] wants applied, deferred to the `vmMain` boundary so the
+/// re-entrant engine trap doesn't fire while a `&mut GameState` borrow is live. See
+/// [`drain_roster`] and [`crate::game::GameState::pending_roster`].
+pub(crate) enum RosterOp {
+    /// Add a fake client with this name/colours (skin is always `"base"`).
+    Add { name: CString, bottom: i32, top: i32 },
+    /// Remove the fake client at edict `slot` (its engine client id is `client`).
+    Remove { client: i32, slot: EntId },
+}
+
+/// Apply the queued [`RosterOp`], if any. `add_bot`/`remove_bot` run the module's
+/// `ClientConnect`/`PutClientInServer`/`ClientDisconnect` synchronously and re-entrantly, so this
+/// is called from `vmMain` with **no** `&mut GameState` borrow live: the re-entered `vmMain` then
+/// holds the sole borrow (soundly nested) instead of aliasing one of ours.
+///
+/// # Safety
+/// `game` must point at the live `GameState`, and no other reference into it may be live for the
+/// duration of this call (guaranteed by calling it from `vmMain` after the frame's borrow drops).
+/// The engine is single-threaded, so the re-entrant callbacks the trap fires are the only nested
+/// access, and each borrow below is created briefly and dropped before the next trap.
+pub(crate) unsafe fn drain_roster(game: *mut GameState) {
+    // Take the op out (and copy the `Copy` host handle) under a short borrow that ends here — so a
+    // re-entrant `vmMain` -> `drain_roster` during the trap finds `None`, and no borrow spans the
+    // trap. Every `&mut *game` below is an explicit, scoped reborrow, never live across a trap.
+    let (op, host) = {
+        let g = &mut *game;
+        (g.pending_roster.take(), g.host)
+    };
+    let Some(op) = op else {
+        return;
+    };
+    match op {
+        // `add_bot` sets the bot's name in userinfo and broadcasts it — don't re-set "name"
+        // afterwards (that renamed the bot to an empty string and kept it off the scoreboard). Tag
+        // the edict as bot-driven only after the trap returns.
+        RosterOp::Add { name, bottom, top } => {
+            let client = host.add_bot(&name, bottom, top, c"base");
+            if client > 0 {
+                let g = &mut *game;
+                g.entities[EntId(client as u32)].bot = BotState {
+                    is_bot: true,
+                    client,
+                    goal_cell: u32::MAX,
+                    ..Default::default()
+                };
+            }
+        }
+        RosterOp::Remove { client, slot } => {
+            host.remove_bot(client);
+            let g = &mut *game;
+            g.retire_slot(slot); // fully retire the slot (bot state + in_use/classname/arena)
         }
     }
 }
@@ -220,24 +280,13 @@ fn bot_target(cvar_want: i32, humans: i32, cfg: crate::mode::team::MatchConfig, 
     Some(cvar_want.min((seats - humans).max(0)))
 }
 
-/// Spawn one bot. `add_bot` runs the module's ClientConnect + PutClientInServer for the new
-/// edict synchronously, then we tag that edict as bot-driven. No-op if the server is full.
-fn add_one_bot(game: &mut GameState, index: i32) {
-    let host = *game.host();
+/// Queue the add of one bot (name/colours by rotating `index`). The actual `add_bot` trap — which
+/// re-enters the module — is fired later by [`drain_roster`] at the `vmMain` boundary, not here,
+/// so it can't alias the population manager's `&mut GameState`.
+fn queue_add_bot(game: &mut GameState, index: i32) {
     let name = cstring(&format!("[rtx]{}", bot_name(index)));
     let (bottom, top) = bot_colors(index);
-    // `add_bot` already sets the bot's name in its userinfo and broadcasts it (the
-    // "[rtx]Grunt entered the game" line) — don't re-set "name" afterwards: doing so renamed the
-    // bot to an empty string and is what kept bots off the scoreboard.
-    let client = host.add_bot(&name, bottom, top, c"base");
-    if client > 0 {
-        game.entities[EntId(client as u32)].bot = BotState {
-            is_bot: true,
-            client,
-            goal_cell: u32::MAX,
-            ..Default::default()
-        };
-    }
+    game.pending_roster = Some(RosterOp::Add { name, bottom, top });
 }
 
 /// A rotating set of bot names.

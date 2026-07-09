@@ -264,6 +264,13 @@ pub struct GameState {
     map_spawned: bool,
     /// One-shot: whether we've logged that the normal frame is driving the bots (diagnostic).
     normal_bot_drive_logged: bool,
+    /// A population change the bot manager wants applied this frame (add or remove one bot),
+    /// deferred out of the frame. `add_bot`/`remove_bot` make the engine run our
+    /// `ClientConnect`/`PutClientInServer`/`ClientDisconnect` *synchronously and re-entrantly*; if
+    /// we called them while a `&mut GameState` borrow is live (as `manage_population` does), the
+    /// re-entered `vmMain` would create a second, aliasing `&mut GameState` — undefined behavior.
+    /// `vmMain` drains this after the frame's borrow is released. See [`bot::drain_roster`].
+    pub(crate) pending_roster: Option<bot::RosterOp>,
     /// Escape hatch for string-declared sounds (precache-and-intern at load time). Empty for the
     /// current port — every sound is a registry handle — but here so a runtime path is registered
     /// through the same precache-guaranteeing door. Use `dyn_assets.sound(&host, path)`.
@@ -325,6 +332,7 @@ impl GameState {
             bot_frame_seen: false,
             map_spawned: false,
             normal_bot_drive_logged: false,
+            pending_roster: None,
             dyn_assets: DynAssets::default(),
         }
     }
