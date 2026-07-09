@@ -522,6 +522,16 @@ impl NavGraph {
         } else if dz.abs() <= STEP_HEIGHT {
             LinkKind::Step
         } else if (-MAX_DROP..-STEP_HEIGHT).contains(&dz) {
+            // A drop is only real off a **ledge**: the column stepped toward the target must not
+            // have walkable ground at our height (mirrors the ledge check in `find_jumps`). Without
+            // this, a cell in the middle of a floor sprouts phantom drops onto lower cells beneath
+            // it — `path_clear` only samples the top corridor, so it never sees the solid slab in
+            // between (worst on thin floors, where a lower room sits directly under every cell). A
+            // bot handed such a link freezes trying to "drop" straight through solid ground.
+            let (dgx, dgy) = (b.gx - a.gx, b.gy - a.gy);
+            if self.has_ground_near(a.gx + dgx.signum(), a.gy + dgy.signum(), a.origin.z) {
+                return None;
+            }
             LinkKind::Drop
         } else {
             return None; // up beyond a jump's apex — needs the windowed ledge jumps
