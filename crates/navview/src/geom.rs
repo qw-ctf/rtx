@@ -653,7 +653,7 @@ mod tests {
             return;
         };
         let bytes = std::fs::read(&path).expect("read bsp");
-        let (_bsp, graph) = build_navmesh(
+        let (bsp, graph) = build_navmesh(
             bytes,
             Vec::new(),
             Vec::new(),
@@ -664,6 +664,21 @@ mod tests {
             Some(RocketJumpParams { gravity: 800.0, rj_extra: 0.0 }),
         )
         .expect("build navmesh");
+
+        // No jump-type link may take off from a submerged cell — you can't jump underwater.
+        let jump_kinds =
+            [LinkKind::JumpGap, LinkKind::DoubleJump, LinkKind::SpeedJump, LinkKind::RocketJump];
+        let submerged = graph.cells.iter().filter(|c| bsp.is_liquid_at(c.origin)).count();
+        for link in &graph.links {
+            if jump_kinds.contains(&link.kind) {
+                assert!(
+                    !bsp.is_liquid_at(graph.cell_origin(link.from)),
+                    "{:?} link takes off from a submerged cell",
+                    link.kind
+                );
+            }
+        }
+        eprintln!("{path}: {submerged}/{} cells submerged", graph.cells.len());
 
         let surface = nav_surface(&graph);
         assert_eq!(surface.len(), graph.cells.len() * 6, "surface should be 2 triangles per cell");

@@ -58,19 +58,23 @@ enum Version {
     Bsp2,
 }
 
-/// The lump directory, reading only the three lumps the navmesh needs and skipping the rest
-/// (`pad_before` jumps over the unused entries: 1 before planes, 7 before clipnodes, 4 before
-/// models).
+/// The lump directory, reading only the lumps the navmesh needs and skipping the rest with
+/// `pad_before`. Besides the clip hull (`planes`, `clipnodes`, `models`) it also reads the render
+/// tree (`nodes` + `leafs`, lumps 5 and 10) so `pointcontents` can answer which *liquid* a point is
+/// in — the clip hull only resolves solid/empty.
 #[derive(BinRead)]
 #[br(little)]
 struct Header {
     version: Version,
     #[br(pad_before = 8)]
-    planes: Lump,
-    #[br(pad_before = 56)]
-    clipnodes: Lump,
-    #[br(pad_before = 32)]
-    models: Lump,
+    planes: Lump, // lump 1
+    #[br(pad_before = 24)]
+    nodes: Lump, // lump 5 (render tree) — skip textures/vertexes/vis
+    #[br(pad_before = 24)]
+    clipnodes: Lump, // lump 9 — skip texinfo/faces/lighting
+    leafs: Lump, // lump 10 (render leaf contents)
+    #[br(pad_before = 24)]
+    models: Lump, // lump 14 — skip marksurfaces/edges/surfedges
 }
 
 /// A BSP plane (`dplane_t`): `normal·p - dist`. `kind` is the axial type — `0/1/2` for an
@@ -110,8 +114,8 @@ impl From<ClipNodeV1> for ClipNode {
     }
 }
 
-/// The world model (`models[0]`): we only need its bounding box and the hull-1 headnode, so
-/// `pad_before` skips `origin` and `headnode[0]` and the trailing fields aren't read at all.
+/// The world model (`models[0]`): its bounding box, the render-tree headnode (`headnode[0]`, for
+/// `pointcontents`), and the hull-1 headnode (`headnode[1]`); the trailing fields aren't read.
 #[derive(BinRead)]
 #[br(little)]
 struct Model {
@@ -119,8 +123,61 @@ struct Model {
     mins: Vec3,
     #[br(map = Vec3::from_array)]
     maxs: Vec3,
-    #[br(pad_before = 16)] // skip origin (12) + headnode[0] (4)
-    clip1: i32,
+    #[br(pad_before = 12)] // skip origin (12)
+    render_head: i32,      // headnode[0] — render (hull 0) tree root
+    clip1: i32,            // headnode[1] — hull-1 (player clip) tree root
+}
+
+/// `dnode_t` render node (v29/HL): `i16` children. Only the split plane and children are needed for
+/// a point-contents descent; the bbox and face range are skipped.
+#[derive(BinRead, Clone, Copy)]
+#[br(little)]
+struct NodeV1 {
+    plane: u32,
+    #[br(pad_after = 16)] // skip mins[3]i16 + maxs[3]i16 + firstface u16 + numfaces u16
+    children: [i16; 2],
+}
+
+/// `dnode_t` render node (BSP2): `i32` children, `f32` bbox.
+#[derive(BinRead, Clone, Copy)]
+#[br(little)]
+struct NodeV2 {
+    plane: u32,
+    #[br(pad_after = 32)] // skip mins[3]f32 + maxs[3]f32 + firstface u32 + numfaces u32
+    children: [i32; 2],
+}
+
+/// A render-tree node normalized to `i32` children. A non-negative child is a node index; a negative
+/// child is a leaf, index `-1 - child`.
+#[derive(Clone, Copy)]
+struct RenderNode {
+    plane: u32,
+    children: [i32; 2],
+}
+
+impl From<NodeV1> for RenderNode {
+    fn from(n: NodeV1) -> Self {
+        RenderNode { plane: n.plane, children: [n.children[0] as i32, n.children[1] as i32] }
+    }
+}
+impl From<NodeV2> for RenderNode {
+    fn from(n: NodeV2) -> Self {
+        RenderNode { plane: n.plane, children: n.children }
+    }
+}
+
+/// `dleaf_t` — only the leading `contents` (`CONTENTS_*`) is needed. v29/HL is 28 bytes, BSP2 44.
+#[derive(BinRead, Clone, Copy)]
+#[br(little)]
+struct LeafV1 {
+    #[br(pad_after = 24)]
+    contents: i32,
+}
+#[derive(BinRead, Clone, Copy)]
+#[br(little)]
+struct LeafV2 {
+    #[br(pad_after = 40)]
+    contents: i32,
 }
 
 /// The subset of a parsed BSP the navmesh consumes.
@@ -132,6 +189,11 @@ pub struct Bsp {
     /// World model bounding box (float coords), the volume the navmesh voxelizes.
     pub mins: Vec3,
     pub maxs: Vec3,
+    /// The render (hull 0) tree — nodes + per-leaf contents + root — used only by `pointcontents`
+    /// to tell which liquid (if any) a point is in. Private: callers go through `pointcontents`.
+    render_nodes: Vec<RenderNode>,
+    leaf_contents: Vec<i32>,
+    render_headnode: i32,
 }
 
 impl Bsp {
@@ -142,10 +204,22 @@ impl Bsp {
         let header: Header = c.read_le().ok()?;
 
         let planes = read_lump::<Plane>(&mut c, &header.planes).ok()?;
-        let clipnodes = if header.version == Version::Bsp2 {
+        let bsp2 = header.version == Version::Bsp2;
+        let clipnodes = if bsp2 {
             read_lump::<ClipNode>(&mut c, &header.clipnodes).ok()?
         } else {
             read_lump_into::<ClipNodeV1, ClipNode>(&mut c, &header.clipnodes).ok()?
+        };
+        // Render tree (for liquid point-contents). v29/HL nodes are 24 B / leafs 28 B; BSP2 44 / 44.
+        let render_nodes = if bsp2 {
+            read_lump_stride::<NodeV2, RenderNode>(&mut c, &header.nodes, 44).ok()?
+        } else {
+            read_lump_stride::<NodeV1, RenderNode>(&mut c, &header.nodes, 24).ok()?
+        };
+        let leaf_contents: Vec<i32> = if bsp2 {
+            read_lump_stride::<LeafV2, LeafV2>(&mut c, &header.leafs, 44).ok()?.iter().map(|l| l.contents).collect()
+        } else {
+            read_lump_stride::<LeafV1, LeafV1>(&mut c, &header.leafs, 28).ok()?.iter().map(|l| l.contents).collect()
         };
 
         c.seek(SeekFrom::Start(header.models.offset as u64)).ok()?;
@@ -157,7 +231,40 @@ impl Bsp {
             hull1_headnode: model.clip1,
             mins: model.mins,
             maxs: model.maxs,
+            render_nodes,
+            leaf_contents,
+            render_headnode: model.render_head,
         })
+    }
+
+    /// The `CONTENTS_*` value at `p` in the render hull (hull 0) — the one that carries liquids
+    /// (`SV_PointContents`). Descends `models[0]`'s node tree to a leaf and returns its contents.
+    /// Out-of-range indices in a malformed file resolve to `CONTENTS_SOLID` and never panic.
+    pub fn pointcontents(&self, p: Vec3) -> i32 {
+        let mut num = self.render_headnode;
+        while num >= 0 {
+            let Some(node) = self.render_nodes.get(num as usize) else {
+                return CONTENTS_SOLID;
+            };
+            let Some(plane) = self.planes.get(node.plane as usize) else {
+                return CONTENTS_SOLID;
+            };
+            let d = if plane.kind < 3 {
+                p[plane.kind as usize] - plane.dist
+            } else {
+                plane.normal.dot(p) - plane.dist
+            };
+            num = node.children[usize::from(d < 0.0)];
+        }
+        // A negative child is leaf `-1 - num`.
+        self.leaf_contents.get((-1 - num) as usize).copied().unwrap_or(CONTENTS_SOLID)
+    }
+
+    /// Whether `p` is inside a liquid volume (water / slime / lava) per the render hull. Used by the
+    /// navmesh to reject jump links whose takeoff is submerged — a submerged player can't jump (the
+    /// jump input swims up).
+    pub fn is_liquid_at(&self, p: Vec3) -> bool {
+        matches!(self.pointcontents(p), CONTENTS_WATER | CONTENTS_SLIME | CONTENTS_LAVA)
     }
 
     /// Walk the hull rooted at `headnode`, returning the `CONTENTS_*` value at `p`
@@ -320,6 +427,22 @@ where
     Ok(out)
 }
 
+/// Like [`read_lump_into`] but with an explicit on-disk record `stride`, for records whose Rust
+/// `size_of` doesn't match the file layout because trailing fields are skipped with `pad_after`.
+fn read_lump_stride<T, U>(c: &mut Cursor<&[u8]>, lump: &Lump, stride: usize) -> BinResult<Vec<U>>
+where
+    T: BinRead + for<'a> BinRead<Args<'a> = ()>,
+    U: From<T>,
+{
+    c.seek(SeekFrom::Start(lump.offset as u64))?;
+    let count = lump.size as usize / stride;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        out.push(T::read_le(c)?.into());
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,6 +469,10 @@ mod tests {
             hull1_headnode: 0,
             mins: Vec3::splat(-256.0),
             maxs: Vec3::splat(256.0),
+            // No render tree in this hand-built hull — pointcontents isn't exercised here.
+            render_nodes: Vec::new(),
+            leaf_contents: Vec::new(),
+            render_headnode: 0,
         }
     }
 

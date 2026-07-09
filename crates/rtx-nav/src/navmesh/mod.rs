@@ -506,7 +506,11 @@ impl NavGraph {
         let (a, b) = (self.cells[from as usize], self.cells[to as usize]);
         let dz = b.origin.z - a.origin.z;
         if dz > STEP_HEIGHT && dz <= JUMP_APEX {
-            // Hop up onto the adjacent higher footing; clear the standing-jump arc to it.
+            // Hop up onto the adjacent higher footing; clear the standing-jump arc to it. Not from a
+            // submerged cell, though — you can't jump when submerged (the jump input swims up).
+            if bsp.is_liquid_at(a.origin) {
+                return None;
+            }
             return arc_clear(bsp, a.origin, b.origin).then(|| {
                 let horiz = (b.origin.xy() - a.origin.xy()).length();
                 Link {
@@ -557,6 +561,9 @@ impl NavGraph {
     /// separate ledge, and the pit floor doesn't lead back up to that ledge.
     fn find_jumps(&self, bsp: &Bsp, from: CellId) -> Vec<Link> {
         let a = self.cells[from as usize];
+        if bsp.is_liquid_at(a.origin) {
+            return Vec::new(); // submerged: the jump input swims up, so a jump takeoff here is a no-op
+        }
         // best (distance, link) per compass direction bucket (3×3, center unused) × elevation band
         let mut best = [[None::<(f32, Link)>; JUMP_ELEV_BANDS]; 9];
         for to in self.neighbors_within(a.gx, a.gy, jump_grid_radius()) {
@@ -611,6 +618,9 @@ impl NavGraph {
         let mut pending: Vec<Link> = Vec::new();
         for from in 0..self.cells.len() as CellId {
             let a = self.cells[from as usize];
+            if bsp.is_liquid_at(a.origin) {
+                continue; // submerged takeoff: can't jump (the jump input swims up)
+            }
             let mut best: [Option<(f32, Link)>; 9] = Default::default();
             for to in self.neighbors_within(a.gx, a.gy, double_jump_grid_radius()) {
                 if to == from {
@@ -695,6 +705,9 @@ impl NavGraph {
         out: &mut Vec<(Link, SpeedJumpTraversal)>,
     ) {
         let a = self.cells[ledge as usize];
+        if bsp.is_liquid_at(a.origin) {
+            return; // submerged takeoff: can't jump (the jump input swims up)
+        }
         let mut cands: Vec<(f32, Link, SpeedJumpTraversal)> = Vec::new(); // stand-start (v_req, link, tr)
         let mut cands_chained: Vec<(f32, Link, SpeedJumpTraversal)> = Vec::new(); // chained
         // The most speed a chained entry can ever carry into a jump (the top band's floor); a jump
@@ -1317,6 +1330,9 @@ impl NavGraph {
         out: &mut Vec<(Link, RocketJumpTraversal)>,
     ) {
         let a = self.cells[from as usize].origin;
+        if bsp.is_liquid_at(a) {
+            return; // submerged takeoff: can't jump to start the rocket jump (the jump input swims up)
+        }
         let is_solid = |p: Vec3| bsp.is_solid(p);
         // Height an RJ must clear to earn its health cost: past a plain (or double) jump's apex.
         let useful_apex = if double_jump { DOUBLE_JUMP_APEX } else { JUMP_APEX };
