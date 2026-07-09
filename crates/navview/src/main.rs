@@ -177,6 +177,7 @@ impl App {
         };
 
         gpu.set_mesh(&mesh.vertices);
+        gpu.set_water(&mesh.water);
         gpu.clear_overlay();
         self.graph = None;
         self.camera.frame(mesh.mins, mesh.maxs);

@@ -32,7 +32,8 @@ pub struct MeshVertex {
     pub normal: [f32; 3],
 }
 
-/// A navmesh line vertex: position + RGB color (one draw as `LineList`).
+/// A flat colored triangle/line vertex: position + RGB color. Used for nav lines (`LineList`) and
+/// for the translucent liquid surfaces (`TriangleList`).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct LineVertex {
@@ -40,9 +41,12 @@ pub struct LineVertex {
     pub color: [f32; 3],
 }
 
-/// The triangulated world geometry plus its bounds (for framing the camera).
+/// The triangulated world geometry plus its bounds (for framing the camera). Opaque solid surfaces
+/// go in `vertices` (backface-culled grey); liquid surfaces go in `water` (drawn additive), sky is
+/// dropped entirely.
 pub struct RenderMesh {
     pub vertices: Vec<MeshVertex>,
+    pub water: Vec<LineVertex>,
     pub mins: Vec3,
     pub maxs: Vec3,
 }
@@ -67,7 +71,10 @@ struct Lump {
 }
 
 // Lump indices (identical across the three versions).
+const LUMP_PLANES: usize = 1;
+const LUMP_TEXTURES: usize = 2;
 const LUMP_VERTEXES: usize = 3;
+const LUMP_TEXINFO: usize = 6;
 const LUMP_FACES: usize = 7;
 const LUMP_EDGES: usize = 12;
 const LUMP_SURFEDGES: usize = 13;
@@ -75,7 +82,10 @@ const LUMP_MODELS: usize = 14;
 
 const BSP2_MAGIC: u32 = u32::from_le_bytes(*b"BSP2");
 
-// On-disk record sizes (bytes). binrw reads packed, so these are exact.
+// On-disk record sizes (bytes). binrw reads packed, so these are exact. Planes and texinfo keep the
+// same layout across BSP29/30/BSP2 (only faces/edges widen).
+const PLANE_SIZE: usize = 20; // normal[3] f32 + dist f32 + type i32
+const TEXINFO_SIZE: usize = 40; // vecs[2][4] f32 (32) + miptex i32 + flags i32
 const VERTEX_SIZE: usize = 12; // [f32; 3]
 const SURFEDGE_SIZE: usize = 4; // i32
 const EDGE_SIZE_V1: usize = 4; // [u16; 2]
@@ -84,15 +94,107 @@ const FACE_SIZE_V1: usize = 20;
 const FACE_SIZE_V2: usize = 28;
 const MODEL_SIZE: usize = 64;
 
+/// A BSP plane — only its normal is needed (to orient faces for backface culling and lighting).
+#[derive(BinRead, Clone, Copy)]
+#[br(little)]
+struct PlaneRec {
+    normal: [f32; 3],
+    _dist: f32,
+    _kind: i32,
+}
+
+/// A `texinfo` record — only its `miptex` index (into the textures lump) is needed, to look up the
+/// surface's texture name and classify it (sky / liquid / solid).
+#[derive(BinRead, Clone, Copy)]
+#[br(little)]
+struct TexInfo {
+    #[br(pad_before = 32)] // skip vecs[2][4]
+    miptex: i32,
+    _flags: i32,
+}
+
+/// How a surface should be drawn, decided by its texture name (Quake convention: `sky*` is the
+/// skybox, `*name` is a turbulent liquid).
+#[derive(PartialEq, Clone, Copy)]
+enum SurfKind {
+    Solid,
+    Sky,
+    Water,
+    Lava,
+    Slime,
+}
+
+fn classify(name: &str) -> SurfKind {
+    if name.starts_with("sky") {
+        SurfKind::Sky
+    } else if let Some(rest) = name.strip_prefix('*') {
+        if rest.contains("lava") {
+            SurfKind::Lava
+        } else if rest.contains("slime") {
+            SurfKind::Slime
+        } else {
+            SurfKind::Water
+        }
+    } else {
+        SurfKind::Solid
+    }
+}
+
+/// Additive tint for a liquid surface (the color the water/lava/slime adds over the grey scene).
+fn liquid_tint(kind: SurfKind) -> [f32; 3] {
+    match kind {
+        SurfKind::Lava => [0.85, 0.30, 0.08],
+        SurfKind::Slime => [0.35, 0.70, 0.18],
+        _ => [0.18, 0.42, 0.90], // water
+    }
+}
+
+/// Read the texture-name table: the miptex lump is a count, then per-texture offsets, then each
+/// `dmiptex_t` whose first 16 bytes are the null-terminated name. Missing entries (`ofs < 0`, animated
+/// placeholders) become empty strings. Best-effort — a malformed table just yields fewer names.
+fn read_texture_names(bytes: &[u8], lump: Lump) -> Vec<String> {
+    let mut cur = Cursor::new(bytes);
+    if cur.seek(SeekFrom::Start(lump.offset as u64)).is_err() {
+        return Vec::new();
+    }
+    let count = match cur.read_le::<i32>() {
+        Ok(n) if n >= 0 => n as usize,
+        _ => return Vec::new(),
+    };
+    let mut offsets = Vec::with_capacity(count);
+    for _ in 0..count {
+        match cur.read_le::<i32>() {
+            Ok(o) => offsets.push(o),
+            Err(_) => break,
+        }
+    }
+    offsets
+        .into_iter()
+        .map(|o| {
+            if o < 0 {
+                return String::new();
+            }
+            let start = lump.offset as usize + o as usize;
+            bytes
+                .get(start..start + 16)
+                .map(|b| {
+                    let end = b.iter().position(|&c| c == 0).unwrap_or(16);
+                    String::from_utf8_lossy(&b[..end]).to_ascii_lowercase()
+                })
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
 /// BSP29 / BSP30 face (`dface_t`): 16-bit plane/side/numedges/texinfo.
 #[derive(BinRead)]
 #[br(little)]
 struct FaceV1 {
-    _plane: u16,
-    _side: u16,
+    plane: u16,
+    side: u16,
     first_edge: i32,
     num_edges: u16,
-    _texinfo: u16,
+    texinfo: u16,
     _styles: [u8; 4],
     _light_ofs: i32,
 }
@@ -101,30 +203,46 @@ struct FaceV1 {
 #[derive(BinRead)]
 #[br(little)]
 struct FaceV2 {
-    _plane: u32,
-    _side: u32,
+    plane: u32,
+    side: u32,
     first_edge: i32,
     num_edges: u32,
-    _texinfo: u32,
+    texinfo: u32,
     _styles: [u8; 4],
     _light_ofs: i32,
 }
 
-/// The one field pair we need from every face: where its edge loop starts and how long it is.
+/// The fields we need from every face: its edge loop, the plane it lies on (+ which side, for the
+/// outward normal), and its texinfo (to look up the texture name).
 #[derive(Clone, Copy)]
 struct Face {
+    plane: u32,
+    side: u32,
     first_edge: i32,
     num_edges: u32,
+    texinfo: u32,
 }
 
 impl From<FaceV1> for Face {
     fn from(f: FaceV1) -> Self {
-        Face { first_edge: f.first_edge, num_edges: f.num_edges as u32 }
+        Face {
+            plane: f.plane as u32,
+            side: f.side as u32,
+            first_edge: f.first_edge,
+            num_edges: f.num_edges as u32,
+            texinfo: f.texinfo as u32,
+        }
     }
 }
 impl From<FaceV2> for Face {
     fn from(f: FaceV2) -> Self {
-        Face { first_edge: f.first_edge, num_edges: f.num_edges }
+        Face {
+            plane: f.plane,
+            side: f.side,
+            first_edge: f.first_edge,
+            num_edges: f.num_edges,
+            texinfo: f.texinfo,
+        }
     }
 }
 
@@ -182,6 +300,9 @@ pub fn parse_render_mesh(bytes: &[u8]) -> Option<RenderMesh> {
     let vertexes: Vec<[f32; 3]> = read_records(bytes, header.lumps[LUMP_VERTEXES], VERTEX_SIZE, "vertexes")?;
     let surfedges: Vec<i32> = read_records(bytes, header.lumps[LUMP_SURFEDGES], SURFEDGE_SIZE, "surfedges")?;
     let models: Vec<ModelRec> = read_records(bytes, header.lumps[LUMP_MODELS], MODEL_SIZE, "models")?;
+    let planes: Vec<PlaneRec> = read_records(bytes, header.lumps[LUMP_PLANES], PLANE_SIZE, "planes")?;
+    let texinfos: Vec<TexInfo> = read_records(bytes, header.lumps[LUMP_TEXINFO], TEXINFO_SIZE, "texinfo")?;
+    let tex_names = read_texture_names(bytes, header.lumps[LUMP_TEXTURES]);
 
     // Edges and faces widen between v1 and BSP2 — read the right shape, normalize.
     let edges: Vec<[u32; 2]> = if bsp2 {
@@ -212,13 +333,27 @@ pub fn parse_render_mesh(bytes: &[u8]) -> Option<RenderMesh> {
         let v = vertexes.get(vi as usize)?;
         Some(Vec3::new(v[0], v[1], v[2]))
     };
+    // The texture name behind a face (via texinfo → miptex), for sky/liquid classification.
+    let tex_of = |face: &Face| -> &str {
+        texinfos
+            .get(face.texinfo as usize)
+            .and_then(|t| usize::try_from(t.miptex).ok())
+            .and_then(|mi| tex_names.get(mi))
+            .map(String::as_str)
+            .unwrap_or("")
+    };
 
     let mut vertices: Vec<MeshVertex> = Vec::new();
+    let mut water: Vec<LineVertex> = Vec::new();
     let (mut mins, mut maxs) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
 
     'faces: for face in faces.get(face_lo..face_hi.min(faces.len()))?.iter() {
         if face.num_edges < 3 {
             continue;
+        }
+        let kind = classify(tex_of(face));
+        if kind == SurfKind::Sky {
+            continue; // sky isn't a surface a viewer wants — drop it
         }
         // Resolve the face's ordered vertex loop through the surfedge indirection.
         let mut loop_verts: Vec<Vec3> = Vec::with_capacity(face.num_edges as usize);
@@ -240,25 +375,51 @@ pub fn parse_render_mesh(bytes: &[u8]) -> Option<RenderMesh> {
         if loop_verts.len() < 3 {
             continue;
         }
-        let normal = newell_normal(&loop_verts);
         for v in &loop_verts {
             mins = mins.min(*v);
             maxs = maxs.max(*v);
         }
-        // Fan-triangulate: (v0, v[i], v[i+1]).
-        let n = [normal.x, normal.y, normal.z];
-        for i in 1..loop_verts.len() - 1 {
-            for &v in &[loop_verts[0], loop_verts[i], loop_verts[i + 1]] {
-                vertices.push(MeshVertex { pos: [v.x, v.y, v.z], normal: n });
-            }
+
+        if kind != SurfKind::Solid {
+            // Liquid: emit flat tinted triangles into the water buffer (drawn additive, double-sided
+            // — no winding fixup needed).
+            let color = liquid_tint(kind);
+            fan(&loop_verts, |v| water.push(LineVertex { pos: v.to_array(), color }));
+            continue;
         }
+
+        // Solid: orient by the face's plane so backface culling works. The front (visible) normal
+        // is the plane normal, flipped when the face is on the plane's back side. Wind the fan CCW
+        // about it (reverse the loop if the surfedge order came out the other way).
+        let front_n = planes
+            .get(face.plane as usize)
+            .map(|p| {
+                let n = Vec3::from_array(p.normal);
+                if face.side != 0 { -n } else { n }
+            })
+            .map(|n| n.normalize_or(Vec3::Z))
+            .unwrap_or_else(|| newell_normal(&loop_verts));
+        if newell_normal(&loop_verts).dot(front_n) < 0.0 {
+            loop_verts.reverse();
+        }
+        let n = front_n.to_array();
+        fan(&loop_verts, |v| vertices.push(MeshVertex { pos: v.to_array(), normal: n }));
     }
 
-    if vertices.is_empty() {
+    if vertices.is_empty() && water.is_empty() {
         eprintln!("navview: BSP parsed but produced no world faces");
         return None;
     }
-    Some(RenderMesh { vertices, mins, maxs })
+    Some(RenderMesh { vertices, water, mins, maxs })
+}
+
+/// Fan-triangulate a vertex loop, calling `emit` for each of the `(v0, v[i], v[i+1])` corners.
+fn fan(loop_verts: &[Vec3], mut emit: impl FnMut(Vec3)) {
+    for i in 1..loop_verts.len() - 1 {
+        emit(loop_verts[0]);
+        emit(loop_verts[i]);
+        emit(loop_verts[i + 1]);
+    }
 }
 
 /// Robust planar-polygon normal via Newell's method — independent of triangulation and stable for
@@ -339,10 +500,15 @@ const ARC_SEGMENTS: usize = 16;
 /// Standing feet sit this far below the cell origin (player `mins.z`) — the floor height.
 const FEET_DROP: f32 = 24.0;
 
+/// Brightness of a link's color at its `from` end; it ramps to full at the `to` end. This makes each
+/// directed link read as a dim→bright flow in its direction of travel — the path's direction cue.
+const DIR_DIM: f32 = 0.25;
+
 /// Build the navmesh **line** overlay: one colored polyline per non-`Walk` link (a true parabola for
-/// the ballistic kinds, a straight segment otherwise), emitted as `LineList` pairs. `Walk` links are
-/// the flat-ground connectivity and are shown as the filled surface ([`nav_surface`]) instead. Links
-/// whose kind isn't in `visible` are skipped, so a viewer can toggle path types.
+/// the ballistic kinds, a straight segment otherwise), emitted as `LineList` pairs shaded dim→bright
+/// from `from` to `to` so the travel direction is visible. `Walk` links are the flat-ground
+/// connectivity and are shown as the filled surface ([`nav_surface`]) instead. Links whose kind isn't
+/// in `visible` are skipped, so a viewer can toggle path types.
 pub fn nav_lines(graph: &NavGraph, visible: &[bool; NUM_LINK_KINDS]) -> Vec<LineVertex> {
     let mut out: Vec<LineVertex> = Vec::new();
 
@@ -353,30 +519,22 @@ pub fn nav_lines(graph: &NavGraph, visible: &[bool; NUM_LINK_KINDS]) -> Vec<Line
         let li = li as u32;
         let a = graph.cell_origin(link.from);
         let b = graph.cell_origin(link.to);
-        let color = link_color(link.kind);
-        match link.kind {
-            LinkKind::JumpGap => push_arc(&mut out, arc_pts(a, b, JUMP_APEX), color),
-            LinkKind::DoubleJump => push_arc(&mut out, arc_pts(a, b, DOUBLE_ARC_PEAK), color),
-            LinkKind::SpeedJump => {
-                // The `from` cell is the runway start; the real leap begins at the solved takeoff.
-                if let Some(sj) = graph.speed_jump_of_link(li) {
-                    push_seg(&mut out, a, sj.takeoff, color);
-                    push_arc(&mut out, ballistic_pts(sj.takeoff, b, sj.airtime), color);
-                } else {
-                    push_seg(&mut out, a, b, color);
-                }
-            }
-            LinkKind::RocketJump => {
-                // `from` → blast position is the jump+aim; then the post-blast parabola to the target.
-                if let Some(rj) = graph.rocket_jump_of_link(li) {
-                    push_seg(&mut out, a, rj.pos_blast, color);
-                    push_arc(&mut out, launch_pts(rj.pos_blast, rj.v0, rj.airtime), color);
-                } else {
-                    push_seg(&mut out, a, b, color);
-                }
-            }
-            _ => push_seg(&mut out, a, b, color),
-        }
+        // The ordered points from `from` to `to` — a true arc for the ballistic kinds, prefixed by
+        // the runway/jump-up straight for the two-phase speed- and rocket-jumps.
+        let path: Vec<Vec3> = match link.kind {
+            LinkKind::JumpGap => arc_pts(a, b, JUMP_APEX),
+            LinkKind::DoubleJump => arc_pts(a, b, DOUBLE_ARC_PEAK),
+            LinkKind::SpeedJump => match graph.speed_jump_of_link(li) {
+                Some(sj) => std::iter::once(a).chain(ballistic_pts(sj.takeoff, b, sj.airtime)).collect(),
+                None => vec![a, b],
+            },
+            LinkKind::RocketJump => match graph.rocket_jump_of_link(li) {
+                Some(rj) => std::iter::once(a).chain(launch_pts(rj.pos_blast, rj.v0, rj.airtime)).collect(),
+                None => vec![a, b],
+            },
+            _ => vec![a, b],
+        };
+        push_gradient(&mut out, &path, link_color(link.kind));
     }
     out
 }
@@ -398,15 +556,24 @@ pub fn nav_surface(graph: &NavGraph) -> Vec<LineVertex> {
     out
 }
 
-fn push_seg(out: &mut Vec<LineVertex>, a: Vec3, b: Vec3, color: [f32; 3]) {
-    out.push(LineVertex { pos: a.to_array(), color });
-    out.push(LineVertex { pos: b.to_array(), color });
-}
-
-/// Emit a polyline (a slice of points) as consecutive `LineList` segment pairs.
-fn push_arc(out: &mut Vec<LineVertex>, pts: Vec<Vec3>, color: [f32; 3]) {
-    for w in pts.windows(2) {
-        push_seg(out, w[0], w[1], color);
+/// Emit a polyline as `LineList` pairs, shading each vertex from `DIR_DIM`·color at the start to full
+/// color at the end (by fraction of arc length) so the line reads as a directional flow.
+fn push_gradient(out: &mut Vec<LineVertex>, path: &[Vec3], color: [f32; 3]) {
+    if path.len() < 2 {
+        return;
+    }
+    let total = path.windows(2).map(|w| w[0].distance(w[1])).sum::<f32>().max(1e-3);
+    let shade = |frac: f32| {
+        let s = DIR_DIM + (1.0 - DIR_DIM) * frac;
+        [color[0] * s, color[1] * s, color[2] * s]
+    };
+    let mut acc = 0.0;
+    for w in path.windows(2) {
+        let c0 = shade(acc / total);
+        acc += w[0].distance(w[1]);
+        let c1 = shade(acc / total);
+        out.push(LineVertex { pos: w[0].to_array(), color: c0 });
+        out.push(LineVertex { pos: w[1].to_array(), color: c1 });
     }
 }
 
@@ -466,9 +633,10 @@ mod tests {
         assert!(mesh.mins.is_finite() && mesh.maxs.is_finite(), "bad bounds");
         assert!(mesh.maxs.cmpge(mesh.mins).all(), "inverted bounds");
         eprintln!(
-            "{}: {} triangles, bounds {:?}..{:?}",
+            "{}: {} solid tris, {} water tris, bounds {:?}..{:?}",
             path,
             mesh.vertices.len() / 3,
+            mesh.water.len() / 3,
             mesh.mins,
             mesh.maxs
         );

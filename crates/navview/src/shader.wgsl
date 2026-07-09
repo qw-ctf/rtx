@@ -56,3 +56,12 @@ fn fs_line(in: LineOut) -> @location(0) vec4<f32> {
 fn fs_surf(in: LineOut) -> @location(0) vec4<f32> {
     return vec4<f32>(in.color, 0.45);
 }
+
+// --- liquid surfaces (water / lava / slime) ---
+// Shares vs_line (pos + tint color); drawn with additive blending at 0.5 so liquids glow over the
+// scene behind them.
+
+@fragment
+fn fs_water(in: LineOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(in.color, 0.5);
+}

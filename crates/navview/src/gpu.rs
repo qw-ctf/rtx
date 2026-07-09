@@ -19,13 +19,15 @@ pub struct Gpu {
     config: wgpu::SurfaceConfiguration,
     depth_view: wgpu::TextureView,
     mesh_pipeline: wgpu::RenderPipeline,
+    water_pipeline: wgpu::RenderPipeline,
     surf_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     camera_buf: wgpu::Buffer,
     camera_bind: wgpu::BindGroup,
-    /// (buffer, vertex count) for the world mesh, the walkable surface tiles, and the nav lines;
-    /// `None` until a map is loaded / navmesh is built.
+    /// (buffer, vertex count) for the world mesh, the liquid surfaces, the walkable surface tiles,
+    /// and the nav lines; `None` until a map is loaded / navmesh is built.
     mesh_vbuf: Option<(wgpu::Buffer, u32)>,
+    water_vbuf: Option<(wgpu::Buffer, u32)>,
     surf_vbuf: Option<(wgpu::Buffer, u32)>,
     line_vbuf: Option<(wgpu::Buffer, u32)>,
     /// egui's wgpu backend, drawn in a second pass over the 3D scene each frame.
@@ -33,6 +35,21 @@ pub struct Gpu {
 }
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// Additive blend (`src·srcAlpha + dst`) for the translucent liquid surfaces — they brighten the
+/// scene behind them rather than replacing it.
+const ADDITIVE_BLEND: wgpu::BlendState = wgpu::BlendState {
+    color: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::SrcAlpha,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    },
+    alpha: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    },
+};
 
 impl Gpu {
     pub fn new(window: Arc<Window>) -> Gpu {
@@ -99,6 +116,8 @@ impl Gpu {
 
         let mesh_stride = std::mem::size_of::<MeshVertex>() as u64;
         let line_stride = std::mem::size_of::<LineVertex>() as u64;
+        // Solid world geometry: opaque grey, lit, with backface culling — faces are wound so their
+        // front (empty side) shows, so near shell walls drop out and you can see into the level.
         let mesh_pipeline = make_pipeline(
             &device,
             &layout,
@@ -109,7 +128,22 @@ impl Gpu {
             wgpu::CompareFunction::Less,
             wgpu::BlendState::REPLACE,
             true,
+            Some(wgpu::Face::Back),
             mesh_stride,
+        );
+        // Liquid surfaces: additive translucent, double-sided, depth-tested but not depth-writing.
+        let water_pipeline = make_pipeline(
+            &device,
+            &layout,
+            &shader,
+            ("vs_line", "fs_water"),
+            config.format,
+            wgpu::PrimitiveTopology::TriangleList,
+            wgpu::CompareFunction::Less,
+            ADDITIVE_BLEND,
+            false,
+            None,
+            line_stride,
         );
         // Translucent walkable-surface tiles: alpha-blended over the mesh, depth-tested but not
         // depth-writing, so overlapping tiles and the lines drawn afterward compose cleanly.
@@ -123,6 +157,7 @@ impl Gpu {
             wgpu::CompareFunction::Less,
             wgpu::BlendState::ALPHA_BLENDING,
             false,
+            None,
             line_stride,
         );
         let line_pipeline = make_pipeline(
@@ -135,6 +170,7 @@ impl Gpu {
             wgpu::CompareFunction::LessEqual,
             wgpu::BlendState::REPLACE,
             true,
+            None,
             line_stride,
         );
 
@@ -147,11 +183,13 @@ impl Gpu {
             config,
             depth_view,
             mesh_pipeline,
+            water_pipeline,
             surf_pipeline,
             line_pipeline,
             camera_buf,
             camera_bind,
             mesh_vbuf: None,
+            water_vbuf: None,
             surf_vbuf: None,
             line_vbuf: None,
             egui_renderer,
@@ -175,6 +213,11 @@ impl Gpu {
     /// Replace the world-mesh vertex buffer (grey triangles).
     pub fn set_mesh(&mut self, verts: &[MeshVertex]) {
         self.mesh_vbuf = self.upload(bytemuck::cast_slice(verts), verts.len() as u32, "mesh");
+    }
+
+    /// Replace the liquid-surface vertex buffer (additive translucent triangles).
+    pub fn set_water(&mut self, verts: &[LineVertex]) {
+        self.water_vbuf = self.upload(bytemuck::cast_slice(verts), verts.len() as u32, "water");
     }
 
     /// Replace the navmesh line overlay.
@@ -271,6 +314,13 @@ impl Gpu {
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..*count, 0..1);
             }
+            // Additive liquid surfaces over the opaque geometry, then the translucent walkable
+            // surface, then the opaque link lines on top.
+            if let Some((buf, count)) = &self.water_vbuf {
+                pass.set_pipeline(&self.water_pipeline);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..*count, 0..1);
+            }
             if let Some((buf, count)) = &self.surf_vbuf {
                 pass.set_pipeline(&self.surf_pipeline);
                 pass.set_vertex_buffer(0, buf.slice(..));
@@ -337,6 +387,7 @@ fn make_pipeline(
     depth_compare: wgpu::CompareFunction,
     blend: wgpu::BlendState,
     depth_write: bool,
+    cull: Option<wgpu::Face>,
     stride: u64,
 ) -> wgpu::RenderPipeline {
     // Both vertex formats are two vec3s (pos, normal|color) → the same attribute layout.
@@ -357,7 +408,7 @@ fn make_pipeline(
         },
         primitive: wgpu::PrimitiveState {
             topology,
-            cull_mode: None,
+            cull_mode: cull,
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
