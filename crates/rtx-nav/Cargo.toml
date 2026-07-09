@@ -1,0 +1,10 @@
+[package]
+name = "rtx-nav"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+binrw.workspace = true
+glam.workspace = true

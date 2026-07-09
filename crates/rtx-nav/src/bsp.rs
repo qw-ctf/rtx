@@ -24,6 +24,15 @@ use glam::Vec3;
 /// which this minimal parser doesn't read.
 pub const CONTENTS_SOLID: i32 = -2;
 
+/// The Quake liquid/empty point-contents values (as returned by the engine's `pointcontents`).
+/// The clip hull this parser reads never yields them — they come from a caller-supplied `contents`
+/// oracle — but they're single-sourced here so the hazard classifier and its tests agree with the
+/// engine. (`SOLID` above is the render-hull `-2`; `SKY` `-6` is unused by navigation.)
+pub const CONTENTS_EMPTY: i32 = -1;
+pub const CONTENTS_WATER: i32 = -3;
+pub const CONTENTS_SLIME: i32 = -4;
+pub const CONTENTS_LAVA: i32 = -5;
+
 /// `DIST_EPSILON` — the crossing point is placed this far onto the near side of a plane during a
 /// hull trace, so a bounce restart doesn't immediately re-collide with the surface it left.
 const DIST_EPSILON: f32 = 0.03125;

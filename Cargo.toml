@@ -1,17 +1,20 @@
-[package]
-name = "rtx"
+[workspace]
+resolver = "2"
+members = ["crates/rtx-nav", "crates/rtx-game", "crates/navview"]
+# Plain `cargo build` / `cargo test` build only the game module and its nav core — the viewer
+# (and its wgpu/winit tree) stays out of the default build and out of CI.
+default-members = ["crates/rtx-nav", "crates/rtx-game"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 authors = ["Daniel Svensson <dsvensson@gmail.com>"]
 
-[lib]
-name = "rtx"
-# `rlib` in addition to the engine-loaded `cdylib` so the pure-logic modules (bsp parser,
-# navmesh) can be unit-tested with `cargo test`.
-crate-type = ["cdylib", "rlib"]
-
-[dependencies]
+[workspace.dependencies]
+# `glam` crosses the rtx-nav public API boundary (Vec3 in Bsp/NavGraph), so every crate must
+# resolve the same version — single-source it here.
+glam = "0.32"
 binrw = "0.15"
 bitflags = "2"
-glam = "0.32"
+rtx-nav = { path = "crates/rtx-nav" }

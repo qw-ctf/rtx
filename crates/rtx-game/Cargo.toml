@@ -1,0 +1,19 @@
+[package]
+name = "rtx-game"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "rtx"
+# `rlib` in addition to the engine-loaded `cdylib` so the pure-logic modules can be unit-tested
+# with `cargo test`. The `rtx` name is load-bearing: CI copies `target/release/rtx.dll` (and the
+# `librtx.so` / `librtx.dylib` variants) to the `qwprogs` module the engine loads.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rtx-nav.workspace = true
+binrw.workspace = true
+bitflags.workspace = true
+glam.workspace = true

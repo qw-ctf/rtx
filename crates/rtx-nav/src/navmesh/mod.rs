@@ -21,7 +21,7 @@ mod hook;
 mod query;
 mod rocketjump;
 
-pub(crate) use hook::arc_land;
+pub use hook::arc_land;
 use hook::{hook_cost, march_to_solid, perturb_ok, HOOK_PITCHES};
 #[cfg(test)]
 use hook::{simulate_arc, ArcResult};
@@ -47,8 +47,9 @@ const MAX_DROP: f32 = 4096.0;
 const DJ_MAX_DROP: f32 = 240.0;
 /// Fall height beyond which QW fall damage applies (`MAX_SAFE_FALL` ≈ when speed > 580).
 const SAFE_FALL: f32 = 88.0;
-/// Apex a standing jump adds: `jump_vel² / (2·gravity)` = `270² / 1600`.
-const JUMP_APEX: f32 = 45.0;
+/// Apex a standing jump adds: `jump_vel² / (2·gravity)` = `270² / 1600`. Public so a viewer can
+/// re-fly a [`LinkKind::JumpGap`] arc with [`arc_point`] using the same apex the build cleared with.
+pub const JUMP_APEX: f32 = 45.0;
 /// Horizontal reach of a running jump (`maxspeed · air-time`), conservatively floored.
 const JUMP_REACH: f32 = 200.0;
 /// Extra reach/rise unlocked by rtx's mid-air **double jump** (`rtx_doublejump`): a second jump near
@@ -57,10 +58,11 @@ const JUMP_REACH: f32 = 200.0;
 const DOUBLE_JUMP_REACH: f32 = 300.0;
 const DOUBLE_JUMP_APEX: f32 = 80.0;
 /// Clearance envelope for a double jump — the real two-arc path peaks ~91u above the launch, so
-/// sample the arc a touch higher to be safe.
-const DOUBLE_ARC_PEAK: f32 = 100.0;
+/// sample the arc a touch higher to be safe. Public for the same reason as [`JUMP_APEX`]: a viewer
+/// re-flies a [`LinkKind::DoubleJump`] arc with [`arc_point`] at this apex.
+pub const DOUBLE_ARC_PEAK: f32 = 100.0;
 /// `sv_maxspeed` default — the cost denominator (travel time = distance / speed).
-const MAX_SPEED: f32 = 320.0;
+pub const MAX_SPEED: f32 = 320.0;
 
 // --- speed jumps (bunnyhop-carried leaps across wide gaps) ---
 
@@ -73,7 +75,7 @@ const SPEED_JUMP_V_CAP: f32 = 900.0;
 /// Calibrated against the controller's own pmove-oracle sim (`bhop::sim`): a 10s run covers
 /// ~4500u and lands at ~0.75 of the ideal `(v0³+3k·len)^⅓` — 0.8 rides just above it, with
 /// [`SJ_MARGIN`] absorbing the difference.
-const BHOP_EFF: f32 = 0.8;
+pub const BHOP_EFF: f32 = 0.8;
 /// Longest runway we bother measuring. Sized so the model can credit the speeds the controller
 /// demonstrably reaches (its sim sustains gains past 550 u/s over ~4500u): at 4096u the
 /// effective takeoff is ~605 u/s — flat gaps to ~350u, dropping gaps to ~620u — where the old
@@ -110,7 +112,7 @@ pub const BAND_FLOOR: [f32; NBANDS] = [MAX_SPEED, 340.0, 430.0, 540.0];
 /// cell-only one — at worst it expands more nodes, never less optimal than the existing search.
 pub const BAND_V_MAX: f32 = SPEED_JUMP_V_CAP;
 /// Runway a standing start (band 0) must spend spinning up before air-strafe gains begin, charged
-/// against a Walk/Step leg's length. Mirrors the controller's [`crate::bot::bhop`] engage runway.
+/// against a Walk/Step leg's length. Mirrors the game's bhop controller engage runway.
 const BAND_SPINUP: f32 = 256.0;
 /// A carried-speed leg only counts if the corridor continues roughly straight: if the turn from the
 /// link that *reached* a cell to the candidate link exceeds this, the planner treats the entry as
@@ -144,13 +146,13 @@ fn v_required(horiz: f32, dz: f32, gravity: f32) -> f32 {
 
 /// Bhop speed-gain constant `k`: velocity² grows at `2k` per second while air-strafing. Derived from
 /// the perpendicular air-accel cap and the tickrate (`k = tick · a² / 2`, `a = min(accel·maxspeed/tick, cap)`).
-fn bhop_k(accel: f32, maxspeed: f32) -> f32 {
+pub fn bhop_k(accel: f32, maxspeed: f32) -> f32 {
     let a = (accel * maxspeed / SJ_TICKRATE).min(AIR_CAP);
     SJ_TICKRATE * a * a / 2.0
 }
 
 /// Speed reached after air-strafing `len` units from `v0`: `(v0³ + 3k·len)^⅓`.
-fn attainable_speed(v0: f32, len: f32, k: f32) -> f32 {
+pub fn attainable_speed(v0: f32, len: f32, k: f32) -> f32 {
     (v0.powi(3) + 3.0 * k * len.max(0.0)).cbrt()
 }
 
@@ -220,8 +222,9 @@ const RJ_MAX_PER_CELL: usize = 2;
 // --- grid ---
 
 /// XY sampling step. 32 = the player's full width: one column per body. Coarser than the
-/// plan's 16 to keep the build cheap on big maps; thin ledges may be missed (revisit).
-const GRID: f32 = 32.0;
+/// plan's 16 to keep the build cheap on big maps; thin ledges may be missed (revisit). Public so a
+/// viewer can tile each cell's walkable footprint at the true grid pitch.
+pub const GRID: f32 = 32.0;
 /// Player hull half-width (the QW player box is ±16 in X/Y). Used to grow obstacles by the agent
 /// radius so a bot doesn't clip geometry its path's centre-line technically clears.
 const PLAYER_HALF_WIDTH: f32 = 16.0;
@@ -358,7 +361,7 @@ const CLOSED_GATE_PENALTY: f32 = 100_000.0;
 
 /// Extra travel-time charged to every [`LinkKind::RocketJump`] link when the querying bot is unfit
 /// to fly one (no rocket launcher, no rocket, too little health, or quad running — see
-/// [`crate::bot::rj::rocket_jump_extra`]). Same magnitude as [`CLOSED_GATE_PENALTY`]: the planner
+/// the game's `bot::rj::rocket_jump_extra`). Same magnitude as [`CLOSED_GATE_PENALTY`]: the planner
 /// diverts around rocket jumps it can't make, yet — being finite — still takes one as a last resort
 /// down a sole corridor rather than treating the graph as severed.
 pub const RJ_UNFIT_PENALTY: f32 = 100_000.0;
@@ -848,8 +851,8 @@ impl NavGraph {
     /// surcharge half the map); the runtime combat guard [`crate::hazard::hazard_ahead`] keeps bots
     /// from stepping off edges in a fight. Only *liquids* get a routing bias, and the pure
     /// worker-thread build can't see them — the clip hull it reads carries no liquid contents — so
-    /// this takes the engine's `pointcontents` as `contents` and runs at graph-swap time (see
-    /// [`crate::game::GameState`]'s navmesh poll) rather than inside [`build_navmesh`].
+    /// this takes the engine's `pointcontents` as `contents` and runs at graph-swap time (from the
+    /// game's navmesh poll) rather than inside [`build_navmesh`].
     pub fn surcharge_hazard_links(&mut self, is_solid: &impl Fn(Vec3) -> bool, contents: &impl Fn(Vec3) -> f32) {
         let hazard: Vec<bool> = (0..self.cells.len() as CellId)
             .map(|id| self.cell_on_liquid_edge(id, is_solid, contents))
@@ -1707,16 +1710,20 @@ fn ballistic_clear(bsp: &Bsp, a: Vec3, b: Vec3) -> bool {
     })
 }
 
+/// A point at parameter `t ∈ [0, 1]` along a jump arc from `a` to `b` with apex `apex` above the
+/// higher endpoint: xy is linear in `t`, z is the parabola through `a.z` (t=0) and `b.z` (t=1)
+/// peaking at `max(a.z, b.z) + apex`. Shared by the build's clearance check (`arc_clear_peak`) and
+/// any consumer that re-flies the same arc for display, so both trace the identical curve.
+pub fn arc_point(a: Vec3, b: Vec3, apex: f32, t: f32) -> Vec3 {
+    let peak = a.z.max(b.z) + apex;
+    let xy = a.xy().lerp(b.xy(), t);
+    let z = a.z + (b.z - a.z) * t + 4.0 * (peak - a.z.max(b.z)) * t * (1.0 - t);
+    Vec3::new(xy.x, xy.y, z)
+}
+
 /// [`arc_clear`] with a caller-chosen apex height (for the taller double-jump arc) and step count.
 fn arc_clear_peak(bsp: &Bsp, a: Vec3, b: Vec3, apex: f32, steps: i32) -> bool {
-    let peak = a.z.max(b.z) + apex;
-    (0..=steps).all(|i| {
-        let t = i as f32 / steps as f32;
-        let xy = a.xy().lerp(b.xy(), t);
-        // Parabola through a.z (t=0) and b.z (t=1) peaking at `peak`.
-        let z = a.z + (b.z - a.z) * t + 4.0 * (peak - a.z.max(b.z)) * t * (1.0 - t);
-        !bsp.is_solid(Vec3::new(xy.x, xy.y, z))
-    })
+    (0..=steps).all(|i| !bsp.is_solid(arc_point(a, b, apex, i as f32 / steps as f32)))
 }
 
 /// Grid column index for a world coordinate.
@@ -1810,7 +1817,7 @@ pub struct NavState {
     pub pending: Option<std::sync::mpsc::Receiver<NavBuild>>,
     /// Static catalog of item-goal pickups: `(entity index, nearest cell)`. Built once with the
     /// graph; items don't move, so their cell is fixed. Live availability and desire are read
-    /// fresh at selection time (see [`crate::bot::goals`]).
+    /// fresh at selection time (by the game's `bot::goals`).
     pub goals: Vec<(u32, CellId)>,
 }
 
@@ -2265,26 +2272,8 @@ mod tests {
         let v = attainable_speed(MAX_SPEED, 800.0, k);
         assert!(v > 450.0, "800u runway should build good speed, got {v}"); // ~480, ≈1.5× maxspeed
         assert!((runway_len_for(v, MAX_SPEED, k) - 800.0).abs() < 1.0);
-
-        // The build-time model, derated, is conservative vs the actual bhop controller: simulate a
-        // real air-strafe over the runway and confirm it reaches at least the planned speed.
-        use crate::bot::bhop::{air_accel_max, apply_airaccel, strafe, wishdir_of};
-        let dt = 1.0 / 72.0;
-        let a_max = air_accel_max(10.0, MAX_SPEED, dt);
-        let steps = (800.0 / (MAX_SPEED * dt)) as i32; // ~time to cover the runway, air frames only
-        let mut vel = glam::Vec2::new(MAX_SPEED, 0.0);
-        let mut sigma = 0.0;
-        for _ in 0..steps {
-            let s = strafe(vel, 0.0, sigma, a_max);
-            sigma = s.sigma;
-            vel = apply_airaccel(vel, wishdir_of(s.view_yaw, s.side), MAX_SPEED, 10.0, dt);
-        }
-        let planned = BHOP_EFF * attainable_speed(MAX_SPEED, 800.0, k);
-        assert!(
-            vel.length() >= planned,
-            "controller {} slower than planned {planned}",
-            vel.length()
-        );
+        // The cross-check that this derated model is conservative vs the *actual* bhop controller
+        // lives in the game crate (`bot::bhop`'s tests), where the controller sim is defined.
     }
 
     /// Count cells directly reachable from `start` over the (directed) graph — a small DFS helper
@@ -2460,9 +2449,9 @@ mod tests {
         let is_solid = |p: Vec3| p.x <= 60.0 && p.z <= -40.0;
         let contents = |p: Vec3| {
             if p.x > 60.0 && p.z < 0.0 {
-                crate::defs::Content::Lava.as_f32()
+                crate::bsp::CONTENTS_LAVA as f32
             } else {
-                crate::defs::Content::Empty.as_f32()
+                crate::bsp::CONTENTS_EMPTY as f32
             }
         };
         g.surcharge_hazard_links(&is_solid, &contents);
@@ -2490,9 +2479,9 @@ mod tests {
         let lava_at = |cx: f32, cy: f32| {
             move |p: Vec3| {
                 if (p.x - cx).abs() < 40.0 && (p.y - cy).abs() < 40.0 && p.z < 0.0 {
-                    crate::defs::Content::Lava.as_f32()
+                    crate::bsp::CONTENTS_LAVA as f32
                 } else {
-                    crate::defs::Content::Empty.as_f32()
+                    crate::bsp::CONTENTS_EMPTY as f32
                 }
             }
         };

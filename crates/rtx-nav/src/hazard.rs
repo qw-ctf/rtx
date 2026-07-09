@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Shared hazard classification for the bots: where lava, slime, and lethal drops lie relative to
-//! a point. Two consumers use it, which is why it lives in its own neutral module rather than in
-//! `bot::grenade` where it started:
+//! a point. Two consumers use it, which is why it lives in this neutral navigation-core crate:
 //!
 //!  * **offence** — [`find_hazard`] scans the ring around an enemy for a spot to *shove* them into
-//!    (the grenade lob-and-shoot combo and the one-shot rocket shove in [`crate::bot::grenade`]);
+//!    (the grenade lob-and-shoot combo and the one-shot rocket shove in the game's `bot::grenade`);
 //!  * **self-preservation** — [`hazard_ahead`] asks "does stepping this way walk me into lava?" for
-//!    the combat-movement guard in [`crate::bot::combat`], and the navmesh bakes a routing surcharge
-//!    onto links that skirt a liquid edge.
+//!    the game's combat-movement guard, and the navmesh bakes a routing surcharge onto links that
+//!    skirt a liquid edge.
 //!
 //! Everything here is **pure** over two oracles — `is_solid` (the clip-hull point test,
 //! [`crate::bsp::Bsp::is_solid`]) and `contents` (the render-hull `pointcontents`, which is the only
@@ -17,7 +16,7 @@
 
 use glam::Vec3;
 
-use crate::defs::Content;
+use crate::bsp::{CONTENTS_LAVA, CONTENTS_SLIME, CONTENTS_WATER};
 
 /// The eight compass directions probed around a point for a hazard.
 pub(crate) const HAZARD_DIRS: [(f32, f32); 8] = [
@@ -42,7 +41,7 @@ const HAZARD_PROBE_DEPTH: f32 = 320.0;
 
 /// What kind of hazard a direction leads to. Ordered by how much a bot should prefer to shove there.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum HazardKind {
+pub enum HazardKind {
     Slime,
     Pit, // a lethal/harmful fall (ledge or bottomless)
     Lava,
@@ -61,7 +60,7 @@ impl HazardKind {
 /// A shove opportunity near an enemy: the horizontal direction to push them, how far the hazard edge
 /// is, and what it is.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Hazard {
+pub struct Hazard {
     pub dir: Vec3,
     pub edge_dist: f32,
     pub kind: HazardKind,
@@ -80,13 +79,13 @@ pub(crate) fn hazard_below(
     while d <= HAZARD_PROBE_DEPTH {
         let q = p - Vec3::new(0.0, 0.0, d);
         let c = contents(q);
-        if c == Content::Lava.as_f32() {
+        if c == CONTENTS_LAVA as f32 {
             return Some(HazardKind::Lava);
         }
-        if c == Content::Slime.as_f32() {
+        if c == CONTENTS_SLIME as f32 {
             return Some(HazardKind::Slime);
         }
-        if c == Content::Water.as_f32() {
+        if c == CONTENTS_WATER as f32 {
             return None; // swimmable — harmless, and not a pit no matter how deep
         }
         if is_solid(q) {
@@ -100,7 +99,7 @@ pub(crate) fn hazard_below(
 /// Find the best hazard to shove an enemy (at `e_feet`) into: probe a ring of directions/distances,
 /// classify each by what lies below (liquids via `contents`, drops via `is_solid`), and require a
 /// clear horizontal path to it (a railing/wall between blocks the shove). Pure over the two oracles.
-pub(crate) fn find_hazard(
+pub fn find_hazard(
     is_solid: &impl Fn(Vec3) -> bool,
     contents: &impl Fn(Vec3) -> f32,
     e_feet: Vec3,
@@ -139,8 +138,8 @@ pub(crate) fn find_hazard(
 /// stride or two: probe a near and a far point ahead (feet-plus-a-little height) and classify what
 /// lies below each. A probe that lands *inside solid* is a wall, not a pit — normal collision
 /// handles that — so it's skipped, not treated as unsafe. Pure over the two oracles, like
-/// [`hazard_below`]; the movement guard in [`crate::bot::combat`] uses it to veto a lethal step.
-pub(crate) fn hazard_ahead(
+/// [`hazard_below`]; the game's combat movement guard uses it to veto a lethal step.
+pub fn hazard_ahead(
     is_solid: &impl Fn(Vec3) -> bool,
     contents: &impl Fn(Vec3) -> f32,
     feet: Vec3,
@@ -161,6 +160,7 @@ pub(crate) fn hazard_ahead(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bsp::CONTENTS_EMPTY;
 
     // Oracle helpers: a flat floor at z ≤ 0 by default.
     fn floor(p: Vec3) -> bool {
@@ -173,9 +173,9 @@ mod tests {
         let solid = |p: Vec3| p.z <= 0.0 && p.x <= 200.0;
         let contents = |p: Vec3| {
             if p.x > 200.0 && p.z < 0.0 {
-                Content::Lava.as_f32()
+                CONTENTS_LAVA as f32
             } else {
-                Content::Empty.as_f32()
+                CONTENTS_EMPTY as f32
             }
         };
         let e_feet = Vec3::new(160.0, 0.0, 24.0); // enemy near the lava edge
@@ -188,7 +188,7 @@ mod tests {
     fn finds_pit() {
         // Floor at z ≤ 0 for x ≤ 200; bottomless past it.
         let solid = |p: Vec3| p.z <= 0.0 && p.x <= 200.0;
-        let empty = |_: Vec3| Content::Empty.as_f32();
+        let empty = |_: Vec3| CONTENTS_EMPTY as f32;
         let h = find_hazard(&solid, &empty, Vec3::new(170.0, 0.0, 24.0)).expect("pit found");
         assert_eq!(h.kind, HazardKind::Pit);
         assert!(h.dir.x > 0.5);
@@ -200,9 +200,9 @@ mod tests {
         let solid = |p: Vec3| (p.z <= 0.0 && p.x <= 200.0) || (96.0..104.0).contains(&p.x);
         let contents = |p: Vec3| {
             if p.x > 200.0 && p.z < 0.0 {
-                Content::Lava.as_f32()
+                CONTENTS_LAVA as f32
             } else {
-                Content::Empty.as_f32()
+                CONTENTS_EMPTY as f32
             }
         };
         assert!(find_hazard(&solid, &contents, Vec3::new(40.0, 0.0, 24.0)).is_none());
@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn open_floor_has_no_hazard() {
-        let empty = |_: Vec3| Content::Empty.as_f32();
+        let empty = |_: Vec3| CONTENTS_EMPTY as f32;
         assert!(find_hazard(&floor, &empty, Vec3::new(0.0, 0.0, 24.0)).is_none());
     }
 
@@ -220,9 +220,9 @@ mod tests {
         let never_solid = |_: Vec3| false;
         let water = |p: Vec3| {
             if p.z < 0.0 {
-                Content::Water.as_f32()
+                CONTENTS_WATER as f32
             } else {
-                Content::Empty.as_f32()
+                CONTENTS_EMPTY as f32
             }
         };
         assert!(hazard_below(&never_solid, &water, Vec3::new(0.0, 0.0, 24.0)).is_none());
@@ -236,9 +236,9 @@ mod tests {
         let solid = |p: Vec3| p.z <= 0.0 && p.x <= 60.0;
         let contents = |p: Vec3| {
             if p.x > 60.0 && p.z < 0.0 {
-                Content::Lava.as_f32()
+                CONTENTS_LAVA as f32
             } else {
-                Content::Empty.as_f32()
+                CONTENTS_EMPTY as f32
             }
         };
         let feet = Vec3::new(0.0, 0.0, 24.0);
@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn hazard_ahead_safe_on_open_floor() {
-        let empty = |_: Vec3| Content::Empty.as_f32();
+        let empty = |_: Vec3| CONTENTS_EMPTY as f32;
         let feet = Vec3::new(0.0, 0.0, 24.0);
         assert!(hazard_ahead(&floor, &empty, feet, Vec3::new(1.0, 0.0, 0.0)).is_none());
     }
@@ -261,7 +261,7 @@ mod tests {
     fn hazard_ahead_wall_is_not_a_hazard() {
         // Solid wall filling all of x > 60 (including at knee height): a wall, not a pit.
         let solid = |p: Vec3| p.z <= 0.0 || p.x > 60.0;
-        let empty = |_: Vec3| Content::Empty.as_f32();
+        let empty = |_: Vec3| CONTENTS_EMPTY as f32;
         let feet = Vec3::new(0.0, 0.0, 24.0);
         assert!(hazard_ahead(&solid, &empty, feet, Vec3::new(1.0, 0.0, 0.0)).is_none());
     }

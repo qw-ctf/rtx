@@ -577,6 +577,28 @@ mod tests {
         let heading = mean_heading(&trace[trace.len() - 100..]);
         assert!((heading - 30.0).abs() < 12.0, "did not converge to 30°: {heading}");
     }
+
+    /// The navmesh's derated speed-jump model (`rtx_nav::navmesh`, planned offline) must be
+    /// *conservative* against this actual controller: simulate a real air-strafe over an 800u runway
+    /// and confirm the controller reaches at least the speed the planner credited. Lives here rather
+    /// than in `rtx-nav` because it exercises the controller sim, which is defined in this crate.
+    #[test]
+    fn navmesh_speed_jump_model_is_conservative() {
+        use rtx_nav::navmesh::{attainable_speed, bhop_k, BHOP_EFF, MAX_SPEED};
+        let k = bhop_k(ACCEL, MAX_SPEED);
+        let dt = 1.0 / 72.0; // the planner's conservative model tickrate
+        let a_max = air_accel_max(ACCEL, MAX_SPEED, dt);
+        let steps = (800.0 / (MAX_SPEED * dt)) as i32; // ~time to cover the runway, air frames only
+        let mut vel = Vec2::new(MAX_SPEED, 0.0);
+        let mut sigma = 0.0;
+        for _ in 0..steps {
+            let s = strafe(vel, 0.0, sigma, a_max);
+            sigma = s.sigma;
+            vel = apply_airaccel(vel, wishdir_of(s.view_yaw, s.side), MAX_SPEED, ACCEL, dt);
+        }
+        let planned = BHOP_EFF * attainable_speed(MAX_SPEED, 800.0, k);
+        assert!(vel.length() >= planned, "controller {} slower than planned {planned}", vel.length());
+    }
 }
 
 /// Full hop-cycle simulation: [`Bhop::step`] driven against a pmove oracle that mirrors FTEQW's

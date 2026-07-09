@@ -22,7 +22,6 @@ mod arsenal;
 mod assets;
 mod bob;
 mod bot;
-mod bsp;
 mod buttons;
 mod client;
 mod combat;
@@ -34,13 +33,11 @@ mod ext_field;
 mod game;
 mod game_command;
 mod grapple;
-mod hazard;
 mod host;
 mod items;
 mod misc;
 mod mode;
 mod nav_build;
-mod navmesh;
 mod obituary;
 mod plats;
 mod player;
@@ -56,6 +53,11 @@ mod subs;
 mod triggers;
 mod weapons;
 mod world;
+
+// The BSP parser, navmesh, and hazard classifier live in the shared `rtx-nav` crate; re-export
+// them under their old module paths so game code keeps referring to `crate::bsp` / `crate::navmesh`
+// / `crate::hazard` unchanged.
+pub(crate) use rtx_nav::{bsp, hazard, navmesh};
 
 use game::GameState;
 use game_command::GameCommand;
