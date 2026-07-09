@@ -9,6 +9,7 @@
 //! reallocated, so the pointers stay valid.
 
 use std::ffi::CString;
+use std::sync::atomic;
 
 use glam::Vec3;
 
@@ -477,7 +478,16 @@ impl GameState {
 
     /// Allocate a fresh entity from the engine and wire up its string indirection.
     pub(crate) fn spawn(&mut self) -> EntId {
-        let id = EntId(self.host.spawn() as u32);
+        // `host.spawn()` -> the engine's `ED_Alloc` -> `ED_ClearEdict` re-enters this module with
+        // `GAME_CLEAR_EDICT` synchronously, while this `&mut self` is live — which would alias the
+        // `&mut GameState` the re-entered `vmMain` derives (UB). We re-establish the edict's string
+        // refs ourselves just below, so that callback is redundant here: suppress it across the trap
+        // so `vmMain` skips it before taking a borrow. Save/restore rather than clear-to-false so a
+        // nested `spawn()` (e.g. from a re-entrant `PutClientInServer`) stays suppressed too.
+        let prev = crate::SUPPRESS_CLEAR_EDICT.swap(true, atomic::Ordering::Relaxed);
+        let raw = self.host.spawn();
+        crate::SUPPRESS_CLEAR_EDICT.store(prev, atomic::Ordering::Relaxed);
+        let id = EntId(raw as u32);
         self.entities[id].reset();
         self.setup_string_refs(id);
         id

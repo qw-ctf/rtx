@@ -13,6 +13,7 @@
 #![allow(non_snake_case)] // dllEntry / vmMain are the engine's required export names.
 
 use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 mod abi;
@@ -71,6 +72,22 @@ unsafe impl Send for Game {}
 /// The one and only global.
 static GAME: OnceLock<Game> = OnceLock::new();
 
+/// Set by [`game::GameState::spawn`] for the duration of the `spawn` trap. That trap makes the
+/// engine's `ED_Alloc` run `ED_ClearEdict`, which re-enters this module with `GAME_CLEAR_EDICT`
+/// *synchronously* — while `spawn`'s `&mut GameState` is live. `spawn` re-establishes the edict's
+/// string refs itself, so that callback is redundant; `vmMain` skips it while this is set, before
+/// taking a borrow, so the re-entrant call can't alias `spawn`'s borrow. Engine-initiated
+/// `GAME_CLEAR_EDICT` (map load, client edicts) leaves this clear and runs normally. Single-threaded.
+pub(crate) static SUPPRESS_CLEAR_EDICT: AtomicBool = AtomicBool::new(false);
+
+/// Debug-only re-entrancy guard: set while a `dispatch` borrow is live. Every host trap that
+/// re-enters `vmMain` is either deferred out of the borrow ([`bot::drain_roster`]) or suppressed
+/// ([`SUPPRESS_CLEAR_EDICT`]), so this must never already be set when `vmMain` takes a borrow —
+/// if it is, a *new* re-entrant trap slipped in and would create an aliasing `&mut` (UB). The
+/// assert makes that a loud, deterministic failure in testing instead of silent corruption.
+#[cfg(debug_assertions)]
+static IN_DISPATCH: AtomicBool = AtomicBool::new(false);
+
 /// `dllEntry` — first export the engine calls, handing us the syscall dispatcher.
 #[no_mangle]
 pub extern "C" fn dllEntry(syscall: SyscallFn) {
@@ -86,12 +103,29 @@ pub extern "C" fn vmMain(cmd: i32, arg0: i32, arg1: i32, arg2: i32) -> isize {
         return 0;
     };
     let cell = GAME.get().expect("vmMain called before dllEntry");
-    // SAFETY: single-threaded engine; no other live borrow of the GameState exists. The borrow is
-    // confined to this block and dropped before `drain_roster` runs.
+    // A `GAME_CLEAR_EDICT` re-entered from our own `spawn()` is handled by `spawn()` itself; skip it
+    // here *before* taking a borrow so it can't alias the `&mut GameState` the outer `spawn()` holds.
+    // See `SUPPRESS_CLEAR_EDICT`.
+    if matches!(cmd, GameCommand::ClearEdict) && SUPPRESS_CLEAR_EDICT.load(Ordering::Relaxed) {
+        return 0;
+    }
+    // Guard (debug builds): no dispatch borrow may already be live when we take one — see
+    // `IN_DISPATCH`.
+    #[cfg(debug_assertions)]
+    assert!(
+        !IN_DISPATCH.swap(true, Ordering::Relaxed),
+        "vmMain re-entered mid-dispatch: a host trap re-entered while a &mut GameState was live — \
+         defer it (bot::drain_roster) or suppress it (SUPPRESS_CLEAR_EDICT)"
+    );
+    // SAFETY: single-threaded engine; the borrow is confined to this block and dropped before the
+    // roster drain. With the deferral and the `ClearEdict` suppression above, no host trap re-enters
+    // `vmMain` while this borrow is live, so it is never aliased.
     let ret = {
         let game = unsafe { &mut *cell.0.get() };
         game.dispatch(cmd, arg0, arg1, arg2)
     };
+    #[cfg(debug_assertions)]
+    IN_DISPATCH.store(false, Ordering::Relaxed);
     // Apply any bot add/remove queued during the frame *now*, with no `&mut GameState` borrow live.
     // `add_bot`/`remove_bot` run the module's client callbacks synchronously and re-entrantly; doing
     // this here (rather than inline in `manage_population`) keeps the re-entered `vmMain`'s borrow
