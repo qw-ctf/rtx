@@ -441,6 +441,9 @@ struct Sense {
     client: i32,
     weapon: Weapon,
     on_ground: bool,
+    /// Waist-deep or deeper (`waterlevel >= 2`): the engine's pmove swims here — jumps become
+    /// swim-up strokes — so bunnyhopping is impossible. Vetoes the bhop controller.
+    in_water: bool,
     alive: bool,
     vz: f32,
     air_jumped: bool,
@@ -474,6 +477,8 @@ fn sense(game: &GameState, e: EntId) -> Sense {
     let client = game.entities[e].bot.client;
     let weapon = game.entities[e].v.weapon;
     let on_ground = game.entities[e].v.flags.has(Flags::ONGROUND);
+    // Swimming (waterlevel >= 2): matches the swim gate in `player_jump` and combat's `swimming`.
+    let in_water = game.entities[e].v.waterlevel >= 2.0;
     let alive = game.entities[e].v.health > 0.0 && game.entities[e].v.deadflag == 0.0;
     // Vertical speed and whether the once-per-air-travel double jump is still available — snapshot
     // now, since the `&mut bot` binding below blocks reading the edict during the move logic.
@@ -506,7 +511,7 @@ fn sense(game: &GameState, e: EntId) -> Sense {
     let armorvalue = game.entities[e].v.armorvalue;
     let quad = game.entities[e].combat.super_damage_finished > now;
     Sense {
-        host, now, frametime, msec, origin, v_angle, client, weapon, on_ground, alive, vz, air_jumped, enemy_seen_time, v_xy, speed, grapple_hook, has_grapple, hook_out, on_hook, anchor, reel_half_step,
+        host, now, frametime, msec, origin, v_angle, client, weapon, on_ground, in_water, alive, vz, air_jumped, enemy_seen_time, v_xy, speed, grapple_hook, has_grapple, hook_out, on_hook, anchor, reel_half_step,
         attack_finished, has_rl, ammo_rockets, health, armortype, armorvalue, quad,
     }
 }
@@ -866,7 +871,7 @@ fn emit(
 fn run_bot(game: &mut GameState, e: EntId) {
     let s = sense(game, e);
     let Sense {
-        host, now, frametime, msec, origin, v_angle, client, weapon, on_ground, alive, vz,
+        host, now, frametime, msec, origin, v_angle, client, weapon, on_ground, in_water, alive, vz,
         air_jumped, enemy_seen_time, v_xy, speed, grapple_hook, has_grapple, hook_out, on_hook,
         anchor, reel_half_step, attack_finished, has_rl, ammo_rockets, health, armortype,
         armorvalue, quad,
@@ -1322,6 +1327,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     let combat_view = enemy.is_some() && enemy_seen_time > 0.0 && now - enemy_seen_time < BHOP_COMBAT_GRACE;
     let bhop_veto = !host.cvar_bool(c"rtx_bot_bhop")
         || combat_view
+        || in_water // can't hop while swimming — the engine's pmove turns jumps into swim strokes
         || hook_active
         || rj_active
         // Spectating: a bhop cmd would overwrite the view yaw in `emit` and clobber the watch —
