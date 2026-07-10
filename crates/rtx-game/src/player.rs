@@ -106,8 +106,44 @@ impl GameState {
         ent.v.nextthink = next;
     }
 
+    /// DEV (`rtx_wedge_debug`): catch the frame an *alive* animation loop (`player_run` /
+    /// `player_stand1`) is first installed on a *dead* entity. That corruption leaves a dead bot
+    /// cycling a stand/run frame with `deadflag` stuck below `Dead`, so `player_death_think` never
+    /// runs and — rtx having no autospawn — it never respawns again. Logged once per wedge: only on
+    /// the transition (a live entity animating is normal; once the think is already an alive loop the
+    /// dispatch re-enters here every 0.1s — those are skipped so this can't spam). `#[track_caller]`
+    /// on the two callers makes `caller` name the exact call site that installed the alive loop.
+    /// On its own cvar (not `rtx_bot_debug`) so it can be enabled without the per-spawn spam.
+    fn dbg_wedge_edge(&self, e: EntId, caller: &'static std::panic::Location<'static>) {
+        // Hot-path bail before any cvar read: this runs on every stand/run tick of every live player.
+        if self.entities[e].v.deadflag == 0.0 {
+            return;
+        }
+        let prev = self.entities[e].think;
+        if matches!(prev, Think::PlayerRun | Think::PlayerStand) {
+            return; // continuation, not the originating transition
+        }
+        if !self.host.cvar_bool(c"rtx_wedge_debug") {
+            return;
+        }
+        let msg = crate::game::cstring(&format!(
+            "rtx: WEDGE e{} bot={} deadflag={} health={:.0} frame={} prev_think={:?} installer={}:{}\n",
+            e.0,
+            self.entities[e].bot.is_bot as i32,
+            self.entities[e].v.deadflag as i32,
+            self.entities[e].v.health,
+            self.entities[e].v.frame as i32,
+            prev,
+            caller.file(),
+            caller.line(),
+        ));
+        self.host.dprint(&msg);
+    }
+
     /// `player_stand1` — idle loop; transitions to the run loop while moving.
+    #[track_caller]
     pub(crate) fn player_stand1(&mut self, e: EntId) {
+        self.dbg_wedge_edge(e, std::panic::Location::caller());
         self.schedule_anim(e, Think::PlayerStand);
 
         let moving = {
@@ -131,7 +167,9 @@ impl GameState {
     }
 
     /// `player_run` — running loop; transitions back to idle when stopped.
+    #[track_caller]
     pub(crate) fn player_run(&mut self, e: EntId) {
+        self.dbg_wedge_edge(e, std::panic::Location::caller());
         self.schedule_anim(e, Think::PlayerRun);
 
         let stopped = {
