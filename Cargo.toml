@@ -17,4 +17,5 @@ authors = ["Daniel Svensson <dsvensson@gmail.com>"]
 glam = "0.32"
 binrw = "0.15"
 bitflags = "2"
+rayon = "1"
 rtx-nav = { path = "crates/rtx-nav" }

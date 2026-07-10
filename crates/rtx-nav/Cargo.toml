@@ -8,3 +8,4 @@ authors.workspace = true
 [dependencies]
 binrw.workspace = true
 glam.workspace = true
+rayon.workspace = true

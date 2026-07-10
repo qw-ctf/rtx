@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 
 use glam::{Vec2, Vec3, Vec3Swizzles};
+use rayon::prelude::*;
 
 mod hook;
 mod query;
@@ -436,22 +437,34 @@ impl NavGraph {
     fn carve_cells(bsp: &Bsp) -> (Vec<Cell>, GridIndex) {
         let (gx0, gy0) = (floor_grid(bsp.mins.x), floor_grid(bsp.mins.y));
         let (gx1, gy1) = (floor_grid(bsp.maxs.x), floor_grid(bsp.maxs.y));
+
+        // Scan columns for floors in parallel — the column sweep is a big share of the build and the
+        // columns are independent geometry. One `(gx, gy, origin_z)` row per `gx`; the indexed
+        // `collect` keeps rows in `gx` order (a `RangeInclusive<i32>` is an indexed parallel
+        // iterator) and `gy` is sequential within a row, so the serial ID-assignment pass below
+        // reproduces the single-threaded cell order — cell IDs and the grid index come out identical.
+        let rows: Vec<Vec<(i32, i32, f32)>> = (gx0..=gx1)
+            .into_par_iter()
+            .map(|gx| {
+                let mut row = Vec::new();
+                for gy in gy0..=gy1 {
+                    let (x, y) = (gx as f32 * GRID, gy as f32 * GRID);
+                    Self::column_floors(bsp, x, y, |origin_z| row.push((gx, gy, origin_z)));
+                }
+                row
+            })
+            .collect();
+
         let mut cells = Vec::new();
         let mut grid: GridIndex = HashMap::new();
-
-        for gx in gx0..=gx1 {
-            for gy in gy0..=gy1 {
-                let (x, y) = (gx as f32 * GRID, gy as f32 * GRID);
-                Self::column_floors(bsp, x, y, |origin_z| {
-                    let id = cells.len() as CellId;
-                    cells.push(Cell {
-                        origin: Vec3::new(x, y, origin_z),
-                        gx,
-                        gy,
-                    });
-                    grid.entry((gx, gy)).or_default().push(id);
-                });
-            }
+        for (gx, gy, origin_z) in rows.into_iter().flatten() {
+            let id = cells.len() as CellId;
+            cells.push(Cell {
+                origin: Vec3::new(gx as f32 * GRID, gy as f32 * GRID, origin_z),
+                gx,
+                gy,
+            });
+            grid.entry((gx, gy)).or_default().push(id);
         }
         (cells, grid)
     }
@@ -476,18 +489,28 @@ impl NavGraph {
     /// Classify the moves out of every cell into directed links: grounded moves to the 8
     /// grid-adjacent columns, then jumps across gaps / up to ledges (windowed and deduped).
     fn link_cells(&mut self, bsp: &Bsp) {
-        for from in 0..self.cells.len() as CellId {
-            let c = self.cells[from as usize];
-            for to in self.neighbors_within(c.gx, c.gy, 1) {
-                if to != from {
-                    if let Some(link) = self.classify_grounded(bsp, from, to) {
-                        self.push_link(link);
+        // Classify per cell in parallel (`classify_grounded`/`find_jumps` are read-only), collecting
+        // each cell's links grounded-then-jumps, then splice serially. Indexed `collect` keeps cell
+        // order and the per-cell order is preserved, so link indices are identical to a serial build.
+        let this = &*self;
+        let per_cell: Vec<Vec<Link>> = (0..this.cells.len() as CellId)
+            .into_par_iter()
+            .map(|from| {
+                let c = this.cells[from as usize];
+                let mut out = Vec::new();
+                for to in this.neighbors_within(c.gx, c.gy, 1) {
+                    if to != from {
+                        if let Some(link) = this.classify_grounded(bsp, from, to) {
+                            out.push(link);
+                        }
                     }
                 }
-            }
-            for link in self.find_jumps(bsp, from) {
-                self.push_link(link);
-            }
+                out.extend(this.find_jumps(bsp, from));
+                out
+            })
+            .collect();
+        for link in per_cell.into_iter().flatten() {
+            self.push_link(link);
         }
     }
 
@@ -624,58 +647,72 @@ impl NavGraph {
     /// the wider reach/apex and the taller arc-clearance envelope — and only for targets a plain
     /// jump can't already make (else a `JumpGap` covers it). The bot air-jumps mid-flight to cross.
     pub fn add_double_jumps(&mut self, bsp: &Bsp) {
-        let mut pending: Vec<Link> = Vec::new();
-        for from in 0..self.cells.len() as CellId {
-            let a = self.cells[from as usize];
-            if bsp.is_liquid_at(a.origin) {
-                continue; // submerged takeoff: can't jump (the jump input swims up)
-            }
-            let mut best: [Option<(f32, Link)>; 9] = Default::default();
-            for to in self.neighbors_within(a.gx, a.gy, double_jump_grid_radius()) {
-                if to == from {
-                    continue;
-                }
-                let b = self.cells[to as usize];
-                let (dgx, dgy) = (b.gx - a.gx, b.gy - a.gy);
-                if dgx.abs() <= 1 && dgy.abs() <= 1 {
-                    continue;
-                }
-                let dz = b.origin.z - a.origin.z;
-                let horiz = (b.origin.xy() - a.origin.xy()).length();
-                if !(-DJ_MAX_DROP..=DOUBLE_JUMP_APEX).contains(&dz) || horiz > DOUBLE_JUMP_REACH {
-                    continue;
-                }
-                // Only worthwhile beyond a single jump — otherwise `find_jumps` already linked it.
-                if horiz <= JUMP_REACH && dz <= JUMP_APEX {
-                    continue;
-                }
-                // Take off from a ledge edge, clear the taller arc, and don't duplicate a route the
-                // static graph already provides (walk/step/jump).
-                if self.has_ground_near(a.gx + dgx.signum(), a.gy + dgy.signum(), a.origin.z)
-                    || !arc_clear_peak(bsp, a.origin, b.origin, DOUBLE_ARC_PEAK, 12)
-                    || (dz < 0.0 && !descent_clear(bsp, a.origin.z, b.origin))
-                    || self.has_direct_link(from, to)
-                {
-                    continue;
-                }
-                let oct = dir_bucket(dgx, dgy);
-                if best[oct].is_none_or(|(d, _)| horiz < d) {
-                    best[oct] = Some((
-                        horiz,
-                        Link {
-                            from,
-                            to,
-                            kind: LinkKind::DoubleJump,
-                            cost: link_cost(LinkKind::DoubleJump, horiz, dz),
-                        },
-                    ));
-                }
-            }
-            pending.extend(best.into_iter().flatten().map(|(_, l)| l));
-        }
-        for link in pending {
+        // Solve per source cell in parallel (read-only borrow), then splice serially. The indexed
+        // `collect` returns per-cell results in cell order, so the splice — and thus link indices —
+        // are identical to a sequential build. The solvers never observe each other's pending links
+        // (same as the sequential drain), so within-stage parallelism is sound.
+        let this = &*self;
+        let pending: Vec<Vec<Link>> = (0..this.cells.len() as CellId)
+            .into_par_iter()
+            .map(|from| {
+                let mut out = Vec::new();
+                this.solve_double_jumps_from(bsp, from, &mut out);
+                out
+            })
+            .collect();
+        for link in pending.into_iter().flatten() {
             self.push_link(link);
         }
+    }
+
+    /// The double-jump links leaving cell `from`, appended to `out`.
+    fn solve_double_jumps_from(&self, bsp: &Bsp, from: CellId, out: &mut Vec<Link>) {
+        let a = self.cells[from as usize];
+        if bsp.is_liquid_at(a.origin) {
+            return; // submerged takeoff: can't jump (the jump input swims up)
+        }
+        let mut best: [Option<(f32, Link)>; 9] = Default::default();
+        for to in self.neighbors_within(a.gx, a.gy, double_jump_grid_radius()) {
+            if to == from {
+                continue;
+            }
+            let b = self.cells[to as usize];
+            let (dgx, dgy) = (b.gx - a.gx, b.gy - a.gy);
+            if dgx.abs() <= 1 && dgy.abs() <= 1 {
+                continue;
+            }
+            let dz = b.origin.z - a.origin.z;
+            let horiz = (b.origin.xy() - a.origin.xy()).length();
+            if !(-DJ_MAX_DROP..=DOUBLE_JUMP_APEX).contains(&dz) || horiz > DOUBLE_JUMP_REACH {
+                continue;
+            }
+            // Only worthwhile beyond a single jump — otherwise `find_jumps` already linked it.
+            if horiz <= JUMP_REACH && dz <= JUMP_APEX {
+                continue;
+            }
+            // Take off from a ledge edge, clear the taller arc, and don't duplicate a route the
+            // static graph already provides (walk/step/jump).
+            if self.has_ground_near(a.gx + dgx.signum(), a.gy + dgy.signum(), a.origin.z)
+                || !arc_clear_peak(bsp, a.origin, b.origin, DOUBLE_ARC_PEAK, 12)
+                || (dz < 0.0 && !descent_clear(bsp, a.origin.z, b.origin))
+                || self.has_direct_link(from, to)
+            {
+                continue;
+            }
+            let oct = dir_bucket(dgx, dgy);
+            if best[oct].is_none_or(|(d, _)| horiz < d) {
+                best[oct] = Some((
+                    horiz,
+                    Link {
+                        from,
+                        to,
+                        kind: LinkKind::DoubleJump,
+                        cost: link_cost(LinkKind::DoubleJump, horiz, dz),
+                    },
+                ));
+            }
+        }
+        out.extend(best.into_iter().flatten().map(|(_, l)| l));
     }
 
     /// Splice **speed-jump** links: leaps across gaps too wide for any single/double jump, cleared by
@@ -695,11 +732,18 @@ impl NavGraph {
     pub fn add_speed_jumps(&mut self, bsp: &Bsp, params: SpeedJumpParams, double_jump: bool) {
         let k = bhop_k(params.accel, params.maxspeed);
         self.sj_k = k; // the banded planner prices carried speed with this map's k
-        let mut pending: Vec<(Link, SpeedJumpTraversal)> = Vec::new();
-        for ledge in 0..self.cells.len() as CellId {
-            self.solve_speed_jumps_from(bsp, ledge, params, k, double_jump, &mut pending);
-        }
-        for (link, tr) in pending {
+        // Solve per ledge in parallel (read-only borrow); indexed `collect` keeps cell order, so the
+        // serial splice below reproduces the sequential build's link indices exactly.
+        let this = &*self;
+        let pending: Vec<Vec<(Link, SpeedJumpTraversal)>> = (0..this.cells.len() as CellId)
+            .into_par_iter()
+            .map(|ledge| {
+                let mut out = Vec::new();
+                this.solve_speed_jumps_from(bsp, ledge, params, k, double_jump, &mut out);
+                out
+            })
+            .collect();
+        for (link, tr) in pending.into_iter().flatten() {
             self.push_speed_jump(link, tr);
         }
     }
@@ -1219,12 +1263,18 @@ impl NavGraph {
         if self.hook_links.len() != self.links.len() {
             self.hook_links.resize(self.links.len(), -1);
         }
-        // Solve per source cell first (immutable borrow), then splice (push_hook needs `&mut`).
-        let mut pending: Vec<(Link, HookTraversal)> = Vec::new();
-        for from in 0..self.cells.len() as CellId {
-            self.solve_hooks_from(bsp, from, params, &mut pending);
-        }
-        for (link, tr) in pending {
+        // Solve per source cell in parallel (immutable borrow), then splice serially (push_hook needs
+        // `&mut`). Indexed `collect` preserves cell order, so link indices match a sequential build.
+        let this = &*self;
+        let pending: Vec<Vec<(Link, HookTraversal)>> = (0..this.cells.len() as CellId)
+            .into_par_iter()
+            .map(|from| {
+                let mut out = Vec::new();
+                this.solve_hooks_from(bsp, from, params, &mut out);
+                out
+            })
+            .collect();
+        for (link, tr) in pending.into_iter().flatten() {
             self.push_hook(link, tr);
         }
     }
@@ -1304,11 +1354,15 @@ impl NavGraph {
             }
         }
 
-        // Keep the cheapest few per cell.
-        let mut chosen: Vec<(f32, Link, HookTraversal)> = best.into_values().collect();
-        chosen.sort_by(|x, y| x.0.total_cmp(&y.0));
+        // Keep the cheapest few per cell. Break cost ties by target cell then dedup key, so the
+        // survivors don't depend on `HashMap` iteration order (randomized per instance — and under
+        // parallel building a tie would otherwise resolve differently run to run).
+        let mut chosen: Vec<_> = best.into_iter().collect();
+        chosen.sort_by(|(ak, (ac, al, _)), (bk, (bc, bl, _))| {
+            ac.total_cmp(bc).then(al.to.cmp(&bl.to)).then(ak.cmp(bk))
+        });
         chosen.truncate(HOOK_MAX_PER_CELL);
-        out.extend(chosen.into_iter().map(|(_, link, tr)| (link, tr)));
+        out.extend(chosen.into_iter().map(|(_, (_, link, tr))| (link, tr)));
     }
 
     /// Splice rocket-jump links: for each cell, fire a rocket at a solved delay/angle during a jump
@@ -1318,12 +1372,18 @@ impl NavGraph {
         if self.rocket_jump_links.len() != self.links.len() {
             self.rocket_jump_links.resize(self.links.len(), -1);
         }
-        // Solve per source cell first (immutable borrow), then splice (push needs `&mut`).
-        let mut pending: Vec<(Link, RocketJumpTraversal)> = Vec::new();
-        for from in 0..self.cells.len() as CellId {
-            self.solve_rocket_jumps_from(bsp, from, params, double_jump, &mut pending);
-        }
-        for (link, tr) in pending {
+        // Solve per source cell in parallel (immutable borrow), then splice serially (push needs
+        // `&mut`). Indexed `collect` preserves cell order, so link indices match a sequential build.
+        let this = &*self;
+        let pending: Vec<Vec<(Link, RocketJumpTraversal)>> = (0..this.cells.len() as CellId)
+            .into_par_iter()
+            .map(|from| {
+                let mut out = Vec::new();
+                this.solve_rocket_jumps_from(bsp, from, params, double_jump, &mut out);
+                out
+            })
+            .collect();
+        for (link, tr) in pending.into_iter().flatten() {
             self.push_rocket_jump(link, tr);
         }
     }
@@ -1395,11 +1455,15 @@ impl NavGraph {
             }
         }
 
-        // Keep the cheapest few per cell.
-        let mut chosen: Vec<(f32, Link, RocketJumpTraversal)> = best.into_values().collect();
-        chosen.sort_by(|x, y| x.0.total_cmp(&y.0));
+        // Keep the cheapest few per cell. Break cost ties by target cell then dedup key, so the
+        // survivors don't depend on `HashMap` iteration order (randomized per instance — and under
+        // parallel building a tie would otherwise resolve differently run to run).
+        let mut chosen: Vec<_> = best.into_iter().collect();
+        chosen.sort_by(|(ak, (ac, al, _)), (bk, (bc, bl, _))| {
+            ac.total_cmp(bc).then(al.to.cmp(&bl.to)).then(ak.cmp(bk))
+        });
         chosen.truncate(RJ_MAX_PER_CELL);
-        out.extend(chosen.into_iter().map(|(_, link, tr)| (link, tr)));
+        out.extend(chosen.into_iter().map(|(_, (_, link, tr))| (link, tr)));
     }
 
     /// Whether `from` already has a direct (non-hook) link to `to` — such a target needs no hook.
@@ -1883,32 +1947,47 @@ pub fn build_navmesh(
     speed_jump: Option<SpeedJumpParams>,
     rocket_jump: Option<RocketJumpParams>,
 ) -> NavBuild {
-    let bsp = Bsp::parse(&bytes)?;
-    let mut graph = NavGraph::build(&bsp);
-    // Static-geometry jump/hook splices first (before the plat/gate splices): keeps plat surfaces
-    // off their endpoints and lets `add_gates` tag any of these links that cross a door.
-    if double_jump {
-        graph.add_double_jumps(&bsp);
+    let run = move || -> NavBuild {
+        let bsp = Bsp::parse(&bytes)?;
+        let mut graph = NavGraph::build(&bsp);
+        // Static-geometry jump/hook splices first (before the plat/gate splices): keeps plat surfaces
+        // off their endpoints and lets `add_gates` tag any of these links that cross a door.
+        if double_jump {
+            graph.add_double_jumps(&bsp);
+        }
+        // Speed jumps after double jumps, so they only fill the gaps double jumps can't (they see the DJ
+        // links via `has_direct_link`).
+        if let Some(params) = speed_jump {
+            graph.add_speed_jumps(&bsp, params, double_jump);
+        }
+        // Hooks first: they derive from the static hull, and going before the plat/gate splices keeps
+        // plat surfaces off hook endpoints and lets `add_gates` tag any hook link crossing a door.
+        if let Some(params) = hooks {
+            graph.add_hooks(&bsp, params);
+        }
+        // Rocket jumps after hooks: `has_direct_link` then skips any ledge a (free, cheaper) hook already
+        // reaches, so an RJ link is only spent where nothing else gets there.
+        if let Some(params) = rocket_jump {
+            graph.add_rocket_jumps(&bsp, params, double_jump);
+        }
+        graph.add_plats(&bsp, &plats);
+        graph.add_teleports(&teleports);
+        graph.add_gates(&gates);
+        Some((bsp, graph))
+    };
+    // Run the (rayon-parallel) build on a transient pool sized to leave one core for the caller.
+    // A transient pool rather than rayon's process-global one because this crate ships inside a
+    // native game module (rtx.dll) the engine can unload: global-pool worker threads would outlive
+    // the DLL and later run freed code. This pool's threads are joined when the call returns.
+    // If parallelism can't be queried or the pool fails to build, fall back to running inline (which
+    // uses rayon's global pool for the par_iters — fine in tests and the standalone viewer).
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(1).max(1))
+        .unwrap_or(1);
+    match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
+        Ok(pool) => pool.install(run),
+        Err(_) => run(),
     }
-    // Speed jumps after double jumps, so they only fill the gaps double jumps can't (they see the DJ
-    // links via `has_direct_link`).
-    if let Some(params) = speed_jump {
-        graph.add_speed_jumps(&bsp, params, double_jump);
-    }
-    // Hooks first: they derive from the static hull, and going before the plat/gate splices keeps
-    // plat surfaces off hook endpoints and lets `add_gates` tag any hook link crossing a door.
-    if let Some(params) = hooks {
-        graph.add_hooks(&bsp, params);
-    }
-    // Rocket jumps after hooks: `has_direct_link` then skips any ledge a (free, cheaper) hook already
-    // reaches, so an RJ link is only spent where nothing else gets there.
-    if let Some(params) = rocket_jump {
-        graph.add_rocket_jumps(&bsp, params, double_jump);
-    }
-    graph.add_plats(&bsp, &plats);
-    graph.add_teleports(&teleports);
-    graph.add_gates(&gates);
-    Some((bsp, graph))
 }
 
 impl NavState {
@@ -2303,6 +2382,117 @@ mod tests {
         };
         assert!(reach_after >= reach_before, "rocket jumps reduced reachability");
         eprintln!("rocket-jump splice: {rjumps} links; best directed reach {reach_before} -> {reach_after}");
+    }
+
+    /// Two full builds of the same map must produce a byte-identical graph — the guard that the
+    /// rayon-parallel solvers stay deterministic across link indices, adjacency, and every
+    /// side-table payload. Env-gated on `RTX_TEST_BSP` like [`builds_navmesh`]. Prints an FNV-1a
+    /// fingerprint of the graph so a change that alters build output (versus an earlier commit) is
+    /// visible run to run, not just detectable as a build-vs-build mismatch.
+    #[test]
+    fn build_deterministic() {
+        let Ok(path) = std::env::var("RTX_TEST_BSP") else {
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read bsp");
+        let hooks = Some(HookParams {
+            gravity: 800.0,
+            pull: HOOK_PULL_BASE,
+            throw: HOOK_THROW_BASE,
+        });
+        let speed = Some(SpeedJumpParams {
+            gravity: 800.0,
+            accel: 10.0,
+            maxspeed: MAX_SPEED,
+        });
+        let rj = Some(RocketJumpParams { gravity: 800.0, rj_extra: 0.0 });
+        // All solvers on, no entity splices (they're serial and not the subject here).
+        let build = || {
+            build_navmesh(bytes.clone(), vec![], vec![], vec![], hooks, true, speed, rj)
+                .expect("build produced no graph")
+                .1
+        };
+        let a = build();
+        let b = build();
+
+        fn mix(h: &mut u64, x: u64) {
+            *h ^= x;
+            *h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV-1a 64-bit prime
+        }
+        fn mix_vec3(h: &mut u64, v: Vec3) {
+            mix(h, v.x.to_bits() as u64);
+            mix(h, v.y.to_bits() as u64);
+            mix(h, v.z.to_bits() as u64);
+        }
+        fn fingerprint(g: &NavGraph) -> u64 {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+            mix(&mut h, g.cells.len() as u64);
+            for c in &g.cells {
+                mix_vec3(&mut h, c.origin);
+                mix(&mut h, c.gx as u32 as u64);
+                mix(&mut h, c.gy as u32 as u64);
+            }
+            mix(&mut h, g.links.len() as u64);
+            for l in &g.links {
+                mix(&mut h, l.from as u64);
+                mix(&mut h, l.to as u64);
+                mix(&mut h, l.kind as u64);
+                mix(&mut h, l.cost.to_bits() as u64);
+            }
+            for adj in &g.adjacency {
+                mix(&mut h, adj.len() as u64);
+                for &li in adj {
+                    mix(&mut h, li as u64);
+                }
+            }
+            for &x in &g.hook_links {
+                mix(&mut h, x as u32 as u64);
+            }
+            for t in &g.hooks {
+                mix_vec3(&mut h, t.stick);
+                mix(&mut h, t.release_dist.to_bits() as u64);
+                mix_vec3(&mut h, t.v0);
+                mix(&mut h, t.airtime.to_bits() as u64);
+            }
+            for &x in &g.speed_jump_links {
+                mix(&mut h, x as u32 as u64);
+            }
+            for t in &g.speed_jumps {
+                mix_vec3(&mut h, t.takeoff);
+                mix(&mut h, t.v_req.to_bits() as u64);
+                mix(&mut h, t.airtime.to_bits() as u64);
+                mix(&mut h, t.chained as u64);
+            }
+            for &x in &g.rocket_jump_links {
+                mix(&mut h, x as u32 as u64);
+            }
+            for t in &g.rocket_jumps {
+                mix_vec3(&mut h, t.fire_angles);
+                mix(&mut h, t.fire_delay.to_bits() as u64);
+                mix_vec3(&mut h, t.blast);
+                mix_vec3(&mut h, t.pos_blast);
+                mix_vec3(&mut h, t.v0);
+                mix(&mut h, t.airtime.to_bits() as u64);
+                mix(&mut h, t.self_damage.to_bits() as u64);
+            }
+            h
+        }
+
+        assert_eq!(a.links.len(), b.links.len(), "link count not deterministic");
+        assert_eq!(a.adjacency, b.adjacency, "adjacency not deterministic");
+        let (fa, fb) = (fingerprint(&a), fingerprint(&b));
+        assert_eq!(fa, fb, "navmesh build not deterministic (fingerprint mismatch)");
+        let c = a.summary();
+        eprintln!(
+            "{path}: deterministic build fingerprint {fa:#018x} \
+             ({} cells, {} links; hook {} speedjump {} doublejump {} rocketjump {})",
+            a.cells.len(),
+            a.links.len(),
+            c.hook,
+            c.speed_jump,
+            c.double_jump,
+            c.rocket_jump,
+        );
     }
 
     /// The speed-jump ballistic + runway model, and its agreement with the real bhop controller.
