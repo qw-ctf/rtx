@@ -140,10 +140,29 @@ impl GameState {
         self.host.dprint(&msg);
     }
 
+    /// Recover from the wedge `dbg_wedge_edge` reports: a stale *alive* animation think (a weapon /
+    /// nail / light / grapple hand-off) reached a *dead* corpse and is about to install the
+    /// self-perpetuating `player_run`/`player_stand1` loop. That loop re-arms forever and never
+    /// reaches `player_dead`, so `deadflag` stays pinned at `Dying` — and with no autospawn the bot
+    /// never respawns. The death animation is already lost (the alive think clobbered it), so finalize
+    /// the corpse straight to the death terminus: `player_pre_think` then routes to `player_death_think`
+    /// and the respawn press is honoured. Returns whether the caller should bail out of the alive loop.
+    fn finalize_if_dead(&mut self, e: EntId) -> bool {
+        if self.entities[e].v.deadflag == 0.0 {
+            return false;
+        }
+        self.entities[e].v.frame = DEATHA.last() as f32; // a corpse pose, not the frozen mid-anim frame
+        self.player_dead(e);
+        true
+    }
+
     /// `player_stand1` — idle loop; transitions to the run loop while moving.
     #[track_caller]
     pub(crate) fn player_stand1(&mut self, e: EntId) {
         self.dbg_wedge_edge(e, std::panic::Location::caller());
+        if self.finalize_if_dead(e) {
+            return;
+        }
         self.schedule_anim(e, Think::PlayerStand);
 
         let moving = {
@@ -170,6 +189,9 @@ impl GameState {
     #[track_caller]
     pub(crate) fn player_run(&mut self, e: EntId) {
         self.dbg_wedge_edge(e, std::panic::Location::caller());
+        if self.finalize_if_dead(e) {
+            return;
+        }
         self.schedule_anim(e, Think::PlayerRun);
 
         let stopped = {
