@@ -35,6 +35,10 @@ impl GameState {
     /// Trigger the client's screen "blend flash" (QuakeC `stuffcmd(e, "bf\n")`) — the pickup /
     /// powerup screen tint.
     pub(crate) fn screen_flash(&self, e: EntId) {
+        // A bot is a fake client; stuffcmd to one makes the engine log "Not a client".
+        if self.entities[e].bot.is_bot {
+            return;
+        }
         self.host.stuffcmd(e, c"bf\n");
     }
 
@@ -606,6 +610,9 @@ impl GameState {
     }
 
     fn sprint_low(&self, e: EntId, msg: &str) {
+        if self.entities[e].bot.is_bot {
+            return;
+        }
         let c = game::cstring(msg);
         self.host.sprint(e, PrintLevel::Low, &c);
     }

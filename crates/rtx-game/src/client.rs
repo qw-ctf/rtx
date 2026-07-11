@@ -908,7 +908,7 @@ impl GameState {
             PowerupKind::Biosuit => self.entities[e].combat.rad_time,
         };
         if latch == 1.0 {
-            self.host.sprint(e, PrintLevel::High, msg);
+            self.sprint_to(e, msg);
             self.screen_flash(e);
             self.host.sound(e, Channel::Auto, sound, 1.0, Attenuation::Norm);
             self.set_powerup_time(e, kind, time + 1.0);

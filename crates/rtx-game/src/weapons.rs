@@ -1008,21 +1008,43 @@ impl GameState {
     }
 
     // --- small helpers ---
+    //
+    // These all unicast to one client (view punch / console print). A bot is a fake client with no
+    // connection, so the engine rejects a unicast aimed at one and logs "msg_entity: not a client"
+    // / "Not a client" every time — skip bots up front (the effect is a client-side no-op anyway).
+    // Same guard as `deny_fire` / `centerprint_all`.
 
     /// `Svc::SmallKick` view punch to a single client (`msg_entity = e; WriteByte MsgDest::One`).
     pub(crate) fn small_kick(&mut self, e: EntId) {
+        if self.entities[e].bot.is_bot {
+            return;
+        }
         self.globals.msg_entity = e.to_prog();
         self.host.write_svc(MsgDest::One, Svc::SmallKick);
     }
 
     /// `Svc::BigKick` view punch (super shotgun).
     fn big_kick(&mut self, e: EntId) {
+        if self.entities[e].bot.is_bot {
+            return;
+        }
         self.globals.msg_entity = e.to_prog();
         self.host.write_svc(MsgDest::One, Svc::BigKick);
     }
 
     /// `sprint(self, PrintLevel::High, ...)` to a player.
     pub(crate) fn sprint_to(&self, e: EntId, msg: &CStr) {
+        if self.entities[e].bot.is_bot {
+            return;
+        }
         self.host.sprint(e, PrintLevel::High, msg);
+    }
+
+    /// `centerprint(e, ...)` to a single player (single-recipient sibling of `centerprint_all`).
+    pub(crate) fn centerprint_to(&self, e: EntId, msg: &CStr) {
+        if self.entities[e].bot.is_bot {
+            return;
+        }
+        self.host.centerprint(e, msg);
     }
 }

@@ -140,7 +140,7 @@ impl GameState {
         let has_message = self.entities[e].message.is_some();
         if has_message && self.entities[activator].classname() == Some("player") {
             if let Some(msg) = self.message_cstring(e) {
-                self.host.centerprint(activator, &msg);
+                self.centerprint_to(activator, &msg);
             }
             if self.entities[e].noise.is_none() {
                 self.host
