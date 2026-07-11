@@ -49,9 +49,8 @@ pub(crate) enum RoundState {
 #[derive(Default)]
 pub(crate) struct ArenaState {
     pub round: RoundState,
-    /// Last announced tick, so a repeated message fires once per interval rather than every frame:
-    /// the countdown's "3/2/1" second in `Countdown`, and the 5-second "waiting for the spawn area"
-    /// reminder bucket in `Forming`. Reset by `arm_countdown` / on entering `Forming`.
+    /// Last countdown second announced, so the "3/2/1" center-print fires once per second rather
+    /// than every frame. Reset to -1 by `arm_countdown`.
     pub last_count: i32,
     /// Monotonic stamp handed out to audience members to order the challenger queue.
     pub serial: u32,
@@ -64,9 +63,10 @@ pub(crate) struct Arena;
 const ROUND_END_PAUSE: f32 = 3.0;
 /// Players in the arena at once — Rocket Arena is a 1v1 duel; everyone else waits in the audience.
 const FIGHTER_SLOTS: usize = 2;
-/// While a round is stalled in [`RoundState::Forming`] (spawn area not clearing), re-announce the
-/// "waiting" reminder once per this many seconds.
-const FORMING_REMINDER: f32 = 5.0;
+/// How long to wait for a pending fighter's spawn area to clear before forcing the placement (which
+/// slides it a hull-width off any occupant via [`spread_spawn`]). Bounds the single-spawn stall so
+/// the round always starts.
+const FORMING_TIMEOUT: f32 = 3.0;
 
 /// Audience spectating: how many candidate stands spawns to line-of-sight test when re-picking a
 /// vantage point (from a random start offset), capping the tracelines per re-pick — mirrors vigil's
@@ -107,16 +107,16 @@ impl GameMode for Arena {
                     // A pending fighter left mid-forming but others still wait — re-form to pull a
                     // fresh challenger and re-arm cleanly.
                     self.form_round(g, now);
+                } else if now - since >= FORMING_TIMEOUT {
+                    // The area never cleared (a single-spawn map, an occupant parked on the spot) —
+                    // force the remaining fighters in. `spread_spawn` (in `adjust_spawn_origin`)
+                    // slides each a hull-width off the occupant, so they spawn apart, not stacked.
+                    self.force_place_pending(g);
+                    self.arm_countdown(g, now);
                 } else {
+                    // Keep retrying the clean placement; the timeout above is the backstop.
                     self.place_pending(g);
-                    if any_pending(g) {
-                        // Still stalled (the spawn area hasn't cleared) — remind, once per interval.
-                        let bucket = ((now - since) / FORMING_REMINDER) as i32;
-                        if bucket != g.arena.last_count {
-                            g.arena.last_count = bucket;
-                            g.broadcast(PrintLevel::High, "Rocket Arena: waiting for the spawn area to clear\n");
-                        }
-                    } else {
+                    if !any_pending(g) {
                         self.arm_countdown(g, now);
                     }
                 }
@@ -180,6 +180,13 @@ impl GameMode for Arena {
         // The pool `select_spawn` will actually draw from must have a free spot. A degenerate map
         // with no pool (info_player_start only) can't wedge meaningfully — treat it as clear.
         spawn_pool(g, e).is_none_or(|c| g.has_free_spawn_of(c, e))
+    }
+
+    fn adjust_spawn_origin(&self, g: &mut GameState, e: EntId, origin: Vec3) -> Vec3 {
+        // The pre-round damage gate nullifies the spawn telefrag, so a spot shared with another
+        // live player would wedge both forever. Slide off to a free adjacent point instead — this
+        // is what lets a single-spawn arena still run (fighters spawn a hull-width apart).
+        spread_spawn(g, e, origin)
     }
 
     fn apply_loadout(&self, g: &mut GameState, e: EntId) {
@@ -377,9 +384,9 @@ impl Arena {
         self.place_pending(g);
 
         if any_pending(g) {
-            // At least one fighter couldn't be placed — hold in Forming until the area frees.
+            // At least one fighter couldn't be placed — hold in Forming until the area frees or the
+            // timeout forces a spread placement.
             g.arena.round = RoundState::Forming { since: now };
-            g.arena.last_count = 0;
             g.broadcast(PrintLevel::High, "Rocket Arena: waiting for the spawn area to clear\n");
         } else {
             self.arm_countdown(g, now);
@@ -413,6 +420,21 @@ impl Arena {
                 a.role == ArenaRole::Fighter && a.pending_spawn
             };
             if pending && self.spawn_area_clear(g, e) {
+                g.put_client_in_server(e);
+            }
+        }
+    }
+
+    /// Place every remaining `pending_spawn` fighter unconditionally — the [`FORMING_TIMEOUT`]
+    /// backstop when the area never clears. `put_client_in_server` spreads each off any occupant
+    /// (via [`Arena::adjust_spawn_origin`]), so this un-stalls the round without stacking players.
+    fn force_place_pending(&self, g: &mut GameState) {
+        for e in players(g) {
+            let pending = {
+                let a = &g.entities[e].mode_p.arena;
+                a.role == ArenaRole::Fighter && a.pending_spawn
+            };
+            if pending {
                 g.put_client_in_server(e);
             }
         }
@@ -560,6 +582,47 @@ fn any_pending(g: &GameState) -> bool {
     players(g).into_iter().any(|e| {
         let a = &g.entities[e].mode_p.arena;
         a.role == ArenaRole::Fighter && a.pending_spawn
+    })
+}
+
+/// Just over the player hull half-width (16) doubled — the closest two hulls can sit before they
+/// overlap. Spawn origins nearer than this share space and wedge.
+const SPREAD_MIN: f32 = 34.0;
+/// Ring radii tried when sliding a spawn off an occupant, in [`SPREAD_MIN`]-ish steps.
+const SPREAD_RINGS: [f32; 2] = [40.0, 80.0];
+
+/// Slide `origin` off any other live player, so no two players are relinked onto the same point (a
+/// pre-round arena can't telefrag them apart). Returns `origin` untouched when it's already clear —
+/// the common case, so a normal spawn pays only one proximity scan. Otherwise the first free point
+/// on a ring around it that also has clear line from `origin` (not through a wall); `origin` as the
+/// last resort if the spot is fully boxed in.
+fn spread_spawn(g: &mut GameState, spawning: EntId, origin: Vec3) -> Vec3 {
+    if !origin_crowded(g, origin, spawning) {
+        return origin;
+    }
+    for &ring in &SPREAD_RINGS {
+        for i in 0..8 {
+            let a = i as f32 * std::f32::consts::FRAC_PI_4;
+            let cand = origin + Vec3::new(ring * a.cos(), ring * a.sin(), 0.0);
+            if origin_crowded(g, cand, spawning) {
+                continue;
+            }
+            // Reject a candidate a wall away from the spot (would land outside the arena / in geo).
+            if g.traceline(origin, cand, false, spawning).fraction > 0.99 {
+                return cand;
+            }
+        }
+    }
+    origin
+}
+
+/// Any live player other than `who` within [`SPREAD_MIN`] of point `p`.
+fn origin_crowded(g: &GameState, p: Vec3, who: EntId) -> bool {
+    players(g).into_iter().any(|e| {
+        e != who
+            && g.entities[e].v.health > 0.0
+            && g.entities[e].v.deadflag == 0.0
+            && (g.entities[e].v.origin - p).length() < SPREAD_MIN
     })
 }
 

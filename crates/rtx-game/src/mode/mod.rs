@@ -209,6 +209,15 @@ pub(crate) trait GameMode: Sync {
         true
     }
 
+    /// Final say on a spawn origin, once the spot is chosen and offset — the last funnel before the
+    /// player is relinked, so it covers every spawn path (engine-driven, round former, respawn).
+    /// Default: unchanged. Rocket Arena nudges a player off any other live player here, so two
+    /// fighters can never share a position (their pre-round protection nullifies the telefrag that
+    /// would otherwise unstack them) — this is what lets even a single-spawn arena run.
+    fn adjust_spawn_origin(&self, _g: &mut GameState, _e: EntId, origin: Vec3) -> Vec3 {
+        origin
+    }
+
     /// Set weapons / ammo / armor / health after `DecodeLevelParms`. Default: keep the decoded
     /// spawn parms (stock deathmatch loadout). Team assignment is applied generically before this,
     /// so a mode's loadout composes with any team composition.

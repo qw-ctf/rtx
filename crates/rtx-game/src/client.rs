@@ -281,7 +281,10 @@ impl GameState {
         } else {
             mode.select_spawn(self, player)
         };
+        // Let the mode nudge the origin off any other live player (Rocket Arena) so no two players
+        // are relinked onto the same point — the last funnel every spawn path passes through.
         let origin = self.entities[spot].v.origin + Vec3::new(0.0, 0.0, 1.0);
+        let origin = mode.adjust_spawn_origin(self, player, origin);
         let angles = self.entities[spot].v.angles;
         {
             let ent = &mut self.entities[player];

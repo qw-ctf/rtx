@@ -353,6 +353,16 @@ impl GameState {
                 1
             }
             GameCommand::PutClientInServer if !is_spectator => {
+                // The engine drives this for bots on a bot frame whenever the server isn't empty (a
+                // human is watching), bypassing the round former's deferral. Honor the mode's spawn
+                // gate for bots so it can't drop a bot onto an occupied arena spot the pre-round
+                // telefrag can't clear — leave it never-spawned and let `run_bot` / the arena's
+                // Forming retry place it once the area frees. Humans can't be deferred (no retry
+                // channel), so they always spawn here.
+                let mode = self.mode;
+                if self.entities[player].bot.is_bot && !mode.spawn_area_clear(self, player) {
+                    return 1;
+                }
                 self.put_client_in_server(player);
                 1
             }
