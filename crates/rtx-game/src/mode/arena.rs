@@ -125,13 +125,18 @@ impl GameMode for Arena {
         if g.entities[e].mode_p.arena.role == ArenaRole::Fighter {
             // Fighters spawn inside the arena. On maps without teleport destinations, fall back
             // to the deathmatch spawns so the mode still functions.
-            let spot = g.select_spawn_point_of("info_teleport_destination");
+            let spot = g.select_spawn_point_of("info_teleport_destination", Some(e));
             if spot != EntId::WORLD {
                 return spot;
             }
         }
         // Audience (and the fallback) use the deathmatch spawns — the stands on an arena map.
-        g.select_spawn_point()
+        g.select_spawn_point(Some(e))
+    }
+
+    fn spawn_rules_live(&self, g: &GameState) -> bool {
+        // The arena's "actually playing" state is a live round, not the team-match lifecycle.
+        matches!(g.arena.round, RoundState::Live)
     }
 
     fn apply_loadout(&self, g: &mut GameState, e: EntId) {

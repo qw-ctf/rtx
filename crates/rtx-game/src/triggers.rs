@@ -331,11 +331,16 @@ impl GameState {
             o.angles = t_mangle;
         }
         if self.entities[other].classname() == Some("player") {
-            let o = &mut self.entities[other].v;
-            o.fixangle = 1.0;
-            o.teleport_time = time + 0.7;
-            o.flags = o.flags.without(Flags::ONGROUND);
-            o.velocity = v_forward * 300.0;
+            {
+                let o = &mut self.entities[other].v;
+                o.fixangle = 1.0;
+                o.teleport_time = time + 0.7;
+                o.flags = o.flags.without(Flags::ONGROUND);
+                o.velocity = v_forward * 300.0;
+            }
+            // A just-teleported player briefly fences nearby spawn spots (KTX's k_1spawn),
+            // so nobody respawns into the arrival telefrag zone.
+            self.entities[other].spawn.grace_until = time + 0.78;
         }
     }
 

@@ -81,14 +81,14 @@ impl GameMode for Race {
         self.run_touch_machine(g);
     }
 
-    fn select_spawn(&self, g: &mut GameState, _e: EntId) -> EntId {
+    fn select_spawn(&self, g: &mut GameState, e: EntId) -> EntId {
         // Everyone spawns on the start pad. On a map with no routes there's no marker, so
         // degrade to the stock deathmatch spawns and let the mode idle.
-        let spot = g.select_spawn_point_of(RACE_SPAWN_CLASS);
+        let spot = g.select_spawn_point_of(RACE_SPAWN_CLASS, Some(e));
         if spot != EntId::WORLD {
             return spot;
         }
-        g.select_spawn_point()
+        g.select_spawn_point(Some(e))
     }
 
     fn apply_loadout(&self, g: &mut GameState, e: EntId) {

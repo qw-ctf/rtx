@@ -13,10 +13,10 @@ use crate::abi::EntVars;
 use crate::assets::{Model, Sound};
 use crate::bot;
 use crate::defs::*;
-use crate::entity::{CombatState, Die, EntId, Pain};
+use crate::entity::{CombatState, Die, EntId, Pain, SpawnState};
 use crate::game::GameState;
 use crate::obituary::DeathType;
-use crate::mode::ModePlayer;
+use crate::mode::{ArenaRole, ModePlayer};
 
 #[derive(Clone, Copy)]
 struct PlayerParms {
@@ -153,6 +153,7 @@ impl GameState {
         ent.in_use = false;
         ent.classname = None;
         ent.mode_p = ModePlayer::default();
+        ent.spawn = SpawnState::default();
     }
 
     /// `SetNewParms` — default spawn parameters for a fresh player.
@@ -276,7 +277,7 @@ impl GameState {
         // The mode chooses the spawn point (arena vs. audience in Rocket Arena; a plain DM spawn
         // otherwise). Benched spectators go to the stands (plain DM spawns), not the mode's logic.
         let spot = if benched {
-            self.select_spawn_point()
+            self.select_spawn_point(Some(player))
         } else {
             mode.select_spawn(self, player)
         };
@@ -289,6 +290,9 @@ impl GameState {
             ent.v.fixangle = 1.0; // snap the client's view immediately
             ent.v.view_ofs = VEC_VIEW_OFS;
             ent.v.velocity = Vec3::ZERO;
+            // Freshly spawned players fence nearby spawn spots for a moment (KTX's k_1spawn),
+            // so two respawns in quick succession don't land on adjacent spots.
+            ent.spawn.grace_until = time + 2.6;
         }
 
         // Assign the player model and bounding box, then explicitly relink at the spawn
@@ -961,11 +965,10 @@ impl GameState {
     }
 
     /// `SelectSpawnPoint` — pick a deathmatch spawn (preferring unoccupied ones), falling
-    /// back to the single-player start.
-    /// Standard deathmatch spawn: a free `info_player_deathmatch`, falling back to
-    /// `info_player_start` when a map has none.
-    pub(crate) fn select_spawn_point(&mut self) -> EntId {
-        let spot = self.pick_spawn_of("info_player_deathmatch");
+    /// back to the single-player start. `who` is the spawning player (`None` for non-player
+    /// placement like CTF runes — no spawn memory, no self-exclusion).
+    pub(crate) fn select_spawn_point(&mut self, who: Option<EntId>) -> EntId {
+        let spot = self.pick_spawn_of("info_player_deathmatch", who);
         if spot != EntId::WORLD {
             return spot;
         }
@@ -977,29 +980,58 @@ impl GameState {
     /// Pick a spawn point of a specific classname (e.g. `info_teleport_destination` for arena
     /// fighters), preferring an unoccupied one. `EntId::WORLD` if the map has none — the caller
     /// decides the fallback.
-    pub(crate) fn select_spawn_point_of(&mut self, classname: &str) -> EntId {
-        self.pick_spawn_of(classname)
+    pub(crate) fn select_spawn_point_of(&mut self, classname: &str, who: Option<EntId>) -> EntId {
+        self.pick_spawn_of(classname, who)
     }
 
-    /// Shared spawn-point picker: a random unoccupied entity of `classname` (any of them if all
-    /// are occupied), or `EntId::WORLD` if none exist.
-    fn pick_spawn_of(&mut self, classname: &str) -> EntId {
+    /// Shared spawn-point picker — KTX's default spawn model (`k_spw 4` "KTX2"): a random
+    /// unoccupied entity of `classname` (any of them if all are occupied — the following
+    /// telefrag clears the collision), or `EntId::WORLD` if none exist. Under live rules
+    /// ([`GameMode::spawn_rules_live`](crate::mode::GameMode::spawn_rules_live)) a pick that
+    /// repeats `who`'s previous spawn is re-rolled once, and the spot is remembered — but only
+    /// on maps with more than two spots, where avoidance means something.
+    fn pick_spawn_of(&mut self, classname: &str, who: Option<EntId>) -> EntId {
         let spots: Vec<EntId> = self.find_by_classname(classname).collect();
         if spots.is_empty() {
             return EntId::WORLD;
         }
-        let free: Vec<EntId> = spots.iter().copied().filter(|&s| !self.spot_occupied(s)).collect();
-        let pool = if free.is_empty() { &spots } else { &free };
-
-        let pick = (self.random() * pool.len() as f32) as usize;
-        pool[pick.min(pool.len() - 1)]
+        let mode = self.mode;
+        let live = mode.spawn_rules_live(self);
+        let blocked: Vec<bool> = spots.iter().map(|&s| self.spot_occupied(s, who, live)).collect();
+        // The previous spawn as an index into this classname's spots; a stale or foreign
+        // `last_spot` simply doesn't match and costs nothing.
+        let prev = who.and_then(|w| spots.iter().position(|&s| s == self.entities[w].spawn.last_spot));
+        let (r1, r2) = (self.random(), self.random());
+        let pick = spots[choose_spot(&blocked, prev, live, r1, r2)];
+        if let Some(w) = who {
+            if records_last_spot(spots.len(), live) {
+                self.entities[w].spawn.last_spot = pick;
+            }
+        }
+        pick
     }
 
-    /// Whether any player stands within 84 units of a spawn point.
-    fn spot_occupied(&self, spot: EntId) -> bool {
+    /// Whether a live player (other than `who`) fences this spawn spot: within 84 units and
+    /// blocking per [`blocks_spot`]. Dead players never block — their corpse is about to
+    /// respawn elsewhere, and KTX skips them too.
+    fn spot_occupied(&self, spot: EntId, who: Option<EntId>, live: bool) -> bool {
+        let time = self.time();
         let origin = self.entities[spot].v.origin;
-        self.find_by_classname("player")
-            .any(|p| (self.entities[p].v.origin - origin).length() < 84.0)
+        self.find_by_classname("player").any(|p| {
+            if Some(p) == who
+                || self.entities[p].v.health <= 0.0
+                || (self.entities[p].v.origin - origin).length() >= 84.0
+            {
+                return false;
+            }
+            // A bystander a telefrag can't clear must always fence: benched spectators and the
+            // Rocket Arena audience are solid but damage-refused, so spawning into them would
+            // wedge both players.
+            let untouchable = crate::mode::team::benched(self, p)
+                || (self.mode.name() == "ra"
+                    && self.entities[p].mode_p.arena.role == ArenaRole::Audience);
+            blocks_spot(live, untouchable, self.entities[p].spawn.grace_until, time)
+        })
     }
 
     // --- small helpers ---
@@ -1008,5 +1040,113 @@ impl GameState {
     pub(crate) fn read_netname(&self, player: EntId) -> String {
         let mut buf = [0u8; 64];
         self.host.infokey(player, c"name", &mut buf).to_owned()
+    }
+}
+
+// --- spawn-selection rules (KTX k_spw 4), extracted pure for unit tests ---
+
+/// Does one nearby live non-self player fence a spawn spot? Outside live play always (the stock
+/// rule — dead/self/radius are filtered by the caller); during live play only while inside their
+/// own post-spawn/teleport grace window, so an established player camping a spot doesn't remove
+/// it from the pool forever. Untouchable bystanders (benched spectators, arena audience) always
+/// fence — a telefrag can't clear them.
+fn blocks_spot(live: bool, untouchable: bool, grace_until: f32, time: f32) -> bool {
+    !live || untouchable || grace_until >= time
+}
+
+/// KTX's `SelectSpawnPoint` over `Sub_SelectSpawnPoint`: a random free spot (any spot when all
+/// are blocked), re-rolled once under live rules when the pick repeats `prev` — the previous
+/// spawn. The re-roll may land on `prev` again; that's accepted, exactly like KTX. `r1`/`r2`
+/// are the two pre-drawn uniform `[0,1)` rolls.
+fn choose_spot(blocked: &[bool], prev: Option<usize>, live: bool, r1: f32, r2: f32) -> usize {
+    let free: Vec<usize> = (0..blocked.len()).filter(|&i| !blocked[i]).collect();
+    let roll = |r: f32| -> usize {
+        if free.is_empty() {
+            let i = (r * blocked.len() as f32) as usize;
+            i.min(blocked.len() - 1)
+        } else {
+            let i = (r * free.len() as f32) as usize;
+            free[i.min(free.len() - 1)]
+        }
+    };
+    let first = roll(r1);
+    if live && Some(first) == prev {
+        return roll(r2);
+    }
+    first
+}
+
+/// KTX records the previous spawn only on maps with more than two spots (with two, avoidance
+/// would just ping-pong deterministically), and only under live rules.
+fn records_last_spot(total: usize, live: bool) -> bool {
+    live && total > 2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{blocks_spot, choose_spot, records_last_spot};
+
+    #[test]
+    fn warmup_blocks_regardless_of_grace() {
+        // Outside live rules any nearby live player fences, grace long expired or not.
+        assert!(blocks_spot(false, false, 0.0, 100.0));
+        assert!(blocks_spot(false, false, 200.0, 100.0));
+    }
+
+    #[test]
+    fn live_grace_gates_blocking() {
+        assert!(blocks_spot(true, false, 100.0, 100.0)); // inside grace (inclusive)
+        assert!(!blocks_spot(true, false, 99.9, 100.0)); // grace lapsed — no longer fences
+    }
+
+    #[test]
+    fn untouchable_always_fences() {
+        assert!(blocks_spot(true, true, 0.0, 100.0));
+    }
+
+    #[test]
+    fn prefers_free_spots() {
+        let blocked = [true, false, true, false];
+        for r in [0.0, 0.3, 0.6, 0.99] {
+            let pick = choose_spot(&blocked, None, true, r, 0.0);
+            assert!(!blocked[pick]);
+        }
+    }
+
+    #[test]
+    fn all_blocked_falls_back_to_any() {
+        let blocked = [true, true, true];
+        assert_eq!(choose_spot(&blocked, None, true, 0.0, 0.0), 0);
+        assert_eq!(choose_spot(&blocked, None, true, 0.5, 0.0), 1);
+        assert_eq!(choose_spot(&blocked, None, true, 0.99, 0.0), 2);
+    }
+
+    #[test]
+    fn reroll_once_on_repeat() {
+        let blocked = [false, false, false, false];
+        // r1 lands on the previous spawn (index 1) → the second roll decides (index 3).
+        assert_eq!(choose_spot(&blocked, Some(1), true, 0.3, 0.9), 3);
+        // The re-roll landing on prev again is accepted — no third roll.
+        assert_eq!(choose_spot(&blocked, Some(1), true, 0.3, 0.3), 1);
+    }
+
+    #[test]
+    fn no_reroll_when_not_live() {
+        let blocked = [false, false, false, false];
+        assert_eq!(choose_spot(&blocked, Some(1), false, 0.3, 0.9), 1);
+    }
+
+    #[test]
+    fn no_reroll_without_memory() {
+        // The `who: None` paths (CTF runes, bot roam points) carry no previous spawn.
+        let blocked = [false, false, false, false];
+        assert_eq!(choose_spot(&blocked, None, true, 0.3, 0.9), 1);
+    }
+
+    #[test]
+    fn last_spot_recorded_only_when_meaningful() {
+        assert!(!records_last_spot(2, true)); // two spots would ping-pong
+        assert!(records_last_spot(3, true));
+        assert!(!records_last_spot(5, false)); // warmup never records
     }
 }

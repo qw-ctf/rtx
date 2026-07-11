@@ -388,6 +388,11 @@ pub struct Entity {
     pub refs: CustomRefs,
     pub combat: CombatState,
     pub item: ItemState,
+    /// Per-player spawn-selection memory (KTX k_spw 4). Deliberately outside [`CombatState`]:
+    /// `put_client_in_server` wipes combat *before* the spawn is selected, and this must
+    /// survive respawns. The map-load edict sweep defaults the whole entity, so `last_spot`
+    /// can't dangle across maps.
+    pub spawn: SpawnState,
     /// Per-player game-mode state (arena role, team, CTF carry/runes). Default in FFA.
     pub mode_p: ModePlayer,
     /// CTF flag state — only meaningful on the two flag entities (`flag.team != 0`).
@@ -546,6 +551,17 @@ pub struct CombatState {
     pub fly_sound: f32,
     pub axhitme: f32,
     pub show_hostile: f32,
+}
+
+/// Spawn-point fairness state, per player (KTX's `k_lastspawn`/`k_1spawn`).
+#[derive(Default)]
+pub struct SpawnState {
+    /// The spot entity this player last spawned at (`WORLD` = none yet). Consulted for the
+    /// one-time re-roll that avoids back-to-back respawns on the same spot.
+    pub last_spot: EntId,
+    /// World time until which this player fences nearby spawn spots during live play
+    /// (+2.6 on spawn, +0.78 on teleport — KTX's `k_1spawn` grace window).
+    pub grace_until: f32,
 }
 
 #[derive(Default)]

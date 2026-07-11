@@ -662,7 +662,7 @@ impl GameState {
             return; // 1 = runes off
         }
         for bit in [RUNE_RESISTANCE, RUNE_STRENGTH, RUNE_HASTE, RUNE_REGEN] {
-            let spot = self.select_spawn_point();
+            let spot = self.select_spawn_point(None); // item placement — no spawn memory
             if spot != EntId::WORLD {
                 let org = self.entities[spot].v.origin;
                 self.do_spawn_rune(org, bit);
@@ -724,7 +724,7 @@ impl GameState {
     /// `Think::RuneRespawn` — an untouched rune relocates to a fresh spawn.
     pub(crate) fn rune_respawn(&mut self, rune: EntId) {
         let bit = self.entities[rune].item.rune_bit;
-        let spot = self.select_spawn_point();
+        let spot = self.select_spawn_point(None); // item placement — no spawn memory
         let org = if spot != EntId::WORLD {
             self.entities[spot].v.origin
         } else {

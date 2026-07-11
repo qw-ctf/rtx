@@ -358,12 +358,12 @@ pub(crate) fn announce_team_result(g: &mut GameState) {
 pub(crate) fn team_spawn(g: &mut GameState, e: EntId) -> EntId {
     let team = g.entities[e].mode_p.team;
     if team >= 1 {
-        let spot = g.select_spawn_point_of(&format!("info_player_team{team}"));
+        let spot = g.select_spawn_point_of(&format!("info_player_team{team}"), Some(e));
         if spot != EntId::WORLD {
             return spot;
         }
     }
-    g.select_spawn_point()
+    g.select_spawn_point(Some(e))
 }
 
 /// Weapons are hot in every match phase except the pre-fight countdown.

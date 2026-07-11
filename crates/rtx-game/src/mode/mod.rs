@@ -182,6 +182,16 @@ pub(crate) trait GameMode: Sync {
         team::team_spawn(g, e)
     }
 
+    /// Do the live spawn-fairness rules apply right now — KTX's `match_in_progress == 2`, i.e.
+    /// "actually playing"? Under live rules a bystander fences nearby spawn spots only during
+    /// their own post-spawn grace window, and a re-roll avoids back-to-back same-spot respawns;
+    /// outside them any nearby live player blocks (the stock rule). Default: a Live team match,
+    /// or any composition with no lifecycle at all (plain FFA ≈ a KTX matchless server). Arena
+    /// overrides this with its round state.
+    fn spawn_rules_live(&self, g: &GameState) -> bool {
+        !team::lifecycle_active(g) || matches!(g.team_match.phase, MatchPhase::Live)
+    }
+
     /// Set weapons / ammo / armor / health after `DecodeLevelParms`. Default: keep the decoded
     /// spawn parms (stock deathmatch loadout). Team assignment is applied generically before this,
     /// so a mode's loadout composes with any team composition.
@@ -505,7 +515,8 @@ pub(crate) fn wander_point(
     let arrived = target != Vec3::ZERO && (dx * dx + dy * dy).sqrt() < 48.0;
     if now >= g.entities[bot].bot.wander_time || target == Vec3::ZERO || arrived {
         let next = prefer(g).unwrap_or_else(|| {
-            let spot = g.select_spawn_point_of(classname);
+            // A roam destination, not a spawn — no spawn memory, no self-exclusion.
+            let spot = g.select_spawn_point_of(classname, None);
             if spot != EntId::WORLD {
                 g.entities[spot].v.origin
             } else {
