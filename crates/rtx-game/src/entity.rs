@@ -738,3 +738,54 @@ impl core::ops::IndexMut<usize> for Entities {
         &mut self.0[i]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::defs::Solid;
+
+    /// A slot cleared with `Entity::default()` — what the map-load `GAME_CLEAR_EDICT` handler now
+    /// does — must be inert to every full-array scan gate. Our entity box is process-global, and the
+    /// engine's map-load sweep does *not* memset it, so a slot left non-inert would keep the previous
+    /// map's data at an index `>= num_edicts` and crash the server ("NUM_FOR_EDICT: bad pointer") the
+    /// moment a scan passed it to a builtin.
+    #[test]
+    fn cleared_slot_is_inert_to_scans() {
+        let e = Entity::default();
+        // `find_by_classname`'s gate.
+        assert!(!e.in_use, "a cleared slot must read as not-in-use");
+        // The `bot_pickup_items` backpack sweep's gate: `touch == Backpack && v.solid == Trigger`.
+        assert_eq!(e.touch, Touch::None, "a cleared slot has no touch behaviour");
+        assert_eq!(e.v.solid, Solid::Not, "a cleared slot is non-solid");
+        assert_ne!(e.v.solid, Solid::Trigger);
+    }
+
+    /// The map-load clear must neutralize a slot that carried a live backpack over from the previous
+    /// map — the concrete stale state the crash hinged on.
+    #[test]
+    fn stale_backpack_slot_is_neutralized_by_clear() {
+        // A slot as it looked on the previous map: a live, touchable backpack trigger.
+        let mut slot = Entity { in_use: true, ..Default::default() };
+        slot.set_touch(Touch::Backpack);
+        slot.v.solid = Solid::Trigger;
+        slot.v.origin = glam::Vec3::new(128.0, -64.0, 24.0);
+        assert!(slot.touch == Touch::Backpack && slot.v.solid == Solid::Trigger, "sanity: matches the sweep");
+
+        // The map-load `GAME_CLEAR_EDICT` clear.
+        slot = Entity::default();
+
+        assert!(!slot.in_use);
+        assert_ne!(slot.touch, Touch::Backpack);
+        assert_ne!(slot.v.solid, Solid::Trigger);
+    }
+
+    /// `reset()` is for freshly *spawned* slots and marks them in-use — distinct from the `default()`
+    /// clear, which must leave `in_use == false`. The fix relies on this difference.
+    #[test]
+    fn reset_marks_in_use_unlike_default() {
+        assert!(!Entity::default().in_use);
+        let mut e = Entity::default();
+        e.reset();
+        assert!(e.in_use, "reset() spawns the slot in-use");
+    }
+}
