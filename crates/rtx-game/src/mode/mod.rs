@@ -88,6 +88,12 @@ pub(crate) struct ArenaSlot {
     /// Throttle for the "can't fire yet" screen blink during the countdown (world time of the last
     /// blink), so a held fire button flashes once in a while rather than every frame.
     pub flash_time: f32,
+    /// Set when this player has been promoted to fighter for the forming round but not yet placed
+    /// in the arena, because the spawn area wasn't clear (see [`GameMode::spawn_area_clear`]). The
+    /// round former / tick loop keeps retrying the placement; any spawn clears it (in
+    /// `select_spawn`). Per-player rather than in `ArenaState` so `retire_slot` drops it with the
+    /// slot — it can never dangle across slot reuse.
+    pub pending_spawn: bool,
 }
 
 /// A player's CTF state: the flag they carry, their held rune, and the assist/defense windows.
@@ -190,6 +196,17 @@ pub(crate) trait GameMode: Sync {
     /// overrides this with its round state.
     fn spawn_rules_live(&self, g: &GameState) -> bool {
         !team::lifecycle_active(g) || matches!(g.team_match.phase, MatchPhase::Live)
+    }
+
+    /// Is `e`'s spawn area clear enough to place them without wedging into another player? A game-
+    /// driven spawn (round formation, a bot's first spawn, a death-think respawn) consults this and
+    /// postpones the placement while it's false, retrying rather than stacking two players on one
+    /// spot. Default: always clear (stock behavior — the spawn telefrag resolves any overlap).
+    /// Rocket Arena overrides it, because its pre-round damage gate swallows that telefrag and the
+    /// two players would interpenetrate permanently. Not consulted on the engine-driven human
+    /// spawn path (connect / map change), which can't be deferred.
+    fn spawn_area_clear(&self, _g: &GameState, _e: EntId) -> bool {
+        true
     }
 
     /// Set weapons / ammo / armor / health after `DecodeLevelParms`. Default: keep the decoded

@@ -899,6 +899,12 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // can't help it (`death_think` only runs for `deadflag >= Dead`). Seed fresh spawn parms before
     // spawning; FFA/team keep those decoded parms, while fixed-kit modes overwrite them.
     if !alive && game.entities[e].v.deadflag == 0.0 {
+        // Don't place onto an occupied spot the mode can't telefrag clear (Rocket Arena): postpone
+        // and retry next bot frame — an early return without a command is this branch's own shape.
+        let mode = game.mode;
+        if !mode.spawn_area_clear(game, e) {
+            return;
+        }
         game.set_new_parms();
         game.put_client_in_server(e);
         return;

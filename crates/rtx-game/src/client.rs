@@ -450,7 +450,14 @@ impl GameState {
         self.client_obituary(e, e);
         self.set_suicide_frame(e);
         self.entities[e].v.modelindex = self.level.modelindex_player;
-        self.respawn(e);
+        // `kill` respawns directly rather than through the death-think, so honor the mode's spawn
+        // gate here too — otherwise a suicide could re-stack onto an occupied arena spot. When the
+        // area isn't clear the corpse (now `Dead`) just falls into the normal death-think, which
+        // retries the gated respawn on the next button press.
+        let mode = self.mode;
+        if mode.allow_respawn(self, e) {
+            self.respawn(e);
+        }
     }
 
     /// `respawn` — copy the corpse, reset parms, re-enter the server.
@@ -1032,6 +1039,16 @@ impl GameState {
                     && self.entities[p].mode_p.arena.role == ArenaRole::Audience);
             blocks_spot(live, untouchable, self.entities[p].spawn.grace_until, time)
         })
+    }
+
+    /// Is any spot of `classname` free of other players for `spawning` to take? Uses the strict
+    /// (non-live) occupancy rule — any *other, living* player within 84 units fences a spot —
+    /// because this answers "would placing here wedge them", not spawn fairness. The wedge-avoidance
+    /// gate behind [`GameMode::spawn_area_clear`] (Rocket Arena, whose pre-round damage gate eats the
+    /// spawn telefrag).
+    pub(crate) fn has_free_spawn_of(&self, classname: &str, spawning: EntId) -> bool {
+        self.find_by_classname(classname)
+            .any(|s| !self.spot_occupied(s, Some(spawning), false))
     }
 
     // --- small helpers ---

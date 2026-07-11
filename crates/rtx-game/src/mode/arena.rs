@@ -24,13 +24,18 @@ use crate::defs::{Items, PrintLevel, Weapon, VEC_VIEW_OFS};
 use crate::entity::EntId;
 use crate::game::GameState;
 
-/// Where the round is in its lifecycle. The whole mode is this four-state machine, advanced once
+/// Where the round is in its lifecycle. The whole mode is this five-state machine, advanced once
 /// per server frame by [`Arena::tick`] and on each kill by [`Arena::on_death`].
 #[derive(Default, Clone, Copy)]
 pub(crate) enum RoundState {
     /// Waiting for enough players to start a round.
     #[default]
     Warmup,
+    /// Fighters assigned, but at least one couldn't be placed yet because its spawn area wasn't
+    /// clear (a single-spawn map, an occupied arena). [`Arena::tick`] keeps retrying the placement
+    /// and arms the countdown once every fighter is in. `since` is when forming began. Treated as
+    /// "not live" everywhere (damage gated, weapons cold), exactly like `Countdown`.
+    Forming { since: f32 },
     /// Fighters spawned and protected; counting down to "FIGHT". `until` is the world time the
     /// countdown ends.
     Countdown { until: f32 },
@@ -44,8 +49,9 @@ pub(crate) enum RoundState {
 #[derive(Default)]
 pub(crate) struct ArenaState {
     pub round: RoundState,
-    /// Last countdown second announced, so the "3/2/1" center-print fires once per second rather
-    /// than every frame.
+    /// Last announced tick, so a repeated message fires once per interval rather than every frame:
+    /// the countdown's "3/2/1" second in `Countdown`, and the 5-second "waiting for the spawn area"
+    /// reminder bucket in `Forming`. Reset by `arm_countdown` / on entering `Forming`.
     pub last_count: i32,
     /// Monotonic stamp handed out to audience members to order the challenger queue.
     pub serial: u32,
@@ -58,6 +64,9 @@ pub(crate) struct Arena;
 const ROUND_END_PAUSE: f32 = 3.0;
 /// Players in the arena at once — Rocket Arena is a 1v1 duel; everyone else waits in the audience.
 const FIGHTER_SLOTS: usize = 2;
+/// While a round is stalled in [`RoundState::Forming`] (spawn area not clearing), re-announce the
+/// "waiting" reminder once per this many seconds.
+const FORMING_REMINDER: f32 = 5.0;
 
 /// Audience spectating: how many candidate stands spawns to line-of-sight test when re-picking a
 /// vantage point (from a random start offset), capping the tracelines per re-pick — mirrors vigil's
@@ -85,6 +94,31 @@ impl GameMode for Arena {
             RoundState::Warmup => {
                 if count_players(g) >= 2 {
                     self.form_round(g, now);
+                }
+            }
+            RoundState::Forming { since } => {
+                if count_players(g) < 2 {
+                    // Lost a player before the round could start — abandon it and clear the flags.
+                    for e in players(g) {
+                        g.entities[e].mode_p.arena.pending_spawn = false;
+                    }
+                    g.arena.round = RoundState::Warmup;
+                } else if fighter_count(g) < FIGHTER_SLOTS {
+                    // A pending fighter left mid-forming but others still wait — re-form to pull a
+                    // fresh challenger and re-arm cleanly.
+                    self.form_round(g, now);
+                } else {
+                    self.place_pending(g);
+                    if any_pending(g) {
+                        // Still stalled (the spawn area hasn't cleared) — remind, once per interval.
+                        let bucket = ((now - since) / FORMING_REMINDER) as i32;
+                        if bucket != g.arena.last_count {
+                            g.arena.last_count = bucket;
+                            g.broadcast(PrintLevel::High, "Rocket Arena: waiting for the spawn area to clear\n");
+                        }
+                    } else {
+                        self.arm_countdown(g, now);
+                    }
                 }
             }
             RoundState::Countdown { until } => {
@@ -122,6 +156,9 @@ impl GameMode for Arena {
     }
 
     fn select_spawn(&self, g: &mut GameState, e: EntId) -> EntId {
+        // Any spawn (this one is about to happen) settles a pending placement — clear it here, the
+        // one point every game-driven spawn path funnels through, so no path can double-place.
+        g.entities[e].mode_p.arena.pending_spawn = false;
         if g.entities[e].mode_p.arena.role == ArenaRole::Fighter {
             // Fighters spawn inside the arena. On maps without teleport destinations, fall back
             // to the deathmatch spawns so the mode still functions.
@@ -137,6 +174,12 @@ impl GameMode for Arena {
     fn spawn_rules_live(&self, g: &GameState) -> bool {
         // The arena's "actually playing" state is a live round, not the team-match lifecycle.
         matches!(g.arena.round, RoundState::Live)
+    }
+
+    fn spawn_area_clear(&self, g: &GameState, e: EntId) -> bool {
+        // The pool `select_spawn` will actually draw from must have a free spot. A degenerate map
+        // with no pool (info_player_start only) can't wedge meaningfully — treat it as clear.
+        spawn_pool(g, e).is_none_or(|c| g.has_free_spawn_of(c, e))
     }
 
     fn apply_loadout(&self, g: &mut GameState, e: EntId) {
@@ -209,17 +252,34 @@ impl GameMode for Arena {
         }
     }
 
+    fn allow_respawn(&self, g: &GameState, e: EntId) -> bool {
+        // Hold a death-think respawn (into the stands, or the arena) until it won't wedge into
+        // another player the pre-round telefrag can't clear. A dead bot keeps pulsing +attack and a
+        // human keeps pressing, so the respawn fires as soon as the area frees.
+        self.spawn_area_clear(g, e)
+    }
+
     fn bot_intent(&self, g: &mut GameState, bot: EntId) -> Option<BotIntent> {
         match g.entities[bot].mode_p.arena.role {
             ArenaRole::Fighter => {
-                // Before the round goes live (countdown), roam the arena to take up a position,
-                // rather than standing on the spawn (which looks dead and trips the stuck-jumper).
+                // Before the round goes live (countdown), roam to take up a position rather than
+                // standing on the spawn (which looks dead and trips the stuck-jumper). A promoted-
+                // but-not-yet-placed fighter is still physically in the stands, so it roams the
+                // audience pool until placed; a placed fighter roams its own arena pool. Using the
+                // resolved pool (not a hardcoded classname) keeps a teleport-dest-less map — where
+                // fighters fall back to DM spawns — from degenerating to a stand-still wander.
                 if !matches!(g.arena.round, RoundState::Live) {
-                    return Some(BotIntent::Move(super::wander_point(g, bot, "info_teleport_destination", |_| None)));
+                    let pool = if g.entities[bot].mode_p.arena.pending_spawn {
+                        "info_player_deathmatch"
+                    } else {
+                        spawn_pool(g, bot).unwrap_or("info_player_deathmatch")
+                    };
+                    return Some(BotIntent::Move(super::wander_point(g, bot, pool, |_| None)));
                 }
+                let pool = spawn_pool(g, bot).unwrap_or("info_player_deathmatch");
                 Some(match nearest_enemy(g, bot) {
                     Some(enemy) => BotIntent::Fight(enemy),
-                    None => BotIntent::Move(super::wander_point(g, bot, "info_teleport_destination", |_| None)),
+                    None => BotIntent::Move(super::wander_point(g, bot, pool, |_| None)),
                 })
             }
             // Eliminated / waiting: mill around the audience (the stands) but *watch the duel* —
@@ -271,10 +331,14 @@ impl Arena {
     }
 
     /// Form the next round: keep any current fighter (the previous winner stays), fill the
-    /// remaining arena slots from the front of the audience queue, respawn all fighters into the
+    /// remaining arena slots from the front of the audience queue, spawn the fresh fighters into the
     /// arena with a full loadout, and begin the spawn-protected countdown. Everyone else stays in
     /// the audience. This is the "winner stays, loser goes to the back of the queue" duel model —
     /// the arena never holds more than `rtx_ra_fighters` players.
+    ///
+    /// A fighter whose arena spot isn't clear yet is left `pending_spawn` and placed later by
+    /// [`Self::tick`]'s [`RoundState::Forming`] arm; the countdown is armed only once every fighter
+    /// is actually in the arena.
     fn form_round(&self, g: &mut GameState, now: f32) {
         // Everyone waiting is already queued by `stamp_audience` (run every frame), so their order
         // reflects when they started waiting — no lazy stamping here.
@@ -287,7 +351,45 @@ impl Arena {
             .filter(|&e| g.entities[e].mode_p.arena.role == ArenaRole::Fighter)
             .collect();
 
-        // Fill empty fighter slots with the longest-waiting audience members.
+        self.promote_challengers(g);
+
+        // Bring fighters up for the new round. A carried-over winner still alive *stays where they
+        // are* and is just topped back up to full — no teleport, never pending. Everyone else
+        // (promoted challengers, dead carried-over slots) needs a fresh arena spawn: mark them
+        // pending, then place any whose spot is already clear.
+        for e in players(g) {
+            if g.entities[e].mode_p.arena.role != ArenaRole::Fighter {
+                continue;
+            }
+            let winner_stays = carried.contains(&e) && g.entities[e].v.health > 0.0 && g.entities[e].v.deadflag == 0.0;
+            if winner_stays {
+                g.entities[e].mode_p.arena.pending_spawn = false;
+                self.apply_loadout(g, e);
+                // The winner is re-equipped here, not through `put_client_in_server`, so apply the
+                // `rtx_weapons` filter ourselves — otherwise a disabled weapon (e.g. the RL) would
+                // leak back into the carried-over arsenal each round.
+                g.filter_disabled_weapons(e);
+                g.w_set_current_ammo(e);
+            } else {
+                g.entities[e].mode_p.arena.pending_spawn = true;
+            }
+        }
+        self.place_pending(g);
+
+        if any_pending(g) {
+            // At least one fighter couldn't be placed — hold in Forming until the area frees.
+            g.arena.round = RoundState::Forming { since: now };
+            g.arena.last_count = 0;
+            g.broadcast(PrintLevel::High, "Rocket Arena: waiting for the spawn area to clear\n");
+        } else {
+            self.arm_countdown(g, now);
+        }
+    }
+
+    /// Fill empty fighter slots with the longest-waiting audience members (lowest queue stamp).
+    /// Promotion only changes the role/queue; the actual arena placement is done by [`Self::form_round`]
+    /// / [`Self::place_pending`].
+    fn promote_challengers(&self, g: &mut GameState) {
         let mut fighters = fighter_count(g);
         while fighters < FIGHTER_SLOTS {
             let next = players(g)
@@ -299,27 +401,25 @@ impl Arena {
             g.entities[e].mode_p.arena.queue = 0;
             fighters += 1;
         }
+    }
 
-        // Bring fighters up for the new round. A carried-over winner still alive *stays where they
-        // are* and is just topped back up to full — no teleport. Challengers promoted from the
-        // audience (and any dead carried-over slot) get a fresh spawn inside the arena.
+    /// Place every `pending_spawn` fighter whose spawn area is now clear (`put_client_in_server`
+    /// self-clears the flag via `select_spawn`). Sequential, so each placement is seen by the next
+    /// check — two fighters won't both claim the last free spot in one pass.
+    fn place_pending(&self, g: &mut GameState) {
         for e in players(g) {
-            if g.entities[e].mode_p.arena.role != ArenaRole::Fighter {
-                continue;
-            }
-            let winner_stays = carried.contains(&e) && g.entities[e].v.health > 0.0 && g.entities[e].v.deadflag == 0.0;
-            if winner_stays {
-                self.apply_loadout(g, e);
-                // The winner is re-equipped here, not through `put_client_in_server`, so apply the
-                // `rtx_weapons` filter ourselves — otherwise a disabled weapon (e.g. the RL) would
-                // leak back into the carried-over arsenal each round.
-                g.filter_disabled_weapons(e);
-                g.w_set_current_ammo(e);
-            } else {
+            let pending = {
+                let a = &g.entities[e].mode_p.arena;
+                a.role == ArenaRole::Fighter && a.pending_spawn
+            };
+            if pending && self.spawn_area_clear(g, e) {
                 g.put_client_in_server(e);
             }
         }
+    }
 
+    /// Arm the spawn-protected countdown once all fighters are in the arena.
+    fn arm_countdown(&self, g: &mut GameState, now: f32) {
         let countdown = g.host().cvar(c"rtx_ra_countdown").max(0.0);
         g.arena.round = RoundState::Countdown { until: now + countdown };
         g.arena.last_count = -1;
@@ -455,6 +555,40 @@ fn fighter_count(g: &GameState) -> usize {
         .count()
 }
 
+/// Is any fighter still waiting to be placed in the arena this round?
+fn any_pending(g: &GameState) -> bool {
+    players(g).into_iter().any(|e| {
+        let a = &g.entities[e].mode_p.arena;
+        a.role == ArenaRole::Fighter && a.pending_spawn
+    })
+}
+
+/// The spawn-point classname `select_spawn` will actually draw from for `e` — the single source of
+/// truth shared by the spawn picker and the [`Arena::spawn_area_clear`] gate, so the two never
+/// disagree. Fighters spawn at `info_teleport_destination` when the map has any (even all-occupied —
+/// `select_spawn` returns one regardless), else fall back to the deathmatch spawns; audience always
+/// uses the deathmatch spawns. `None` on a degenerate map with neither (an `info_player_start`-only
+/// map), where there's no pool to gate on.
+fn spawn_pool(g: &GameState, e: EntId) -> Option<&'static str> {
+    let fighter = g.entities[e].mode_p.arena.role == ArenaRole::Fighter;
+    let has_tele = g.find_by_classname("info_teleport_destination").next().is_some();
+    let has_dm = g.find_by_classname("info_player_deathmatch").next().is_some();
+    spawn_pool_class(fighter, has_tele, has_dm)
+}
+
+/// The spawn-pool decision, extracted pure: a fighter takes the arena's teleport destinations when
+/// the map has any (never falling back to DM while they exist), otherwise the deathmatch spawns;
+/// audience always takes the deathmatch spawns. `None` when the relevant pool is absent.
+fn spawn_pool_class(fighter: bool, has_tele: bool, has_dm: bool) -> Option<&'static str> {
+    if fighter && has_tele {
+        Some("info_teleport_destination")
+    } else if has_dm {
+        Some("info_player_deathmatch")
+    } else {
+        None
+    }
+}
+
 /// Fighters still alive this round.
 fn live_fighters(g: &GameState) -> Vec<EntId> {
     players(g)
@@ -476,6 +610,20 @@ fn nearest_enemy(g: &GameState, bot: EntId) -> Option<EntId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_pool_prefers_arena_for_fighters() {
+        // On a real arena map, fighters take the teleport destinations even though DM spawns exist.
+        assert_eq!(spawn_pool_class(true, true, true), Some("info_teleport_destination"));
+        // A fighter on a teleport-dest-less map falls back to the DM spawns (mode still runs).
+        assert_eq!(spawn_pool_class(true, false, true), Some("info_player_deathmatch"));
+        // Audience always uses the DM spawns (the stands), teleport dests or not.
+        assert_eq!(spawn_pool_class(false, true, true), Some("info_player_deathmatch"));
+        assert_eq!(spawn_pool_class(false, false, true), Some("info_player_deathmatch"));
+        // Degenerate map (info_player_start only): no pool to gate on.
+        assert_eq!(spawn_pool_class(true, false, false), None);
+        assert_eq!(spawn_pool_class(false, false, false), None);
+    }
 
     #[test]
     fn vantage_returns_first_visible_from_offset() {
