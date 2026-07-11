@@ -413,8 +413,18 @@ impl GameState {
             GameCommand::ClientCommand => self.client_command(player),
             GameCommand::ClientSay => 1,
             GameCommand::ClearEdict => {
-                // The engine has just zeroed this edict; re-establish its native string-field
-                // indirection (mirrors ktx's `initialise_spawned_ent`).
+                // Zero the slot ourselves — the engine only memsets an edict on `ED_Alloc`, NOT on
+                // the map-load `PR2_ClearEdict` sweep that also drives us here. Our entity box is
+                // process-global (adopted verbatim as `sv.game_edicts`) and outlives the map, so
+                // without this a slot the new map hasn't re-allocated keeps the previous map's
+                // `Entity` at an index `>= sv.num_edicts`; passing it to a `NUM_FOR_EDICT`-routed
+                // builtin (sound, unicast) then aborts with "NUM_FOR_EDICT: bad pointer". `default()`
+                // (not `reset()`) leaves `in_use == false`, so the cleared slot is inert to scans.
+                // Our own `spawn()` suppresses this callback and resets the slot itself, so the only
+                // callers reaching here are the map-load sweep and client (re)spawns — exactly where
+                // a fresh slot is wanted. Then re-establish the native string-field indirection the
+                // clear just wiped (mirrors ktx's `initialise_spawned_ent`).
+                self.entities[player] = Entity::default();
                 self.setup_string_refs(player);
                 0
             }
