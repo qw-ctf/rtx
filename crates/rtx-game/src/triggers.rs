@@ -109,12 +109,12 @@ impl GameState {
                 } else {
                     c"Only 1 more to go..."
                 };
-                self.host.centerprint(activator, msg);
+                self.centerprint_to(activator, msg);
             }
             return;
         }
         if show {
-            self.host.centerprint(activator, c"Sequence completed!");
+            self.centerprint_to(activator, c"Sequence completed!");
         }
         self.entities[e].set_enemy(activator);
         self.multi_trigger(e);

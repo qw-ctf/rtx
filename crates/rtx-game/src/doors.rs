@@ -182,7 +182,7 @@ impl GameState {
 
         if self.entities[owner].message.is_some() {
             if let Some(msg) = self.message_cstring(owner) {
-                self.host.centerprint(other, &msg);
+                self.centerprint_to(other, &msg);
             }
             self.host
                 .sound(other, Channel::Voice, Sound::MISC_TALK, 1.0, Attenuation::Norm);
@@ -210,7 +210,7 @@ impl GameState {
                     _ => c"You need the gold key",
                 }
             };
-            self.host.centerprint(other, msg);
+            self.centerprint_to(other, msg);
             self.play_door(e, false, 3);
             return;
         }
