@@ -775,6 +775,40 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // Bundle the frame's decisions into one command for the combat/grenade overlays to mutate.
     let cmd = BotCmd { look, move_world, buttons, impulse };
 
+    // Unified air steering (always on): while airborne on a plain jump leg or riding a rocket-jump
+    // arc, steer the velocity toward the landing with a yaw-synced air-strafe (`bhop::air_correct`)
+    // rather than the naive full-stick wish the 30-ups air-accel cap all but ignores. It rides the
+    // same channel the bhop controller uses — `emit` bypasses the aim spring and consumes the cmd's
+    // view yaw + forward/side directly — and only kicks in when the hop controller isn't already
+    // driving. The landing point is the pinned waypoint on a jump leg (the `on_air` gate keeps it on
+    // the link target) or the driver's target on a rocket-jump Ballistic arc. `look` (pitch) is left
+    // as steered above, so `emit` sends landing-ward pitch with the air-strafe yaw.
+    let air_cmd = if !on_ground && bhop_cmd.is_none() {
+        let target = if matches!(bot.rj.phase, RjPhase::Ballistic) {
+            rj.air_correct
+        } else if on_air {
+            Some(waypoint)
+        } else {
+            None
+        };
+        target.filter(|t| (t.xy() - origin.xy()).length() > 24.0).map(|t| {
+            let dt = frametime.clamp(0.001, 0.05);
+            let accel = host.cvar(c"sv_accelerate");
+            let maxspeed = host.cvar(c"sv_maxspeed");
+            let a_max = bhop::air_accel_max(
+                if accel > 0.0 { accel } else { 10.0 },
+                if maxspeed > 0.0 { maxspeed } else { 320.0 },
+                dt,
+            );
+            let to = t.xy() - origin.xy();
+            let s = bhop::air_correct(v_xy, to.y.atan2(to.x).to_degrees(), a_max, dt);
+            bhop::Cmd { view_yaw: s.view_yaw, forward: s.forward, side: s.side, jump: false }
+        })
+    } else {
+        None
+    };
+    let bhop_cmd = bhop_cmd.or(air_cmd);
+
     // Traversal-critical legs lock out the combat/grenade overlays: `engage` owns movement and
     // clears +jump, which cancels the planner's route if done mid gap/double/speed jump.
     let traversal_lock = hook_lock

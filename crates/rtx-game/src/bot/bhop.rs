@@ -28,8 +28,29 @@ use rtx_nav::qphys::AIR_CAP;
 const DT_NOMINAL: f32 = 1.0 / 77.0;
 /// Flat-ground hop airtime: `2 · JUMP_VZ / gravity` = 2·270/800 (see `navmesh`).
 const T_HOP: f32 = 0.675;
-/// How many times per hop the serpentine should switch sides. ~3 matches how human runners weave.
+/// How many times per hop the ground serpentine ([`prestrafe`]/zigzag) switches sides. ~3 matches
+/// how human runners weave; the *air* hop path uses the lobe scheduler below instead.
 const FLIPS_PER_HOP: f32 = 3.0;
+
+/// The slalom turn rate (deg/s) the air lobe holds once the heading matches the bearing — the
+/// smooth sweep real players ride (demos measure 135–160 °/s), *not* the max-rate perpendicular
+/// weave. A perpendicular strafe turns the velocity ~300 °/s at 450 ups, which forces ~3 sign flips
+/// per hop inside any sane deadband — the "shake." Turning at `OMEGA_BASE` instead needs the wish
+/// angled a few degrees forward of perpendicular (see [`strafe_rate`]), which still gains speed but
+/// carves one wide lobe per hop.
+const OMEGA_BASE: f32 = 140.0;
+/// How far (deg) the heading curves past the bearing before the lobe flips back — the slalom
+/// amplitude. The flip is symmetric (fires the same ±[`LOBE_DEADBAND`] either side), so the S stays
+/// centered on the bearing. With the engine's fixed full-height hop (~0.675 s airborne), one lobe
+/// per hop needs an amplitude near `OMEGA_BASE · T_HOP / 2`; sizing it there keeps the gait to ~one
+/// flip per hop (smooth, not the shake) *and* maximizes speed gain. The cost is a wider lateral
+/// sweep (~±55u), which the live navmesh gates by only bunnyhopping open-enough routes.
+const LOBE_DEADBAND: f32 = 34.0;
+/// [`air_correct`] drives straight forward within this heading error (deg) — the demo's held
+/// `forward` on a well-aimed arc — and strafes to converge outside it.
+const AIR_CORRECT_DEADBAND: f32 = 4.0;
+/// Floor turn rate (deg/s) for [`air_correct`]'s convergence strafe: gentle when nearly aligned.
+const AIR_CORRECT_MIN: f32 = 60.0;
 
 /// How long the entry conditions must hold before engaging, so a momentary straightaway doesn't
 /// stutter the gait. Applies only to the initial engage; disengage decisions happen on landings.
@@ -75,6 +96,57 @@ pub fn theta_star(speed: f32, a_max: f32) -> f32 {
     (u_star / speed.max(1.0)).clamp(0.0, 1.0).acos().to_degrees()
 }
 
+/// The fastest heading turn rate (deg/s) an air-strafe can sustain at `speed`: a perpendicular
+/// strafe adds `min(a_max, cap)` ups sideways per tick, rotating the velocity by `atan(that/speed)`.
+/// This is the ceiling [`strafe_rate`] clamps a requested rate to (and where it degenerates to the
+/// max-gain [`theta_star`] angle).
+pub fn omega_max(speed: f32, a_max: f32, dt: f32) -> f32 {
+    let a = a_max.min(AIR_CAP);
+    (a / speed.max(1.0)).atan().to_degrees() / dt.max(1e-4)
+}
+
+/// An air-strafe that turns the velocity at a *chosen* rate `omega_deg` (deg/s) rather than the
+/// speed-optimal maximum — the smooth-lobe primitive. The turn rate is set by how much sideways
+/// speed the tick adds: `a_need = speed·tan(ω·dt)`. Angling the wish so its projection onto the
+/// velocity is `cap − a_need` (i.e. `θ = acos((cap − a_need)/speed)`, forward of perpendicular)
+/// delivers exactly that sideways add while the parallel component still grows the speed. When the
+/// requested rate meets or exceeds what the tick can physically deliver, fall back to the max-rate
+/// [`theta_star`] angle (perpendicular). `sigma` is the strafe side (±1); the geometry mirrors
+/// [`strafe`] so the two are interchangeable.
+pub fn strafe_rate(v_xy: Vec2, sigma: f32, omega_deg: f32, a_max: f32, dt: f32) -> Strafe {
+    let speed = v_xy.length().max(1.0);
+    let vel_yaw = v_xy.y.atan2(v_xy.x).to_degrees();
+    let cap = a_max.min(AIR_CAP);
+    let a_need = speed * (omega_deg.to_radians() * dt).tan();
+    let theta = if a_need >= cap {
+        theta_star(speed, a_max)
+    } else {
+        ((AIR_CAP - a_need).max(0.0) / speed).clamp(0.0, 1.0).acos().to_degrees()
+    };
+    Strafe {
+        view_yaw: wrap180(vel_yaw + sigma * (theta - 90.0)),
+        forward: 0.0,
+        side: -sigma * MOVE_SPEED,
+        sigma,
+    }
+}
+
+/// Mid-air course correction toward a fixed `bearing` — for a gap jump or rocket-jump arc, where
+/// there is no hop cycle and no slalom, just an arc to steer onto the landing line. Within a small
+/// heading deadband hold straight forward (the demo's sustained `forward` on a good arc); outside
+/// it, strafe toward the bearing at a rate scaled by the error so the arc converges while still
+/// preserving speed. Stateless — the deadband kills chatter and both branches keep the heading.
+pub fn air_correct(v_xy: Vec2, bearing: f32, a_max: f32, dt: f32) -> Strafe {
+    let speed = v_xy.length().max(1.0);
+    let vel_yaw = v_xy.y.atan2(v_xy.x).to_degrees();
+    let err = wrap180(bearing - vel_yaw);
+    if err.abs() < AIR_CORRECT_DEADBAND {
+        return Strafe { view_yaw: bearing, forward: MOVE_SPEED, side: 0.0, sigma: 0.0 };
+    }
+    let omega = (err.abs() / 0.15).max(AIR_CORRECT_MIN).min(omega_max(speed, a_max, dt));
+    strafe_rate(v_xy, err.signum(), omega, a_max, dt)
+}
+
 /// Heading deadband (degrees) for the strafe-sign weave, sized from the physics so the sign flips
 /// ~[`FLIPS_PER_HOP`] times per hop: a perpendicular strafe rotates the velocity by
 /// `ψ = atan(cap/v)` per tick (≈5.4° at 320 ups, shrinking with speed), a hop is `T_HOP/dt` ticks,
@@ -115,13 +187,13 @@ pub struct Strafe {
     pub sigma: f32,
 }
 
-/// Compute the air-strafe: aim the view so a single held strafe key puts the wish direction at the
-/// speed-optimal angle off the current velocity, and choose the strafe side to weave the heading
-/// toward `wp_bearing`. `prev_sigma` is last frame's side (`0` on the first frame).
-///
-/// With `forward = 0` and `side = −sigma·MOVE`, the engine's `right` vector places the wish
-/// direction at `view_yaw ± 90°`, so `view_yaw = vel_yaw + sigma·(θ*−90)` — in practice the view
-/// rides exactly on the velocity and sweeps smoothly with it; sign flips move only the strafe key.
+/// The **max-rate** air-strafe: aim the view so a single held strafe key puts the wish direction at
+/// the speed-*optimal* ([`theta_star`], ~perpendicular) angle off the velocity, and weave the strafe
+/// side toward `wp_bearing`. This is [`strafe_rate`] at [`omega_max`] — maximum speed gain, maximum
+/// turn rate (hence the ~3-flip weave). The live hop path uses [`strafe_rate`] at the gentler
+/// [`OMEGA_BASE`] for the smooth slalom; this remains the reference primitive and speed-gain oracle
+/// the unit tests and the navmesh speed-jump model are validated against.
+#[allow(dead_code)]
 pub fn strafe(v_xy: Vec2, wp_bearing: f32, prev_sigma: f32, a_max: f32) -> Strafe {
     let speed = v_xy.length().max(1.0);
     let vel_yaw = v_xy.y.atan2(v_xy.x).to_degrees();
@@ -246,7 +318,9 @@ pub struct Cmd {
 pub struct Bhop {
     /// Where in the hop cycle we are.
     pub phase: Phase,
-    /// Sticky strafe sign (±1; 0 = unseeded).
+    /// Sticky strafe sign (±1; 0 = unseeded). On the air lobe this is the current slalom side,
+    /// flipped when the heading curves a deadband past the bearing; on the ground
+    /// ([`prestrafe`]/zigzag) it is the weave sign.
     sigma: f32,
     /// When the entry conditions started holding (0 = not holding) — the engage hysteresis clock.
     eligible_since: f32,
@@ -329,16 +403,16 @@ impl Bhop {
             self.phase = Phase::Hop;
             self.phase_start = i.now;
         }
-        self.hop_cmd(i, speed, a_max, a_g, env.maxspeed)
+        self.hop_cmd(i, speed, a_max, a_g, env.maxspeed, env.dt)
     }
 
     /// The hop loop: air-strafe while airborne; on a landing frame decide whether another hop
     /// fits, and if so take off again with a strafe+jump cmd (full air-accel gain — see module
     /// docs on `PM_CheckJump` running before `PM_Friction`).
-    fn hop_cmd(&mut self, i: &Input, speed: f32, a_max: f32, a_g: f32, maxspeed: f32) -> Option<Cmd> {
+    fn hop_cmd(&mut self, i: &Input, speed: f32, a_max: f32, a_g: f32, maxspeed: f32, dt: f32) -> Option<Cmd> {
         if !i.on_ground {
             self.jump_prev = false; // airborne releases the button, re-arming PM_CheckJump
-            let s = self.weave(strafe(i.v_xy, i.bearing, self.sigma, a_max));
+            let s = self.air_strafe(i, speed, a_max, dt);
             return Some(Cmd { view_yaw: s.view_yaw, forward: s.forward, side: s.side, jump: false });
         }
         // Landing (or first) ground frame — the only place a run ends by policy. A planned carry
@@ -357,12 +431,30 @@ impl Bhop {
         self.jump_prev = jump;
         if jump {
             self.hops += 1;
-            let s = self.weave(strafe(i.v_xy, i.bearing, self.sigma, a_max));
+            let s = self.air_strafe(i, speed, a_max, dt);
             Some(Cmd { view_yaw: s.view_yaw, forward: s.forward, side: s.side, jump: true })
         } else {
             // The pulse-release frame after a press that didn't take: still gain on the ground.
             Some(self.ground_cmd(i, a_g, maxspeed, f32::INFINITY))
         }
+    }
+
+    /// One air-strafe frame at the lobe's turn rate. Turn the velocity smoothly at [`OMEGA_BASE`]
+    /// (plus a term that nulls a bearing error within a hop, capped at the physical [`omega_max`]),
+    /// and flip the strafe side once the heading has curved [`LOBE_DEADBAND`] past the bearing. The
+    /// flip is symmetric — same threshold either side — so the S self-centers on the bearing; sized
+    /// so a lobe runs about a hop, i.e. one flip per hop, the smooth gait rather than the shake.
+    fn air_strafe(&mut self, i: &Input, speed: f32, a_max: f32, dt: f32) -> Strafe {
+        let vel_yaw = i.v_xy.y.atan2(i.v_xy.x).to_degrees();
+        let err = wrap180(i.bearing - vel_yaw);
+        if self.sigma == 0.0 {
+            self.sigma = if err >= 0.0 { 1.0 } else { -1.0 };
+        } else if err * self.sigma < -LOBE_DEADBAND {
+            self.sigma = -self.sigma;
+            self.flips += 1;
+        }
+        let omega = (OMEGA_BASE + err.abs() / T_HOP).min(omega_max(speed, a_max, dt));
+        strafe_rate(i.v_xy, self.sigma, omega, a_max, dt)
     }
 
     /// A prestrafe cmd, with sigma/flip bookkeeping. `band_cap` clamps the weave deadband — `∞` for
@@ -512,6 +604,30 @@ mod tests {
                     v.length(),
                     v2.length()
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn strafe_rate_turns_at_requested_rate_and_gains() {
+        // The turn-rate dial: driven through the real air-accel oracle, `strafe_rate` should rotate
+        // the velocity at ~`omega` (within 10%) while still growing the speed — the property the
+        // smooth lobe leans on (a gentle turn that nonetheless accelerates).
+        let dt = 1.0 / 77.0;
+        let a = air_accel_max(ACCEL, MAXSPEED, dt);
+        for &s in &[350.0f32, 500.0, 700.0] {
+            let wmax = omega_max(s, a, dt);
+            for &omega in &[60.0f32, 100.0, 150.0] {
+                if omega >= wmax {
+                    continue; // beyond the physical ceiling — degenerates to max-rate, tested elsewhere
+                }
+                let v = Vec2::new(s, 0.0);
+                let cmd = strafe_rate(v, 1.0, omega, a, dt);
+                let v2 = apply_airaccel(v, wishdir_of(cmd.view_yaw, cmd.side), MAXSPEED, ACCEL, dt);
+                let turned = v2.y.atan2(v2.x).to_degrees();
+                let want = omega * dt;
+                assert!((turned - want).abs() <= 0.1 * want + 0.02, "s={s} ω={omega}: turned {turned}° want {want}°");
+                assert!(v2.length() > s, "s={s} ω={omega}: no speed gain {s} -> {}", v2.length());
             }
         }
     }
@@ -729,11 +845,45 @@ mod sim {
         let launch = launch_speed.expect("never launched from prestrafe");
         assert!(launch >= 420.0, "launched at only {launch} ups");
         assert!(w.v.length() >= 550.0, "only {} ups after 10s (peak {})", w.v.length(), b.peak);
-        let heading = mean_heading(&trace[trace.len() - 77..]);
+        // Average over a couple of weave periods: the slalom lobe is wide (±LOBE_DEADBAND), so a
+        // short window catches a lobe peak, not the centered mean.
+        let heading = mean_heading(&trace[trace.len() - 154..]);
         assert!(heading.abs() < 8.0, "mean heading drifted to {heading}");
         assert!(b.hops >= 3, "only {} hops in 10s", b.hops);
+        // The smooth slalom carves ~one lobe per hop — a decisive drop from the old ~3-flip weave.
         let flips_per_hop = b.flips as f32 / b.hops as f32;
-        assert!((1.0..=6.0).contains(&flips_per_hop), "{} flips over {} hops", b.flips, b.hops);
+        assert!((0.5..=2.0).contains(&flips_per_hop), "{} flips over {} hops (want smooth ~1/hop)", b.flips, b.hops);
+    }
+
+    #[test]
+    fn curved_chain_gains_like_the_demo() {
+        // The demo bar (bridge_rl): carry ~446 ups into a chain of hops while the corridor bends
+        // ~80°, and come out faster — the human reached 468 over four such hops. The bot must gain
+        // at least that, holding the smooth ~1-flip-per-hop gait and a human-like sweep rate, not
+        // the max-rate shake.
+        let mut w = World::grounded(446.0);
+        let mut b = Bhop::default();
+        let mut air_rates = Vec::new();
+        let mut prev_hd = w.v.y.atan2(w.v.x).to_degrees();
+        for f in 0..270 {
+            let now = f as f32 * DT;
+            let bearing = (now / 2.7 * 80.0).min(80.0); // 80° over ~4 hops
+            let was_air = !w.on_ground;
+            let cmd = b.step(&input(&w, bearing, 4096.0, now), &ENV).unwrap_or(run_cmd(bearing));
+            pm_frame(&mut w, &cmd, false);
+            let hd = w.v.y.atan2(w.v.x).to_degrees();
+            if was_air && !w.on_ground {
+                air_rates.push(wrap180(hd - prev_hd).abs() / DT);
+            }
+            prev_hd = hd;
+        }
+        assert!(w.v.length() >= 468.0, "curved chain gained too little: {} ups", w.v.length());
+        assert!(b.hops >= 4, "only {} hops in the chain", b.hops);
+        let flips_per_hop = b.flips as f32 / b.hops as f32;
+        assert!(flips_per_hop <= 2.0, "{flips_per_hop} flips/hop — not the smooth gait");
+        air_rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = air_rates[air_rates.len() / 2];
+        assert!((80.0..=280.0).contains(&median), "median air-strafe yaw rate {median} °/s off human band");
     }
 
     #[test]
@@ -748,8 +898,9 @@ mod sim {
             pm_frame(&mut w, &cmd, false);
             trace.push(w.v);
         }
-        // 3s at bearing 0, then 2s at 30°: the last half-second should sit on the new bearing.
-        let heading = mean_heading(&trace[trace.len() - 38..]);
+        // 3s at bearing 0, then 2s at 30°: the last ~1.7s (a couple of the wide slalom lobes)
+        // should average onto the new bearing. A shorter window catches a single lobe's peak.
+        let heading = mean_heading(&trace[trace.len() - 130..]);
         assert!((heading - 30.0).abs() < 10.0, "did not converge to 30°: {heading}");
     }
 

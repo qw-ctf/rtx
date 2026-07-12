@@ -27,6 +27,8 @@ mod client;
 mod combat;
 mod cvars;
 mod defs;
+#[cfg(test)]
+mod demo_replay;
 mod dispatch;
 mod doors;
 mod entity;
