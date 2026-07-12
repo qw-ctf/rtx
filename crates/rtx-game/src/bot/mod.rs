@@ -1104,7 +1104,7 @@ fn runway(graph: &NavGraph, route: &[u32], route_pos: usize, origin: Vec3) -> f3
 fn roam_target(game: &mut GameState, e: EntId, origin: Vec3, now: f32) -> Vec3 {
     let (wt, wtime) = {
         let b = &game.entities[e].bot;
-        (b.wander_target, b.wander_time)
+        (b.wander.target, b.wander.time)
     };
     let reached = wt != Vec3::ZERO && (wt.xy() - origin.xy()).length() < 64.0;
     if wt != Vec3::ZERO && !reached && now < wtime {
@@ -1119,8 +1119,8 @@ fn roam_target(game: &mut GameState, e: EntId, origin: Vec3, now: f32) -> Vec3 {
     }
     let idx = ((r * g.cells.len() as f32) as usize).min(g.cells.len() - 1);
     let cell = g.cell_origin(idx as u32);
-    game.entities[e].bot.wander_target = cell; // disjoint field from game.nav — coexists with `g`
-    game.entities[e].bot.wander_time = now + 5.0;
+    game.entities[e].bot.wander.target = cell; // disjoint field from game.nav — coexists with `g`
+    game.entities[e].bot.wander.time = now + 5.0;
     cell
 }
 

@@ -601,10 +601,10 @@ pub(crate) fn wander_point(
 ) -> Vec3 {
     let now = g.time();
     let origin = g.entities[bot].v.origin;
-    let target = g.entities[bot].bot.wander_target;
+    let target = g.entities[bot].bot.wander.target;
     let (dx, dy) = (target.x - origin.x, target.y - origin.y);
     let arrived = target != Vec3::ZERO && (dx * dx + dy * dy).sqrt() < 48.0;
-    if now >= g.entities[bot].bot.wander_time || target == Vec3::ZERO || arrived {
+    if now >= g.entities[bot].bot.wander.time || target == Vec3::ZERO || arrived {
         let next = prefer(g).unwrap_or_else(|| {
             // A roam destination, not a spawn — no spawn memory, no self-exclusion.
             let spot = g.select_spawn_point_of(classname, None);
@@ -616,10 +616,10 @@ pub(crate) fn wander_point(
         });
         let jitter = g.random();
         let b = &mut g.entities[bot].bot;
-        b.wander_target = next;
-        b.wander_time = now + 3.0 + jitter * 3.0;
+        b.wander.target = next;
+        b.wander.time = now + 3.0 + jitter * 3.0;
     }
-    g.entities[bot].bot.wander_target
+    g.entities[bot].bot.wander.target
 }
 
 #[cfg(test)]

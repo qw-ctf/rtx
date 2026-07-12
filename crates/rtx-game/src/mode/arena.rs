@@ -497,7 +497,7 @@ impl Arena {
         let now = g.time();
         let (held, watch_time) = {
             let b = &g.entities[bot].bot;
-            (b.watch_ent, b.watch_time)
+            (b.watch.ent, b.watch.time)
         };
         let eye = g.entities[bot].v.origin + VEC_VIEW_OFS;
 
@@ -522,13 +522,13 @@ impl Arena {
         let b = &mut g.entities[bot].bot;
         match pick {
             Some(w) => {
-                b.watch_ent = w.0;
-                b.watch_time = now + WATCH_HOLD + jitter * WATCH_JITTER;
+                b.watch.ent = w.0;
+                b.watch.time = now + WATCH_HOLD + jitter * WATCH_JITTER;
                 Some(w)
             }
             None => {
-                b.watch_ent = 0;
-                b.watch_time = now + WATCH_RETRY;
+                b.watch.ent = 0;
+                b.watch.time = now + WATCH_RETRY;
                 None
             }
         }

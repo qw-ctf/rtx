@@ -308,11 +308,11 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // greedy detour (`chasing`) — are exactly where we want to look, so they keep `target_origin`.
     let combat_blind =
         enemy.is_some() && !chasing && (enemy_seen_time <= 0.0 || now - enemy_seen_time > LOOK_LOS_GRACE);
-    let look_point = if vigil && bot.scan_point != Vec3::ZERO {
+    let look_point = if vigil && bot.vigil.scan_point != Vec3::ZERO {
         // Standing vigil: sweep the eyes across the room (the scan point the aim spring pans to).
         // This drives the perception cone too (perception reads `bot.aim.angles`), so it's real scouting;
         // combat's `engage` still overrides the moment a target comes into sight.
-        bot.scan_point
+        bot.vigil.scan_point
     } else if let Some(pi) = plat_hold {
         // Holding off a raised lift: watch it, so we notice it descend (and combat's `engage` still
         // overrides the instant a target comes into sight).

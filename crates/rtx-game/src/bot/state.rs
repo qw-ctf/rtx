@@ -47,25 +47,13 @@ pub struct BotState {
     pub seen: SeenEnemy,
     /// Perception memory (hear/feel as well as sight). See [`Perception`].
     pub percept: Perception,
-    /// Audience-wander destination (a round mode's stands) and the next time to pick a new one.
-    /// Only used while the mode marks this bot as an audience/spectator; zero otherwise.
-    pub wander_target: Vec3,
-    pub wander_time: f32,
-    /// Audience watch (Rocket Arena): the live fighter this bot's eyes are held on, and when to
-    /// re-pick (or retry after losing sight). Chosen and LOS-validated by the mode; `0` = nobody.
-    /// Held ~1-2s so the gaze doesn't ping-pong between duelists or flicker when sight blinks.
-    pub watch_ent: u32,
-    pub watch_time: f32,
-    /// Item vigil ([`crate::bot::vigil`]): while waiting on an uncollectable goal item (mid-respawn,
-    /// or a handoff-held weapon) the bot cruises a short walk away and scans the room. `vigil_post` is
-    /// the current cruise spot (`ZERO` = none / heading back to the item) with its re-pick deadline;
-    /// `scan_point` is the world point the eyes sweep to, held until `scan_until`. Disjoint from
-    /// `wander_*` (roam needs `goal_item == 0`; audience wander needs a Move intent — a vigil bot is
-    /// by definition chasing an item), so the two never overlap despite the similar shape.
-    pub vigil_post: Vec3,
-    pub vigil_post_until: f32,
-    pub scan_point: Vec3,
-    pub scan_until: f32,
+    /// Audience-wander state (a round mode's stands). See [`Wander`].
+    pub wander: Wander,
+    /// Audience watch (Rocket Arena): the fighter this bot's eyes are held on. See [`Watch`].
+    pub watch: Watch,
+    /// Item vigil ([`crate::bot::vigil`]): cruise-and-scan while waiting on an uncollectable goal
+    /// item. See [`Vigil`].
+    pub vigil: Vigil,
     /// Gate-errand progress watchdog: the closest we've gotten to the target button and the time
     /// we last got closer. If we stop making progress (stuck at a door we can't reach the button
     /// of) we give up — a flat timeout would wrongly abandon a button that's simply far away. Plus
@@ -201,6 +189,37 @@ pub struct Aim {
     pub look_prev_time: f32,
     /// Last frame's sent bhop view yaw, to seed the spring's angular velocity when combat resumes.
     pub bhop_prev_yaw: f32,
+}
+
+/// Audience-wander state: where a spectating bot is strolling in a round mode's stands, and the next
+/// time to pick a new destination. Only used while the mode marks this bot as audience; zero otherwise.
+#[derive(Default)]
+pub struct Wander {
+    pub target: Vec3,
+    pub time: f32,
+}
+
+/// Audience watch (Rocket Arena): the live fighter this bot's eyes are held on (`0` = nobody), and
+/// when to re-pick (or retry after losing sight). Chosen and LOS-validated by the mode; held ~1-2s
+/// so the gaze doesn't ping-pong between duelists or flicker when sight blinks.
+#[derive(Default)]
+pub struct Watch {
+    pub ent: u32,
+    pub time: f32,
+}
+
+/// Item vigil (see [`crate::bot::vigil`]): while waiting on an uncollectable goal item (mid-respawn,
+/// or a handoff-held weapon) the bot cruises a short walk away and scans the room. `post` is the
+/// current cruise spot (`ZERO` = none / heading back to the item) with its re-pick deadline
+/// `post_until`; `scan_point` is the world point the eyes sweep to, held until `scan_until`. Disjoint
+/// from [`Wander`] (roam needs no item goal; audience wander needs a Move intent — a vigil bot is by
+/// definition chasing an item), so the two never overlap despite the similar shape.
+#[derive(Default)]
+pub struct Vigil {
+    pub post: Vec3,
+    pub post_until: f32,
+    pub scan_point: Vec3,
+    pub scan_until: f32,
 }
 
 /// A bot's item-fetch goal (see [`crate::bot::goals`]) and the bookkeeping around it.

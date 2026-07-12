@@ -95,7 +95,7 @@ fn update(game: &mut GameState, e: EntId, origin: Vec3, item_org: Vec3, holding:
 
     let (post, post_until, scan, scan_until) = {
         let b = &game.entities[e].bot;
-        (b.vigil_post, b.vigil_post_until, b.scan_point, b.scan_until)
+        (b.vigil.post, b.vigil.post_until, b.vigil.scan_point, b.vigil.scan_until)
     };
     let eye = origin + VEC_VIEW_OFS;
     let dist_to_item = (item_org.xy() - origin.xy()).length();
@@ -130,10 +130,10 @@ fn update(game: &mut GameState, e: EntId, origin: Vec3, item_org: Vec3, holding:
     };
 
     let b = &mut game.entities[e].bot;
-    b.vigil_post = out_post;
-    b.vigil_post_until = out_until;
-    b.scan_point = new_scan;
-    b.scan_until = new_scan_until;
+    b.vigil.post = out_post;
+    b.vigil.post_until = out_until;
+    b.vigil.scan_point = new_scan;
+    b.vigil.scan_until = new_scan_until;
     (target, target_cell)
 }
 
