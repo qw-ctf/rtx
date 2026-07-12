@@ -19,7 +19,7 @@
 use glam::{Vec3, Vec3Swizzles};
 
 use super::hook::{march_to_solid, simulate_arc, ArcResult};
-use super::{RocketJumpParams, HOOK_SIM_DT, RJ_LAND_XY, RJ_LAND_Z};
+use super::{RocketJumpParams, FALL_DAMAGE_SPEED, HOOK_SIM_DT, RJ_LAND_XY, RJ_LAND_Z};
 use crate::qphys::JUMP_VZ;
 
 /// View pitches (degrees below horizontal) tried for the shot; a steeper pitch blasts the bot more
@@ -183,7 +183,7 @@ pub(super) fn rj_perturb_ok(
 /// resort. Plus a hard-landing surcharge mirroring `hook_cost` / `Drop`.
 pub(super) fn rocket_jump_cost(t_blast: f32, airtime: f32, vz_land: f32, self_damage: f32) -> f32 {
     let mut c = t_blast + airtime + RJ_OVERHEAD + self_damage * RJ_HEALTH_SECS_PER_HP;
-    if vz_land.abs() > 580.0 {
+    if vz_land.abs() > FALL_DAMAGE_SPEED {
         c += 1.0;
     }
     c

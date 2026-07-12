@@ -24,6 +24,7 @@ mod jumps;
 mod physics;
 mod query;
 mod rocketjump;
+mod sidetable;
 mod splice;
 
 pub use geom::arc_point;
@@ -38,6 +39,7 @@ pub use physics::{
 };
 use physics::*;
 use rocketjump::{rj_perturb_ok, rocket_jump_cost, simulate_rocket_jump, RJ_DELAYS, RJ_PITCHES};
+use sidetable::SideTable;
 pub use splice::{Gate, GateInfo, Plat, PlatInfo, TeleportInfo};
 
 use crate::bsp::Bsp;
@@ -183,32 +185,20 @@ pub struct NavGraph {
     pub links: Vec<Link>,
     pub adjacency: Vec<Vec<u32>>,
     grid: GridIndex,
-    gates: Vec<Gate>,
-    /// Per-link gate tag: the index of the gate whose *closed* door the link's segment passes
-    /// through, or `-1` for an ungated link. This is the "navmesh aware of dynamic geometry" core
-    /// — a link (graph edge) knows which door it depends on, so pathfinding can price it by the
-    /// door's live state (see [`find_path`](Self::find_path)). Empty until [`add_gates`](Self::add_gates)
-    /// runs; indexed by link index (parallel to `links`).
-    gated_links: Vec<i32>,
-    /// Per-link hook payload index: for a [`LinkKind::Hook`] link, the index into `hooks` of its
-    /// solved [`HookTraversal`]; `-1` for every non-hook link. Parallel to `links` (the same
-    /// side-table pattern as `gated_links`), so the bot can look up how to fly a hook leg.
-    hook_links: Vec<i32>,
-    hooks: Vec<HookTraversal>,
-    /// Per-link speed-jump payload index (parallel to `links`, `-1` for non-speed-jump links) — the
-    /// takeoff point + required entry speed the bot executor needs.
-    speed_jump_links: Vec<i32>,
-    speed_jumps: Vec<SpeedJumpTraversal>,
-    /// Per-link rocket-jump payload index (parallel to `links`, `-1` for non-rocket-jump links) — the
-    /// fire delay + angles + self-damage the bot executor needs.
-    rocket_jump_links: Vec<i32>,
-    rocket_jumps: Vec<RocketJumpTraversal>,
-    /// Spliced `func_plat` lifts (entity id + footprint), and a per-link tag (parallel to `links`,
-    /// `-1` for untagged) marking the ride link and every jump-aboard link that boards each plat —
-    /// same side-table pattern as `gated_links`, so the runtime can find which lift a leg boards and
+    /// The closed door/movewall each link's segment passes through — the "navmesh aware of dynamic
+    /// geometry" core, so pathfinding can price a link by its door's live state (see
+    /// [`find_path`](Self::find_path)). Empty until [`add_gates`](Self::add_gates) runs.
+    gates: SideTable<Gate>,
+    /// How to fly each [`LinkKind::Hook`] link (its solved [`HookTraversal`]).
+    hooks: SideTable<HookTraversal>,
+    /// The takeoff point + required entry speed for each speed-jump link, for the bot executor.
+    speed_jumps: SideTable<SpeedJumpTraversal>,
+    /// The fire delay + angles + self-damage for each rocket-jump link, for the bot executor.
+    rocket_jumps: SideTable<RocketJumpTraversal>,
+    /// Spliced `func_plat` lifts (entity id + footprint), tagged onto the ride link and every
+    /// jump-aboard link that boards each plat, so the runtime can find which lift a leg boards and
     /// hold a standoff while it's raised.
-    plats: Vec<Plat>,
-    plat_links: Vec<i32>,
+    plats: SideTable<Plat>,
     /// The bhop speed-gain constant `k` for this map's movement cvars ([`bhop_k`]), captured when
     /// speed jumps are spliced (or left at the stock default). The banded planner reads it to price
     /// speed carried between links; keeping it here avoids re-reading cvars at query time.
@@ -292,16 +282,11 @@ impl NavGraph {
             cells: cells_grid.0,
             links: Vec::new(),
             grid: cells_grid.1,
-            gates: Vec::new(),
-            gated_links: Vec::new(),
-            hook_links: Vec::new(),
-            hooks: Vec::new(),
-            speed_jump_links: Vec::new(),
-            speed_jumps: Vec::new(),
-            rocket_jump_links: Vec::new(),
-            rocket_jumps: Vec::new(),
-            plats: Vec::new(),
-            plat_links: Vec::new(),
+            gates: SideTable::default(),
+            hooks: SideTable::default(),
+            speed_jumps: SideTable::default(),
+            rocket_jumps: SideTable::default(),
+            plats: SideTable::default(),
             sj_k: bhop_k(10.0, MAX_SPEED), // stock default until add_speed_jumps captures live cvars
         };
         graph.link_cells(bsp);
@@ -629,9 +614,6 @@ impl NavGraph {
     /// long horizontal flings from one mechanism. Only accepted when the arc (and perturbed variants)
     /// land safely, so a bot is never flung into a pit. Deduped per direction/elevation and capped.
     pub fn add_hooks(&mut self, bsp: &Bsp, params: HookParams) {
-        if self.hook_links.len() != self.links.len() {
-            self.hook_links.resize(self.links.len(), -1);
-        }
         // Solve per source cell in parallel (immutable borrow), then splice serially (push_hook needs
         // `&mut`). Indexed `collect` preserves cell order, so link indices match a sequential build.
         let this = &*self;
@@ -738,9 +720,6 @@ impl NavGraph {
     /// and keep the launches that land on a higher ledge no cheaper move reaches. `double_jump` gates
     /// the useful height. See [`super::rocketjump`] for the two-phase ballistics.
     pub fn add_rocket_jumps(&mut self, bsp: &Bsp, params: RocketJumpParams, double_jump: bool) {
-        if self.rocket_jump_links.len() != self.links.len() {
-            self.rocket_jump_links.resize(self.links.len(), -1);
-        }
         // Solve per source cell in parallel (immutable borrow), then splice serially (push needs
         // `&mut`). Indexed `collect` preserves cell order, so link indices match a sequential build.
         let this = &*self;
@@ -844,59 +823,38 @@ impl NavGraph {
 
     /// The solved traversal for hook link `li`, or `None` for a non-hook link.
     pub fn hook_of_link(&self, li: u32) -> Option<&HookTraversal> {
-        match self.hook_links.get(li as usize).copied().unwrap_or(-1) {
-            h if h >= 0 => self.hooks.get(h as usize),
-            _ => None,
-        }
+        self.hooks.of_link(li)
     }
 
-    /// Push a hook link with its solved traversal, keeping the `hook_links` side table in step.
+    /// Push a hook link with its solved traversal, tagging the new link in the `hooks` side table.
     fn push_hook(&mut self, link: Link, traversal: HookTraversal) {
-        if self.hook_links.len() != self.links.len() {
-            self.hook_links.resize(self.links.len(), -1);
-        }
-        let h = self.hooks.len() as i32;
-        self.hooks.push(traversal);
+        let h = self.hooks.push(traversal);
         self.push_link(link);
-        self.hook_links.push(h);
+        self.hooks.tag(self.links.len() - 1, h);
     }
 
     /// The solved traversal for speed-jump link `li`, or `None` for any other link.
     pub fn speed_jump_of_link(&self, li: u32) -> Option<&SpeedJumpTraversal> {
-        match self.speed_jump_links.get(li as usize).copied().unwrap_or(-1) {
-            s if s >= 0 => self.speed_jumps.get(s as usize),
-            _ => None,
-        }
+        self.speed_jumps.of_link(li)
     }
 
-    /// Push a speed-jump link with its traversal, keeping the side table in step.
+    /// Push a speed-jump link with its traversal, tagging the new link in the side table.
     fn push_speed_jump(&mut self, link: Link, traversal: SpeedJumpTraversal) {
-        if self.speed_jump_links.len() != self.links.len() {
-            self.speed_jump_links.resize(self.links.len(), -1);
-        }
-        let s = self.speed_jumps.len() as i32;
-        self.speed_jumps.push(traversal);
+        let s = self.speed_jumps.push(traversal);
         self.push_link(link);
-        self.speed_jump_links.push(s);
+        self.speed_jumps.tag(self.links.len() - 1, s);
     }
 
     /// The solved traversal for rocket-jump link `li`, or `None` for any other link.
     pub fn rocket_jump_of_link(&self, li: u32) -> Option<&RocketJumpTraversal> {
-        match self.rocket_jump_links.get(li as usize).copied().unwrap_or(-1) {
-            r if r >= 0 => self.rocket_jumps.get(r as usize),
-            _ => None,
-        }
+        self.rocket_jumps.of_link(li)
     }
 
-    /// Push a rocket-jump link with its traversal, keeping the side table in step.
+    /// Push a rocket-jump link with its traversal, tagging the new link in the side table.
     fn push_rocket_jump(&mut self, link: Link, traversal: RocketJumpTraversal) {
-        if self.rocket_jump_links.len() != self.links.len() {
-            self.rocket_jump_links.resize(self.links.len(), -1);
-        }
-        let r = self.rocket_jumps.len() as i32;
-        self.rocket_jumps.push(traversal);
+        let r = self.rocket_jumps.push(traversal);
         self.push_link(link);
-        self.rocket_jump_links.push(r);
+        self.rocket_jumps.tag(self.links.len() - 1, r);
     }
 
     /// Append a free-standing cell (not from the column carve) and index it. Used for plat
@@ -1604,28 +1562,28 @@ mod tests {
                     mix(&mut h, li as u64);
                 }
             }
-            for &x in &g.hook_links {
+            for &x in g.hooks.idx_raw() {
                 mix(&mut h, x as u32 as u64);
             }
-            for t in &g.hooks {
+            for t in g.hooks.items_raw() {
                 mix_vec3(&mut h, t.stick);
                 mix(&mut h, t.release_dist.to_bits() as u64);
                 mix_vec3(&mut h, t.v0);
                 mix(&mut h, t.airtime.to_bits() as u64);
             }
-            for &x in &g.speed_jump_links {
+            for &x in g.speed_jumps.idx_raw() {
                 mix(&mut h, x as u32 as u64);
             }
-            for t in &g.speed_jumps {
+            for t in g.speed_jumps.items_raw() {
                 mix_vec3(&mut h, t.takeoff);
                 mix(&mut h, t.v_req.to_bits() as u64);
                 mix(&mut h, t.airtime.to_bits() as u64);
                 mix(&mut h, t.chained as u64);
             }
-            for &x in &g.rocket_jump_links {
+            for &x in g.rocket_jumps.idx_raw() {
                 mix(&mut h, x as u32 as u64);
             }
-            for t in &g.rocket_jumps {
+            for t in g.rocket_jumps.items_raw() {
                 mix_vec3(&mut h, t.fire_angles);
                 mix(&mut h, t.fire_delay.to_bits() as u64);
                 mix_vec3(&mut h, t.blast);
@@ -1713,16 +1671,11 @@ mod tests {
             links: vec![link(0, 1, 1.0), link(1, 3, 1.0), link(0, 2, 1.1), link(2, 3, 1.1)],
             adjacency: vec![vec![0, 2], vec![1], vec![3], vec![]],
             grid: GridIndex::default(),
-            gates: Vec::new(),
-            gated_links: Vec::new(),
-            hook_links: Vec::new(),
-            hooks: Vec::new(),
-            speed_jump_links: Vec::new(),
-            speed_jumps: Vec::new(),
-            rocket_jump_links: Vec::new(),
-            rocket_jumps: Vec::new(),
-            plats: Vec::new(),
-            plat_links: Vec::new(),
+            gates: SideTable::default(),
+            hooks: SideTable::default(),
+            speed_jumps: SideTable::default(),
+            rocket_jumps: SideTable::default(),
+            plats: SideTable::default(),
             sj_k: bhop_k(10.0, MAX_SPEED),
         }
     }
@@ -1830,16 +1783,11 @@ mod tests {
             links: vec![link(0, 1), link(1, 0)],
             adjacency: vec![vec![0], vec![1]],
             grid,
-            gates: Vec::new(),
-            gated_links: Vec::new(),
-            hook_links: Vec::new(),
-            hooks: Vec::new(),
-            speed_jump_links: Vec::new(),
-            speed_jumps: Vec::new(),
-            rocket_jump_links: Vec::new(),
-            rocket_jumps: Vec::new(),
-            plats: Vec::new(),
-            plat_links: Vec::new(),
+            gates: SideTable::default(),
+            hooks: SideTable::default(),
+            speed_jumps: SideTable::default(),
+            rocket_jumps: SideTable::default(),
+            plats: SideTable::default(),
             sj_k: bhop_k(10.0, MAX_SPEED),
         };
         // Floor a short step (z ≤ −40) below the cells for x ≤ 60; lava fills x > 60 under z = 0.
@@ -1915,27 +1863,21 @@ mod tests {
                 Link { from, to, kind, cost }
             })
             .collect::<Vec<_>>();
-        let mut speed_jump_links = vec![-1i32; links.len()];
-        let mut speed_jumps = Vec::new();
+        let mut speed_jumps = SideTable::default();
         for &(li, v_req, airtime, chained) in sjs {
-            speed_jump_links[li] = speed_jumps.len() as i32;
-            speed_jumps.push(SpeedJumpTraversal { takeoff: origins[links[li].from as usize], v_req, airtime, chained });
+            let s = speed_jumps.push(SpeedJumpTraversal { takeoff: origins[links[li].from as usize], v_req, airtime, chained });
+            speed_jumps.tag(li, s);
         }
         NavGraph {
             cells,
             links,
             adjacency,
             grid: GridIndex::default(),
-            gates: Vec::new(),
-            gated_links: Vec::new(),
-            hook_links: Vec::new(),
-            hooks: Vec::new(),
-            speed_jump_links,
+            gates: SideTable::default(),
+            hooks: SideTable::default(),
             speed_jumps,
-            rocket_jump_links: Vec::new(),
-            rocket_jumps: Vec::new(),
-            plats: Vec::new(),
-            plat_links: Vec::new(),
+            rocket_jumps: SideTable::default(),
+            plats: SideTable::default(),
             sj_k: bhop_k(10.0, MAX_SPEED),
         }
     }

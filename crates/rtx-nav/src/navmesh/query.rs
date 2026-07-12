@@ -11,6 +11,31 @@ use super::{
     SPEED_CONE_DEG,
 };
 
+/// A min-heap entry for the A*/Dijkstra searches below: a NaN-free f32 priority `key` carrying an
+/// opaque `payload` (a cell, or a `(cell, band)` state). `Ord` reverses the key so `BinaryHeap` (a
+/// max-heap) pops the smallest key first; the payload never participates in the comparison. One
+/// shared shape replaces the three identical hand-written `Node` orderings.
+struct MinCost<T> {
+    key: f32,
+    payload: T,
+}
+impl<T> PartialEq for MinCost<T> {
+    fn eq(&self, o: &Self) -> bool {
+        self.key == o.key
+    }
+}
+impl<T> Eq for MinCost<T> {}
+impl<T> PartialOrd for MinCost<T> {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl<T> Ord for MinCost<T> {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        o.key.partial_cmp(&self.key).unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
 /// A route from the banded planner: link indices plus the planned *entry* speed band for each leg
 /// (parallel to `links`), so the runtime knows where it is meant to arrive carrying speed.
 pub struct BandedRoute {
@@ -52,7 +77,6 @@ impl NavGraph {
     /// so the route bends around closed doors when it can and only crosses one (leaving the bot to
     /// open it) when there's no other way. Pass [`LinkCosts::gated`] (or `default`) for gates-only.
     pub fn find_path(&self, start: CellId, goal: CellId, costs: &LinkCosts) -> Option<Vec<u32>> {
-        use std::cmp::Ordering;
         use std::collections::BinaryHeap;
 
         if start == goal {
@@ -60,40 +84,18 @@ impl NavGraph {
         }
         let h = |c: CellId| (self.cells[goal as usize].origin - self.cells[c as usize].origin).length() / MAX_SPEED;
 
-        // Min-heap on f = g + h (Reverse via a custom ordering on a NaN-free f32 key).
-        struct Node {
-            f: f32,
-            cell: CellId,
-        }
-        impl PartialEq for Node {
-            fn eq(&self, o: &Self) -> bool {
-                self.f == o.f
-            }
-        }
-        impl Eq for Node {}
-        impl PartialOrd for Node {
-            fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-                Some(self.cmp(o))
-            }
-        }
-        impl Ord for Node {
-            fn cmp(&self, o: &Self) -> Ordering {
-                // Reverse so BinaryHeap (a max-heap) pops the smallest f first.
-                o.f.partial_cmp(&self.f).unwrap_or(Ordering::Equal)
-            }
-        }
-
+        // Min-heap on f = g + h (see MinCost).
         let n = self.cells.len();
         let mut g_cost = vec![f32::INFINITY; n];
         let mut came_from = vec![u32::MAX; n]; // link index used to reach this cell
         let mut heap = BinaryHeap::new();
         g_cost[start as usize] = 0.0;
-        heap.push(Node {
-            f: h(start),
-            cell: start,
+        heap.push(MinCost {
+            key: h(start),
+            payload: start,
         });
 
-        while let Some(Node { cell, .. }) = heap.pop() {
+        while let Some(MinCost { payload: cell, .. }) = heap.pop() {
             if cell == goal {
                 return Some(self.reconstruct(&came_from, start, goal));
             }
@@ -103,9 +105,9 @@ impl NavGraph {
                 if ng < g_cost[link.to as usize] {
                     g_cost[link.to as usize] = ng;
                     came_from[link.to as usize] = li;
-                    heap.push(Node {
-                        f: ng + h(link.to),
-                        cell: link.to,
+                    heap.push(MinCost {
+                        key: ng + h(link.to),
+                        payload: link.to,
                     });
                 }
             }
@@ -133,7 +135,6 @@ impl NavGraph {
         start_speed: f32,
         costs: &LinkCosts,
     ) -> Option<BandedRoute> {
-        use std::cmp::Ordering;
         use std::collections::BinaryHeap;
 
         if start == goal {
@@ -145,36 +146,15 @@ impl NavGraph {
             (self.cells[goal as usize].origin - self.cells[cell as usize].origin).length() / BAND_V_MAX
         };
 
-        struct Node {
-            f: f32,
-            state: u32,
-        }
-        impl PartialEq for Node {
-            fn eq(&self, o: &Self) -> bool {
-                self.f == o.f
-            }
-        }
-        impl Eq for Node {}
-        impl PartialOrd for Node {
-            fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-                Some(self.cmp(o))
-            }
-        }
-        impl Ord for Node {
-            fn cmp(&self, o: &Self) -> Ordering {
-                o.f.partial_cmp(&self.f).unwrap_or(Ordering::Equal) // min-heap on f
-            }
-        }
-
         let mut g_cost = vec![f32::INFINITY; nstates];
         let mut came_link = vec![u32::MAX; nstates]; // link used to reach this state
         let mut came_state = vec![u32::MAX; nstates]; // predecessor state
         let mut heap = BinaryHeap::new();
         let s0 = start * nb + band_of(start_speed) as u32;
         g_cost[s0 as usize] = 0.0;
-        heap.push(Node { f: h(start), state: s0 });
+        heap.push(MinCost { key: h(start), payload: s0 });
 
-        while let Some(Node { state, .. }) = heap.pop() {
+        while let Some(MinCost { payload: state, .. }) = heap.pop() {
             let cell = state / nb;
             let band = (state % nb) as u8;
             if cell == goal {
@@ -208,7 +188,7 @@ impl NavGraph {
                     g_cost[ns as usize] = ng;
                     came_link[ns as usize] = li;
                     came_state[ns as usize] = state;
-                    heap.push(Node { f: ng + h(self.links[li as usize].to), state: ns });
+                    heap.push(MinCost { key: ng + h(self.links[li as usize].to), payload: ns });
                 }
             }
         }
@@ -258,35 +238,13 @@ impl NavGraph {
     /// for unreachable ones). One pass answers "how far is each item?" for goal selection, far
     /// cheaper than an A* per candidate. Indexed by [`CellId`].
     pub fn costs_from(&self, start: CellId, costs: &LinkCosts) -> Vec<f32> {
-        use std::cmp::Ordering;
         use std::collections::BinaryHeap;
-
-        struct Node {
-            g: f32,
-            cell: CellId,
-        }
-        impl PartialEq for Node {
-            fn eq(&self, o: &Self) -> bool {
-                self.g == o.g
-            }
-        }
-        impl Eq for Node {}
-        impl PartialOrd for Node {
-            fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-                Some(self.cmp(o))
-            }
-        }
-        impl Ord for Node {
-            fn cmp(&self, o: &Self) -> Ordering {
-                o.g.partial_cmp(&self.g).unwrap_or(Ordering::Equal) // min-heap on g
-            }
-        }
 
         let mut cost = vec![f32::INFINITY; self.cells.len()];
         let mut heap = BinaryHeap::new();
         cost[start as usize] = 0.0;
-        heap.push(Node { g: 0.0, cell: start });
-        while let Some(Node { g, cell }) = heap.pop() {
+        heap.push(MinCost { key: 0.0, payload: start });
+        while let Some(MinCost { key: g, payload: cell }) = heap.pop() {
             if g > cost[cell as usize] {
                 continue; // a cheaper path already settled this cell
             }
@@ -295,7 +253,7 @@ impl NavGraph {
                 let ng = g + link.cost + self.link_extra(li, costs) + self.chained_block(li);
                 if ng < cost[link.to as usize] {
                     cost[link.to as usize] = ng;
-                    heap.push(Node { g: ng, cell: link.to });
+                    heap.push(MinCost { key: ng, payload: link.to });
                 }
             }
         }

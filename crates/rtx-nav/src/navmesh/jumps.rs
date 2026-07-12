@@ -285,12 +285,15 @@ impl NavGraph {
                 cands_chained.push(c);
             }
         }
-        cands.sort_by(|x, y| x.0.total_cmp(&y.0));
-        cands.truncate(SPEED_JUMP_MAX_PER_CELL);
-        cands_chained.sort_by(|x, y| x.0.total_cmp(&y.0));
-        cands_chained.truncate(SPEED_JUMP_CHAINED_MAX_PER_CELL);
-        out.extend(cands.into_iter().map(|(_, l, t)| (l, t)));
-        out.extend(cands_chained.into_iter().map(|(_, l, t)| (l, t)));
+        // Keep the cheapest-entry candidates in each pool (they never evict each other — separate
+        // budgets), then splice link + traversal into the shared output.
+        let mut keep_cheapest = |mut cs: Vec<(f32, Link, SpeedJumpTraversal)>, cap: usize| {
+            cs.sort_by(|x, y| x.0.total_cmp(&y.0));
+            cs.truncate(cap);
+            out.extend(cs.into_iter().map(|(_, l, t)| (l, t)));
+        };
+        keep_cheapest(cands, SPEED_JUMP_MAX_PER_CELL);
+        keep_cheapest(cands_chained, SPEED_JUMP_CHAINED_MAX_PER_CELL);
     }
 
     /// Measure the straight, flat, hop-wide runway feeding ledge cell `a` from behind (opposite the

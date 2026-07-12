@@ -6,7 +6,10 @@
 
 use glam::{Vec3, Vec3Swizzles};
 
-use super::{HookParams, HOOK_LAND_XY, HOOK_LAND_Z, HOOK_MAX_AIRTIME, HOOK_OVERHEAD, HOOK_SAMPLE, HOOK_SIM_DT};
+use super::{
+    HookParams, FALL_DAMAGE_SPEED, HOOK_LAND_XY, HOOK_LAND_Z, HOOK_MAX_AIRTIME, HOOK_OVERHEAD, HOOK_SAMPLE,
+    HOOK_SIM_DT,
+};
 use crate::bsp::Bsp;
 
 /// Launch pitches (degrees above horizontal) tried when searching for a hook anchor.
@@ -115,7 +118,7 @@ pub(super) fn hook_cost(rope: f32, release_dist: f32, airtime: f32, vz_land: f32
     let throw = rope / params.throw;
     let reel = (rope - release_dist).max(0.0) / params.pull;
     let mut c = throw + reel + airtime + HOOK_OVERHEAD;
-    if vz_land.abs() > 580.0 {
+    if vz_land.abs() > FALL_DAMAGE_SPEED {
         c += 1.0;
     }
     c

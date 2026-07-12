@@ -23,6 +23,9 @@ pub(super) const MAX_DROP: f32 = 4096.0;
 pub(super) const DJ_MAX_DROP: f32 = 240.0;
 /// Fall height beyond which QW fall damage applies (`MAX_SAFE_FALL` ≈ when speed > 580).
 pub(super) const SAFE_FALL: f32 = 88.0;
+/// Landing vertical speed (u/s) above which QW inflicts fall damage. A ballistic arc (hook swing,
+/// rocket jump) that lands harder than this is priced with the HP hit by the solvers.
+pub(super) const FALL_DAMAGE_SPEED: f32 = 580.0;
 /// Apex a standing jump adds: `jump_vel² / (2·gravity)` = `270² / 1600`. Public so a viewer can
 /// re-fly a [`LinkKind::JumpGap`](super::LinkKind) arc with [`arc_point`](super::arc_point) using
 /// the same apex the build cleared with.

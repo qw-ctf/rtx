@@ -87,8 +87,7 @@ impl NavGraph {
             };
             // Register the plat only once its top wired in (skipped plats never register — same as
             // gates), so `plat_of_link` indices stay dense and match `plats`.
-            let pi = self.plats.len() as i32;
-            self.plats.push(Plat {
+            let pi = self.plats.push(Plat {
                 entity: p.entity,
                 fp_min: p.fp_min,
                 fp_max: p.fp_max,
@@ -128,14 +127,11 @@ impl NavGraph {
     }
 
     /// Push a plat-related link (the ride or a jump-aboard), tagging it with plat index `pi` so the
-    /// runtime can look the lift up via [`plat_of_link`](Self::plat_of_link). Keeps `plat_links` in
-    /// step with `links`, mirroring [`push_hook`](Self::push_hook).
-    fn push_plat_link(&mut self, link: Link, pi: i32) {
-        if self.plat_links.len() != self.links.len() {
-            self.plat_links.resize(self.links.len(), -1);
-        }
+    /// runtime can look the lift up via [`plat_of_link`](Self::plat_of_link), tagging the new link
+    /// in the `plats` side table (mirroring [`push_hook`](Self::push_hook)).
+    fn push_plat_link(&mut self, link: Link, pi: usize) {
         self.push_link(link);
-        self.plat_links.push(pi);
+        self.plats.tag(self.links.len() - 1, pi);
     }
 
     pub fn plat_count(&self) -> usize {
@@ -143,15 +139,12 @@ impl NavGraph {
     }
 
     pub fn plat(&self, i: usize) -> &Plat {
-        &self.plats[i]
+        self.plats.item(i)
     }
 
     /// The plat (if any) that link `li` boards or rides.
     pub fn plat_of_link(&self, li: u32) -> Option<usize> {
-        match self.plat_links.get(li as usize).copied().unwrap_or(-1) {
-            p if p >= 0 => Some(p as usize),
-            _ => None,
-        }
+        self.plats.index_of_link(li)
     }
 
     /// Splice `trigger_teleport`s into the graph: every standable cell inside a teleporter's
@@ -214,9 +207,6 @@ impl NavGraph {
     /// shut one (see `bot.rs`). Gates whose closed door crosses no link, or whose button has no
     /// nearby cell to operate from, are skipped.
     pub fn add_gates(&mut self, gates: &[GateInfo]) {
-        if self.gated_links.len() != self.links.len() {
-            self.gated_links = vec![-1; self.links.len()];
-        }
         for gi in gates {
             let Some(button_cell) = self.nearest_within(gi.button, GRID * 5.0, 160.0) else {
                 continue;
@@ -239,11 +229,7 @@ impl NavGraph {
             if hit.is_empty() {
                 continue; // door crosses no link — not an obstruction the bots can hit
             }
-            let idx = self.gates.len() as i32;
-            for li in hit {
-                self.gated_links[li] = idx;
-            }
-            self.gates.push(Gate {
+            let idx = self.gates.push(Gate {
                 obstruction: gi.obstruction,
                 closed_origin: gi.closed_origin,
                 activator: gi.activator,
@@ -251,6 +237,9 @@ impl NavGraph {
                 aim: gi.button,
                 shoot: gi.shoot,
             });
+            for li in hit {
+                self.gates.tag(li, idx);
+            }
         }
     }
 
@@ -259,14 +248,11 @@ impl NavGraph {
     }
 
     pub fn gate(&self, i: usize) -> &Gate {
-        &self.gates[i]
+        self.gates.item(i)
     }
 
     /// The gate (if any) whose shut door link `li` passes through.
     pub fn gate_of_link(&self, li: u32) -> Option<usize> {
-        match self.gated_links.get(li as usize).copied().unwrap_or(-1) {
-            g if g >= 0 => Some(g as usize),
-            _ => None,
-        }
+        self.gates.index_of_link(li)
     }
 }
