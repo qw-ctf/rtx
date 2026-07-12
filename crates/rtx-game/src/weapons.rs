@@ -740,24 +740,9 @@ impl GameState {
             return;
         }
         let v = &mut self.entities[e].v;
-        let remaining = match kind {
-            AmmoKind::Shells => {
-                v.ammo_shells -= n;
-                v.ammo_shells
-            }
-            AmmoKind::Nails => {
-                v.ammo_nails -= n;
-                v.ammo_nails
-            }
-            AmmoKind::Rockets => {
-                v.ammo_rockets -= n;
-                v.ammo_rockets
-            }
-            AmmoKind::Cells => {
-                v.ammo_cells -= n;
-                v.ammo_cells
-            }
-        };
+        let field = arsenal::ammo_field_mut(v, kind);
+        *field -= n;
+        let remaining = *field;
         v.currentammo = remaining;
     }
 

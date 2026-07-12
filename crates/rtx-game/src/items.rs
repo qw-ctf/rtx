@@ -8,7 +8,7 @@ use core::ffi::CStr;
 
 use glam::Vec3;
 
-use crate::arsenal::{weapon_spec, weapon_spec_for_classname, AmmoKind, WeaponSpec};
+use crate::arsenal::{self, weapon_spec, weapon_spec_for_classname, AmmoKind, WeaponSpec};
 use crate::assets::{Model, Sound};
 use crate::bot::model::PickupKind;
 use crate::defs::*;
@@ -566,23 +566,11 @@ impl GameState {
     }
 
     fn ammo_of(&self, e: EntId, kind: AmmoKind) -> f32 {
-        let v = &self.entities[e].v;
-        match kind {
-            AmmoKind::Shells => v.ammo_shells,
-            AmmoKind::Nails => v.ammo_nails,
-            AmmoKind::Rockets => v.ammo_rockets,
-            AmmoKind::Cells => v.ammo_cells,
-        }
+        arsenal::ammo_count(&self.entities[e].v, kind)
     }
 
     fn add_ammo(&mut self, e: EntId, kind: AmmoKind, amount: f32) {
-        let v = &mut self.entities[e].v;
-        match kind {
-            AmmoKind::Shells => v.ammo_shells += amount,
-            AmmoKind::Nails => v.ammo_nails += amount,
-            AmmoKind::Rockets => v.ammo_rockets += amount,
-            AmmoKind::Cells => v.ammo_cells += amount,
-        }
+        *arsenal::ammo_field_mut(&mut self.entities[e].v, kind) += amount;
     }
 
     /// `RankForWeapon` (lower is better).

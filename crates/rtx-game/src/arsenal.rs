@@ -254,6 +254,17 @@ pub(crate) fn ammo_count(v: &EntVars, kind: AmmoKind) -> f32 {
     }
 }
 
+/// Mutable handle to an ammo pool — for spending (`consume_ammo`) and granting (`add_ammo`) without
+/// re-matching the four `ammo_*` fields by hand at each site.
+pub(crate) fn ammo_field_mut(v: &mut EntVars, kind: AmmoKind) -> &mut f32 {
+    match kind {
+        AmmoKind::Shells => &mut v.ammo_shells,
+        AmmoKind::Nails => &mut v.ammo_nails,
+        AmmoKind::Rockets => &mut v.ammo_rockets,
+        AmmoKind::Cells => &mut v.ammo_cells,
+    }
+}
+
 /// `W_BestWeapon`'s auto-pick chain, best first (LG, SNG, SSG, NG, SG). Explosives and the
 /// axe/grapple are absent (`auto_pick == None`): stock QW never auto-switches to GL/RL, and the axe
 /// is the hard fallback.
