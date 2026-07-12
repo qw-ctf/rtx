@@ -76,6 +76,12 @@ impl GameState {
         ent.v.solid = Solid::Not;
     }
 
+    /// The respawn delay for an item picked up now: `base` seconds, or `None` in deathmatch 2 (items
+    /// don't respawn there). The `dm != 2` gate every ordinary pickup re-derived.
+    fn respawn_delay(&self, base: f32) -> Option<f32> {
+        (self.level.deathmatch != 2).then_some(base)
+    }
+
     /// Schedule an item respawn (`SUB_regen`) after `delay`, then fire targets.
     fn pickup_finish(&mut self, e: EntId, other: EntId, delay: Option<f32>) {
         self.pickup_hide(e);
@@ -155,7 +161,7 @@ impl GameState {
             self.activator = other;
             self.sub_use_targets(e);
         } else {
-            let delay = if self.level.deathmatch != 2 { Some(20.0) } else { None };
+            let delay = self.respawn_delay(20.0);
             self.pickup_finish(e, other, delay);
         }
     }
@@ -213,7 +219,7 @@ impl GameState {
         self.host
             .sound(other, Channel::Item, Sound::ITEMS_ARMOR1, 1.0, Attenuation::Norm);
         self.screen_flash(other);
-        let delay = if self.level.deathmatch != 2 { Some(20.0) } else { None };
+        let delay = self.respawn_delay(20.0);
         self.pickup_finish(e, other, delay);
     }
 
@@ -268,7 +274,7 @@ impl GameState {
             return;
         }
         let _ = best;
-        let delay = if self.level.deathmatch != 2 { Some(30.0) } else { None };
+        let delay = self.respawn_delay(30.0);
         self.pickup_finish(e, other, delay);
     }
 
