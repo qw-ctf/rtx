@@ -184,6 +184,17 @@ pub struct NavGraph {
     pub cells: Vec<Cell>,
     pub links: Vec<Link>,
     pub adjacency: Vec<Vec<u32>>,
+    /// Per-cell "the standing origin is under water" flag (parallel to `cells`), so the planner can
+    /// price swimming above walking and the runtime can tell a wet cell from a dry one. Empty until
+    /// [`surcharge_water_links`](Self::surcharge_water_links) runs at graph-swap (it needs the
+    /// engine's liquid-carrying `pointcontents`, unavailable on the pure worker build); an empty vec
+    /// reads as "all dry" via [`cell_in_water`](Self::cell_in_water).
+    water: Vec<bool>,
+    /// Per-cell "a bot standing here can breathe" flag (parallel to `cells`): its eye point is out of
+    /// the water, so it's a spot a drowning bot can path to for air. Filled alongside `water`; an
+    /// empty vec reads as "all breathable" via [`cell_breathable`](Self::cell_breathable) — the safe
+    /// default for an unmarked (dry) graph.
+    breathable: Vec<bool>,
     grid: GridIndex,
     /// The closed door/movewall each link's segment passes through — the "navmesh aware of dynamic
     /// geometry" core, so pathfinding can price a link by its door's live state (see
@@ -281,6 +292,8 @@ impl NavGraph {
             adjacency: vec![Vec::new(); cells_grid.0.len()],
             cells: cells_grid.0,
             links: Vec::new(),
+            water: Vec::new(),      // filled at graph-swap by surcharge_water_links
+            breathable: Vec::new(), // (needs the engine's liquid-carrying pointcontents)
             grid: cells_grid.1,
             gates: SideTable::default(),
             hooks: SideTable::default(),
@@ -518,6 +531,28 @@ impl NavGraph {
         })
     }
 
+    /// Flag every cell whose standing origin is under water, and price swimming above walking. Fills
+    /// the parallel `water`/`breathable` vectors — an origin in water means a bot swims here; an eye
+    /// point out of the water (`origin + 22`, pmove's waterlevel-3 sample) means a spot it can
+    /// breathe — then multiplies the cost of every link *entering* a water cell by
+    /// [`WATER_COST_MULT`]. Exit links (water → dry) are left untouched, so the surcharge forms a
+    /// cost gradient the planner follows back to shore rather than a uniform pool tax.
+    ///
+    /// Like [`surcharge_hazard_links`](Self::surcharge_hazard_links) this reads liquid contents, which
+    /// only the engine's render-hull `pointcontents` carries (the worker build's clip hull is
+    /// liquid-blind), so it runs at graph-swap from the game's navmesh poll — not inside [`build`].
+    pub fn surcharge_water_links(&mut self, contents: &impl Fn(Vec3) -> f32) {
+        let is_water = |p: Vec3| contents(p) == crate::bsp::CONTENTS_WATER as f32;
+        self.water = self.cells.iter().map(|c| is_water(c.origin)).collect();
+        // Eye height for the breathe test: the standing view offset (pmove samples waterlevel 3 here).
+        let eye = Vec3::new(0.0, 0.0, 22.0);
+        self.breathable = self.cells.iter().map(|c| !is_water(c.origin + eye)).collect();
+        for link in &mut self.links {
+            if self.water[link.to as usize] {
+                link.cost *= WATER_COST_MULT;
+            }
+        }
+    }
 
     /// Extra A* cost for link `li` under `costs`: closed-gate penalty + this caller's per-link
     /// surcharge + optional deterministic jitter. All non-negative, keeping the A* heuristic
@@ -996,6 +1031,15 @@ const HAZARD_PROBE_R: f32 = 48.0;
 /// a parallel safe corridor when one exists within a short detour, yet still crosses a lava bridge
 /// that is the only way; finite, so it never disconnects the graph (like the gate/RJ penalties).
 const HAZARD_LINK_EXTRA: f32 = 0.5;
+
+/// Multiplier on the cost of every link *entering* an underwater cell (see
+/// [`NavGraph::surcharge_water_links`]). Water is not lethal like lava, so it's a soft bias, not the
+/// flat [`HAZARD_LINK_EXTRA`] surcharge: a flat add on each of a pool's many short swim links would
+/// stack into an effective ban, whereas a multiplier keeps a crossing *proportional* to its length —
+/// a dry detour up to ~twice as long wins, longer ones don't. `2.0` sits a touch above the honest
+/// physical cost (pmove swims at 0.7× ground wishspeed ⇒ ≥1.43×) to price in the exposure and the
+/// lost bunnyhop, so a bot travels through water only when it's genuinely the shorter way.
+const WATER_COST_MULT: f32 = 2.0;
 
 /// Travel-time cost of a link: horizontal distance / speed, plus risk/effort penalties so A*
 /// prefers grounded routes and avoids damaging falls.
@@ -1677,6 +1721,8 @@ mod tests {
             cells: vec![cell(0.0, 0.0), cell(100.0, 50.0), cell(100.0, -50.0), cell(200.0, 0.0)],
             links: vec![link(0, 1, 1.0), link(1, 3, 1.0), link(0, 2, 1.1), link(2, 3, 1.1)],
             adjacency: vec![vec![0, 2], vec![1], vec![3], vec![]],
+            water: Vec::new(),
+            breathable: Vec::new(),
             grid: GridIndex::default(),
             gates: SideTable::default(),
             hooks: SideTable::default(),
@@ -1707,6 +1753,8 @@ mod tests {
             cells: vec![cell(0.0, 0.0, 0.0), cell(1500.0, 0.0, 0.0), cell(0.0, 1500.0, 100.0)],
             links: vec![step(0, 1), step(0, 2)], // link 0: 1500u flat; link 1: 1500u rising 100u
             adjacency: vec![vec![0, 1], vec![], vec![]],
+            water: Vec::new(),
+            breathable: Vec::new(),
             grid: GridIndex::default(),
             gates: SideTable::default(),
             hooks: SideTable::default(),
@@ -1823,6 +1871,8 @@ mod tests {
             cells: vec![cell(0.0, 0), cell(32.0, 1)],
             links: vec![link(0, 1), link(1, 0)],
             adjacency: vec![vec![0], vec![1]],
+            water: Vec::new(),
+            breathable: Vec::new(),
             grid,
             gates: SideTable::default(),
             hooks: SideTable::default(),
@@ -1848,6 +1898,69 @@ mod tests {
             g.links[0].cost
         );
         assert_eq!(g.links[1].cost, 1.0, "interior link must be unchanged");
+    }
+
+    /// `surcharge_water_links` flags the submerged cell, multiplies the cost of links *into* it while
+    /// leaving the exit link alone, and reports the depth via `cell_in_water`/`cell_breathable`.
+    #[test]
+    fn surcharge_flags_water_cells_and_multiplies_into_links() {
+        let cell = |x: f32, gx: i32| Cell {
+            origin: Vec3::new(x, 0.0, 0.0),
+            gx,
+            gy: 0,
+        };
+        let link = |from: CellId, to: CellId| Link {
+            from,
+            to,
+            kind: LinkKind::Walk,
+            cost: 1.0,
+        };
+        let mut g = NavGraph {
+            cells: vec![cell(0.0, 0), cell(32.0, 1)],
+            links: vec![link(0, 1), link(1, 0)],
+            adjacency: vec![vec![0], vec![1]],
+            water: Vec::new(),
+            breathable: Vec::new(),
+            grid: GridIndex::default(),
+            gates: SideTable::default(),
+            hooks: SideTable::default(),
+            speed_jumps: SideTable::default(),
+            rocket_jumps: SideTable::default(),
+            plats: SideTable::default(),
+            sj_k: bhop_k(10.0, MAX_SPEED),
+        };
+        // Deep water under and around cell 1 (x = 32), up past its eye point; cell 0 (x = 0) is dry.
+        let contents = |p: Vec3| {
+            if p.x > 16.0 {
+                crate::bsp::CONTENTS_WATER as f32
+            } else {
+                crate::bsp::CONTENTS_EMPTY as f32
+            }
+        };
+        g.surcharge_water_links(&contents);
+        assert!(!g.cell_in_water(0) && g.cell_breathable(0), "dry cell 0");
+        assert!(g.cell_in_water(1) && !g.cell_breathable(1), "deep cell 1 submerged, no air");
+        // Link 0→1 enters the water cell → ×WATER_COST_MULT; link 1→0 exits to dry → unchanged.
+        assert!((g.links[0].cost - WATER_COST_MULT).abs() < 1e-6, "into-water link: {}", g.links[0].cost);
+        assert_eq!(g.links[1].cost, 1.0, "exit link must stay cheap (the gradient toward shore)");
+    }
+
+    /// A shallow cell — origin submerged but the eye point above the surface — is both `in_water`
+    /// (swim physics) and `breathable` (a safe spot for a drowning bot to path to for air).
+    #[test]
+    fn shallow_water_cell_is_breathable() {
+        let mut g = diamond();
+        // Water fills z < 10 only, so cell origins (z = 0) are wet but their eye points (z = 22) are dry.
+        let contents = |p: Vec3| {
+            if p.z < 10.0 {
+                crate::bsp::CONTENTS_WATER as f32
+            } else {
+                crate::bsp::CONTENTS_EMPTY as f32
+            }
+        };
+        g.surcharge_water_links(&contents);
+        assert!(g.cell_in_water(0), "origin under the surface");
+        assert!(g.cell_breathable(0), "eye above the surface — can breathe");
     }
 
     /// The surcharge diverts A* off a lava-edge route the same way a penalty does: flagging the
@@ -1913,6 +2026,8 @@ mod tests {
             cells,
             links,
             adjacency,
+            water: Vec::new(),
+            breathable: Vec::new(),
             grid: GridIndex::default(),
             gates: SideTable::default(),
             hooks: SideTable::default(),

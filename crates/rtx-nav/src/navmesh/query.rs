@@ -293,6 +293,18 @@ impl NavGraph {
         self.cells[cell as usize].origin
     }
 
+    /// Whether a bot standing on this cell is under water (its origin is submerged, so pmove swims).
+    /// Set by [`surcharge_water_links`](Self::surcharge_water_links); an unmarked graph reads as dry.
+    pub fn cell_in_water(&self, cell: CellId) -> bool {
+        self.water.get(cell as usize).copied().unwrap_or(false)
+    }
+
+    /// Whether a bot standing on this cell can breathe (its eye point is out of the water) — the
+    /// destinations a drowning bot paths to for air. An unmarked graph reads as all-breathable (dry).
+    pub fn cell_breathable(&self, cell: CellId) -> bool {
+        self.breathable.get(cell as usize).copied().unwrap_or(true)
+    }
+
     /// Counts per link kind, for the load-time debug line.
     pub fn summary(&self) -> LinkCounts {
         let mut c = LinkCounts::default();

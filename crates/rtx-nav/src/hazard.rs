@@ -16,7 +16,7 @@
 
 use glam::Vec3;
 
-use crate::bsp::{CONTENTS_LAVA, CONTENTS_SLIME, CONTENTS_WATER};
+use crate::bsp::{CONTENTS_EMPTY, CONTENTS_LAVA, CONTENTS_SLIME, CONTENTS_SOLID, CONTENTS_WATER};
 
 /// The eight compass directions probed around a point for a hazard.
 pub(crate) const HAZARD_DIRS: [(f32, f32); 8] = [
@@ -66,6 +66,42 @@ pub struct Hazard {
     pub kind: HazardKind,
 }
 
+/// What the downward march from a point first meets: a liquid, solid ground at that fall distance,
+/// or nothing within reach. The raw probe behind [`hazard_below`] and [`water_ahead`], so the two
+/// classify the *same* geometry and only differ in which finding they care about.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Below {
+    Lava,
+    Slime,
+    Water,
+    Solid(f32), // ground this far below the probe point
+    Bottomless, // no floor within HAZARD_PROBE_DEPTH
+}
+
+/// March straight down from `p`, reporting the first liquid or solid floor met (water short-circuits
+/// like the others — it never lets the march run past its surface to the floor below).
+fn probe_below(is_solid: &impl Fn(Vec3) -> bool, contents: &impl Fn(Vec3) -> f32, p: Vec3) -> Below {
+    let mut d = 0.0;
+    while d <= HAZARD_PROBE_DEPTH {
+        let q = p - Vec3::new(0.0, 0.0, d);
+        let c = contents(q);
+        if c == CONTENTS_LAVA as f32 {
+            return Below::Lava;
+        }
+        if c == CONTENTS_SLIME as f32 {
+            return Below::Slime;
+        }
+        if c == CONTENTS_WATER as f32 {
+            return Below::Water;
+        }
+        if is_solid(q) {
+            return Below::Solid(d);
+        }
+        d += 24.0;
+    }
+    Below::Bottomless
+}
+
 /// Classify what's below `p` by marching down: lava/slime (from `contents`) or a big drop / pit
 /// (from `is_solid`). `None` if solid ground sits close below, or if *water* is below — swimmable
 /// water breaks a fall and is harmless, so it is never a hazard (a deep pool would otherwise march
@@ -75,25 +111,13 @@ pub(crate) fn hazard_below(
     contents: &impl Fn(Vec3) -> f32,
     p: Vec3,
 ) -> Option<HazardKind> {
-    let mut d = 0.0;
-    while d <= HAZARD_PROBE_DEPTH {
-        let q = p - Vec3::new(0.0, 0.0, d);
-        let c = contents(q);
-        if c == CONTENTS_LAVA as f32 {
-            return Some(HazardKind::Lava);
-        }
-        if c == CONTENTS_SLIME as f32 {
-            return Some(HazardKind::Slime);
-        }
-        if c == CONTENTS_WATER as f32 {
-            return None; // swimmable — harmless, and not a pit no matter how deep
-        }
-        if is_solid(q) {
-            return (d > HAZARD_DROP).then_some(HazardKind::Pit);
-        }
-        d += 24.0;
+    match probe_below(is_solid, contents, p) {
+        Below::Lava => Some(HazardKind::Lava),
+        Below::Slime => Some(HazardKind::Slime),
+        Below::Water => None, // swimmable — harmless, and not a pit no matter how deep
+        Below::Solid(d) => (d > HAZARD_DROP).then_some(HazardKind::Pit),
+        Below::Bottomless => Some(HazardKind::Pit), // no floor within reach
     }
-    Some(HazardKind::Pit) // no floor within reach — bottomless
 }
 
 /// Find the best hazard to shove an enemy (at `e_feet`) into: probe a ring of directions/distances,
@@ -155,6 +179,42 @@ pub fn hazard_ahead(
         }
     }
     None
+}
+
+/// Whether stepping from `feet` along horizontal unit `dir` heads out over water within the next
+/// stride or two — the same probe geometry as [`hazard_ahead`], but reporting swimmable water rather
+/// than lethal hazards. The combat guard uses it to prefer dry footing: water is slow and exposed,
+/// so a bot picks a dry candidate move over a wet one when both are safe.
+pub fn water_ahead(
+    is_solid: &impl Fn(Vec3) -> bool,
+    contents: &impl Fn(Vec3) -> f32,
+    feet: Vec3,
+    dir: Vec3,
+) -> bool {
+    HAZARD_AHEAD_DISTS.iter().any(|&d| {
+        let p = feet + dir * d + Vec3::new(0.0, 0.0, 8.0);
+        // A wall ahead isn't water — normal collision handles it (mirrors `hazard_ahead`).
+        !is_solid(p) && probe_below(is_solid, contents, p) == Below::Water
+    })
+}
+
+/// Whether open air sits directly above `p` — a surface a submerged bot can swim up to by holding
+/// jump. Marches up in strides: reaching `CONTENTS_EMPTY` means an open surface overhead (true);
+/// hitting solid first means a roofed underwater tunnel (false) — there the bot must swim *out* to
+/// a breathing spot rather than press uselessly into the ceiling. Pure over the render-hull oracle.
+pub fn surface_above(contents: &impl Fn(Vec3) -> f32, p: Vec3) -> bool {
+    let mut d = 0.0;
+    while d <= HAZARD_PROBE_DEPTH {
+        let c = contents(p + Vec3::new(0.0, 0.0, d));
+        if c == CONTENTS_EMPTY as f32 {
+            return true; // broke the surface into open air
+        }
+        if c == CONTENTS_SOLID as f32 {
+            return false; // roofed — no surface directly overhead
+        }
+        d += 24.0;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -264,5 +324,42 @@ mod tests {
         let empty = |_: Vec3| CONTENTS_EMPTY as f32;
         let feet = Vec3::new(0.0, 0.0, 24.0);
         assert!(hazard_ahead(&solid, &empty, feet, Vec3::new(1.0, 0.0, 0.0)).is_none());
+    }
+
+    #[test]
+    fn water_ahead_detects_a_pool() {
+        // Water fills x > 60 below the floor; a bot at the origin stepping +x heads into it.
+        let solid = |p: Vec3| p.z <= 0.0 && p.x <= 60.0;
+        let contents = |p: Vec3| {
+            if p.x > 60.0 && p.z < 0.0 {
+                CONTENTS_WATER as f32
+            } else {
+                CONTENTS_EMPTY as f32
+            }
+        };
+        let feet = Vec3::new(0.0, 0.0, 24.0);
+        assert!(water_ahead(&solid, &contents, feet, Vec3::new(1.0, 0.0, 0.0)));
+        // Stepping the other way stays over dry floor.
+        assert!(!water_ahead(&solid, &contents, feet, Vec3::new(-1.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn water_ahead_dry_floor_and_wall_are_not_water() {
+        let empty = |_: Vec3| CONTENTS_EMPTY as f32;
+        let feet = Vec3::new(0.0, 0.0, 24.0);
+        assert!(!water_ahead(&floor, &empty, feet, Vec3::new(1.0, 0.0, 0.0)));
+        // A wall ahead (solid at the probe) is not water.
+        let wall = |p: Vec3| p.z <= 0.0 || p.x > 60.0;
+        assert!(!water_ahead(&wall, &empty, feet, Vec3::new(1.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn surface_above_open_pool_vs_roofed_tunnel() {
+        // Open pool: water below z = 0, open air above it — a surface to swim up to.
+        let open = |p: Vec3| if p.z < 0.0 { CONTENTS_WATER as f32 } else { CONTENTS_EMPTY as f32 };
+        assert!(surface_above(&open, Vec3::new(0.0, 0.0, -40.0)));
+        // Roofed tunnel: water below z = 0, solid ceiling above — no surface overhead.
+        let roofed = |p: Vec3| if p.z < 0.0 { CONTENTS_WATER as f32 } else { CONTENTS_SOLID as f32 };
+        assert!(!surface_above(&roofed, Vec3::new(0.0, 0.0, -40.0)));
     }
 }

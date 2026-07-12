@@ -34,7 +34,7 @@ pub(crate) use population::{drain_roster, RosterOp};
 #[cfg(test)]
 use population::bot_target;
 
-use crate::bot::state::{BotState, GrenadePhase, HookPhase, RjPhase};
+use crate::bot::state::{BotState, GrenadePhase, HookPhase, RjPhase, Wander};
 use crate::defs::{
     Bits, DeadFlag, Flags, Items, Solid, TakeDamage, Weapon, BUTTON_ATTACK, BUTTON_JUMP, VEC_VIEW_OFS,
 };
@@ -113,6 +113,13 @@ pub(super) fn ballistic_landing(origin: Vec3, target: Vec3, on_ground: bool, ela
 }
 /// Stop closing once this near the followed human, so bots tail rather than shove.
 const POLITE_DIST: f32 = 64.0;
+/// Seconds of air left at which a submerged bot drops everything and makes for the surface. The tank
+/// is 12s (see [`crate::client::movement`]); triggering with 5 left leaves ~1100u of swimming
+/// (0.7·MAX_SPEED for the panic window) before drown damage — ample slack for any id1 water pocket.
+const DROWN_PANIC_SECS: f32 = 5.0;
+/// How long the anti-drown surface target is reused before re-flooding the graph — a short cache so
+/// a drowning bot doesn't run a full Dijkstra every frame while it swims out.
+const SURFACE_CACHE_TTL: f32 = 0.5;
 /// Minimum seconds between A* re-paths (the human keeps moving).
 const REPATH_INTERVAL: f32 = 0.4;
 /// Stuck detector: if we move less than this over `STUCK_TIME`, jump and re-path.
@@ -298,6 +305,14 @@ struct Objective {
     /// Fighter eye point an arena audience bot holds its eyes on (a `Spectate` intent); `None`
     /// otherwise, leaving the eyes on the walk corridor.
     watch_point: Option<Vec3>,
+    /// Anti-drown override active: fully submerged and low on air, so the normal goal is replaced
+    /// with a dash to the nearest breathable cell (and combat yields movement to navigation). Set in
+    /// `run_bot` once the graph is borrowed, not by [`resolve_objective`].
+    surfacing: bool,
+    /// While `surfacing`, whether open water sits overhead so holding jump swims the bot up (an open
+    /// pool). False in a roofed tunnel, where pressing up only pins it to the ceiling — there it
+    /// swims *out* to the breathing spot on the navigation move alone.
+    swim_up: bool,
 }
 
 /// Resolve what this bot pursues this frame: reconcile a stale hook, ask the mode for an intent
@@ -320,6 +335,12 @@ struct Sense {
     /// Waist-deep or deeper (`waterlevel >= 2`): the engine's pmove swims here — jumps become
     /// swim-up strokes — so bunnyhopping is impossible. Vetoes the bhop controller.
     in_water: bool,
+    /// Fully submerged (`waterlevel == 3`, eyes underwater): the only state that *drowns* — the air
+    /// tank counts down here (see [`crate::client::movement`]). Drives the anti-drown override.
+    submerged: bool,
+    /// Seconds of air left before drowning (`combat.air_finished - now`): the 12s tank, ticking down
+    /// only while `submerged`, refreshed on every surfacing breath. Read only when `submerged`.
+    air_left: f32,
     alive: bool,
     vz: f32,
     air_jumped: bool,
@@ -355,6 +376,9 @@ fn sense(game: &GameState, e: EntId) -> Sense {
     let on_ground = game.entities[e].v.flags.has(Flags::ONGROUND);
     // Swimming (waterlevel >= 2): matches the swim gate in `player_jump` and combat's `swimming`.
     let in_water = game.entities[e].v.waterlevel >= 2.0;
+    // Fully under (waterlevel == 3) is the drowning state; snapshot the air tank for the override.
+    let submerged = game.entities[e].v.waterlevel >= 3.0;
+    let air_left = game.entities[e].combat.air_finished - now;
     let alive = game.entities[e].is_alive();
     // Vertical speed and whether the once-per-air-travel double jump is still available — snapshot
     // now, since the `&mut bot` binding below blocks reading the edict during the move logic.
@@ -387,7 +411,7 @@ fn sense(game: &GameState, e: EntId) -> Sense {
     let armorvalue = game.entities[e].v.armorvalue;
     let quad = game.entities[e].combat.super_damage_finished > now;
     Sense {
-        host, now, frametime, msec, origin, v_angle, client, weapon, on_ground, in_water, alive, vz, air_jumped, enemy_seen_time, v_xy, speed, grapple_hook, has_grapple, hook_out, on_hook, anchor, reel_half_step,
+        host, now, frametime, msec, origin, v_angle, client, weapon, on_ground, in_water, submerged, air_left, alive, vz, air_jumped, enemy_seen_time, v_xy, speed, grapple_hook, has_grapple, hook_out, on_hook, anchor, reel_half_step,
         attack_finished, has_rl, ammo_rockets, health, armortype, armorvalue, quad,
     }
 }
@@ -615,7 +639,12 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         _ => None,
     };
 
-    Objective { hooking, on_sj, on_rj, enemy, chasing, polite, target_origin, item_cell, watch_point, vigil: vigil.is_some() }
+    // `surfacing`/`swim_up` are decided in `run_bot` (they need the borrowed graph + bot cell), so
+    // the normal objective leaves them off — the anti-drown override flips them on when it fires.
+    Objective {
+        hooking, on_sj, on_rj, enemy, chasing, polite, target_origin, item_cell, watch_point,
+        vigil: vigil.is_some(), surfacing: false, swim_up: false,
+    }
 }
 
 /// Turn the frame's accumulated decisions into the engine usercmd. Bunnyhopping bypasses the aim
@@ -784,7 +813,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
 
     let idle = |angles: Vec3| host.set_bot_cmd(client, msec, angles, 0, 0, 0, 0, 0);
 
-    let o = resolve_objective(game, e, now, origin, client);
+    let mut o = resolve_objective(game, e, now, origin, client);
     // The spine and prologue read a few fields; `steer` re-destructures the rest from `o` via `SteerCtx`.
     let Objective { enemy, item_cell, target_origin, .. } = o;
 
@@ -821,10 +850,27 @@ fn run_bot(game: &mut GameState, e: EntId) {
         idle(v_angle);
         return;
     };
-    let Some(goal_cell) = item_cell.or_else(|| graph.nearest(target_origin)) else {
+    let Some(mut goal_cell) = item_cell.or_else(|| graph.nearest(target_origin)) else {
         idle(v_angle);
         return;
     };
+
+    // Anti-drown override: fully submerged and low on air, so drop the current goal and make for
+    // air. `surfacing`/`swim_up` tell the combat spine to hand movement back to navigation and hold
+    // jump (open water above) — see the `engage` overlay below. When a breathing cell is reachable
+    // the goal is redirected onto it; otherwise the bot at least swims straight up. Fires only in the
+    // rare panic window and self-limits (one breath refills the tank), so it wins outright.
+    if s.submerged && s.air_left < DROWN_PANIC_SECS {
+        o.surfacing = true;
+        o.swim_up = crate::hazard::surface_above(&|p| host.pointcontents(p), origin);
+        let air = surface_target(&mut game.entities[e].bot.surface, graph, bot_cell, &costs, now);
+        if let Some(cell) = air.and_then(|a| graph.nearest(a)) {
+            goal_cell = cell;
+            o.target_origin = graph.cell_origin(cell);
+            o.item_cell = Some(cell);
+            o.polite = false;
+        }
+    }
 
     // Race mode: the offline-optimized racing line's look-ahead point to bias the bhop bearing
     // toward (`None` outside race, with the feature off, or when the bot has strayed off the line —
@@ -859,10 +905,26 @@ fn run_bot(game: &mut GameState, e: EntId) {
     );
 
     // The `&nav` / `&mut bot` steering borrows have ended; the spine resumes with `&mut game`.
+    // Navigation's world-move, kept so combat can't strand the bot in water: a swimmer isn't
+    // ONGROUND, so `combat_move`'s hazard filter never runs and it would strafe in place until it
+    // drowns. In water we restore this route move (which the water surcharge aims at shore).
+    let nav_move = cmd.move_world;
+
     // Combat overlay: with an enemy in sight, `engage` picks the look (live aim with drifting error)
     // and its own movement; traversal-critical legs are locked out (see `SteerOut::traversal_lock`).
     if let Some(en) = enemy.filter(|_| !traversal_lock) {
         combat::engage(game, e, en, origin, now, &mut cmd);
+    }
+
+    // In water, navigation owns *travel* — combat keeps aiming and firing, but the bot heads for
+    // shore (or dives on to a genuinely wet goal) instead of treading water in a fight. When actively
+    // surfacing with open water overhead, also hold jump to swim up. `engage` clears BUTTON_JUMP, so
+    // this runs after it — and before the grenade overlays, so a grenade flee can still take over.
+    if s.in_water {
+        cmd.move_world = nav_move;
+        if o.surfacing && o.swim_up {
+            cmd.buttons |= BUTTON_JUMP;
+        }
     }
     // Splash-weapon overlays, after `engage`: react to live grenades, finish a lob->shoot combo, take
     // a one-shot rocket hazard shove, else start a grenade combo. Skipped while hooking/rj/bhop-ing or
@@ -1147,18 +1209,49 @@ fn roam_target(game: &mut GameState, e: EntId, origin: Vec3, now: f32) -> Vec3 {
     if wt != Vec3::ZERO && !reached && now < wtime {
         return wt;
     }
-    let r = game.random(); // before borrowing the graph (needs &mut game)
+    // Draw a handful of candidates before the graph borrow (each `random` needs `&mut game`).
+    let draws: [f32; 8] = std::array::from_fn(|_| game.random());
     let Some(g) = game.nav.graph.as_ref() else {
         return origin;
     };
     if g.cells.is_empty() {
         return origin;
     }
-    let idx = ((r * g.cells.len() as f32) as usize).min(g.cells.len() - 1);
+    let pick = |r: f32| ((r * g.cells.len() as f32) as usize).min(g.cells.len() - 1);
+    // Prefer a dry destination — roaming into water just to turn around is the loiter we avoid. Take
+    // the first non-water draw; if every draw lands in water (a mostly-flooded map) keep the last.
+    let idx = draws.iter().map(|&r| pick(r)).find(|&i| !g.cell_in_water(i as u32)).unwrap_or_else(|| pick(draws[7]));
     let cell = g.cell_origin(idx as u32);
     game.entities[e].bot.wander.target = cell; // disjoint field from game.nav — coexists with `g`
     game.entities[e].bot.wander.time = now + 5.0;
     cell
+}
+
+/// The nearest cell to `bot_cell` (by travel cost) where a bot can breathe — the anti-drown target.
+/// Floods link costs once and takes the cheapest breathable cell (its own cell, at cost 0, when that
+/// already breaks the surface). `None` if every reachable cell is underwater (a sealed flooded
+/// pocket), leaving the caller to just swim up toward any open surface.
+fn nearest_air(graph: &NavGraph, bot_cell: CellId, costs: &LinkCosts) -> Option<CellId> {
+    let flood = graph.costs_from(bot_cell, costs);
+    flood
+        .iter()
+        .enumerate()
+        .filter(|&(c, &d)| d.is_finite() && graph.cell_breathable(c as CellId))
+        .min_by(|&(_, &a), &(_, &b)| a.total_cmp(&b))
+        .map(|(c, _)| c as CellId)
+}
+
+/// The origin of the nearest breathing spot for a drowning bot, cached in `cache` for
+/// [`SURFACE_CACHE_TTL`] so the graph flood ([`nearest_air`]) doesn't run every frame while it swims
+/// out. `None` if no breathable cell is reachable.
+fn surface_target(cache: &mut Wander, graph: &NavGraph, bot_cell: CellId, costs: &LinkCosts, now: f32) -> Option<Vec3> {
+    if cache.target != Vec3::ZERO && now < cache.time {
+        return Some(cache.target);
+    }
+    let picked = nearest_air(graph, bot_cell, costs).map(|c| graph.cell_origin(c));
+    cache.target = picked.unwrap_or(Vec3::ZERO);
+    cache.time = now + SURFACE_CACHE_TTL;
+    picked
 }
 
 /// The nearest living human player to bot `bot_e` (skips bots, spectators, and the dead).

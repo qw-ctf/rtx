@@ -175,6 +175,9 @@ impl GameState {
             let is_solid = |p: Vec3| bsp.is_solid(p);
             let contents = |p: Vec3| host.pointcontents(p);
             graph.surcharge_hazard_links(&is_solid, &contents);
+            // Same reason (needs the render-hull `pointcontents`): flag underwater cells and price
+            // swimming above walking, so bots cross water but never loiter in it.
+            graph.surcharge_water_links(&contents);
         }
         let counts = graph.summary();
         let goals = self.collect_goals(&graph);

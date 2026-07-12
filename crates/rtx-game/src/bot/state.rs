@@ -51,6 +51,10 @@ pub struct BotState {
     pub percept: Perception,
     /// Audience-wander state (a round mode's stands). See [`Wander`].
     pub wander: Wander,
+    /// Anti-drown surface target: the air spot the nearest-breathable flood picked, with a short TTL
+    /// (`time`) so a drowning bot doesn't re-run the graph Dijkstra every frame. `target == ZERO`
+    /// (or an expired `time`) means "recompute". Reuses the [`Wander`] `{target, time}` shape.
+    pub surface: Wander,
     /// Audience watch (Rocket Arena): the fighter this bot's eyes are held on. See [`Watch`].
     pub watch: Watch,
     /// Item vigil ([`crate::bot::vigil`]): cruise-and-scan while waiting on an uncollectable goal

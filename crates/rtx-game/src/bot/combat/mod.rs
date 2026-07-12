@@ -175,8 +175,12 @@ impl Loadout {
 
 /// Pick a weapon for `dist`, given what the bot owns and has ammo for. `gl_air`/`gl_ground` are set
 /// by [`engage`] once it has a *validated* grenade-arc solution (an airborne intercept, or a
-/// grounded lead-lob) — when either holds, the grenade launcher wins.
-fn choose_weapon(inv: Loadout, dist: f32, gl_air: bool, gl_ground: bool) -> WeaponChoice {
+/// grounded lead-lob) — when either holds, the grenade launcher wins. `underwater` (own `waterlevel
+/// > 1`, the discharge condition in `w_fire_lightning`) bars the lightning gun: firing it submerged
+/// dumps all cells as a self-lethal discharge. The server's auto-pick guard (`w_best_weapon`) can't
+/// help — the bot forces its weapon by impulse, which bypasses it — so the ban lives here (and, as a
+/// belt-and-suspenders fire gate, in [`engage`]).
+fn choose_weapon(inv: Loadout, dist: f32, gl_air: bool, gl_ground: bool, underwater: bool) -> WeaponChoice {
     // A solved airborne grenade intercept takes precedence: it's the shot we came here to take.
     if gl_air {
         return WeaponChoice::grenade();
@@ -190,8 +194,8 @@ fn choose_weapon(inv: Loadout, dist: f32, gl_air: bool, gl_ground: bool) -> Weap
             return WeaponChoice::of(Weapon::Shotgun);
         }
     }
-    // Mid range: the lightning gun (fast, high DPS) when fed.
-    if dist < PREFERRED_RANGE + 150.0 && inv.fed(Weapon::Lightning) {
+    // Mid range: the lightning gun (fast, high DPS) when fed — never submerged (it would discharge).
+    if dist < PREFERRED_RANGE + 150.0 && inv.fed(Weapon::Lightning) && !underwater {
         return WeaponChoice::of(Weapon::Lightning);
     }
     // Default: the rocket launcher (projectile, lead the target).
@@ -210,22 +214,96 @@ fn choose_weapon(inv: Loadout, dist: f32, gl_air: bool, gl_ground: bool) -> Weap
     // restricted to a nailgun via `rtx_weapons` still fights with it. The axe is the hard fallback.
     Loadout::DIRECT_GUNS
         .into_iter()
+        .filter(|&w| !(underwater && w == Weapon::Lightning)) // an LG-only bot discharges otherwise
         .find(|&w| inv.fed(w))
         .map_or_else(|| WeaponChoice::of(Weapon::Axe), WeaponChoice::of)
+}
+
+/// One player caught inside a would-be discharge blast, as the bot's belief sees them: distance from
+/// the blast centre, estimated effective HP, and whether they're believed to hold quad.
+struct DischargeVictim {
+    dist: f32,
+    strength: f32,
+    quad: bool,
+}
+
+/// Whether dumping `cells` as an underwater discharge is a worthwhile sacrifice. The blast deals
+/// `35·cells` at the centre with `−0.5/unit` falloff (`combat.rs::t_radius_damage`), and the firer
+/// eats `17.5·cells` (halved, but never excluded from its own blast) — so it's usually self-lethal,
+/// justified only when it kills a believed **quad** carrier or **≥2** enemies at once. A plain 1v1
+/// never qualifies. A victim counts as killed when the blast damage at their range meets their
+/// estimated strength.
+fn discharge_worth_it(cells: f32, victims: &[DischargeVictim]) -> bool {
+    let kills = |v: &DischargeVictim| 35.0 * cells - 0.5 * v.dist >= v.strength;
+    let quad_kill = victims.iter().any(|v| kills(v) && v.quad);
+    let multi_kill = victims.iter().filter(|&v| kills(v)).count() >= 2;
+    quad_kill || multi_kill
+}
+
+/// The players a discharge from `e` (dumping its cells at `origin`) would catch: living non-teammate
+/// clients inside the blast radius with a clear line to the centre, each tagged with the bot's belief
+/// about their strength and quad. Empty when `rtx_bot_model` is off (`opponent_est` returns `None`),
+/// so a modeling-disabled bot can never talk itself into a discharge — it just never fires the LG
+/// underwater.
+fn discharge_victims(game: &mut GameState, e: EntId, origin: Vec3, now: f32) -> Vec<DischargeVictim> {
+    let cells = game.entities[e].v.ammo_cells;
+    let radius = 35.0 * cells + 40.0; // t_radius_damage blast radius (damage + 40)
+    let my_team = game.entities[e].mode_p.team;
+    let maxclients = game.host().cvar(c"maxclients") as i32;
+    let mut victims = Vec::new();
+    for p in (1..=maxclients as u32).map(EntId) {
+        if p == e {
+            continue;
+        }
+        let (ok, center) = {
+            let ent = &game.entities[p];
+            let teammate = my_team != 0 && ent.mode_p.team == my_team;
+            let ok = ent.in_use && ent.is_player() && ent.v.health > 0.0 && !teammate;
+            (ok, ent.v.origin + (ent.v.mins + ent.v.maxs) * 0.5)
+        };
+        if !ok || (center - origin).length() > radius {
+            continue;
+        }
+        // A wall between the firer and the victim stops radius damage (t_radius_damage's can_damage).
+        let tr = game.traceline(origin, center, false, e);
+        if tr.ent != p && tr.fraction <= 0.95 {
+            continue;
+        }
+        let Some(est) = game.opponent_est(e, p, now) else {
+            continue; // modeling off / no pool → no belief → don't count them
+        };
+        victims.push(DischargeVictim {
+            dist: (center - origin).length(),
+            strength: crate::bot::model::est_strength(&est, now),
+            quad: est.quad_until > now,
+        });
+    }
+    victims
 }
 
 /// How long after losing sight of the enemy the bot keeps *holding the angle* where they vanished
 /// (like a player holding a corner) before its eyes fall back to the navigation view.
 const HOLD_ANGLE_TIME: f32 = 2.0;
 
-/// Choose the safest combat move near a hazard. Candidates are tried in priority order — the wanted
-/// move, the wanted move with the strafe flipped, each strafe alone, then the forward/backpedal
-/// component alone — and the first that doesn't step toward lava/slime/a pit wins; if every option is
-/// unsafe the bot holds ground rather than walking off. `unsafe_dir` reports whether a horizontal
-/// move heads into a hazard. Backpedal is dropped before the strafe, so a bot pinned at a lava edge
-/// sidesteps rather than backing in. Pure over the oracle, so the priority order is unit-testable.
+/// How a candidate move's footing rates for a fighting bot: dry ground (best), swimmable water (slow
+/// and exposed — accept only if nothing dry works), or a lethal hazard (lava/slime/a pit — never step
+/// there). Ordered best-to-worst.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Footing {
+    Dry,
+    Wet,
+    Hazard,
+}
+
+/// Choose the best combat move near a hazard or water. Candidates are tried in priority order — the
+/// wanted move, the wanted move with the strafe flipped, each strafe alone, then the forward/backpedal
+/// component alone. Two passes: a candidate that lands on dry ground wins outright; failing that, the
+/// first that isn't a lethal hazard (wading shallow water beats freezing at a lava edge); if every
+/// option is a hazard the bot holds ground rather than walking off. Backpedal is dropped before the
+/// strafe, so a bot pinned at a lava edge sidesteps rather than backing in. `footing` classifies where
+/// a horizontal move lands. Pure over the oracle, so the priority order is unit-testable.
 fn safe_combat_move(
-    unsafe_dir: &impl Fn(Vec3) -> bool,
+    footing: &impl Fn(Vec3) -> Footing,
     dir: Vec3,
     perp: Vec3,
     want_forward: f32,
@@ -233,12 +311,11 @@ fn safe_combat_move(
 ) -> Vec3 {
     let fwd = dir * want_forward;
     let strafe = perp * (strafe_sign * MOVE_SPEED);
-    for mv in [fwd + strafe, fwd - strafe, strafe, -strafe, fwd] {
-        if !unsafe_dir(mv) {
-            return mv;
-        }
+    let candidates = [fwd + strafe, fwd - strafe, strafe, -strafe, fwd];
+    if let Some(&mv) = candidates.iter().find(|&&mv| footing(mv) == Footing::Dry) {
+        return mv; // dry footing preferred — bias the dodge toward the bank
     }
-    Vec3::ZERO
+    candidates.into_iter().find(|&mv| footing(mv) != Footing::Hazard).unwrap_or(Vec3::ZERO)
 }
 
 /// A fleeing bot's move away from a threat at heading `away` (a horizontal unit vector), kept off
@@ -255,18 +332,31 @@ fn safe_flee_move(game: &GameState, e: EntId, origin: Vec3, away: Vec3) -> (Vec3
     let is_solid = |p: Vec3| bsp.is_solid(p);
     let contents = |p: Vec3| host.pointcontents(p);
     let feet = origin - Vec3::new(0.0, 0.0, 24.0);
-    let hazardous = |d: Vec3| {
+    let footing = |d: Vec3| {
         let n = Vec3::new(d.x, d.y, 0.0).normalize_or_zero();
-        n != Vec3::ZERO && crate::hazard::hazard_ahead(&is_solid, &contents, feet, n).is_some()
+        if n == Vec3::ZERO {
+            Footing::Dry
+        } else if crate::hazard::hazard_ahead(&is_solid, &contents, feet, n).is_some() {
+            Footing::Hazard
+        } else if crate::hazard::water_ahead(&is_solid, &contents, feet, n) {
+            Footing::Wet
+        } else {
+            Footing::Dry
+        }
     };
-    if !hazardous(away) {
+    // Straight away is the best escape vector — take it unless it's a lethal hazard, even through
+    // water (fleeing a blast beats staying dry). Only when away is blocked do we sidestep, and there
+    // prefer a dry perpendicular over a wet one.
+    if footing(away) != Footing::Hazard {
         return (away * MOVE_SPEED, grounded);
     }
     let perp = Vec3::new(-away.y, away.x, 0.0);
-    for cand in [perp, -perp] {
-        if !hazardous(cand) {
-            return (cand * MOVE_SPEED, grounded);
-        }
+    let sides = [perp, -perp];
+    if let Some(&d) = sides.iter().find(|&&d| footing(d) == Footing::Dry) {
+        return (d * MOVE_SPEED, grounded);
+    }
+    if let Some(&d) = sides.iter().find(|&&d| footing(d) != Footing::Hazard) {
+        return (d * MOVE_SPEED, grounded);
     }
     (Vec3::ZERO, false) // hazards on every side — hold, don't hop off the edge
 }
@@ -542,11 +632,19 @@ fn combat_move(game: &mut GameState, e: EntId, enemy: EntId, now: f32, origin: V
             let is_solid = |p: Vec3| bsp.is_solid(p);
             let contents = |p: Vec3| host.pointcontents(p);
             let feet = origin - Vec3::new(0.0, 0.0, 24.0);
-            let unsafe_dir = |mv: Vec3| {
+            let footing = |mv: Vec3| {
                 let d = Vec3::new(mv.x, mv.y, 0.0).normalize_or_zero();
-                d != Vec3::ZERO && crate::hazard::hazard_ahead(&is_solid, &contents, feet, d).is_some()
+                if d == Vec3::ZERO {
+                    Footing::Dry
+                } else if crate::hazard::hazard_ahead(&is_solid, &contents, feet, d).is_some() {
+                    Footing::Hazard
+                } else if crate::hazard::water_ahead(&is_solid, &contents, feet, d) {
+                    Footing::Wet // slow and exposed — dodge to dry ground when we can, wade only if forced
+                } else {
+                    Footing::Dry
+                }
             };
-            safe_combat_move(&unsafe_dir, dir, perp, want_forward, strafe_sign)
+            safe_combat_move(&footing, dir, perp, want_forward, strafe_sign)
         }
         _ => dir * want_forward + perp * (strafe_sign * MOVE_SPEED),
     }
@@ -665,11 +763,24 @@ pub(crate) fn engage(
     // Geometry-aware projectile planning, all inside one immutable BSP borrow, handed back as data.
     let plan = plan_ballistics(game, origin, &tgt, gravity, inv, idle, combos_on);
 
+    // Underwater the lightning gun discharges — dumping every cell as a self-lethal radius blast
+    // (`w_fire_lightning`, at `waterlevel > 1`). A bot only does that on purpose when it trades for a
+    // believed quad carrier or ≥2 enemies (`discharge_worth_it`); otherwise the pick steers clear of
+    // the LG entirely, and the fire gate below refuses to shoot one still in hand.
+    let underwater = game.entities[e].v.waterlevel > 1.0;
+    let discharge = underwater
+        && inv.fed(Weapon::Lightning)
+        && discharge_worth_it(inv.cells, &discharge_victims(game, e, origin, now));
+
     // Weapon for the range. The grenade choice is keyed solely on inventory (a validated arc, RL
     // unavailable) — not a clock or geometry threshold — so it can't flip mid-jump and re-slew the
     // aim off the shot; RL/GL share ammo, so the only transition is the pool running dry, grounding
     // both at once. Midair's RL-only loadout never reaches the grenade path.
-    let choice = choose_weapon(inv, dist, plan.air_gl.is_some(), plan.gl_ground.is_some());
+    let choice = if discharge {
+        WeaponChoice::of(Weapon::Lightning)
+    } else {
+        choose_weapon(inv, dist, plan.air_gl.is_some(), plan.gl_ground.is_some(), underwater)
+    };
     // Switch weapon only when we don't already hold the desired one (setting `impulse` re-runs
     // W_ChangeWeapon each frame otherwise).
     if game.entities[e].v.weapon != choice.weapon {
@@ -693,7 +804,19 @@ pub(crate) fn engage(
     cmd.buttons &= !BUTTON_JUMP; // don't bunny-hop while dueling
 
     let shot = Shot { choice, aim, clean, muzzle_base, gate_direct };
-    if fire_gate(game, e, enemy, origin, skill, &shot) {
+    let holding_lg = game.entities[e].v.weapon == Weapon::Lightning;
+    let fire = if discharge {
+        // Deliberate discharge: radius damage needs no aim, but wait until the LG is actually in hand
+        // so the still-held weapon doesn't loose first (the switch takes a frame).
+        holding_lg
+    } else if underwater && holding_lg {
+        // Still holding the LG underwater with no worthwhile discharge (a mid-fight dive, or the
+        // switch to another gun hasn't landed yet): never pull the trigger — it would discharge.
+        false
+    } else {
+        fire_gate(game, e, enemy, origin, skill, &shot)
+    };
+    if fire {
         // The engine paces shots via `attack_finished`; holding fire shoots at the weapon's rate.
         cmd.buttons |= BUTTON_ATTACK;
     }
@@ -725,9 +848,11 @@ pub(crate) fn blast_self_damage(dist: f32) -> f32 {
 
 /// The best hitscan weapon the bot owns and can feed, for detonating a grenade precisely: the
 /// lightning beam first (a continuous line, most reliable on the 8u hit radius), then the shotguns.
+/// Underwater the beam is skipped — firing it there is a discharge, not a detonation — so the bot
+/// falls to a shotgun (or, with only the LG, doesn't shoot the grenade down).
 pub(crate) fn hitscan_choice(g: &GameState, e: EntId) -> Option<(i32, Weapon)> {
     let v = &g.entities[e].v;
-    if v.items.has(Items::LIGHTNING) && v.ammo_cells >= 1.0 {
+    if v.items.has(Items::LIGHTNING) && v.ammo_cells >= 1.0 && v.waterlevel <= 1.0 {
         Some((8, Weapon::Lightning))
     } else if v.items.has(Items::SUPER_SHOTGUN) && v.ammo_shells >= 2.0 {
         Some((3, Weapon::SuperShotgun))
@@ -901,35 +1026,53 @@ mod tests {
 
     #[test]
     fn safe_combat_move_passes_through_when_clear() {
-        // Nothing unsafe → the exact original composition (dir·forward + perp·strafe·speed).
-        let never = |_: Vec3| false;
-        let mv = safe_combat_move(&never, DIR, PERP, MOVE_SPEED, 1.0);
+        // All dry → the exact original composition (dir·forward + perp·strafe·speed).
+        let dry = |_: Vec3| Footing::Dry;
+        let mv = safe_combat_move(&dry, DIR, PERP, MOVE_SPEED, 1.0);
         assert_eq!(mv, DIR * MOVE_SPEED + PERP * MOVE_SPEED);
     }
 
     #[test]
     fn safe_combat_move_prefers_flip() {
-        // Holding range (no forward), strafing +y is unsafe → flip to −y, same speed.
-        let unsafe_plus_y = |mv: Vec3| mv.y > 0.0;
-        let mv = safe_combat_move(&unsafe_plus_y, DIR, PERP, 0.0, 1.0);
+        // Holding range (no forward), strafing +y is a hazard → flip to −y, same speed.
+        let hazard_plus_y = |mv: Vec3| if mv.y > 0.0 { Footing::Hazard } else { Footing::Dry };
+        let mv = safe_combat_move(&hazard_plus_y, DIR, PERP, 0.0, 1.0);
         assert_eq!(mv, PERP * -MOVE_SPEED);
     }
 
     #[test]
     fn safe_combat_move_drops_backpedal_before_strafe() {
-        // Retreating (−x) is unsafe but the strafe is fine → take the strafe alone, no backpedal.
-        let unsafe_back = |mv: Vec3| mv.x < 0.0;
-        let mv = safe_combat_move(&unsafe_back, DIR, PERP, -MOVE_SPEED, 1.0);
+        // Retreating (−x) is a hazard but the strafe is fine → take the strafe alone, no backpedal.
+        let hazard_back = |mv: Vec3| if mv.x < 0.0 { Footing::Hazard } else { Footing::Dry };
+        let mv = safe_combat_move(&hazard_back, DIR, PERP, -MOVE_SPEED, 1.0);
         assert_eq!(mv, PERP * MOVE_SPEED); // strafe only, no −x component
         assert_eq!(mv.x, 0.0);
     }
 
     #[test]
     fn safe_combat_move_holds_ground_when_surrounded() {
-        // Every candidate steps toward a hazard → hold ground rather than walk into it.
-        let all_unsafe = |mv: Vec3| mv != Vec3::ZERO;
-        let mv = safe_combat_move(&all_unsafe, DIR, PERP, -MOVE_SPEED, 1.0);
+        // Every real move steps toward a hazard → hold ground rather than walk into it.
+        let all_hazard = |mv: Vec3| if mv == Vec3::ZERO { Footing::Dry } else { Footing::Hazard };
+        let mv = safe_combat_move(&all_hazard, DIR, PERP, -MOVE_SPEED, 1.0);
         assert_eq!(mv, Vec3::ZERO);
+    }
+
+    #[test]
+    fn safe_combat_move_prefers_dry_over_wet() {
+        // Holding range: strafing +y is into water, −y is dry → pick the dry side even though the
+        // wet one is a valid (non-hazard) move and comes first in the candidate order.
+        let wet_plus_y = |mv: Vec3| if mv.y > 0.0 { Footing::Wet } else { Footing::Dry };
+        let mv = safe_combat_move(&wet_plus_y, DIR, PERP, 0.0, 1.0);
+        assert_eq!(mv, PERP * -MOVE_SPEED);
+    }
+
+    #[test]
+    fn safe_combat_move_wades_when_no_dry_option() {
+        // Every real move heads into water (none dry, none a hazard) → still move: take the first
+        // wet candidate rather than freezing (wading out beats treading water).
+        let all_wet = |mv: Vec3| if mv == Vec3::ZERO { Footing::Dry } else { Footing::Wet };
+        let mv = safe_combat_move(&all_wet, DIR, PERP, MOVE_SPEED, 1.0);
+        assert_eq!(mv, DIR * MOVE_SPEED + PERP * MOVE_SPEED); // the first candidate, fwd+strafe
     }
 
     // Line-of-fire verdict: bot at the origin, aim 400u downrange along +x unless noted.
@@ -1111,14 +1254,14 @@ mod tests {
     #[test]
     fn choose_weapon_falls_back_to_nailguns() {
         // A bot restricted to a nailgun (via rtx_weapons) must fire it, not the axe. Super first.
-        let sng = choose_weapon(armed(Items::SUPER_NAILGUN), 400.0, false, false);
+        let sng = choose_weapon(armed(Items::SUPER_NAILGUN), 400.0, false, false, false);
         assert_eq!(sng.weapon, Weapon::SuperNailgun);
         assert_eq!(sng.projectile_speed, NAIL_SPEED);
-        let ng = choose_weapon(armed(Items::NAILGUN), 400.0, false, false);
+        let ng = choose_weapon(armed(Items::NAILGUN), 400.0, false, false, false);
         assert_eq!(ng.weapon, Weapon::Nailgun);
         // Out of nails → nothing else to fire → the axe.
         let dry = Loadout { nails: 0.0, ..armed(Items::SUPER_NAILGUN | Items::NAILGUN) };
-        assert_eq!(choose_weapon(dry, 400.0, false, false).weapon, Weapon::Axe);
+        assert_eq!(choose_weapon(dry, 400.0, false, false, false).weapon, Weapon::Axe);
     }
 
     #[test]
@@ -1126,19 +1269,47 @@ mod tests {
         // A GL-only bot only fires the GL when engage supplies an arc (gl_ground/gl_air); with no
         // solution there's nothing else to fire, so it holds the axe (never lobs blindly).
         let gl = armed(Items::GRENADE_LAUNCHER);
-        assert_eq!(choose_weapon(gl, 400.0, false, false).weapon, Weapon::Axe);
-        assert_eq!(choose_weapon(gl, 400.0, false, true).weapon, Weapon::GrenadeLauncher);
-        assert_eq!(choose_weapon(gl, 400.0, true, false).weapon, Weapon::GrenadeLauncher);
+        assert_eq!(choose_weapon(gl, 400.0, false, false, false).weapon, Weapon::Axe);
+        assert_eq!(choose_weapon(gl, 400.0, false, true, false).weapon, Weapon::GrenadeLauncher);
+        assert_eq!(choose_weapon(gl, 400.0, true, false, false).weapon, Weapon::GrenadeLauncher);
     }
 
     #[test]
     fn choose_weapon_full_arsenal_unchanged() {
-        // Regression guard: with everything, the range order is still SSG (point-blank <140) / LG
-        // (mid <550) / RL (beyond) — the nailgun fallbacks never pre-empt it.
+        // Regression guard: with everything (and dry), the range order is still SSG (point-blank
+        // <140) / LG (mid <550) / RL (beyond) — the nailgun fallbacks never pre-empt it.
         let all = armed(Items::all());
-        assert_eq!(choose_weapon(all, 100.0, false, false).weapon, Weapon::SuperShotgun);
-        assert_eq!(choose_weapon(all, 400.0, false, false).weapon, Weapon::Lightning);
-        assert_eq!(choose_weapon(all, 600.0, false, false).weapon, Weapon::RocketLauncher);
+        assert_eq!(choose_weapon(all, 100.0, false, false, false).weapon, Weapon::SuperShotgun);
+        assert_eq!(choose_weapon(all, 400.0, false, false, false).weapon, Weapon::Lightning);
+        assert_eq!(choose_weapon(all, 600.0, false, false, false).weapon, Weapon::RocketLauncher);
+    }
+
+    #[test]
+    fn choose_weapon_never_lg_underwater() {
+        // Underwater the lightning gun is barred (it would discharge). With a full arsenal the
+        // mid-range pick falls through to the rocket launcher instead of the LG...
+        let all = armed(Items::all());
+        assert_eq!(choose_weapon(all, 400.0, false, false, true).weapon, Weapon::RocketLauncher);
+        // ...and a bot whose only fed gun is the LG drops to the axe rather than discharging.
+        let lg_only = armed(Items::LIGHTNING);
+        assert_eq!(choose_weapon(lg_only, 400.0, false, false, true).weapon, Weapon::Axe);
+        // Dry, that same LG-only bot fires the LG as usual (regression guard on the gate).
+        assert_eq!(choose_weapon(lg_only, 400.0, false, false, false).weapon, Weapon::Lightning);
+    }
+
+    #[test]
+    fn discharge_worth_it_only_trades_for_quad_or_multi() {
+        let v = |dist: f32, strength: f32, quad: bool| DischargeVictim { dist, strength, quad };
+        // 100 cells → 3500 at the centre, −0.5/unit falloff. A single plain victim is never worth it.
+        assert!(!discharge_worth_it(100.0, &[v(50.0, 100.0, false)]), "1v1 must not discharge");
+        // A believed quad carrier in lethal range → worth the trade.
+        assert!(discharge_worth_it(100.0, &[v(50.0, 100.0, true)]), "quad kill is worth it");
+        // Two plain enemies both in lethal range → a 2-for-1 is worth it.
+        assert!(discharge_worth_it(100.0, &[v(50.0, 100.0, false), v(80.0, 100.0, false)]));
+        // A quad carrier too far to actually kill (blast has fallen below their HP) → not worth it.
+        assert!(!discharge_worth_it(2.0, &[v(200.0, 100.0, true)]), "no kill, no discharge");
+        // Nobody in the blast → never.
+        assert!(!discharge_worth_it(100.0, &[]));
     }
 
     #[test]
