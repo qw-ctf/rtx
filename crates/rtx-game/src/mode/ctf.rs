@@ -468,9 +468,10 @@ impl GameState {
         let dir = self.aim_dir(player);
         let origin = self.entities[player].v.origin + Vec3::new(0.0, 0.0, 16.0);
         let time = self.time();
-        self.entities[player].mode_p.ctf.carrying = 0;
-        self.set_flag_effect(player, team, false);
+        self.clear_carrier(flag);
         {
+            // Like `place_flag`, but keeps the tosser as `carrier` (a "who threw it" reference the
+            // grab logic reads), so this sets the fields itself rather than un-carrying via place_flag.
             let f = &mut self.entities[flag];
             f.flag.phase = FlagPhase::Tossed;
             f.flag.carrier = player; // lock reference (the tosser)
@@ -570,6 +571,32 @@ impl GameState {
             .sound(returner, Channel::Item, Sound::DOORS_RUNETRY, 1.0, Attenuation::Norm);
     }
 
+    /// Clear a flag's carry state (if it has a carrier): drop the carrier's carry bit and its carry
+    /// glow. No-op for a flag already at rest.
+    fn clear_carrier(&mut self, flag: EntId) {
+        let carrier = self.entities[flag].flag.carrier;
+        if carrier != EntId::WORLD {
+            let team = self.entities[flag].flag.team;
+            self.entities[carrier].mode_p.ctf.carrying = 0;
+            self.set_flag_effect(carrier, team, false);
+        }
+    }
+
+    /// Put `flag` down at `pos` in `phase` with launch `velocity`, un-carried: the "touchable Toss
+    /// brush showing the flag model" tail shared by drop and send-home.
+    fn place_flag(&mut self, flag: EntId, phase: FlagPhase, pos: Vec3, velocity: Vec3) {
+        {
+            let f = &mut self.entities[flag];
+            f.flag.phase = phase;
+            f.flag.carrier = EntId::WORLD;
+            f.v.solid = Solid::Trigger;
+            f.v.movetype = MoveType::Toss;
+            f.v.velocity = velocity;
+        }
+        self.host.set_model(flag, Model::PROGS_FLAG);
+        self.host.set_origin(flag, pos);
+    }
+
     /// Drop a carried flag where its carrier is, starting the auto-return countdown.
     fn flag_drop(&mut self, flag: EntId) {
         let carrier = self.entities[flag].flag.carrier;
@@ -579,46 +606,19 @@ impl GameState {
             self.entities[flag].v.origin
         };
         let team = self.entities[flag].flag.team;
-        if carrier != EntId::WORLD {
-            self.entities[carrier].mode_p.ctf.carrying = 0;
-            self.set_flag_effect(carrier, team, false);
-        }
+        self.clear_carrier(flag);
         let time = self.time();
-        let pos = origin - Vec3::new(0.0, 0.0, 24.0);
-        {
-            let f = &mut self.entities[flag];
-            f.flag.phase = FlagPhase::Dropped;
-            f.flag.carrier = EntId::WORLD;
-            f.flag.return_at = time + FLAG_RETURN_TIME;
-            f.v.solid = Solid::Trigger;
-            f.v.movetype = MoveType::Toss;
-            f.v.velocity = Vec3::new(0.0, 0.0, 300.0);
-        }
-        self.host.set_model(flag, Model::PROGS_FLAG);
-        self.host.set_origin(flag, pos);
+        self.place_flag(flag, FlagPhase::Dropped, origin - Vec3::new(0.0, 0.0, 24.0), Vec3::new(0.0, 0.0, 300.0));
+        self.entities[flag].flag.return_at = time + FLAG_RETURN_TIME;
         let (tname, _) = team::team_identity(team);
         self.broadcast(PrintLevel::High, &format!("The {tname} flag was dropped!\n"));
     }
 
     /// Return a flag to its base (from a return, capture, auto-return, or match reset).
     fn flag_send_home(&mut self, flag: EntId) {
-        let carrier = self.entities[flag].flag.carrier;
-        let team = self.entities[flag].flag.team;
-        if carrier != EntId::WORLD {
-            self.entities[carrier].mode_p.ctf.carrying = 0;
-            self.set_flag_effect(carrier, team, false);
-        }
+        self.clear_carrier(flag);
         let home = self.entities[flag].flag.home;
-        {
-            let f = &mut self.entities[flag];
-            f.flag.phase = FlagPhase::Home;
-            f.flag.carrier = EntId::WORLD;
-            f.v.solid = Solid::Trigger;
-            f.v.movetype = MoveType::Toss;
-            f.v.velocity = Vec3::ZERO;
-        }
-        self.host.set_model(flag, Model::PROGS_FLAG);
-        self.host.set_origin(flag, home);
+        self.place_flag(flag, FlagPhase::Home, home, Vec3::ZERO);
     }
 
     /// Send both flags home and clear every carry — used when a match goes live.
