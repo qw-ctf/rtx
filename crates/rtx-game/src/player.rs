@@ -493,15 +493,7 @@ impl GameState {
                 .sound(e, Channel::Voice, Sound::PLAYER_AXHIT1, 1.0, Attenuation::Norm);
             return;
         }
-        let rs = (self.random() * 5.0).round() as i32 + 1;
-        let noise = match rs {
-            1 => Sound::PLAYER_PAIN1,
-            2 => Sound::PLAYER_PAIN2,
-            3 => Sound::PLAYER_PAIN3,
-            4 => Sound::PLAYER_PAIN4,
-            5 => Sound::PLAYER_PAIN5,
-            _ => Sound::PLAYER_PAIN6,
-        };
+        let noise = pain_noise((self.random() * 5.0).round() as i32 + 1);
         self.host.sound(e, Channel::Voice, noise, 1.0, Attenuation::Norm);
     }
 
@@ -513,14 +505,7 @@ impl GameState {
                 .sound(e, Channel::Voice, Sound::PLAYER_H2ODEATH, 1.0, Attenuation::None);
             return;
         }
-        let rs = (self.random() * 4.0).round() as i32 + 1;
-        let noise = match rs {
-            1 => Sound::PLAYER_DEATH1,
-            2 => Sound::PLAYER_DEATH2,
-            3 => Sound::PLAYER_DEATH3,
-            4 => Sound::PLAYER_DEATH4,
-            _ => Sound::PLAYER_DEATH5,
-        };
+        let noise = death_noise((self.random() * 4.0).round() as i32 + 1);
         self.host.sound(e, Channel::Voice, noise, 1.0, Attenuation::None);
     }
 
@@ -707,4 +692,64 @@ impl GameState {
     /// `DeathBubbles` — air bubbles when dying underwater. Cosmetic; the bubble-spawner
     /// chain is omitted for now (the death/drown sounds still play).
     fn death_bubbles(&mut self, _e: EntId, _count: f32) {}
+}
+
+/// The player death vocalization for a `1..=5` roll — id's `DeathSound` table (`player/death1-5`).
+/// Pure so the roll→sound mapping is pinned by test, the way the obituary strings are: clients
+/// select the wav by index, so a silent repermutation must not slip through a refactor.
+fn death_noise(roll: i32) -> Sound {
+    match roll {
+        1 => Sound::PLAYER_DEATH1,
+        2 => Sound::PLAYER_DEATH2,
+        3 => Sound::PLAYER_DEATH3,
+        4 => Sound::PLAYER_DEATH4,
+        _ => Sound::PLAYER_DEATH5,
+    }
+}
+
+/// The player pain vocalization for a `1..=6` roll — id's `PainSound` table (`player/pain1-6`).
+/// Pure for the same reason as [`death_noise`].
+fn pain_noise(roll: i32) -> Sound {
+    match roll {
+        1 => Sound::PLAYER_PAIN1,
+        2 => Sound::PLAYER_PAIN2,
+        3 => Sound::PLAYER_PAIN3,
+        4 => Sound::PLAYER_PAIN4,
+        5 => Sound::PLAYER_PAIN5,
+        _ => Sound::PLAYER_PAIN6,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{death_noise, pain_noise};
+    use crate::assets::Sound;
+
+    // `Sound` is an opaque precache handle (no PartialEq) — compare on its wire path.
+    fn same(a: Sound, b: Sound) -> bool {
+        a.path() == b.path()
+    }
+
+    // The live rolls are `(random()*4).round()+1` -> 1..=5 and `(random()*5).round()+1` -> 1..=6;
+    // pin the whole table (including the out-of-range guards) so the wav indices never drift.
+    #[test]
+    fn death_noise_table_is_stock() {
+        assert!(same(death_noise(1), Sound::PLAYER_DEATH1));
+        assert!(same(death_noise(2), Sound::PLAYER_DEATH2));
+        assert!(same(death_noise(3), Sound::PLAYER_DEATH3));
+        assert!(same(death_noise(4), Sound::PLAYER_DEATH4));
+        assert!(same(death_noise(5), Sound::PLAYER_DEATH5));
+        assert!(same(death_noise(0), Sound::PLAYER_DEATH5));
+    }
+
+    #[test]
+    fn pain_noise_table_is_stock() {
+        assert!(same(pain_noise(1), Sound::PLAYER_PAIN1));
+        assert!(same(pain_noise(2), Sound::PLAYER_PAIN2));
+        assert!(same(pain_noise(3), Sound::PLAYER_PAIN3));
+        assert!(same(pain_noise(4), Sound::PLAYER_PAIN4));
+        assert!(same(pain_noise(5), Sound::PLAYER_PAIN5));
+        assert!(same(pain_noise(6), Sound::PLAYER_PAIN6));
+        assert!(same(pain_noise(0), Sound::PLAYER_PAIN6));
+    }
 }
