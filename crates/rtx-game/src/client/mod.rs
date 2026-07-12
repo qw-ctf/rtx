@@ -206,6 +206,16 @@ impl GameState {
 
     /// `PutClientInServer` — set up (or respawn) the player entity at a spawn point.
     pub(crate) fn put_client_in_server(&mut self, player: EntId) {
+        self.configure_fresh_player_body(player);
+        // Granting the loadout is also where bench-vs-active is decided; the spawn placement reuses
+        // that verdict (benched spectators go to the stands, not the mode's spawn logic).
+        let benched = self.grant_spawn_loadout(player);
+        self.place_at_spawn(player, benched);
+    }
+
+    /// Reset `player`'s edict to a fresh, living body: solid slidebox, walk movetype, full health,
+    /// the client flag, a wiped per-life `CombatState`, and the player think/pain/die callbacks.
+    fn configure_fresh_player_body(&mut self, player: EntId) {
         let time = self.globals.time;
         // The move-speed cap the engine seeds each client's pmove clamp from (via the declared
         // `maxspeed` field). Standard `sv_maxspeed` is 320; fall back to it if the cvar reads as
@@ -218,30 +228,35 @@ impl GameState {
                 320.0
             }
         };
-        {
-            let ent = &mut self.entities[player];
-            ent.in_use = true;
-            ent.maxspeed = maxspeed;
-            ent.classname = Some("player".into());
-            ent.v.health = 100.0;
-            ent.v.takedamage = TakeDamage::Aim;
-            ent.v.solid = Solid::SlideBox;
-            ent.v.movetype = MoveType::Walk;
-            ent.v.max_health = 100.0;
-            ent.v.flags = Flags::CLIENT.as_f32();
-            ent.v.effects = 0.0;
-            ent.v.deadflag = DeadFlag::No;
-            // Respawn: a fresh player, so wipe all per-life combat state (powerup timers, pain
-            // and attack cooldowns, the air-jump latch, …) and set only the two time-based timers.
-            ent.combat = CombatState::default();
-            ent.combat.air_finished = time + 12.0;
-            ent.combat.attack_finished = time;
-            ent.mover.dmg = 2.0; // initial water damage
-            ent.mover.pausetime = 0.0;
-            ent.th_pain = Pain::Player;
-            ent.th_die = Die::Player;
-        }
+        let ent = &mut self.entities[player];
+        ent.in_use = true;
+        ent.maxspeed = maxspeed;
+        ent.classname = Some("player".into());
+        ent.v.health = 100.0;
+        ent.v.takedamage = TakeDamage::Aim;
+        ent.v.solid = Solid::SlideBox;
+        ent.v.movetype = MoveType::Walk;
+        ent.v.max_health = 100.0;
+        ent.v.flags = Flags::CLIENT.as_f32();
+        ent.v.effects = 0.0;
+        ent.v.deadflag = DeadFlag::No;
+        // Respawn: a fresh player, so wipe all per-life combat state (powerup timers, pain
+        // and attack cooldowns, the air-jump latch, …) and set only the two time-based timers.
+        ent.combat = CombatState::default();
+        ent.combat.air_finished = time + 12.0;
+        ent.combat.attack_finished = time;
+        ent.mover.dmg = 2.0; // initial water damage
+        ent.mover.pausetime = 0.0;
+        ent.th_pain = Pain::Player;
+        ent.th_die = Die::Player;
+    }
 
+    /// Grant `player` their spawn kit and return whether they were benched. Decoded level parms,
+    /// then the optional grapple grant, then either the audience loadout (a benched late joiner:
+    /// axe only, damage refused) or team assignment plus the mode's kit. Disabled weapons are
+    /// stripped from whatever was granted, current ammo is set, and every side's opponent-model
+    /// hypothesis of this player resets to the spawn baseline.
+    fn grant_spawn_loadout(&mut self, player: EntId) -> bool {
         self.decode_level_parms(player);
         // The grappling hook is handed out at spawn (also selectable via impulse 22 or a double-tap
         // of impulse 1), gated by a cvar like the other rtx movement features. It carries no ammo,
@@ -275,7 +290,17 @@ impl GameState {
         // of this player to the mode's spawn-kit baseline. Covers connect and mode kit re-grants
         // without relying on the death path. No-op when modeling is off.
         self.model_reset_target(player);
+        benched
+    }
 
+    /// Choose `player`'s spawn point (mode-driven; benched spectators use plain DM spawns), nudge
+    /// the origin off any other live player, snap the view there, then relink via `set_origin` (a
+    /// raw origin write doesn't fix the engine's internal links). Finishes by telefragging anyone
+    /// already standing there, starting the idle animation, and telling a benched human why they're
+    /// a spectator.
+    fn place_at_spawn(&mut self, player: EntId, benched: bool) {
+        let time = self.globals.time;
+        let mode = self.mode;
         // The mode chooses the spawn point (arena vs. audience in Rocket Arena; a plain DM spawn
         // otherwise). Benched spectators go to the stands (plain DM spawns), not the mode's logic.
         let spot = if benched {
