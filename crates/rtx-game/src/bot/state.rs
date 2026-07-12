@@ -158,7 +158,8 @@ pub struct Perception {
 /// current view, seeded from `v_angle`) toward the frame's look target at `vel` (deg/s), so a
 /// spectated bot turns like a mouse-controlled human — fast proportional flicks, smooth settle, no
 /// per-frame snapping (stiffness scales with skill). `err*` is the drifting aim error; `look_prev*`
-/// and `bhop_prev_yaw` seed the feed-forward and the bhop→combat hand-off.
+/// seeds the feed-forward. The bhop air-strafe runs through this same spring (its wish is carried in
+/// forward/side, decoupled from the view), so it needs no separate bypass state.
 #[derive(Default)]
 pub struct Aim {
     /// Current smoothed view angles (deg), seeded from `v_angle` on first use.
@@ -176,8 +177,6 @@ pub struct Aim {
     /// against a strafing target.
     pub look_prev: Vec3,
     pub look_prev_time: f32,
-    /// Last frame's sent bhop view yaw, to seed the spring's angular velocity when combat resumes.
-    pub bhop_prev_yaw: f32,
 }
 
 /// Audience-wander state: where a spectating bot is strolling in a round mode's stands, and the next

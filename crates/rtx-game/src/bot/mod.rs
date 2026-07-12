@@ -637,28 +637,21 @@ fn emit(
     let Sense { host, now, frametime, v_angle, client, msec, speed, .. } = s;
     let BotCmd { look, move_world, mut buttons, impulse } = cmd;
 
-    // View + move for the frame. Bunnyhopping bypasses the aim spring and the world-move reprojection
-    // entirely — an air-strafe needs the view yaw swept *independently* of the travel direction, with
-    // `forward = 0` and one strafe key held, which the reprojection can't express. The controller
-    // already decided the whole cmd (air strafe, landing strafe+jump, or ground prestrafe); consume
-    // it here. Otherwise the normal aim spring smooths the view and the world move is projected onto it.
-    let (view, forward, side) = if let Some(c) = bhop_cmd {
-        let dt = frametime.clamp(0.001, 0.05);
-        let view = Vec3::new(look.x, c.view_yaw, 0.0);
-        // Seed the aim spring so combat re-acquisition continues from the real view with a plausible
-        // turn rate (a human-like flick) instead of snapping.
-        let b = &mut game.entities[e].bot;
-        let yv = if b.aim.bhop_prev_yaw == 0.0 {
-            0.0
-        } else {
-            (wrap180(view.y - b.aim.bhop_prev_yaw) / dt).clamp(-720.0, 720.0)
-        };
-        b.aim.bhop_prev_yaw = view.y;
-        b.aim.angles = view;
-        b.aim.vel = Vec3::new(0.0, yv, 0.0);
-        (view, c.forward.round() as i32, c.side.round() as i32)
-    } else {
-        game.entities[e].bot.aim.bhop_prev_yaw = 0.0; // forget the bhop yaw so the next engage seeds clean
+    // View + move for the frame. When the bhop controller is driving, translate its usercmd into a
+    // world-space wish and a swept view target (yaw = the velocity heading it chose) so it can go
+    // through the *same* aim spring as everything else. The air-strafe wish now lives in
+    // `forward`/`side` decoupled from the view (see `bhop::strafe_rate`), so smoothing the eyes no
+    // longer corrupts the movement — the reprojection below reproduces the world wish onto whatever
+    // view the spring settles on. This keeps the view a smooth spring-lagged sweep instead of a raw
+    // per-frame yaw that kinks at each strafe flip and bobs in pitch every hop.
+    let (look, move_world) = match bhop_cmd {
+        Some(c) => {
+            let w = bhop::wishdir_fs(c.view_yaw, c.forward, c.side);
+            (Vec3::new(look.x, c.view_yaw, 0.0), Vec3::new(w.x, w.y, 0.0) * crate::defs::BOT_MOVE_SPEED)
+        }
+        None => (look, move_world),
+    };
+    let (view, forward, side) = {
         let dt = frametime.clamp(0.001, 0.05);
         let skill = host.cvar(c"rtx_bot_skill").clamp(0.0, 7.0);
         // Spring stiffness (1/s): sluggish → pro-snappy. Shared with the combat feed-forward,

@@ -417,7 +417,10 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     let bhop_entry = !final_leg
         && matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
         && (goal_dist > 300.0 || planned_band >= 1)
-        && runway_dist >= bhop::RUNWAY_ENGAGE;
+        && runway_dist >= bhop::RUNWAY_ENGAGE
+        // Run up first: don't start the hop cycle from a standstill — accelerate on the ground until
+        // we're actually moving, then leap into the circle-jump (a human never hops from a stop).
+        && speed >= bhop::RUN_UP_SPEED;
     // Lenient continuation gate for taking *another* hop from a landing: leg kinds churn as the
     // route advances, and a run in progress shouldn't be dumped by the stricter entry conditions.
     let bhop_sustain =

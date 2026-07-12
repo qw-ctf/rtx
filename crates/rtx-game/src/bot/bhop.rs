@@ -66,6 +66,10 @@ const PRESTRAFE_MIN_RUNWAY: f32 = 512.0;
 /// covers ~216u). Deliberately *not* speed-scaled: the old `speed·0.9` bar rose as the bot gained
 /// speed and disengaged it mid-run — the policy capped the very thing it built.
 pub const RUNWAY_ENGAGE: f32 = 256.0;
+/// Minimum ground speed before the hop cycle engages: a human *runs up* to near `sv_maxspeed` and
+/// then leaps into the circle-jump, never bunnyhops from a standstill. Below this the bot just runs
+/// (normal ground acceleration) until it's moving, so the first hop leaves at a real running speed.
+pub const RUN_UP_SPEED: f32 = 280.0;
 /// Slack beyond the current hop's flight distance when deciding whether another hop fits.
 const HOP_MARGIN: f32 = 64.0;
 
