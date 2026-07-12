@@ -452,7 +452,7 @@ fn aim_solution(
 fn aim_error(game: &mut GameState, e: EntId, now: f32, skill: f32, aim: Vec3, my_eye: Vec3, tgt: &Target) -> Vec3 {
     let base_spread = (7.0 - skill).max(0.0);
     let visible_for = {
-        let vs = game.entities[e].bot.vis_since;
+        let vs = game.entities[e].bot.percept.vis_since;
         if vs > 0.0 {
             now - vs
         } else {
@@ -477,8 +477,8 @@ fn aim_error(game: &mut GameState, e: EntId, now: f32, skill: f32, aim: Vec3, my
     let t = (4.0 * frametime).min(1.0);
     b.aim.err = b.aim.err + (b.aim.err_target - b.aim.err) * t;
     // Remember where the enemy is while we can see them, for the hold-the-angle behavior.
-    b.enemy_seen_at = aim;
-    b.enemy_seen_time = now;
+    b.seen.at = aim;
+    b.seen.time = now;
     b.aim.err
 }
 
@@ -630,8 +630,8 @@ pub(crate) fn engage(
         // back to the route — the human "holding the corner" look, and it kills the nav↔enemy
         // view flip-flop while line of sight flickers at an edge.
         let b = &game.entities[e].bot;
-        if b.enemy_seen_time > 0.0 && now - b.enemy_seen_time < HOLD_ANGLE_TIME {
-            cmd.look = angles_to(my_eye, b.enemy_seen_at);
+        if b.seen.time > 0.0 && now - b.seen.time < HOLD_ANGLE_TIME {
+            cmd.look = angles_to(my_eye, b.seen.at);
         }
         return;
     }

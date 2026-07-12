@@ -361,7 +361,7 @@ fn sense(game: &GameState, e: EntId) -> Sense {
     let vz = game.entities[e].v.velocity.z;
     let air_jumped = game.entities[e].combat.air_jumped;
     // When combat last had line of sight (see `combat::engage`) — snapshot for the bhop veto.
-    let enemy_seen_time = game.entities[e].bot.enemy_seen_time;
+    let enemy_seen_time = game.entities[e].bot.seen.time;
     let v_xy = game.entities[e].v.velocity.xy();
     let speed = v_xy.length();
     // Snapshot grapple state up front (it's set in the previous frame's PlayerPreThink, so it's
@@ -462,7 +462,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         other => {
             // No combat target this frame: clear the visibility clock so the next engagement starts
             // with loose first-glimpse aim rather than reading a stale, long-settled duration.
-            game.entities[e].bot.vis_since = 0.0;
+            game.entities[e].bot.percept.vis_since = 0.0;
             (other, None)
         }
     };
@@ -526,13 +526,13 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         // Loop-free-nav telemetry: live failed-link penalties and whether the target is currently
         // perceived (aware of / in memory), so a stuck/looping bot's divert can be watched live.
         let pen = b.failed_links.iter().filter(|&&(_, until, _)| until > now).count();
-        let aware = (b.known_enemy != 0 && now < b.known_until) as i32;
+        let aware = (b.percept.known_enemy != 0 && now < b.percept.known_until) as i32;
         let hold = b.hold_item;
         // Opponent-model telemetry: this bot's current hypothesis of the enemy it's aware of — the
         // estimated health/armor stack and believed arsenal bits — so the shared read can be watched
         // converge and reset live. Blank (`est=-`) when there's no belief / modeling is off.
-        let est = if b.known_enemy != 0 && now < b.known_until {
-            game.opponent_est(e, EntId(b.known_enemy), now)
+        let est = if b.percept.known_enemy != 0 && now < b.percept.known_until {
+            game.opponent_est(e, EntId(b.percept.known_enemy), now)
         } else {
             None
         };

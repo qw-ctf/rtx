@@ -548,7 +548,7 @@ fn teammate_attackers(g: &GameState, bot: EntId, my_team: u8, enemy: EntId) -> u
         .into_iter()
         .filter(|&t| {
             let e = &g.entities[t];
-            t != bot && e.bot.is_bot && e.v.health > 0.0 && e.mode_p.team == my_team && e.bot.known_enemy == enemy.0
+            t != bot && e.bot.is_bot && e.v.health > 0.0 && e.mode_p.team == my_team && e.bot.percept.known_enemy == enemy.0
         })
         .count() as u32
 }

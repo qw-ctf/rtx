@@ -244,9 +244,9 @@ impl GameState {
             let (r_lat, r_dist) = (self.random(), self.random());
             let pt = crate::bot::perception::heard_hypothesis(targ_org, atk_org, r_lat, r_dist);
             let b = &mut self.entities[targ].bot;
-            b.known_enemy = attacker.0;
-            b.known_until = time + crate::bot::perception::MEMORY;
-            b.percept_last_seen = pt; // felt the hit's direction, not the shooter's exact position
+            b.percept.known_enemy = attacker.0;
+            b.percept.known_until = time + crate::bot::perception::MEMORY;
+            b.percept.last_seen = pt; // felt the hit's direction, not the shooter's exact position
         }
     }
 

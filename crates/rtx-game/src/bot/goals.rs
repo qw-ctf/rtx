@@ -628,8 +628,8 @@ impl GameState {
             m.combat.super_damage_finished > now || m.combat.invincible_finished > now;
         let mate_has_weapon = m.v.items.has(weapon_bit(w));
         // Contest: a perceived, living enemy near the weapon means "take it rather than leave it".
-        let known = self.entities[e].bot.known_enemy;
-        let enemy_contesting = known != 0 && now < self.entities[e].bot.known_until && {
+        let known = self.entities[e].bot.percept.known_enemy;
+        let enemy_contesting = known != 0 && now < self.entities[e].bot.percept.known_until && {
             let ent = &self.entities[EntId(known)];
             ent.v.health > 0.0
                 && (ent.v.origin - it.v.origin).length_squared()

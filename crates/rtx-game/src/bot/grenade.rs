@@ -584,7 +584,7 @@ fn try_start_bank(game: &mut GameState, e: EntId, en: EntId, origin: Vec3, now: 
         return;
     }
     // Only bank at a position we actually saw recently — don't lob blindly at a stale origin.
-    let seen = game.entities[e].bot.enemy_seen_time;
+    let seen = game.entities[e].bot.seen.time;
     if seen <= 0.0 || now - seen > 3.0 {
         combo_reset(game, e, now + BANK_COOLDOWN);
         return;

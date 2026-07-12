@@ -126,49 +126,49 @@ pub(crate) fn perceive(game: &mut GameState, e: EntId, enemy: EntId, now: f32) -
     let heard_pt = heard.then(|| heard_hypothesis(my_origin, enemy_org, game.random(), game.random()));
 
     let b = &mut game.entities[e].bot;
-    let same_target = b.percept_ent == enemy.0;
+    let same_target = b.percept.ent == enemy.0;
 
     // Continuous-visibility clock (read by combat for aim convergence): starts on the first
     // line-of-sight frame of *this* target and clears when sight breaks, so switching targets resets
     // it (a fresh face gets the loose first-glimpse aim, not the previous target's settled tracking).
     if los {
-        if b.vis_since == 0.0 || !same_target {
-            b.vis_since = now;
+        if b.percept.vis_since == 0.0 || !same_target {
+            b.percept.vis_since = now;
         }
     } else {
-        b.vis_since = 0.0;
+        b.percept.vis_since = 0.0;
     }
 
     // Reaction clock for *sight*: accumulate continuous sight of this enemy — a changed target or a
     // break in sight restarts it — and promote to "known" once it clears the reaction time.
     if can_see {
-        if b.percept_ent != enemy.0 {
-            b.percept_ent = enemy.0;
-            b.percept_since = now;
+        if b.percept.ent != enemy.0 {
+            b.percept.ent = enemy.0;
+            b.percept.since = now;
         }
-        b.percept_last_seen = enemy_org;
-        if now - b.percept_since >= reaction {
-            b.known_enemy = enemy.0;
-            b.known_until = now + MEMORY;
+        b.percept.last_seen = enemy_org;
+        if now - b.percept.since >= reaction {
+            b.percept.known_enemy = enemy.0;
+            b.percept.known_until = now + MEMORY;
         }
     } else {
-        if b.percept_ent == enemy.0 {
-            b.percept_ent = 0; // lost sight — the next sighting starts a fresh reaction beat
+        if b.percept.ent == enemy.0 {
+            b.percept.ent = 0; // lost sight — the next sighting starts a fresh reaction beat
         }
         if let Some(pt) = heard_pt {
-            b.known_enemy = enemy.0;
-            b.known_until = now + MEMORY;
-            b.percept_last_seen = pt; // direction-only hypothesis, not the true origin
+            b.percept.known_enemy = enemy.0;
+            b.percept.known_until = now + MEMORY;
+            b.percept.last_seen = pt; // direction-only hypothesis, not the true origin
         }
     }
 
     // `known` also covers the "feel" channel: `t_damage` stamps `known_enemy`/`known_until` when this
     // bot is hurt, so a hit registers as awareness here without any sight/sound this frame.
-    let known = b.known_enemy == enemy.0 && now < b.known_until;
+    let known = b.percept.known_enemy == enemy.0 && now < b.percept.known_until;
     match (los, known) {
         (true, true) => Awareness::Visible,
         (false, true) => Awareness::Known {
-            last_seen: b.percept_last_seen,
+            last_seen: b.percept.last_seen,
         },
         _ => Awareness::Unaware,
     }

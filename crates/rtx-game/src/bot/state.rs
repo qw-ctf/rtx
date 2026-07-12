@@ -64,24 +64,10 @@ pub struct BotState {
     pub pulse: bool,
     /// Smoothed view state: the aim spring plus its error and feed-forward memory. See [`Aim`].
     pub aim: Aim,
-    /// Where the combat enemy was last actually visible, and when. While line of sight is briefly
-    /// lost the bot *holds this angle* (like a player holding a corner) instead of snapping back
-    /// to its navigation view. Written by combat under *true* line of sight only (the bhop veto and
-    /// corner-hold key off it) — perception memory below is separate.
-    pub enemy_seen_at: Vec3,
-    pub enemy_seen_time: f32,
-    /// Perception ([`crate::bot::perception`]): the target we're currently accruing sight-reaction
-    /// time on and since when (a change of target or a break in sight restarts it); the target we've
-    /// been promoted to *aware of* and the expiry of that awareness memory; where it was last
-    /// perceived (hunted while aware but out of sight); and when continuous line of sight to the
-    /// current target began (drives combat's aim-error convergence). Distinct from `enemy_seen_*`:
-    /// these advance on hear/feel too, so they must not be read where true line of sight is meant.
-    pub percept_ent: u32,
-    pub percept_since: f32,
-    pub known_enemy: u32,
-    pub known_until: f32,
-    pub percept_last_seen: Vec3,
-    pub vis_since: f32,
+    /// Where the combat enemy was last actually visible, under true line of sight only. See [`SeenEnemy`].
+    pub seen: SeenEnemy,
+    /// Perception memory (hear/feel as well as sight). See [`Perception`].
+    pub percept: Perception,
     /// Audience-wander destination (a round mode's stands) and the next time to pick a new one.
     /// Only used while the mode marks this bot as an audience/spectator; zero otherwise.
     pub wander_target: Vec3,
@@ -222,6 +208,31 @@ impl BotState {
             }
         }
     }
+}
+
+/// Where the combat enemy was last *actually visible*, and when — written by combat under true line
+/// of sight only (the bhop veto and corner-hold key off it). While sight is briefly lost the bot
+/// holds this angle like a player holding a corner. Distinct from [`Perception`], which advances on
+/// hear/feel too, so these must not be read where true line of sight is meant.
+#[derive(Default)]
+pub struct SeenEnemy {
+    pub at: Vec3,
+    pub time: f32,
+}
+
+/// Perception memory (see [`crate::bot::perception`]): the target currently accruing sight-reaction
+/// time and since when (a change of target or a break in sight restarts it); the target promoted to
+/// *aware of* and the expiry of that awareness; where it was last perceived (hunted while aware but
+/// out of sight); and when continuous line of sight to the current target began (drives combat's
+/// aim-error convergence). These advance on hear/feel too — see [`SeenEnemy`] for the sight-only spot.
+#[derive(Default)]
+pub struct Perception {
+    pub ent: u32,
+    pub since: f32,
+    pub known_enemy: u32,
+    pub known_until: f32,
+    pub last_seen: Vec3,
+    pub vis_since: f32,
 }
 
 /// Smoothed view state carried on a [`BotState`]. A critically damped spring drives `angles` (the
