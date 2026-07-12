@@ -737,6 +737,36 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     let (nf, nr, _) = angle_vectors(angles);
     let mut move_world = nf * forward as f32 + nr * side as f32;
 
+    // Unified air steering (always on): a yaw-synced air-strafe wish toward a landing point, in
+    // **world space** so the wish actually turns the velocity — a straight wish the 30-ups air-accel
+    // cap all but ignores — while the eyes keep smoothing toward the target through the normal aim
+    // spring (no raw-view channel, so the strafe never twitches the view). `None` when we're basically
+    // on top of the target (keep whatever wish we had). See [`bhop::air_correct`].
+    let air_wish = |target: Vec3| -> Option<Vec3> {
+        let to = target.xy() - origin.xy();
+        (to.length() > 24.0).then(|| {
+            let dt = frametime.clamp(0.001, 0.05);
+            let accel = host.cvar(c"sv_accelerate");
+            let maxspeed = host.cvar(c"sv_maxspeed");
+            let a_max = bhop::air_accel_max(
+                if accel > 0.0 { accel } else { 10.0 },
+                if maxspeed > 0.0 { maxspeed } else { 320.0 },
+                dt,
+            );
+            let s = bhop::air_correct(v_xy, to.y.atan2(to.x).to_degrees(), a_max, dt);
+            let w = bhop::wishdir_fs(s.view_yaw, s.forward, s.side);
+            Vec3::new(w.x, w.y, 0.0) * MOVE_SPEED
+        })
+    };
+    // Airborne on a plain jump leg: ride the arc toward the landing (the pinned waypoint — the
+    // `on_air` gate keeps it on the link target) with the air-strafe wish. `look` stays as steered
+    // above, so the eyes pan smoothly toward the landing while the strafe curves the trajectory.
+    if on_air && !on_ground {
+        if let Some(w) = air_wish(waypoint) {
+            move_world = w;
+        }
+    }
+
     // Hook override: stand still while reeling/flying (the pull owns velocity; ground input would
     // fight it or, airborne, break the frictionless arc), or walk toward the throw stance in Aim.
     if hook_engaged {
@@ -752,16 +782,14 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     }
 
     // Rocket-jump override: walk to the launch cell (Stance), stand and hold the aim (Rise), or ride
-    // the arc with a gentle wish toward the landing (Ballistic — the in-flight air-strafe correction).
-    // The jump itself is pressed post-spring in `emit` (via `rj.jump_ready`); the rocket fires on the
-    // driver's pure-timing `rj.fire`.
+    // the arc with the world-space air-strafe wish toward the landing (Ballistic — the same in-flight
+    // correction as a plain jump leg, curving the blast arc onto the target). The jump itself is
+    // pressed post-spring in `emit` (via `rj.jump_ready`); the rocket fires on the driver's `rj.fire`.
     if rj_engaged {
         move_world = match rj.approach {
             _ if rj.stand => Vec3::ZERO,
             Some(src) => Vec3::new(src.x - origin.x, src.y - origin.y, 0.0).normalize_or_zero() * MOVE_SPEED,
-            None => rj
-                .air_correct
-                .map_or(Vec3::ZERO, |t| Vec3::new(t.x - origin.x, t.y - origin.y, 0.0).normalize_or_zero() * MOVE_SPEED),
+            None => rj.air_correct.and_then(air_wish).unwrap_or(Vec3::ZERO),
         };
         buttons &= !BUTTON_JUMP; // the launch jump is pressed only via `emit`'s post-spring gate
         if rj.select {
@@ -774,40 +802,6 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
 
     // Bundle the frame's decisions into one command for the combat/grenade overlays to mutate.
     let cmd = BotCmd { look, move_world, buttons, impulse };
-
-    // Unified air steering (always on): while airborne on a plain jump leg or riding a rocket-jump
-    // arc, steer the velocity toward the landing with a yaw-synced air-strafe (`bhop::air_correct`)
-    // rather than the naive full-stick wish the 30-ups air-accel cap all but ignores. It rides the
-    // same channel the bhop controller uses — `emit` bypasses the aim spring and consumes the cmd's
-    // view yaw + forward/side directly — and only kicks in when the hop controller isn't already
-    // driving. The landing point is the pinned waypoint on a jump leg (the `on_air` gate keeps it on
-    // the link target) or the driver's target on a rocket-jump Ballistic arc. `look` (pitch) is left
-    // as steered above, so `emit` sends landing-ward pitch with the air-strafe yaw.
-    let air_cmd = if !on_ground && bhop_cmd.is_none() {
-        let target = if matches!(bot.rj.phase, RjPhase::Ballistic) {
-            rj.air_correct
-        } else if on_air {
-            Some(waypoint)
-        } else {
-            None
-        };
-        target.filter(|t| (t.xy() - origin.xy()).length() > 24.0).map(|t| {
-            let dt = frametime.clamp(0.001, 0.05);
-            let accel = host.cvar(c"sv_accelerate");
-            let maxspeed = host.cvar(c"sv_maxspeed");
-            let a_max = bhop::air_accel_max(
-                if accel > 0.0 { accel } else { 10.0 },
-                if maxspeed > 0.0 { maxspeed } else { 320.0 },
-                dt,
-            );
-            let to = t.xy() - origin.xy();
-            let s = bhop::air_correct(v_xy, to.y.atan2(to.x).to_degrees(), a_max, dt);
-            bhop::Cmd { view_yaw: s.view_yaw, forward: s.forward, side: s.side, jump: false }
-        })
-    } else {
-        None
-    };
-    let bhop_cmd = bhop_cmd.or(air_cmd);
 
     // Traversal-critical legs lock out the combat/grenade overlays: `engage` owns movement and
     // clears +jump, which cancels the planner's route if done mid gap/double/speed jump.

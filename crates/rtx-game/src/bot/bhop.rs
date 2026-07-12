@@ -46,11 +46,9 @@ const OMEGA_BASE: f32 = 140.0;
 /// flip per hop (smooth, not the shake) *and* maximizes speed gain. The cost is a wider lateral
 /// sweep (~±55u), which the live navmesh gates by only bunnyhopping open-enough routes.
 const LOBE_DEADBAND: f32 = 34.0;
-/// [`air_correct`] drives straight forward within this heading error (deg) — the demo's held
-/// `forward` on a well-aimed arc — and strafes to converge outside it.
-const AIR_CORRECT_DEADBAND: f32 = 4.0;
-/// Floor turn rate (deg/s) for [`air_correct`]'s convergence strafe: gentle when nearly aligned.
-const AIR_CORRECT_MIN: f32 = 60.0;
+/// [`air_correct`] turn rate per degree of heading error (deg/s per deg): a proportional pull toward
+/// the bearing that eases smoothly to zero at alignment, so the correction never snaps.
+const AIR_CORRECT_GAIN: f32 = 6.0;
 
 /// How long the entry conditions must hold before engaging, so a momentary straightaway doesn't
 /// stutter the gait. Applies only to the initial engage; disengage decisions happen on landings.
@@ -111,8 +109,12 @@ pub fn omega_max(speed: f32, a_max: f32, dt: f32) -> f32 {
 /// velocity is `cap − a_need` (i.e. `θ = acos((cap − a_need)/speed)`, forward of perpendicular)
 /// delivers exactly that sideways add while the parallel component still grows the speed. When the
 /// requested rate meets or exceeds what the tick can physically deliver, fall back to the max-rate
-/// [`theta_star`] angle (perpendicular). `sigma` is the strafe side (±1); the geometry mirrors
-/// [`strafe`] so the two are interchangeable.
+/// [`theta_star`] angle (perpendicular). `sigma` is the strafe side (±1).
+///
+/// The wish (world direction `vel_yaw + sigma·θ`) is expressed with the **view riding the velocity**
+/// and the angle carried in `forward`/`side` (`MOVE·cosθ`, `−sigma·MOVE·sinθ`) rather than offsetting
+/// the view by `sigma·(θ−90)` with a single strafe key. Same wishdir, but the strafe-side flip no
+/// longer *jumps* the view yaw (the eyes just sweep with the velocity), so the gait doesn't twitch.
 pub fn strafe_rate(v_xy: Vec2, sigma: f32, omega_deg: f32, a_max: f32, dt: f32) -> Strafe {
     let speed = v_xy.length().max(1.0);
     let vel_yaw = v_xy.y.atan2(v_xy.x).to_degrees();
@@ -123,27 +125,27 @@ pub fn strafe_rate(v_xy: Vec2, sigma: f32, omega_deg: f32, a_max: f32, dt: f32) 
     } else {
         ((AIR_CAP - a_need).max(0.0) / speed).clamp(0.0, 1.0).acos().to_degrees()
     };
+    let tr = theta.to_radians();
     Strafe {
-        view_yaw: wrap180(vel_yaw + sigma * (theta - 90.0)),
-        forward: 0.0,
-        side: -sigma * MOVE_SPEED,
+        view_yaw: vel_yaw,
+        forward: MOVE_SPEED * tr.cos(),
+        side: -sigma * MOVE_SPEED * tr.sin(),
         sigma,
     }
 }
 
 /// Mid-air course correction toward a fixed `bearing` — for a gap jump or rocket-jump arc, where
-/// there is no hop cycle and no slalom, just an arc to steer onto the landing line. Within a small
-/// heading deadband hold straight forward (the demo's sustained `forward` on a good arc); outside
-/// it, strafe toward the bearing at a rate scaled by the error so the arc converges while still
-/// preserving speed. Stateless — the deadband kills chatter and both branches keep the heading.
+/// there is no hop cycle, just an arc to steer onto the landing line. A single continuous strafe
+/// whose turn rate is proportional to the heading error and eases to zero at alignment (at `err ≈ 0`
+/// the wish projects exactly onto the [`AIR_CAP`] and adds nothing — a coast on the current heading).
+/// No mode switch and no deadband, so the returned wish never snaps. The strafe *side* still flips as
+/// `err` crosses zero, but there the turn rate is ~0 and the wish is inert, so the caller applies the
+/// wish in **world space** and steers the eyes separately — the flip never moves the view.
 pub fn air_correct(v_xy: Vec2, bearing: f32, a_max: f32, dt: f32) -> Strafe {
     let speed = v_xy.length().max(1.0);
     let vel_yaw = v_xy.y.atan2(v_xy.x).to_degrees();
     let err = wrap180(bearing - vel_yaw);
-    if err.abs() < AIR_CORRECT_DEADBAND {
-        return Strafe { view_yaw: bearing, forward: MOVE_SPEED, side: 0.0, sigma: 0.0 };
-    }
-    let omega = (err.abs() / 0.15).max(AIR_CORRECT_MIN).min(omega_max(speed, a_max, dt));
+    let omega = (err.abs() * AIR_CORRECT_GAIN).min(omega_max(speed, a_max, dt));
     strafe_rate(v_xy, err.signum(), omega, a_max, dt)
 }
 
@@ -623,7 +625,7 @@ mod tests {
                 }
                 let v = Vec2::new(s, 0.0);
                 let cmd = strafe_rate(v, 1.0, omega, a, dt);
-                let v2 = apply_airaccel(v, wishdir_of(cmd.view_yaw, cmd.side), MAXSPEED, ACCEL, dt);
+                let v2 = apply_airaccel(v, wishdir_fs(cmd.view_yaw, cmd.forward, cmd.side), MAXSPEED, ACCEL, dt);
                 let turned = v2.y.atan2(v2.x).to_degrees();
                 let want = omega * dt;
                 assert!((turned - want).abs() <= 0.1 * want + 0.02, "s={s} ω={omega}: turned {turned}° want {want}°");
