@@ -1488,11 +1488,16 @@ mod tests {
             // downhill one whose extra airtime a JumpGap's flat 200u cap still missed.
             assert!(horiz > JUMP_REACH, "speed jump within single-jump reach: {horiz}");
             assert!(tr.v_req <= SPEED_JUMP_V_CAP + 1.0, "v_req over the cap: {}", tr.v_req);
-            // The from-cell is the runway start: at least the runway needed to build the *extra*
-            // speed over maxspeed (a gap crossable at ≤ maxspeed needs no runway → from = ledge).
-            let need = runway_len_for(tr.v_req.max(MAX_SPEED), MAX_SPEED, k);
-            let back = (start.xy() - tr.takeoff.xy()).length();
-            assert!(back + GRID >= need, "runway too short: {back} < {need}");
+            // A *chained* speed jump has no self-contained runway by design — its from-cell **is**
+            // the ledge (it's only traversable when the planner proves the entry band already carries
+            // `v_req`), so the runway-back invariant applies only to stand-start jumps.
+            if !tr.chained {
+                // The from-cell is the runway start: at least the runway needed to build the *extra*
+                // speed over maxspeed (a gap crossable at ≤ maxspeed needs no runway → from = ledge).
+                let need = runway_len_for(tr.v_req.max(MAX_SPEED), MAX_SPEED, k);
+                let back = (start.xy() - tr.takeoff.xy()).length();
+                assert!(back + GRID >= need, "runway too short: {back} < {need}");
+            }
         }
         eprintln!("speed-jump splice: {sjumps} links");
 
