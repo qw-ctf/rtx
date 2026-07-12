@@ -535,17 +535,55 @@ pub(crate) fn countdown_announce(until: f32, now: f32, last: i32) -> (i32, Optio
 /// Arena's audience and a structured match's benched late-joiners; damage to (and from) these
 /// players is refused by the bench/audience damage gates. Health/armor must stay positive — a
 /// client (and the bot AI) treats 0 health as dead and locks movement, freezing the spectator.
+/// A fixed spawn kit — the arena fighter, midair, race and audience kits each hand-wrote these
+/// fields. `apply` *assigns* `items` (not `.with`), which drops the grapple bit
+/// `put_client_in_server` hands out first (the intended no-hook-in-the-arena behavior). `max_health:
+/// None` leaves the current max untouched (the audience kit never set it).
+pub(crate) struct Loadout {
+    pub items: Items,
+    pub health: f32,
+    pub max_health: Option<f32>,
+    pub armorvalue: f32,
+    pub armortype: f32,
+    pub shells: f32,
+    pub nails: f32,
+    pub rockets: f32,
+    pub cells: f32,
+    pub weapon: Weapon,
+}
+
+impl Loadout {
+    pub(crate) fn apply(&self, g: &mut GameState, e: EntId) {
+        let v = &mut g.entities[e].v;
+        v.items = self.items.as_f32();
+        v.health = self.health;
+        if let Some(mh) = self.max_health {
+            v.max_health = mh;
+        }
+        v.armorvalue = self.armorvalue;
+        v.armortype = self.armortype;
+        v.ammo_shells = self.shells;
+        v.ammo_nails = self.nails;
+        v.ammo_rockets = self.rockets;
+        v.ammo_cells = self.cells;
+        v.weapon = self.weapon;
+    }
+}
+
 pub(crate) fn audience_loadout(g: &mut GameState, e: EntId) {
-    let v = &mut g.entities[e].v;
-    v.items = Items::AXE.as_f32();
-    v.health = 100.0;
-    v.armorvalue = 100.0;
-    v.armortype = 0.8;
-    v.ammo_shells = 0.0;
-    v.ammo_nails = 0.0;
-    v.ammo_rockets = 0.0;
-    v.ammo_cells = 0.0;
-    v.weapon = Weapon::Axe;
+    Loadout {
+        items: Items::AXE,
+        health: 100.0,
+        max_health: None,
+        armorvalue: 100.0,
+        armortype: 0.8,
+        shells: 0.0,
+        nails: 0.0,
+        rockets: 0.0,
+        cells: 0.0,
+        weapon: Weapon::Axe,
+    }
+    .apply(g, e);
 }
 
 /// A roaming destination among `classname` spawns for a bot with nothing to fight — re-picked on a

@@ -204,17 +204,19 @@ impl GameMode for Arena {
             | Items::GRENADE_LAUNCHER
             | Items::ROCKET_LAUNCHER
             | Items::ARMOR3;
-        let v = &mut g.entities[e].v;
-        v.items = arsenal.as_f32();
-        v.health = 100.0;
-        v.max_health = 100.0;
-        v.armorvalue = 200.0;
-        v.armortype = 0.8; // red armor
-        v.ammo_shells = 250.0;
-        v.ammo_nails = 250.0;
-        v.ammo_rockets = 200.0;
-        v.ammo_cells = 0.0;
-        v.weapon = Weapon::RocketLauncher;
+        super::Loadout {
+            items: arsenal,
+            health: 100.0,
+            max_health: Some(100.0),
+            armorvalue: 200.0,
+            armortype: 0.8, // red armor
+            shells: 250.0,
+            nails: 250.0,
+            rockets: 200.0,
+            cells: 0.0,
+            weapon: Weapon::RocketLauncher,
+        }
+        .apply(g, e);
     }
 
     fn player_damage(

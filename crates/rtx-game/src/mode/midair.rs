@@ -32,19 +32,20 @@ impl GameMode for Midair {
 
     fn apply_loadout(&self, g: &mut GameState, e: EntId) {
         // Rocket launcher + axe only, a big rocket stock, red armor and 250 overheal — KTX's
-        // midair kit (client.c:2190). Assigning `items` (not `.with`) drops the grapple bit that
-        // `put_client_in_server` hands out first, so there's no hook in the arena.
-        let v = &mut g.entities[e].v;
-        v.items = (Items::AXE | Items::ROCKET_LAUNCHER).as_f32();
-        v.health = 250.0;
-        v.max_health = 250.0;
-        v.armorvalue = 200.0;
-        v.armortype = 0.8; // red armor
-        v.ammo_shells = 0.0;
-        v.ammo_nails = 0.0;
-        v.ammo_rockets = 255.0;
-        v.ammo_cells = 0.0;
-        v.weapon = Weapon::RocketLauncher;
+        // midair kit (client.c:2190).
+        super::Loadout {
+            items: Items::AXE | Items::ROCKET_LAUNCHER,
+            health: 250.0,
+            max_health: Some(250.0),
+            armorvalue: 200.0,
+            armortype: 0.8, // red armor
+            shells: 0.0,
+            nails: 0.0,
+            rockets: 255.0,
+            cells: 0.0,
+            weapon: Weapon::RocketLauncher,
+        }
+        .apply(g, e);
     }
 
     fn player_damage(

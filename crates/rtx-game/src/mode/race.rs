@@ -92,19 +92,20 @@ impl GameMode for Race {
     }
 
     fn apply_loadout(&self, g: &mut GameState, e: EntId) {
-        // KTX raceWeaponNo: axe only, nothing else. Assigning `items` (not `.with`) drops the
-        // grapple bit `put_client_in_server` hands out first — the midair precedent.
-        let v = &mut g.entities[e].v;
-        v.items = Items::AXE.as_f32();
-        v.health = 100.0;
-        v.max_health = 100.0;
-        v.armorvalue = 0.0;
-        v.armortype = 0.0;
-        v.ammo_shells = 0.0;
-        v.ammo_nails = 0.0;
-        v.ammo_rockets = 0.0;
-        v.ammo_cells = 0.0;
-        v.weapon = Weapon::Axe;
+        // KTX raceWeaponNo: axe only, nothing else.
+        super::Loadout {
+            items: Items::AXE,
+            health: 100.0,
+            max_health: Some(100.0),
+            armorvalue: 0.0,
+            armortype: 0.0,
+            shells: 0.0,
+            nails: 0.0,
+            rockets: 0.0,
+            cells: 0.0,
+            weapon: Weapon::Axe,
+        }
+        .apply(g, e);
     }
 
     /// Nobody fires in a race (KTX raceWeaponNo; the axe-only loadout makes this belt-and-braces).
