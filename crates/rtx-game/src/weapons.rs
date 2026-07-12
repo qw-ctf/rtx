@@ -179,7 +179,7 @@ impl GameState {
         if self.try_detonate_shootable_grenade(tr.ent) {
             return;
         }
-        if self.entities[tr.ent].v.takedamage != 0.0 {
+        if self.entities[tr.ent].v.takedamage != TakeDamage::No {
             self.entities[tr.ent].combat.axhitme = 1.0;
             self.spawn_blood(org, 20);
             let dmg = if self.level.deathmatch > 3 { 75.0 } else { 20.0 };
@@ -244,7 +244,7 @@ impl GameState {
             if self.try_detonate_shootable_grenade(tr.ent) {
                 continue;
             }
-            if self.entities[tr.ent].v.takedamage != 0.0 {
+            if self.entities[tr.ent].v.takedamage != TakeDamage::No {
                 blood_count += 1;
                 blood_org = org;
                 if tr.ent != multi_ent {
@@ -400,7 +400,7 @@ impl GameState {
         if self.try_detonate_shootable_grenade(e1) {
             return;
         }
-        if self.entities[e1].v.takedamage != 0.0 {
+        if self.entities[e1].v.takedamage != TakeDamage::No {
             self.lightning_hit(from, damage);
         }
 
@@ -414,7 +414,7 @@ impl GameState {
         if self.try_detonate_shootable_grenade(e2) {
             return;
         }
-        if e2 != e1 && self.entities[e2].v.takedamage != 0.0 {
+        if e2 != e1 && self.entities[e2].v.takedamage != TakeDamage::No {
             self.lightning_hit(from, damage);
         }
 
@@ -428,7 +428,7 @@ impl GameState {
         if self.try_detonate_shootable_grenade(e3) {
             return;
         }
-        if e3 != e1 && e3 != e2 && self.entities[e3].v.takedamage != 0.0 {
+        if e3 != e1 && e3 != e2 && self.entities[e3].v.takedamage != TakeDamage::No {
             self.lightning_hit(from, damage);
         }
     }
@@ -498,7 +498,7 @@ impl GameState {
         if other == self.entities[e].owner() {
             return;
         }
-        if self.entities[other].v.takedamage.is(TakeDamage::Aim) {
+        if self.entities[other].v.takedamage == TakeDamage::Aim {
             self.grenade_explode(e);
             return;
         }
@@ -549,7 +549,7 @@ impl GameState {
             mis.v.nextthink = time + 2.5;
             mis.think = Think::GrenadeExplode;
             if shootable {
-                mis.v.takedamage = TakeDamage::Aim.as_f32();
+                mis.v.takedamage = TakeDamage::Aim;
                 mis.v.health = 1.0;
                 mis.th_die = Die::GrenadeExplode;
             }
@@ -660,7 +660,7 @@ impl GameState {
             (9.0, DeathType::Nailgun, Te::Spike)
         };
 
-        if self.entities[other].v.takedamage != 0.0 {
+        if self.entities[other].v.takedamage != TakeDamage::No {
             if self.try_detonate_shootable_grenade(other) {
                 self.free(e);
                 return;

@@ -124,7 +124,7 @@ impl GameState {
     pub(crate) fn barrel_explode(&mut self, e: EntId) {
         {
             let ent = &mut self.entities[e];
-            ent.v.takedamage = TakeDamage::No.as_f32();
+            ent.v.takedamage = TakeDamage::No;
             ent.classname = Some("explo_box".into());
         }
         self.t_radius_damage(e, e, 160.0, EntId::WORLD, DeathType::ExploBox);
@@ -153,7 +153,7 @@ impl GameState {
             let ent = &mut self.entities[e];
             ent.v.health = 20.0;
             ent.th_die = Die::ExploBoxDie;
-            ent.v.takedamage = TakeDamage::Aim.as_f32();
+            ent.v.takedamage = TakeDamage::Aim;
             ent.v.origin.z += 2.0;
         }
         if !self.host.droptofloor(e) {

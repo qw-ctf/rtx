@@ -32,7 +32,7 @@
 
 use glam::Vec3;
 
-use crate::defs::{Items, Weapon};
+use crate::defs::{DeadFlag, Items, Weapon};
 use crate::entity::EntId;
 use crate::game::{cstring, GameState};
 
@@ -478,7 +478,7 @@ pub(crate) fn nearest_player_where(
             continue;
         }
         let ent = &g.entities[e];
-        if ent.v.health <= 0.0 || ent.v.deadflag != 0.0 || !pred(g, e) {
+        if ent.v.health <= 0.0 || ent.v.deadflag != DeadFlag::No || !pred(g, e) {
             continue;
         }
         let d = (ent.v.origin - point).length_squared();

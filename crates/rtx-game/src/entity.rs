@@ -73,7 +73,7 @@ pub enum Think {
     /// One-shot body-frame run from the current frame to `anim_end`, then `anim_after`
     /// (used for pain and death sequences).
     PlayerAnim,
-    /// Terminal of a death sequence (`PlayerDead`: freeze, mark `DeadFlag::Dead.as_f32()`).
+    /// Terminal of a death sequence (`PlayerDead`: freeze, mark `DeadFlag::Dead`).
     PlayerDead,
     /// Cosmetic weapon firing animation (shotgun/rocket/axe), parameterized by the
     /// `anim_*` tail fields; fires `W_FireAxe` at `anim_fire` if set, then `player_run`.

@@ -41,7 +41,7 @@ impl GameState {
         self.sub_calc_move(e, pos1, speed, Think::ButtonDone);
         self.entities[e].v.frame = 0.0;
         if health != 0.0 {
-            self.entities[e].v.takedamage = TakeDamage::Yes.as_f32();
+            self.entities[e].v.takedamage = TakeDamage::Yes;
         }
     }
 
@@ -82,7 +82,7 @@ impl GameState {
             let ent = &mut self.entities[e];
             ent.set_enemy(attacker);
             ent.v.health = ent.v.max_health;
-            ent.v.takedamage = TakeDamage::No.as_f32();
+            ent.v.takedamage = TakeDamage::No;
         }
         self.button_fire(e);
     }
@@ -109,7 +109,7 @@ impl GameState {
             let ent = &mut self.entities[e];
             ent.v.max_health = ent.v.health;
             ent.th_die = Die::ButtonKilled;
-            ent.v.takedamage = TakeDamage::Yes.as_f32();
+            ent.v.takedamage = TakeDamage::Yes;
         } else {
             self.entities[e].set_touch(Touch::ButtonTouch);
         }

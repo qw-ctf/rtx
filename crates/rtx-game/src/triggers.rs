@@ -19,7 +19,7 @@ impl GameState {
         let ent = &mut self.entities[e];
         if ent.v.max_health != 0.0 {
             ent.v.health = ent.v.max_health;
-            ent.v.takedamage = TakeDamage::Yes.as_f32();
+            ent.v.takedamage = TakeDamage::Yes;
             ent.v.solid = Solid::BBox;
         }
     }
@@ -37,7 +37,7 @@ impl GameState {
             self.host.write_svc(MsgDest::All, Svc::FoundSecret);
         }
         self.play_noise(e, Channel::Voice);
-        self.entities[e].v.takedamage = TakeDamage::No.as_f32();
+        self.entities[e].v.takedamage = TakeDamage::No;
         self.activator = self.entities[e].enemy();
         self.sub_use_targets(e);
 
@@ -144,7 +144,7 @@ impl GameState {
             let ent = &mut self.entities[e];
             ent.v.max_health = ent.v.health;
             ent.th_die = Die::TriggerKilled;
-            ent.v.takedamage = TakeDamage::Yes.as_f32();
+            ent.v.takedamage = TakeDamage::Yes;
             ent.v.solid = Solid::BBox;
             let origin = ent.v.origin;
             self.host.set_origin(e, origin);
@@ -393,7 +393,7 @@ impl GameState {
 
     /// `hurt_touch`.
     pub(crate) fn hurt_touch(&mut self, e: EntId, other: EntId) {
-        if self.entities[other].v.takedamage != 0.0 {
+        if self.entities[other].v.takedamage != TakeDamage::No {
             let dmg = self.entities[e].mover.dmg;
             self.entities[e].v.solid = Solid::Not;
             self.entities[other].deathtype = DeathType::TriggerHurt;

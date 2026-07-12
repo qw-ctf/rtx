@@ -25,7 +25,7 @@ use glam::Vec3;
 
 use super::{BotIntent, DamageOutcome, GameMode};
 use crate::bsp::Bsp;
-use crate::defs::{Items, PrintLevel, Weapon};
+use crate::defs::{DeadFlag, Items, PrintLevel, Weapon};
 use crate::entity::EntId;
 use crate::game::{cstring, GameState};
 use crate::navmesh::{LinkCosts, LinkKind, BAND_FLOOR};
@@ -229,7 +229,7 @@ impl Race {
         let last = route.nodes.len() - 1;
         for e in super::players(g) {
             let ent = &g.entities[e];
-            if ent.v.health <= 0.0 || ent.v.deadflag != 0.0 {
+            if ent.v.health <= 0.0 || ent.v.deadflag != DeadFlag::No {
                 continue;
             }
             let origin = ent.v.origin;

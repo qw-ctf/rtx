@@ -472,8 +472,10 @@ float_enum! {
     }
 }
 
-float_enum! {
-    /// `.deadflag`.
+field_enum! {
+    /// `.deadflag` — stored directly in the [`EntVars`](crate::abi::EntVars) field, so the death
+    /// sequence reads/writes it with plain `==`/`=` (and `>= DeadFlag::Dead`, since `field_enum!`
+    /// derives `PartialOrd`) rather than the `.as_f32()`/`.is()` bridge.
     DeadFlag {
         No = 0,
         Dying = 1,
@@ -482,8 +484,9 @@ float_enum! {
     }
 }
 
-float_enum! {
-    /// `.takedamage`.
+field_enum! {
+    /// `.takedamage` — stored directly in the [`EntVars`](crate::abi::EntVars) field; damage sites
+    /// test it with `== TakeDamage::No` / `!= TakeDamage::No` and set it with `= TakeDamage::Yes`.
     TakeDamage {
         No = 0,
         Yes = 1,

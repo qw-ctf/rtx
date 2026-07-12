@@ -79,7 +79,7 @@ impl GameState {
 
         {
             let t = &mut self.entities[targ];
-            t.v.takedamage = TakeDamage::No.as_f32();
+            t.v.takedamage = TakeDamage::No;
             t.set_touch(Touch::None);
             t.v.effects = 0.0;
         }
@@ -88,7 +88,7 @@ impl GameState {
 
     /// `T_Damage` — the only function that reduces health.
     pub(crate) fn t_damage(&mut self, targ: EntId, inflictor: EntId, attacker: EntId, mut damage: f32) {
-        if self.entities[targ].v.takedamage == 0.0 {
+        if self.entities[targ].v.takedamage == TakeDamage::No {
             return;
         }
         if self.is_grenade(targ) {
@@ -237,7 +237,7 @@ impl GameState {
     ) {
         let org = self.entities[inflictor].v.origin;
         for head in self.find_radius(org, damage + 40.0) {
-            if head == ignore || self.entities[head].v.takedamage == 0.0 {
+            if head == ignore || self.entities[head].v.takedamage == TakeDamage::No {
                 continue;
             }
             let henter = {

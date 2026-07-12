@@ -116,7 +116,7 @@ impl GameState {
     /// On its own cvar (not `rtx_bot_debug`) so it can be enabled without the per-spawn spam.
     fn dbg_wedge_edge(&self, e: EntId, caller: &'static std::panic::Location<'static>) {
         // Hot-path bail before any cvar read: this runs on every stand/run tick of every live player.
-        if self.entities[e].v.deadflag == 0.0 {
+        if self.entities[e].v.deadflag == DeadFlag::No {
             return;
         }
         let prev = self.entities[e].think;
@@ -130,7 +130,7 @@ impl GameState {
             "rtx: WEDGE e{} bot={} deadflag={} health={:.0} frame={} prev_think={:?} installer={}:{}\n",
             e.0,
             self.entities[e].bot.is_bot as i32,
-            self.entities[e].v.deadflag as i32,
+            self.entities[e].v.deadflag.as_f32() as i32,
             self.entities[e].v.health,
             self.entities[e].v.frame as i32,
             prev,
@@ -148,7 +148,7 @@ impl GameState {
     /// the corpse straight to the death terminus: `player_pre_think` then routes to `player_death_think`
     /// and the respawn press is honoured. Returns whether the caller should bail out of the alive loop.
     fn finalize_if_dead(&mut self, e: EntId) -> bool {
-        if self.entities[e].v.deadflag == 0.0 {
+        if self.entities[e].v.deadflag == DeadFlag::No {
             return false;
         }
         self.entities[e].v.frame = DEATHA.last() as f32; // a corpse pose, not the frozen mid-anim frame
@@ -421,7 +421,7 @@ impl GameState {
     pub(crate) fn player_dead(&mut self, e: EntId) {
         let ent = &mut self.entities[e];
         ent.v.nextthink = -1.0;
-        ent.v.deadflag = DeadFlag::Dead.as_f32();
+        ent.v.deadflag = DeadFlag::Dead;
     }
 
     /// `player_pain` (`th_pain`) — play a pain sequence if not mid-attack.
@@ -547,7 +547,7 @@ impl GameState {
             let ent = &mut self.entities[e];
             ent.weaponmodel = None;
             ent.v.view_ofs = Vec3::new(0.0, 0.0, -8.0);
-            ent.v.deadflag = DeadFlag::Dying.as_f32();
+            ent.v.deadflag = DeadFlag::Dying;
             ent.v.solid = Solid::Not;
             ent.v.flags = ent.v.flags.without(Flags::ONGROUND);
             ent.v.movetype = MoveType::Toss;
@@ -590,7 +590,7 @@ impl GameState {
         ent.v.frame = DEATHA.last() as f32;
         ent.v.solid = Solid::Not;
         ent.v.movetype = MoveType::Toss;
-        ent.v.deadflag = DeadFlag::Dead.as_f32();
+        ent.v.deadflag = DeadFlag::Dead;
         ent.v.nextthink = -1.0;
     }
 
@@ -661,7 +661,7 @@ impl GameState {
             ent.v.frame = 0.0;
             ent.v.nextthink = -1.0;
             ent.v.movetype = MoveType::Bounce;
-            ent.v.takedamage = TakeDamage::No.as_f32();
+            ent.v.takedamage = TakeDamage::No;
             ent.v.solid = Solid::Not;
             ent.v.view_ofs = Vec3::new(0.0, 0.0, 8.0);
             ent.v.velocity = vel;
@@ -683,7 +683,7 @@ impl GameState {
         self.throw_gib(e, Model::PROGS_GIB1, health);
         self.throw_gib(e, Model::PROGS_GIB2, health);
         self.throw_gib(e, Model::PROGS_GIB3, health);
-        self.entities[e].v.deadflag = DeadFlag::Dead.as_f32();
+        self.entities[e].v.deadflag = DeadFlag::Dead;
         if self.entities[e].deathtype.is_telefrag() {
             self.host
                 .sound(e, Channel::Voice, Sound::PLAYER_TELEDTH1, 1.0, Attenuation::None);

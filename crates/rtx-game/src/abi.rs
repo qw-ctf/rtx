@@ -19,7 +19,7 @@
 use core::ffi::c_char;
 use glam::Vec3;
 
-use crate::defs::{MoveType, Solid, Weapon};
+use crate::defs::{DeadFlag, MoveType, Solid, TakeDamage, Weapon};
 
 /// QuakeC string reference. With `sv_pr2references 1` these are engine-managed `int`
 /// handles; the mod communicates real strings to the engine via trap calls (e.g.
@@ -71,9 +71,9 @@ pub struct EntVars {
     pub ammo_rockets: f32,
     pub ammo_cells: f32,
     pub items: f32,
-    pub takedamage: f32,
+    pub takedamage: TakeDamage,
     pub chain: i32,
-    pub deadflag: f32,
+    pub deadflag: DeadFlag,
     pub view_ofs: Vec3,
     pub button0: f32,
     pub button1: f32,

@@ -95,7 +95,7 @@ impl GameState {
         let players: Vec<EntId> = self.find_by_classname("player").collect();
         for p in players {
             let v = &mut self.entities[p].v;
-            v.takedamage = TakeDamage::No.as_f32();
+            v.takedamage = TakeDamage::No;
             v.solid = Solid::Not;
             v.movetype = MoveType::None;
             v.modelindex = 0.0;

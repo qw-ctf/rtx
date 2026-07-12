@@ -26,8 +26,8 @@ use super::team;
 use super::{players, BotIntent, DamageOutcome, GameMode};
 use crate::assets::{Model, Sound};
 use crate::defs::{
-    Attenuation, Channel, MoveType, PrintLevel, Solid, RUNE_HASTE, RUNE_MASK, RUNE_REGEN, RUNE_RESISTANCE,
-    RUNE_STRENGTH,
+    Attenuation, Channel, DeadFlag, MoveType, PrintLevel, Solid, RUNE_HASTE, RUNE_MASK, RUNE_REGEN,
+    RUNE_RESISTANCE, RUNE_STRENGTH,
 };
 use crate::entity::{EntId, FlagPhase, Think, Touch};
 use crate::game::GameState;
@@ -403,7 +403,7 @@ impl GameState {
     pub(crate) fn flag_touch(&mut self, flag: EntId, other: EntId) {
         if self.entities[other].classname() != Some("player")
             || self.entities[other].v.health <= 0.0
-            || self.entities[other].v.deadflag != 0.0
+            || self.entities[other].v.deadflag != DeadFlag::No
         {
             return;
         }
@@ -704,7 +704,7 @@ impl GameState {
         if other == self.entities[rune].owner()
             || self.entities[other].classname() != Some("player")
             || self.entities[other].v.health <= 0.0
-            || self.entities[other].v.deadflag != 0.0
+            || self.entities[other].v.deadflag != DeadFlag::No
         {
             return;
         }

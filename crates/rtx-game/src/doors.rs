@@ -58,7 +58,7 @@ impl GameState {
         {
             let ent = &mut self.entities[e];
             if ent.v.max_health != 0.0 {
-                ent.v.takedamage = TakeDamage::Yes.as_f32();
+                ent.v.takedamage = TakeDamage::Yes;
                 ent.v.health = ent.v.max_health;
             }
             ent.mover.state = STATE_DOWN;
@@ -163,7 +163,7 @@ impl GameState {
         {
             let o = &mut self.entities[owner];
             o.v.health = o.v.max_health;
-            o.v.takedamage = TakeDamage::No.as_f32();
+            o.v.takedamage = TakeDamage::No;
         }
         self.door_use(owner);
     }
@@ -386,7 +386,7 @@ impl GameState {
             let ent = &mut self.entities[e];
             ent.mover.state = STATE_BOTTOM;
             if ent.v.health != 0.0 {
-                ent.v.takedamage = TakeDamage::Yes.as_f32();
+                ent.v.takedamage = TakeDamage::Yes;
                 ent.th_die = Die::DoorKilled;
             }
             if ent.v.items != 0.0 {

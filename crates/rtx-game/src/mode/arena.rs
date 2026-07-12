@@ -20,7 +20,7 @@
 use glam::Vec3;
 
 use super::{centerprint_all, nearest_player_where, players, ArenaRole, BotIntent, DamageOutcome, GameMode};
-use crate::defs::{Items, PrintLevel, Weapon, VEC_VIEW_OFS};
+use crate::defs::{DeadFlag, Items, PrintLevel, Weapon, VEC_VIEW_OFS};
 use crate::entity::EntId;
 use crate::game::GameState;
 
@@ -368,7 +368,8 @@ impl Arena {
             if g.entities[e].mode_p.arena.role != ArenaRole::Fighter {
                 continue;
             }
-            let winner_stays = carried.contains(&e) && g.entities[e].v.health > 0.0 && g.entities[e].v.deadflag == 0.0;
+            let winner_stays =
+                carried.contains(&e) && g.entities[e].v.health > 0.0 && g.entities[e].v.deadflag == DeadFlag::No;
             if winner_stays {
                 g.entities[e].mode_p.arena.pending_spawn = false;
                 self.apply_loadout(g, e);
@@ -621,7 +622,7 @@ fn origin_crowded(g: &GameState, p: Vec3, who: EntId) -> bool {
     players(g).into_iter().any(|e| {
         e != who
             && g.entities[e].v.health > 0.0
-            && g.entities[e].v.deadflag == 0.0
+            && g.entities[e].v.deadflag == DeadFlag::No
             && (g.entities[e].v.origin - p).length() < SPREAD_MIN
     })
 }
@@ -658,7 +659,7 @@ fn live_fighters(g: &GameState) -> Vec<EntId> {
         .into_iter()
         .filter(|&e| {
             let ent = &g.entities[e];
-            ent.mode_p.arena.role == ArenaRole::Fighter && ent.v.health > 0.0 && ent.v.deadflag == 0.0
+            ent.mode_p.arena.role == ArenaRole::Fighter && ent.v.health > 0.0 && ent.v.deadflag == DeadFlag::No
         })
         .collect()
 }

@@ -30,7 +30,8 @@ mod vigil;
 
 use crate::bot::state::{BotState, GrenadePhase, HookPhase, RjPhase};
 use crate::defs::{
-    Bits, Flags, Items, Solid, Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP, VEC_VIEW_OFS,
+    Bits, DeadFlag, Flags, Items, Solid, TakeDamage, Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK,
+    BUTTON_JUMP, VEC_VIEW_OFS,
 };
 use crate::entity::{EntId, Entity, Touch};
 use crate::game::{cstring, GameState};
@@ -344,7 +345,7 @@ const PICKUP_AVOID_TIME: f32 = 3.0;
 /// the touch here, guarded by `solid == Trigger` (a respawning item that's already been taken is
 /// non-solid → skipped) so this can't double-grant even if an engine *does* fire the touch.
 fn bot_pickup_items(game: &mut GameState, e: EntId) {
-    if game.entities[e].v.health <= 0.0 || game.entities[e].v.deadflag != 0.0 {
+    if game.entities[e].v.health <= 0.0 || game.entities[e].v.deadflag != DeadFlag::No {
         return;
     }
     let origin = game.entities[e].v.origin;
@@ -479,7 +480,7 @@ fn sense(game: &GameState, e: EntId) -> Sense {
     let on_ground = game.entities[e].v.flags.has(Flags::ONGROUND);
     // Swimming (waterlevel >= 2): matches the swim gate in `player_jump` and combat's `swimming`.
     let in_water = game.entities[e].v.waterlevel >= 2.0;
-    let alive = game.entities[e].v.health > 0.0 && game.entities[e].v.deadflag == 0.0;
+    let alive = game.entities[e].v.health > 0.0 && game.entities[e].v.deadflag == DeadFlag::No;
     // Vertical speed and whether the once-per-air-travel double jump is still available — snapshot
     // now, since the `&mut bot` binding below blocks reading the edict during the move logic.
     let vz = game.entities[e].v.velocity.z;
@@ -898,7 +899,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // (bots-only) server never runs. So the bot sits at 0 health forever, and the respawn pulse below
     // can't help it (`death_think` only runs for `deadflag >= Dead`). Seed fresh spawn parms before
     // spawning; FFA/team keep those decoded parms, while fixed-kit modes overwrite them.
-    if !alive && game.entities[e].v.deadflag == 0.0 {
+    if !alive && game.entities[e].v.deadflag == DeadFlag::No {
         // Don't place onto an occupied spot the mode can't telefrag clear (Rocket Arena): postpone
         // and retry next bot frame — an early return without a command is this branch's own shape.
         let mode = game.mode;
@@ -989,7 +990,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     let gate_ready: Vec<bool> = (0..graph.gate_count())
         .map(|gi| {
             let g = graph.gate(gi);
-            !g.shoot || game.entities[EntId(g.activator)].v.takedamage != 0.0
+            !g.shoot || game.entities[EntId(g.activator)].v.takedamage != TakeDamage::No
         })
         .collect();
 
@@ -1974,7 +1975,7 @@ fn nearest_human(game: &GameState, bot_e: EntId) -> Option<EntId> {
         if !ent.in_use || ent.bot.is_bot || ent.classname() != Some("player") {
             continue;
         }
-        if ent.v.health <= 0.0 || ent.v.deadflag != 0.0 {
+        if ent.v.health <= 0.0 || ent.v.deadflag != DeadFlag::No {
             continue;
         }
         let d = (ent.v.origin - origin).length_squared();

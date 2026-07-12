@@ -112,7 +112,7 @@ impl GameState {
             self.host
                 .sound(hook, Channel::Weapon, Sound::PLAYER_AXHIT2, 1.0, Attenuation::Norm);
             // One hit on impact; further damage only goes to players (so doors/triggers fire once).
-            if self.entities[other].v.takedamage != 0.0 {
+            if self.entities[other].v.takedamage != TakeDamage::No {
                 self.t_damage(other, hook, owner, 1.0);
             }
             let h = &mut self.entities[hook];

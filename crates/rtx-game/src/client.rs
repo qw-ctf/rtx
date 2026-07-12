@@ -222,13 +222,13 @@ impl GameState {
             ent.maxspeed = maxspeed;
             ent.classname = Some("player".into());
             ent.v.health = 100.0;
-            ent.v.takedamage = TakeDamage::Aim.as_f32();
+            ent.v.takedamage = TakeDamage::Aim;
             ent.v.solid = Solid::SlideBox;
             ent.v.movetype = MoveType::Walk;
             ent.v.max_health = 100.0;
             ent.v.flags = Flags::CLIENT.as_f32();
             ent.v.effects = 0.0;
-            ent.v.deadflag = DeadFlag::No.as_f32();
+            ent.v.deadflag = DeadFlag::No;
             // Respawn: a fresh player, so wipe all per-life combat state (powerup timers, pain
             // and attack cooldowns, the air-jump latch, …) and set only the two time-based timers.
             ent.combat = CombatState::default();
@@ -339,11 +339,11 @@ impl GameState {
         mode.player_prethink(self, e); // CTF Regeneration rune tick
 
         let deadflag = self.entities[e].v.deadflag;
-        if deadflag >= DeadFlag::Dead.as_f32() {
+        if deadflag >= DeadFlag::Dead {
             self.player_death_think(e);
             return;
         }
-        if deadflag.is(DeadFlag::Dying) {
+        if deadflag == DeadFlag::Dying {
             return;
         }
 
@@ -383,7 +383,7 @@ impl GameState {
 
     /// `PlayerPostThink` — runs after engine physics: landing damage, powerups, weapon loop.
     pub(crate) fn player_post_think(&mut self, e: EntId) {
-        if self.entities[e].v.view_ofs == Vec3::ZERO || self.entities[e].v.deadflag != 0.0 {
+        if self.entities[e].v.view_ofs == Vec3::ZERO || self.entities[e].v.deadflag != DeadFlag::No {
             return;
         }
 
@@ -501,11 +501,11 @@ impl GameState {
             let v = &self.entities[e].v;
             (self.entities[e].v.deadflag, v.button0, v.button1, v.button2)
         };
-        if deadflag.is(DeadFlag::Dead) {
+        if deadflag == DeadFlag::Dead {
             if b0 != 0.0 || b1 != 0.0 || b2 != 0.0 {
                 return;
             }
-            self.entities[e].v.deadflag = DeadFlag::Respawnable.as_f32();
+            self.entities[e].v.deadflag = DeadFlag::Respawnable;
             return;
         }
         if b0 == 0.0 && b1 == 0.0 && b2 == 0.0 {
