@@ -561,11 +561,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     let eye = origin + Vec3::new(0.0, 0.0, 22.0);
     let to_look = look_point - eye;
     let mut look = if to_look.xy().length() > 48.0 {
-        Vec3::new(
-            -to_look.z.atan2(to_look.xy().length()).to_degrees(),
-            to_look.y.atan2(to_look.x).to_degrees(),
-            0.0,
-        )
+        combat::angles_to(eye, look_point)
     } else if dist > 8.0 {
         angles // steering yaw is still meaningful — look where we're walking
     } else if bot.aim != Vec3::ZERO {
@@ -634,13 +630,8 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     let rj_lock = matches!(bot.rj_phase, RjPhase::Rise | RjPhase::Ballistic);
 
     if let Some(t) = hook.look_target {
-        let d = t - eye;
-        if d.xy().length() > 1.0 {
-            look = Vec3::new(
-                -d.z.atan2(d.xy().length()).to_degrees(),
-                d.y.atan2(d.x).to_degrees(),
-                0.0,
-            );
+        if (t - eye).xy().length() > 1.0 {
+            look = combat::angles_to(eye, t);
         }
     }
     // Rocket-jump look: Stance/Rise hold the solved fire *angles* directly (the shot flies along the
@@ -648,13 +639,8 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     if let Some(a) = rj.look_target_angles {
         look = a;
     } else if let Some(t) = rj.look_target {
-        let d = t - eye;
-        if d.xy().length() > 1.0 {
-            look = Vec3::new(
-                -d.z.atan2(d.xy().length()).to_degrees(),
-                d.y.atan2(d.x).to_degrees(),
-                0.0,
-            );
+        if (t - eye).xy().length() > 1.0 {
+            look = combat::angles_to(eye, t);
         }
     }
     // Audience watch (arena Spectate): eyes on the fighter the mode chose — already LOS-validated
@@ -716,10 +702,8 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         let at_button =
             bot.route_pos >= bot.route.len() || (origin.xy() - graph.cell_origin(g.button_cell).xy()).length() < 40.0;
         if at_button {
-            let d = g.aim - eye;
-            let yaw = d.y.atan2(d.x).to_degrees();
-            let pitch = -d.z.atan2(d.xy().length()).to_degrees();
-            angles = Vec3::new(pitch, yaw, 0.0);
+            angles = combat::angles_to(eye, g.aim);
+            let (pitch, yaw) = (angles.x, angles.y);
             look = angles; // the button needs a precise aim; the spring settles on it while parked
             buttons &= !BUTTON_JUMP;
             if g.shoot {
