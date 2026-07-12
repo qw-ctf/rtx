@@ -724,21 +724,36 @@ impl GameState {
 
     /// `WaterMove` — drowning and lava/slime damage and enter/leave sounds.
     fn water_move(&mut self, e: EntId) {
-        let time = self.time();
-        let (movetype, health, waterlevel, watertype, air_finished) = {
+        let (movetype, health, waterlevel) = {
             let ent = &self.entities[e];
-            (
-                ent.v.movetype,
-                ent.v.health,
-                ent.v.waterlevel,
-                ent.v.watertype,
-                ent.combat.air_finished,
-            )
+            (ent.v.movetype, ent.v.health, ent.v.waterlevel)
         };
         if movetype == MoveType::Noclip || health < 0.0 {
             return;
         }
+        self.update_air_supply(e);
+        if waterlevel == 0.0 {
+            // Just left the water: play the out-of-water splash and clear the flag.
+            if self.entities[e].v.flags.has(Flags::INWATER) {
+                self.host
+                    .sound(e, Channel::Body, Sound::MISC_OUTWATER, 1.0, Attenuation::Norm);
+                let ent = &mut self.entities[e];
+                ent.v.flags = ent.v.flags.without(Flags::INWATER);
+            }
+            return;
+        }
+        self.apply_liquid_damage(e);
+        self.update_water_sounds(e);
+    }
 
+    /// Air/drowning accounting: out of (or only partly in) the water refreshes the air timer and
+    /// gasps as it runs low; fully submerged past the timer drowns, crediting the liquid.
+    fn update_air_supply(&mut self, e: EntId) {
+        let time = self.time();
+        let (waterlevel, watertype, air_finished) = {
+            let ent = &self.entities[e];
+            (ent.v.waterlevel, ent.v.watertype, ent.combat.air_finished)
+        };
         if waterlevel != 3.0 {
             if air_finished < time {
                 self.host
@@ -768,21 +783,15 @@ impl GameState {
             };
             self.t_damage(e, EntId::WORLD, EntId::WORLD, dmg);
         }
+    }
 
-        if waterlevel == 0.0 {
-            if self.entities[e].v.flags.has(Flags::INWATER) {
-                self.host
-                    .sound(e, Channel::Body, Sound::MISC_OUTWATER, 1.0, Attenuation::Norm);
-                let ent = &mut self.entities[e];
-                ent.v.flags = ent.v.flags.without(Flags::INWATER);
-            }
-            return;
-        }
-
-        // Lava/slime contact damage.
-        let (dmgtime, radsuit) = {
+    /// Lava / slime contact damage while standing in it (throttled by `dmgtime`; the biosuit exempts
+    /// slime and slows lava).
+    fn apply_liquid_damage(&mut self, e: EntId) {
+        let time = self.time();
+        let (waterlevel, watertype, dmgtime, radsuit) = {
             let ent = &self.entities[e];
-            (ent.combat.dmgtime, ent.combat.radsuit_finished)
+            (ent.v.waterlevel, ent.v.watertype, ent.combat.dmgtime, ent.combat.radsuit_finished)
         };
         if watertype.is(Content::Lava) && dmgtime < time {
             self.entities[e].combat.dmgtime = if radsuit > time { time + 1.0 } else { time + 0.2 };
@@ -793,21 +802,27 @@ impl GameState {
             self.entities[e].deathtype = DeathType::Slime;
             self.t_damage(e, EntId::WORLD, EntId::WORLD, 4.0 * waterlevel);
         }
+    }
 
-        if !self.entities[e].v.flags.has(Flags::INWATER) {
-            let s = match watertype {
-                w if w.is(Content::Lava) => Some(Sound::PLAYER_INLAVA),
-                w if w.is(Content::Water) => Some(Sound::PLAYER_INH2O),
-                w if w.is(Content::Slime) => Some(Sound::PLAYER_SLIMBRN2),
-                _ => None,
-            };
-            if let Some(s) = s {
-                self.host.sound(e, Channel::Body, s, 1.0, Attenuation::Norm);
-            }
-            let ent = &mut self.entities[e];
-            ent.v.flags = ent.v.flags.with(Flags::INWATER);
-            ent.combat.dmgtime = 0.0;
+    /// The enter-water splash: on first entering, play the per-liquid sound, set the `INWATER` flag,
+    /// and reset the contact-damage clock.
+    fn update_water_sounds(&mut self, e: EntId) {
+        if self.entities[e].v.flags.has(Flags::INWATER) {
+            return;
         }
+        let watertype = self.entities[e].v.watertype;
+        let s = match watertype {
+            w if w.is(Content::Lava) => Some(Sound::PLAYER_INLAVA),
+            w if w.is(Content::Water) => Some(Sound::PLAYER_INH2O),
+            w if w.is(Content::Slime) => Some(Sound::PLAYER_SLIMBRN2),
+            _ => None,
+        };
+        if let Some(s) = s {
+            self.host.sound(e, Channel::Body, s, 1.0, Attenuation::Norm);
+        }
+        let ent = &mut self.entities[e];
+        ent.v.flags = ent.v.flags.with(Flags::INWATER);
+        ent.combat.dmgtime = 0.0;
     }
 
     /// `CheckPowerups` — expire powerups, flash warnings, and drive their lighting effects.
