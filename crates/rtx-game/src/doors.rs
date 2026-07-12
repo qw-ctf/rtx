@@ -9,6 +9,7 @@ use glam::Vec3;
 use crate::assets::Sound;
 use crate::defs::*;
 use crate::entity::{Blocked, Die, EntId, MoverPhase, Think, Touch, Use};
+use crate::subs::{NoiseSlot, Phs};
 use crate::game::GameState;
 use crate::obituary::DeathType;
 
@@ -34,7 +35,7 @@ impl GameState {
 
     /// `door_hit_top`.
     pub(crate) fn door_hit_top(&mut self, e: EntId) {
-        self.play_door(e, true, 1);
+        self.mover_sound(e, NoiseSlot::Noise1, Phs::NoPhs);
         self.entities[e].mover.state = MoverPhase::Top;
         if self.entities[e].v.spawnflags.has(DoorFlags::TOGGLE) {
             return;
@@ -48,13 +49,13 @@ impl GameState {
 
     /// `door_hit_bottom`.
     pub(crate) fn door_hit_bottom(&mut self, e: EntId) {
-        self.play_door(e, true, 1);
+        self.mover_sound(e, NoiseSlot::Noise1, Phs::NoPhs);
         self.entities[e].mover.state = MoverPhase::Bottom;
     }
 
     /// `door_go_down`.
     pub(crate) fn door_go_down(&mut self, e: EntId) {
-        self.play_door(e, false, 2);
+        self.mover_sound(e, NoiseSlot::Noise2, Phs::Normal);
         {
             let ent = &mut self.entities[e];
             if ent.v.max_health != 0.0 {
@@ -83,7 +84,7 @@ impl GameState {
             self.entities[e].v.nextthink = ltime + wait;
             return;
         }
-        self.play_door(e, false, 2);
+        self.mover_sound(e, NoiseSlot::Noise2, Phs::Normal);
         self.entities[e].mover.state = MoverPhase::Up;
         let (pos2, speed) = {
             let v = &self.entities[e];
@@ -98,7 +99,7 @@ impl GameState {
     /// `door_fire` — open (or, when toggled, close) every door in the linked group.
     fn door_fire(&mut self, master: EntId) {
         if self.entities[master].v.items != 0.0 {
-            self.play_door(master, false, 4);
+            self.mover_sound(master, NoiseSlot::Noise4, Phs::Normal);
         }
         self.entities[master].message = None;
 
@@ -211,7 +212,7 @@ impl GameState {
                 }
             };
             self.centerprint_to(other, msg);
-            self.play_door(e, false, 3);
+            self.mover_sound(e, NoiseSlot::Noise3, Phs::Normal);
             return;
         }
 
@@ -432,22 +433,5 @@ impl GameState {
         };
         self.entities[e].noise1 = Some(n1);
         self.entities[e].noise2 = Some(n2);
-    }
-
-    /// Play the door's `noiseN` (1..4) on `chan`.
-    fn play_door(&mut self, e: EntId, no_phs: bool, which: i32) {
-        let noise = match which {
-            1 => self.entities[e].noise1,
-            2 => self.entities[e].noise2,
-            3 => self.entities[e].noise3,
-            _ => self.entities[e].noise4,
-        };
-        if let Some(noise) = noise {
-            if no_phs {
-                self.host.sound_no_phs(e, Channel::Voice, noise, 1.0, Attenuation::Norm);
-            } else {
-                self.host.sound(e, Channel::Voice, noise, 1.0, Attenuation::Norm);
-            }
-        }
     }
 }

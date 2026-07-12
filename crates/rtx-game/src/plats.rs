@@ -8,30 +8,16 @@ use glam::Vec3;
 use crate::assets::Sound;
 use crate::defs::*;
 use crate::entity::{Blocked, EntId, MoverPhase, Think, Touch, Use};
+use crate::subs::{NoiseSlot, Phs};
 use crate::game::GameState;
 use crate::obituary::DeathType;
 
 impl GameState {
     // --- plats ---
 
-    fn plat_sound(&mut self, e: EntId, no_phs: bool, which: i32) {
-        let noise = if which == 0 {
-            self.entities[e].noise
-        } else {
-            self.entities[e].noise1
-        };
-        if let Some(noise) = noise {
-            if no_phs {
-                self.host.sound_no_phs(e, Channel::Voice, noise, 1.0, Attenuation::Norm);
-            } else {
-                self.host.sound(e, Channel::Voice, noise, 1.0, Attenuation::Norm);
-            }
-        }
-    }
-
     /// `plat_hit_top`.
     pub(crate) fn plat_hit_top(&mut self, e: EntId) {
-        self.plat_sound(e, true, 1);
+        self.mover_sound(e, NoiseSlot::Noise1, Phs::NoPhs);
         let ltime = self.entities[e].v.ltime;
         let ent = &mut self.entities[e];
         ent.mover.state = MoverPhase::Top;
@@ -41,13 +27,13 @@ impl GameState {
 
     /// `plat_hit_bottom`.
     pub(crate) fn plat_hit_bottom(&mut self, e: EntId) {
-        self.plat_sound(e, true, 1);
+        self.mover_sound(e, NoiseSlot::Noise1, Phs::NoPhs);
         self.entities[e].mover.state = MoverPhase::Bottom;
     }
 
     /// `plat_go_down`.
     pub(crate) fn plat_go_down(&mut self, e: EntId) {
-        self.plat_sound(e, false, 0);
+        self.mover_sound(e, NoiseSlot::Noise, Phs::Normal);
         self.entities[e].mover.state = MoverPhase::Down;
         let (pos2, speed) = {
             let v = &self.entities[e];
@@ -58,7 +44,7 @@ impl GameState {
 
     /// `plat_go_up`.
     pub(crate) fn plat_go_up(&mut self, e: EntId) {
-        self.plat_sound(e, false, 0);
+        self.mover_sound(e, NoiseSlot::Noise, Phs::Normal);
         self.entities[e].mover.state = MoverPhase::Up;
         let (pos1, speed) = {
             let v = &self.entities[e];
@@ -243,7 +229,7 @@ impl GameState {
         };
         if wait != 0.0 {
             self.entities[e].v.nextthink = ltime + wait;
-            self.plat_sound(e, true, 0);
+            self.mover_sound(e, NoiseSlot::Noise, Phs::NoPhs);
         } else {
             self.entities[e].v.nextthink = ltime + 0.1;
         }
@@ -266,7 +252,7 @@ impl GameState {
         };
         self.entities[e].target = next_target;
         self.entities[e].mover.wait = targ_wait; // 0 if none
-        self.plat_sound(e, false, 1);
+        self.mover_sound(e, NoiseSlot::Noise1, Phs::Normal);
         let (mins, speed) = {
             let v = &self.entities[e];
             (v.v.mins, v.mover.speed)

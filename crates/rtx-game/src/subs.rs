@@ -19,7 +19,44 @@ pub(crate) fn mover_pos2(pos1: Vec3, movedir: Vec3, size: Vec3, lip: f32) -> Vec
     pos1 + movedir * (movedir.dot(size).abs() - lip)
 }
 
+/// One of a mover's five noise slots (`noise`..`noise4`), named so plats/doors/buttons stop picking
+/// the slot by a magic int.
+#[derive(Clone, Copy)]
+pub(crate) enum NoiseSlot {
+    Noise,
+    Noise1,
+    Noise2,
+    Noise3,
+    Noise4,
+}
+
+/// Whether a mover sound honors the PHS (potentially-hearable set) or bypasses it — the arrival/stop
+/// sounds use `NoPhs` so a distant player still hears the lift settle.
+#[derive(Clone, Copy)]
+pub(crate) enum Phs {
+    Normal,
+    NoPhs,
+}
+
 impl GameState {
+    /// Play a mover's `slot` noise on the Voice channel, honoring `phs`. Shared by the plat, door and
+    /// button movers, which each used to re-pick the slot by int and branch on a `no_phs` bool.
+    pub(crate) fn mover_sound(&mut self, e: EntId, slot: NoiseSlot, phs: Phs) {
+        let noise = match slot {
+            NoiseSlot::Noise => self.entities[e].noise,
+            NoiseSlot::Noise1 => self.entities[e].noise1,
+            NoiseSlot::Noise2 => self.entities[e].noise2,
+            NoiseSlot::Noise3 => self.entities[e].noise3,
+            NoiseSlot::Noise4 => self.entities[e].noise4,
+        };
+        if let Some(noise) = noise {
+            match phs {
+                Phs::Normal => self.host.sound(e, Channel::Voice, noise, 1.0, Attenuation::Norm),
+                Phs::NoPhs => self.host.sound_no_phs(e, Channel::Voice, noise, 1.0, Attenuation::Norm),
+            }
+        }
+    }
+
     /// `SetMovedir` — QuakeEd writes a single yaw float for door/button move direction;
     /// the magic angles `0 -1 0` / `0 -2 0` mean straight up / down.
     pub(crate) fn set_movedir(&mut self, e: EntId) {
