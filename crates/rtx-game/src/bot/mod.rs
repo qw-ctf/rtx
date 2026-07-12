@@ -933,39 +933,20 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // `find_path` bends the route around a closed door when any open way exists and only crosses
     // one (leaving the bot to detour to the button) when there's no alternative. Computed before
     // the nav borrow (it reads the obstruction edicts).
-    let gate_closed = game.gate_closed_flags();
+    // This bot's per-frame A* pricing: closed gates (so `find_path` bends the route around a shut
+    // door when it can), this bot's failed-link surcharges (so the planner diverts off legs it keeps
+    // failing rather than handing back the same dead route), and its rocket-jump fitness gate. Built
+    // from an immutable read so the owned Vecs outlive the disjoint `&mut bot` borrow below.
+    let pricing = game.bot_link_pricing(e, now);
 
     // Live lift states, for the plat standoff. A bot approaching a raised `func_plat` must hold
     // outside its inner trigger — standing under it resets the lift's lower-timer and it never comes
     // down (see `plat_statuses`). Read before the nav borrow (it reads the plat edicts).
     let plat_status = game.plat_statuses();
 
-    // This bot's live failed-link surcharges: legs it recently failed to traverse (stuck, stalled
-    // speed-jump, given-up hook) cost extra in *its* A* so the planner diverts instead of handing
-    // back the identical dead route to retry until a coarse goal-timeout fires. Built here from an
-    // immutable read so the owned Vecs outlive the disjoint `&mut bot` borrow below; new failures
-    // recorded later this frame apply next frame. Expired entries are dropped as they're gathered.
-    let penalties: Vec<(u32, f32)> = game.entities[e]
-        .bot
-        .failed_links
-        .iter()
-        .filter(|&&(_, until, _)| until > now)
-        .map(|&(li, _, strikes)| (li, link_penalty_secs(strikes)))
-        .collect();
-    // Gates + this bot's penalties + a per-bot jitter seed (so two bots vary otherwise-equal routes
-    // rather than treading an identical line — cheap route variety that also reads as more human) +
-    // the rocket-jump fitness gate (so a bot with no RL / rocket / health plans around RJ links).
-    let rj_extra = rj::rocket_jump_extra(
-        &game.entities[e].v,
-        game.entities[e].combat.super_damage_finished,
-        now,
-    );
-    let costs = LinkCosts {
-        gate_closed: &gate_closed,
-        penalties: &penalties,
-        jitter_seed: e.0,
-        rocket_jump_extra: rj_extra,
-    };
+    // A per-bot jitter seed varies otherwise-equal routes so two bots don't tread an identical line
+    // (cheap route variety that also reads as more human).
+    let costs = pricing.costs(e.0);
 
     // Graph queries (borrows game.nav) and bot-state updates (borrows game.entities) are on
     // disjoint fields, so they coexist; `host` is a Copy, no game borrow held across the send.
@@ -1058,6 +1039,50 @@ fn route_blocking_gate(graph: &NavGraph, route: &[u32], from: usize, closed: &[b
 /// capped). Grows super-linearly so a link that keeps failing is diverted harder each time.
 fn link_penalty_secs(strikes: u8) -> f32 {
     ((strikes as f32).powi(2) * PENALTY_STEP).min(PENALTY_CAP)
+}
+
+/// A bot's per-frame A* pricing inputs, gathered from an immutable `&GameState` so the owned Vecs
+/// outlive the disjoint `&mut bot` borrow: the live closed-gate flags, this bot's unexpired
+/// failed-link surcharges, and its rocket-jump fitness gate. Build once with
+/// [`GameState::bot_link_pricing`], then take a [`LinkCosts`] view per query with [`costs`](Self::costs)
+/// — the only difference between callers is the jitter seed (per-bot for routing variety, `0` for
+/// stable item scoring). Replaces the identical assembly `run_bot` and `best_item_goal` each spelled out.
+pub(crate) struct LinkPricing {
+    gate_closed: Vec<bool>,
+    penalties: Vec<(u32, f32)>,
+    rj_extra: f32,
+}
+
+impl LinkPricing {
+    /// A `LinkCosts` view over this pricing, with the caller's `jitter_seed`.
+    pub(crate) fn costs(&self, jitter_seed: u32) -> LinkCosts<'_> {
+        LinkCosts {
+            gate_closed: &self.gate_closed,
+            penalties: &self.penalties,
+            jitter_seed,
+            rocket_jump_extra: self.rj_extra,
+        }
+    }
+}
+
+impl GameState {
+    /// Gather bot `e`'s live A* pricing (see [`LinkPricing`]) — closed gates, its failed-link
+    /// surcharges (expired entries dropped), and its rocket-jump fitness gate.
+    pub(crate) fn bot_link_pricing(&self, e: EntId, now: f32) -> LinkPricing {
+        let penalties = self.entities[e]
+            .bot
+            .failed_links
+            .iter()
+            .filter(|&&(_, until, _)| until > now)
+            .map(|&(li, _, strikes)| (li, link_penalty_secs(strikes)))
+            .collect();
+        let rj_extra = rj::rocket_jump_extra(&self.entities[e].v, self.entities[e].combat.super_damage_finished, now);
+        LinkPricing {
+            gate_closed: self.gate_closed_flags(),
+            penalties,
+            rj_extra,
+        }
+    }
 }
 
 /// Whether the goal-ward distance has stalled: no improvement of at least `PROGRESS_EPS` below the

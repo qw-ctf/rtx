@@ -23,7 +23,7 @@ use crate::arsenal::AmmoKind;
 use crate::defs::{Bits, Items, Solid};
 use crate::entity::{EntId, Think, Touch};
 use crate::game::GameState;
-use crate::navmesh::{CellId, LinkCosts};
+use crate::navmesh::CellId;
 
 /// Beyond this travel-or-respawn time (seconds) an *ordinary* item isn't worth pursuing.
 pub(crate) const LOOKAHEAD: f32 = 10.0;
@@ -694,34 +694,13 @@ impl GameState {
         let graph = self.nav.graph.as_ref()?;
         let bot_cell = graph.nearest(self.entities[bot_e].v.origin)?;
         let now = self.time();
-        // Gate-aware: items behind a shut door cost more, so a bot prefers ones it can reach now.
-        // Also charge this bot's failed-link penalties (jitter off — item scoring stays stable): an
-        // item only reachable via a leg it keeps failing floods to a higher `t` and scores lower, so
-        // it stops re-choosing an item it can path a route to but never actually traverse.
-        let gate_closed = self.gate_closed_flags();
-        let penalties: Vec<(u32, f32)> = self.entities[bot_e]
-            .bot
-            .failed_links
-            .iter()
-            .filter(|&&(_, until, _)| until > now)
-            .map(|&(li, _, strikes)| (li, super::link_penalty_secs(strikes)))
-            .collect();
-        // The rocket-jump fitness gate too, so an item only reachable via a rocket jump scores as
-        // (near-)unreachable for a bot that can't currently make one — it stops choosing it.
-        let rj_extra = super::rj::rocket_jump_extra(
-            &self.entities[bot_e].v,
-            self.entities[bot_e].combat.super_damage_finished,
-            now,
-        );
-        let costs = graph.costs_from(
-            bot_cell,
-            &LinkCosts {
-                gate_closed: &gate_closed,
-                penalties: &penalties,
-                jitter_seed: 0,
-                rocket_jump_extra: rj_extra,
-            },
-        );
+        // Gate-aware, and charged with this bot's failed-link surcharges and rocket-jump fitness gate
+        // (jitter off — `0` — so item scoring stays stable): an item behind a shut door, only
+        // reachable via a leg it keeps failing, or needing a rocket jump it can't make, floods to a
+        // higher `t` and scores lower, so the bot stops re-choosing an item it can never actually
+        // reach. Same pricing `run_bot` routes with (see [`LinkPricing`](super::LinkPricing)).
+        let pricing = self.bot_link_pricing(bot_e, now);
+        let costs = graph.costs_from(bot_cell, &pricing.costs(0));
         let s = self.bot_stats(bot_e);
         // The item we're already chasing, for the hysteresis bonus below.
         let current_goal = self.entities[bot_e].bot.goal_item;
