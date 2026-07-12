@@ -56,11 +56,8 @@ pub struct BotState {
     /// Item vigil ([`crate::bot::vigil`]): cruise-and-scan while waiting on an uncollectable goal
     /// item. See [`Vigil`].
     pub vigil: Vigil,
-    /// Plat standoff: the navmesh plat index we're holding off from while it's raised, and when the
-    /// hold began (the give-up timeout base). Keyed on the plat index, not the leg, so the 0.4s
-    /// repath churn doesn't reset the timer. `None` = not waiting on a lift.
-    pub plat_wait: Option<usize>,
-    pub plat_wait_since: f32,
+    /// Plat standoff — the lift we're holding off from while it's raised. See [`PlatWait`].
+    pub plat_wait: Option<PlatWait>,
     /// Grappling-hook traversal state machine (see [`HookState`]), driven when the current route leg
     /// is a [`LinkKind::Hook`](crate::navmesh::LinkKind::Hook).
     pub hook: HookState,
@@ -69,16 +66,14 @@ pub struct BotState {
     /// The bunnyhop controller (see [`crate::bot::bhop`]): the hop-cycle phase machine, sticky
     /// strafe sign, engage hysteresis, and telemetry.
     pub bhop: crate::bot::bhop::Bhop,
-    /// The [`LinkKind::SpeedJump`](crate::navmesh::LinkKind::SpeedJump) leg currently being flown (a
-    /// committed bhop run-up + leap), and when it began. `None` = not on a speed jump.
-    pub sj_leg: Option<u32>,
-    pub sj_started: f32,
-    /// The plain jump leg (JumpGap/DoubleJump) currently being flown, and when the commitment began.
-    /// Latched at takeoff, it freezes the route and locks out combat until landing — so an enemy
-    /// appearing mid-arc can't flip the goal, replace the route, and yank the bot off the jump (the
-    /// `sj_leg`/rocket-jump commitment, which plain jumps previously lacked). `None` = not committed.
-    pub air_leg: Option<u32>,
-    pub air_started: f32,
+    /// A committed [`LinkKind::SpeedJump`](crate::navmesh::LinkKind::SpeedJump) leg (a bhop run-up +
+    /// leap) being flown. `None` = not on a speed jump. See [`Commit`].
+    pub sj: Option<Commit>,
+    /// A committed plain jump leg (JumpGap/DoubleJump) being flown. Latched at takeoff, it freezes
+    /// the route and locks out combat until landing — so an enemy appearing mid-arc can't flip the
+    /// goal, replace the route, and yank the bot off the jump (the same commitment `sj`/the rocket
+    /// jump have, which plain jumps previously lacked). `None` = not committed. See [`Commit`].
+    pub air: Option<Commit>,
     /// Rocket-jump traversal machine (see [`RjState`]): stance → jump → fire → ride the blast arc
     /// onto a high ledge.
     pub rj: RjState,
@@ -214,6 +209,24 @@ pub struct Vigil {
     pub post_until: f32,
     pub scan_point: Vec3,
     pub scan_until: f32,
+}
+
+/// A latched route-leg commitment — a speed jump or a plain-jump arc — that freezes the route while
+/// in flight: the leg being flown and when the commitment began (the watchdog's timeout base). While
+/// Some, a goal flip mid-air can't replace the route and yank the bot off the jump.
+#[derive(Clone, Copy)]
+pub struct Commit {
+    pub leg: u32,
+    pub since: f32,
+}
+
+/// Plat standoff (see [`crate::bot::steer`]): the navmesh plat index the bot is holding off from
+/// while it's raised, and when the hold began (the give-up timeout base). Keyed on the plat index,
+/// not the leg, so the 0.4s repath churn doesn't reset the timer.
+#[derive(Clone, Copy)]
+pub struct PlatWait {
+    pub plat: usize,
+    pub since: f32,
 }
 
 /// A gate the bot is diverting to open (its button unreachable by the normal route), plus its

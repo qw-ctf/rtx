@@ -417,7 +417,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     }
     // On a speed-jump leg the route must be frozen: the link's `from` is the runway start, now behind
     // the bot, so a repath would drop the link and turn the bot around at speed. Treated like `hooking`.
-    let on_sj = game.entities[e].bot.sj_leg.is_some();
+    let on_sj = game.entities[e].bot.sj.is_some();
     // A rocket-jump leg freezes the route the same way (stance stands still, the arc flies fast).
     let on_rj = game.entities[e].bot.rj.phase != RjPhase::Idle;
 
@@ -762,7 +762,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
         if b.goal.hold_item != 0 {
             (b.goal.hold_item, b.goal.hold_for, b.goal.hold_until) = (0, 0, 0.0);
         }
-        b.air_leg = None;
+        b.air = None;
     }
 
     // Connected but never spawned (health 0, not dead): the engine defers `PutClientInServer` — the

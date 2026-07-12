@@ -13,7 +13,7 @@
 use glam::{Vec3, Vec3Swizzles};
 
 use super::*;
-use crate::bot::state::GateErrand;
+use crate::bot::state::{Commit, GateErrand, PlatWait};
 use crate::defs::{Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP};
 use crate::game::cstring;
 use crate::nav_build::PlatStatus;
@@ -61,7 +61,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // Airborne jump commitment (latched last frame at takeoff): while flying a plain jump leg, freeze
     // the route and lock out combat so an enemy appearing mid-arc can't flip the goal and yank us off
     // the jump. Read here (before the repath gate and leg-advance) like `on_sj`/`on_rj`.
-    let on_air = bot.air_leg.is_some();
+    let on_air = bot.air.is_some();
     // Route committed to a ballistic traversal (hook flight, speed jump, or rocket jump): a goal flip
     // must not replace the route and yank the bot off the leg it's flying. Gates the repath/errand
     // logic below (`on_air`, the plain-jump commitment, is a separate, per-arc gate added alongside).
@@ -192,7 +192,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // carries us up, so XY barely changes.
     // A bunnyhopping bot covers ground fast enough to orbit a 24u waypoint, so widen the arrival gate
     // with speed and also advance once a waypoint slips *behind* the velocity.
-    let arrive_r = if bot.bhop.phase != bhop::Phase::Off || bot.sj_leg.is_some() {
+    let arrive_r = if bot.bhop.phase != bhop::Phase::Off || bot.sj.is_some() {
         ARRIVE_RADIUS.max(2.0 * speed * frametime)
     } else {
         ARRIVE_RADIUS
@@ -214,7 +214,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             LinkKind::RocketJump => false,
             _ => {
                 let to = target.xy() - origin.xy();
-                let fast = bot.bhop.phase != bhop::Phase::Off || bot.sj_leg.is_some();
+                let fast = bot.bhop.phase != bhop::Phase::Off || bot.sj.is_some();
                 to.length() <= arrive_r || (fast && to.dot(v_xy) < 0.0 && to.length() <= 64.0)
             }
         };
@@ -276,10 +276,9 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // lowers — by striking its ride link so this bot's A* diverts, then re-path.
     match plat_hold {
         Some(pi) => {
-            if bot.plat_wait != Some(pi) {
-                bot.plat_wait = Some(pi);
-                bot.plat_wait_since = now;
-            } else if now - bot.plat_wait_since > PLAT_WAIT_TIMEOUT {
+            if bot.plat_wait.map(|w| w.plat) != Some(pi) {
+                bot.plat_wait = Some(PlatWait { plat: pi, since: now });
+            } else if bot.plat_wait.is_some_and(|w| now - w.since > PLAT_WAIT_TIMEOUT) {
                 let ride = bot.route[bot.route_pos..]
                     .iter()
                     .copied()
@@ -437,37 +436,35 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     let mut sj_active =
         matches!(kind, Some(LinkKind::SpeedJump)) && host.cvar_bool(c"rtx_bot_bhop") && !hook_active && !rj_active;
     if sj_active {
-        if bot.sj_leg != cur_leg {
-            bot.sj_leg = cur_leg;
-            bot.sj_started = now;
+        if bot.sj.map(|c| c.leg) != cur_leg {
+            bot.sj = cur_leg.map(|leg| Commit { leg, since: now });
         }
         // Watchdog: the route is frozen mid-leg, so if the run-up stalls (blocked, shoved, never
         // built speed) abandon it and re-path rather than wedging on the runway forever.
-        if now - bot.sj_started > 4.0 {
-            bot.sj_leg = None;
+        if bot.sj.is_some_and(|c| now - c.since > 4.0) {
+            bot.sj = None;
             bot.route.clear();
             bot.repath_time = now;
             sj_active = false;
         }
-    } else if bot.sj_leg.is_some() {
-        bot.sj_leg = None;
+    } else if bot.sj.is_some() {
+        bot.sj = None;
     }
     // Airborne commitment for a plain jump leg (JumpGap/DoubleJump): latch it (like `sj_leg`) so the
     // route stays frozen and combat locked until we land. Latched whenever we're on such a leg (the
     // grace in the release decision absorbs the one or two ground frames at takeoff); released on
     // landing, on advancing off the leg, or by the watchdog if we never come down.
     let on_jump_leg = matches!(kind, Some(LinkKind::JumpGap | LinkKind::DoubleJump));
-    if on_jump_leg && bot.air_leg != cur_leg {
-        bot.air_leg = cur_leg;
-        bot.air_started = now;
+    if on_jump_leg && bot.air.map(|c| c.leg) != cur_leg {
+        bot.air = cur_leg.map(|leg| Commit { leg, since: now });
     }
-    if let Some(committed) = bot.air_leg {
-        match air_commit_decision(on_ground, on_jump_leg, now - bot.air_started) {
+    if let Some(committed) = bot.air {
+        match air_commit_decision(on_ground, on_jump_leg, now - committed.since) {
             AirRelease::Keep => {}
-            AirRelease::Land => bot.air_leg = None,
+            AirRelease::Land => bot.air = None,
             AirRelease::Timeout => {
-                penalize_leg(bot, Some(committed), kind, now);
-                bot.air_leg = None;
+                penalize_leg(bot, Some(committed.leg), kind, now);
+                bot.air = None;
                 bot.route.clear();
                 bot.repath_time = now;
             }
