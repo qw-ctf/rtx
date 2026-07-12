@@ -10,7 +10,7 @@ use core::ffi::CStr;
 
 use glam::Vec3;
 
-use crate::arsenal::AmmoKind;
+use crate::arsenal::{self, AmmoKind};
 use crate::assets::{Model, Sound};
 use crate::defs::*;
 use crate::entity::{Die, EntId, Think, Touch};
@@ -787,21 +787,24 @@ impl GameState {
         // earshot learns which weapon the firer holds. No-op when modeling is off.
         self.model_note_weapon_fire(e);
 
+        // Post-shot cooldown from the arsenal for the single-press weapons (the nailguns arm inside
+        // `start_nail`; the lightning gun's continuous beam re-arms faster on this opening press).
+        let cd = arsenal::cooldown_of(self.entities[e].v.weapon.item());
         match self.entities[e].v.weapon {
             w if w == Weapon::Axe => {
-                self.entities[e].combat.attack_finished = time + 0.5;
+                self.entities[e].combat.attack_finished = time + cd;
                 self.host
                     .sound(e, Channel::Weapon, Sound::WEAPONS_AX1, 1.0, Attenuation::Norm);
                 self.start_axe_anim(e);
             }
             w if w == Weapon::Shotgun => {
                 self.start_shot_anim(e);
-                self.entities[e].combat.attack_finished = time + 0.5;
+                self.entities[e].combat.attack_finished = time + cd;
                 self.w_fire_shotgun(e);
             }
             w if w == Weapon::SuperShotgun => {
                 self.start_shot_anim(e);
-                self.entities[e].combat.attack_finished = time + 0.7;
+                self.entities[e].combat.attack_finished = time + cd;
                 self.w_fire_super_shotgun(e);
             }
             w if w == Weapon::Nailgun || w == Weapon::SuperNailgun => {
@@ -809,22 +812,22 @@ impl GameState {
             }
             w if w == Weapon::GrenadeLauncher => {
                 self.start_rocket_anim(e);
-                self.entities[e].combat.attack_finished = time + 0.6;
+                self.entities[e].combat.attack_finished = time + cd;
                 self.w_fire_grenade(e);
             }
             w if w == Weapon::RocketLauncher => {
                 self.start_rocket_anim(e);
-                self.entities[e].combat.attack_finished = time + 0.8;
+                self.entities[e].combat.attack_finished = time + cd;
                 self.w_fire_rocket(e);
             }
             w if w == Weapon::Lightning => {
-                self.entities[e].combat.attack_finished = time + 0.1;
+                self.entities[e].combat.attack_finished = time + 0.1; // beam opens faster than its per-tick cd
                 self.host
                     .sound(e, Channel::Auto, Sound::WEAPONS_LSTART, 1.0, Attenuation::Norm);
                 self.start_light(e);
             }
             w if w == Weapon::Grapple => {
-                self.entities[e].combat.attack_finished = time + 0.1;
+                self.entities[e].combat.attack_finished = time + cd;
                 // Throws on the first press and animates the viewmodel; a no-op while out.
                 self.start_grapple_throw(e);
             }
@@ -853,20 +856,21 @@ impl GameState {
             self.select_grapple(e);
             return;
         }
-        let (weapon, needs_ammo): (Items, bool) = {
-            let v = &self.entities[e].v;
-            match v.impulse as i32 {
-                1 => (Items::AXE, false),
-                2 => (Items::SHOTGUN, v.ammo_shells < 1.0),
-                3 => (Items::SUPER_SHOTGUN, v.ammo_shells < 2.0),
-                4 => (Items::NAILGUN, v.ammo_nails < 1.0),
-                5 => (Items::SUPER_NAILGUN, v.ammo_nails < 2.0),
-                6 => (Items::GRENADE_LAUNCHER, v.ammo_rockets < 1.0),
-                7 => (Items::ROCKET_LAUNCHER, v.ammo_rockets < 1.0),
-                8 => (Items::LIGHTNING, v.ammo_cells < 1.0),
-                _ => (Items::empty(), false),
-            }
+        // impulse 1..=8 selects a weapon; its ammo gate comes from the arsenal (`min_ammo`), not a
+        // second copy of the thresholds here. (`switch_code` is the `.weapon` value, not the impulse,
+        // so the impulse map stays explicit.)
+        let weapon = match self.entities[e].v.impulse as i32 {
+            1 => Items::AXE,
+            2 => Items::SHOTGUN,
+            3 => Items::SUPER_SHOTGUN,
+            4 => Items::NAILGUN,
+            5 => Items::SUPER_NAILGUN,
+            6 => Items::GRENADE_LAUNCHER,
+            7 => Items::ROCKET_LAUNCHER,
+            8 => Items::LIGHTNING,
+            _ => Items::empty(),
         };
+        let needs_ammo = arsenal::out_of_ammo(&self.entities[e].v, weapon);
         self.entities[e].v.impulse = 0.0;
 
         if !self.entities[e].v.items.has(weapon) {
@@ -928,25 +932,16 @@ impl GameState {
     /// `CycleWeaponCommand` — advance to the next owned, fed weapon.
     fn cycle_weapon(&mut self, e: EntId, reverse: bool) {
         self.entities[e].v.impulse = 0.0;
-        const ORDER: [Items; 8] = [
-            Items::AXE,
-            Items::SHOTGUN,
-            Items::SUPER_SHOTGUN,
-            Items::NAILGUN,
-            Items::SUPER_NAILGUN,
-            Items::GRENADE_LAUNCHER,
-            Items::ROCKET_LAUNCHER,
-            Items::LIGHTNING,
-        ];
-        for step in 1..=ORDER.len() {
+        let order: Vec<Items> = arsenal::cycle_order().collect();
+        for step in 1..=order.len() {
             let weapon = self.entities[e].v.weapon.item();
-            let cur = ORDER.iter().position(|&w| w == weapon).unwrap_or(0);
+            let cur = order.iter().position(|&w| w == weapon).unwrap_or(0);
             let next = if reverse {
-                (cur + ORDER.len() - (step % ORDER.len())) % ORDER.len()
+                (cur + order.len() - (step % order.len())) % order.len()
             } else {
-                (cur + step) % ORDER.len()
+                (cur + step) % order.len()
             };
-            let weapon = ORDER[next];
+            let weapon = order[next];
             if self.weapon_fed(e, weapon) {
                 self.entities[e].v.weapon = weapon.into();
                 self.w_set_current_ammo(e);

@@ -48,6 +48,11 @@ pub(crate) struct WeaponSpec {
     pub switch_code: f32,
     /// Minimum ammo in [`ammo_kind`] needed to fire one shot (`0` for the axe/grapple).
     pub min_ammo: f32,
+    /// Post-shot re-arm delay (seconds) added to `attack_finished` — the cooldown literal that used
+    /// to be scattered across `w_attack`'s arms and the nail/light loop thinks. The lightning gun's
+    /// *continuous* beam re-arms faster on the opening press (`w_attack` keeps its explicit 0.1);
+    /// this is its steady per-tick rate.
+    pub cooldown: f32,
     /// Position in `W_BestWeapon`'s auto-pick chain, best first (`Some(0)` = tried first). `None`
     /// means never auto-selected: the explosives (stock QW never auto-switches to GL/RL) and the
     /// axe (the hard fallback) / grapple.
@@ -60,6 +65,7 @@ pub(crate) const WEAPON_SPECS: &[WeaponSpec] = &[
     WeaponSpec {
         item: Items::AXE,
         token: "axe",
+        cooldown: 0.5,
         classname: None,
         pickup_model: None,
         pickup_name: "Axe",
@@ -76,6 +82,7 @@ pub(crate) const WEAPON_SPECS: &[WeaponSpec] = &[
     WeaponSpec {
         item: Items::SHOTGUN,
         token: "sg",
+        cooldown: 0.5,
         classname: None,
         pickup_model: None,
         pickup_name: "Shotgun",
@@ -92,6 +99,7 @@ pub(crate) const WEAPON_SPECS: &[WeaponSpec] = &[
     WeaponSpec {
         item: Items::SUPER_SHOTGUN,
         token: "ssg",
+        cooldown: 0.7,
         classname: Some("weapon_supershotgun"),
         pickup_model: Some(Model::PROGS_G_SHOT),
         pickup_name: "Double-barrelled Shotgun",
@@ -108,6 +116,7 @@ pub(crate) const WEAPON_SPECS: &[WeaponSpec] = &[
     WeaponSpec {
         item: Items::NAILGUN,
         token: "ng",
+        cooldown: 0.2,
         classname: Some("weapon_nailgun"),
         pickup_model: Some(Model::PROGS_G_NAIL),
         pickup_name: "nailgun",
@@ -124,6 +133,7 @@ pub(crate) const WEAPON_SPECS: &[WeaponSpec] = &[
     WeaponSpec {
         item: Items::SUPER_NAILGUN,
         token: "sng",
+        cooldown: 0.2,
         classname: Some("weapon_supernailgun"),
         pickup_model: Some(Model::PROGS_G_NAIL2),
         pickup_name: "Super Nailgun",
@@ -140,6 +150,7 @@ pub(crate) const WEAPON_SPECS: &[WeaponSpec] = &[
     WeaponSpec {
         item: Items::GRENADE_LAUNCHER,
         token: "gl",
+        cooldown: 0.6,
         classname: Some("weapon_grenadelauncher"),
         pickup_model: Some(Model::PROGS_G_ROCK),
         pickup_name: "Grenade Launcher",
@@ -156,6 +167,7 @@ pub(crate) const WEAPON_SPECS: &[WeaponSpec] = &[
     WeaponSpec {
         item: Items::ROCKET_LAUNCHER,
         token: "rl",
+        cooldown: 0.8,
         classname: Some("weapon_rocketlauncher"),
         pickup_model: Some(Model::PROGS_G_ROCK2),
         pickup_name: "Rocket Launcher",
@@ -172,6 +184,7 @@ pub(crate) const WEAPON_SPECS: &[WeaponSpec] = &[
     WeaponSpec {
         item: Items::LIGHTNING,
         token: "lg",
+        cooldown: 0.2,
         classname: Some("weapon_lightning"),
         pickup_model: Some(Model::PROGS_G_LIGHT),
         pickup_name: "Thunderbolt",
@@ -190,6 +203,7 @@ pub(crate) const WEAPON_SPECS: &[WeaponSpec] = &[
     WeaponSpec {
         item: Items::GRAPPLE,
         token: "hook",
+        cooldown: 0.1,
         classname: None,
         pickup_model: None,
         pickup_name: "Grappling Hook",
@@ -247,6 +261,24 @@ pub(crate) fn auto_pick_chain() -> impl Iterator<Item = &'static WeaponSpec> {
     (0u8..).map_while(|rank| WEAPON_SPECS.iter().find(|s| s.auto_pick == Some(rank)))
 }
 
+/// The post-shot re-arm delay for a weapon's [`Items`] bit (`0` if it's not a known weapon). The
+/// value `w_attack` and the nail/light loop thinks add to `attack_finished`.
+pub(crate) fn cooldown_of(item: Items) -> f32 {
+    weapon_spec(item).map_or(0.0, |s| s.cooldown)
+}
+
+/// The `CycleWeaponCommand` order: every impulse-selectable weapon (the eight guns; the grapple is
+/// impulse-22 only, `switch_code == 0`) in table order.
+pub(crate) fn cycle_order() -> impl Iterator<Item = Items> {
+    WEAPON_SPECS.iter().filter(|s| s.switch_code > 0.0).map(|s| s.item)
+}
+
+/// Whether `v` lacks the ammo to fire the weapon `item` — the per-weapon fire gate, from the table's
+/// `ammo_kind`/`min_ammo` (always feedable for the axe/grapple, which draw no ammo).
+pub(crate) fn out_of_ammo(v: &EntVars, item: Items) -> bool {
+    weapon_spec(item).is_some_and(|s| s.ammo_kind.is_some_and(|k| ammo_count(v, k) < s.min_ammo))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +329,46 @@ mod tests {
                 Items::SUPER_SHOTGUN,
                 Items::NAILGUN,
                 Items::SHOTGUN,
+            ]
+        );
+    }
+
+    /// Pins the post-shot cooldowns against the stock QuakeC `attack_finished` deltas the table now
+    /// owns, so `w_attack` and the nail/light loop thinks can't drift them. (The lightning gun's
+    /// opening-press 0.1 stays an explicit literal in `w_attack`; this is its per-tick rate.)
+    #[test]
+    fn cooldowns_match_stock() {
+        let expect = [
+            (Items::AXE, 0.5),
+            (Items::SHOTGUN, 0.5),
+            (Items::SUPER_SHOTGUN, 0.7),
+            (Items::NAILGUN, 0.2),
+            (Items::SUPER_NAILGUN, 0.2),
+            (Items::GRENADE_LAUNCHER, 0.6),
+            (Items::ROCKET_LAUNCHER, 0.8),
+            (Items::LIGHTNING, 0.2),
+            (Items::GRAPPLE, 0.1),
+        ];
+        for (item, cd) in expect {
+            assert_eq!(cooldown_of(item), cd, "cooldown for {item:?}");
+        }
+    }
+
+    /// Pins `CycleWeaponCommand`'s order: the eight guns in impulse order, grapple excluded.
+    #[test]
+    fn cycle_order_is_stock() {
+        let order: Vec<Items> = cycle_order().collect();
+        assert_eq!(
+            order,
+            vec![
+                Items::AXE,
+                Items::SHOTGUN,
+                Items::SUPER_SHOTGUN,
+                Items::NAILGUN,
+                Items::SUPER_NAILGUN,
+                Items::GRENADE_LAUNCHER,
+                Items::ROCKET_LAUNCHER,
+                Items::LIGHTNING,
             ]
         );
     }

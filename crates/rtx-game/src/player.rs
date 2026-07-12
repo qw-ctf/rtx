@@ -318,8 +318,9 @@ impl GameState {
         let dir = if parity == 0 { 4.0 } else { -4.0 };
         self.w_fire_spikes(e, dir);
         let time = self.time();
+        let cd = crate::arsenal::cooldown_of(self.entities[e].v.weapon.item());
         let ent = &mut self.entities[e];
-        ent.combat.attack_finished = time + 0.2;
+        ent.combat.attack_finished = time + cd;
         ent.v.frame = NAILATT.frame(parity);
         ent.anim.walkframe = parity ^ 1;
         ent.think = Think::PlayerNail;
@@ -348,8 +349,9 @@ impl GameState {
         self.w_fire_lightning(e);
         let parity = self.entities[e].anim.walkframe & 1;
         let time = self.time();
+        let cd = crate::arsenal::cooldown_of(self.entities[e].v.weapon.item());
         let ent = &mut self.entities[e];
-        ent.combat.attack_finished = time + 0.2;
+        ent.combat.attack_finished = time + cd;
         ent.v.frame = LIGHT.frame(parity);
         ent.anim.walkframe = parity ^ 1;
         ent.think = Think::PlayerLight;
