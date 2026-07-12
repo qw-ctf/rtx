@@ -69,11 +69,11 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // A teleport (or any large instant displacement) invalidates the planned route — drop it
     // and re-path from where we landed. ~200u in one frame is far beyond running/falling. Skipped
     // mid-hook: the reel and the parabola move fast on purpose and must not clear the hook route.
-    if !route_frozen && bot.last_origin != Vec3::ZERO && (origin - bot.last_origin).length() > 200.0 {
+    if !route_frozen && bot.watchdog.last_origin != Vec3::ZERO && (origin - bot.watchdog.last_origin).length() > 200.0 {
         bot.route.clear();
         bot.repath_time = now;
     }
-    bot.last_origin = origin;
+    bot.watchdog.last_origin = origin;
 
     // Gate errand: drop it once the gate's door has opened — or give up if we stop making progress
     // toward its button (stuck at a door whose button we can't actually reach), so we don't camp
@@ -149,8 +149,8 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         bot.repath_time = now + REPATH_INTERVAL;
         // Restart the progress watchdog against the new route (INFINITY ⇒ the first frame records the
         // real starting distance rather than reading as an instant stall on an old baseline).
-        bot.progress_best = f32::INFINITY;
-        bot.progress_since = now;
+        bot.watchdog.progress_best = f32::INFINITY;
+        bot.watchdog.progress_since = now;
     }
     // If we've fallen off the planned route (missed a jump, got shoved), re-localize next.
     if !route_frozen && !on_air && bot.route_pos >= bot.route.len() && bot_cell != goal && now >= bot.repath_time {
@@ -347,17 +347,17 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         || on_air
         || vigil
         || plat_hold.is_some()
-        || (origin - bot.stuck_origin).length() > STUCK_MOVE
+        || (origin - bot.watchdog.stuck_origin).length() > STUCK_MOVE
     {
-        bot.stuck_origin = origin;
-        bot.stuck_since = now;
-    } else if now - bot.stuck_since > STUCK_TIME {
+        bot.watchdog.stuck_origin = origin;
+        bot.watchdog.stuck_since = now;
+    } else if now - bot.watchdog.stuck_since > STUCK_TIME {
         force_jump = true;
         // Penalize the leg we're wedged on so the forced re-path actually *diverts* — without this
         // the deterministic A* hands back the identical route and the bot re-wedges every 0.7s.
         penalize_leg(bot, cur_leg, kind, now);
         bot.repath_time = now; // re-path next frame
-        bot.stuck_since = now;
+        bot.watchdog.stuck_since = now;
     }
 
     // Path-progress watchdog: catches a bot that *is* moving (so the displacement detector above
@@ -368,20 +368,20 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // legitimately hold or reverse XY progress for a while).
     let plat_leg = matches!(kind, Some(LinkKind::Plat));
     if !hook_active && !rj_active && !on_sj && !on_air && !plat_leg && !vigil {
-        if progress_stalled(bot.progress_best, bot.progress_since, goal_dist, now) {
+        if progress_stalled(bot.watchdog.progress_best, bot.watchdog.progress_since, goal_dist, now) {
             penalize_leg(bot, cur_leg, kind, now);
             bot.route.clear();
             bot.repath_time = now;
-            bot.progress_best = goal_dist;
-            bot.progress_since = now;
-        } else if goal_dist < bot.progress_best - PROGRESS_EPS {
-            bot.progress_best = goal_dist;
-            bot.progress_since = now;
+            bot.watchdog.progress_best = goal_dist;
+            bot.watchdog.progress_since = now;
+        } else if goal_dist < bot.watchdog.progress_best - PROGRESS_EPS {
+            bot.watchdog.progress_best = goal_dist;
+            bot.watchdog.progress_since = now;
         }
     } else {
         // Keep the baseline current so a stall isn't falsely flagged the instant we resume.
-        bot.progress_best = goal_dist;
-        bot.progress_since = now;
+        bot.watchdog.progress_best = goal_dist;
+        bot.watchdog.progress_since = now;
     }
 
     // Bunnyhop policy verdicts — everything that needs game state is judged here; *when* each

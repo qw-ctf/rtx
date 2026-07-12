@@ -57,17 +57,8 @@ pub struct BotState {
     pub failed_links: [(u32, f32, u8); 8],
     /// Earliest time we may recompute the route (throttles A*).
     pub repath_time: f32,
-    /// Stuck detector: where we were when last checked, and since when we've been there.
-    pub stuck_origin: Vec3,
-    pub stuck_since: f32,
-    /// Path-progress watchdog: the closest straight-line distance to the goal we've reached on the
-    /// current route, and when it last improved. No improvement for a while ⇒ the leg is failing in a
-    /// way the displacement stuck-detector can't see (orbiting, wall-sliding) — penalize and re-path.
-    pub progress_best: f32,
-    pub progress_since: f32,
-    /// Origin on the previous bot frame, to detect a teleport (a large instant jump) and
-    /// re-path from the landing spot.
-    pub last_origin: Vec3,
+    /// The route-progress watchdogs — three ways a bot notices it isn't getting anywhere.
+    pub watchdog: Watchdog,
     /// Per-frame toggle, flipped each tick, used to *pulse* buttons that QW only acts on at a
     /// press edge (the respawn key, which needs a release between presses).
     pub pulse: bool,
@@ -250,6 +241,23 @@ impl BotState {
             }
         }
     }
+}
+
+/// The route-progress watchdogs carried on a [`BotState`]: three independent ways a bot detects it
+/// has stopped making headway on its current route, each triggering a penalize-and-repath.
+#[derive(Default)]
+pub struct Watchdog {
+    /// Displacement stuck-detector: where we were when last checked, and since when we've been there.
+    pub stuck_origin: Vec3,
+    pub stuck_since: f32,
+    /// Path-progress watchdog: the closest straight-line distance to the goal we've reached on the
+    /// current route, and when it last improved. No improvement for a while ⇒ the leg is failing in a
+    /// way the displacement stuck-detector can't see (orbiting, wall-sliding) — penalize and re-path.
+    pub progress_best: f32,
+    pub progress_since: f32,
+    /// Origin on the previous bot frame, to detect a teleport (a large instant jump) and re-path
+    /// from the landing spot.
+    pub last_origin: Vec3,
 }
 
 /// Which ballistic leg driver a failure belongs to — selects the per-driver consecutive-failure
