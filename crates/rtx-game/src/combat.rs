@@ -131,40 +131,11 @@ impl GameState {
         let knockback = outcome.knockback;
 
         // Armor absorption.
-        let take;
-        {
-            let t = &mut self.entities[targ];
-            let mut save = (t.v.armortype * damage).ceil();
-            if save >= t.v.armorvalue {
-                save = t.v.armorvalue;
-                t.v.armortype = 0.0;
-                t.v.items = t.v.items.without(Items::ARMOR1 | Items::ARMOR2 | Items::ARMOR3);
-            }
-            t.v.armorvalue -= save;
-            take = (damage - save).ceil();
-
-            if t.v.flags.has(Flags::CLIENT) {
-                t.v.dmg_take += take;
-                t.v.dmg_save += save;
-                t.v.dmg_inflictor = inflictor.to_prog();
-            }
-        }
+        let take = self.apply_armor(targ, damage, inflictor);
         self.damage_inflictor = inflictor;
 
         // Knockback.
-        let inflictor_org = {
-            let v = &self.entities[inflictor].v;
-            (v.absmin + v.absmax) * 0.5
-        };
-        if inflictor != EntId::WORLD && self.entities[targ].v.movetype == MoveType::Walk {
-            let dir = (self.entities[targ].v.origin - inflictor_org).normalize_or_zero();
-            self.entities[targ].v.velocity += dir * knockback * 8.0;
-
-            let rj = self.host.cvar(c"rj");
-            if rj > 1.0 && self.same_player_netname(attacker, targ) {
-                self.entities[targ].v.velocity += dir * knockback * rj;
-            }
-        }
+        self.apply_knockback(targ, attacker, inflictor, knockback);
 
         // God mode / pentagram protection.
         if self.entities[targ].v.flags.has(Flags::GODMODE) {
@@ -187,11 +158,62 @@ impl GameState {
         // Apply.
         self.entities[targ].v.health -= take;
 
-        // Opponent modeling: the attacker's side learns `targ` lost roughly `damage` off its stack
-        // (they saw the hit land — run the delivered, pre-armor amount through the estimate's own
-        // armor). And an identifiable projectile proves the attacker owns that weapon, which the
-        // victim's side felt. Ambiguous inflictors (spikes: nailgun vs super-nailgun) are left to the
-        // fire-heard hook. Both are no-ops when opponent modeling is off.
+        // Opponent modeling + a bot's damage "feel" — the AI-noting seam (no-op when modeling is off
+        // and for non-bot targets).
+        self.note_damage(targ, attacker, inflictor, damage);
+
+        if self.entities[targ].v.health <= 0.0 {
+            self.killed(targ, attacker);
+            return;
+        }
+
+        self.run_pain(targ, attacker, take);
+    }
+
+    /// Absorb `damage` into `targ`'s armor: reduce armorvalue by the saved amount (clearing the armor
+    /// bits when it runs out), stamp the client `dmg_*` HUD fields, and return the health damage that
+    /// gets through.
+    fn apply_armor(&mut self, targ: EntId, damage: f32, inflictor: EntId) -> f32 {
+        let t = &mut self.entities[targ];
+        let mut save = (t.v.armortype * damage).ceil();
+        if save >= t.v.armorvalue {
+            save = t.v.armorvalue;
+            t.v.armortype = 0.0;
+            t.v.items = t.v.items.without(Items::ARMOR1 | Items::ARMOR2 | Items::ARMOR3);
+        }
+        t.v.armorvalue -= save;
+        let take = (damage - save).ceil();
+        if t.v.flags.has(Flags::CLIENT) {
+            t.v.dmg_take += take;
+            t.v.dmg_save += save;
+            t.v.dmg_inflictor = inflictor.to_prog();
+        }
+        take
+    }
+
+    /// Shove `targ` away from the inflictor's centre by `knockback` (walking targets only), plus the
+    /// extra self-boost the `rj` cvar grants a player rocket-jumping off their own splash.
+    fn apply_knockback(&mut self, targ: EntId, attacker: EntId, inflictor: EntId, knockback: f32) {
+        let inflictor_org = {
+            let v = &self.entities[inflictor].v;
+            (v.absmin + v.absmax) * 0.5
+        };
+        if inflictor != EntId::WORLD && self.entities[targ].v.movetype == MoveType::Walk {
+            let dir = (self.entities[targ].v.origin - inflictor_org).normalize_or_zero();
+            self.entities[targ].v.velocity += dir * knockback * 8.0;
+            let rj = self.host.cvar(c"rj");
+            if rj > 1.0 && self.same_player_netname(attacker, targ) {
+                self.entities[targ].v.velocity += dir * knockback * rj;
+            }
+        }
+    }
+
+    /// Feed a landed hit into the bots' shared knowledge: the attacker's side learns `targ` lost
+    /// ~`damage` off its stack and (for an identifiable projectile) that the attacker owns that
+    /// weapon; and a bot `targ` instantly registers its attacker's *direction* — the "shot in the
+    /// back" reflex — bypassing the perception view-cone/reaction gate. All no-ops when modeling is
+    /// off / the target isn't a bot; skipped for self-damage and world hazards.
+    fn note_damage(&mut self, targ: EntId, attacker: EntId, inflictor: EntId, damage: f32) {
         self.model_note_damage(attacker, targ, damage);
         let inflictor_weapon = match self.entities[inflictor].classname() {
             Some("rocket") => Some(Items::ROCKET_LAUNCHER),
@@ -201,13 +223,8 @@ impl GameState {
         if let Some(bit) = inflictor_weapon {
             self.model_note_weapon_of_attacker(targ, attacker, bit);
         }
-
-        // Perception "feel": a bot that just took damage instantly registers its attacker (you turn
-        // toward the hit when shot in the back), bypassing the view-cone/reaction gate. Like sound,
-        // this reveals only a *direction* — the bot hunts a hypothesised point along the bearing the
-        // hit came from, not the shooter's exact spot (only sight pins that). Perception then reads
-        // `known_enemy`/`known_until` next frame. Skipped for self-damage and world hazards.
         if self.entities[targ].bot.is_bot && attacker != targ && attacker != EntId::WORLD {
+            let time = self.time();
             let targ_org = self.entities[targ].v.origin;
             let atk_org = self.entities[attacker].v.origin;
             let (r_lat, r_dist) = (self.random(), self.random());
@@ -217,13 +234,6 @@ impl GameState {
             b.known_until = time + crate::bot::perception::MEMORY;
             b.percept_last_seen = pt; // felt the hit's direction, not the shooter's exact position
         }
-
-        if self.entities[targ].v.health <= 0.0 {
-            self.killed(targ, attacker);
-            return;
-        }
-
-        self.run_pain(targ, attacker, take);
     }
 
     /// `T_RadiusDamage` — splash damage to everything near `inflictor`, falling off linearly.
