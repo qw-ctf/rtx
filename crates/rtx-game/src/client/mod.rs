@@ -554,34 +554,13 @@ impl GameState {
             return;
         }
         // An elevator jump (riding a rising lift) takes priority and works whether the lift left
-        // us flagged on-ground or bounced us airborne. Failing that, the mid-air jumps.
-        if !self.try_elevator_jump(e) && !flags.has(Flags::ONGROUND) {
-            // Mid-air. A wall jump (kicking off a wall we're moving into) takes priority and is
-            // limited only by geometry; failing that, the once-per-air-travel double jump. The
-            // ground jump's impulse is applied by the engine's pmove, but nothing lifts us
-            // mid-air, so both set velocity themselves.
-            if !self.try_wall_jump(e) {
-                // The double jump is off in stock-movement modes (race) — its maps are authored
-                // without it, and bots' undershoot-recovery air jump flows through here too.
-                if self.entities[e].combat.air_jumped
-                    || !self.host.cvar_bool(c"rtx_doublejump")
-                    || self.mode.stock_movement_only()
-                {
-                    return;
-                }
-                // Don't double-jump when about to land (or just after takeoff) — preserves bunny
-                // hopping (jump-on-landing). Trace straight down from the feet; if the floor is
-                // close, bail without consuming the air jump so the intent carries to the landing.
-                const CLEARANCE: f32 = 24.0; // units of air required below the feet
-                let mut feet = self.entities[e].v.origin;
-                feet.z += self.entities[e].v.mins.z; // mins.z = -24 (VEC_HULL_MIN): origin -> feet
-                let tr = self.traceline(feet, feet - Vec3::new(0.0, 0.0, CLEARANCE), true, e);
-                if tr.fraction < 1.0 {
-                    return; // floor close: the landing ground jump happens instead
-                }
-                self.entities[e].combat.air_jumped = true;
-                self.entities[e].v.velocity.z = 270.0;
-            }
+        // us flagged on-ground or bounced us airborne. Failing that, the mid-air jumps: a wall jump
+        // (kicking off a wall we're moving into) takes priority over the once-per-air-travel double
+        // jump. If neither mid-air jump fires, bail without the jump-release/sound below (the ground
+        // jump's own impulse is the engine's pmove job).
+        if !self.try_elevator_jump(e) && !flags.has(Flags::ONGROUND) && !self.try_wall_jump(e) && !self.try_double_jump(e)
+        {
+            return;
         }
         {
             let v = &mut self.entities[e].v;
@@ -719,6 +698,30 @@ impl GameState {
         let outward = (-into).max(KICK);
         let launch = tangential + outward * n;
         self.entities[e].v.velocity = Vec3::new(launch.x, launch.y, UP);
+        true
+    }
+
+    /// The rtx once-per-air-travel mid-air double jump: near the apex, restack a jump to clear a
+    /// wider gap. Off in stock-movement modes (race maps aren't authored for it; bots'
+    /// undershoot-recovery air jump flows through here too). Suppressed when about to land or just
+    /// after takeoff — a nearby floor bails without consuming the air jump, so the intent carries to
+    /// the landing and bunny hopping (jump-on-landing) is preserved. Returns whether it fired.
+    fn try_double_jump(&mut self, e: EntId) -> bool {
+        if self.entities[e].combat.air_jumped
+            || !self.host.cvar_bool(c"rtx_doublejump")
+            || self.mode.stock_movement_only()
+        {
+            return false;
+        }
+        const CLEARANCE: f32 = 24.0; // units of air required below the feet
+        let mut feet = self.entities[e].v.origin;
+        feet.z += self.entities[e].v.mins.z; // mins.z = -24 (VEC_HULL_MIN): origin -> feet
+        let tr = self.traceline(feet, feet - Vec3::new(0.0, 0.0, CLEARANCE), true, e);
+        if tr.fraction < 1.0 {
+            return false; // floor close: the landing ground jump happens instead
+        }
+        self.entities[e].combat.air_jumped = true;
+        self.entities[e].v.velocity.z = 270.0;
         true
     }
 
