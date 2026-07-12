@@ -471,7 +471,7 @@ impl GameState {
     pub(crate) fn item_goal_valid(&self, bot_e: EntId, item: EntId, now: f32) -> bool {
         // A weapon held for a powerup carrier (handoff) is a valid goal while it's still on the floor,
         // even though the holder may already own it (so its ordinary item_desire is 0).
-        if item.0 != 0 && item.0 == self.entities[bot_e].bot.hold_item {
+        if item.0 != 0 && item.0 == self.entities[bot_e].bot.goal.hold_item {
             return self.entities[item].v.solid == Solid::Trigger;
         }
         let ent = &self.entities[item];
@@ -528,7 +528,7 @@ impl GameState {
         (1..=maxclients).map(EntId).any(|t| {
             t != bot_e && {
                 let e = &self.entities[t];
-                e.bot.is_bot && e.v.health > 0.0 && e.mode_p.team == my_team && e.bot.goal_item == idx
+                e.bot.is_bot && e.v.health > 0.0 && e.mode_p.team == my_team && e.bot.goal.item == idx
             }
         })
     }
@@ -565,7 +565,7 @@ impl GameState {
             self.clear_hold(e);
             return false;
         }
-        let held = self.entities[e].bot.hold_item;
+        let held = self.entities[e].bot.goal.hold_item;
         if held != 0 {
             if self.hold_should_continue(e, EntId(held), now) {
                 self.pin_hold_goal(e, EntId(held));
@@ -580,10 +580,10 @@ impl GameState {
         if let Some((item, mate)) = self.handoff_hold_target(e, now) {
             {
                 let b = &mut self.entities[e].bot;
-                b.hold_item = item.0;
-                b.hold_for = mate.0;
-                b.hold_until = now + HOLD_MAX;
-                b.goal_started = now;
+                b.goal.hold_item = item.0;
+                b.goal.hold_for = mate.0;
+                b.goal.hold_until = now + HOLD_MAX;
+                b.goal.since = now;
             }
             self.pin_hold_goal(e, item);
             return true;
@@ -600,16 +600,16 @@ impl GameState {
             .as_ref()
             .and_then(|g| g.nearest(self.entities[item].v.origin));
         let b = &mut self.entities[e].bot;
-        b.goal_item = item.0;
+        b.goal.item = item.0;
         if let Some(c) = cell {
-            b.goal_item_cell = c;
+            b.goal.item_cell = c;
         }
     }
 
     fn clear_hold(&mut self, e: EntId) {
         let b = &mut self.entities[e].bot;
-        if b.hold_item != 0 {
-            (b.hold_item, b.hold_for, b.hold_until) = (0, 0, 0.0);
+        if b.goal.hold_item != 0 {
+            (b.goal.hold_item, b.goal.hold_for, b.goal.hold_until) = (0, 0, 0.0);
         }
     }
 
@@ -621,7 +621,7 @@ impl GameState {
         let Some(Category::Weapon(w)) = it.classname().and_then(category) else {
             return false;
         };
-        let mate = EntId(self.entities[e].bot.hold_for);
+        let mate = EntId(self.entities[e].bot.goal.hold_for);
         let m = &self.entities[mate];
         let mate_alive = mate.0 != 0 && m.is_player() && m.v.health > 0.0;
         let mate_powered =
@@ -637,7 +637,7 @@ impl GameState {
         };
         hold_continues(
             now,
-            self.entities[e].bot.hold_until,
+            self.entities[e].bot.goal.hold_until,
             item_on_floor,
             mate_alive,
             mate_powered,
@@ -703,7 +703,7 @@ impl GameState {
         let costs = graph.costs_from(bot_cell, &pricing.costs(0));
         let s = self.bot_stats(bot_e);
         // The item we're already chasing, for the hysteresis bonus below.
-        let current_goal = self.entities[bot_e].bot.goal_item;
+        let current_goal = self.entities[bot_e].bot.goal.item;
         // Item claims (teamwork): an item a living teammate bot is already fetching is discounted, so
         // teammates spread across pickups instead of racing the same one. A powerup's dominating
         // desire still beats the discount, so the quad stays contested. Off in FFA (no team).

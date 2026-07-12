@@ -61,7 +61,7 @@ const GOLDEN_DEG: f32 = 137.508;
 /// toward this frame. `None` ⇒ not a vigil (still travelling, or the item is collectable / gone) and
 /// the caller keeps its normal target. `holding` is [`update_handoff_hold`]'s verdict.
 pub(crate) fn maybe(game: &mut GameState, e: EntId, origin: Vec3, holding: bool, now: f32) -> Option<(Vec3, Option<CellId>)> {
-    let item = EntId(game.entities[e].bot.goal_item);
+    let item = EntId(game.entities[e].bot.goal.item);
     if item.0 == 0 {
         return None;
     }
@@ -91,7 +91,7 @@ fn update(game: &mut GameState, e: EntId, origin: Vec3, item_org: Vec3, holding:
     // Waiting near a known respawn *is* making progress toward the goal — keep the give-up watchdog
     // (super::resolve_objective's GOAL_GIVEUP_TIME) from abandoning a legitimate wait. A hold is
     // bounded by its own HOLD_MAX deadline, so refreshing this is safe there too.
-    game.entities[e].bot.goal_started = now;
+    game.entities[e].bot.goal.since = now;
 
     let (post, post_until, scan, scan_until) = {
         let b = &game.entities[e].bot;

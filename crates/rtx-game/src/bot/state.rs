@@ -26,30 +26,9 @@ pub struct BotState {
     pub goal_cell: u32,
     /// The gate currently being opened as an errand (`None` = following the human normally).
     pub gate: Option<usize>,
-    /// The item entity this bot is fetching (`0` = none → follow a human), and the navmesh cell
-    /// it sits in. See [`crate::bot::goals`].
-    pub goal_item: u32,
-    pub goal_item_cell: u32,
-    /// Handoff hold (team opponent modeling): a spawned RL/LG this bot stands on but deliberately does
-    /// **not** pick up (`bot_pickup_items` skips it), reserving it for a powerup-carrying teammate that
-    /// lacks it. `0` = not holding. `hold_for` is that teammate; `hold_until` the hard deadline after
-    /// which the bot takes the weapon itself (denial beats a handoff that never arrives).
-    pub hold_item: u32,
-    pub hold_for: u32,
-    pub hold_until: f32,
-    /// Earliest time the bot may re-pick its item goal (throttles the catalog scan).
-    pub goal_select_time: f32,
-    /// When the bot began chasing its current item goal. If it's *still* chasing the same item
-    /// long after (one it can't actually reach — e.g. behind an elevator/button/movewall/teleporter
-    /// chain the router can't thread), it abandons that goal rather than circling forever. Uses
-    /// time-on-goal, not distance, so a legitimate route that walks *away* toward a teleporter
-    /// isn't mistaken for being stuck.
-    pub goal_started: f32,
-    /// Items to skip while picking goals, each until its paired expiry — set when we gave up reaching
-    /// one (unreachable pickup) or just collected one (so an instant-respawn item or lingering
-    /// weapons-stay trigger can't re-capture the goal slot the same second). A small ring: a fresh
-    /// entry evicts the soonest-to-expire slot. `(item entid, until)`; a `0` item marks an empty slot.
-    pub avoid_items: [(u32, f32); 4],
+    /// The bot's item-fetch goal: which item, where, the re-pick throttle, and the handoff/avoid
+    /// bookkeeping. See [`GoalState`].
+    pub goal: GoalState,
     /// Links this bot recently failed to traverse (stuck, stalled speed-jump, given-up hook), each a
     /// `(link idx, until, strikes)`: a per-bot A* surcharge (growing with strikes) that makes the
     /// planner *divert* around a dead leg instead of re-issuing the identical route to retry forever.
@@ -130,16 +109,16 @@ impl BotState {
         if item == 0 {
             return;
         }
-        if let Some(slot) = self.avoid_items.iter_mut().find(|(it, _)| *it == item) {
+        if let Some(slot) = self.goal.avoid_items.iter_mut().find(|(it, _)| *it == item) {
             slot.1 = slot.1.max(until);
-        } else if let Some(slot) = self.avoid_items.iter_mut().min_by(|a, b| a.1.total_cmp(&b.1)) {
+        } else if let Some(slot) = self.goal.avoid_items.iter_mut().min_by(|a, b| a.1.total_cmp(&b.1)) {
             *slot = (item, until);
         }
     }
 
     /// Whether `item` is currently on the avoid ring (an unexpired entry).
     pub fn is_avoided(&self, item: u32, now: f32) -> bool {
-        self.avoid_items.iter().any(|&(it, until)| it == item && now < until)
+        self.goal.avoid_items.iter().any(|&(it, until)| it == item && now < until)
     }
 
     /// Shared failure tail for the hook / rocket-jump leg drivers (see [`Driver`]): bump the driver's
@@ -165,9 +144,9 @@ impl BotState {
             }
             self.route.clear();
             if chasing {
-                self.mark_avoid(self.goal_item, now + super::GOAL_AVOID_TIME);
-                self.goal_item = 0;
-                self.goal_select_time = now;
+                self.mark_avoid(self.goal.item, now + super::GOAL_AVOID_TIME);
+                self.goal.item = 0;
+                self.goal.next_pick = now;
             }
         }
     }
@@ -222,6 +201,35 @@ pub struct Aim {
     pub look_prev_time: f32,
     /// Last frame's sent bhop view yaw, to seed the spring's angular velocity when combat resumes.
     pub bhop_prev_yaw: f32,
+}
+
+/// A bot's item-fetch goal (see [`crate::bot::goals`]) and the bookkeeping around it.
+#[derive(Default)]
+pub struct GoalState {
+    /// The item entity this bot is fetching (`0` = none → follow a human), and the navmesh cell it
+    /// sits in.
+    pub item: u32,
+    pub item_cell: u32,
+    /// Earliest time the bot may re-pick its item goal (throttles the catalog scan).
+    pub next_pick: f32,
+    /// When the bot began chasing its current item goal. If it's *still* chasing the same item long
+    /// after (one it can't actually reach — e.g. behind an elevator/button/movewall/teleporter chain
+    /// the router can't thread), it abandons that goal rather than circling forever. Uses time-on-
+    /// goal, not distance, so a legitimate route that walks *away* toward a teleporter isn't mistaken
+    /// for being stuck.
+    pub since: f32,
+    /// Handoff hold (team opponent modeling): a spawned RL/LG this bot stands on but deliberately
+    /// does **not** pick up (`bot_pickup_items` skips it), reserving it for a powerup-carrying
+    /// teammate that lacks it. `0` = not holding. `hold_for` is that teammate; `hold_until` the hard
+    /// deadline after which the bot takes the weapon itself (denial beats a handoff that never arrives).
+    pub hold_item: u32,
+    pub hold_for: u32,
+    pub hold_until: f32,
+    /// Items to skip while picking goals, each until its paired expiry — set when we gave up reaching
+    /// one (unreachable pickup) or just collected one (so an instant-respawn item or lingering
+    /// weapons-stay trigger can't re-capture the goal slot the same second). A small ring: a fresh
+    /// entry evicts the soonest-to-expire slot. `(item entid, until)`; a `0` item marks an empty slot.
+    pub avoid_items: [(u32, f32); 4],
 }
 
 /// Grappling-hook traversal state (see [`crate::bot::hook`]): aim at the anchor, throw, reel to

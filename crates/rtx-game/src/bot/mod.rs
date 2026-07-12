@@ -242,9 +242,9 @@ fn bot_pickup_items(game: &mut GameState, e: EntId) {
             .then_some(EntId(i as u32))
     }));
     let now = game.time();
-    let goal_item = game.entities[e].bot.goal_item;
-    let hold_item = game.entities[e].bot.hold_item;
-    let holding = hold_item != 0 && now < game.entities[e].bot.hold_until;
+    let goal_item = game.entities[e].bot.goal.item;
+    let hold_item = game.entities[e].bot.goal.hold_item;
+    let holding = hold_item != 0 && now < game.entities[e].bot.goal.hold_until;
     for item in hits {
         // Handoff hold: don't pick up the weapon we're reserving for a powerup-carrying teammate
         // (the engine never fires trigger touches for fake clients, so skipping here is sufficient).
@@ -475,7 +475,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     if holding {
         // `update_handoff_hold` set `goal_item` to the held weapon — nothing else to pick this frame.
     } else if intent.is_none() || greedy {
-        if now >= game.entities[e].bot.goal_select_time {
+        if now >= game.entities[e].bot.goal.next_pick {
             let pick = if greedy {
                 game.select_combat_item(e)
             } else {
@@ -483,25 +483,25 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
             };
             let (new_item, new_cell) = pick.map_or((0, 0), |(it, c)| (it.0, c));
             let b = &mut game.entities[e].bot;
-            if new_item != b.goal_item {
-                b.goal_started = now; // restart the watchdog for a new goal
+            if new_item != b.goal.item {
+                b.goal.since = now; // restart the watchdog for a new goal
             }
-            (b.goal_item, b.goal_item_cell) = (new_item, new_cell);
-            b.goal_select_time = now + GOAL_SELECT_INTERVAL;
+            (b.goal.item, b.goal.item_cell) = (new_item, new_cell);
+            b.goal.next_pick = now + GOAL_SELECT_INTERVAL;
         }
-        if game.entities[e].bot.goal_item != 0 && !game.item_goal_valid(e, EntId(game.entities[e].bot.goal_item), now) {
+        if game.entities[e].bot.goal.item != 0 && !game.item_goal_valid(e, EntId(game.entities[e].bot.goal.item), now) {
             let b = &mut game.entities[e].bot;
-            b.goal_item = 0;
-            b.goal_select_time = now; // re-pick next frame
+            b.goal.item = 0;
+            b.goal.next_pick = now; // re-pick next frame
         }
     } else {
-        game.entities[e].bot.goal_item = 0; // a Move objective supersedes any item chase
+        game.entities[e].bot.goal.item = 0; // a Move objective supersedes any item chase
     }
 
     // Item vigil: if the goal item isn't collectable yet (mid-respawn, or a weapon held for a
     // teammate) and we're already standing near it, cruise a short walk off and scan the room instead
     // of twitching on the spot. Returns the overridden navigation target; `None` = carry on normally.
-    let vigil = if game.entities[e].bot.goal_item != 0 {
+    let vigil = if game.entities[e].bot.goal.item != 0 {
         vigil::maybe(game, e, origin, holding, now)
     } else {
         None
@@ -510,7 +510,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // Opt-in diagnostics (`rtx_bot_debug 1`): one throttled line per bot — what it wants, how far,
     // whether it's standing on that item, and whether it owns the LG. Pinpoints pickup-vs-desire.
     if host.cvar_bool(c"rtx_bot_debug") && now >= game.entities[e].bot.repath_time {
-        let gi = game.entities[e].bot.goal_item;
+        let gi = game.entities[e].bot.goal.item;
         let (goal, dist, overlap) = if gi != 0 {
             let it = &game.entities[EntId(gi)];
             let on = it.v.solid == Solid::Trigger && on_item(origin, it.v.origin);
@@ -527,7 +527,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         // perceived (aware of / in memory), so a stuck/looping bot's divert can be watched live.
         let pen = b.failed_links.iter().filter(|&&(_, until, _)| until > now).count();
         let aware = (b.percept.known_enemy != 0 && now < b.percept.known_until) as i32;
-        let hold = b.hold_item;
+        let hold = b.goal.hold_item;
         // Opponent-model telemetry: this bot's current hypothesis of the enemy it's aware of — the
         // estimated health/armor stack and believed arsenal bits — so the shared read can be watched
         // converge and reset live. Blank (`est=-`) when there's no belief / modeling is off.
@@ -561,10 +561,10 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // the combat overlay keeps aiming/firing on line of sight (and its range-keeping owns movement
     // then); the detour only steers navigation while the enemy is *out* of sight, when navigation
     // would otherwise just beeline the enemy. This is ktx's "the enemy is one more goal" in effect.
-    let chasing = game.entities[e].bot.goal_item != 0;
+    let chasing = game.entities[e].bot.goal.item != 0;
     let goal_item_org = {
-        let it = EntId(game.entities[e].bot.goal_item);
-        (game.entities[it].v.origin, Some(game.entities[e].bot.goal_item_cell))
+        let it = EntId(game.entities[e].bot.goal.item);
+        (game.entities[it].v.origin, Some(game.entities[e].bot.goal.item_cell))
     };
     // Where we're headed: the vigil post (waiting on an uncollectable item), the detour item, the
     // mode's target, the chosen item, or the nearest human.
@@ -595,16 +595,16 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // chain the router can't thread) so we stop circling and go fetch something reachable instead.
     // A powerup goal gets a longer leash — a cross-map quad/pent run legitimately outlasts the
     // ordinary give-up time (the progress watchdog still catches a genuinely stuck bot sooner).
-    let giveup = if game.is_powerup_item(EntId(game.entities[e].bot.goal_item)) {
+    let giveup = if game.is_powerup_item(EntId(game.entities[e].bot.goal.item)) {
         goals::POWERUP_GIVEUP
     } else {
         GOAL_GIVEUP_TIME
     };
-    if chasing && game.entities[e].bot.gate.is_none() && now - game.entities[e].bot.goal_started > giveup {
+    if chasing && game.entities[e].bot.gate.is_none() && now - game.entities[e].bot.goal.since > giveup {
         let b = &mut game.entities[e].bot;
-        b.mark_avoid(b.goal_item, now + GOAL_AVOID_TIME);
-        b.goal_item = 0;
-        b.goal_select_time = now; // re-pick (skipping the abandoned item) next frame
+        b.mark_avoid(b.goal.item, now + GOAL_AVOID_TIME);
+        b.goal.item = 0;
+        b.goal.next_pick = now; // re-pick (skipping the abandoned item) next frame
     }
 
     // Audience watch (arena Spectate): snapshot the chosen fighter's eye point so the look override
@@ -759,8 +759,8 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // commitment so neither resumes after respawn.
     if !alive {
         let b = &mut game.entities[e].bot;
-        if b.hold_item != 0 {
-            (b.hold_item, b.hold_for, b.hold_until) = (0, 0, 0.0);
+        if b.goal.hold_item != 0 {
+            (b.goal.hold_item, b.goal.hold_for, b.goal.hold_until) = (0, 0, 0.0);
         }
         b.air_leg = None;
     }
