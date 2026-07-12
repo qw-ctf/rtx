@@ -54,7 +54,7 @@ impl GameState {
             .map(|pi| {
                 let p = &self.entities[EntId(graph.plat(pi).entity)];
                 PlatStatus {
-                    down: !p.in_use || p.mover.state == crate::entity::STATE_BOTTOM,
+                    down: !p.in_use || p.mover.state == crate::entity::MoverPhase::Bottom,
                     surface_z: p.v.origin.z + p.v.maxs.z,
                 }
             })

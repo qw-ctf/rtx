@@ -8,7 +8,7 @@ use glam::Vec3;
 
 use crate::assets::Sound;
 use crate::defs::*;
-use crate::entity::{Blocked, Die, EntId, Think, Touch, Use, STATE_BOTTOM, STATE_DOWN, STATE_TOP, STATE_UP};
+use crate::entity::{Blocked, Die, EntId, MoverPhase, Think, Touch, Use};
 use crate::game::GameState;
 use crate::obituary::DeathType;
 
@@ -24,7 +24,7 @@ impl GameState {
         self.entities[other].deathtype = DeathType::Squish;
         self.t_damage(other, e, goal, dmg);
         if wait >= 0.0 {
-            if state == STATE_DOWN {
+            if state == MoverPhase::Down {
                 self.door_go_up(e);
             } else {
                 self.door_go_down(e);
@@ -35,7 +35,7 @@ impl GameState {
     /// `door_hit_top`.
     pub(crate) fn door_hit_top(&mut self, e: EntId) {
         self.play_door(e, true, 1);
-        self.entities[e].mover.state = STATE_TOP;
+        self.entities[e].mover.state = MoverPhase::Top;
         if self.entities[e].v.spawnflags.has(DoorFlags::TOGGLE) {
             return;
         }
@@ -49,7 +49,7 @@ impl GameState {
     /// `door_hit_bottom`.
     pub(crate) fn door_hit_bottom(&mut self, e: EntId) {
         self.play_door(e, true, 1);
-        self.entities[e].mover.state = STATE_BOTTOM;
+        self.entities[e].mover.state = MoverPhase::Bottom;
     }
 
     /// `door_go_down`.
@@ -61,7 +61,7 @@ impl GameState {
                 ent.v.takedamage = TakeDamage::Yes;
                 ent.v.health = ent.v.max_health;
             }
-            ent.mover.state = STATE_DOWN;
+            ent.mover.state = MoverPhase::Down;
         }
         let (pos1, speed) = {
             let v = &self.entities[e];
@@ -76,15 +76,15 @@ impl GameState {
             let v = &self.entities[e];
             (v.mover.state, v.v.ltime, v.mover.wait)
         };
-        if state == STATE_UP {
+        if state == MoverPhase::Up {
             return;
         }
-        if state == STATE_TOP {
+        if state == MoverPhase::Top {
             self.entities[e].v.nextthink = ltime + wait;
             return;
         }
         self.play_door(e, false, 2);
-        self.entities[e].mover.state = STATE_UP;
+        self.entities[e].mover.state = MoverPhase::Up;
         let (pos2, speed) = {
             let v = &self.entities[e];
             (v.mover.pos2, v.mover.speed)
@@ -105,7 +105,7 @@ impl GameState {
         let toggled = self.entities[master].v.spawnflags.has(DoorFlags::TOGGLE);
         if toggled {
             let state = self.entities[master].mover.state;
-            if state == STATE_UP || state == STATE_TOP {
+            if state == MoverPhase::Up || state == MoverPhase::Top {
                 let mut cur = master;
                 loop {
                     self.door_go_down(cur);
@@ -384,7 +384,7 @@ impl GameState {
 
         {
             let ent = &mut self.entities[e];
-            ent.mover.state = STATE_BOTTOM;
+            ent.mover.state = MoverPhase::Bottom;
             if ent.v.health != 0.0 {
                 ent.v.takedamage = TakeDamage::Yes;
                 ent.th_die = Die::DoorKilled;

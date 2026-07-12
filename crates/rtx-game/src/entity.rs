@@ -260,11 +260,17 @@ pub enum Die {
     ExploBoxDie,
 }
 
-/// `state` for door/plat/button movers (QuakeC `STATE_*`).
-pub const STATE_TOP: f32 = 0.0;
-pub const STATE_BOTTOM: f32 = 1.0;
-pub const STATE_UP: f32 = 2.0;
-pub const STATE_DOWN: f32 = 3.0;
+/// A brush mover's phase (QuakeC `STATE_*`): at rest at the bottom/top, or in motion up/down. This
+/// is a crate-owned scratch field (`MoverState::state`), not an engine-shared entvar, so it's a real
+/// enum rather than an `f32` compared with `==`. `Top` is the default (QuakeC's `STATE_TOP = 0`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MoverPhase {
+    #[default]
+    Top,
+    Bottom,
+    Up,
+    Down,
+}
 
 /// How a brush targeted by a rotator follows it (hiprot's `rotate_type`), assigned by
 /// `link_rotate_targets` from the target's classname.
@@ -437,7 +443,7 @@ pub struct MoverState {
     pub delay: f32,
     pub lip: f32,
     pub height: f32,
-    pub state: f32,
+    pub state: MoverPhase,
     pub dmg: f32,
     pub count: f32,
     pub cnt: f32,

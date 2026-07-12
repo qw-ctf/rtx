@@ -5,7 +5,7 @@
 
 use crate::assets::Sound;
 use crate::defs::*;
-use crate::entity::{Die, EntId, Think, Touch, Use, STATE_BOTTOM, STATE_DOWN, STATE_TOP, STATE_UP};
+use crate::entity::{Die, EntId, MoverPhase, Think, Touch, Use};
 use crate::game::GameState;
 
 impl GameState {
@@ -17,7 +17,7 @@ impl GameState {
         };
         {
             let ent = &mut self.entities[e];
-            ent.mover.state = STATE_TOP;
+            ent.mover.state = MoverPhase::Top;
             ent.v.nextthink = ltime + wait;
             ent.think = Think::ButtonReturn;
             ent.v.frame = 1.0;
@@ -28,7 +28,7 @@ impl GameState {
 
     /// `button_done`.
     pub(crate) fn button_done(&mut self, e: EntId) {
-        self.entities[e].mover.state = STATE_BOTTOM;
+        self.entities[e].mover.state = MoverPhase::Bottom;
     }
 
     /// `button_return`.
@@ -37,7 +37,7 @@ impl GameState {
             let v = &self.entities[e];
             (v.mover.pos1, v.mover.speed, v.v.health)
         };
-        self.entities[e].mover.state = STATE_DOWN;
+        self.entities[e].mover.state = MoverPhase::Down;
         self.sub_calc_move(e, pos1, speed, Think::ButtonDone);
         self.entities[e].v.frame = 0.0;
         if health != 0.0 {
@@ -51,11 +51,11 @@ impl GameState {
             let v = &self.entities[e];
             (v.mover.state, v.mover.pos2, v.mover.speed)
         };
-        if state == STATE_UP || state == STATE_TOP {
+        if state == MoverPhase::Up || state == MoverPhase::Top {
             return;
         }
         self.play_noise(e, Channel::Voice);
-        self.entities[e].mover.state = STATE_UP;
+        self.entities[e].mover.state = MoverPhase::Up;
         self.sub_calc_move(e, pos2, speed, Think::ButtonWait);
     }
 
@@ -124,7 +124,7 @@ impl GameState {
         if ent.mover.lip == 0.0 {
             ent.mover.lip = 4.0;
         }
-        ent.mover.state = STATE_BOTTOM;
+        ent.mover.state = MoverPhase::Bottom;
         ent.mover.pos1 = ent.v.origin;
         ent.mover.pos2 = crate::subs::mover_pos2(ent.mover.pos1, ent.v.movedir, ent.v.size, ent.mover.lip);
         true

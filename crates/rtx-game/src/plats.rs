@@ -7,7 +7,7 @@ use glam::Vec3;
 
 use crate::assets::Sound;
 use crate::defs::*;
-use crate::entity::{Blocked, EntId, Think, Touch, Use, STATE_BOTTOM, STATE_DOWN, STATE_TOP, STATE_UP};
+use crate::entity::{Blocked, EntId, MoverPhase, Think, Touch, Use};
 use crate::game::GameState;
 use crate::obituary::DeathType;
 
@@ -34,7 +34,7 @@ impl GameState {
         self.plat_sound(e, true, 1);
         let ltime = self.entities[e].v.ltime;
         let ent = &mut self.entities[e];
-        ent.mover.state = STATE_TOP;
+        ent.mover.state = MoverPhase::Top;
         ent.think = Think::PlatGoDown;
         ent.v.nextthink = ltime + 3.0;
     }
@@ -42,13 +42,13 @@ impl GameState {
     /// `plat_hit_bottom`.
     pub(crate) fn plat_hit_bottom(&mut self, e: EntId) {
         self.plat_sound(e, true, 1);
-        self.entities[e].mover.state = STATE_BOTTOM;
+        self.entities[e].mover.state = MoverPhase::Bottom;
     }
 
     /// `plat_go_down`.
     pub(crate) fn plat_go_down(&mut self, e: EntId) {
         self.plat_sound(e, false, 0);
-        self.entities[e].mover.state = STATE_DOWN;
+        self.entities[e].mover.state = MoverPhase::Down;
         let (pos2, speed) = {
             let v = &self.entities[e];
             (v.mover.pos2, v.mover.speed)
@@ -59,7 +59,7 @@ impl GameState {
     /// `plat_go_up`.
     pub(crate) fn plat_go_up(&mut self, e: EntId) {
         self.plat_sound(e, false, 0);
-        self.entities[e].mover.state = STATE_UP;
+        self.entities[e].mover.state = MoverPhase::Up;
         let (pos1, speed) = {
             let v = &self.entities[e];
             (v.mover.pos1, v.mover.speed)
@@ -74,9 +74,9 @@ impl GameState {
         }
         let plat = self.entities[e].enemy();
         let state = self.entities[plat].mover.state;
-        if state == STATE_BOTTOM {
+        if state == MoverPhase::Bottom {
             self.plat_go_up(plat);
-        } else if state == STATE_TOP {
+        } else if state == MoverPhase::Top {
             let ltime = self.entities[plat].v.ltime;
             self.entities[plat].v.nextthink = ltime + 1.0;
         }
@@ -101,9 +101,9 @@ impl GameState {
         self.entities[other].deathtype = DeathType::Squish;
         self.t_damage(other, e, e, 1.0);
         let state = self.entities[e].mover.state;
-        if state == STATE_UP {
+        if state == MoverPhase::Up {
             self.plat_go_down(e);
-        } else if state == STATE_DOWN {
+        } else if state == MoverPhase::Down {
             self.plat_go_up(e);
         }
     }
@@ -201,14 +201,14 @@ impl GameState {
 
         if self.entities[e].targetname.is_some() {
             let ent = &mut self.entities[e];
-            ent.mover.state = STATE_UP;
+            ent.mover.state = MoverPhase::Up;
             ent.use_ = Use::PlatUse;
         } else {
             let pos2 = self.entities[e].mover.pos2;
             self.host.set_origin(e, pos2);
             let ent = &mut self.entities[e];
             ent.v.origin = pos2;
-            ent.mover.state = STATE_BOTTOM;
+            ent.mover.state = MoverPhase::Bottom;
         }
         true
     }
