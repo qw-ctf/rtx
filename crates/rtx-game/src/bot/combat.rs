@@ -16,6 +16,7 @@
 use glam::{Vec3, Vec3Swizzles};
 
 use crate::abi::EntVars;
+use crate::arsenal::{self, AmmoKind};
 use crate::bot::state::GrenadePhase;
 use crate::bot::{self, grenade, BotCmd};
 use crate::defs::{
@@ -69,6 +70,33 @@ struct WeaponChoice {
     grenade_arc: bool,
 }
 
+impl WeaponChoice {
+    /// The direct-fire choice for a weapon: its select impulse and (for projectile guns) the shot
+    /// speed the aim lead uses; hitscan is `0.0`. One table in place of the per-arm struct literals.
+    fn of(weapon: Weapon) -> WeaponChoice {
+        let (impulse, projectile_speed) = match weapon {
+            Weapon::SuperShotgun => (3, 0.0),
+            Weapon::Shotgun => (2, 0.0),
+            Weapon::Lightning => (8, 0.0),
+            Weapon::RocketLauncher => (7, ROCKET_SPEED),
+            Weapon::SuperNailgun => (5, NAIL_SPEED),
+            Weapon::Nailgun => (4, NAIL_SPEED),
+            _ => (1, 0.0), // axe — the hard fallback
+        };
+        WeaponChoice { impulse, weapon, projectile_speed, grenade_arc: false }
+    }
+
+    /// The grenade-launcher arc shot (a validated lob/intercept solution — `engage` owns the aim).
+    fn grenade() -> WeaponChoice {
+        WeaponChoice {
+            impulse: grenade::GL_IMPULSE,
+            weapon: Weapon::GrenadeLauncher,
+            projectile_speed: grenade::GL_SPEED,
+            grenade_arc: true,
+        }
+    }
+}
+
 /// A bot's weapon inventory and ammo pools — the pure inputs to weapon selection, so [`choose_weapon`]
 /// and [`Loadout::gl_primary`] can be unit-tested without a live [`GameState`].
 #[derive(Clone, Copy)]
@@ -95,15 +123,38 @@ impl Loadout {
         self.items.contains(bit)
     }
 
+    /// Amount held in an ammo pool.
+    fn ammo(&self, kind: AmmoKind) -> f32 {
+        match kind {
+            AmmoKind::Shells => self.shells,
+            AmmoKind::Nails => self.nails,
+            AmmoKind::Rockets => self.rockets,
+            AmmoKind::Cells => self.cells,
+        }
+    }
+
+    /// Owns `w` and has the ammo to fire it — the arsenal's `min_ammo` gate (the axe/grapple, which
+    /// draw no ammo, are fed whenever owned).
+    fn fed(&self, w: Weapon) -> bool {
+        let item = w.item();
+        self.has(item)
+            && arsenal::weapon_spec(item).is_some_and(|s| s.ammo_kind.is_none_or(|k| self.ammo(k) >= s.min_ammo))
+    }
+
+    /// The direct (non-explosive, before-axe) guns [`choose_weapon`] can pick, best first.
+    const DIRECT_GUNS: [Weapon; 5] = [
+        Weapon::SuperShotgun,
+        Weapon::Lightning,
+        Weapon::SuperNailgun,
+        Weapon::Nailgun,
+        Weapon::Shotgun,
+    ];
+
     /// A fireable super-shotgun / lightning / super-nailgun / nailgun / shotgun — any hitscan or nail
     /// gun [`choose_weapon`] can pick before the axe. Used to decide whether the GL is the bot's
     /// *only* real weapon.
     fn has_direct_gun(&self) -> bool {
-        (self.has(Items::SUPER_SHOTGUN) && self.shells >= 2.0)
-            || (self.has(Items::LIGHTNING) && self.cells >= 1.0)
-            || (self.has(Items::SUPER_NAILGUN) && self.nails >= 2.0)
-            || (self.has(Items::NAILGUN) && self.nails >= 1.0)
-            || (self.has(Items::SHOTGUN) && self.shells >= 1.0)
+        Self::DIRECT_GUNS.iter().any(|&w| self.fed(w))
     }
 
     /// The grenade launcher is the bot's only offensive gun: a fireable GL, no RL, and no direct gun.
@@ -124,116 +175,39 @@ impl Loadout {
 fn choose_weapon(inv: Loadout, dist: f32, gl_air: bool, gl_ground: bool) -> WeaponChoice {
     // A solved airborne grenade intercept takes precedence: it's the shot we came here to take.
     if gl_air {
-        return WeaponChoice {
-            impulse: grenade::GL_IMPULSE,
-            weapon: Weapon::GrenadeLauncher,
-            projectile_speed: grenade::GL_SPEED,
-            grenade_arc: true,
-        };
+        return WeaponChoice::grenade();
     }
-
-    // Point blank: the super shotgun (hitscan, no self-splash). Fall back to the axe if somehow
-    // unarmed (audience never gets here).
+    // Point blank: the super shotgun then shotgun (hitscan, no self-splash).
     if dist < SPLASH_RANGE {
-        if inv.has(Items::SUPER_SHOTGUN) && inv.shells >= 2.0 {
-            return WeaponChoice {
-                impulse: 3,
-                weapon: Weapon::SuperShotgun,
-                projectile_speed: 0.0,
-                grenade_arc: false,
-            };
+        if inv.fed(Weapon::SuperShotgun) {
+            return WeaponChoice::of(Weapon::SuperShotgun);
         }
-        if inv.has(Items::SHOTGUN) && inv.shells >= 1.0 {
-            return WeaponChoice {
-                impulse: 2,
-                weapon: Weapon::Shotgun,
-                projectile_speed: 0.0,
-                grenade_arc: false,
-            };
+        if inv.fed(Weapon::Shotgun) {
+            return WeaponChoice::of(Weapon::Shotgun);
         }
     }
-
     // Mid range: the lightning gun (fast, high DPS) when fed.
-    if dist < PREFERRED_RANGE + 150.0 && inv.has(Items::LIGHTNING) && inv.cells >= 1.0 {
-        return WeaponChoice {
-            impulse: 8,
-            weapon: Weapon::Lightning,
-            projectile_speed: 0.0,
-            grenade_arc: false,
-        };
+    if dist < PREFERRED_RANGE + 150.0 && inv.fed(Weapon::Lightning) {
+        return WeaponChoice::of(Weapon::Lightning);
     }
-
     // Default: the rocket launcher (projectile, lead the target).
-    if inv.has(Items::ROCKET_LAUNCHER) && inv.rockets >= 1.0 {
-        return WeaponChoice {
-            impulse: 7,
-            weapon: Weapon::RocketLauncher,
-            projectile_speed: ROCKET_SPEED,
-            grenade_arc: false,
-        };
+    if inv.fed(Weapon::RocketLauncher) {
+        return WeaponChoice::of(Weapon::RocketLauncher);
     }
     // No rocket launcher but a solved grenade lob: prefer the arc over the shotgun at range (the GL
     // reaches where the SSG can't). `engage` only sets this when a lob actually solves, so we never
     // pick it hopelessly.
     if gl_ground {
-        return WeaponChoice {
-            impulse: grenade::GL_IMPULSE,
-            weapon: Weapon::GrenadeLauncher,
-            projectile_speed: grenade::GL_SPEED,
-            grenade_arc: true,
-        };
+        return WeaponChoice::grenade();
     }
-    // Ammo-starved fallbacks: pick the best owned gun with ammo before resorting to the axe. This
-    // is also the *only* branch a bot with just the stock loadout (shotgun + axe) reaches at range,
-    // so without the shotgun/lightning arms here it would roam throwing the axe at distant enemies.
-    // The nailguns sit here too (never preferred over the RL/SSG/LG), so a bot restricted to a
-    // nailgun via `rtx_weapons` still fights with it instead of the axe.
-    if inv.has(Items::SUPER_SHOTGUN) && inv.shells >= 2.0 {
-        return WeaponChoice {
-            impulse: 3,
-            weapon: Weapon::SuperShotgun,
-            projectile_speed: 0.0,
-            grenade_arc: false,
-        };
-    }
-    if inv.has(Items::LIGHTNING) && inv.cells >= 1.0 {
-        return WeaponChoice {
-            impulse: 8,
-            weapon: Weapon::Lightning,
-            projectile_speed: 0.0,
-            grenade_arc: false,
-        };
-    }
-    if inv.has(Items::SUPER_NAILGUN) && inv.nails >= 2.0 {
-        return WeaponChoice {
-            impulse: 5,
-            weapon: Weapon::SuperNailgun,
-            projectile_speed: NAIL_SPEED,
-            grenade_arc: false,
-        };
-    }
-    if inv.has(Items::NAILGUN) && inv.nails >= 1.0 {
-        return WeaponChoice {
-            impulse: 4,
-            weapon: Weapon::Nailgun,
-            projectile_speed: NAIL_SPEED,
-            grenade_arc: false,
-        };
-    }
-    if inv.has(Items::SHOTGUN) && inv.shells >= 1.0 {
-        return WeaponChoice {
-            impulse: 2,
-            weapon: Weapon::Shotgun,
-            projectile_speed: 0.0,
-            grenade_arc: false,
-        };
-    }
-    WeaponChoice {
-        impulse: 1,
-        weapon: Weapon::Axe,
-        projectile_speed: 0.0,
-        grenade_arc: false,
-    }
+    // Ammo-starved fallbacks: the best owned+fed gun before the axe. This is also the *only* branch a
+    // stock-loadout (shotgun + axe) bot reaches at range, so without these it would roam throwing the
+    // axe at distant enemies; the nailguns sit here too (never preferred over RL/SSG/LG), so a bot
+    // restricted to a nailgun via `rtx_weapons` still fights with it. The axe is the hard fallback.
+    Loadout::DIRECT_GUNS
+        .into_iter()
+        .find(|&w| inv.fed(w))
+        .map_or_else(|| WeaponChoice::of(Weapon::Axe), WeaponChoice::of)
 }
 
 /// How long after losing sight of the enemy the bot keeps *holding the angle* where they vanished
