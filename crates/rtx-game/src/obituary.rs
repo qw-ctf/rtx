@@ -74,8 +74,7 @@ impl GameState {
         // Pentagram telefrag specials resolve before the player/world split (KTX client.c:5218).
         match death {
             DeathType::TelefragDeflected => {
-                self.entities[targ].v.frags -= 1.0;
-                self.host.logfrag(targ, targ);
+                self.dock_frag(targ, 1.0);
                 self.broadcast(
                     PrintLevel::Medium,
                     &format!("Satan's power deflects {victim}'s telefrag\n"),
@@ -84,8 +83,7 @@ impl GameState {
             }
             DeathType::TelefragMutual => {
                 let att = self.netname_of(attacker);
-                self.entities[targ].v.frags -= 1.0;
-                self.host.logfrag(targ, targ);
+                self.dock_frag(targ, 1.0);
                 self.broadcast(
                     PrintLevel::Medium,
                     &format!("{victim} was telefragged by {att}'s Satan's power\n"),
@@ -101,8 +99,7 @@ impl GameState {
         if !attacker_is_player {
             // World / environment death.
             let health = self.entities[targ].v.health;
-            self.entities[targ].v.frags -= 1.0;
-            self.host.logfrag(targ, targ);
+            self.dock_frag(targ, 1.0);
             let s = world_death_string(death, health, r);
             self.broadcast(PrintLevel::Medium, &format!("{victim}{s}"));
             return;
@@ -112,8 +109,7 @@ impl GameState {
             // Killed self with a weapon / discharge / console `kill`.
             let watertype = self.entities[targ].v.watertype;
             let dock = if death == DeathType::Suicide { 2.0 } else { 1.0 };
-            self.entities[targ].v.frags -= dock;
-            self.host.logfrag(targ, targ);
+            self.dock_frag(targ, dock);
             let s = self_kill_string(death, watertype, r);
             self.broadcast(PrintLevel::Medium, &format!("{victim}{s}"));
             return;
@@ -123,8 +119,7 @@ impl GameState {
         if self.obituary_is_teamkill(targ, attacker) {
             let (msg, docks) = teamkill_message(death, &victim, &att, r);
             if docks {
-                self.entities[attacker].v.frags -= 1.0;
-                self.host.logfrag(attacker, attacker); // ZOID: killing a teammate logs as suicide
+                self.dock_frag(attacker, 1.0); // ZOID: killing a teammate logs as a suicide
             }
             self.broadcast(PrintLevel::Medium, &msg);
             return;
@@ -133,8 +128,7 @@ impl GameState {
         // Normal kill.
         let gibbed = self.entities[targ].v.health < -40.0;
         let quad = self.entities[attacker].combat.super_damage_finished > 0.0;
-        self.entities[attacker].v.frags += 1.0;
-        self.host.logfrag(attacker, targ);
+        self.award_frag(attacker, 1.0, targ);
         let msg = frag_message(death, &victim, &att, gibbed, quad, r);
         self.broadcast(PrintLevel::Medium, &msg);
     }

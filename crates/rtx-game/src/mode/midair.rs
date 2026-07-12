@@ -120,8 +120,7 @@ impl GameMode for Midair {
             (1.0, "bronze")
         };
 
-        g.entities[attacker].v.frags += frags;
-        g.host().logfrag(attacker, victim);
+        g.award_frag(attacker, frags, victim);
         let att = g.netname_of(attacker);
         let vic = g.netname_of(victim);
         g.broadcast(

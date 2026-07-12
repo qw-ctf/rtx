@@ -46,6 +46,20 @@ impl GameState {
         false
     }
 
+    /// Award `killer` `n` frags for fragging `killee`, and log the frag (server frag log / MVD
+    /// stream). The award-and-log pairing the obituary and midair scoring repeat.
+    pub(crate) fn award_frag(&mut self, killer: EntId, n: f32, killee: EntId) {
+        self.entities[killer].v.frags += n;
+        self.host.logfrag(killer, killee);
+    }
+
+    /// Dock `e` `n` frags for a self-kill or teamkill, logged as a suicide (`logfrag(e, e)` — ZOID:
+    /// killing a teammate logs as a suicide).
+    pub(crate) fn dock_frag(&mut self, e: EntId, n: f32) {
+        self.entities[e].v.frags -= n;
+        self.host.logfrag(e, e);
+    }
+
     /// `Killed` — `targ` has reached <= 0 health; run its death behaviour.
     pub(crate) fn killed(&mut self, targ: EntId, attacker: EntId) {
         {
