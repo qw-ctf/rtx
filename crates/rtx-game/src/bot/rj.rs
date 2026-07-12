@@ -129,10 +129,10 @@ pub(crate) fn drive_rj(graph: &NavGraph, bot: &mut BotState, c: RjCtx) -> RjDriv
             let src = graph.cell_origin(graph.link_source(leg));
             let tgt = graph.cell_origin(graph.link_target(leg));
             // An enemy while not yet committed (Idle/Stance) → let combat win; abort cleanly.
-            if enemy.is_some() && matches!(bot.rj_phase, RjPhase::Idle | RjPhase::Stance) {
-                bot.rj_phase = RjPhase::Idle;
+            if enemy.is_some() && matches!(bot.rj.phase, RjPhase::Idle | RjPhase::Stance) {
+                bot.rj.phase = RjPhase::Idle;
             } else {
-                if bot.rj_phase == RjPhase::Idle {
+                if bot.rj.phase == RjPhase::Idle {
                     // Fitness pre-check on arrival: the bot's state can change between plan and here,
                     // so verify it can still afford the specific leg's blast before committing.
                     let effective = effective_self_damage(tr.self_damage, armortype, armorvalue);
@@ -144,12 +144,12 @@ pub(crate) fn drive_rj(graph: &NavGraph, bot: &mut BotState, c: RjCtx) -> RjDriv
                     if !fit {
                         failed = true;
                     } else {
-                        bot.rj_phase = RjPhase::Stance;
-                        bot.rj_link = leg;
-                        bot.rj_started = now;
+                        bot.rj.phase = RjPhase::Stance;
+                        bot.rj.link = leg;
+                        bot.rj.started = now;
                     }
                 }
-                match bot.rj_phase {
+                match bot.rj.phase {
                     RjPhase::Stance => {
                         look_target_angles = Some(tr.fire_angles);
                         if weapon != Weapon::RocketLauncher {
@@ -165,19 +165,19 @@ pub(crate) fn drive_rj(graph: &NavGraph, bot: &mut BotState, c: RjCtx) -> RjDriv
                         } else {
                             approach = Some(src);
                         }
-                        if now - bot.rj_started > RJ_STANCE_TIMEOUT {
+                        if now - bot.rj.started > RJ_STANCE_TIMEOUT {
                             failed = true;
                         }
                     }
                     RjPhase::Rise => {
                         look_target_angles = Some(tr.fire_angles); // keep holding the settled aim
                         stand = true;
-                        if on_ground && now - bot.rj_jump_time > RJ_LIFTOFF_TIMEOUT {
+                        if on_ground && now - bot.rj.jump_time > RJ_LIFTOFF_TIMEOUT {
                             failed = true; // the jump was swallowed — never left the ground
-                        } else if now - bot.rj_jump_time >= tr.fire_delay {
+                        } else if now - bot.rj.jump_time >= tr.fire_delay {
                             fire = true; // fire this frame (aim already held since Stance)
-                            bot.rj_phase = RjPhase::Ballistic;
-                            bot.rj_started = now;
+                            bot.rj.phase = RjPhase::Ballistic;
+                            bot.rj.started = now;
                         }
                     }
                     RjPhase::Ballistic => {
@@ -185,18 +185,18 @@ pub(crate) fn drive_rj(graph: &NavGraph, bot: &mut BotState, c: RjCtx) -> RjDriv
                         // Gentle correction toward the landing — QW air accel caps this to a nudge
                         // within the perturb-guaranteed neighborhood (the user's error-correction).
                         air_correct = Some(tgt);
-                        let elapsed = now - bot.rj_started;
+                        let elapsed = now - bot.rj.started;
                         match ballistic_landing(origin, tgt, on_ground, elapsed, tr.airtime + RJ_BALLISTIC_SLACK) {
                             Landing::Down { on_target } => {
                                 if on_target {
-                                    bot.rj_fails = 0;
+                                    bot.rj.fails = 0;
                                 }
                                 bot.route_pos += 1; // clear the leg; repath from the landing
-                                bot.rj_phase = RjPhase::Idle;
+                                bot.rj.phase = RjPhase::Idle;
                                 bot.repath_time = now;
                             }
                             Landing::Overran => {
-                                bot.rj_phase = RjPhase::Idle; // never landed cleanly — repath
+                                bot.rj.phase = RjPhase::Idle; // never landed cleanly — repath
                                 bot.repath_time = now;
                             }
                             Landing::Riding => {}
@@ -206,11 +206,11 @@ pub(crate) fn drive_rj(graph: &NavGraph, bot: &mut BotState, c: RjCtx) -> RjDriv
                 }
             }
         } else {
-            bot.rj_phase = RjPhase::Idle; // the current leg isn't a solvable rocket jump — abort
+            bot.rj.phase = RjPhase::Idle; // the current leg isn't a solvable rocket jump — abort
         }
     }
     if failed {
-        bot.rj_phase = RjPhase::Idle;
+        bot.rj.phase = RjPhase::Idle;
         bot.traversal_failed(Driver::RocketJump, chasing, now);
     }
 

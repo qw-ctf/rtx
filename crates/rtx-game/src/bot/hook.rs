@@ -89,23 +89,23 @@ pub(crate) fn drive_hook(graph: &NavGraph, bot: &mut BotState, c: HookCtx) -> Ho
             let src = graph.cell_origin(graph.link_source(leg));
             let tgt = graph.cell_origin(graph.link_target(leg));
             // An enemy in an early phase → let combat win; abort a hook we haven't committed to.
-            if enemy.is_some() && matches!(bot.hook_phase, HookPhase::Idle | HookPhase::Aim) {
+            if enemy.is_some() && matches!(bot.hook.phase, HookPhase::Idle | HookPhase::Aim) {
                 if hook_out {
                     hook_reset = Some(grapple_hook);
                 }
-                bot.hook_phase = HookPhase::Idle;
+                bot.hook.phase = HookPhase::Idle;
             } else {
-                if bot.hook_phase == HookPhase::Idle {
+                if bot.hook.phase == HookPhase::Idle {
                     if !has_grapple {
                         hook_failed = true; // no hook to fly this leg (a mode stripped it)
                     } else {
-                        bot.hook_phase = HookPhase::Aim;
-                        bot.hook_link = leg;
-                        bot.hook_started = now;
-                        bot.hook_release_dist = tr.release_dist;
+                        bot.hook.phase = HookPhase::Aim;
+                        bot.hook.link = leg;
+                        bot.hook.started = now;
+                        bot.hook.release_dist = tr.release_dist;
                     }
                 }
-                match bot.hook_phase {
+                match bot.hook.phase {
                     HookPhase::Aim => {
                         hook_look_target = Some(tr.stick);
                         if weapon != Weapon::Grapple {
@@ -119,7 +119,7 @@ pub(crate) fn drive_hook(graph: &NavGraph, bot: &mut BotState, c: HookCtx) -> Ho
                         } else {
                             hook_approach = Some(src);
                         }
-                        if now - bot.hook_started > HOOK_AIM_TIMEOUT {
+                        if now - bot.hook.started > HOOK_AIM_TIMEOUT {
                             hook_failed = true;
                         }
                     }
@@ -131,11 +131,11 @@ pub(crate) fn drive_hook(graph: &NavGraph, bot: &mut BotState, c: HookCtx) -> Ho
                             if (anchor - tr.stick).length() > HOOK_ANCHOR_DRIFT {
                                 hook_failed = true; // stuck somewhere the solve didn't predict
                             } else {
-                                bot.hook_phase = HookPhase::Reel;
-                                bot.hook_started = now;
-                                bot.hook_prev_dist = (origin - anchor).length();
+                                bot.hook.phase = HookPhase::Reel;
+                                bot.hook.started = now;
+                                bot.hook.prev_dist = (origin - anchor).length();
                             }
-                        } else if !hook_out || now - bot.hook_started > HOOK_FLIGHT_TIMEOUT {
+                        } else if !hook_out || now - bot.hook.started > HOOK_FLIGHT_TIMEOUT {
                             hook_failed = true; // throw missed / hit sky (server reset it)
                         }
                     }
@@ -146,32 +146,32 @@ pub(crate) fn drive_hook(graph: &NavGraph, bot: &mut BotState, c: HookCtx) -> Ho
                         let d = (origin - anchor).length();
                         if !on_hook || !hook_out || (anchor - tr.stick).length() > HOOK_ANCHOR_DRIFT {
                             hook_failed = true; // hook lost or the anchor moved (door/plat/player)
-                        } else if d - reel_half_step <= bot.hook_release_dist {
+                        } else if d - reel_half_step <= bot.hook.release_dist {
                             // Release: drop +attack so `service_grapple` lets go next PreThink.
                             hook_hold_fire = false;
-                            bot.hook_phase = HookPhase::Ballistic;
-                            bot.hook_started = now;
-                        } else if d > bot.hook_prev_dist - 1.0 && now - bot.hook_started > HOOK_REEL_TIMEOUT {
+                            bot.hook.phase = HookPhase::Ballistic;
+                            bot.hook.started = now;
+                        } else if d > bot.hook.prev_dist - 1.0 && now - bot.hook.started > HOOK_REEL_TIMEOUT {
                             hook_failed = true; // reel stalled against a lip
                         } else {
-                            bot.hook_prev_dist = d.min(bot.hook_prev_dist);
+                            bot.hook.prev_dist = d.min(bot.hook.prev_dist);
                         }
                     }
                     HookPhase::Ballistic => {
                         hook_look_target = Some(tgt);
                         hook_stand = true; // zero input: the frictionless arc must match the solve
-                        let elapsed = now - bot.hook_started;
+                        let elapsed = now - bot.hook.started;
                         match ballistic_landing(origin, tgt, on_ground, elapsed, tr.airtime + HOOK_BALLISTIC_SLACK) {
                             Landing::Down { on_target } => {
                                 if on_target {
-                                    bot.hook_fails = 0;
+                                    bot.hook.fails = 0;
                                 }
                                 bot.route_pos += 1; // clear the hook leg; repath from the landing
-                                bot.hook_phase = HookPhase::Idle;
+                                bot.hook.phase = HookPhase::Idle;
                                 bot.repath_time = now;
                             }
                             Landing::Overran => {
-                                bot.hook_phase = HookPhase::Idle; // never landed cleanly — just repath
+                                bot.hook.phase = HookPhase::Idle; // never landed cleanly — just repath
                                 bot.repath_time = now;
                             }
                             Landing::Riding => {}
@@ -185,14 +185,14 @@ pub(crate) fn drive_hook(graph: &NavGraph, bot: &mut BotState, c: HookCtx) -> Ho
             if hook_out {
                 hook_reset = Some(grapple_hook);
             }
-            bot.hook_phase = HookPhase::Idle;
+            bot.hook.phase = HookPhase::Idle;
         }
     }
     if hook_failed {
         if hook_out {
             hook_reset = Some(grapple_hook);
         }
-        bot.hook_phase = HookPhase::Idle;
+        bot.hook.phase = HookPhase::Idle;
         bot.traversal_failed(Driver::Hook, chasing, now);
     }
 

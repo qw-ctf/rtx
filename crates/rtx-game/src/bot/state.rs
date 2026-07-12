@@ -100,42 +100,11 @@ pub struct BotState {
     /// repath churn doesn't reset the timer. `None` = not waiting on a lift.
     pub plat_wait: Option<usize>,
     pub plat_wait_since: f32,
-    /// Grappling-hook traversal state machine (see [`crate::bot`]), driven when the current route leg
-    /// is a [`LinkKind::Hook`](crate::navmesh::LinkKind::Hook): aim at the anchor, throw, reel to
-    /// build speed, release into a parabola, ride it to the target.
-    pub hook_phase: HookPhase,
-    /// The hook leg (link index) currently being flown, and when the active phase began (per-phase
-    /// timeout base).
-    pub hook_link: u32,
-    pub hook_started: f32,
-    /// Distance-from-anchor at which to release, re-solved against the *live* anchor once the hook
-    /// bites (so the parabola lands on the target despite aim/stance error), plus last frame's
-    /// distance-to-anchor to detect the release crossing and a stalled reel.
-    pub hook_release_dist: f32,
-    pub hook_prev_dist: f32,
-    /// Consecutive failed hook attempts toward the current goal — two in a row abandons the goal.
-    pub hook_fails: u8,
-    /// Grenade lob→shoot combo state machine (see [`crate::bot::grenade`]): aim a lobbed grenade,
-    /// then detonate it to airburst an enemy or shove them into a hazard.
-    pub grenade_phase: GrenadePhase,
-    /// When the current combo phase began (per-phase timeout base; becomes the fuse clock once the
-    /// grenade is fired).
-    pub grenade_started: f32,
-    /// The blast point the lob targets, and the solved view angles to lob it there.
-    pub grenade_target: Vec3,
-    pub grenade_look: Vec3,
-    /// The lobbed grenade entity once captured (`0` = not yet in flight / none).
-    pub grenade_ent: u32,
-    /// This combo is a no-line-of-sight **bank shot** — detonate on the fuse, not by shooting the
-    /// grenade (which the bot can't see). See `crate::bot::grenade`'s bank-shot start.
-    pub grenade_bank: bool,
-    /// Desired shove direction (unit, horizontal) when the combo is a hazard shove; `ZERO` for a
-    /// plain airburst.
-    pub grenade_shove_dir: Vec3,
-    /// Distance from the enemy to the hazard edge — the shove must carry them at least this far.
-    pub grenade_shove_edge: f32,
-    /// Earliest time the bot may start another combo (anti-spam).
-    pub grenade_next_try: f32,
+    /// Grappling-hook traversal state machine (see [`HookState`]), driven when the current route leg
+    /// is a [`LinkKind::Hook`](crate::navmesh::LinkKind::Hook).
+    pub hook: HookState,
+    /// Grenade lob→shoot combo state machine (see [`GrenadeState`]).
+    pub grenade: GrenadeState,
     /// The bunnyhop controller (see [`crate::bot::bhop`]): the hop-cycle phase machine, sticky
     /// strafe sign, engage hysteresis, and telemetry.
     pub bhop: crate::bot::bhop::Bhop,
@@ -149,15 +118,9 @@ pub struct BotState {
     /// `sj_leg`/rocket-jump commitment, which plain jumps previously lacked). `None` = not committed.
     pub air_leg: Option<u32>,
     pub air_started: f32,
-    /// Rocket-jump traversal machine (see [`crate::bot::rj`]): stance → jump → fire → ride the blast
-    /// arc onto a high ledge. `rj_link` is the leg being flown; `rj_started` the per-phase timeout
-    /// base; `rj_jump_time` the moment the jump was pressed (the fire-delay clock); `rj_fails` the
-    /// consecutive-failure count (two aborts avoid the goal, like the hook).
-    pub rj_phase: RjPhase,
-    pub rj_link: u32,
-    pub rj_started: f32,
-    pub rj_jump_time: f32,
-    pub rj_fails: u8,
+    /// Rocket-jump traversal machine (see [`RjState`]): stance → jump → fire → ride the blast arc
+    /// onto a high ledge.
+    pub rj: RjState,
 }
 
 impl BotState {
@@ -186,19 +149,19 @@ impl BotState {
     pub(crate) fn traversal_failed(&mut self, driver: Driver, chasing: bool, now: f32) {
         let n = match driver {
             Driver::Hook => {
-                self.hook_fails = self.hook_fails.saturating_add(1);
-                self.hook_fails
+                self.hook.fails = self.hook.fails.saturating_add(1);
+                self.hook.fails
             }
             Driver::RocketJump => {
-                self.rj_fails = self.rj_fails.saturating_add(1);
-                self.rj_fails
+                self.rj.fails = self.rj.fails.saturating_add(1);
+                self.rj.fails
             }
         };
         self.repath_time = now;
         if n >= 2 {
             match driver {
-                Driver::Hook => self.hook_fails = 0,
-                Driver::RocketJump => self.rj_fails = 0,
+                Driver::Hook => self.hook.fails = 0,
+                Driver::RocketJump => self.rj.fails = 0,
             }
             self.route.clear();
             if chasing {
@@ -259,6 +222,64 @@ pub struct Aim {
     pub look_prev_time: f32,
     /// Last frame's sent bhop view yaw, to seed the spring's angular velocity when combat resumes.
     pub bhop_prev_yaw: f32,
+}
+
+/// Grappling-hook traversal state (see [`crate::bot::hook`]): aim at the anchor, throw, reel to
+/// build speed, release into a parabola, ride it to the target.
+#[derive(Default)]
+pub struct HookState {
+    pub phase: HookPhase,
+    /// The hook leg (link index) currently being flown, and when the active phase began (per-phase
+    /// timeout base).
+    pub link: u32,
+    pub started: f32,
+    /// Distance-from-anchor at which to release, re-solved against the *live* anchor once the hook
+    /// bites (so the parabola lands on the target despite aim/stance error), plus last frame's
+    /// distance-to-anchor to detect the release crossing and a stalled reel.
+    pub release_dist: f32,
+    pub prev_dist: f32,
+    /// Consecutive failed hook attempts toward the current goal — two in a row abandons the goal.
+    pub fails: u8,
+}
+
+/// Grenade lob→shoot combo state (see [`crate::bot::grenade`]): aim a lobbed grenade, then detonate
+/// it to airburst an enemy or shove them into a hazard.
+#[derive(Default)]
+pub struct GrenadeState {
+    pub phase: GrenadePhase,
+    /// When the current combo phase began (per-phase timeout base; becomes the fuse clock once the
+    /// grenade is fired).
+    pub started: f32,
+    /// The blast point the lob targets, and the solved view angles to lob it there.
+    pub target: Vec3,
+    pub look: Vec3,
+    /// The lobbed grenade entity once captured (`0` = not yet in flight / none).
+    pub ent: u32,
+    /// This combo is a no-line-of-sight **bank shot** — detonate on the fuse, not by shooting the
+    /// grenade (which the bot can't see). See `crate::bot::grenade`'s bank-shot start.
+    pub bank: bool,
+    /// Desired shove direction (unit, horizontal) when the combo is a hazard shove; `ZERO` for a
+    /// plain airburst.
+    pub shove_dir: Vec3,
+    /// Distance from the enemy to the hazard edge — the shove must carry them at least this far.
+    pub shove_edge: f32,
+    /// Earliest time the bot may start another combo (anti-spam).
+    pub next_try: f32,
+}
+
+/// Rocket-jump traversal state (see [`crate::bot::rj`]): stance → jump → fire → ride the blast arc
+/// onto a high ledge.
+#[derive(Default)]
+pub struct RjState {
+    pub phase: RjPhase,
+    /// The leg (link index) being flown.
+    pub link: u32,
+    /// The per-phase timeout base.
+    pub started: f32,
+    /// The moment the jump was pressed (the fire-delay clock).
+    pub jump_time: f32,
+    /// Consecutive-failure count (two aborts avoid the goal, like the hook).
+    pub fails: u8,
 }
 
 /// The route-progress watchdogs carried on a [`BotState`]: three independent ways a bot detects it

@@ -398,28 +398,28 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // it, e.g. Rocket Arena), abandon the traversal cleanly — release any live hook and reset the
     // phase. Runs before the nav borrow, where `&mut game` is free. Other aborts (leg changed, hook
     // vanished, timeouts) are handled inside the hook driver below.
-    if game.entities[e].bot.hook_phase != HookPhase::Idle && !game.entities[e].v.items.has(Items::GRAPPLE) {
+    if game.entities[e].bot.hook.phase != HookPhase::Idle && !game.entities[e].v.items.has(Items::GRAPPLE) {
         if game.entities[e].grapple.hook_out {
             let hook = EntId(game.entities[e].grapple.hook);
             game.reset_grapple(hook);
         }
-        game.entities[e].bot.hook_phase = HookPhase::Idle;
-        game.entities[e].bot.hook_fails = 0;
+        game.entities[e].bot.hook.phase = HookPhase::Idle;
+        game.entities[e].bot.hook.fails = 0;
     }
-    let hooking = game.entities[e].bot.hook_phase != HookPhase::Idle;
+    let hooking = game.entities[e].bot.hook.phase != HookPhase::Idle;
     // Rocket-jump invariant net: mid-RJ but the RL or its ammo is gone (dropped, spent, stripped) —
     // abort so the bot doesn't jump into a shot it can't fire. Timeouts/misfires are the driver's.
-    if game.entities[e].bot.rj_phase != RjPhase::Idle
+    if game.entities[e].bot.rj.phase != RjPhase::Idle
         && (!game.entities[e].v.items.has(Items::ROCKET_LAUNCHER) || game.entities[e].v.ammo_rockets < 1.0)
     {
-        game.entities[e].bot.rj_phase = RjPhase::Idle;
-        game.entities[e].bot.rj_fails = 0;
+        game.entities[e].bot.rj.phase = RjPhase::Idle;
+        game.entities[e].bot.rj.fails = 0;
     }
     // On a speed-jump leg the route must be frozen: the link's `from` is the runway start, now behind
     // the bot, so a repath would drop the link and turn the bot around at speed. Treated like `hooking`.
     let on_sj = game.entities[e].bot.sj_leg.is_some();
     // A rocket-jump leg freezes the route the same way (stance stands still, the arc flies fast).
-    let on_rj = game.entities[e].bot.rj_phase != RjPhase::Idle;
+    let on_rj = game.entities[e].bot.rj.phase != RjPhase::Idle;
 
     // Ask the active mode for this bot's intent. A round mode (Rocket Arena) returns Fight/Move to
     // drive combat or audience-roaming; FFA hunts the nearest player. Every mode-specific bot
@@ -696,8 +696,8 @@ fn emit(
         if err < HOOK_AIM_TOL {
             buttons |= BUTTON_ATTACK;
             let b = &mut game.entities[e].bot;
-            b.hook_phase = HookPhase::Flight;
-            b.hook_started = now;
+            b.hook.phase = HookPhase::Flight;
+            b.hook.started = now;
         }
     } else if hook.hold_fire {
         buttons |= BUTTON_ATTACK;
@@ -710,8 +710,8 @@ fn emit(
         if err < RJ_AIM_TOL {
             buttons |= BUTTON_JUMP;
             let b = &mut game.entities[e].bot;
-            b.rj_phase = RjPhase::Rise;
-            b.rj_jump_time = now;
+            b.rj.phase = RjPhase::Rise;
+            b.rj.jump_time = now;
         }
     }
     // Flush any deferred hook release now the graph/bot borrows are done.
@@ -724,8 +724,8 @@ fn emit(
     if host.cvar_bool(c"rtx_bot_debug") {
         let gate = game.entities[e].bot.gate;
         let route = game.entities[e].bot.route.len();
-        let hph = game.entities[e].bot.hook_phase;
-        let rjph = game.entities[e].bot.rj_phase;
+        let hph = game.entities[e].bot.hook.phase;
+        let rjph = game.entities[e].bot.rj.phase;
         let bpos = game.entities[e].bot.route_pos;
         let band = game.entities[e].bot.route_bands.get(bpos).copied().unwrap_or(0);
         let bh = &game.entities[e].bot.bhop;
@@ -876,11 +876,11 @@ fn run_bot(game: &mut GameState, e: EntId) {
     if overlays_ok {
         let handled = combat::grenade_tactics(game, e, enemy, origin, &mut cmd);
         if handled {
-            game.entities[e].bot.grenade_phase = GrenadePhase::Idle; // defence drops a stale combo
+            game.entities[e].bot.grenade.phase = GrenadePhase::Idle; // defence drops a stale combo
         } else {
             // A one-shot rocket shove takes priority over *starting* a grenade combo, but never
             // interrupts one already in progress (the short-circuit keeps a running combo going).
-            let running = game.entities[e].bot.grenade_phase != GrenadePhase::Idle;
+            let running = game.entities[e].bot.grenade.phase != GrenadePhase::Idle;
             if running || !grenade::rocket_shove(game, e, enemy, origin, &mut cmd) {
                 grenade::grenade_combo(game, e, enemy, origin, now, &mut cmd);
             }

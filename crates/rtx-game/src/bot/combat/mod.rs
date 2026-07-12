@@ -659,7 +659,7 @@ pub(crate) fn engage(
     // The lob→shoot combo (`grenade::grenade_combo`, run after us) owns grounded grenade offence when
     // shootable grenades are enabled; `idle`/`combos_on` tell `plan_ballistics` whether engage is the
     // driver (see its doc). The airborne intercept is engage-exclusive.
-    let idle = game.entities[e].bot.grenade_phase == GrenadePhase::Idle;
+    let idle = game.entities[e].bot.grenade.phase == GrenadePhase::Idle;
     let combos_on = game.host().cvar_bool(c"rtx_shootable_grenades");
 
     // Geometry-aware projectile planning, all inside one immutable BSP borrow, handed back as data.
@@ -828,7 +828,7 @@ pub(crate) fn grenade_tactics(
     // A grenade this bot is running as a lob→shoot combo (see `super::grenade`): don't let the
     // opportunistic offence below detonate it early — that would blow it *short* of the enemy and
     // shove them the wrong way. The combo driver detonates it at the right moment itself.
-    let combo_grenade = game.entities[e].bot.grenade_ent;
+    let combo_grenade = game.entities[e].bot.grenade.ent;
 
     // Nearest threatening enemy grenade (defence), and the nearest grenade sitting on our enemy that
     // we can safely detonate (offence).

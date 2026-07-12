@@ -361,10 +361,10 @@ pub(crate) fn predict_shove(v_center: Vec3, v_origin: Vec3, b: Vec3) -> Vec3 {
 /// Reset the combo and set a restart cooldown.
 fn combo_reset(game: &mut GameState, e: EntId, next_try: f32) {
     let b = &mut game.entities[e].bot;
-    b.grenade_phase = GrenadePhase::Idle;
-    b.grenade_ent = 0;
-    b.grenade_bank = false;
-    b.grenade_next_try = next_try;
+    b.grenade.phase = GrenadePhase::Idle;
+    b.grenade.ent = 0;
+    b.grenade.bank = false;
+    b.grenade.next_try = next_try;
 }
 
 /// A player's bbox centre (where radius damage/knockback are measured).
@@ -433,7 +433,7 @@ pub(crate) fn grenade_combo(
     now: f32,
     cmd: &mut BotCmd,
 ) {
-    let phase = game.entities[e].bot.grenade_phase;
+    let phase = game.entities[e].bot.grenade.phase;
     // Losing the enemy cancels any in-progress combo (but a lobbed grenade can still fuse-blow).
     let Some(en) = enemy else {
         if phase != GrenadePhase::Idle {
@@ -452,7 +452,7 @@ pub(crate) fn grenade_combo(
 /// Decide whether to start a combo, and if so aim the lob (Idle → Windup).
 fn try_start(game: &mut GameState, e: EntId, en: EntId, origin: Vec3, now: f32) {
     let host = *game.host();
-    if now < game.entities[e].bot.grenade_next_try || !host.cvar_bool(c"rtx_shootable_grenades") {
+    if now < game.entities[e].bot.grenade.next_try || !host.cvar_bool(c"rtx_shootable_grenades") {
         return;
     }
     let (items, ammo_rockets, ammo_cells, health) = {
@@ -557,14 +557,14 @@ fn try_start(game: &mut GameState, e: EntId, en: EntId, origin: Vec3, now: f32) 
     };
 
     let b = &mut game.entities[e].bot;
-    b.grenade_phase = GrenadePhase::Windup;
-    b.grenade_started = now;
-    b.grenade_target = target;
-    b.grenade_look = look;
-    b.grenade_shove_dir = shove_dir;
-    b.grenade_shove_edge = shove_edge;
-    b.grenade_ent = 0;
-    b.grenade_bank = false;
+    b.grenade.phase = GrenadePhase::Windup;
+    b.grenade.started = now;
+    b.grenade.target = target;
+    b.grenade.look = look;
+    b.grenade.shove_dir = shove_dir;
+    b.grenade.shove_edge = shove_edge;
+    b.grenade.ent = 0;
+    b.grenade.bank = false;
 }
 
 /// Try to start an indirect **bank shot** at an out-of-sight enemy (Idle → Windup): search the
@@ -612,23 +612,23 @@ fn try_start_bank(game: &mut GameState, e: EntId, en: EntId, origin: Vec3, now: 
         return;
     }
     let b = &mut game.entities[e].bot;
-    b.grenade_phase = GrenadePhase::Windup;
-    b.grenade_started = now;
-    b.grenade_target = shot.det_pos;
-    b.grenade_look = shot.look;
-    b.grenade_shove_dir = Vec3::ZERO;
-    b.grenade_shove_edge = 0.0;
-    b.grenade_ent = 0;
-    b.grenade_bank = true;
+    b.grenade.phase = GrenadePhase::Windup;
+    b.grenade.started = now;
+    b.grenade.target = shot.det_pos;
+    b.grenade.look = shot.look;
+    b.grenade.shove_dir = Vec3::ZERO;
+    b.grenade.shove_edge = 0.0;
+    b.grenade.ent = 0;
+    b.grenade.bank = true;
 }
 
 /// Select the GL, aim the lob, and fire once the smoothed view is on it (Windup → Lobbed).
 fn windup(game: &mut GameState, e: EntId, now: f32, cmd: &mut BotCmd) {
-    if now - game.entities[e].bot.grenade_started > WINDUP_TIMEOUT {
+    if now - game.entities[e].bot.grenade.started > WINDUP_TIMEOUT {
         combo_reset(game, e, now + COMBO_COOLDOWN);
         return;
     }
-    let want = game.entities[e].bot.grenade_look;
+    let want = game.entities[e].bot.grenade.look;
     cmd.look = want;
     cmd.move_world = Vec3::ZERO; // hold the firing stance
     cmd.buttons &= !BUTTON_ATTACK; // don't fire the current gun at lob pitch
@@ -644,25 +644,25 @@ fn windup(game: &mut GameState, e: EntId, now: f32, cmd: &mut BotCmd) {
     if now >= attack_finished && aim_err(game.entities[e].bot.aim.angles, want) < LOB_AIM_TOL {
         cmd.buttons |= BUTTON_ATTACK;
         let b = &mut game.entities[e].bot;
-        b.grenade_phase = GrenadePhase::Lobbed;
-        b.grenade_started = now; // now the fuse clock
+        b.grenade.phase = GrenadePhase::Lobbed;
+        b.grenade.started = now; // now the fuse clock
     }
 }
 
 /// Capture the fired grenade and switch to the detonator (Lobbed → Detonate).
 fn lobbed(game: &mut GameState, e: EntId, origin: Vec3, now: f32, cmd: &mut BotCmd) {
-    if game.entities[e].bot.grenade_ent == 0 {
+    if game.entities[e].bot.grenade.ent == 0 {
         match own_live_grenade(game, e, origin) {
-            Some(g) => game.entities[e].bot.grenade_ent = g.0,
+            Some(g) => game.entities[e].bot.grenade.ent = g.0,
             None => {
-                if now - game.entities[e].bot.grenade_started > CAPTURE_TIMEOUT {
+                if now - game.entities[e].bot.grenade.started > CAPTURE_TIMEOUT {
                     combo_reset(game, e, now + COMBO_COOLDOWN); // the shot never produced a grenade
                 }
                 return;
             }
         }
     }
-    let g = EntId(game.entities[e].bot.grenade_ent);
+    let g = EntId(game.entities[e].bot.grenade.ent);
     if !grenade_live(game, g) {
         combo_reset(game, e, now + COMBO_DONE_COOLDOWN); // already went off (touch/fuse) — done
         return;
@@ -670,8 +670,8 @@ fn lobbed(game: &mut GameState, e: EntId, origin: Vec3, now: f32, cmd: &mut BotC
     // Bank shot: no line of sight to the grenade, so don't switch to a detonator or yank the view at
     // an unseen wall — just let the fuse blow it near the enemy. Navigation/combat keep the bot
     // moving (often back toward line of sight) while it burns. A backstop reset covers a lost track.
-    if game.entities[e].bot.grenade_bank {
-        if now - game.entities[e].bot.grenade_started > GL_FUSE + 0.5 {
+    if game.entities[e].bot.grenade.bank {
+        if now - game.entities[e].bot.grenade.started > GL_FUSE + 0.5 {
             combo_reset(game, e, now + BANK_DONE_COOLDOWN);
         }
         return;
@@ -682,7 +682,7 @@ fn lobbed(game: &mut GameState, e: EntId, origin: Vec3, now: f32, cmd: &mut BotC
         if game.entities[e].v.weapon != weapon {
             cmd.impulse = imp;
         } else {
-            game.entities[e].bot.grenade_phase = GrenadePhase::Detonate;
+            game.entities[e].bot.grenade.phase = GrenadePhase::Detonate;
         }
     } else {
         combo_reset(game, e, now + COMBO_COOLDOWN);
@@ -695,13 +695,13 @@ fn lobbed(game: &mut GameState, e: EntId, origin: Vec3, now: f32, cmd: &mut BotC
 
 /// Detonate the grenade the instant its blast puts the enemy where we want them (Detonate → Idle).
 fn detonate(game: &mut GameState, e: EntId, en: EntId, origin: Vec3, now: f32, cmd: &mut BotCmd) {
-    let g = EntId(game.entities[e].bot.grenade_ent);
-    if game.entities[e].bot.grenade_ent == 0 || !grenade_live(game, g) {
+    let g = EntId(game.entities[e].bot.grenade.ent);
+    if game.entities[e].bot.grenade.ent == 0 || !grenade_live(game, g) {
         combo_reset(game, e, now + COMBO_DONE_COOLDOWN); // detonated (by us or fuse) — done
         return;
     }
     // Fuse backstop: if we've held too long, stop and let it blow on its own.
-    if now - game.entities[e].bot.grenade_started > GL_FUSE {
+    if now - game.entities[e].bot.grenade.started > GL_FUSE {
         combo_reset(game, e, now + COMBO_DONE_COOLDOWN);
         return;
     }
@@ -725,8 +725,8 @@ fn detonate(game: &mut GameState, e: EntId, en: EntId, origin: Vec3, now: f32, c
 
     // Is the geometry right? For a shove, the grenade must sit close to the enemy on the correct
     // side so the outward push drives them toward the hazard; for an airburst, just close.
-    let shove_dir = game.entities[e].bot.grenade_shove_dir;
-    let shove_edge = game.entities[e].bot.grenade_shove_edge;
+    let shove_dir = game.entities[e].bot.grenade.shove_dir;
+    let shove_edge = game.entities[e].bot.grenade.shove_edge;
     let e_center = player_center(game, en);
     let e_org = game.entities[en].v.origin;
     let fire_ok = if shove_dir != Vec3::ZERO {

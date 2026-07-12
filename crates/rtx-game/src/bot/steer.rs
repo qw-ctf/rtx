@@ -406,7 +406,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         // and a spectator strolling the stands shouldn't be bunnyhopping anyway.
         || watch_point.is_some()
         || bot.gate.is_some()
-        || bot.grenade_phase != GrenadePhase::Idle;
+        || bot.grenade.phase != GrenadePhase::Idle;
     // The banded planner's intent for this run: a band ≥ 1 on the current or next leg means the
     // route was planned to carry speed here, so admit bhop even on a short leg (the goal-distance
     // gates below exist to avoid hopping on trivial approaches — the plan overrides that judgment)
@@ -595,9 +595,9 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         },
     );
     // Whether the hook is actively steering this frame (survives the abort branches above).
-    let hook_engaged = bot.hook_phase != HookPhase::Idle;
+    let hook_engaged = bot.hook.phase != HookPhase::Idle;
     let hook_lock = matches!(
-        bot.hook_phase,
+        bot.hook.phase,
         HookPhase::Flight | HookPhase::Reel | HookPhase::Ballistic
     );
 
@@ -626,8 +626,8 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             quad,
         },
     );
-    let rj_engaged = bot.rj_phase != RjPhase::Idle;
-    let rj_lock = matches!(bot.rj_phase, RjPhase::Rise | RjPhase::Ballistic);
+    let rj_engaged = bot.rj.phase != RjPhase::Idle;
+    let rj_lock = matches!(bot.rj.phase, RjPhase::Rise | RjPhase::Ballistic);
 
     if let Some(t) = hook.look_target {
         if (t - eye).xy().length() > 1.0 {
