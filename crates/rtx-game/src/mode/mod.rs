@@ -310,6 +310,20 @@ pub(crate) trait GameMode: Sync {
         false
     }
 
+    /// Whether `e` is a bystander a spawn telefrag cannot clear (solid but damage-refused), so it must
+    /// always fence spawn spots regardless of the live/warmup rule. Default: no one. Arena returns its
+    /// audience members. (The team-bench half of the spawn-fence check stays at the call site —
+    /// benching is the composition layer, not the mode.)
+    fn untouchable_bystander(&self, _g: &GameState, _e: EntId) -> bool {
+        false
+    }
+
+    /// Whether this mode fields CTF furniture (flags and runes), gating the map-entity spawns that
+    /// other modes drop. Default: no; CTF overrides.
+    fn uses_ctf_objects(&self) -> bool {
+        false
+    }
+
     // --- structured-match variation points (only reached when a team match is active) ---
 
     /// Reset the mode's slate when a match countdown expires: frags/scores for team DM, plus flags
@@ -502,6 +516,19 @@ pub(crate) fn centerprint_all(g: &GameState, msg: &str) {
     }
 }
 
+/// One announce step of a 3…2…1 countdown ending at world time `until`. Given the last whole second
+/// already shown (`last`), returns the updated marker and the second to centerprint now — each shown
+/// exactly once, and only while positive (the "FIGHT!" at zero is the caller's own go-live step,
+/// which differs between arena and team). Pure, so the tick logic is unit-testable without a match.
+pub(crate) fn countdown_announce(until: f32, now: f32, last: i32) -> (i32, Option<i32>) {
+    let remaining = (until - now).ceil() as i32;
+    if remaining != last {
+        (remaining, (remaining > 0).then_some(remaining))
+    } else {
+        (last, None)
+    }
+}
+
 // --- shared spectator/audience helpers -----------------------------------------------------------
 
 /// The harmless-spectator loadout: axe only, no ammo, positive health/armor. Shared by Rocket
@@ -555,4 +582,24 @@ pub(crate) fn wander_point(
         b.wander_time = now + 3.0 + jitter * 3.0;
     }
     g.entities[bot].bot.wander_target
+}
+
+#[cfg(test)]
+mod tests {
+    use super::countdown_announce;
+
+    /// Each whole second of a countdown is announced exactly once (only while positive); the same
+    /// second polled again yields nothing, and zero/negative print nothing (the caller owns "FIGHT!").
+    #[test]
+    fn countdown_announces_each_second_once() {
+        // 3s out, nothing shown yet (last = -1): print 3.
+        assert_eq!(countdown_announce(3.0, 0.0, -1), (3, Some(3)));
+        // Still within the 3-second, already shown: nothing.
+        assert_eq!(countdown_announce(3.0, 0.4, 3), (3, None));
+        // Crossed into the 2-second: print 2.
+        assert_eq!(countdown_announce(3.0, 1.5, 3), (2, Some(2)));
+        // At/after zero: update the marker but print nothing.
+        assert_eq!(countdown_announce(3.0, 3.0, 1), (0, None));
+        assert_eq!(countdown_announce(3.0, 3.5, 0), (0, None));
+    }
 }

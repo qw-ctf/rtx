@@ -122,12 +122,10 @@ impl GameMode for Arena {
                 }
             }
             RoundState::Countdown { until } => {
-                let remaining = (until - now).ceil() as i32;
-                if remaining != g.arena.last_count {
-                    g.arena.last_count = remaining;
-                    if remaining > 0 {
-                        centerprint_all(g, &format!("{remaining}"));
-                    }
+                let (last, print) = super::countdown_announce(until, now, g.arena.last_count);
+                g.arena.last_count = last;
+                if let Some(n) = print {
+                    centerprint_all(g, &format!("{n}"));
                 }
                 if now >= until {
                     g.arena.round = RoundState::Live;
@@ -244,6 +242,11 @@ impl GameMode for Arena {
     fn weapons_hot(&self, g: &GameState) -> bool {
         // No firing until "FIGHT" — locked out through warmup, countdown, and the post-round pause.
         matches!(g.arena.round, RoundState::Live)
+    }
+
+    fn untouchable_bystander(&self, g: &GameState, e: EntId) -> bool {
+        // The audience is solid but damage-refused, so a spawn telefrag can't clear them.
+        g.entities[e].mode_p.arena.role == ArenaRole::Audience
     }
 
     fn on_death(&self, g: &mut GameState, victim: EntId, _attacker: EntId) {

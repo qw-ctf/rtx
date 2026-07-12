@@ -71,6 +71,10 @@ impl GameMode for Ctf {
         "ctf"
     }
 
+    fn uses_ctf_objects(&self) -> bool {
+        true
+    }
+
     fn player_damage(
         &self,
         g: &mut GameState,
@@ -366,7 +370,7 @@ impl GameState {
 
     /// Place a flag at its base. Only in CTF — otherwise the entity is removed (purectf's guard).
     fn spawn_flag(&mut self, e: EntId, team: u8, skin: f32) -> bool {
-        if self.mode.name() != "ctf" {
+        if !self.mode.uses_ctf_objects() {
             return false;
         }
         self.entities[e].classname = Some("flag".into());
@@ -652,7 +656,7 @@ impl GameState {
             self.entities[p].mode_p.ctf.runes = 0;
             self.refresh_haste_speed(p);
         }
-        if self.mode.name() != "ctf" || self.host.cvar(c"rtx_runes") as i32 == 1 {
+        if !self.mode.uses_ctf_objects() || self.host.cvar(c"rtx_runes") as i32 == 1 {
             return; // 1 = runes off
         }
         for bit in [RUNE_RESISTANCE, RUNE_STRENGTH, RUNE_HASTE, RUNE_REGEN] {

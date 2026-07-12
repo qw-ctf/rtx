@@ -22,7 +22,7 @@
 
 use glam::Vec3;
 
-use super::{centerprint_all, nearest_player_where, players};
+use super::{centerprint_all, countdown_announce, nearest_player_where, players};
 use crate::defs::PrintLevel;
 use crate::entity::EntId;
 use crate::game::{cstring, GameState};
@@ -239,12 +239,10 @@ pub(crate) fn tick_lifecycle(g: &mut GameState) {
     match g.team_match.phase {
         MatchPhase::Warmup => {} // playable; team assignment happens on spawn (put_client_in_server)
         MatchPhase::Countdown { until } => {
-            let remaining = (until - now).ceil() as i32;
-            if remaining != g.team_match.last_count {
-                g.team_match.last_count = remaining;
-                if remaining > 0 {
-                    centerprint_all(g, &format!("{remaining}"));
-                }
+            let (last, print) = countdown_announce(until, now, g.team_match.last_count);
+            g.team_match.last_count = last;
+            if let Some(n) = print {
+                centerprint_all(g, &format!("{n}"));
             }
             if now >= until {
                 // Go live: the mode's own slate reset, then arm the time limit (`timelimit` is in

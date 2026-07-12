@@ -16,7 +16,7 @@ use crate::defs::*;
 use crate::entity::{CombatState, Die, EntId, Pain, SpawnState};
 use crate::game::GameState;
 use crate::obituary::DeathType;
-use crate::mode::{ArenaRole, ModePlayer};
+use crate::mode::ModePlayer;
 
 #[derive(Clone, Copy)]
 struct PlayerParms {
@@ -1033,12 +1033,10 @@ impl GameState {
             {
                 return false;
             }
-            // A bystander a telefrag can't clear must always fence: benched spectators and the
-            // Rocket Arena audience are solid but damage-refused, so spawning into them would
-            // wedge both players.
-            let untouchable = crate::mode::team::benched(self, p)
-                || (self.mode.name() == "ra"
-                    && self.entities[p].mode_p.arena.role == ArenaRole::Audience);
+            // A bystander a telefrag can't clear must always fence: benched spectators (composition
+            // layer) and any mode's untouchable bystanders (the Rocket Arena audience) are solid but
+            // damage-refused, so spawning into them would wedge both players.
+            let untouchable = crate::mode::team::benched(self, p) || self.mode.untouchable_bystander(self, p);
             blocks_spot(live, untouchable, self.entities[p].spawn.grace_until, time)
         })
     }
