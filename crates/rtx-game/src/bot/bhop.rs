@@ -70,6 +70,13 @@ pub const RUNWAY_ENGAGE: f32 = 256.0;
 /// then leaps into the circle-jump, never bunnyhops from a standstill. Below this the bot just runs
 /// (normal ground acceleration) until it's moving, so the first hop leaves at a real running speed.
 pub const RUN_UP_SPEED: f32 = 280.0;
+/// Fraction of `sv_maxspeed` a grounded bot must reach before it will *leap*. This is the backstop
+/// inside the controller (the [`RUN_UP_SPEED`] gate only decides *engagement*): every takeoff path —
+/// a short-runway direct-to-Hop entry, a committed speed jump, or a mid-chain landing after a bump —
+/// keeps circle-strafing on the ground until it's at full run speed rather than leaping slow. Below
+/// ~maxspeed, ground accel (~40 ups/tick toward the wish) far outgains the 30-ups air cap, so a slow
+/// leap is strictly worse than one more ground stride.
+const LAUNCH_MIN_FRAC: f32 = 0.95;
 /// Slack beyond the current hop's flight distance when deciding whether another hop fits.
 const HOP_MARGIN: f32 = 64.0;
 
@@ -220,9 +227,13 @@ pub fn strafe(v_xy: Vec2, wp_bearing: f32, prev_sigma: f32, a_max: f32) -> Straf
 /// gain² `2·u·a + a²` under `a = min(a_g, maxspeed − u)` peaks at `u* = maxspeed − a_g`, i.e.
 /// `θg = acos(u*/speed)` — 0° until `speed > u*` (≈278), then bending outward as speed grows.
 ///
-/// Unlike the air strafe the **view stays on the bearing** and the angle is expressed through the
-/// forward/side split instead (`wishvel = forward·fwd + side·right` rotates by `δ` exactly), so
-/// engaging/disengaging and sign flips never move the view — no snap, just a curving run.
+/// The wish angle is expressed through the `forward`/`side` split (`wishvel = forward·fwd +
+/// side·right`), decoupled from the view: below `u*` the eyes look straight down the bearing (a
+/// plain run-up); once the circle-strafe arc begins the view **rides the velocity heading**, so the
+/// eyes tilt into the arc and sweep up through the takeoff direction — the human circle-jump wind-up
+/// — then hand off continuously to the air lobe (which also looks along the velocity). The world
+/// wishdir is identical either way; `emit` reprojects it onto the spring-smoothed view, so moving
+/// the look target never disturbs the movement or snaps the eyes.
 pub fn prestrafe(v_xy: Vec2, bearing: f32, prev_sigma: f32, a_g: f32, maxspeed: f32, band_cap: f32) -> Strafe {
     let speed = v_xy.length();
     // Below the angling threshold (or barely moving) there's nothing to exploit: run at the
@@ -235,12 +246,13 @@ pub fn prestrafe(v_xy: Vec2, bearing: f32, prev_sigma: f32, a_g: f32, maxspeed: 
     let err = wrap180(bearing - vel_yaw);
     let sigma = weave_sigma(err, prev_sigma, weave_band(speed).min(band_cap));
     let theta_g = (u_star / speed).clamp(0.0, 1.0).acos().to_degrees();
-    let delta = wrap180(vel_yaw + sigma * theta_g - bearing); // wish yaw relative to the view
-    let (ds, dc) = delta.to_radians().sin_cos();
+    // Wish at `vel_yaw + sigma·θg` in world; with the view riding the velocity that is `sigma·θg`
+    // relative to the view, carried in forward/side (same wishdir as a bearing-locked view).
+    let (ts, tc) = theta_g.to_radians().sin_cos();
     Strafe {
-        view_yaw: bearing,
-        forward: MOVE_SPEED * dc,
-        side: -MOVE_SPEED * ds,
+        view_yaw: vel_yaw,
+        forward: MOVE_SPEED * tc,
+        side: -sigma * MOVE_SPEED * ts,
         sigma,
     }
 }
@@ -429,8 +441,11 @@ impl Bhop {
             self.disengage(if i.sustain { "runway" } else { "leg" });
             return None;
         }
-        if i.hold_jump {
-            // Too slow at the takeoff edge: keep gaining on the ground instead of leaping short.
+        // Run up before the leap: keep circle-strafing on the ground rather than take off slow —
+        // either because we haven't reached full run speed yet ([`LAUNCH_MIN_FRAC`], the human "run
+        // first, then jump"), or because a speed jump's takeoff edge is still too slow to clear the
+        // gap (`hold_jump`). Ground accel outgains the air cap below maxspeed, so this only ever helps.
+        if i.hold_jump || speed < LAUNCH_MIN_FRAC * maxspeed {
             return Some(self.ground_cmd(i, a_g, maxspeed, f32::INFINITY));
         }
         let jump = !self.jump_prev;
@@ -636,6 +651,28 @@ mod tests {
                 assert!(v2.length() > s, "s={s} ω={omega}: no speed gain {s} -> {}", v2.length());
             }
         }
+    }
+
+    #[test]
+    fn prestrafe_view_rides_arc() {
+        // During the circle-jump arc (speed > u*) the eyes ride the velocity heading (the wind-up
+        // into the takeoff), and the world wishdir is unchanged — still at `vel_yaw + sigma·θg`.
+        let dt = 1.0 / 77.0;
+        let a_g = air_accel_max(ACCEL, MAXSPEED, dt);
+        let v = Vec2::new(400.0, 0.0); // vel_yaw = 0, above u* ≈ 278
+        let s = prestrafe(v, 20.0, 1.0, a_g, MAXSPEED, f32::INFINITY);
+        assert!(s.view_yaw.abs() < 0.01, "view should ride the velocity (0°), got {}", s.view_yaw);
+        let theta_g = ((MAXSPEED - a_g).max(0.0) / 400.0).clamp(0.0, 1.0).acos().to_degrees();
+        let wd = wishdir_fs(s.view_yaw, s.forward, s.side);
+        let wish_yaw = wd.y.atan2(wd.x).to_degrees();
+        assert!(
+            (wish_yaw - s.sigma * theta_g).abs() < 0.5,
+            "wishdir {wish_yaw}° should be sigma·θg {}°",
+            s.sigma * theta_g
+        );
+        // Below u* it's a plain run-up: eyes on the bearing, no strafe.
+        let s2 = prestrafe(Vec2::new(150.0, 0.0), 20.0, 1.0, a_g, MAXSPEED, f32::INFINITY);
+        assert!((s2.view_yaw - 20.0).abs() < 0.01 && s2.side == 0.0, "below u* should run straight at the bearing");
     }
 
     #[test]
@@ -859,6 +896,64 @@ mod sim {
         // The smooth slalom carves ~one lobe per hop — a decisive drop from the old ~3-flip weave.
         let flips_per_hop = b.flips as f32 / b.hops as f32;
         assert!((0.5..=2.0).contains(&flips_per_hop), "{} flips over {} hops (want smooth ~1/hop)", b.flips, b.hops);
+    }
+
+    #[test]
+    fn never_leaps_below_full_run() {
+        // A human runs up before leaping. From a near-standstill, no takeoff may happen below the
+        // launch floor (0.95·maxspeed) on *either* a long runway (goes via Prestrafe) or a short one
+        // (the 256–512u direct-to-Hop hole) — the bot builds speed on the ground first.
+        let floor = 0.95 * ENV.maxspeed;
+        for &(runway, min_takeoff) in &[(4096.0f32, 420.0f32), (400.0, 304.0)] {
+            let mut w = World::grounded(100.0);
+            let mut b = Bhop::default();
+            let mut first_jump = None;
+            for f in 0..770 {
+                let now = f as f32 * DT;
+                let cmd = b.step(&input(&w, 0.0, runway, now), &ENV).unwrap_or(run_cmd(0.0));
+                if cmd.jump {
+                    assert!(w.v.length() >= floor - 1.0, "leaped at {} ups (runway {runway})", w.v.length());
+                    first_jump.get_or_insert(w.v.length());
+                }
+                pm_frame(&mut w, &cmd, false);
+            }
+            let fj = first_jump.expect("never took off");
+            assert!(fj >= min_takeoff, "first takeoff at {fj} ups (runway {runway}), want ≥ {min_takeoff}");
+        }
+    }
+
+    #[test]
+    fn slow_landing_regrounds_and_rebuilds() {
+        // Hopping fast, then a bump drops us to a slow grounded state mid-chain: the controller must
+        // not leap slow — it circle-strafes on the ground until it's rebuilt past the launch floor.
+        let mut w = World::grounded(460.0);
+        let mut b = Bhop::default();
+        for f in 0..40 {
+            let now = f as f32 * DT;
+            let cmd = b.step(&input(&w, 0.0, 4096.0, now), &ENV).unwrap_or(run_cmd(0.0));
+            pm_frame(&mut w, &cmd, false);
+        }
+        assert!(b.hops >= 1, "never got hopping");
+        // Bump: force a slow grounded state.
+        w.v = Vec2::new(250.0, 0.0);
+        w.z = 0.0;
+        w.vz = 0.0;
+        w.on_ground = true;
+        w.jump_held = false;
+        let cmd = b.step(&input(&w, 0.0, 4096.0, 40.0 * DT), &ENV).expect("stays engaged after the bump");
+        assert!(!cmd.jump, "leaped at 250 ups after a bump");
+        // Drive forward: it rebuilds on the ground and only re-jumps past the floor.
+        let mut rejump = None;
+        for f in 41..160 {
+            let now = f as f32 * DT;
+            let cmd = b.step(&input(&w, 0.0, 4096.0, now), &ENV).unwrap_or(run_cmd(0.0));
+            if cmd.jump {
+                rejump.get_or_insert(w.v.length());
+            }
+            pm_frame(&mut w, &cmd, false);
+        }
+        let rj = rejump.expect("never re-jumped");
+        assert!(rj >= 0.95 * ENV.maxspeed - 1.0, "re-jumped at {rj} ups (below the floor)");
     }
 
     #[test]
