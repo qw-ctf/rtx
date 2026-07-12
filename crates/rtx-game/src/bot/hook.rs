@@ -9,10 +9,10 @@
 use glam::{Vec3, Vec3Swizzles};
 
 use super::{
-    ARRIVE_RADIUS, GOAL_AVOID_TIME, HOOK_AIM_TIMEOUT, HOOK_ANCHOR_DRIFT, HOOK_BALLISTIC_SLACK,
-    HOOK_FLIGHT_TIMEOUT, HOOK_REEL_TIMEOUT, HOOK_STANCE,
+    ARRIVE_RADIUS, HOOK_AIM_TIMEOUT, HOOK_ANCHOR_DRIFT, HOOK_BALLISTIC_SLACK, HOOK_FLIGHT_TIMEOUT,
+    HOOK_REEL_TIMEOUT, HOOK_STANCE,
 };
-use crate::bot::state::{BotState, HookPhase};
+use crate::bot::state::{BotState, Driver, HookPhase};
 use crate::defs::Weapon;
 use crate::entity::EntId;
 use crate::navmesh::NavGraph;
@@ -188,17 +188,7 @@ pub(crate) fn drive_hook(graph: &NavGraph, bot: &mut BotState, c: HookCtx) -> Ho
             hook_reset = Some(grapple_hook);
         }
         bot.hook_phase = HookPhase::Idle;
-        bot.hook_fails = bot.hook_fails.saturating_add(1);
-        bot.repath_time = now;
-        if bot.hook_fails >= 2 {
-            bot.hook_fails = 0;
-            bot.route.clear();
-            if chasing {
-                bot.mark_avoid(bot.goal_item, now + GOAL_AVOID_TIME);
-                bot.goal_item = 0;
-                bot.goal_select_time = now;
-            }
-        }
+        bot.traversal_failed(Driver::Hook, chasing, now);
     }
 
     HookDrive {

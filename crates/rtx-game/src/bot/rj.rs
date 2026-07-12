@@ -9,8 +9,8 @@
 
 use glam::{Vec3, Vec3Swizzles};
 
-use super::state::{BotState, RjPhase};
-use super::{ARRIVE_RADIUS, GOAL_AVOID_TIME, RJ_BALLISTIC_SLACK, RJ_STANCE, RJ_STANCE_TIMEOUT, RJ_LIFTOFF_TIMEOUT};
+use super::state::{BotState, Driver, RjPhase};
+use super::{ARRIVE_RADIUS, RJ_BALLISTIC_SLACK, RJ_STANCE, RJ_STANCE_TIMEOUT, RJ_LIFTOFF_TIMEOUT};
 use crate::abi::EntVars;
 use crate::defs::{Bits, Items, Weapon};
 use crate::entity::EntId;
@@ -206,17 +206,7 @@ pub(crate) fn drive_rj(graph: &NavGraph, bot: &mut BotState, c: RjCtx) -> RjDriv
     }
     if failed {
         bot.rj_phase = RjPhase::Idle;
-        bot.rj_fails = bot.rj_fails.saturating_add(1);
-        bot.repath_time = now;
-        if bot.rj_fails >= 2 {
-            bot.rj_fails = 0;
-            bot.route.clear();
-            if chasing {
-                bot.mark_avoid(bot.goal_item, now + GOAL_AVOID_TIME);
-                bot.goal_item = 0;
-                bot.goal_select_time = now;
-            }
-        }
+        bot.traversal_failed(Driver::RocketJump, chasing, now);
     }
 
     RjDrive {

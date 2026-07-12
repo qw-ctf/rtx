@@ -220,6 +220,44 @@ impl BotState {
     pub fn is_avoided(&self, item: u32, now: f32) -> bool {
         self.avoid_items.iter().any(|&(it, until)| it == item && now < until)
     }
+
+    /// Shared failure tail for the hook / rocket-jump leg drivers (see [`Driver`]): bump the driver's
+    /// consecutive-fail count and force a repath; after two failures in a row, abandon a chased goal
+    /// item — drop the route, briefly avoid-list the item, and re-select next frame. The
+    /// driver-specific phase reset (and the hook's deferred grapple reset) stay at the call site.
+    pub(crate) fn traversal_failed(&mut self, driver: Driver, chasing: bool, now: f32) {
+        let n = match driver {
+            Driver::Hook => {
+                self.hook_fails = self.hook_fails.saturating_add(1);
+                self.hook_fails
+            }
+            Driver::RocketJump => {
+                self.rj_fails = self.rj_fails.saturating_add(1);
+                self.rj_fails
+            }
+        };
+        self.repath_time = now;
+        if n >= 2 {
+            match driver {
+                Driver::Hook => self.hook_fails = 0,
+                Driver::RocketJump => self.rj_fails = 0,
+            }
+            self.route.clear();
+            if chasing {
+                self.mark_avoid(self.goal_item, now + super::GOAL_AVOID_TIME);
+                self.goal_item = 0;
+                self.goal_select_time = now;
+            }
+        }
+    }
+}
+
+/// Which ballistic leg driver a failure belongs to — selects the per-driver consecutive-failure
+/// counter in [`BotState::traversal_failed`].
+#[derive(Clone, Copy)]
+pub(crate) enum Driver {
+    Hook,
+    RocketJump,
 }
 
 /// Phase of a bot's grenade lob→shoot combo. `Idle` unless a combo is in progress.
