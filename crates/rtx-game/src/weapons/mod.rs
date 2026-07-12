@@ -164,20 +164,6 @@ impl GameState {
         self.host.multicast(org, Multicast::Pvs);
     }
 
-    /// Write a vector as three `WriteCoord`s.
-    fn write_coords(&self, to: MsgDest, v: Vec3) {
-        self.host.write_coord(to, v.x);
-        self.host.write_coord(to, v.y);
-        self.host.write_coord(to, v.z);
-    }
-
-    /// Broadcast a payload-less point temp-entity (an explosion, teleport fog, …) to the PHS: the
-    /// `write_te` → coords → `multicast` ritual every such effect hand-rolls.
-    pub(crate) fn temp_entity_point(&self, te: Te, org: Vec3) {
-        self.host.write_te(MsgDest::Multicast, te);
-        self.write_coords(MsgDest::Multicast, org);
-        self.host.multicast(org, Multicast::Phs);
-    }
 
     // --- axe ---
 

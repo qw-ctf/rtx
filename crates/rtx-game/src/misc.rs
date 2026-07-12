@@ -131,9 +131,7 @@ impl GameState {
         let mut origin = self.entities[e].v.origin;
         origin.z += 32.0;
         self.host.write_te(MsgDest::Multicast, Te::Explosion);
-        self.host.write_coord(MsgDest::Multicast, origin.x);
-        self.host.write_coord(MsgDest::Multicast, origin.y);
-        self.host.write_coord(MsgDest::Multicast, origin.z);
+        self.write_coords(MsgDest::Multicast, origin);
         let center = self.entities[e].v.origin;
         self.host.multicast(center, Multicast::Phs);
         self.free(e);

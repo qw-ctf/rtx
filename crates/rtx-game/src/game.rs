@@ -421,6 +421,29 @@ impl GameState {
         }
     }
 
+    /// Write a `Vec3` as its three network coords to `to` — the x/y/z triple every temp-entity /
+    /// effect / intermission emit used to spell out.
+    pub(crate) fn write_coords(&self, to: defs::MsgDest, v: Vec3) {
+        self.host.write_coord(to, v.x);
+        self.host.write_coord(to, v.y);
+        self.host.write_coord(to, v.z);
+    }
+
+    /// Write a `Vec3` as its three network angles to `to`.
+    pub(crate) fn write_angles(&self, to: defs::MsgDest, a: Vec3) {
+        self.host.write_angle(to, a.x);
+        self.host.write_angle(to, a.y);
+        self.host.write_angle(to, a.z);
+    }
+
+    /// Broadcast a point temp-entity (`te` at `org`) to everyone in the PHS — the standard
+    /// explosion / teleport / spike-hit effect emit.
+    pub(crate) fn temp_entity_point(&self, te: defs::Te, org: Vec3) {
+        self.host.write_te(defs::MsgDest::Multicast, te);
+        self.write_coords(defs::MsgDest::Multicast, org);
+        self.host.multicast(org, defs::Multicast::Phs);
+    }
+
     /// `findradius` — every solid entity whose bounding sphere is within `rad` of `org`.
     /// Implemented directly over our entity array (QuakeC's builtin links via `.chain`;
     /// returning a `Vec` is cleaner and avoids mutating shared state).

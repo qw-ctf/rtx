@@ -85,12 +85,8 @@ impl GameState {
         self.host.write_svc(MsgDest::All, Svc::CdTrack);
         self.host.write_byte(MsgDest::All, 3);
         self.host.write_svc(MsgDest::All, Svc::Intermission);
-        self.host.write_coord(MsgDest::All, origin.x);
-        self.host.write_coord(MsgDest::All, origin.y);
-        self.host.write_coord(MsgDest::All, origin.z);
-        self.host.write_angle(MsgDest::All, mangle.x);
-        self.host.write_angle(MsgDest::All, mangle.y);
-        self.host.write_angle(MsgDest::All, mangle.z);
+        self.write_coords(MsgDest::All, origin);
+        self.write_angles(MsgDest::All, mangle);
 
         let players: Vec<EntId> = self.find_by_classname("player").collect();
         for p in players {
