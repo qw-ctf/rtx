@@ -166,7 +166,7 @@ pub fn manage_population(game: &mut GameState) {
         if ent.bot.is_bot {
             count += 1;
             last_bot = Some(EntId(i));
-        } else if ent.in_use && ent.classname() == Some("player") {
+        } else if ent.in_use && ent.is_player() {
             humans += 1;
         }
     }
@@ -345,7 +345,7 @@ const PICKUP_AVOID_TIME: f32 = 3.0;
 /// the touch here, guarded by `solid == Trigger` (a respawning item that's already been taken is
 /// non-solid → skipped) so this can't double-grant even if an engine *does* fire the touch.
 fn bot_pickup_items(game: &mut GameState, e: EntId) {
-    if game.entities[e].v.health <= 0.0 || game.entities[e].v.deadflag != DeadFlag::No {
+    if !game.entities[e].is_alive() {
         return;
     }
     let origin = game.entities[e].v.origin;
@@ -480,7 +480,7 @@ fn sense(game: &GameState, e: EntId) -> Sense {
     let on_ground = game.entities[e].v.flags.has(Flags::ONGROUND);
     // Swimming (waterlevel >= 2): matches the swim gate in `player_jump` and combat's `swimming`.
     let in_water = game.entities[e].v.waterlevel >= 2.0;
-    let alive = game.entities[e].v.health > 0.0 && game.entities[e].v.deadflag == DeadFlag::No;
+    let alive = game.entities[e].is_alive();
     // Vertical speed and whether the once-per-air-travel double jump is still available — snapshot
     // now, since the `&mut bot` binding below blocks reading the edict during the move logic.
     let vz = game.entities[e].v.velocity.z;
@@ -1972,10 +1972,10 @@ fn nearest_human(game: &GameState, bot_e: EntId) -> Option<EntId> {
             continue;
         }
         let ent = &game.entities[e];
-        if !ent.in_use || ent.bot.is_bot || ent.classname() != Some("player") {
+        if !ent.in_use || ent.bot.is_bot || !ent.is_player() {
             continue;
         }
-        if ent.v.health <= 0.0 || ent.v.deadflag != DeadFlag::No {
+        if !ent.is_alive() {
             continue;
         }
         let d = (ent.v.origin - origin).length_squared();

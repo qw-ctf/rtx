@@ -64,8 +64,7 @@ impl GameState {
 
     /// First entity with `classname` at an index greater than `after`.
     fn find_by_classname_after(&self, name: &str, after: EntId) -> Option<EntId> {
-        (after.index() + 1..self.entities.len())
-            .find(|&i| self.entities[i].in_use && self.entities[i].classname() == Some(name))
-            .map(|i| EntId(i as u32))
+        self.find_where(move |e| e.classname() == Some(name))
+            .find(|e| e.index() > after.index())
     }
 }

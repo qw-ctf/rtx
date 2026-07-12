@@ -68,7 +68,7 @@ impl GameState {
 
     /// `button_touch`.
     pub(crate) fn button_touch(&mut self, e: EntId, other: EntId) {
-        if self.entities[other].classname() != Some("player") {
+        if !self.entities[other].is_player() {
             return;
         }
         self.entities[e].set_enemy(other);

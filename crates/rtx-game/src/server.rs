@@ -118,20 +118,20 @@ impl GameState {
     /// `GotoNextMap`.
     fn goto_next_map(&mut self) {
         let samelevel = self.host.cvar(c"samelevel") as i32;
-        let map = if samelevel == 1 {
-            self.level.mapname.clone()
-        } else if !self.level.nextmap.is_empty() {
-            self.level.nextmap.clone()
+        // `nextmap` wins only when we aren't forcing the same level and one was actually set;
+        // otherwise (samelevel, or no nextmap) we replay the current map.
+        let map = if samelevel != 1 && !self.level.nextmap.is_empty() {
+            &self.level.nextmap
         } else {
-            self.level.mapname.clone()
+            &self.level.mapname
         };
-        let c = cstring(&map);
+        let c = cstring(map);
         self.host.changelevel(&c);
     }
 
     /// `changelevel_touch`.
     pub(crate) fn changelevel_touch(&mut self, e: EntId, other: EntId) {
-        if self.entities[other].classname() != Some("player") {
+        if !self.entities[other].is_player() {
             return;
         }
         let samelevel = self.host.cvar(c"samelevel") as i32;

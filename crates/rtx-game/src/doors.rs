@@ -170,7 +170,7 @@ impl GameState {
 
     /// `door_touch` — print messages / open key doors.
     pub(crate) fn door_touch(&mut self, e: EntId, other: EntId) {
-        if self.entities[other].classname() != Some("player") {
+        if !self.entities[other].is_player() {
             return;
         }
         let owner = self.entities[e].owner();

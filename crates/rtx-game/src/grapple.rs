@@ -101,7 +101,7 @@ impl GameState {
             return;
         }
 
-        if self.entities[other].classname() == Some("player") {
+        if self.entities[other].is_player() {
             self.host
                 .sound(hook, Channel::Weapon, Sound::PLAYER_AXHIT1, 1.0, Attenuation::Norm);
             self.entities[other].deathtype = DeathType::Hook;
@@ -146,7 +146,7 @@ impl GameState {
     pub(crate) fn grapple_track(&mut self, hook: EntId) {
         let owner = self.entities[hook].owner();
         let enemy = self.entities[hook].enemy();
-        let enemy_is_player = self.entities[enemy].classname() == Some("player");
+        let enemy_is_player = self.entities[enemy].is_player();
 
         // Release a hooked player once they die.
         if enemy_is_player && self.entities[enemy].v.health <= 0.0 {
@@ -196,7 +196,7 @@ impl GameState {
         }
 
         let enemy = self.entities[hook].enemy();
-        let target = if self.entities[enemy].classname() == Some("player") {
+        let target = if self.entities[enemy].is_player() {
             self.entities[enemy].v.origin
         } else {
             self.entities[hook].v.origin

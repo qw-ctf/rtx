@@ -25,7 +25,7 @@ use glam::Vec3;
 
 use super::{BotIntent, DamageOutcome, GameMode};
 use crate::bsp::Bsp;
-use crate::defs::{DeadFlag, Items, PrintLevel, Weapon};
+use crate::defs::{Items, PrintLevel, Weapon};
 use crate::entity::EntId;
 use crate::game::{cstring, GameState};
 use crate::navmesh::{LinkCosts, LinkKind, BAND_FLOOR};
@@ -121,7 +121,7 @@ impl GameMode for Race {
         incoming: f32,
     ) -> DamageOutcome {
         // Only gate players — anything else (doors, buttons) takes normal damage.
-        if g.entities[targ].classname() != Some("player") {
+        if !g.entities[targ].is_player() {
             return DamageOutcome::pass(incoming);
         }
         // Spawn telefrags must still connect: everyone shares one start pad, and a blocked
@@ -131,7 +131,7 @@ impl GameMode for Race {
         }
         // No player-vs-player. World damage stays — a run that ends in the lava must read as
         // a death (which resets the run via on_death), not a free pass.
-        if attacker != targ && g.entities[attacker].classname() == Some("player") {
+        if attacker != targ && g.entities[attacker].is_player() {
             return DamageOutcome::none();
         }
         DamageOutcome::pass(incoming)
@@ -229,7 +229,7 @@ impl Race {
         let last = route.nodes.len() - 1;
         for e in super::players(g) {
             let ent = &g.entities[e];
-            if ent.v.health <= 0.0 || ent.v.deadflag != DeadFlag::No {
+            if !ent.is_alive() {
                 continue;
             }
             let origin = ent.v.origin;

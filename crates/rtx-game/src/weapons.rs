@@ -26,6 +26,24 @@ const SHOOTABLE_GRENADE_HIT_RADIUS: f32 = 8.0;
 const SHOOTABLE_GRENADE_MINS: Vec3 = Vec3::splat(-4.0);
 const SHOOTABLE_GRENADE_MAXS: Vec3 = Vec3::splat(4.0);
 
+/// Which nail a [`GameState::spike_touch`] is servicing — the nailgun's single spike or the
+/// super-nailgun's heavier one. Replaces a positional `bool` at the touch dispatcher.
+#[derive(Clone, Copy)]
+pub(crate) enum SpikeKind {
+    Nail,
+    Super,
+}
+
+impl SpikeKind {
+    /// Impact damage, obituary stamp, and wall temp-entity for this nail.
+    fn effect(self) -> (f32, DeathType, Te) {
+        match self {
+            SpikeKind::Nail => (9.0, DeathType::Nailgun, Te::Spike),
+            SpikeKind::Super => (18.0, DeathType::SuperNailgun, Te::SuperSpike),
+        }
+    }
+}
+
 /// `vectoangles` — convert a direction to `(pitch, yaw, 0)` Euler angles (degrees).
 pub(crate) fn vectoangles(v: Vec3) -> Vec3 {
     if v.x == 0.0 && v.y == 0.0 {
@@ -636,7 +654,7 @@ impl GameState {
     }
 
     /// `spike_touch` / `superspike_touch` — spike impact.
-    pub(crate) fn spike_touch(&mut self, e: EntId, other: EntId, super_spike: bool) {
+    pub(crate) fn spike_touch(&mut self, e: EntId, other: EntId, kind: SpikeKind) {
         if other == self.entities[e].owner() {
             return;
         }
@@ -654,11 +672,7 @@ impl GameState {
         }
 
         let owner = self.entities[e].owner();
-        let (damage, dtype, te) = if super_spike {
-            (18.0, DeathType::SuperNailgun, Te::SuperSpike)
-        } else {
-            (9.0, DeathType::Nailgun, Te::Spike)
-        };
+        let (damage, dtype, te) = kind.effect();
 
         if self.entities[other].v.takedamage != TakeDamage::No {
             if self.try_detonate_shootable_grenade(other) {

@@ -326,7 +326,7 @@ impl GameState {
             if !ent.in_use || !ent.bot.is_bot || ent.v.health <= 0.0 {
                 continue;
             }
-            if ent.classname() != Some("player") {
+            if !ent.is_player() {
                 continue;
             }
             let Some(pool) = self.observer_pool(e) else {
@@ -366,9 +366,7 @@ impl GameState {
         if !self.host.cvar_bool(c"rtx_bot_model") || attacker == targ {
             return;
         }
-        if self.entities[attacker].classname() != Some("player")
-            || self.entities[targ].classname() != Some("player")
-        {
+        if !self.entities[attacker].is_player() || !self.entities[targ].is_player() {
             return;
         }
         if let Some(pool) = self.observer_pool(attacker) {
@@ -383,7 +381,7 @@ impl GameState {
         if !self.host.cvar_bool(c"rtx_bot_model") || attacker == victim {
             return;
         }
-        if self.entities[attacker].classname() != Some("player") {
+        if !self.entities[attacker].is_player() {
             return;
         }
         if let Some(pool) = self.observer_pool(victim) {
@@ -446,7 +444,7 @@ impl GameState {
         if !self.host.cvar_bool(c"rtx_bot_model") {
             return;
         }
-        if self.entities[target].classname() != Some("player") {
+        if !self.entities[target].is_player() {
             return;
         }
         let now = self.time();

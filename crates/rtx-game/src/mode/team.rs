@@ -23,7 +23,7 @@
 use glam::Vec3;
 
 use super::{centerprint_all, nearest_player_where, players};
-use crate::defs::{DeadFlag, PrintLevel};
+use crate::defs::PrintLevel;
 use crate::entity::EntId;
 use crate::game::{cstring, GameState};
 
@@ -532,7 +532,7 @@ pub(crate) fn nearest_enemy(g: &GameState, bot: EntId) -> Option<EntId> {
         .into_iter()
         .filter(|&en| {
             let e = &g.entities[en];
-            e.v.health > 0.0 && e.v.deadflag == DeadFlag::No && e.mode_p.team != my_team
+            e.is_alive() && e.mode_p.team != my_team
         })
         .map(|en| {
             let d = (g.entities[en].v.origin - origin).length_squared()

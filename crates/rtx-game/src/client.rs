@@ -601,12 +601,11 @@ impl GameState {
         };
         let feet_z = origin.z + mins.z;
         let mut best = 0.0;
-        for i in 1..self.entities.len() {
-            let id = EntId(i as u32);
-            if id == e || !self.entities[id].in_use {
+        for (id, ent) in self.entities.live() {
+            if id == e {
                 continue;
             }
-            let m = &self.entities[id].v;
+            let m = &ent.v;
             if m.movetype != MoveType::Push || m.velocity.z <= best {
                 continue;
             }

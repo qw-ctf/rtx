@@ -69,7 +69,7 @@ impl GameState {
 
     /// `plat_center_touch` — a player on the inner trigger raises/holds the plat.
     pub(crate) fn plat_center_touch(&mut self, e: EntId, other: EntId) {
-        if self.entities[other].classname() != Some("player") || self.entities[other].v.health <= 0.0 {
+        if !self.entities[other].is_player() || self.entities[other].v.health <= 0.0 {
             return;
         }
         let plat = self.entities[e].enemy();

@@ -541,7 +541,7 @@ impl GameState {
         let maxclients = self.host().cvar(c"maxclients") as u32;
         (1..=maxclients).map(EntId).any(|t| {
             let e = &self.entities[t];
-            e.classname() == Some("player")
+            e.is_player()
                 && e.v.health > 0.0
                 && e.mode_p.team != my_team
                 && self
@@ -623,7 +623,7 @@ impl GameState {
         };
         let mate = EntId(self.entities[e].bot.hold_for);
         let m = &self.entities[mate];
-        let mate_alive = mate.0 != 0 && m.classname() == Some("player") && m.v.health > 0.0;
+        let mate_alive = mate.0 != 0 && m.is_player() && m.v.health > 0.0;
         let mate_powered =
             m.combat.super_damage_finished > now || m.combat.invincible_finished > now;
         let mate_has_weapon = m.v.items.has(weapon_bit(w));
@@ -656,7 +656,7 @@ impl GameState {
         let mate = (1..=maxclients).map(EntId).find(|&t| {
             t != bot && {
                 let m = &self.entities[t];
-                m.classname() == Some("player")
+                m.is_player()
                     && m.v.health > 0.0
                     && m.mode_p.team == my_team
                     && (m.combat.super_damage_finished > now + HOLD_MATE_MIN_POWER
@@ -836,7 +836,7 @@ impl GameState {
             .filter(|&t| {
                 t != bot_e && {
                     let e = &self.entities[t];
-                    e.classname() == Some("player") && e.v.health > 0.0 && e.mode_p.team == my_team
+                    e.is_player() && e.v.health > 0.0 && e.mode_p.team == my_team
                 }
             })
             .map(|t| (self.entities[t].v.origin - point).length())

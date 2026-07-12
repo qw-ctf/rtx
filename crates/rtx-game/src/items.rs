@@ -606,7 +606,7 @@ impl GameState {
     // --- small helpers ---
 
     fn is_live_player(&self, e: EntId) -> bool {
-        self.entities[e].classname() == Some("player") && self.entities[e].v.health > 0.0
+        self.entities[e].is_player() && self.entities[e].v.health > 0.0
     }
 
     fn sprint_low(&self, e: EntId, msg: &str) {

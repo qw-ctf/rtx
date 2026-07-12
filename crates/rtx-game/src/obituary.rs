@@ -65,7 +65,7 @@ impl GameState {
     /// `ClientObituary` — pick the death message, apply frag scoring + `logfrag`, and broadcast it
     /// at [`PrintLevel::Medium`]. Message selection is delegated to the pure functions below.
     pub(crate) fn client_obituary(&mut self, targ: EntId, attacker: EntId) {
-        if self.entities[targ].classname() != Some("player") {
+        if !self.entities[targ].is_player() {
             return;
         }
         let death = self.entities[targ].deathtype;
@@ -96,7 +96,7 @@ impl GameState {
         }
 
         let r = self.random();
-        let attacker_is_player = self.entities[attacker].classname() == Some("player");
+        let attacker_is_player = self.entities[attacker].is_player();
 
         if !attacker_is_player {
             // World / environment death.

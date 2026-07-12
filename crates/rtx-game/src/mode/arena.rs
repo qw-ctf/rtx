@@ -20,7 +20,7 @@
 use glam::Vec3;
 
 use super::{centerprint_all, nearest_player_where, players, ArenaRole, BotIntent, DamageOutcome, GameMode};
-use crate::defs::{DeadFlag, Items, PrintLevel, Weapon, VEC_VIEW_OFS};
+use crate::defs::{Items, PrintLevel, Weapon, VEC_VIEW_OFS};
 use crate::entity::EntId;
 use crate::game::GameState;
 
@@ -230,7 +230,7 @@ impl GameMode for Arena {
         // Only gate players — doors, buttons, grenades, etc. must stay damageable (bots shoot
         // gate buttons to open them).
         let t = &g.entities[targ];
-        if t.classname() != Some("player") {
+        if !t.is_player() {
             return DamageOutcome::pass(incoming);
         }
         // Audience is untouchable; fighters are protected until the round goes live. A blocked hit
@@ -368,8 +368,7 @@ impl Arena {
             if g.entities[e].mode_p.arena.role != ArenaRole::Fighter {
                 continue;
             }
-            let winner_stays =
-                carried.contains(&e) && g.entities[e].v.health > 0.0 && g.entities[e].v.deadflag == DeadFlag::No;
+            let winner_stays = carried.contains(&e) && g.entities[e].is_alive();
             if winner_stays {
                 g.entities[e].mode_p.arena.pending_spawn = false;
                 self.apply_loadout(g, e);
@@ -620,10 +619,7 @@ fn spread_spawn(g: &mut GameState, spawning: EntId, origin: Vec3) -> Vec3 {
 /// Any live player other than `who` within [`SPREAD_MIN`] of point `p`.
 fn origin_crowded(g: &GameState, p: Vec3, who: EntId) -> bool {
     players(g).into_iter().any(|e| {
-        e != who
-            && g.entities[e].v.health > 0.0
-            && g.entities[e].v.deadflag == DeadFlag::No
-            && (g.entities[e].v.origin - p).length() < SPREAD_MIN
+        e != who && g.entities[e].is_alive() && (g.entities[e].v.origin - p).length() < SPREAD_MIN
     })
 }
 
@@ -659,7 +655,7 @@ fn live_fighters(g: &GameState) -> Vec<EntId> {
         .into_iter()
         .filter(|&e| {
             let ent = &g.entities[e];
-            ent.mode_p.arena.role == ArenaRole::Fighter && ent.v.health > 0.0 && ent.v.deadflag == DeadFlag::No
+            ent.mode_p.arena.role == ArenaRole::Fighter && ent.is_alive()
         })
         .collect()
 }

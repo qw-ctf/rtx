@@ -57,7 +57,7 @@ impl GameMode for Midair {
     ) -> DamageOutcome {
         // Only players obey midair rules — doors/buttons/grenades take normal damage (bots shoot
         // gate buttons to open them).
-        if g.entities[targ].classname() != Some("player") {
+        if !g.entities[targ].is_player() {
             return DamageOutcome::pass(incoming);
         }
         // Only rockets do anything. The axe, fall damage (inflictor = world), drowning, etc. are
@@ -98,7 +98,7 @@ impl GameMode for Midair {
         // The rocket that scored the kill: `damage_inflictor` is set in the same `t_damage` call
         // that reaches `killed`, and the rocket isn't freed until after `killed` returns.
         let inflictor = g.damage_inflictor;
-        if g.entities[attacker].classname() != Some("player")
+        if !g.entities[attacker].is_player()
             || attacker == victim
             || !g.entities[inflictor].in_use
             || g.entities[inflictor].classname() != Some("rocket")

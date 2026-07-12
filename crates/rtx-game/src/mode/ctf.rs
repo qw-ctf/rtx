@@ -26,8 +26,8 @@ use super::team;
 use super::{players, BotIntent, DamageOutcome, GameMode};
 use crate::assets::{Model, Sound};
 use crate::defs::{
-    Attenuation, Channel, DeadFlag, MoveType, PrintLevel, Solid, RUNE_HASTE, RUNE_MASK, RUNE_REGEN,
-    RUNE_RESISTANCE, RUNE_STRENGTH,
+    Attenuation, Channel, MoveType, PrintLevel, Solid, RUNE_HASTE, RUNE_MASK, RUNE_REGEN, RUNE_RESISTANCE,
+    RUNE_STRENGTH,
 };
 use crate::entity::{EntId, FlagPhase, Think, Touch};
 use crate::game::GameState;
@@ -92,7 +92,7 @@ impl GameMode for Ctf {
         }
         if g.entities[targ].mode_p.ctf.carrying != 0
             && attacker != targ
-            && g.entities[attacker].classname() == Some("player")
+            && g.entities[attacker].is_player()
             && g.entities[attacker].mode_p.team != g.entities[targ].mode_p.team
         {
             g.entities[attacker].mode_p.ctf.last_hurt_carrier = g.time();
@@ -168,10 +168,7 @@ impl GameMode for Ctf {
 /// purectf's kill-time CTF bonuses (obituary side): fragging the enemy carrier, protecting your own
 /// carrier / flag by fragging attackers near them. Runs after the stock obituary credited the +1.
 fn ctf_frag_bonuses(g: &mut GameState, victim: EntId, attacker: EntId) {
-    if attacker == victim
-        || g.entities[attacker].classname() != Some("player")
-        || g.entities[victim].classname() != Some("player")
-    {
+    if attacker == victim || !g.entities[attacker].is_player() || !g.entities[victim].is_player() {
         return;
     }
     let now = g.time();
@@ -203,7 +200,7 @@ fn ctf_frag_bonuses(g: &mut GameState, victim: EntId, attacker: EntId) {
         for head in g.find_radius(center, PROTECT_RADIUS) {
             if !protected_carrier
                 && head != attacker
-                && g.entities[head].classname() == Some("player")
+                && g.entities[head].is_player()
                 && g.entities[head].mode_p.team == a_team
                 && g.entities[head].mode_p.ctf.carrying != 0
             {
@@ -401,10 +398,7 @@ impl GameState {
     /// `Touch::Flag` — a player touched a flag: grab (enemy), return (own, dropped), or capture
     /// (own base while carrying the enemy flag).
     pub(crate) fn flag_touch(&mut self, flag: EntId, other: EntId) {
-        if self.entities[other].classname() != Some("player")
-            || self.entities[other].v.health <= 0.0
-            || self.entities[other].v.deadflag != DeadFlag::No
-        {
+        if !self.entities[other].is_player() || !self.entities[other].is_alive() {
             return;
         }
         if self.entities[flag].flag.phase == FlagPhase::Carried {
@@ -702,9 +696,8 @@ impl GameState {
     /// `Touch::Rune` — pick up a rune (one per player; a held rune blocks the pickup).
     pub(crate) fn rune_touch(&mut self, rune: EntId, other: EntId) {
         if other == self.entities[rune].owner()
-            || self.entities[other].classname() != Some("player")
-            || self.entities[other].v.health <= 0.0
-            || self.entities[other].v.deadflag != DeadFlag::No
+            || !self.entities[other].is_player()
+            || !self.entities[other].is_alive()
         {
             return;
         }

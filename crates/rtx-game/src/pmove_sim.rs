@@ -19,7 +19,7 @@ use glam::{Vec2, Vec3, Vec3Swizzles};
 
 use crate::bot::bhop::{apply_airaccel, apply_friction, apply_groundaccel, wishdir_fs, Cmd};
 use crate::bsp::Bsp;
-use crate::qphys::{JUMP_VZ, STEP_HEIGHT};
+use rtx_nav::qphys::{JUMP_VZ, STEP_HEIGHT};
 
 /// The map's movement cvars, snapshotted so a rollout is pure and reproducible.
 #[derive(Clone, Copy)]

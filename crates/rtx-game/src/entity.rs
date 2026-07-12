@@ -654,6 +654,19 @@ impl Entity {
         self.classname.as_deref()
     }
 
+    /// Whether this is a player edict (classname `"player"`) — the check spelled out at ~two dozen
+    /// call sites that iterate entities looking for clients.
+    pub fn is_player(&self) -> bool {
+        self.classname() == Some("player")
+    }
+
+    /// Whether this entity is a live, fightable body: positive health and not partway through (or
+    /// finished) a death sequence. The `health > 0 && deadflag == No` compound the spawn/mode/bot
+    /// pickers all repeat.
+    pub fn is_alive(&self) -> bool {
+        self.v.health > 0.0 && self.v.deadflag == crate::defs::DeadFlag::No
+    }
+
     // --- entvars entity-reference accessors (stored as byte offsets) ---
     pub fn enemy(&self) -> EntId {
         EntId::from_prog(self.v.enemy)
@@ -705,6 +718,18 @@ impl Entities {
     /// Allocate `count` cleared entity slots.
     pub fn new(count: usize) -> Self {
         Entities((0..count).map(|_| Entity::default()).collect())
+    }
+
+    /// Iterate the live (`in_use`) entities as `(EntId, &Entity)`, skipping slot 0 (world) and every
+    /// free slot — the shape the many `for i in 1..len { let id = EntId(i); if !in_use { continue } }`
+    /// scans hand-roll.
+    pub fn live(&self) -> impl Iterator<Item = (EntId, &Entity)> {
+        self.0
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(_, e)| e.in_use)
+            .map(|(i, e)| (EntId(i as u32), e))
     }
 }
 

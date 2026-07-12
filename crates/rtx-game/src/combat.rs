@@ -110,8 +110,8 @@ impl GameState {
         // Benched spectators (a structured match's non-roster late-joiners) neither deal nor take
         // player damage — the same hard gate Rocket Arena applies to its audience. Guard the
         // attacker check to player attackers so world hits (fall/lava/drowning) aren't blocked.
-        if self.entities[targ].classname() == Some("player") {
-            let att_benched = self.entities[attacker].classname() == Some("player")
+        if self.entities[targ].is_player() {
+            let att_benched = self.entities[attacker].is_player()
                 && crate::mode::team::benched(self, attacker);
             if att_benched || crate::mode::team::benched(self, targ) {
                 return;
@@ -262,8 +262,8 @@ impl GameState {
 
     /// Whether `a` and `b` are both players sharing a netname (rocket-jump self-boost case).
     fn same_player_netname(&self, a: EntId, b: EntId) -> bool {
-        self.entities[a].classname() == Some("player")
-            && self.entities[b].classname() == Some("player")
+        self.entities[a].is_player()
+            && self.entities[b].is_player()
             && self.netname_of(a) == self.netname_of(b)
     }
 
@@ -278,7 +278,7 @@ impl GameState {
         if tp != 1 && tp != 3 {
             return false;
         }
-        if self.entities[attacker].classname() != Some("player") {
+        if !self.entities[attacker].is_player() {
             return false;
         }
         if self.entities[inflictor].classname() == Some("door") {

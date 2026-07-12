@@ -32,7 +32,7 @@
 
 use glam::Vec3;
 
-use crate::defs::{DeadFlag, Items, Weapon};
+use crate::defs::{Items, Weapon};
 use crate::entity::EntId;
 use crate::game::{cstring, GameState};
 
@@ -458,7 +458,7 @@ pub(crate) fn players(g: &GameState) -> Vec<EntId> {
     let maxclients = g.host().cvar(c"maxclients") as i32;
     (1..=maxclients as u32)
         .map(EntId)
-        .filter(|&e| g.entities[e].in_use && g.entities[e].classname() == Some("player"))
+        .filter(|&e| g.entities[e].in_use && g.entities[e].is_player())
         .collect()
 }
 
@@ -478,7 +478,7 @@ pub(crate) fn nearest_player_where(
             continue;
         }
         let ent = &g.entities[e];
-        if ent.v.health <= 0.0 || ent.v.deadflag != DeadFlag::No || !pred(g, e) {
+        if !ent.is_alive() || !pred(g, e) {
             continue;
         }
         let d = (ent.v.origin - point).length_squared();

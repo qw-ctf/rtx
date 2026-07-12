@@ -21,7 +21,7 @@ use glam::Vec2;
 
 use crate::bot::wrap180;
 use crate::defs::BOT_MOVE_SPEED as MOVE_SPEED;
-use crate::qphys::AIR_CAP;
+use rtx_nav::qphys::AIR_CAP;
 
 /// The engine's fixed bot tick (bots run `SV_RunCmd` at ~77 Hz regardless of what we pass as
 /// `msec`), used only to size the weave band. The live accel math uses the real per-frame `dt`.

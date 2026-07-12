@@ -10,7 +10,6 @@
 //! `bot::run_bot`.)
 
 use super::{nearest_player_where, team, BotIntent, GameMode};
-use crate::defs::DeadFlag;
 use crate::entity::EntId;
 use crate::game::GameState;
 
@@ -53,7 +52,7 @@ fn nearest_player(g: &GameState, bot: EntId) -> Option<EntId> {
         .filter(|&en| {
             en != bot && {
                 let e = &g.entities[en];
-                e.v.health > 0.0 && e.v.deadflag == DeadFlag::No
+                e.is_alive()
             }
         })
         .map(|en| {

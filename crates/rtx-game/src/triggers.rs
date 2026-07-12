@@ -30,7 +30,7 @@ impl GameState {
             return;
         }
         if self.entities[e].classname() == Some("trigger_secret") {
-            if self.entities[self.entities[e].enemy()].classname() != Some("player") {
+            if !self.entities[self.entities[e].enemy()].is_player() {
                 return;
             }
             self.globals.found_secrets += 1.0;
@@ -70,7 +70,7 @@ impl GameState {
 
     /// `multi_touch` (`touch`).
     pub(crate) fn multi_touch(&mut self, e: EntId, other: EntId) {
-        if self.entities[other].classname() != Some("player") {
+        if !self.entities[other].is_player() {
             return;
         }
         let movedir = self.entities[e].v.movedir;
@@ -96,7 +96,7 @@ impl GameState {
         if count < 0.0 {
             return;
         }
-        let is_player = self.entities[activator].classname() == Some("player");
+        let is_player = self.entities[activator].is_player();
         let show = is_player && !spawnflags.has(TriggerFlags::NOMESSAGE);
         if count != 0.0 {
             if show {
@@ -234,7 +234,7 @@ impl GameState {
             return;
         }
         let time = self.time();
-        if self.entities[other].classname() == Some("player") {
+        if self.entities[other].is_player() {
             let other_inv = self.entities[other].combat.invincible_finished > time;
             let owner_inv = self.entities[owner].combat.invincible_finished > time;
             if other_inv && owner_inv {
@@ -291,7 +291,7 @@ impl GameState {
             return;
         }
         if self.entities[e].v.spawnflags.has(TeleportFlags::PLAYER_ONLY)
-            && self.entities[other].classname() != Some("player")
+            && !self.entities[other].is_player()
         {
             return;
         }
@@ -330,7 +330,7 @@ impl GameState {
             o.origin = t_org;
             o.angles = t_mangle;
         }
-        if self.entities[other].classname() == Some("player") {
+        if self.entities[other].is_player() {
             {
                 let o = &mut self.entities[other].v;
                 o.fixangle = 1.0;
@@ -429,7 +429,7 @@ impl GameState {
             self.entities[other].v.velocity = push;
         } else if self.entities[other].v.health > 0.0 {
             self.entities[other].v.velocity = push;
-            if self.entities[other].classname() == Some("player") {
+            if self.entities[other].is_player() {
                 let time = self.time();
                 if self.entities[other].combat.fly_sound < time {
                     self.entities[other].combat.fly_sound = time + 1.5;

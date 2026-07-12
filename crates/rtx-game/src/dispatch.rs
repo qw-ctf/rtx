@@ -10,6 +10,7 @@
 
 use crate::entity::{Blocked, Die, EntId, Pain, Think, Touch, Use};
 use crate::game::GameState;
+use crate::weapons::SpikeKind;
 
 impl GameState {
     /// Run an entity's scheduled `think` (`GAME_EDICT_THINK`).
@@ -94,8 +95,8 @@ impl GameState {
             // weapons.qc projectiles
             Missile => self.t_missile_touch(e, other),
             Grenade => self.grenade_touch(e, other),
-            Spike => self.spike_touch(e, other, false),
-            SuperSpike => self.spike_touch(e, other, true),
+            Spike => self.spike_touch(e, other, SpikeKind::Nail),
+            SuperSpike => self.spike_touch(e, other, SpikeKind::Super),
             // items.qc
             ItemHealth => self.health_touch(e, other),
             ItemArmor => self.armor_touch(e, other),

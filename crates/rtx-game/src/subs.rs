@@ -138,7 +138,7 @@ impl GameState {
         // Center-print our message to the activator (if a player).
         let activator = self.activator;
         let has_message = self.entities[e].message.is_some();
-        if has_message && self.entities[activator].classname() == Some("player") {
+        if has_message && self.entities[activator].is_player() {
             if let Some(msg) = self.message_cstring(e) {
                 self.centerprint_to(activator, &msg);
             }
@@ -172,19 +172,11 @@ impl GameState {
 
     /// Live entities whose `targetname` matches `name`.
     pub(crate) fn find_by_targetname<'a>(&'a self, name: &'a str) -> impl Iterator<Item = EntId> + 'a {
-        self.entities
-            .iter()
-            .enumerate()
-            .filter(move |(_, e)| e.in_use && e.targetname.as_deref() == Some(name))
-            .map(|(i, _)| EntId(i as u32))
+        self.find_where(move |e| e.targetname.as_deref() == Some(name))
     }
 
     /// Live entities whose `group` matches `name` (used by rotating-door groups).
     pub(crate) fn find_by_group<'a>(&'a self, name: &'a str) -> impl Iterator<Item = EntId> + 'a {
-        self.entities
-            .iter()
-            .enumerate()
-            .filter(move |(_, e)| e.in_use && e.group.as_deref() == Some(name))
-            .map(|(i, _)| EntId(i as u32))
+        self.find_where(move |e| e.group.as_deref() == Some(name))
     }
 }

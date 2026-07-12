@@ -863,7 +863,7 @@ pub(crate) fn teammate_in_blast(g: &GameState, e: EntId, my_team: u8, pos: Vec3)
         let ent = &g.entities[p];
         p != e
             && ent.in_use
-            && ent.classname() == Some("player")
+            && ent.is_player()
             && ent.v.health > 0.0
             && ent.mode_p.team == my_team
             && (ent.v.origin - pos).length() < GRENADE_BLAST_RADIUS
