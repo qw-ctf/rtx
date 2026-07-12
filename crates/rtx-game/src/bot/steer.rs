@@ -485,6 +485,11 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         }
     };
 
+    // Plain/double jump links need the same perpendicular air acceleration as a speed jump. A direct
+    // wish at the landing is usually projected above QW's 30-ups air cap and cannot curve at all.
+    // The traversal is already committed and combat-locked, so let bhop own the view/move for the arc.
+    let air_curve = on_jump_leg && !bhop_veto;
+
     // Drive the hop-cycle controller (see `bhop::Bhop`). On a speed jump the runway is the
     // run-up to the takeoff edge and the bearing aims straight at the landing so the leap goes
     // across the gap; otherwise steer toward the look-ahead corridor point (smoother than the 32u
@@ -498,11 +503,11 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             accel: if accel > 0.0 { accel } else { 10.0 },
             maxspeed: if maxspeed > 0.0 { maxspeed } else { 320.0 },
         };
-        // A committed speed jump aims at its gap; otherwise steer toward the racing-line look-ahead
+        // Any committed jump aims at its landing; otherwise steer toward the racing-line look-ahead
         // (race mode, when a line exists) or the navmesh corridor look-ahead point.
         let ahead = match race_line_ahead {
-            Some(lp) if !sj_active => lp.xy() - origin.xy(),
-            _ if sj_active => waypoint.xy() - origin.xy(),
+            _ if sj_active || air_curve => waypoint.xy() - origin.xy(),
+            Some(lp) => lp.xy() - origin.xy(),
             _ => look_point.xy() - origin.xy(),
         };
         let to_wp = waypoint.xy() - origin.xy();
@@ -523,7 +528,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 zigzag: zigzag_ok,
                 sustain: bhop_sustain,
                 veto: bhop_veto,
-                committed: sj_active,
+                committed: sj_active || air_curve,
                 carry,
                 hold_jump: sj_hold,
                 now,
@@ -614,6 +619,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             now,
             weapon,
             origin,
+            v_xy,
             on_ground,
             attack_finished,
             weapons_hot,
@@ -752,7 +758,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     }
 
     // Rocket-jump override: walk to the launch cell (Stance), stand and hold the aim (Rise), or ride
-    // the arc with a gentle wish toward the landing (Ballistic — the in-flight air-strafe correction).
+    // the arc with a perpendicular wish that curves toward the landing (Ballistic air correction).
     // The jump itself is pressed post-spring in `emit` (via `rj.jump_ready`); the rocket fires on the
     // driver's pure-timing `rj.fire`.
     if rj_engaged {
@@ -760,8 +766,8 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             _ if rj.stand => Vec3::ZERO,
             Some(src) => Vec3::new(src.x - origin.x, src.y - origin.y, 0.0).normalize_or_zero() * MOVE_SPEED,
             None => rj
-                .air_correct
-                .map_or(Vec3::ZERO, |t| Vec3::new(t.x - origin.x, t.y - origin.y, 0.0).normalize_or_zero() * MOVE_SPEED),
+                .air_wish
+                .map_or(Vec3::ZERO, |wish| wish * MOVE_SPEED),
         };
         buttons &= !BUTTON_JUMP; // the launch jump is pressed only via `emit`'s post-spring gate
         if rj.select {

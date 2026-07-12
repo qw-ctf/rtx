@@ -7,7 +7,7 @@
 //! launcher, no rocket, too little health, or quad running) never plans a route through one. The
 //! execution driver (a `HookPhase`-style machine) lands with the next phase.
 
-use glam::{Vec3, Vec3Swizzles};
+use glam::{Vec2, Vec3, Vec3Swizzles};
 
 use super::state::{BotState, Driver, RjPhase};
 use super::{ballistic_landing, Landing, RJ_BALLISTIC_SLACK, RJ_STANCE, RJ_STANCE_TIMEOUT, RJ_LIFTOFF_TIMEOUT};
@@ -23,6 +23,31 @@ const RJ_WORST_SELF_DAMAGE: f32 = 60.0;
 /// Health kept in reserve above the blast — a bot won't rocket-jump itself down to the wire, since it
 /// often arrives into a fight (the conservative policy).
 const RJ_HEALTH_MARGIN: f32 = 25.0;
+/// Once the velocity points this close to the landing bearing, stop correcting. A perpendicular
+/// QW air-accel stroke turns several degrees per bot tick; a deadband prevents left/right chatter.
+const RJ_AIR_ALIGN_DEG: f32 = 4.0;
+
+/// World-space air-acceleration wish that turns `velocity` toward `target` without braking. In QW,
+/// wishing straight toward a landing does nothing whenever the velocity projected onto that wish is
+/// already above the 30-ups air cap. Human air curves instead wish nearly perpendicular to velocity;
+/// that both turns and gains speed. Return zero once aligned so the finite rocket-jump solution is
+/// not disturbed by an unnecessary weave.
+fn air_curve_wish(velocity: Vec2, target: Vec2) -> Vec2 {
+    let Some(v) = velocity.try_normalize() else {
+        return target.normalize_or_zero();
+    };
+    let Some(t) = target.try_normalize() else {
+        return Vec2::ZERO;
+    };
+    let err = v.perp_dot(t).atan2(v.dot(t)).to_degrees();
+    if err.abs() <= RJ_AIR_ALIGN_DEG {
+        Vec2::ZERO
+    } else if err > 0.0 {
+        Vec2::new(-v.y, v.x)
+    } else {
+        Vec2::new(v.y, -v.x)
+    }
+}
 
 /// Health actually lost to a `dmg`-point blast after armor absorbs its share, mirroring `t_damage`:
 /// `save = ceil(armortype·dmg)` clamped to `armorvalue`, and the knockback is *not* reduced.
@@ -65,8 +90,8 @@ pub(crate) struct RjDrive {
     pub jump_ready: bool,
     /// Rise: fire the rocket this frame (pure timing — the aim was pre-settled in Stance).
     pub fire: bool,
-    /// Ballistic: world-space wish toward the landing, for gentle in-flight air-strafe correction.
-    pub air_correct: Option<Vec3>,
+    /// Ballistic: world-space perpendicular wish that curves the velocity toward the landing.
+    pub air_wish: Option<Vec3>,
 }
 
 /// The per-frame snapshot the rocket-jump driver reads (all Copy). The fitness fields (`has_rl` …
@@ -79,6 +104,7 @@ pub(crate) struct RjCtx {
     pub now: f32,
     pub weapon: Weapon,
     pub origin: Vec3,
+    pub v_xy: Vec2,
     pub on_ground: bool,
     pub attack_finished: f32,
     pub weapons_hot: bool,
@@ -103,6 +129,7 @@ pub(crate) fn drive_rj(graph: &NavGraph, bot: &mut BotState, c: RjCtx) -> RjDriv
         now,
         weapon,
         origin,
+        v_xy,
         on_ground,
         attack_finished,
         weapons_hot,
@@ -121,7 +148,7 @@ pub(crate) fn drive_rj(graph: &NavGraph, bot: &mut BotState, c: RjCtx) -> RjDriv
     let mut select = false;
     let mut jump_ready = false;
     let mut fire = false;
-    let mut air_correct = None;
+    let mut air_wish = None;
     let mut failed = false;
 
     if rj_active {
@@ -182,9 +209,10 @@ pub(crate) fn drive_rj(graph: &NavGraph, bot: &mut BotState, c: RjCtx) -> RjDriv
                     }
                     RjPhase::Ballistic => {
                         look_target = Some(tgt);
-                        // Gentle correction toward the landing — QW air accel caps this to a nudge
-                        // within the perturb-guaranteed neighborhood (the user's error-correction).
-                        air_correct = Some(tgt);
+                        // Perpendicular air acceleration actually turns at QW speeds; a direct wish
+                        // at the landing is normally above the 30-ups projection cap and does nothing.
+                        let wish = air_curve_wish(v_xy, tgt.xy() - origin.xy());
+                        air_wish = Some(Vec3::new(wish.x, wish.y, 0.0));
                         let elapsed = now - bot.rj.started;
                         match ballistic_landing(origin, tgt, on_ground, elapsed, tr.airtime + RJ_BALLISTIC_SLACK) {
                             Landing::Down { on_target } => {
@@ -222,7 +250,7 @@ pub(crate) fn drive_rj(graph: &NavGraph, bot: &mut BotState, c: RjCtx) -> RjDriv
         select,
         jump_ready,
         fire,
-        air_correct,
+        air_wish,
     }
 }
 
@@ -264,5 +292,26 @@ mod tests {
         // So 50 health is fit, 45 is not — armor makes rocket jumps viable at lower health.
         assert_eq!(rocket_jump_extra(&vars(rl, 5.0, 50.0, 0.6, 100.0), 0.0, 1.0), 0.0);
         assert_eq!(rocket_jump_extra(&vars(rl, 5.0, 45.0, 0.6, 100.0), 0.0, 1.0), RJ_UNFIT_PENALTY);
+    }
+
+    #[test]
+    fn air_curve_uses_the_perpendicular_that_turns_toward_target() {
+        let velocity = Vec2::new(320.0, 0.0);
+        assert_eq!(air_curve_wish(velocity, Vec2::new(200.0, 100.0)), Vec2::Y);
+        assert_eq!(air_curve_wish(velocity, Vec2::new(200.0, -100.0)), Vec2::NEG_Y);
+        assert_eq!(air_curve_wish(velocity, Vec2::new(200.0, 0.0)), Vec2::ZERO);
+    }
+
+    #[test]
+    fn air_curve_reduces_bearing_error_without_losing_speed() {
+        use crate::bot::bhop::apply_airaccel;
+
+        let velocity = Vec2::new(320.0, 0.0);
+        let target = Vec2::new(200.0, 100.0);
+        let wish = air_curve_wish(velocity, target);
+        let next = apply_airaccel(velocity, wish, 320.0, 10.0, 1.0 / 77.0);
+        let error = |v: Vec2| v.perp_dot(target).atan2(v.dot(target)).abs();
+        assert!(error(next) < error(velocity));
+        assert!(next.length() > velocity.length());
     }
 }

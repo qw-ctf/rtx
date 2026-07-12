@@ -216,7 +216,8 @@ pub struct Input {
     /// Hard off — combat/hook/gate/grenade wants the view, or the cvar is off. The only thing
     /// that may cut a hop mid-air.
     pub veto: bool,
-    /// A `SpeedJump` leg: the runway is pre-verified, so bypass entry/continuation checks.
+    /// A planned jump traversal (`SpeedJump`, `JumpGap`, or `DoubleJump`): its takeoff and landing
+    /// are pre-verified, so bypass the ordinary runway entry/continuation checks.
     pub committed: bool,
     /// The banded planner routed this run to carry speed here (a leg's planned band ≥ 1). Licenses
     /// engaging straight into the hop cycle when already fast (don't ground into friction to
@@ -276,7 +277,7 @@ impl Bhop {
         }
         if self.phase == Phase::Off {
             let engage = if i.committed {
-                true // a SpeedJump leg is a pre-verified runway — no hysteresis
+                true // a planned jump traversal is pre-verified — no hysteresis
             } else if i.eligible {
                 if self.eligible_since == 0.0 {
                     self.eligible_since = i.now;
@@ -301,7 +302,7 @@ impl Bhop {
         let a_g = a_max; // same cap formula on the ground; only the addspeed limit differs
 
         if self.phase == Phase::Zigzag {
-            // A real runway opened (or a SpeedJump leg committed): promote to the hop cycle,
+            // A real runway opened (or a jump traversal committed): promote to the hop cycle,
             // carrying the speed we built — `engage` picks Prestrafe vs Hop by speed/runway.
             if i.eligible || i.committed {
                 self.engage(i, env.maxspeed);
@@ -708,6 +709,31 @@ mod sim {
     fn mean_heading(tail: &[Vec2]) -> f32 {
         let sum: Vec2 = tail.iter().map(|v| v.normalize_or_zero()).sum();
         sum.y.atan2(sum.x).to_degrees()
+    }
+
+    #[test]
+    fn committed_jump_curves_immediately_without_a_runway() {
+        let mut w = World::grounded(320.0);
+        let mut b = Bhop::default();
+        let committed = |w: &World, now: f32| {
+            let mut i = input(w, 60.0, 0.0, now);
+            i.eligible = false;
+            i.sustain = false;
+            i.committed = true;
+            i
+        };
+
+        let launch = b.step(&committed(&w, 0.0), &ENV).expect("committed jump owns the cmd");
+        assert!(launch.jump, "committed jump did not take off immediately");
+        pm_frame(&mut w, &launch, false);
+        assert!(!w.on_ground);
+
+        let before = w.v;
+        let air = b.step(&committed(&w, DT), &ENV).expect("committed arc stays owned");
+        assert!(!air.jump && air.forward == 0.0 && air.side.abs() == MOVE_SPEED);
+        pm_frame(&mut w, &air, false);
+        assert!(w.v.length() > before.length());
+        assert!(w.v.y > before.y, "air stroke did not curve toward the +60 degree landing");
     }
 
     #[test]
