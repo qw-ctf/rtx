@@ -64,6 +64,15 @@ pub(crate) fn vectoangles(v: Vec3) -> Vec3 {
     Vec3::new(pitch, yaw, 0.0)
 }
 
+/// `w_fire_rocket`'s muzzle point: the projectile spawn height (`origin + 16` up) plus the forward
+/// nudge (`+ fwd*8`). The single source for both the real rocket spawn and the bot's line-of-fire
+/// *prediction* of it (`bot::combat::fire_gate`) — computing them the same way is what keeps the
+/// corner-self-splash gate honest. rtx-nav's rocket-jump pricing mirrors the same offset across the
+/// crate boundary (`navmesh::rocketjump` `MUZZLE_FWD`/`MUZZLE_Z`); keep all three in step.
+pub(crate) fn rocket_muzzle(origin: Vec3, fwd: Vec3) -> Vec3 {
+    origin + fwd * 8.0 + Vec3::new(0.0, 0.0, 16.0)
+}
+
 impl GameState {
     fn shootable_grenades_enabled(&self) -> bool {
         self.host.cvar_bool(c"rtx_shootable_grenades")
@@ -373,8 +382,7 @@ impl GameState {
         }
         self.host.set_model(m, Model::PROGS_MISSILE);
         self.host.set_size(m, Vec3::ZERO, Vec3::ZERO);
-        self.host
-            .set_origin(m, origin + v_forward * 8.0 + Vec3::new(0.0, 0.0, 16.0));
+        self.host.set_origin(m, rocket_muzzle(origin, v_forward));
         // Stamp the shooter's firing origin (set after `set_origin` so it isn't clobbered): the
         // midair mode scores airshots by the vertical shooter→victim distance. Unused otherwise —
         // `FlyMissile` physics never touch `oldorigin`.

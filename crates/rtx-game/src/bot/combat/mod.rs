@@ -584,7 +584,7 @@ fn fire_gate(game: &mut GameState, e: EntId, enemy: EntId, origin: Vec3, skill: 
     // trace, which its lofted path would spuriously fail.
     let mut ray_clear = |ang: Vec3| {
         let fwd = bot::angle_vectors(ang).0;
-        let muzzle = origin + fwd * 8.0 + Vec3::new(0.0, 0.0, 16.0);
+        let muzzle = crate::weapons::rocket_muzzle(origin, fwd);
         let end = muzzle + fwd * (aim - muzzle).length();
         let tr = game.traceline(muzzle, end, false, e);
         let impact = muzzle + (end - muzzle) * tr.fraction;
