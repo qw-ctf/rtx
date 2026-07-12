@@ -23,6 +23,7 @@ use glam::Vec3;
 use crate::defs::VEC_VIEW_OFS;
 use crate::entity::EntId;
 use crate::game::GameState;
+use crate::math::angle_vectors;
 
 /// How long a bot stays aware of a target after last perceiving it, with no fresh contact — the
 /// object-permanence window during which it hunts the last-seen position before giving up.
@@ -112,7 +113,7 @@ pub(crate) fn perceive(game: &mut GameState, e: EntId, enemy: EntId, now: f32) -
     let tr = game.traceline(my_eye, enemy_eye, false, e);
     let los = tr.ent == enemy || tr.fraction > 0.95;
     let in_fov = fov <= 0.0 || {
-        let fwd = crate::bot::angle_vectors(game.entities[e].bot.aim.angles).0;
+        let fwd = angle_vectors(game.entities[e].bot.aim.angles).0;
         let to = (enemy_eye - my_eye).normalize_or_zero();
         fwd.dot(to) >= (0.5 * fov).to_radians().cos()
     };

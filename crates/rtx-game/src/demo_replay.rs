@@ -23,6 +23,7 @@
 use glam::{Vec2, Vec3, Vec3Swizzles};
 
 use crate::bot::bhop::{self, apply_airaccel, apply_friction, apply_groundaccel, wishdir_fs, Bhop, Env};
+use crate::math::yaw_of;
 use crate::bsp::Bsp;
 use crate::pmove_sim::{pm_step, PmParams, PmState};
 use rtx_nav::qphys::JUMP_VZ;
@@ -494,7 +495,7 @@ fn bot_matches_or_beats_human() {
                 let mut landed = None;
                 while t < human_time * 1.5 + 0.5 {
                     let to = (land.xy() - st.origin.xy()).normalize_or_zero();
-                    let bearing = to.y.atan2(to.x).to_degrees();
+                    let bearing = yaw_of(to);
                     let s = bhop::air_correct(st.vel.xy(), bearing, a_max, DT);
                     let cmd = bhop::Cmd { view_yaw: s.view_yaw, forward: s.forward, side: s.side, jump: false };
                     pm_step(&bsp, &mut st, &cmd, &p, DT);

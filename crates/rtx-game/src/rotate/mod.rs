@@ -26,13 +26,9 @@ use crate::assets::Sound;
 use crate::defs::*;
 use crate::entity::{Blocked, EntId, RotPhase, RotateType, Think, Touch, Use};
 use crate::game::GameState;
+use crate::math::normalize_angles;
 
 mod train;
-
-/// `SUB_NormalizeAngles` — wrap each angle into `(-360, 360)` (QuakeC's `fmod(a, 360)`).
-pub(super) fn normalize_angles(a: Vec3) -> Vec3 {
-    Vec3::new(a.x % 360.0, a.y % 360.0, a.z % 360.0)
-}
 
 impl GameState {
     // ----------------------------------------------------------------------------------------

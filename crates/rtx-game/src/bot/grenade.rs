@@ -13,9 +13,9 @@
 
 use glam::{Vec3, Vec3Swizzles};
 
-use crate::bot::{self, BotCmd};
+use crate::bot::BotCmd;
 use crate::bot::combat::{
-    self, blast_self_damage, can_hit_grenade, hitscan_choice, shoot_grenade, teammate_in_blast, GRENADE_MIN_SHOOT,
+    blast_self_damage, can_hit_grenade, hitscan_choice, shoot_grenade, teammate_in_blast, GRENADE_MIN_SHOOT,
     GRENADE_SHOOT_HEALTH_FRAC,
 };
 use crate::defs::{
@@ -24,6 +24,7 @@ use crate::defs::{
 };
 use crate::bot::state::GrenadePhase;
 use crate::entity::EntId;
+use crate::math::{angle_vectors, angles_to, elevation_of, wrap180, yaw_of};
 use crate::game::GameState;
 use crate::hazard::{find_hazard, Hazard};
 
@@ -66,7 +67,7 @@ const LOB_MAX_FLIGHT: f32 = GL_FUSE - 0.8;
 /// `w_fire_grenade` builds it (minus the ±10 u random spread). Fixed magnitude [`GL_SPEED`] at
 /// [`GL_LOFT_DEG`] above the view-forward.
 pub(crate) fn launch_velocity(view: Vec3) -> Vec3 {
-    let (forward, _right, up) = crate::bot::angle_vectors(view);
+    let (forward, _right, up) = angle_vectors(view);
     forward * 600.0 + up * 200.0
 }
 
@@ -103,7 +104,7 @@ pub(crate) fn solve_lob(p0: Vec3, b: Vec3, s: f32, g: f32, high: bool) -> Option
     if pitch == 0.0 {
         pitch = -0.01; // v_angle.x == 0 takes a different velocity branch in w_fire_grenade
     }
-    let yaw = to.y.atan2(to.x).to_degrees();
+    let yaw = yaw_of(to.xy());
     Some((Vec3::new(pitch.clamp(-80.0, 80.0), yaw, 0.0), flight))
 }
 
@@ -125,16 +126,14 @@ pub(crate) fn solve_air_intercept(p0: Vec3, e_pos: Vec3, e_vel: Vec3, g: f32) ->
         return None;
     }
     let v_g = (e_pos - p0) / t + e_vel;
-    let horiz = v_g.xy().length();
-    let elev = v_g.z.atan2(horiz.max(1.0)); // launch elevation above horizontal (radians)
-    let mut pitch = GL_LOFT_DEG - elev.to_degrees();
+    let mut pitch = GL_LOFT_DEG - elevation_of(v_g);
     if pitch == 0.0 {
         pitch = -0.01; // v_angle.x == 0 takes a different velocity branch in w_fire_grenade
     }
     if !(-80.0..=80.0).contains(&pitch) {
         return None; // out of the view-pitch range; the loft would bend the solution
     }
-    let yaw = v_g.y.atan2(v_g.x).to_degrees();
+    let yaw = yaw_of(v_g.xy());
     // Where they actually meet in the world (both dropped by ½g·t²) — for aim memory and the gate.
     let meet = e_pos + e_vel * t - Vec3::new(0.0, 0.0, 0.5 * g * t * t);
     Some((Vec3::new(pitch, yaw, 0.0), t, meet))
@@ -304,7 +303,7 @@ pub(crate) fn solve_bank(
     gravity: f32,
 ) -> Option<BankShot> {
     let bearing = (e_org - p0).xy();
-    let base_yaw = bearing.y.atan2(bearing.x).to_degrees();
+    let base_yaw = yaw_of(bearing);
     let enemy_at = |t: f32| e_org + e_vel * t.min(1.0);
 
     let mut best: Option<(f32, BankShot)> = None;
@@ -414,9 +413,9 @@ fn own_live_grenade(game: &GameState, e: EntId, origin: Vec3) -> Option<EntId> {
 
 /// Angular error (deg) between two view angles (pitch/yaw), the larger axis.
 fn aim_err(view: Vec3, want: Vec3) -> f32 {
-    bot::wrap180(view.x - want.x)
+    wrap180(view.x - want.x)
         .abs()
-        .max(bot::wrap180(view.y - want.y).abs())
+        .max(wrap180(view.y - want.y).abs())
 }
 
 /// Drive the grenade lob→shoot combo for one frame, overlaid after `engage` (and after the
@@ -690,7 +689,7 @@ fn lobbed(game: &mut GameState, e: EntId, origin: Vec3, now: f32, cmd: &mut BotC
     }
     let eye = origin + VEC_VIEW_OFS;
     let gpos = game.entities[g].v.origin;
-    cmd.look = combat::angles_to(eye, gpos); // pre-aim the grenade
+    cmd.look = angles_to(eye, gpos); // pre-aim the grenade
 }
 
 /// Detonate the grenade the instant its blast puts the enemy where we want them (Detonate → Idle).
@@ -708,7 +707,7 @@ fn detonate(game: &mut GameState, e: EntId, en: EntId, origin: Vec3, now: f32, c
     let (health, my_team) = (game.entities[e].v.health, game.entities[e].mode_p.team);
     let gpos = game.entities[g].v.origin;
     let eye = origin + VEC_VIEW_OFS;
-    cmd.look = combat::angles_to(eye, gpos);
+    cmd.look = angles_to(eye, gpos);
 
     // Never blow it up in our own face, or on a teammate. Back away if it's drifted too close.
     let d_self = (gpos - origin).length();
@@ -810,7 +809,7 @@ pub(crate) fn rocket_shove(
         return false; // a wall stops the rocket short of B
     }
     // Aim the rocket at the ground point, select the launcher, and fire once the view is on it.
-    cmd.look = combat::angles_to(eye, aim);
+    cmd.look = angles_to(eye, aim);
     if game.entities[e].v.weapon != Weapon::RocketLauncher {
         cmd.impulse = 7;
         cmd.buttons &= !BUTTON_ATTACK;

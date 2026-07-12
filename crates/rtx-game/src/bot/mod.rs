@@ -40,6 +40,7 @@ use crate::defs::{
 };
 use crate::entity::{EntId, Entity, Touch};
 use crate::game::{cstring, GameState};
+use crate::math::{angle_vectors, wrap180, yaw_of};
 use crate::mode::BotIntent;
 use crate::navmesh::{CellId, LinkCosts, LinkKind, NavGraph};
 
@@ -945,17 +946,6 @@ fn run_bot(game: &mut GameState, e: EntId) {
     emit(game, e, s, cmd, bhop_cmd, &hook, &rj, enemy);
 }
 
-/// Wrap an angle into (-180, 180].
-pub(crate) fn wrap180(a: f32) -> f32 {
-    let mut a = a % 360.0;
-    if a > 180.0 {
-        a -= 360.0;
-    } else if a < -180.0 {
-        a += 360.0;
-    }
-    a
-}
-
 /// The first shut gate whose blocked cell lies on the remaining route, if any.
 fn route_blocking_gate(graph: &NavGraph, route: &[u32], from: usize, closed: &[bool]) -> Option<usize> {
     route.get(from..)?.iter().find_map(|&leg| {
@@ -1157,7 +1147,7 @@ fn runway_over(origin: Vec3, targets: impl Iterator<Item = Vec3>) -> f32 {
         prev = t;
         if dist - anchor_dist >= CHORD {
             let c = t - anchor;
-            let yaw = c.y.atan2(c.x).to_degrees();
+            let yaw = yaw_of(c);
             if chord_yaw.is_some_and(|p| wrap180(yaw - p).abs() > MAX_BEND) || tgt.z - anchor_z > MAX_CLIMB {
                 return anchor_dist; // the corridor turned or climbed in this chord — stop before it
             }
@@ -1279,16 +1269,6 @@ fn nearest_human(game: &GameState, bot_e: EntId) -> Option<EntId> {
     best.map(|(e, _)| e)
 }
 
-/// QuakeWorld `AngleVectors` (roll assumed 0): the view's forward, right, and up unit vectors —
-/// exactly what the engine's `makevectors` produces and `w_fire_grenade` orients the launch by.
-pub(crate) fn angle_vectors(angles: Vec3) -> (Vec3, Vec3, Vec3) {
-    let (sy, cy) = angles.y.to_radians().sin_cos();
-    let (sp, cp) = angles.x.to_radians().sin_cos();
-    let forward = Vec3::new(cp * cy, cp * sy, -sp);
-    let right = Vec3::new(sy, -cy, 0.0);
-    let up = Vec3::new(sp * cy, sp * sy, cp);
-    (forward, right, up)
-}
 
 /// Drop bot bookkeeping when a bot client disconnects (kicked, or removed by the manager), so
 /// a slot reused by a future human isn't mistaken for a bot.

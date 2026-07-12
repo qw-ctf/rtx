@@ -38,6 +38,7 @@ mod game_command;
 mod grapple;
 mod host;
 mod items;
+mod math;
 mod misc;
 mod mode;
 mod nav_build;

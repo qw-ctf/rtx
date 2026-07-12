@@ -49,24 +49,6 @@ impl SpikeKind {
     }
 }
 
-/// `vectoangles` — convert a direction to `(pitch, yaw, 0)` Euler angles (degrees).
-pub(crate) fn vectoangles(v: Vec3) -> Vec3 {
-    if v.x == 0.0 && v.y == 0.0 {
-        let pitch = if v.z > 0.0 { 90.0 } else { 270.0 };
-        return Vec3::new(pitch, 0.0, 0.0);
-    }
-    let mut yaw = v.y.atan2(v.x).to_degrees();
-    if yaw < 0.0 {
-        yaw += 360.0;
-    }
-    let forward = (v.x * v.x + v.y * v.y).sqrt();
-    let mut pitch = v.z.atan2(forward).to_degrees();
-    if pitch < 0.0 {
-        pitch += 360.0;
-    }
-    Vec3::new(pitch, yaw, 0.0)
-}
-
 /// `w_fire_rocket`'s muzzle point: the projectile spawn height (`origin + 16` up) plus the forward
 /// nudge (`+ fwd*8`). The single source for both the real rocket spawn and the bot's line-of-fire
 /// *prediction* of it (`bot::combat::fire_gate`) — computing them the same way is what keeps the

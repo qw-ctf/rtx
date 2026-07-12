@@ -21,13 +21,14 @@ pub(crate) use aim::*;
 use crate::abi::EntVars;
 use crate::arsenal::{self, AmmoKind};
 use crate::bot::state::GrenadePhase;
-use crate::bot::{self, grenade, BotCmd};
+use crate::bot::{grenade, BotCmd};
 use crate::defs::{
     Bits, Flags, Items, Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP,
     VEC_VIEW_OFS,
 };
 use crate::entity::EntId;
 use crate::game::GameState;
+use crate::math::{angle_vectors, angles_to, wrap180};
 
 /// Rocket/grenade projectile speed (QuakeWorld `SV_FireRocket`), for target leading.
 const ROCKET_SPEED: f32 = 1000.0;
@@ -582,7 +583,7 @@ fn feed_forward(game: &mut GameState, e: EntId, now: f32, skill: f32, clean: Vec
     let b = &mut game.entities[e].bot;
     let dt = now - b.aim.look_prev_time;
     let raw = if b.aim.look_prev_time > 0.0 && dt > 1e-3 && dt < 0.25 {
-        Vec3::new(bot::wrap180(clean.x - b.aim.look_prev.x) / dt, bot::wrap180(clean.y - b.aim.look_prev.y) / dt, 0.0)
+        Vec3::new(wrap180(clean.x - b.aim.look_prev.x) / dt, wrap180(clean.y - b.aim.look_prev.y) / dt, 0.0)
     } else {
         Vec3::ZERO // stale/first sample (just acquired the target) — no estimate yet
     };
@@ -672,8 +673,8 @@ fn fire_gate(game: &mut GameState, e: EntId, enemy: EntId, origin: Vec3, skill: 
         // shotguns/axe looser — plus low-skill leniency.
         let base_cone = if choice.weapon == Weapon::Lightning { 2.5 } else { 5.0 };
         let cone = base_cone + (7.0 - skill);
-        let dp = bot::wrap180(view.x - clean.x);
-        let dy = bot::wrap180(view.y - clean.y);
+        let dp = wrap180(view.x - clean.x);
+        let dy = wrap180(view.y - clean.y);
         view == Vec3::ZERO || (dp * dp + dy * dy).sqrt() <= cone
     };
     let switching_to_gl = choice.grenade_arc && game.entities[e].v.weapon != Weapon::GrenadeLauncher;
@@ -681,7 +682,7 @@ fn fire_gate(game: &mut GameState, e: EntId, enemy: EntId, origin: Vec3, skill: 
     // A grenade arc keeps its own geometry check (bounce sim / arc_land) and skips this straight-line
     // trace, which its lofted path would spuriously fail.
     let mut ray_clear = |ang: Vec3| {
-        let fwd = bot::angle_vectors(ang).0;
+        let fwd = angle_vectors(ang).0;
         let muzzle = crate::weapons::rocket_muzzle(origin, fwd);
         let end = muzzle + fwd * (aim - muzzle).length();
         let tr = game.traceline(muzzle, end, false, e);
@@ -909,8 +910,8 @@ pub(crate) fn shoot_grenade(game: &mut GameState, e: EntId, grenade: EntId, cmd:
     let dist = (gpos - eye).length().max(1.0);
     let cone = (8.0 / dist).atan().to_degrees().clamp(1.5, 5.0);
     let view = game.entities[e].bot.aim.angles;
-    let dp = bot::wrap180(view.x - cmd.look.x);
-    let dy = bot::wrap180(view.y - cmd.look.y);
+    let dp = wrap180(view.x - cmd.look.x);
+    let dy = wrap180(view.y - cmd.look.y);
     if view == Vec3::ZERO || (dp * dp + dy * dy).sqrt() <= cone {
         cmd.buttons |= BUTTON_ATTACK;
     }

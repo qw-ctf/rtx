@@ -15,6 +15,7 @@
 use glam::{Vec2, Vec3, Vec3Swizzles};
 
 use crate::bot::bhop::{self, Bhop, Env};
+use crate::math::yaw_of;
 use crate::bsp::Bsp;
 use crate::pmove_sim::{pm_step, PmParams, PmState};
 use crate::race::{touching, RaceRouteNode};
@@ -198,7 +199,7 @@ pub fn rollout(bsp: &Bsp, line: &RaceLine, nodes: &[RaceRouteNode], pm: &PmParam
         // Steer toward a look-ahead point a couple of controls down the line.
         let target = pts[(cursor + 2).min(last)].pos;
         let dir = (target.xy() - st.origin.xy()).normalize_or_zero();
-        let bearing = dir.y.atan2(dir.x).to_degrees();
+        let bearing = yaw_of(dir);
         let runway = line_runway(pts, cursor);
         let tech = pts[cursor.min(last)].technique;
         let input = bhop::Input {

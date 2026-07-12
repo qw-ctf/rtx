@@ -19,6 +19,7 @@ use glam::{Vec3, Vec3Swizzles};
 use crate::defs::{Solid, VEC_VIEW_OFS};
 use crate::entity::{EntId, Think};
 use crate::game::GameState;
+use crate::math::yaw_of;
 use crate::navmesh::{CellId, LinkCosts, LinkKind, NavGraph};
 
 /// A goal item this close (XY) and on roughly the same floor is one we're *waiting at*, not still
@@ -161,7 +162,7 @@ fn scan_due(until: f32, now: f32) -> bool {
 fn pick_scan(eye: Vec3, prev: Vec3, r: f32) -> Vec3 {
     let bearing = if prev != Vec3::ZERO {
         let d = prev - eye;
-        d.y.atan2(d.x).to_degrees() + GOLDEN_DEG
+        yaw_of(d.xy()) + GOLDEN_DEG
     } else {
         r * 360.0
     };
@@ -240,9 +241,9 @@ mod tests {
         assert!((first - eye).xy().length() > SCAN_DIST - 1.0, "look point is far off");
         assert!((first.z - eye.z).abs() < 1e-3, "level scan");
         // Next pick steps the golden angle from the previous bearing.
-        let b0 = { let d = first - eye; d.y.atan2(d.x).to_degrees() };
+        let b0 = { let d = first - eye; yaw_of(d.xy()) };
         let second = pick_scan(eye, first, 0.0);
-        let b1 = { let d = second - eye; d.y.atan2(d.x).to_degrees() };
+        let b1 = { let d = second - eye; yaw_of(d.xy()) };
         let step = (b1 - b0).rem_euclid(360.0);
         assert!((step - GOLDEN_DEG).abs() < 0.5, "bearing advanced ~137.5°, got {step}");
     }

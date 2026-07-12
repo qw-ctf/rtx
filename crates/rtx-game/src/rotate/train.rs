@@ -6,7 +6,7 @@
 
 use glam::Vec3;
 
-use super::normalize_angles;
+use crate::math::normalize_angles;
 use crate::assets::Sound;
 use crate::defs::*;
 use crate::entity::{EntId, RotPhase, Think, Use};

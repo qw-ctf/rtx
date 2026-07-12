@@ -19,7 +19,7 @@
 
 use glam::Vec2;
 
-use crate::bot::wrap180;
+use crate::math::{wrap180, yaw_of};
 use crate::defs::BOT_MOVE_SPEED as MOVE_SPEED;
 use rtx_nav::qphys::AIR_CAP;
 
@@ -141,7 +141,7 @@ pub fn omega_max(speed: f32, a_max: f32, dt: f32) -> f32 {
 /// longer *jumps* the view yaw (the eyes just sweep with the velocity), so the gait doesn't twitch.
 pub fn strafe_rate(v_xy: Vec2, sigma: f32, omega_deg: f32, a_max: f32, dt: f32) -> Strafe {
     let speed = v_xy.length().max(1.0);
-    let vel_yaw = v_xy.y.atan2(v_xy.x).to_degrees();
+    let vel_yaw = yaw_of(v_xy);
     let cap = a_max.min(AIR_CAP);
     let a_need = speed * (omega_deg.to_radians() * dt).tan();
     let theta = if a_need >= cap {
@@ -167,7 +167,7 @@ pub fn strafe_rate(v_xy: Vec2, sigma: f32, omega_deg: f32, a_max: f32, dt: f32) 
 /// wish in **world space** and steers the eyes separately — the flip never moves the view.
 pub fn air_correct(v_xy: Vec2, bearing: f32, a_max: f32, dt: f32) -> Strafe {
     let speed = v_xy.length().max(1.0);
-    let vel_yaw = v_xy.y.atan2(v_xy.x).to_degrees();
+    let vel_yaw = yaw_of(v_xy);
     let err = wrap180(bearing - vel_yaw);
     let omega = (err.abs() * AIR_CORRECT_GAIN).min(omega_max(speed, a_max, dt));
     strafe_rate(v_xy, err.signum(), omega, a_max, dt)
@@ -222,7 +222,7 @@ pub struct Strafe {
 #[allow(dead_code)]
 pub fn strafe(v_xy: Vec2, wp_bearing: f32, prev_sigma: f32, a_max: f32) -> Strafe {
     let speed = v_xy.length().max(1.0);
-    let vel_yaw = v_xy.y.atan2(v_xy.x).to_degrees();
+    let vel_yaw = yaw_of(v_xy);
     let err = wrap180(wp_bearing - vel_yaw);
     let sigma = weave_sigma(err, prev_sigma, weave_band(speed));
     let theta = theta_star(speed, a_max);
@@ -255,7 +255,7 @@ pub fn prestrafe(v_xy: Vec2, bearing: f32, prev_sigma: f32, a_g: f32, maxspeed: 
     if speed <= u_star.max(60.0) {
         return Strafe { view_yaw: bearing, forward: MOVE_SPEED, side: 0.0, sigma: prev_sigma };
     }
-    let vel_yaw = v_xy.y.atan2(v_xy.x).to_degrees();
+    let vel_yaw = yaw_of(v_xy);
     let err = wrap180(bearing - vel_yaw);
     let sigma = weave_sigma(err, prev_sigma, weave_band(speed).min(band_cap));
     let theta_g = (u_star / speed).clamp(0.0, 1.0).acos().to_degrees();
@@ -483,7 +483,7 @@ impl Bhop {
     /// flip is symmetric — same threshold either side — so the S self-centers on the bearing; sized
     /// so a lobe runs about a hop, i.e. one flip per hop, the smooth gait rather than the shake.
     fn air_strafe(&mut self, i: &Input, speed: f32, a_max: f32, dt: f32) -> Strafe {
-        let vel_yaw = i.v_xy.y.atan2(i.v_xy.x).to_degrees();
+        let vel_yaw = yaw_of(i.v_xy);
         let err = wrap180(i.bearing - vel_yaw);
         if self.sigma == 0.0 {
             self.sigma = if err >= 0.0 { 1.0 } else { -1.0 };
@@ -676,7 +676,7 @@ mod tests {
                 let v = Vec2::new(s, 0.0);
                 let cmd = strafe_rate(v, 1.0, omega, a, dt);
                 let v2 = apply_airaccel(v, wishdir_fs(cmd.view_yaw, cmd.forward, cmd.side), MAXSPEED, ACCEL, dt);
-                let turned = v2.y.atan2(v2.x).to_degrees();
+                let turned = yaw_of(v2);
                 let want = omega * dt;
                 assert!((turned - want).abs() <= 0.1 * want + 0.02, "s={s} ω={omega}: turned {turned}° want {want}°");
                 assert!(v2.length() > s, "s={s} ω={omega}: no speed gain {s} -> {}", v2.length());
@@ -695,7 +695,7 @@ mod tests {
         assert!(s.view_yaw.abs() < 0.01, "view should ride the velocity (0°), got {}", s.view_yaw);
         let theta_g = ((MAXSPEED - a_g).max(0.0) / 400.0).clamp(0.0, 1.0).acos().to_degrees();
         let wd = wishdir_fs(s.view_yaw, s.forward, s.side);
-        let wish_yaw = wd.y.atan2(wd.x).to_degrees();
+        let wish_yaw = yaw_of(wd);
         assert!(
             (wish_yaw - s.sigma * theta_g).abs() < 0.5,
             "wishdir {wish_yaw}° should be sigma·θg {}°",
@@ -723,7 +723,7 @@ mod tests {
     /// Circular mean (degrees) of the headings of a velocity trace's tail.
     fn mean_heading(tail: &[Vec2]) -> f32 {
         let sum: Vec2 = tail.iter().map(|v| v.normalize_or_zero()).sum();
-        sum.y.atan2(sum.x).to_degrees()
+        yaw_of(sum)
     }
 
     #[test]
@@ -899,7 +899,7 @@ mod sim {
 
     fn mean_heading(tail: &[Vec2]) -> f32 {
         let sum: Vec2 = tail.iter().map(|v| v.normalize_or_zero()).sum();
-        sum.y.atan2(sum.x).to_degrees()
+        yaw_of(sum)
     }
 
     #[test]
@@ -1037,14 +1037,14 @@ mod sim {
         let mut w = World::grounded(446.0);
         let mut b = Bhop::default();
         let mut air_rates = Vec::new();
-        let mut prev_hd = w.v.y.atan2(w.v.x).to_degrees();
+        let mut prev_hd = yaw_of(w.v);
         for f in 0..270 {
             let now = f as f32 * DT;
             let bearing = (now / 2.7 * 80.0).min(80.0); // 80° over ~4 hops
             let was_air = !w.on_ground;
             let cmd = b.step(&input(&w, bearing, 4096.0, now), &ENV).unwrap_or(run_cmd(bearing));
             pm_frame(&mut w, &cmd, false);
-            let hd = w.v.y.atan2(w.v.x).to_degrees();
+            let hd = yaw_of(w.v);
             if was_air && !w.on_ground {
                 air_rates.push(wrap180(hd - prev_hd).abs() / DT);
             }

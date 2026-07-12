@@ -6,7 +6,9 @@
 //! stateless (glam only), so they unit-test without a `GameState`; `engage` and the grenade solvers
 //! call them.
 
-use glam::{Vec3, Vec3Swizzles};
+use glam::Vec3;
+
+use crate::math::wrap180;
 
 /// Aim-spring stiffness (1/s) for a given skill — the single source shared with the spring
 /// integrator in `bot.rs`, so the feed-forward lag estimate here matches the actual spring.
@@ -135,8 +137,8 @@ pub(super) fn ballistic_intercept(from: Vec3, pos_at: &impl Fn(f32) -> Vec3, s: 
 /// unclamped `sin` dips back toward zero — even negative past 180° — and would wrongly pass a shot
 /// aimed the opposite way, e.g. mid-flick onto an enemy that just appeared behind the bot).
 pub(super) fn miss_distance(view: Vec3, clean: Vec3, range: f32) -> f32 {
-    let dp = crate::bot::wrap180(view.x - clean.x).to_radians();
-    let dy = crate::bot::wrap180(view.y - clean.y).to_radians();
+    let dp = wrap180(view.x - clean.x).to_radians();
+    let dy = wrap180(view.y - clean.y).to_radians();
     (dp * dp + dy * dy).sqrt().min(std::f32::consts::FRAC_PI_2).sin() * range
 }
 
@@ -151,12 +153,4 @@ pub(super) fn fire_tolerance(skill: f32, direct: bool) -> f32 {
     } else {
         40.0 + (7.0 - s) * 25.0
     }
-}
-
-/// View angles (pitch, yaw, 0) from `eye` toward `point`.
-pub(crate) fn angles_to(eye: Vec3, point: Vec3) -> Vec3 {
-    let d = point - eye;
-    let yaw = d.y.atan2(d.x).to_degrees();
-    let pitch = -d.z.atan2(d.xy().length().max(1.0)).to_degrees();
-    Vec3::new(pitch, yaw, 0.0)
 }

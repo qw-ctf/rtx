@@ -15,6 +15,7 @@ use glam::{Vec3, Vec3Swizzles};
 use super::*;
 use crate::bsp::Bsp;
 use crate::bot::state::{Commit, GateErrand, PlatWait};
+use crate::math::{angle_vectors, angles_to, yaw_of};
 use crate::defs::{Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP};
 use crate::game::cstring;
 use crate::nav_build::PlatStatus;
@@ -528,7 +529,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         };
         let to_wp = waypoint.xy() - origin.xy();
         let dir = if ahead.length() > 8.0 { ahead } else { to_wp };
-        let bearing = dir.y.atan2(dir.x).to_degrees();
+        let bearing = yaw_of(dir);
         let bhop_runway = match sj_takeoff {
             Some((takeoff, _)) if sj_active => (takeoff.xy() - origin.xy()).length(),
             _ => runway_dist,
@@ -583,7 +584,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // Steering: face the waypoint and run toward it.
     let to_wp = waypoint.xy() - origin.xy();
     let dist = to_wp.length();
-    let yaw = to_wp.y.atan2(to_wp.x).to_degrees();
+    let yaw = yaw_of(to_wp);
     let mut angles = Vec3::new(0.0, yaw, 0.0);
 
     // Nav look target: eyes on the look-ahead point down the corridor (combat/gate may override
@@ -594,7 +595,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     let eye = origin + Vec3::new(0.0, 0.0, 22.0);
     let to_look = look_point - eye;
     let mut look = if to_look.xy().length() > 48.0 {
-        combat::angles_to(eye, look_point)
+        angles_to(eye, look_point)
     } else if dist > 8.0 {
         angles // steering yaw is still meaningful — look where we're walking
     } else if bot.aim.angles != Vec3::ZERO {
@@ -664,7 +665,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
 
     if let Some(t) = hook.look_target {
         if (t - eye).xy().length() > 1.0 {
-            look = combat::angles_to(eye, t);
+            look = angles_to(eye, t);
         }
     }
     // Rocket-jump look: Stance/Rise hold the solved fire *angles* directly (the shot flies along the
@@ -673,7 +674,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         look = a;
     } else if let Some(t) = rj.look_target {
         if (t - eye).xy().length() > 1.0 {
-            look = combat::angles_to(eye, t);
+            look = angles_to(eye, t);
         }
     }
     // Audience watch (arena Spectate): eyes on the fighter the mode chose — already LOS-validated
@@ -684,7 +685,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     if !hook_engaged && !rj_engaged {
         if let Some(t) = watch_point {
             if (t - eye).xy().length() > 48.0 {
-                look = combat::angles_to(eye, t);
+                look = angles_to(eye, t);
             }
         }
     }
@@ -736,7 +737,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         let at_button =
             bot.route_pos >= bot.route.len() || (origin.xy() - graph.cell_origin(g.button_cell).xy()).length() < 40.0;
         if at_button {
-            angles = combat::angles_to(eye, g.aim);
+            angles = angles_to(eye, g.aim);
             let (pitch, yaw) = (angles.x, angles.y);
             look = angles; // the button needs a precise aim; the spring settles on it while parked
             buttons &= !BUTTON_JUMP;
@@ -787,7 +788,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 if maxspeed > 0.0 { maxspeed } else { 320.0 },
                 dt,
             );
-            let s = bhop::air_correct(v_xy, to.y.atan2(to.x).to_degrees(), a_max, dt);
+            let s = bhop::air_correct(v_xy, yaw_of(to), a_max, dt);
             let w = bhop::wishdir_fs(s.view_yaw, s.forward, s.side);
             Vec3::new(w.x, w.y, 0.0) * MOVE_SPEED
         })
