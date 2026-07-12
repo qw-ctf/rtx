@@ -6,6 +6,8 @@
 
 use glam::Vec3;
 
+use crate::navmesh::CellId;
+
 /// Per-bot navigation/AI state, on the bot's client edict (`1..=maxclients`). Non-bot edicts
 /// keep this at its `Default` (`is_bot == false`). See [`crate::bot`].
 #[derive(Default)]
@@ -22,8 +24,8 @@ pub struct BotState {
     /// A band ≥ 1 on the current or next leg tells the bhop controller to carry speed through the
     /// waypoint instead of disengaging (see `carry` in [`crate::bot::bhop::Input`]).
     pub route_bands: Vec<u8>,
-    /// The cell we last routed toward (`u32::MAX` = none), to detect when to re-path.
-    pub goal_cell: u32,
+    /// The cell we last routed toward (`None` = nothing yet), to detect when to re-path.
+    pub goal_cell: Option<CellId>,
     /// The gate the bot is opening as an errand, plus the gate it's avoiding. See [`GateState`].
     pub gate: GateState,
     /// The bot's item-fetch goal: which item, where, the re-pick throttle, and the handoff/avoid

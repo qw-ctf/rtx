@@ -108,8 +108,7 @@ pub(crate) unsafe fn drain_roster(game: *mut GameState) {
                 g.entities[EntId(client as u32)].bot = BotState {
                     is_bot: true,
                     client,
-                    goal_cell: u32::MAX,
-                    ..Default::default()
+                    ..Default::default() // goal_cell None, route empty, etc. — a fresh blackboard
                 };
             }
         }

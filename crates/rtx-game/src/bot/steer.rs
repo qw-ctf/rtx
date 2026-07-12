@@ -117,7 +117,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // Re-path when the route is empty, the goal changed, or the timer elapsed. Frozen mid-hook, on a
     // speed/rocket jump, or committed to a plain jump arc, so the traversal keeps the route that put
     // it on that leg (a goal flip mid-air must not replace the route and turn the bot around).
-    if !route_frozen && !on_air && (bot.route.is_empty() || bot.goal_cell != goal || now >= bot.repath_time) {
+    if !route_frozen && !on_air && (bot.route.is_empty() || bot.goal_cell != Some(goal) || now >= bot.repath_time) {
         // Speed-band planning credits the speed a bot carries between legs (chained speed jumps,
         // cheaper hot Walk legs) — gated on bhop being on (no speed-jump links otherwise) plus its
         // own escape-hatch cvar. `speed` seeds the start band, so a mid-run re-path keeps a hop
@@ -148,7 +148,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         bot.route = route;
         bot.route_bands = bands;
         bot.route_pos = 0;
-        bot.goal_cell = goal;
+        bot.goal_cell = Some(goal);
         bot.repath_time = now + REPATH_INTERVAL;
         // Restart the progress watchdog against the new route (INFINITY ⇒ the first frame records the
         // real starting distance rather than reading as an instant stall on an old baseline).
@@ -177,7 +177,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 bot.route = graph.find_path(bot_cell, button_cell, &costs).unwrap_or_default();
                 bot.route_bands = vec![0u8; bot.route.len()]; // a walking errand, no carried speed
                 bot.route_pos = 0;
-                bot.goal_cell = button_cell;
+                bot.goal_cell = Some(button_cell);
                 bot.repath_time = now + REPATH_INTERVAL;
             } else {
                 // Button is walled off behind this gate — don't chase it; avoid the gate so
