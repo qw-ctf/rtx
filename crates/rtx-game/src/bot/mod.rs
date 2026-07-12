@@ -854,6 +854,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
             goal_cell,
             race_line_ahead,
             weapons_hot,
+            bsp: game.nav.bsp.as_ref(),
         },
     );
 
@@ -1056,39 +1057,82 @@ fn button_reachable(graph: &NavGraph, from: CellId, gi: usize, costs: &LinkCosts
     }
 }
 
-/// How far a bunnyhop runway extends from `route_pos`: sum the lengths of the leading `Walk`/`Step`
-/// legs while the corridor keeps roughly its heading, stopping at the first sharp turn, non-ground
-/// leg, or route end. Each segment may bend up to ~30° from the *previous* segment — measuring
-/// against the neighbour rather than the initial heading lets a gently curving corridor accumulate
-/// (the weave tracks such bends fine); the old initial-heading test cut real-map runways so short
-/// that bhop barely ever engaged.
-fn runway(graph: &NavGraph, route: &[u32], route_pos: usize, origin: Vec3) -> f32 {
-    // Judge bends on ~chord-length spans, not per 32u leg: grid-quantized cell centres zigzag on
-    // any heading between grid axes, which a per-segment angle test misreads as constant turning.
+/// The target points of the leading `Walk`/`Step` legs from `route_pos` (the ground corridor a
+/// bunnyhop can run), stopping at the first non-ground leg. Shared by [`runway`] and
+/// [`corridor_point`] so both trace the exact same corridor.
+fn ground_leg_targets<'a>(
+    graph: &'a NavGraph,
+    route: &'a [u32],
+    route_pos: usize,
+) -> impl Iterator<Item = Vec3> + 'a {
+    route
+        .get(route_pos..)
+        .unwrap_or_default()
+        .iter()
+        .take_while(move |&&leg| matches!(graph.link_kind(leg), LinkKind::Walk | LinkKind::Step))
+        .map(move |&leg| graph.cell_origin(graph.link_target(leg)))
+}
+
+/// Straight-and-level runway from `origin` along a corridor of successive leg-target points: sum XY
+/// leg lengths while the corridor keeps roughly its heading *and* stays roughly level, stopping
+/// before the first ~96u chord that either turns more than `MAX_BEND` or **climbs** more than
+/// `MAX_CLIMB`. The climb stop is why bots run (not hop) up stairs: an ascending staircase — a chain
+/// of positive-dz Step legs, riser 8–18u per 32u cell — rises ~24u per chord and reads as "not a
+/// bhop runway". Descents never stop it (hopping *down* stairs is fine), and a lone step inside an
+/// otherwise level chord stays under the threshold (single steps are hoppable; pmove steps up on
+/// landing anyway). Judging on chords rather than per 32u leg avoids misreading grid-quantized cell
+/// centres (which zigzag between grid axes) as constant turning.
+fn runway_over(origin: Vec3, targets: impl Iterator<Item = Vec3>) -> f32 {
     const CHORD: f32 = 96.0;
     const MAX_BEND: f32 = 35.0;
+    const MAX_CLIMB: f32 = 20.0;
     let (mut dist, mut prev) = (0.0, origin.xy());
-    let (mut anchor, mut anchor_dist) = (origin.xy(), 0.0);
+    let (mut anchor, mut anchor_dist, mut anchor_z) = (origin.xy(), 0.0, origin.z);
     let mut chord_yaw = None::<f32>;
-    for &leg in route.get(route_pos..).unwrap_or_default() {
-        if !matches!(graph.link_kind(leg), LinkKind::Walk | LinkKind::Step) {
-            break;
-        }
-        let tgt = graph.cell_origin(graph.link_target(leg)).xy();
-        dist += (tgt - prev).length();
-        prev = tgt;
+    for tgt in targets {
+        let t = tgt.xy();
+        dist += (t - prev).length();
+        prev = t;
         if dist - anchor_dist >= CHORD {
-            let c = tgt - anchor;
+            let c = t - anchor;
             let yaw = c.y.atan2(c.x).to_degrees();
-            if chord_yaw.is_some_and(|p| wrap180(yaw - p).abs() > MAX_BEND) {
-                return anchor_dist; // the corridor turned somewhere in this chord — stop before it
+            if chord_yaw.is_some_and(|p| wrap180(yaw - p).abs() > MAX_BEND) || tgt.z - anchor_z > MAX_CLIMB {
+                return anchor_dist; // the corridor turned or climbed in this chord — stop before it
             }
             chord_yaw = Some(yaw);
-            anchor = tgt;
-            anchor_dist = dist;
+            (anchor, anchor_dist, anchor_z) = (t, dist, tgt.z);
         }
     }
     dist
+}
+
+/// See [`runway_over`]; this is the graph-backed wrapper over the leading ground legs.
+fn runway(graph: &NavGraph, route: &[u32], route_pos: usize, origin: Vec3) -> f32 {
+    runway_over(origin, ground_leg_targets(graph, route, route_pos))
+}
+
+/// The point at arc-distance `d` along a corridor of successive leg-target points from `origin`
+/// (clamped to the last point if the corridor is shorter). Placing the bhop look-ahead here at a
+/// **speed-scaled** distance gives a fast bot enough anticipation to start curving into the corridor,
+/// instead of chasing a fixed ~2-legs-ahead point it has already overrun.
+fn point_along(origin: Vec3, targets: impl Iterator<Item = Vec3>, d: f32) -> Vec3 {
+    let mut prev = origin;
+    let mut acc = 0.0;
+    for tgt in targets {
+        let seg = (tgt.xy() - prev.xy()).length();
+        if acc + seg >= d {
+            let t = if seg > 1e-3 { (d - acc) / seg } else { 0.0 };
+            return prev.lerp(tgt, t);
+        }
+        acc += seg;
+        prev = tgt;
+    }
+    prev
+}
+
+/// See [`point_along`]; graph-backed wrapper over the leading ground legs.
+fn corridor_point(graph: &NavGraph, route: &[u32], route_pos: usize, origin: Vec3, d: f32) -> Vec3 {
+    point_along(origin, ground_leg_targets(graph, route, route_pos), d)
 }
 
 /// A wander destination for an idle bot with nothing to chase: a random reachable navmesh cell,
@@ -1167,6 +1211,43 @@ mod tests {
     use crate::bsp::Bsp;
     use crate::mode::team::MatchConfig;
     use crate::navmesh::NavGraph;
+
+    /// The corridor scan (used pure, no NavGraph): a straight level corridor is all runway; a sharp
+    /// bend or an ascending staircase truncates it; a lone step or a descent does not.
+    #[test]
+    fn runway_over_stops_at_bends_and_ascents() {
+        let origin = Vec3::ZERO;
+        let flat: Vec<Vec3> = (1..=12).map(|i| Vec3::new(i as f32 * 32.0, 0.0, 0.0)).collect();
+        assert!((runway_over(origin, flat.iter().copied()) - 384.0).abs() < 1.0, "flat corridor should be full length");
+
+        // A 90° bend after ~128u: runway stops around the last straight chord (before the turn).
+        let mut bend = flat[..4].to_vec();
+        bend.extend((1..=8).map(|i| Vec3::new(128.0, i as f32 * 32.0, 0.0)));
+        let r = runway_over(origin, bend.iter().copied());
+        assert!((96.0..=200.0).contains(&r), "bend should stop the runway near it, got {r}");
+
+        // Ascending staircase: 8u riser per 32u run ⇒ ~24u climb per 96u chord ⇒ stops early.
+        let stairs: Vec<Vec3> = (1..=12).map(|i| Vec3::new(i as f32 * 32.0, 0.0, i as f32 * 8.0)).collect();
+        assert!(runway_over(origin, stairs.iter().copied()) < 160.0, "should not treat stairs as runway");
+
+        // Descending staircase (hopping down is fine) and a lone 16u step both stay full length.
+        let down: Vec<Vec3> = (1..=12).map(|i| Vec3::new(i as f32 * 32.0, 0.0, -(i as f32) * 8.0)).collect();
+        assert!(runway_over(origin, down.iter().copied()) > 350.0, "descending stairs should stay runway");
+        let mut step = flat.clone();
+        for p in step.iter_mut().skip(6) {
+            p.z = 16.0; // a single 16u lip partway along an otherwise level corridor
+        }
+        assert!(runway_over(origin, step.iter().copied()) > 350.0, "a lone step should not truncate the runway");
+    }
+
+    #[test]
+    fn point_along_walks_and_clamps() {
+        let origin = Vec3::ZERO;
+        let pts: Vec<Vec3> = (1..=4).map(|i| Vec3::new(i as f32 * 100.0, 0.0, 0.0)).collect();
+        assert!((point_along(origin, pts.iter().copied(), 250.0).x - 250.0).abs() < 0.5);
+        assert!((point_along(origin, pts.iter().copied(), 9999.0).x - 400.0).abs() < 0.5, "clamps to the last point");
+        assert!((point_along(origin, pts.iter().copied(), 0.0).x - 0.0).abs() < 0.5);
+    }
 
     #[test]
     fn bot_target_caps_in_warmup_and_freezes_live() {

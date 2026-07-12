@@ -572,10 +572,17 @@ impl NavGraph {
         let v_in = BAND_FLOOR[entry as usize].max(MAX_SPEED);
         Some(match link.kind {
             LinkKind::Walk | LinkKind::Step => {
-                // Already moving (band ≥ 1): carry speed and climb. From a standstill spend a
-                // spin-up runway before gains begin. `.max(v_in)` never demotes a band on a short leg.
-                let usable = if entry >= 1 { horiz } else { (horiz - BAND_SPINUP).max(0.0) };
-                let v_out = v_in.max(BHOP_EFF * attainable_speed(v_in, usable, self.sj_k));
+                // Already moving (band ≥ 1): carry speed and climb. From a standstill spend a spin-up
+                // runway before gains begin. But an ascending leg — a stair riser (`dz > WALK_DZ`) —
+                // builds no bhop speed (a human runs up stairs), so it carries the band without gain
+                // and without demotion (a lone step must not zero a chain's plan; the runtime runway
+                // and carry gates handle real staircases). `.max(v_in)` never demotes on a short leg.
+                let v_out = if dz > WALK_DZ {
+                    v_in
+                } else {
+                    let usable = if entry >= 1 { horiz } else { (horiz - BAND_SPINUP).max(0.0) };
+                    v_in.max(BHOP_EFF * attainable_speed(v_in, usable, self.sj_k))
+                };
                 let avg = ((v_in + v_out) * 0.5).max(MAX_SPEED);
                 ((horiz / avg).max(floor_cost), band_of(v_out))
             }
@@ -1678,6 +1685,40 @@ mod tests {
             plats: SideTable::default(),
             sj_k: bhop_k(10.0, MAX_SPEED),
         }
+    }
+
+    /// The banded planner credits bhop speed gains on a flat corridor but not up a staircase: an
+    /// ascending Walk/Step leg carries the entry band without climbing it (a human runs up stairs;
+    /// you can't air-strafe-build up risers), while a flat leg of equal length gains a band.
+    #[test]
+    fn banded_step_no_gain_up_stairs() {
+        let cell = |x: f32, y: f32, z: f32| Cell {
+            origin: Vec3::new(x, y, z),
+            gx: 0,
+            gy: 0,
+        };
+        let step = |from: CellId, to: CellId| Link {
+            from,
+            to,
+            kind: LinkKind::Step,
+            cost: 1.0,
+        };
+        let g = NavGraph {
+            cells: vec![cell(0.0, 0.0, 0.0), cell(1500.0, 0.0, 0.0), cell(0.0, 1500.0, 100.0)],
+            links: vec![step(0, 1), step(0, 2)], // link 0: 1500u flat; link 1: 1500u rising 100u
+            adjacency: vec![vec![0, 1], vec![], vec![]],
+            grid: GridIndex::default(),
+            gates: SideTable::default(),
+            hooks: SideTable::default(),
+            speed_jumps: SideTable::default(),
+            rocket_jumps: SideTable::default(),
+            plats: SideTable::default(),
+            sj_k: bhop_k(10.0, MAX_SPEED),
+        };
+        let (_, flat_exit) = g.banded_step(0, 0).unwrap();
+        let (_, up_exit) = g.banded_step(1, 0).unwrap();
+        assert!(flat_exit >= 1, "a long flat corridor should climb a band, got {flat_exit}");
+        assert_eq!(up_exit, 0, "an ascending leg must not gain a band, got {up_exit}");
     }
 
     /// A per-link penalty diverts A* onto the alternate route once it exceeds the route's cost

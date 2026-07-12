@@ -436,6 +436,7 @@ fn bot_matches_or_beats_human() {
                         committed: true,
                         carry: true,
                         hold_jump: false,
+                        clear: f32::INFINITY, // flat-plane gait bench — no walls
                         now: t,
                     };
                     let cmd = bh.step(&input, &env).unwrap_or(bhop::Cmd {

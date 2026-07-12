@@ -13,6 +13,7 @@
 use glam::{Vec3, Vec3Swizzles};
 
 use super::*;
+use crate::bsp::Bsp;
 use crate::bot::state::{Commit, GateErrand, PlatWait};
 use crate::defs::{Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP};
 use crate::game::cstring;
@@ -31,6 +32,9 @@ pub(super) struct SteerCtx<'a> {
     pub goal_cell: CellId,
     pub race_line_ahead: Option<Vec3>,
     pub weapons_hot: bool,
+    /// The collision hull for the live forward wall probe (bhop wall-avoidance). `None` = no BSP
+    /// (degenerate/test map) → the probe reports open, same as off the live path.
+    pub bsp: Option<&'a Bsp>,
 }
 
 /// What `steer` hands back to the spine: the frame's command (which the combat/grenade overlays then
@@ -49,7 +53,8 @@ pub(super) struct SteerOut {
 }
 
 pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> SteerOut {
-    let SteerCtx { s, o, costs, plat_status, gate_ready, bot_cell, goal_cell, race_line_ahead, weapons_hot } = ctx;
+    let SteerCtx { s, o, costs, plat_status, gate_ready, bot_cell, goal_cell, race_line_ahead, weapons_hot, bsp } =
+        ctx;
     let Sense {
         host, now, frametime, origin, v_angle, client, weapon, on_ground, in_water, vz, air_jumped,
         enemy_seen_time, v_xy, speed, grapple_hook, has_grapple, hook_out, on_hook, anchor, reel_half_step,
@@ -413,7 +418,17 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // gates below exist to avoid hopping on trivial approaches — the plan overrides that judgment)
     // and tell the controller to hold the chain across the waypoint rather than disengage per leg.
     let planned_band = bot.route_bands.get(bot.route_pos).copied().unwrap_or(0);
-    let carry = planned_band >= 1 || bot.route_bands.get(bot.route_pos + 1).copied().unwrap_or(0) >= 1;
+    // An ascending Walk/Step leg (target more than a walk's worth above the source, i.e. a stair
+    // riser) just ahead: a human runs up stairs, so don't let a planned carry hold the hop chain up
+    // them — `runway`'s climb stop keeps *entry* off stairs, and this keeps *carry* from overriding it.
+    let leg_ascends = |leg: u32| {
+        matches!(graph.link_kind(leg), LinkKind::Walk | LinkKind::Step)
+            && graph.cell_origin(graph.link_target(leg)).z - graph.cell_origin(graph.link_source(leg)).z > 8.0
+    };
+    let ascent_ahead =
+        cur_leg.is_some_and(&leg_ascends) || bot.route.get(bot.route_pos + 1).is_some_and(|&l| leg_ascends(l));
+    let carry = (planned_band >= 1 || bot.route_bands.get(bot.route_pos + 1).copied().unwrap_or(0) >= 1)
+        && !ascent_ahead;
     let bhop_entry = !final_leg
         && matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
         && (goal_dist > 300.0 || planned_band >= 1)
@@ -502,11 +517,14 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             maxspeed: if maxspeed > 0.0 { maxspeed } else { 320.0 },
         };
         // A committed speed jump aims at its gap; otherwise steer toward the racing-line look-ahead
-        // (race mode, when a line exists) or the navmesh corridor look-ahead point.
+        // (race mode, when a line exists) or a *speed-scaled* corridor look-ahead — ~0.6 s of travel
+        // ahead (clamped 96–448u) so a fast bot's bearing anticipates the corridor far enough to
+        // start curving, rather than chasing the fixed ~2-legs `look_point` it has already overrun.
+        let bhop_look = corridor_point(graph, &bot.route, bot.route_pos, origin, (speed * 0.6).clamp(96.0, 448.0));
         let ahead = match race_line_ahead {
             Some(lp) if !sj_active => lp.xy() - origin.xy(),
             _ if sj_active => waypoint.xy() - origin.xy(),
-            _ => look_point.xy() - origin.xy(),
+            _ => bhop_look.xy() - origin.xy(),
         };
         let to_wp = waypoint.xy() - origin.xy();
         let dir = if ahead.length() > 8.0 { ahead } else { to_wp };
@@ -514,6 +532,18 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         let bhop_runway = match sj_takeoff {
             Some((takeoff, _)) if sj_active => (takeoff.xy() - origin.xy()).length(),
             _ => runway_dist,
+        };
+        // Forward wall probe: how far the bot can fly straight ahead before a wall — one hull trace
+        // along the velocity out to a hop's flight. Feeds the controller's "don't leap at a wall,
+        // carve when flying at one" logic. `INFINITY` (open) when there's no BSP, we're barely moving,
+        // or the hop cycle isn't engaged/about to engage — so idle and plain-walking bots never trace.
+        let clear = match bsp {
+            Some(bsp) if speed > 1.0 && (bot.bhop.phase != bhop::Phase::Off || bhop_entry) => {
+                let d = (speed * bhop::T_HOP).max(64.0);
+                let end = origin + (v_xy.normalize_or_zero() * d).extend(0.0);
+                bsp.hull1_trace(origin, end).fraction * d
+            }
+            _ => f32::INFINITY,
         };
         let phase_was = bot.bhop.phase;
         let cmd = bot.bhop.step(
@@ -529,6 +559,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 committed: sj_active,
                 carry,
                 hold_jump: sj_hold,
+                clear,
                 now,
             },
             &env,

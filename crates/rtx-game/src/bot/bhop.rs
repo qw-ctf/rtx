@@ -26,8 +26,9 @@ use rtx_nav::qphys::AIR_CAP;
 /// The engine's fixed bot tick (bots run `SV_RunCmd` at ~77 Hz regardless of what we pass as
 /// `msec`), used only to size the weave band. The live accel math uses the real per-frame `dt`.
 const DT_NOMINAL: f32 = 1.0 / 77.0;
-/// Flat-ground hop airtime: `2 · JUMP_VZ / gravity` = 2·270/800 (see `navmesh`).
-const T_HOP: f32 = 0.675;
+/// Flat-ground hop airtime: `2 · JUMP_VZ / gravity` = 2·270/800 (see `navmesh`). Public so the
+/// caller can size its forward wall probe to one hop's flight (`speed · T_HOP`).
+pub const T_HOP: f32 = 0.675;
 /// How many times per hop the ground serpentine ([`prestrafe`]/zigzag) switches sides. ~3 matches
 /// how human runners weave; the *air* hop path uses the lobe scheduler below instead.
 const FLIPS_PER_HOP: f32 = 3.0;
@@ -49,6 +50,10 @@ const LOBE_DEADBAND: f32 = 34.0;
 /// [`air_correct`] turn rate per degree of heading error (deg/s per deg): a proportional pull toward
 /// the bearing that eases smoothly to zero at alignment, so the correction never snaps.
 const AIR_CORRECT_GAIN: f32 = 6.0;
+/// Extra air turn rate per degree of heading error *beyond* the lobe band (deg/s per deg): inside the
+/// band the smooth slalom is untouched, but once the heading runs off-line — a corridor bend, or a
+/// wall to carve around — the turn ramps to the physical maximum within ~25° of excess error.
+const ERR_GAIN: f32 = 6.0;
 
 /// How long the entry conditions must hold before engaging, so a momentary straightaway doesn't
 /// stutter the gait. Applies only to the initial engage; disengage decisions happen on landings.
@@ -77,6 +82,14 @@ pub const RUN_UP_SPEED: f32 = 280.0;
 /// ~maxspeed, ground accel (~40 ups/tick toward the wish) far outgains the 30-ups air cap, so a slow
 /// leap is strictly worse than one more ground stride.
 const LAUNCH_MIN_FRAC: f32 = 0.95;
+/// Don't leap unless a hop's flight (`speed·T_HOP`) fits this fraction of the forward clear distance
+/// (`Input.clear`): a bot flying at a wall is better off carving on the ground (which turns far
+/// faster than air) and re-launching once it's aimed down open corridor — the land-carve-rejump a
+/// human does at a bend, instead of face-planting the wall mid-arc.
+const WALL_HOLD_FRAC: f32 = 0.7;
+/// Airborne, if the wall is nearer than this many seconds of flight, abandon the slalom lobe and
+/// carve toward the bearing (the open corridor) at the full physical turn rate.
+const WALL_PANIC_T: f32 = 0.3;
 /// Slack beyond the current hop's flight distance when deciding whether another hop fits.
 const HOP_MARGIN: f32 = 64.0;
 
@@ -314,6 +327,10 @@ pub struct Input {
     pub carry: bool,
     /// At the takeoff edge too slow to clear the gap (`sj_hold`): keep building, don't leap.
     pub hold_jump: bool,
+    /// Free flight distance straight ahead along the velocity (units), from a forward hull trace —
+    /// how far the bot could fly before hitting a wall. `f32::INFINITY` = unknown/open (the default
+    /// off the live path). Gates leaping at a wall and drives the mid-air carve; see [`Bhop::step`].
+    pub clear: f32,
     /// Game time (s).
     pub now: f32,
 }
@@ -445,7 +462,7 @@ impl Bhop {
         // either because we haven't reached full run speed yet ([`LAUNCH_MIN_FRAC`], the human "run
         // first, then jump"), or because a speed jump's takeoff edge is still too slow to clear the
         // gap (`hold_jump`). Ground accel outgains the air cap below maxspeed, so this only ever helps.
-        if i.hold_jump || speed < LAUNCH_MIN_FRAC * maxspeed {
+        if i.hold_jump || speed < LAUNCH_MIN_FRAC * maxspeed || i.clear < speed * T_HOP * WALL_HOLD_FRAC {
             return Some(self.ground_cmd(i, a_g, maxspeed, f32::INFINITY));
         }
         let jump = !self.jump_prev;
@@ -470,11 +487,25 @@ impl Bhop {
         let err = wrap180(i.bearing - vel_yaw);
         if self.sigma == 0.0 {
             self.sigma = if err >= 0.0 { 1.0 } else { -1.0 };
-        } else if err * self.sigma < -LOBE_DEADBAND {
+        }
+        // Wall panic: flying at a wall within `WALL_PANIC_T` of flight — drop the slalom and carve
+        // toward the bearing (the open corridor the look-ahead points down) at the full physical
+        // turn rate. Holds the current side if we're already dead on the bearing.
+        if i.clear < speed * WALL_PANIC_T {
+            if err.abs() > 1.0 {
+                self.sigma = err.signum();
+            }
+            return strafe_rate(i.v_xy, self.sigma, omega_max(speed, a_max, dt), a_max, dt);
+        }
+        if err * self.sigma < -LOBE_DEADBAND {
             self.sigma = -self.sigma;
             self.flips += 1;
         }
-        let omega = (OMEGA_BASE + err.abs() / T_HOP).min(omega_max(speed, a_max, dt));
+        // Base rate + a gentle within-hop correction, plus a steep ramp once the error runs past the
+        // lobe band (a bend or a wall to carve) — up to what the tick can deliver (`omega_max` falls
+        // with speed). Inside the band the extra term is zero, so the smooth slalom is unchanged.
+        let omega = (OMEGA_BASE + err.abs() / T_HOP + (err.abs() - LOBE_DEADBAND).max(0.0) * ERR_GAIN)
+            .min(omega_max(speed, a_max, dt));
         strafe_rate(i.v_xy, self.sigma, omega, a_max, dt)
     }
 
@@ -835,6 +866,7 @@ mod sim {
             committed: false,
             carry: false,
             hold_jump: false,
+            clear: f32::INFINITY,
             now,
         }
     }
@@ -860,6 +892,7 @@ mod sim {
             committed: false,
             carry: false,
             hold_jump: false,
+            clear: f32::INFINITY,
             now,
         }
     }
@@ -954,6 +987,45 @@ mod sim {
         }
         let rj = rejump.expect("never re-jumped");
         assert!(rj >= 0.95 * ENV.maxspeed - 1.0, "re-jumped at {rj} ups (below the floor)");
+    }
+
+    #[test]
+    fn wall_ahead_holds_the_leap() {
+        // Grounded, fast, but a wall is close ahead (`clear` short): don't leap into it — keep
+        // circle-strafing on the ground (which turns far faster than air) instead of face-planting.
+        let mut w = World::grounded(460.0);
+        let mut b = Bhop::default();
+        for f in 0..30 {
+            let now = f as f32 * DT;
+            let cmd = b.step(&input(&w, 0.0, 4096.0, now), &ENV).unwrap_or(run_cmd(0.0));
+            pm_frame(&mut w, &cmd, false);
+        }
+        w.v = Vec2::new(460.0, 0.0);
+        w.z = 0.0;
+        w.vz = 0.0;
+        w.on_ground = true;
+        w.jump_held = false;
+        let mut inp = input(&w, 0.0, 4096.0, 30.0 * DT);
+        inp.clear = 50.0; // wall 50u ahead; a hop's flight would be ~310u
+        assert!(!b.step(&inp, &ENV).expect("engaged").jump, "leaped toward a wall 50u away");
+    }
+
+    #[test]
+    fn wall_panic_carves_at_max_rate() {
+        // Airborne, flying at a near wall, heading 60° off the bearing: drop the slalom and carve
+        // toward the bearing at the full physical turn rate (not the gentle lobe rate).
+        let a = air_accel_max(ENV.accel, ENV.maxspeed, DT);
+        let w = World { pos: Vec2::ZERO, z: 60.0, vz: 0.0, v: Vec2::new(450.0, 0.0), on_ground: false, jump_held: true };
+        let mut inp = input(&w, 60.0, 4096.0, 0.0); // bearing +60° from the +x velocity
+        inp.committed = true; // engage immediately, no hysteresis
+        inp.clear = 30.0; // wall within WALL_PANIC_T (450·0.3 = 135u)
+        let mut b = Bhop::default();
+        let cmd = b.step(&inp, &ENV).expect("airborne engaged");
+        let wd = wishdir_fs(cmd.view_yaw, cmd.forward, cmd.side);
+        let turned = apply_airaccel(w.v, wd, ENV.maxspeed, ENV.accel, DT).y.atan2(w.v.x).to_degrees();
+        let wmax = omega_max(450.0, a, DT) * DT; // max per-tick heading change
+        assert!(turned > 0.0, "should carve toward the +60° bearing, turned {turned}°");
+        assert!((turned - wmax).abs() < 0.15 * wmax + 0.05, "carve {turned}° should be ~max {wmax}°");
     }
 
     #[test]
