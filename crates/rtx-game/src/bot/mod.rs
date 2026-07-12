@@ -83,6 +83,34 @@ const RJ_BALLISTIC_SLACK: f32 = 1.0;
 
 /// Advance to the next route leg once within this of the current waypoint (≈ ¾ of a grid).
 const ARRIVE_RADIUS: f32 = 24.0;
+
+/// Outcome of a ballistic-phase landing check, shared by the hook and rocket-jump drivers: both fly
+/// a frictionless arc that matches their solve, so the only questions are whether we've touched down
+/// and whether we overran the predicted airtime without a clean landing.
+pub(super) enum Landing {
+    /// Still airborne within the airtime budget — keep riding the arc.
+    Riding,
+    /// Touched down; `on_target` is whether it was within 2·[`ARRIVE_RADIUS`] of the goal (so the
+    /// driver can clear its consecutive-fails counter).
+    Down { on_target: bool },
+    /// Never landed cleanly within `airtime + slack` — give up and repath.
+    Overran,
+}
+
+/// Classify a ballistic landing (see [`Landing`]). `elapsed` is time since the ballistic phase
+/// began; a touchdown only counts after a 0.1 s settle so the takeoff frame isn't read as an instant
+/// landing. `airtime_budget` is the solved airtime plus the driver's watchdog slack.
+pub(super) fn ballistic_landing(origin: Vec3, target: Vec3, on_ground: bool, elapsed: f32, airtime_budget: f32) -> Landing {
+    if on_ground && elapsed > 0.1 {
+        Landing::Down {
+            on_target: (origin.xy() - target.xy()).length() <= ARRIVE_RADIUS * 2.0,
+        }
+    } else if elapsed > airtime_budget {
+        Landing::Overran
+    } else {
+        Landing::Riding
+    }
+}
 /// Stop closing once this near the followed human, so bots tail rather than shove.
 const POLITE_DIST: f32 = 64.0;
 /// Minimum seconds between A* re-paths (the human keeps moving).

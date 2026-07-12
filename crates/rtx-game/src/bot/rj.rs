@@ -10,7 +10,7 @@
 use glam::{Vec3, Vec3Swizzles};
 
 use super::state::{BotState, Driver, RjPhase};
-use super::{ARRIVE_RADIUS, RJ_BALLISTIC_SLACK, RJ_STANCE, RJ_STANCE_TIMEOUT, RJ_LIFTOFF_TIMEOUT};
+use super::{ballistic_landing, Landing, RJ_BALLISTIC_SLACK, RJ_STANCE, RJ_STANCE_TIMEOUT, RJ_LIFTOFF_TIMEOUT};
 use crate::abi::EntVars;
 use crate::defs::{Bits, Items, Weapon};
 use crate::entity::EntId;
@@ -185,16 +185,21 @@ pub(crate) fn drive_rj(graph: &NavGraph, bot: &mut BotState, c: RjCtx) -> RjDriv
                         // Gentle correction toward the landing — QW air accel caps this to a nudge
                         // within the perturb-guaranteed neighborhood (the user's error-correction).
                         air_correct = Some(tgt);
-                        if on_ground && now - bot.rj_started > 0.1 {
-                            if (origin.xy() - tgt.xy()).length() <= ARRIVE_RADIUS * 2.0 {
-                                bot.rj_fails = 0;
+                        let elapsed = now - bot.rj_started;
+                        match ballistic_landing(origin, tgt, on_ground, elapsed, tr.airtime + RJ_BALLISTIC_SLACK) {
+                            Landing::Down { on_target } => {
+                                if on_target {
+                                    bot.rj_fails = 0;
+                                }
+                                bot.route_pos += 1; // clear the leg; repath from the landing
+                                bot.rj_phase = RjPhase::Idle;
+                                bot.repath_time = now;
                             }
-                            bot.route_pos += 1; // clear the leg; repath from the landing
-                            bot.rj_phase = RjPhase::Idle;
-                            bot.repath_time = now;
-                        } else if now - bot.rj_started > tr.airtime + RJ_BALLISTIC_SLACK {
-                            bot.rj_phase = RjPhase::Idle; // never landed cleanly — repath
-                            bot.repath_time = now;
+                            Landing::Overran => {
+                                bot.rj_phase = RjPhase::Idle; // never landed cleanly — repath
+                                bot.repath_time = now;
+                            }
+                            Landing::Riding => {}
                         }
                     }
                     RjPhase::Idle => {}

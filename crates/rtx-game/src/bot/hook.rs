@@ -9,8 +9,8 @@
 use glam::{Vec3, Vec3Swizzles};
 
 use super::{
-    ARRIVE_RADIUS, HOOK_AIM_TIMEOUT, HOOK_ANCHOR_DRIFT, HOOK_BALLISTIC_SLACK, HOOK_FLIGHT_TIMEOUT,
-    HOOK_REEL_TIMEOUT, HOOK_STANCE,
+    ballistic_landing, HOOK_AIM_TIMEOUT, HOOK_ANCHOR_DRIFT, HOOK_BALLISTIC_SLACK, HOOK_FLIGHT_TIMEOUT,
+    HOOK_REEL_TIMEOUT, HOOK_STANCE, Landing,
 };
 use crate::bot::state::{BotState, Driver, HookPhase};
 use crate::defs::Weapon;
@@ -160,16 +160,21 @@ pub(crate) fn drive_hook(graph: &NavGraph, bot: &mut BotState, c: HookCtx) -> Ho
                     HookPhase::Ballistic => {
                         hook_look_target = Some(tgt);
                         hook_stand = true; // zero input: the frictionless arc must match the solve
-                        if on_ground && now - bot.hook_started > 0.1 {
-                            if (origin.xy() - tgt.xy()).length() <= ARRIVE_RADIUS * 2.0 {
-                                bot.hook_fails = 0;
+                        let elapsed = now - bot.hook_started;
+                        match ballistic_landing(origin, tgt, on_ground, elapsed, tr.airtime + HOOK_BALLISTIC_SLACK) {
+                            Landing::Down { on_target } => {
+                                if on_target {
+                                    bot.hook_fails = 0;
+                                }
+                                bot.route_pos += 1; // clear the hook leg; repath from the landing
+                                bot.hook_phase = HookPhase::Idle;
+                                bot.repath_time = now;
                             }
-                            bot.route_pos += 1; // clear the hook leg; repath from the landing
-                            bot.hook_phase = HookPhase::Idle;
-                            bot.repath_time = now;
-                        } else if now - bot.hook_started > tr.airtime + HOOK_BALLISTIC_SLACK {
-                            bot.hook_phase = HookPhase::Idle; // never landed cleanly — just repath
-                            bot.repath_time = now;
+                            Landing::Overran => {
+                                bot.hook_phase = HookPhase::Idle; // never landed cleanly — just repath
+                                bot.repath_time = now;
+                            }
+                            Landing::Riding => {}
                         }
                     }
                     HookPhase::Idle => {}
