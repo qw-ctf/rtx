@@ -600,7 +600,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     } else {
         GOAL_GIVEUP_TIME
     };
-    if chasing && game.entities[e].bot.gate.is_none() && now - game.entities[e].bot.goal.since > giveup {
+    if chasing && game.entities[e].bot.gate.errand.is_none() && now - game.entities[e].bot.goal.since > giveup {
         let b = &mut game.entities[e].bot;
         b.mark_avoid(b.goal.item, now + GOAL_AVOID_TIME);
         b.goal.item = 0;
@@ -722,7 +722,7 @@ fn emit(
     // Combat/gate diagnostics: what the bot is chasing and whether it's stuck at a gate. Enable
     // with `rtx_bot_debug 1` (conprint shows without `developer`).
     if host.cvar_bool(c"rtx_bot_debug") {
-        let gate = game.entities[e].bot.gate;
+        let gate = game.entities[e].bot.gate.errand.map(|er| er.index);
         let route = game.entities[e].bot.route.len();
         let hph = game.entities[e].bot.hook.phase;
         let rjph = game.entities[e].bot.rj.phase;

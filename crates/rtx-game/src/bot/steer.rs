@@ -13,6 +13,7 @@
 use glam::{Vec3, Vec3Swizzles};
 
 use super::*;
+use crate::bot::state::GateErrand;
 use crate::defs::{Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP};
 use crate::game::cstring;
 use crate::nav_build::PlatStatus;
@@ -79,35 +80,37 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // toward its button (stuck at a door whose button we can't actually reach), so we don't camp
     // there. Progress-based, not a flat timeout: a button that's simply far across the map (e.g.
     // when we spawned right next to the door) still gets reached. Suspended mid-hook.
-    if !route_frozen && bot.gate.is_some() {
-        let gi = bot.gate.unwrap();
-        let give_up = |bot: &mut BotState| {
-            bot.avoid_gate = gi as i32;
-            bot.avoid_gate_until = now + GATE_AVOID_TIME;
-            bot.gate = None;
-            bot.route.clear();
-            bot.repath_time = now;
-        };
-        if gate_closed.get(gi).copied() != Some(true) {
-            bot.gate = None; // door opened — done
-            bot.route.clear();
-            bot.repath_time = now;
-        } else if !button_reachable(graph, bot_cell, gi, &costs) {
-            give_up(bot); // button is walled off behind this very gate — route around instead
-        } else {
-            let d = (graph.cell_origin(graph.gate(gi).button_cell).xy() - origin.xy()).length();
-            if d < bot.gate_best_dist - 4.0 {
-                bot.gate_best_dist = d; // got closer — reset the give-up clock
-                bot.gate_since = now;
-            } else if now - bot.gate_since > GATE_GIVEUP_TIME {
-                give_up(bot); // no progress toward a reachable button — stuck; try elsewhere
+    if !route_frozen {
+        if let Some(errand) = bot.gate.errand {
+            let gi = errand.index;
+            let give_up = |bot: &mut BotState| {
+                bot.gate.avoid = Some((gi, now + GATE_AVOID_TIME));
+                bot.gate.errand = None;
+                bot.route.clear();
+                bot.repath_time = now;
+            };
+            if gate_closed.get(gi).copied() != Some(true) {
+                bot.gate.errand = None; // door opened — done
+                bot.route.clear();
+                bot.repath_time = now;
+            } else if !button_reachable(graph, bot_cell, gi, &costs) {
+                give_up(bot); // button is walled off behind this very gate — route around instead
+            } else {
+                let d = (graph.cell_origin(graph.gate(gi).button_cell).xy() - origin.xy()).length();
+                if d < errand.best_dist - 4.0 {
+                    let e = bot.gate.errand.as_mut().unwrap();
+                    e.best_dist = d; // got closer — reset the give-up clock
+                    e.since = now;
+                } else if now - errand.since > GATE_GIVEUP_TIME {
+                    give_up(bot); // no progress toward a reachable button — stuck; try elsewhere
+                }
             }
         }
     }
 
     // Effective goal: the human, or — while opening a gate — that gate's button.
-    let goal = match bot.gate {
-        Some(gi) => graph.gate(gi).button_cell,
+    let goal = match bot.gate.errand {
+        Some(errand) => graph.gate(errand.index).button_cell,
         None => goal_cell,
     };
 
@@ -161,16 +164,16 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // are priced high), so if the chosen route still crosses one, there's no other way in — divert
     // to that gate's button. Skip a gate we recently gave up on (its button was unreachable) so we
     // don't immediately re-camp on it.
-    if !route_frozen && !on_air && bot.gate.is_none() {
-        let avoid = if now < bot.avoid_gate_until { bot.avoid_gate } else { -1 };
+    if !route_frozen && !on_air && bot.gate.errand.is_none() {
+        // Skip a gate we recently gave up on, while its avoid window is still open.
+        let avoid = bot.gate.avoid.filter(|&(_, until)| now < until).map(|(gi, _)| gi);
         let block =
-            route_blocking_gate(graph, &bot.route, bot.route_pos, gate_closed).filter(|&gi| gi as i32 != avoid);
+            route_blocking_gate(graph, &bot.route, bot.route_pos, gate_closed).filter(|&gi| Some(gi) != avoid);
         if let Some(gi) = block {
             if button_reachable(graph, bot_cell, gi, &costs) {
                 let button_cell = graph.gate(gi).button_cell;
-                bot.gate = Some(gi);
-                bot.gate_since = now;
-                bot.gate_best_dist = f32::INFINITY; // first frame records the starting distance
+                // first frame records the starting distance (best_dist starts at +inf)
+                bot.gate.errand = Some(GateErrand { index: gi, best_dist: f32::INFINITY, since: now });
                 bot.route = graph.find_path(bot_cell, button_cell, &costs).unwrap_or_default();
                 bot.route_bands = vec![0u8; bot.route.len()]; // a walking errand, no carried speed
                 bot.route_pos = 0;
@@ -179,8 +182,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             } else {
                 // Button is walled off behind this gate — don't chase it; avoid the gate so
                 // route_blocking_gate stops re-selecting it and find_path routes around the pillar.
-                bot.avoid_gate = gi as i32;
-                bot.avoid_gate_until = now + GATE_AVOID_TIME;
+                bot.gate.avoid = Some((gi, now + GATE_AVOID_TIME));
             }
         }
     }
@@ -405,7 +407,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         // Spectating: a bhop cmd would overwrite the view yaw in `emit` and clobber the watch —
         // and a spectator strolling the stands shouldn't be bunnyhopping anyway.
         || watch_point.is_some()
-        || bot.gate.is_some()
+        || bot.gate.errand.is_some()
         || bot.grenade.phase != GrenadePhase::Idle;
     // The banded planner's intent for this run: a band ≥ 1 on the current or next leg means the
     // route was planned to carry speed here, so admit bhop even on a short leg (the goal-distance
@@ -697,7 +699,8 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     }
 
     // Opening a gate's button: once at it, face it and push (walk in) or shoot it.
-    if let Some(gi) = bot.gate {
+    if let Some(errand) = bot.gate.errand {
+        let gi = errand.index;
         let g = graph.gate(gi);
         let at_button =
             bot.route_pos >= bot.route.len() || (origin.xy() - graph.cell_origin(g.button_cell).xy()).length() < 40.0;

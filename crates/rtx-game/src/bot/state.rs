@@ -24,8 +24,8 @@ pub struct BotState {
     pub route_bands: Vec<u8>,
     /// The cell we last routed toward (`u32::MAX` = none), to detect when to re-path.
     pub goal_cell: u32,
-    /// The gate currently being opened as an errand (`None` = following the human normally).
-    pub gate: Option<usize>,
+    /// The gate the bot is opening as an errand, plus the gate it's avoiding. See [`GateState`].
+    pub gate: GateState,
     /// The bot's item-fetch goal: which item, where, the re-pick throttle, and the handoff/avoid
     /// bookkeeping. See [`GoalState`].
     pub goal: GoalState,
@@ -54,14 +54,6 @@ pub struct BotState {
     /// Item vigil ([`crate::bot::vigil`]): cruise-and-scan while waiting on an uncollectable goal
     /// item. See [`Vigil`].
     pub vigil: Vigil,
-    /// Gate-errand progress watchdog: the closest we've gotten to the target button and the time
-    /// we last got closer. If we stop making progress (stuck at a door we can't reach the button
-    /// of) we give up — a flat timeout would wrongly abandon a button that's simply far away. Plus
-    /// the gate index + expiry to avoid re-taking that errand for a while after giving up.
-    pub gate_best_dist: f32,
-    pub gate_since: f32,
-    pub avoid_gate: i32,
-    pub avoid_gate_until: f32,
     /// Plat standoff: the navmesh plat index we're holding off from while it's raised, and when the
     /// hold began (the give-up timeout base). Keyed on the plat index, not the leg, so the 0.4s
     /// repath churn doesn't reset the timer. `None` = not waiting on a lift.
@@ -220,6 +212,28 @@ pub struct Vigil {
     pub post_until: f32,
     pub scan_point: Vec3,
     pub scan_until: f32,
+}
+
+/// A gate the bot is diverting to open (its button unreachable by the normal route), plus its
+/// progress watchdog: the closest we've gotten to the button and when we last got closer. If we stop
+/// making progress (stuck at a door we can't reach the button of) we give up — a flat timeout would
+/// wrongly abandon a button that's simply far away.
+#[derive(Clone, Copy)]
+pub struct GateErrand {
+    pub index: usize,
+    pub best_dist: f32,
+    pub since: f32,
+}
+
+/// A bot's gate-opening state (see [`crate::bot::steer`]): the errand it's currently on, if any, and
+/// a gate it recently gave up on and is avoiding for a while (so `route_blocking_gate` doesn't
+/// immediately re-camp on a button that's walled off behind its own gate).
+#[derive(Default)]
+pub struct GateState {
+    /// The gate errand in progress (`None` = following the human normally).
+    pub errand: Option<GateErrand>,
+    /// A gate to skip when picking the next errand, until the paired expiry (`None` = none avoided).
+    pub avoid: Option<(usize, f32)>,
 }
 
 /// A bot's item-fetch goal (see [`crate::bot::goals`]) and the bookkeeping around it.
