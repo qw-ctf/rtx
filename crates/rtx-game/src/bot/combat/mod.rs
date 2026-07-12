@@ -467,19 +467,19 @@ fn aim_error(game: &mut GameState, e: EntId, now: f32, skill: f32, aim: Vec3, my
     };
     let spread = base_spread * spread_scale(visible_for, own_speed, perp_speed, tgt.dist);
     let frametime = game.globals.frametime;
-    if now >= game.entities[e].bot.aim_err_until {
+    if now >= game.entities[e].bot.aim.err_until {
         let (r1, r2, r3) = (game.random(), game.random(), game.random());
         let b = &mut game.entities[e].bot;
-        b.aim_err_target = Vec3::new((r1 - 0.5) * spread, (r2 - 0.5) * 2.0 * spread, 0.0);
-        b.aim_err_until = now + 0.3 + r3 * 0.3;
+        b.aim.err_target = Vec3::new((r1 - 0.5) * spread, (r2 - 0.5) * 2.0 * spread, 0.0);
+        b.aim.err_until = now + 0.3 + r3 * 0.3;
     }
     let b = &mut game.entities[e].bot;
     let t = (4.0 * frametime).min(1.0);
-    b.aim_err = b.aim_err + (b.aim_err_target - b.aim_err) * t;
+    b.aim.err = b.aim.err + (b.aim.err_target - b.aim.err) * t;
     // Remember where the enemy is while we can see them, for the hold-the-angle behavior.
     b.enemy_seen_at = aim;
     b.enemy_seen_time = now;
-    b.aim_err
+    b.aim.err
 }
 
 /// Feed-forward lead for the aim spring. The spring tracks a moving solution with a steady-state lag
@@ -490,9 +490,9 @@ fn aim_error(game: &mut GameState, e: EntId, now: f32, skill: f32, aim: Vec3, my
 /// so no phantom slew is fed forward.
 fn feed_forward(game: &mut GameState, e: EntId, now: f32, skill: f32, clean: Vec3) -> Vec3 {
     let b = &mut game.entities[e].bot;
-    let dt = now - b.look_prev_time;
-    let raw = if b.look_prev_time > 0.0 && dt > 1e-3 && dt < 0.25 {
-        Vec3::new(bot::wrap180(clean.x - b.look_prev.x) / dt, bot::wrap180(clean.y - b.look_prev.y) / dt, 0.0)
+    let dt = now - b.aim.look_prev_time;
+    let raw = if b.aim.look_prev_time > 0.0 && dt > 1e-3 && dt < 0.25 {
+        Vec3::new(bot::wrap180(clean.x - b.aim.look_prev.x) / dt, bot::wrap180(clean.y - b.aim.look_prev.y) / dt, 0.0)
     } else {
         Vec3::ZERO // stale/first sample (just acquired the target) — no estimate yet
     };
@@ -502,8 +502,8 @@ fn feed_forward(game: &mut GameState, e: EntId, now: f32, skill: f32, clean: Vec
     } else {
         Vec3::new(raw.x.clamp(-180.0, 180.0), raw.y.clamp(-180.0, 180.0), 0.0)
     };
-    b.look_prev = clean;
-    b.look_prev_time = now;
+    b.aim.look_prev = clean;
+    b.aim.look_prev_time = now;
     rate * (2.0 / aim_omega(skill)) * (skill / 7.0)
 }
 
@@ -553,7 +553,7 @@ fn combat_move(game: &mut GameState, e: EntId, enemy: EntId, now: f32, origin: V
 }
 
 /// Whether to pull the trigger this frame. Fire only when the crosshair is on the spot *and* the
-/// line of fire is clear. The shot leaves along the *smoothed* view (`bot.aim`, last frame's spring
+/// line of fire is clear. The shot leaves along the *smoothed* view (`bot.aim.angles`, last frame's spring
 /// output) — firing every frame would put rockets wherever the lagging view points, behind a strafer
 /// no matter how good the intercept. Projectiles gate on the predicted *miss distance* at intercept
 /// range (a direct-hit shot needs the hull, a splash shot leans on the blast); hitscan keeps the
@@ -564,7 +564,7 @@ fn combat_move(game: &mut GameState, e: EntId, enemy: EntId, now: f32, origin: V
 fn fire_gate(game: &mut GameState, e: EntId, enemy: EntId, origin: Vec3, skill: f32, shot: &Shot) -> bool {
     let Shot { choice, aim, clean, muzzle_base, gate_direct } = *shot;
     let s = choice.projectile_speed;
-    let view = game.entities[e].bot.aim;
+    let view = game.entities[e].bot.aim.angles;
     let on_target = if s > 0.0 {
         let launch = if choice.grenade_arc { origin } else { muzzle_base };
         let range = (aim - launch).length().max(1.0);
@@ -783,7 +783,7 @@ pub(crate) fn shoot_grenade(game: &mut GameState, e: EntId, grenade: EntId, cmd:
     // angular tolerance at this range so the bot fires as soon as its aim is close enough to connect.
     let dist = (gpos - eye).length().max(1.0);
     let cone = (8.0 / dist).atan().to_degrees().clamp(1.5, 5.0);
-    let view = game.entities[e].bot.aim;
+    let view = game.entities[e].bot.aim.angles;
     let dp = bot::wrap180(view.x - cmd.look.x);
     let dy = bot::wrap180(view.y - cmd.look.y);
     if view == Vec3::ZERO || (dp * dp + dy * dy).sqrt() <= cone {

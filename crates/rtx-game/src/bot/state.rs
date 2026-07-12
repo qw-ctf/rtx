@@ -62,19 +62,8 @@ pub struct BotState {
     /// Per-frame toggle, flipped each tick, used to *pulse* buttons that QW only acts on at a
     /// press edge (the respawn key, which needs a release between presses).
     pub pulse: bool,
-    /// Smoothed view state: a critically damped spring drives `aim` (current view angles, seeded
-    /// from `v_angle`) toward the frame's look target with angular velocity `aim_vel` (deg/s), so
-    /// a spectated bot turns like a mouse-controlled human — fast proportional flicks, smooth
-    /// settle, no per-frame snapping. Spring stiffness scales with skill, so low-skill bots also
-    /// track moving targets more slowly.
-    pub aim: Vec3,
-    pub aim_vel: Vec3,
-    /// Drifting aim error (degrees, x=pitch y=yaw): wanders smoothly toward `aim_err_target`,
-    /// which is resampled at `aim_err_until` — misses sweep past the target and drift back rather
-    /// than buzz (per-frame white noise reads as jitter). Magnitude scales inversely with skill.
-    pub aim_err: Vec3,
-    pub aim_err_target: Vec3,
-    pub aim_err_until: f32,
+    /// Smoothed view state: the aim spring plus its error and feed-forward memory. See [`Aim`].
+    pub aim: Aim,
     /// Where the combat enemy was last actually visible, and when. While line of sight is briefly
     /// lost the bot *holds this angle* (like a player holding a corner) instead of snapping back
     /// to its navigation view. Written by combat under *true* line of sight only (the bhop veto and
@@ -93,11 +82,6 @@ pub struct BotState {
     pub known_until: f32,
     pub percept_last_seen: Vec3,
     pub vis_since: f32,
-    /// Last frame's clean firing-solution angles and their timestamp, to estimate how fast the
-    /// solution is moving (deg/s). Feeds the aim feed-forward that cancels the spring's tracking
-    /// lag against a strafing target.
-    pub look_prev: Vec3,
-    pub look_prev_time: f32,
     /// Audience-wander destination (a round mode's stands) and the next time to pick a new one.
     /// Only used while the mode marks this bot as an audience/spectator; zero otherwise.
     pub wander_target: Vec3,
@@ -169,9 +153,6 @@ pub struct BotState {
     /// The bunnyhop controller (see [`crate::bot::bhop`]): the hop-cycle phase machine, sticky
     /// strafe sign, engage hysteresis, and telemetry.
     pub bhop: crate::bot::bhop::Bhop,
-    /// Last frame's sent bhop view yaw (to seed the aim spring's angular velocity when combat
-    /// resumes).
-    pub bhop_prev_yaw: f32,
     /// The [`LinkKind::SpeedJump`](crate::navmesh::LinkKind::SpeedJump) leg currently being flown (a
     /// committed bhop run-up + leap), and when it began. `None` = not on a speed jump.
     pub sj_leg: Option<u32>,
@@ -241,6 +222,32 @@ impl BotState {
             }
         }
     }
+}
+
+/// Smoothed view state carried on a [`BotState`]. A critically damped spring drives `angles` (the
+/// current view, seeded from `v_angle`) toward the frame's look target at `vel` (deg/s), so a
+/// spectated bot turns like a mouse-controlled human — fast proportional flicks, smooth settle, no
+/// per-frame snapping (stiffness scales with skill). `err*` is the drifting aim error; `look_prev*`
+/// and `bhop_prev_yaw` seed the feed-forward and the bhop→combat hand-off.
+#[derive(Default)]
+pub struct Aim {
+    /// Current smoothed view angles (deg), seeded from `v_angle` on first use.
+    pub angles: Vec3,
+    /// Angular velocity of the aim spring (deg/s).
+    pub vel: Vec3,
+    /// Drifting aim error (x=pitch, y=yaw, deg): wanders smoothly toward `err_target`, resampled at
+    /// `err_until` — misses sweep past the target and drift back rather than buzz (per-frame white
+    /// noise reads as jitter). Magnitude scales inversely with skill.
+    pub err: Vec3,
+    pub err_target: Vec3,
+    pub err_until: f32,
+    /// Last frame's clean firing-solution angles and their timestamp, to estimate how fast the
+    /// solution is moving (deg/s). Feeds the aim feed-forward that cancels the spring's tracking lag
+    /// against a strafing target.
+    pub look_prev: Vec3,
+    pub look_prev_time: f32,
+    /// Last frame's sent bhop view yaw, to seed the spring's angular velocity when combat resumes.
+    pub bhop_prev_yaw: f32,
 }
 
 /// The route-progress watchdogs carried on a [`BotState`]: three independent ways a bot detects it

@@ -310,7 +310,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         enemy.is_some() && !chasing && (enemy_seen_time <= 0.0 || now - enemy_seen_time > LOOK_LOS_GRACE);
     let look_point = if vigil && bot.scan_point != Vec3::ZERO {
         // Standing vigil: sweep the eyes across the room (the scan point the aim spring pans to).
-        // This drives the perception cone too (perception reads `bot.aim`), so it's real scouting;
+        // This drives the perception cone too (perception reads `bot.aim.angles`), so it's real scouting;
         // combat's `engage` still overrides the moment a target comes into sight.
         bot.scan_point
     } else if let Some(pi) = plat_hold {
@@ -564,8 +564,8 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         combat::angles_to(eye, look_point)
     } else if dist > 8.0 {
         angles // steering yaw is still meaningful — look where we're walking
-    } else if bot.aim != Vec3::ZERO {
-        bot.aim // standing still on the point — hold the current view, don't snap to yaw 0
+    } else if bot.aim.angles != Vec3::ZERO {
+        bot.aim.angles // standing still on the point — hold the current view, don't snap to yaw 0
     } else {
         v_angle
     };
@@ -646,7 +646,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // Audience watch (arena Spectate): eyes on the fighter the mode chose — already LOS-validated
     // there and held ~1-2s. Post-hoc like the hook/rj overrides, so bhop steering and the route
     // look-ahead stay untouched; the aim spring in `emit` turns it into a human pan and perception
-    // follows through `bot.aim`. Same 48u degenerate-angle guard as the nav look. Audience bots
+    // follows through `bot.aim.angles`. Same 48u degenerate-angle guard as the nav look. Audience bots
     // have no grapple/RL, so the hook/rj guard is belt-and-braces.
     if !hook_engaged && !rj_engaged {
         if let Some(t) = watch_point {

@@ -112,7 +112,7 @@ pub(crate) fn perceive(game: &mut GameState, e: EntId, enemy: EntId, now: f32) -
     let tr = game.traceline(my_eye, enemy_eye, false, e);
     let los = tr.ent == enemy || tr.fraction > 0.95;
     let in_fov = fov <= 0.0 || {
-        let fwd = crate::bot::angle_vectors(game.entities[e].bot.aim).0;
+        let fwd = crate::bot::angle_vectors(game.entities[e].bot.aim.angles).0;
         let to = (enemy_eye - my_eye).normalize_or_zero();
         fwd.dot(to) >= (0.5 * fov).to_radians().cos()
     };

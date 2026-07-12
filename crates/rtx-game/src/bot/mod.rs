@@ -648,36 +648,36 @@ fn emit(
         // Seed the aim spring so combat re-acquisition continues from the real view with a plausible
         // turn rate (a human-like flick) instead of snapping.
         let b = &mut game.entities[e].bot;
-        let yv = if b.bhop_prev_yaw == 0.0 {
+        let yv = if b.aim.bhop_prev_yaw == 0.0 {
             0.0
         } else {
-            (wrap180(view.y - b.bhop_prev_yaw) / dt).clamp(-720.0, 720.0)
+            (wrap180(view.y - b.aim.bhop_prev_yaw) / dt).clamp(-720.0, 720.0)
         };
-        b.bhop_prev_yaw = view.y;
-        b.aim = view;
-        b.aim_vel = Vec3::new(0.0, yv, 0.0);
+        b.aim.bhop_prev_yaw = view.y;
+        b.aim.angles = view;
+        b.aim.vel = Vec3::new(0.0, yv, 0.0);
         (view, c.forward.round() as i32, c.side.round() as i32)
     } else {
-        game.entities[e].bot.bhop_prev_yaw = 0.0; // forget the bhop yaw so the next engage seeds clean
+        game.entities[e].bot.aim.bhop_prev_yaw = 0.0; // forget the bhop yaw so the next engage seeds clean
         let dt = frametime.clamp(0.001, 0.05);
         let skill = host.cvar(c"rtx_bot_skill").clamp(0.0, 7.0);
         // Spring stiffness (1/s): sluggish → pro-snappy. Shared with the combat feed-forward,
         // whose lag compensation assumes exactly this spring.
         let omega = combat::aim_omega(skill);
         let b = &mut game.entities[e].bot;
-        if b.aim == Vec3::ZERO {
-            b.aim = v_angle; // seed from the real view so the first frame doesn't snap from zero
+        if b.aim.angles == Vec3::ZERO {
+            b.aim.angles = v_angle; // seed from the real view so the first frame doesn't snap from zero
         }
         let spring = |a: f32, v: f32, target: f32| {
             let d = wrap180(target - a);
             let v = v + (omega * omega * d - 2.0 * omega * v) * dt;
             (wrap180(a + v * dt), v)
         };
-        let (pitch, pv) = spring(b.aim.x, b.aim_vel.x, look.x);
-        let (yaw, yv) = spring(b.aim.y, b.aim_vel.y, look.y);
-        b.aim = Vec3::new(pitch, yaw, 0.0);
-        b.aim_vel = Vec3::new(pv, yv, 0.0);
-        let view = b.aim;
+        let (pitch, pv) = spring(b.aim.angles.x, b.aim.vel.x, look.x);
+        let (yaw, yv) = spring(b.aim.angles.y, b.aim.vel.y, look.y);
+        b.aim.angles = Vec3::new(pitch, yaw, 0.0);
+        b.aim.vel = Vec3::new(pv, yv, 0.0);
+        let view = b.aim.angles;
         let (vf, vr, _) = angle_vectors(view);
         (
             view,

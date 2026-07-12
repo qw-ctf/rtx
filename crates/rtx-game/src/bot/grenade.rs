@@ -641,7 +641,7 @@ fn windup(game: &mut GameState, e: EntId, now: f32, cmd: &mut BotCmd) {
         return;
     }
     // Grenade launcher in hand: fire when the smoothed aim has settled and the GL is off cooldown.
-    if now >= attack_finished && aim_err(game.entities[e].bot.aim, want) < LOB_AIM_TOL {
+    if now >= attack_finished && aim_err(game.entities[e].bot.aim.angles, want) < LOB_AIM_TOL {
         cmd.buttons |= BUTTON_ATTACK;
         let b = &mut game.entities[e].bot;
         b.grenade_phase = GrenadePhase::Lobbed;
@@ -816,7 +816,7 @@ pub(crate) fn rocket_shove(
         cmd.buttons &= !BUTTON_ATTACK;
         return true;
     }
-    if aim_err(game.entities[e].bot.aim, cmd.look) < 4.0 {
+    if aim_err(game.entities[e].bot.aim.angles, cmd.look) < 4.0 {
         cmd.buttons |= BUTTON_ATTACK;
     } else {
         cmd.buttons &= !BUTTON_ATTACK;

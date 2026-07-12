@@ -6,7 +6,7 @@
 //! feet, twitches its view on floating-point noise while the stuck/progress watchdogs fire on the
 //! zero movement. Instead it **cruises** a short walk from the pickup (scouting approaches, staying
 //! close enough to grab it on spawn) and **scans** the room with a slow bearing sweep that the aim
-//! spring turns into a smooth human pan. Because perception reads `bot.aim`, the sweep genuinely
+//! spring turns into a smooth human pan. Because perception reads `bot.aim.angles`, the sweep genuinely
 //! changes what the bot can see — the scouting is real, not cosmetic.
 //!
 //! One [`maybe`] call per bot per frame from [`resolve_objective`](super::resolve_objective) decides
