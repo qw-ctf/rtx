@@ -877,10 +877,7 @@ impl GameState {
                 );
             }
             if self.entities[e].combat.invisible_finished < time {
-                let ent = &mut self.entities[e];
-                ent.v.items = ent.v.items.without(Items::INVISIBILITY);
-                ent.combat.invisible_finished = 0.0;
-                ent.combat.invisible_time = 0.0;
+                self.powerup_expire(e, PowerupKind::Invisibility, Items::INVISIBILITY);
             }
             let eyes = self.level.modelindex_eyes;
             let ent = &mut self.entities[e];
@@ -901,10 +898,7 @@ impl GameState {
                 );
             }
             if self.entities[e].combat.invincible_finished < time {
-                let ent = &mut self.entities[e];
-                ent.v.items = ent.v.items.without(Items::INVULNERABILITY);
-                ent.combat.invincible_time = 0.0;
-                ent.combat.invincible_finished = 0.0;
+                self.powerup_expire(e, PowerupKind::Invulnerability, Items::INVULNERABILITY);
             }
             self.set_powerup_glow(e, self.entities[e].combat.invincible_finished > time, Effects::RED);
         }
@@ -920,17 +914,15 @@ impl GameState {
                 self.powerup_warn(e, PowerupKind::Quad, msg, Sound::ITEMS_DAMAGE2);
             }
             if self.entities[e].combat.super_damage_finished < time {
-                let dm4 = self.level.deathmatch == 4;
-                let ent = &mut self.entities[e];
-                ent.v.items = ent.v.items.without(Items::QUAD);
-                if dm4 {
+                self.powerup_expire(e, PowerupKind::Quad, Items::QUAD);
+                // dm4 (OctaPower): expiry hands back a fresh cells/armor/health kit.
+                if self.level.deathmatch == 4 {
+                    let ent = &mut self.entities[e];
                     ent.v.ammo_cells = 255.0;
                     ent.v.armorvalue = 1.0;
                     ent.v.armortype = 0.8;
                     ent.v.health = 100.0;
                 }
-                ent.combat.super_damage_finished = 0.0;
-                ent.combat.super_time = 0.0;
             }
             self.set_powerup_glow(e, self.entities[e].combat.super_damage_finished > time, Effects::BLUE);
         }
@@ -947,10 +939,7 @@ impl GameState {
                 );
             }
             if self.entities[e].combat.radsuit_finished < time {
-                let ent = &mut self.entities[e];
-                ent.v.items = ent.v.items.without(Items::SUIT);
-                ent.combat.rad_time = 0.0;
-                ent.combat.radsuit_finished = 0.0;
+                self.powerup_expire(e, PowerupKind::Biosuit, Items::SUIT);
             }
         }
     }
@@ -983,6 +972,32 @@ impl GameState {
             PowerupKind::Invulnerability => ent.combat.invincible_time = t,
             PowerupKind::Quad => ent.combat.super_time = t,
             PowerupKind::Biosuit => ent.combat.rad_time = t,
+        }
+    }
+
+    /// Expire a powerup: strip its item bit and zero both of its `*_finished`/`*_time` latches.
+    /// Per-powerup expiry extras (Quad's dm4 kit refill) stay at the call site — they touch
+    /// disjoint fields, so they compose in either order.
+    fn powerup_expire(&mut self, e: EntId, kind: PowerupKind, item: Items) {
+        let ent = &mut self.entities[e];
+        ent.v.items = ent.v.items.without(item);
+        match kind {
+            PowerupKind::Invisibility => {
+                ent.combat.invisible_finished = 0.0;
+                ent.combat.invisible_time = 0.0;
+            }
+            PowerupKind::Invulnerability => {
+                ent.combat.invincible_finished = 0.0;
+                ent.combat.invincible_time = 0.0;
+            }
+            PowerupKind::Quad => {
+                ent.combat.super_damage_finished = 0.0;
+                ent.combat.super_time = 0.0;
+            }
+            PowerupKind::Biosuit => {
+                ent.combat.radsuit_finished = 0.0;
+                ent.combat.rad_time = 0.0;
+            }
         }
     }
 
