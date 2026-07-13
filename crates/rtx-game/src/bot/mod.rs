@@ -101,6 +101,10 @@ const TURN_SLOW_MIN: f32 = 0.25;
 /// The route must turn past this (cosine — 0.5 ≈ 60°, above the grid's constant 45° zigzag) at the next
 /// leg for the arrival slowdown to engage, so flat straightaways and gentle zigzags keep full speed.
 const TURN_SLOW_COS: f32 = 0.5;
+/// How hard the lateral edge-margin nudge ([`hazard::edge_bias`]) bends a grounded bot's wish away from
+/// a one-sided drop (blended with the waypoint direction; 0.6 ≈ a 31° lean). Enough to hold a bot off
+/// the inner edge of an open-cored spiral without pinning it to the outer wall or stalling progress.
+const EDGE_BIAS_WEIGHT: f32 = 0.6;
 
 /// Outcome of a ballistic-phase landing check, shared by the hook and rocket-jump drivers: both fly
 /// a frictionless arc that matches their solve, so the only questions are whether we've touched down

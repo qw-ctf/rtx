@@ -730,10 +730,35 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             1.0
         }
     };
+    // Edge margin: on a grounded Walk/Step leg, steer away from a one-sided drop beside the line of
+    // travel — the inner edge of an open-cored spiral, a catwalk lip — instead of drifting off it while
+    // homing on the next cell centre (which sits on the grid, up to a hull-width from the true edge).
+    // Probed along actual velocity when we're moving, else the waypoint bearing. Self-cancelling on
+    // open floor and on a thin beam with drops both sides (there it holds the centre). Off while
+    // airborne / bhopping / speed-/rocket-jumping / hooking, so bhop and jump arcs are untouched.
+    let edge_push = if on_ground
+        && !on_air
+        && bot.bhop.phase == bhop::Phase::Off
+        && !bhop_active
+        && !sj_active
+        && !hook_engaged
+        && !rj_engaged
+        && matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
+        && dist > ARRIVE_RADIUS
+    {
+        bsp.map_or(Vec3::ZERO, |bsp| {
+            let feet = origin - Vec3::new(0.0, 0.0, ORIGIN_TO_FEET);
+            let travel = if speed > 40.0 { v_xy.normalize_or_zero() } else { to_wp.normalize_or_zero() };
+            crate::hazard::edge_bias(&|p| bsp.is_solid(p), feet, Vec3::new(travel.x, travel.y, 0.0))
+        })
+    } else {
+        Vec3::ZERO
+    };
+
     let close_enough = final_leg && polite && dist <= POLITE_DIST;
     if !close_enough {
         let (fwd, right, _) = angle_vectors(angles);
-        let dir = Vec3::new(to_wp.x, to_wp.y, 0.0).normalize_or_zero();
+        let dir = (Vec3::new(to_wp.x, to_wp.y, 0.0).normalize_or_zero() + edge_push * EDGE_BIAS_WEIGHT).normalize_or_zero();
         forward = (fwd.dot(dir) * MOVE_SPEED * wish_scale) as i32;
         side = (right.dot(dir) * MOVE_SPEED * wish_scale) as i32;
     }

@@ -200,40 +200,67 @@ pub fn water_ahead(
     })
 }
 
-/// Vertical stride when marching down to test for a walkable floor under a step-ahead probe.
+/// Vertical stride when marching down to test for a walkable floor under a probe point.
 const LEDGE_MARCH: f32 = 8.0;
+/// How far to each side of the travel direction [`edge_bias`] probes for a drop — a body half-width
+/// (16) plus a small margin, so a bot reacts before its hull actually reaches the lip.
+const EDGE_PROBE_SIDE: f32 = 24.0;
+/// Small forward offset of the side probes so a moving bot reads the edge it's heading onto, not the
+/// floor it's already standing on.
+const EDGE_PROBE_AHEAD: f32 = 12.0;
+/// Marge below the side-probe point within which a floor still counts as continuous. With the probe's
+/// 8u lift and the hull's 24u bevel baked into `is_solid`, this lands the effective side-drop
+/// threshold at roughly two steps down from the feet plane — a single walkable step beside the path is
+/// fine, an open shaft or a real ledge is steered away from.
+const EDGE_SIDE_DROP: f32 = 16.0;
+
+/// Whether the floor falls away by more than `allow` just below probe point `p` — a real drop, not a
+/// walkable step. `p` already inside solid is a wall/step-up (not a fall), so `false`. Marches down in
+/// `LEDGE_MARCH` strides looking for a floor within `allow` of `p`.
+fn drop_below(is_solid: &impl Fn(Vec3) -> bool, p: Vec3, allow: f32) -> bool {
+    if is_solid(p) {
+        return false; // a wall or step-up here — normal collision handles it, not a fall
+    }
+    let mut z = 0.0;
+    while z <= allow {
+        if is_solid(p - Vec3::new(0.0, 0.0, z)) {
+            return false;
+        }
+        z += LEDGE_MARCH;
+    }
+    true
+}
 
 /// Whether walking from `feet` along horizontal unit `dir` runs off a plain **ledge** within a stride
 /// or two — the everyday-fall analogue of [`hazard_ahead`], which flags only lava/slime/lethal pits
 /// and runs only in combat. The floor is *allowed* to descend as you walk: a staircase steps down one
 /// [`STEP_HEIGHT`] per grid cell, so the tolerated drop grows with distance. This trips only when the
-/// floor falls away faster than that walkable rate — a real edge the route didn't mean to leave. A
-/// probe landing inside solid is a wall or step-up, not a fall, so it's skipped (mirrors
-/// `hazard_ahead`). Pure over `is_solid`; the game's path-follower uses it to brake a grounded bot
-/// before it fumbles off a stair side.
+/// floor falls away faster than that walkable rate — a real edge the route didn't mean to leave. Pure
+/// over `is_solid`; the game's path-follower uses it to brake a grounded bot before it fumbles off.
 pub fn ledge_ahead(is_solid: &impl Fn(Vec3) -> bool, feet: Vec3, dir: Vec3) -> bool {
-    for d in HAZARD_AHEAD_DISTS {
-        let p = feet + dir * d + Vec3::new(0.0, 0.0, 8.0);
-        if is_solid(p) {
-            continue; // a wall or step-up ahead — normal collision handles it, not a fall
-        }
+    HAZARD_AHEAD_DISTS.iter().any(|&d| {
         // The most the floor may have legally dropped by `d` and still be a walkable descent: the 8u
-        // probe lift plus one step per grid cell covered. March down that far; no floor within = ledge.
-        let allow = 8.0 + STEP_HEIGHT * (1.0 + d / GRID);
-        let mut z = 0.0;
-        let mut grounded = false;
-        while z <= allow {
-            if is_solid(p - Vec3::new(0.0, 0.0, z)) {
-                grounded = true;
-                break;
-            }
-            z += LEDGE_MARCH;
-        }
-        if !grounded {
-            return true;
-        }
+        // probe lift plus one step per grid cell covered.
+        let p = feet + dir * d + Vec3::new(0.0, 0.0, 8.0);
+        drop_below(is_solid, p, 8.0 + STEP_HEIGHT * (1.0 + d / GRID))
+    })
+}
+
+/// A sideways steering nudge that keeps a walking bot off drop edges beside its path. Probes a
+/// body-width to each side of `dir` (a touch ahead) for a drop; returns a horizontal unit vector
+/// pushing *away* from a one-sided drop, or zero when both sides are safe (open floor — no nudge) or
+/// both drop (a thin catwalk / balance beam — hold the centre line rather than veer off the far side).
+/// This is what keeps a bot spiralling up an open-cored staircase, or crossing a narrow ledge, from
+/// drifting off the inner edge while it steers for the next cell centre. Pure over `is_solid`.
+pub fn edge_bias(is_solid: &impl Fn(Vec3) -> bool, feet: Vec3, dir: Vec3) -> Vec3 {
+    let perp = Vec3::new(-dir.y, dir.x, 0.0);
+    let base = feet + dir * EDGE_PROBE_AHEAD + Vec3::new(0.0, 0.0, 8.0);
+    let side_drops = |s: Vec3| drop_below(is_solid, base + s * EDGE_PROBE_SIDE, EDGE_SIDE_DROP);
+    match (side_drops(perp), side_drops(-perp)) {
+        (true, false) => -perp, // drop on the left → steer right
+        (false, true) => perp,  // drop on the right → steer left
+        _ => Vec3::ZERO,        // both safe, or both drop (thin path) → hold the line
     }
-    false
 }
 
 /// Whether open air sits directly above `p` — a surface a submerged bot can swim up to by holding
@@ -431,5 +458,39 @@ mod tests {
         // A wall filling x > 60 at every height: a step-up/obstacle for collision, not a fall.
         let solid = |p: Vec3| p.z <= 24.0 || p.x > 60.0;
         assert!(!ledge_ahead(&solid, Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn edge_bias_open_floor_no_nudge() {
+        // Flat floor everywhere: neither side drops, so nothing to steer away from.
+        let solid = |p: Vec3| p.z <= 24.0;
+        assert_eq!(edge_bias(&solid, Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0)), Vec3::ZERO);
+    }
+
+    #[test]
+    fn edge_bias_pushes_off_a_one_sided_drop() {
+        // Floor for y >= -20, open shaft below/beyond it. Walking +x, the shaft is on the right
+        // (-y) — the nudge should point +y (left), away from it.
+        let solid = |p: Vec3| p.z <= 24.0 && p.y >= -20.0;
+        let n = edge_bias(&solid, Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0));
+        assert!(n.y > 0.5, "should steer +y off the right-hand drop: {n:?}");
+        // Mirror it: shaft on the left (+y) → nudge -y (right).
+        let solid_l = |p: Vec3| p.z <= 24.0 && p.y <= 20.0;
+        assert!(edge_bias(&solid_l, Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0)).y < -0.5);
+    }
+
+    #[test]
+    fn edge_bias_thin_path_holds_the_line() {
+        // A narrow beam of floor |y| <= 16 with drops both sides: the pushes cancel, so a bot
+        // balances straight down the middle instead of veering off one side.
+        let solid = |p: Vec3| p.z <= 24.0 && p.y.abs() <= 16.0;
+        assert_eq!(edge_bias(&solid, Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0)), Vec3::ZERO);
+    }
+
+    #[test]
+    fn edge_bias_step_down_is_not_an_edge() {
+        // A single walkable step (18u) down on the right is fine — not steered away from.
+        let solid = |p: Vec3| if p.y < -20.0 { p.z <= 24.0 - 18.0 } else { p.z <= 24.0 };
+        assert_eq!(edge_bias(&solid, Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0)), Vec3::ZERO);
     }
 }
