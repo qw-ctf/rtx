@@ -121,6 +121,14 @@ pub(crate) fn frame_end(game: &mut GameState) {
                 }
                 poll_rj(game, e, i, link, now);
             }
+            Some(ControlOrder::FlyLink { link }) => {
+                let (origin, vel) = (game.entities[e].v.origin, game.entities[e].v.velocity);
+                let traj = &mut game.entities[e].bot.puppet.traj;
+                if traj.len() < 400 {
+                    traj.push((now, origin, vel));
+                }
+                poll_fly(game, e, i, link, now);
+            }
         }
     }
 }
@@ -211,6 +219,9 @@ enum ControlCmd {
     Teleport { bot: u32, pos: Vec3 },
     Goto { bot: u32, pos: Vec3 },
     Rj { bot: u32, link: u32 },
+    /// Fly a non-RJ link (e.g. a planted speed/curl jump) via the normal steer/bhop path. Reports a
+    /// `fly_result` with the takeoff speed and landing measurement.
+    Fly { bot: u32, link: u32 },
     Hold { bot: u32 },
     Stop { bot: u32 },
     Set { name: String, value: String },
@@ -223,6 +234,10 @@ enum ControlCmd {
     /// Search (offline pmove sim, live BSP) for a speed-curl jump from a source to a target world
     /// point — the M2 curl-jump solver, validated live. Returns the best (v0, launch heading, gain).
     Curl { src: Vec3, tgt: Vec3 },
+    /// Hand-plant a `SpeedJump` link (harness bring-up): a self-contained speed jump from the cell
+    /// nearest `from` (the run-up start), taking off at `takeoff` (the lip), to the cell nearest `tgt`,
+    /// requiring `v_req` ups at the lip. Lets us fly the takeoff regime before the generator emits it.
+    PlanLink { from: Vec3, takeoff: Vec3, tgt: Vec3, v_req: f32 },
 }
 
 /// Split the first whitespace-delimited token off `s`, returning `(token, rest)` with `rest` trimmed
@@ -288,6 +303,12 @@ fn parse_line(line: &str) -> Result<(i64, ControlCmd), String> {
             let link = parse_u32(t.next(), "link")?;
             ControlCmd::Rj { bot, link }
         }
+        "fly" => {
+            let mut t = rest.split_whitespace();
+            let bot = parse_u32(t.next(), "bot")?;
+            let link = parse_u32(t.next(), "link")?;
+            ControlCmd::Fly { bot, link }
+        }
         "hold" => ControlCmd::Hold { bot: parse_u32(rest.split_whitespace().next(), "bot")? },
         "stop" => ControlCmd::Stop { bot: parse_u32(rest.split_whitespace().next(), "bot")? },
         "set" => {
@@ -324,6 +345,14 @@ fn parse_line(line: &str) -> Result<(i64, ControlCmd), String> {
             let tgt = Vec3::new(parse_f32(t.next(), "tx")?, parse_f32(t.next(), "ty")?, parse_f32(t.next(), "tz")?);
             ControlCmd::Curl { src, tgt }
         }
+        "planlink" => {
+            let mut t = rest.split_whitespace();
+            let from = Vec3::new(parse_f32(t.next(), "fx")?, parse_f32(t.next(), "fy")?, parse_f32(t.next(), "fz")?);
+            let takeoff = Vec3::new(parse_f32(t.next(), "ox")?, parse_f32(t.next(), "oy")?, parse_f32(t.next(), "oz")?);
+            let tgt = Vec3::new(parse_f32(t.next(), "tx")?, parse_f32(t.next(), "ty")?, parse_f32(t.next(), "tz")?);
+            let v_req = parse_f32(t.next(), "v_req")?;
+            ControlCmd::PlanLink { from, takeoff, tgt, v_req }
+        }
         other => return Err(format!("unknown verb '{other}'")),
     };
     Ok((id, cmd))
@@ -352,6 +381,7 @@ fn exec_cmd(game: &mut GameState, id: i64, cmd: ControlCmd) {
         ControlCmd::Teleport { bot, pos } => do_teleport(game, bot, pos),
         ControlCmd::Goto { bot, pos } => do_goto(game, bot, pos),
         ControlCmd::Rj { bot, link } => do_rj(game, bot, link),
+        ControlCmd::Fly { bot, link } => do_fly(game, bot, link),
         ControlCmd::Hold { bot } => do_order(game, bot, ControlOrder::Hold),
         ControlCmd::Stop { bot } => do_stop(game, bot),
         ControlCmd::Set { name, value } => do_set(game, &name, &value),
@@ -363,6 +393,7 @@ fn exec_cmd(game: &mut GameState, id: i64, cmd: ControlCmd) {
         ControlCmd::Cell { pos } => cell_json(game, pos),
         ControlCmd::Route { bot } => route_json(game, bot),
         ControlCmd::Curl { src, tgt } => curl_json(game, src, tgt),
+        ControlCmd::PlanLink { from, takeoff, tgt, v_req } => plant_link_json(game, from, takeoff, tgt, v_req),
     };
     match result {
         Ok(data) => reply_ok(game, id, &data),
@@ -485,6 +516,28 @@ fn do_rj(game: &mut GameState, bot: u32, link: u32) -> Result<String, String> {
     Ok(format!("{{\"bot\":{bot},\"link\":{link}}}"))
 }
 
+fn do_fly(game: &mut GameState, bot: u32, link: u32) -> Result<String, String> {
+    let e = valid_bot(game, bot)?;
+    let now = game.time();
+    {
+        let g = game.nav.graph.as_ref().ok_or("navmesh not ready")?;
+        if link as usize >= g.links.len() {
+            return Err(format!("link {link} out of range (0..{})", g.links.len()));
+        }
+        if g.link_kind(link) == LinkKind::RocketJump {
+            return Err(format!("link {link} is a rocket jump — use `rj`"));
+        }
+    }
+    let b = &mut game.entities[e].bot;
+    b.route.clear();
+    b.repath_time = now;
+    b.puppet.traj.clear(); // fresh flight trace
+    b.puppet.fly_airborne = false;
+    b.puppet.fly_takeoff_speed = 0.0;
+    b.puppet.order = Some(ControlOrder::FlyLink { link });
+    Ok(format!("{{\"bot\":{bot},\"link\":{link}}}"))
+}
+
 fn do_order(game: &mut GameState, bot: u32, order: ControlOrder) -> Result<String, String> {
     let e = valid_bot(game, bot)?;
     game.entities[e].bot.puppet.order = Some(order);
@@ -553,7 +606,7 @@ fn status_json(game: &GameState) -> String {
             bots.push(',');
         }
         bots.push_str(&format!(
-            "{{\"ent\":{i},\"client\":{},\"origin\":{},\"health\":{},\"on_ground\":{},\"alive\":{},\"order\":{},\"rj_phase\":{}}}",
+            "{{\"ent\":{i},\"client\":{},\"origin\":{},\"health\":{},\"on_ground\":{},\"alive\":{},\"order\":{},\"rj_phase\":{},\"speed\":{},\"bhop\":{},\"bhop_peak\":{}}}",
             ent.bot.client,
             jvec3(ent.v.origin),
             jnum(ent.v.health),
@@ -561,6 +614,9 @@ fn status_json(game: &GameState) -> String {
             ent.is_alive(),
             jstr(order_name(ent.bot.puppet.order)),
             jstr(&format!("{:?}", ent.bot.rj.phase)),
+            jnum(ent.v.velocity.xy().length()),
+            jstr(&format!("{:?}", ent.bot.bhop.phase)),
+            jnum(ent.bot.bhop.peak),
         ));
     }
     format!(
@@ -748,12 +804,52 @@ fn curl_json(game: &GameState, src: Vec3, tgt: Vec3) -> Result<String, String> {
     }
 }
 
+/// Hand-plant a self-contained `SpeedJump` link into the live graph for takeoff-regime bring-up: the
+/// run-up starts at the cell nearest `from`, the leap is at `takeoff` (the lip), and it lands on the
+/// cell nearest `tgt`, requiring `v_req` ups at the lip. The runtime flies a planted link exactly like
+/// a generated one, so a subsequent `goto <tgt>` exercises the committed-prestrafe takeoff on the real
+/// corridor. Returns the new link index and the resolved cell origins so the caller can verify routing.
+fn plant_link_json(game: &mut GameState, from: Vec3, takeoff: Vec3, tgt: Vec3, v_req: f32) -> Result<String, String> {
+    use crate::navmesh::SpeedJumpTraversal;
+    let gravity = {
+        let g = game.host.cvar(c"sv_gravity");
+        if g > 0.0 { g } else { 800.0 }
+    };
+    let g = game.nav.graph.as_mut().ok_or("navmesh not ready")?;
+    let from_cell = g.nearest(from).ok_or("no cell near from")?;
+    let to_cell = g.nearest(tgt).ok_or("no cell near tgt")?;
+    let dz = g.cell_origin(to_cell).z - takeoff.z;
+    // Ballistic flight time to fall back through `dz` after a jump (vz0 = JUMP_VZ): the later root of
+    // dz = JUMP_VZ·t − ½·g·t². Only used for the planner's hot-entry pricing; the flight itself is
+    // driven by v_req + takeoff at runtime.
+    let vz0 = rtx_nav::qphys::JUMP_VZ;
+    let disc = (vz0 * vz0 - 2.0 * gravity * dz).max(0.0);
+    let airtime = (vz0 + disc.sqrt()) / gravity;
+    // A hand-planted link is a curl by default (it's what we plant for the curl bring-up); the runtime
+    // reads this gain to pick `air_correct` over the slalom. A fast run-up overshoots a gentle curl, so
+    // the bring-up default is a firm gain that bleeds the excess onto the landing (see the harness gain
+    // sweep — ~12 lands the bravado LG dead-on). The cvar overrides it for tuning; step 4's solver will
+    // compute a per-link gain from the certified takeoff speed.
+    let curl_gain = {
+        let g = game.host.cvar(c"rtx_jump_curl_gain");
+        if g > 0.0 { g } else { 12.0 }
+    };
+    let tr = SpeedJumpTraversal { takeoff, v_req, airtime, chained: false, curl_gain };
+    let li = g.plant_speed_jump(from_cell, to_cell, airtime + 1.0, tr);
+    let (fo, to) = (g.cell_origin(from_cell), g.cell_origin(to_cell));
+    Ok(format!(
+        "{{\"link\":{li},\"from_cell\":{from_cell},\"to_cell\":{to_cell},\"from\":{},\"tgt\":{},\"takeoff\":{},\"v_req\":{},\"airtime\":{}}}",
+        jvec3(fo), jvec3(to), jvec3(takeoff), jnum(v_req), jnum(airtime),
+    ))
+}
+
 fn order_name(o: Option<ControlOrder>) -> &'static str {
     match o {
         None => "none",
         Some(ControlOrder::Hold) => "hold",
         Some(ControlOrder::Goto { .. }) => "goto",
         Some(ControlOrder::RocketJump { .. }) => "rj",
+        Some(ControlOrder::FlyLink { .. }) => "fly",
     }
 }
 
@@ -828,6 +924,48 @@ fn poll_rj(game: &mut GameState, e: EntId, bot: u32, link: u32, now: f32) {
     game.entities[e].bot.puppet.order = Some(ControlOrder::Hold);
     let json = rj_result_json(bot, link, &telem, outcome, v0, blast, pos_blast, &traj);
     send(game, json);
+}
+
+/// Watch a FlyLink attempt: capture the horizontal speed at the speed-jump takeoff (the first airborne
+/// frame past the lip, so corridor hops on the run-up don't count), and on the next touchdown emit a
+/// `fly_result` with the landing measurement vs the target cell. Then park the bot (Hold).
+fn poll_fly(game: &mut GameState, e: EntId, bot: u32, link: u32, now: f32) {
+    let og = game.entities[e].v.flags.has(Flags::ONGROUND);
+    let origin = game.entities[e].v.origin;
+    let speed = game.entities[e].v.velocity.xy().length();
+    let Some(g) = game.nav.graph.as_ref() else { return };
+    let takeoff = g.speed_jump_of_link(link).map(|t| t.takeoff).unwrap_or_else(|| g.cell_origin(g.link_source(link)));
+    let target = g.cell_origin(g.link_target(link));
+    // "Past the lip" = progress along takeoff→target is positive, so the run-up (behind the lip) and its
+    // corridor hops never register as the jump's flight.
+    let past_lip = (origin.xy() - takeoff.xy()).dot(target.xy() - takeoff.xy()) > 0.0;
+    if !game.entities[e].bot.puppet.fly_airborne {
+        if !og && past_lip {
+            game.entities[e].bot.puppet.fly_airborne = true;
+            game.entities[e].bot.puppet.fly_takeoff_speed = speed;
+        }
+        return;
+    }
+    if !og {
+        return; // still in flight
+    }
+    // Touchdown after the leap — measure vs the target cell and report.
+    let miss_xy = (origin.xy() - target.xy()).length();
+    let miss_z = (origin.z - target.z).abs();
+    let on_target = miss_xy <= 32.0 && miss_z <= 32.0;
+    let takeoff_speed = game.entities[e].bot.puppet.fly_takeoff_speed;
+    let peak = game.entities[e].bot.bhop.peak;
+    let traj = std::mem::take(&mut game.entities[e].bot.puppet.traj);
+    game.entities[e].bot.puppet.fly_airborne = false;
+    game.entities[e].bot.puppet.order = Some(ControlOrder::Hold);
+    game.entities[e].bot.rj.fails = 0;
+    let _ = now;
+    send(game, format!(
+        "{{\"ev\":\"fly_result\",\"bot\":{bot},\"link\":{link},\"on_target\":{on_target},\"land\":{},\
+         \"target\":{},\"miss_xy\":{},\"miss_z\":{},\"takeoff_speed\":{},\"peak\":{},\"traj\":[{}]}}",
+        jvec3(origin), jvec3(target), jnum(miss_xy), jnum(miss_z), jnum(takeoff_speed), jnum(peak),
+        traj_json(&traj),
+    ));
 }
 
 #[allow(clippy::too_many_arguments)] // one JSON event's worth of measured + solved fields

@@ -433,6 +433,12 @@ pub struct Puppet {
     /// (post-move) while a RocketJump order is active, so the harness can compare the *actual* arc to
     /// the offline solve's prediction. Capped and cleared when the attempt's result is emitted.
     pub traj: Vec<(f32, Vec3, Vec3)>,
+    /// FlyLink bring-up: whether the bot has left the ground since the order began (so a landing frame
+    /// after takeoff — not the initial ground frames — terminates the attempt). Reset with the order.
+    pub fly_airborne: bool,
+    /// FlyLink bring-up: the horizontal speed captured at the takeoff frame (ground → airborne). 0 until
+    /// takeoff. Reported in `fly_result` so the harness can read what the takeoff regime delivered.
+    pub fly_takeoff_speed: f32,
 }
 
 /// A scripted control order for a puppeted bot (see [`crate::control`]). Lives here (not in
@@ -445,6 +451,9 @@ pub enum ControlOrder {
     Goto { target: Vec3 },
     /// Fly a specific rocket-jump link (route pinned to it, repath suppressed). Result reported.
     RocketJump { link: u32 },
+    /// Fly a specific non-RJ link (route pinned to it, repath suppressed) via the normal steer/bhop/
+    /// speed-jump path — no rocket-jump driver. For harness bring-up of a hand-planted speed/curl jump.
+    FlyLink { link: u32 },
 }
 
 /// The route-progress watchdogs carried on a [`BotState`]: three independent ways a bot detects it

@@ -511,6 +511,8 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     let sj_takeoff = cur_leg
         .and_then(|l| graph.speed_jump_of_link(l))
         .map(|tr| (tr.takeoff, tr.v_req));
+    // A curl speed jump carries a nonzero air-curl gain; a straight one carries 0 (keeps the slalom).
+    let sj_curl_gain = cur_leg.and_then(|l| graph.speed_jump_of_link(l)).map(|tr| tr.curl_gain).unwrap_or(0.0);
     let sj_hold = sj_active && {
         match sj_takeoff {
             Some((takeoff, v_req)) => {
@@ -541,7 +543,17 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         let bhop_look = corridor_point(graph, &bot.route, bot.route_pos, origin, (speed * 0.6).clamp(96.0, 448.0));
         let ahead = match race_line_ahead {
             Some(lp) if !sj_active => lp.xy() - origin.xy(),
-            _ if sj_active => waypoint.xy() - origin.xy(),
+            // On a speed jump the run-up aims at the *takeoff* (follow the corridor to the lip), and
+            // only once airborne does the bearing swing to the *landing* — so a curl jump (run-up and
+            // leap not collinear) tracks its corridor instead of cutting across it and off the edge.
+            // For a straight speed jump takeoff and target are collinear, so this is a no-op.
+            _ if sj_active => {
+                let aim = match sj_takeoff {
+                    Some((takeoff, _)) if on_ground => takeoff,
+                    _ => waypoint,
+                };
+                aim.xy() - origin.xy()
+            }
             _ => bhop_look.xy() - origin.xy(),
         };
         let to_wp = waypoint.xy() - origin.xy();
@@ -577,6 +589,18 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 committed: sj_active,
                 carry,
                 hold_jump: sj_hold,
+                takeoff_speed: match sj_takeoff {
+                    Some((_, v_req)) if sj_active => v_req,
+                    _ => 0.0,
+                },
+                // Curl only jumps flagged as curls (straight speed jumps keep the slalom untouched). The
+                // cvar, when set, overrides the link's baked gain for live tuning of the curl arc.
+                curl_gain: if sj_active && sj_curl_gain > 0.0 {
+                    let cv = host.cvar(c"rtx_jump_curl_gain");
+                    if cv > 0.0 { cv } else { sj_curl_gain }
+                } else {
+                    0.0
+                },
                 clear,
                 now,
             },

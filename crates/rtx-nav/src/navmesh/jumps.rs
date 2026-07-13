@@ -258,7 +258,7 @@ impl NavGraph {
                         if start != to {
                             let cost = runway_time(v_req * SJ_MARGIN, MAX_SPEED, k) + airtime + 1.0;
                             let link = Link { from: start, to, kind: LinkKind::SpeedJump, cost };
-                            let tr = SpeedJumpTraversal { takeoff: a.origin, v_req, airtime, chained: false };
+                            let tr = SpeedJumpTraversal { takeoff: a.origin, v_req, airtime, chained: false, curl_gain: 0.0 };
                             if best.is_none_or(|(bv, _, _)| v_req < bv) {
                                 best = Some((v_req, link, tr));
                             }
@@ -272,7 +272,7 @@ impl NavGraph {
                 if v_req * SJ_MARGIN <= v_chain_max {
                     let cost = airtime + 1.0;
                     let link = Link { from: ledge, to, kind: LinkKind::SpeedJump, cost };
-                    let tr = SpeedJumpTraversal { takeoff: a.origin, v_req, airtime, chained: true };
+                    let tr = SpeedJumpTraversal { takeoff: a.origin, v_req, airtime, chained: true, curl_gain: 0.0 };
                     if best_chained.is_none_or(|(bv, _, _)| v_req < bv) {
                         best_chained = Some((v_req, link, tr));
                     }

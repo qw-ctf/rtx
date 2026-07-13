@@ -240,6 +240,11 @@ pub struct SpeedJumpTraversal {
     /// so it is only traversable when the planner proves the entry band already carries `v_req`
     /// (see [`NavGraph::find_path_banded`]). Unbanded queries price it away via [`NavGraph::link_extra`].
     pub chained: bool,
+    /// Air-curl gain for a jump whose run-up and leap are **not collinear** (a curl jump — the bot runs
+    /// down one corridor and turns in the air onto an offset landing). `0` = a straight speed jump: the
+    /// runtime flies it with the hop slalom, unchanged. `> 0` = curl: once airborne the controller homes
+    /// the velocity onto the landing with [`air_correct`](crate) at this rate — one smooth pursuit arc.
+    pub curl_gain: f32,
 }
 
 /// Extra travel-time cost charged to a link whose gate is currently shut. Large enough that the
@@ -902,6 +907,15 @@ impl NavGraph {
     /// The solved traversal for speed-jump link `li`, or `None` for any other link.
     pub fn speed_jump_of_link(&self, li: u32) -> Option<&SpeedJumpTraversal> {
         self.speed_jumps.of_link(li)
+    }
+
+    /// Hand-plant a speed-jump link post-build (harness / bring-up): inject a `SpeedJump` from `from`
+    /// to `to` with the given cost and solved traversal, returning its link index. Lets the control
+    /// harness validate a takeoff/curl the generator doesn't yet emit — the runtime flies a planted
+    /// link exactly like a generated one. Not used by the automatic build.
+    pub fn plant_speed_jump(&mut self, from: CellId, to: CellId, cost: f32, traversal: SpeedJumpTraversal) -> u32 {
+        self.push_speed_jump(Link { from, to, kind: LinkKind::SpeedJump, cost }, traversal);
+        (self.links.len() - 1) as u32
     }
 
     /// Push a speed-jump link with its traversal, tagging the new link in the side table.
@@ -2081,7 +2095,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut speed_jumps = SideTable::default();
         for &(li, v_req, airtime, chained) in sjs {
-            let s = speed_jumps.push(SpeedJumpTraversal { takeoff: origins[links[li].from as usize], v_req, airtime, chained });
+            let s = speed_jumps.push(SpeedJumpTraversal { takeoff: origins[links[li].from as usize], v_req, airtime, chained, curl_gain: 0.0 });
             speed_jumps.tag(li, s);
         }
         NavGraph {

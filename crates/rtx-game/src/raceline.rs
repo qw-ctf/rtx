@@ -214,6 +214,8 @@ pub fn rollout(bsp: &Bsp, line: &RaceLine, nodes: &[RaceRouteNode], pm: &PmParam
             committed: tech == TECH_SPEEDJUMP,
             carry: tech == TECH_HOP || tech == TECH_SPEEDJUMP,
             hold_jump: tech == TECH_SPEEDJUMP && st.vel.xy().length() < pts[cursor.min(last)].target_speed,
+            takeoff_speed: if tech == TECH_SPEEDJUMP { pts[cursor.min(last)].target_speed } else { 0.0 },
+            curl_gain: 0.0, // racing-line speed jumps are straight; keep the slalom the line was tuned with
             clear: f32::INFINITY, // the offline line is already collision-clean; no runtime wall probe
             now: t,
         };

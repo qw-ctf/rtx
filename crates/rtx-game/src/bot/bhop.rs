@@ -67,6 +67,12 @@ const PRESTRAFE_TARGET: f32 = 450.0;
 const PRESTRAFE_MAX_T: f32 = 1.2;
 /// Only bother prestrafing with this much corridor ahead; shorter → hop immediately.
 const PRESTRAFE_MIN_RUNWAY: f32 = 512.0;
+/// Takeoff regime: how close (units, run-up remaining) the takeoff edge must be before a committed
+/// high-speed jump leaps. The bot keeps the ground circle-strafe until it's within this of the lip,
+/// then jumps *once* — so the takeoff point stays where the link was certified. Kept small (a couple
+/// of ticks of travel) so the leap point tracks the certified edge; the certification carries the
+/// matching slack. Distinct from the eager [`LAUNCH_MIN_FRAC`] leap a plain hop takes.
+const LIP_REACH: f32 = 28.0;
 /// Fixed runway required to engage — enough for one worthwhile hop (a flat hop at walk speed
 /// covers ~216u). Deliberately *not* speed-scaled: the old `speed·0.9` bar rose as the bot gained
 /// speed and disengaged it mid-run — the policy capped the very thing it built.
@@ -331,6 +337,15 @@ pub struct Input {
     pub carry: bool,
     /// At the takeoff edge too slow to clear the gap (`sj_hold`): keep building, don't leap.
     pub hold_jump: bool,
+    /// Required takeoff speed for a committed speed jump (0 = none / a plain leg). A high-`v_req` jump
+    /// (a curl/speed jump the bot can't reach at ordinary run speed) drives the *takeoff regime*: keep
+    /// **ground prestrafe** (circle-strafe, which outgains the air cap far below maxspeed) all the way
+    /// to the lip, then leap once at `~0.9·v_req` — not the eager `LAUNCH_MIN_FRAC` hop that leaves slow.
+    pub takeoff_speed: f32,
+    /// Air-curl gain for a committed speed jump: once airborne, home the velocity onto the bearing with
+    /// [`air_correct`] at this rate (a single smooth pursuit curl onto the landing) rather than the hop
+    /// slalom. `> 0` selects the curl (a speed jump is one leap, not a chain); `≤ 0` keeps the slalom.
+    pub curl_gain: f32,
     /// Free flight distance straight ahead along the velocity (units), from a forward hull trace —
     /// how far the bot could fly before hitting a wall. `f32::INFINITY` = unknown/open (the default
     /// off the live path). Gates leaping at a wall and drives the mid-air carve; see [`Bhop::step`].
@@ -432,10 +447,18 @@ impl Bhop {
         }
 
         if self.phase == Phase::Prestrafe {
-            let launch = !i.on_ground
-                || speed >= PRESTRAFE_TARGET
-                || i.now - self.phase_start > PRESTRAFE_MAX_T
-                || i.runway < speed * T_HOP * 2.0 + HOP_MARGIN; // keep room to actually hop
+            // Takeoff regime: a committed high-speed jump holds the circle-strafe all the way to the
+            // lip (the early-launch clause below would leap the moment prestrafe is entered on a short
+            // runway, leaving slow). Everything else launches at target speed / time / runway-out.
+            let sj_build = i.committed && i.takeoff_speed > 0.0;
+            let launch = if sj_build {
+                !i.on_ground || i.runway < LIP_REACH
+            } else {
+                !i.on_ground
+                    || speed >= PRESTRAFE_TARGET
+                    || i.now - self.phase_start > PRESTRAFE_MAX_T
+                    || i.runway < speed * T_HOP * 2.0 + HOP_MARGIN // keep room to actually hop
+            };
             if !launch {
                 return Some(self.ground_cmd(i, a_g, env.maxspeed, f32::INFINITY));
             }
@@ -451,7 +474,14 @@ impl Bhop {
     fn hop_cmd(&mut self, i: &Input, speed: f32, a_max: f32, a_g: f32, maxspeed: f32, dt: f32) -> Option<Cmd> {
         if !i.on_ground {
             self.jump_prev = false; // airborne releases the button, re-arming PM_CheckJump
-            let s = self.air_strafe(i, speed, a_max, dt);
+            // A committed speed jump is a single leap onto a fixed landing: curl the velocity smoothly
+            // onto the bearing with `air_correct` (pursuit guidance), not the hop slalom (whose lobe
+            // flips scatter the landing point). The bearing already tracks the target once airborne.
+            let s = if i.committed && i.takeoff_speed > 0.0 && i.curl_gain > 0.0 {
+                air_correct(i.v_xy, i.bearing, a_max, dt, i.curl_gain)
+            } else {
+                self.air_strafe(i, speed, a_max, dt)
+            };
             return Some(Cmd { view_yaw: s.view_yaw, forward: s.forward, side: s.side, jump: false });
         }
         // Landing (or first) ground frame — the only place a run ends by policy. A planned carry
@@ -462,11 +492,19 @@ impl Bhop {
             self.disengage(if i.sustain { "runway" } else { "leg" });
             return None;
         }
-        // Run up before the leap: keep circle-strafing on the ground rather than take off slow —
-        // either because we haven't reached full run speed yet ([`LAUNCH_MIN_FRAC`], the human "run
-        // first, then jump"), or because a speed jump's takeoff edge is still too slow to clear the
-        // gap (`hold_jump`). Ground accel outgains the air cap below maxspeed, so this only ever helps.
-        if i.hold_jump || speed < LAUNCH_MIN_FRAC * maxspeed || i.clear < speed * T_HOP * WALL_HOLD_FRAC {
+        // Run up before the leap: keep circle-strafing on the ground rather than take off slow.
+        // A committed high-speed jump follows the *takeoff regime* — build all the way to the lip and
+        // leap there once, so the takeoff point stays where the link was certified (leaping early even
+        // when already fast would undershoot). Everything else uses the eager run-up gate: hold until
+        // full run speed ([`LAUNCH_MIN_FRAC`], the human "run first, then jump"), a speed jump's edge
+        // is fast enough (`hold_jump`), and we're not about to fly into a wall. Ground accel outgains
+        // the air cap below maxspeed, so holding on the ground only ever helps the speed.
+        let sj_takeoff = i.committed && i.takeoff_speed > 0.0;
+        if sj_takeoff {
+            if i.runway >= LIP_REACH {
+                return Some(self.ground_cmd(i, a_g, maxspeed, f32::INFINITY));
+            }
+        } else if i.hold_jump || speed < LAUNCH_MIN_FRAC * maxspeed || i.clear < speed * T_HOP * WALL_HOLD_FRAC {
             return Some(self.ground_cmd(i, a_g, maxspeed, f32::INFINITY));
         }
         let jump = !self.jump_prev;
@@ -536,7 +574,16 @@ impl Bhop {
         // routed a carry here and we're already at speed, skip straight to the hop cycle — grounding
         // to prestrafe would bleed the carried speed to friction, the opposite of the intent.
         let hot_carry = i.carry && speed >= maxspeed;
-        self.phase = if i.on_ground && !hot_carry && speed < PRESTRAFE_TARGET && i.runway > PRESTRAFE_MIN_RUNWAY {
+        // A committed high-speed jump below its required takeoff speed prestrafes *regardless of the
+        // 512 runway gate*: the ground circle-strafe outgains the air cap far below maxspeed, so it's
+        // the only way to make `v_req` on a short (~450u) run-up. The `runway()` for such a leg is the
+        // run-up to the takeoff edge, and the Prestrafe phase holds it to the lip (see [`Self::step`]).
+        let sj_build = i.committed && i.takeoff_speed > 0.0 && speed < i.takeoff_speed;
+        self.phase = if i.on_ground
+            && !hot_carry
+            && speed < PRESTRAFE_TARGET
+            && (i.runway > PRESTRAFE_MIN_RUNWAY || sj_build)
+        {
             Phase::Prestrafe
         } else {
             Phase::Hop
@@ -870,6 +917,8 @@ mod sim {
             committed: false,
             carry: false,
             hold_jump: false,
+            takeoff_speed: 0.0,
+            curl_gain: 0.0,
             clear: f32::INFINITY,
             now,
         }
@@ -896,6 +945,8 @@ mod sim {
             committed: false,
             carry: false,
             hold_jump: false,
+            takeoff_speed: 0.0,
+            curl_gain: 0.0,
             clear: f32::INFINITY,
             now,
         }
@@ -957,6 +1008,48 @@ mod sim {
             let fj = first_jump.expect("never took off");
             assert!(fj >= min_takeoff, "first takeoff at {fj} ups (runway {runway}), want ≥ {min_takeoff}");
         }
+    }
+
+    #[test]
+    fn committed_high_speed_jump_builds_to_the_lip() {
+        // The takeoff regime: a committed speed jump needing v_req = 415 on a SHORT (~470u) runway
+        // holds the ground circle-strafe all the way to the lip and leaps near v_req — not the eager
+        // 304 the plain short-runway direct-to-Hop would take (that's what left the bravado LG jump
+        // short). The runway shrinks as the bot advances; it must leap within a lip-reach of the edge.
+        const V_REQ: f32 = 415.0;
+        let start_runway = 470.0f32;
+        let mut w = World::grounded(320.0); // arrives at run speed off the corridor
+        let mut b = Bhop::default();
+        let mut takeoff = None;
+        for f in 0..300 {
+            let now = f as f32 * DT;
+            let runway = (start_runway - w.pos.x).max(0.0);
+            let input = Input {
+                v_xy: w.v,
+                on_ground: w.on_ground,
+                bearing: 0.0,
+                runway,
+                eligible: false,
+                zigzag: false,
+                sustain: false,
+                veto: false,
+                committed: true,
+                carry: false,
+                hold_jump: false,
+                takeoff_speed: V_REQ,
+                curl_gain: 0.0,
+                clear: f32::INFINITY,
+                now,
+            };
+            let cmd = b.step(&input, &ENV).unwrap_or(run_cmd(0.0));
+            if cmd.jump && takeoff.is_none() {
+                takeoff = Some((w.v.length(), runway));
+            }
+            pm_frame(&mut w, &cmd, false);
+        }
+        let (spd, rw) = takeoff.expect("never took off");
+        assert!(spd >= 400.0, "took off at {spd} ups on the short runway, want ≥ 400 (build to ~v_req)");
+        assert!(rw < LIP_REACH + 8.0, "leaped {rw}u short of the lip, want at the edge");
     }
 
     #[test]
