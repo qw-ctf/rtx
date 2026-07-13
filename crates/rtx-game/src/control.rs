@@ -103,7 +103,14 @@ pub(crate) fn frame_end(game: &mut GameState) {
         }
         match game.entities[e].bot.puppet.order {
             None | Some(ControlOrder::Hold) => {}
-            Some(ControlOrder::Goto { target }) => poll_goto(game, e, i, target, now),
+            Some(ControlOrder::Goto { target }) => {
+                let (origin, vel) = (game.entities[e].v.origin, game.entities[e].v.velocity);
+                let traj = &mut game.entities[e].bot.puppet.traj;
+                if traj.len() < 400 {
+                    traj.push((now, origin, vel));
+                }
+                poll_goto(game, e, i, target, now);
+            }
             Some(ControlOrder::RocketJump { link }) => {
                 // Trace the flight: sample this frame's post-move origin/velocity before checking for a
                 // result, so the trajectory in `rj_result` runs from the stance through the landing.
@@ -209,6 +216,8 @@ enum ControlCmd {
     Set { name: String, value: String },
     Get { name: String },
     Cmd { raw: String },
+    /// Inspect the navmesh cell nearest a world point: its origin and every link in/out, by kind.
+    Cell { pos: Vec3 },
 }
 
 /// Split the first whitespace-delimited token off `s`, returning `(token, rest)` with `rest` trimmed
@@ -296,6 +305,13 @@ fn parse_line(line: &str) -> Result<(i64, ControlCmd), String> {
             }
             ControlCmd::Cmd { raw: rest.to_string() }
         }
+        "cell" => {
+            let mut t = rest.split_whitespace();
+            let x = parse_f32(t.next(), "x")?;
+            let y = parse_f32(t.next(), "y")?;
+            let z = parse_f32(t.next(), "z")?;
+            ControlCmd::Cell { pos: Vec3::new(x, y, z) }
+        }
         other => return Err(format!("unknown verb '{other}'")),
     };
     Ok((id, cmd))
@@ -332,6 +348,7 @@ fn exec_cmd(game: &mut GameState, id: i64, cmd: ControlCmd) {
             game.host.localcmd(&raw);
             Ok("{\"queued\":true}".to_string())
         }
+        ControlCmd::Cell { pos } => cell_json(game, pos),
     };
     match result {
         Ok(data) => reply_ok(game, id, &data),
@@ -422,6 +439,7 @@ fn do_goto(game: &mut GameState, bot: u32, pos: Vec3) -> Result<String, String> 
     b.rj = RjState::default();
     b.route.clear();
     b.repath_time = now;
+    b.puppet.traj.clear();
     b.puppet.order = Some(ControlOrder::Goto { target: pos });
     b.puppet.best_dist = f32::INFINITY;
     b.puppet.best_since = now;
@@ -570,6 +588,55 @@ fn links_json(game: &GameState) -> Result<String, String> {
     Ok(format!("{{\"links\":[{items}]}}"))
 }
 
+/// Human-readable name for a link kind, for the `cell` inspector.
+fn kind_name(k: LinkKind) -> &'static str {
+    match k {
+        LinkKind::Walk => "walk",
+        LinkKind::Step => "step",
+        LinkKind::Drop => "drop",
+        LinkKind::JumpGap => "jump",
+        LinkKind::DoubleJump => "doublejump",
+        LinkKind::SpeedJump => "speedjump",
+        LinkKind::Plat => "plat",
+        LinkKind::Teleport => "teleport",
+        LinkKind::Hook => "hook",
+        LinkKind::RocketJump => "rocketjump",
+    }
+}
+
+/// Inspect the navmesh cell nearest `pos`: its origin plus every link leaving and entering it (index,
+/// kind, other endpoint). The diagnostic for "why can't the bot reach here" — an unreachable ledge
+/// has no incoming jump/speed-jump link.
+fn cell_json(game: &GameState, pos: Vec3) -> Result<String, String> {
+    let g = game.nav.graph.as_ref().ok_or("navmesh not ready")?;
+    let cell = g.nearest(pos).ok_or("no navmesh cell near that point")?;
+    let mut out = String::new();
+    let mut inc = String::new();
+    for li in 0..g.links.len() as u32 {
+        if g.link_source(li) == cell {
+            let e = if out.is_empty() { "" } else { "," };
+            out.push_str(&format!(
+                "{e}{{\"link\":{li},\"kind\":{},\"to\":{}}}",
+                jstr(kind_name(g.link_kind(li))),
+                jvec3(g.cell_origin(g.link_target(li)))
+            ));
+        }
+        if g.link_target(li) == cell {
+            let e = if inc.is_empty() { "" } else { "," };
+            inc.push_str(&format!(
+                "{e}{{\"link\":{li},\"kind\":{},\"from\":{}}}",
+                jstr(kind_name(g.link_kind(li))),
+                jvec3(g.cell_origin(g.link_source(li)))
+            ));
+        }
+    }
+    Ok(format!(
+        "{{\"cell\":{},\"origin\":{},\"out\":[{out}],\"in\":[{inc}]}}",
+        cell,
+        jvec3(g.cell_origin(cell))
+    ))
+}
+
 fn order_name(o: Option<ControlOrder>) -> &'static str {
     match o {
         None => "none",
@@ -587,8 +654,9 @@ fn poll_goto(game: &mut GameState, e: EntId, bot: u32, target: Vec3, now: f32) {
     let dz = (origin.z - target.z).abs();
     if dxy <= GOTO_ARRIVE_XY && dz <= GOTO_ARRIVE_Z {
         game.entities[e].bot.puppet.order = Some(ControlOrder::Hold);
+        let traj = traj_json(&std::mem::take(&mut game.entities[e].bot.puppet.traj));
         send(game, format!(
-            "{{\"ev\":\"arrived\",\"bot\":{bot},\"t\":{},\"origin\":{},\"target\":{},\"dist\":{}}}",
+            "{{\"ev\":\"arrived\",\"bot\":{bot},\"t\":{},\"origin\":{},\"target\":{},\"dist\":{},\"traj\":[{traj}]}}",
             jnum(now), jvec3(origin), jvec3(target), jnum(dxy),
         ));
         return;
@@ -603,11 +671,27 @@ fn poll_goto(game: &mut GameState, e: EntId, bot: u32, target: Vec3, now: f32) {
         p.best_since = now;
     } else if now - best_since > STALL_SECS {
         game.entities[e].bot.puppet.order = Some(ControlOrder::Hold);
+        let traj = traj_json(&std::mem::take(&mut game.entities[e].bot.puppet.traj));
         send(game, format!(
-            "{{\"ev\":\"goto_stall\",\"bot\":{bot},\"t\":{},\"origin\":{},\"target\":{},\"dist\":{},\"best\":{},\"secs\":{}}}",
+            "{{\"ev\":\"goto_stall\",\"bot\":{bot},\"t\":{},\"origin\":{},\"target\":{},\"dist\":{},\"best\":{},\"secs\":{},\"traj\":[{traj}]}}",
             jnum(now), jvec3(origin), jvec3(target), jnum(dxy), jnum(best_dist), jnum(STALL_SECS),
         ));
     }
+}
+
+/// Serialize a flight/goto trace as `[t, x,y,z, vx,vy,vz]` rows.
+fn traj_json(traj: &[(f32, Vec3, Vec3)]) -> String {
+    let mut s = String::new();
+    for (ts, o, v) in traj {
+        if !s.is_empty() {
+            s.push(',');
+        }
+        s.push_str(&format!(
+            "[{},{},{},{},{},{},{}]",
+            jnum(*ts), jnum(o.x), jnum(o.y), jnum(o.z), jnum(v.x), jnum(v.y), jnum(v.z)
+        ));
+    }
+    s
 }
 
 fn poll_rj(game: &mut GameState, e: EntId, bot: u32, link: u32, now: f32) {
