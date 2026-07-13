@@ -20,8 +20,12 @@
 use glam::Vec2;
 
 use crate::math::{wrap180, yaw_of};
-use crate::defs::BOT_MOVE_SPEED as MOVE_SPEED;
 use rtx_nav::qphys::AIR_CAP;
+// The pure movement oracles + `Cmd`/`Strafe`/`MOVE_SPEED` now live in `rtx_nav::strafe`, so the
+// navmesh build can run the exact physics the controller flies (curl-jump certification). Glob
+// re-export them here, so both this module's state machine and the rest of the game crate keep
+// using `bhop::air_correct`, `bhop::Cmd`, `bhop::apply_airaccel`, `bhop::MOVE_SPEED`, … unchanged.
+pub use rtx_nav::strafe::*;
 
 /// The engine's fixed bot tick (bots run `SV_RunCmd` at ~77 Hz regardless of what we pass as
 /// `msec`), used only to size the weave band. The live accel math uses the real per-frame `dt`.
@@ -47,9 +51,6 @@ const OMEGA_BASE: f32 = 140.0;
 /// flip per hop (smooth, not the shake) *and* maximizes speed gain. The cost is a wider lateral
 /// sweep (~±55u), which the live navmesh gates by only bunnyhopping open-enough routes.
 const LOBE_DEADBAND: f32 = 34.0;
-/// [`air_correct`] turn rate per degree of heading error (deg/s per deg): a proportional pull toward
-/// the bearing that eases smoothly to zero at alignment, so the correction never snaps.
-const AIR_CORRECT_GAIN: f32 = 6.0;
 /// Extra air turn rate per degree of heading error *beyond* the lobe band (deg/s per deg): inside the
 /// band the smooth slalom is untouched, but once the heading runs off-line — a corridor bend, or a
 /// wall to carve around — the turn ramps to the physical maximum within ~25° of excess error.
@@ -109,79 +110,8 @@ pub const ZIGZAG_ENGAGE: f32 = 96.0;
 /// has a long runway by construction) is left uncapped.
 const ZIGZAG_BAND_CAP: f32 = 15.0;
 
-/// The most air speed a single tick can add along the wish direction: `accel · maxspeed · dt`. At any
-/// sane tickrate this exceeds [`AIR_CAP`], putting the optimum at a perpendicular strafe.
-pub fn air_accel_max(accel: f32, maxspeed: f32, dt: f32) -> f32 {
-    accel * maxspeed * dt
-}
-
-/// The wish angle off the velocity (degrees) that maximizes the per-tick speed gain, from the
-/// air-accel geometry: the gain² is `2·u·a + a²` with `u = s·cosθ` and `a = min(a_max, cap − u)`.
-/// When `a_max ≥ cap` (the usual case) the optimum is `u = 0` → **90°, perpendicular**; otherwise
-/// it's `u = cap − a_max`. One formula covers both and degrades gracefully at coarse tickrates.
-pub fn theta_star(speed: f32, a_max: f32) -> f32 {
-    let u_star = (AIR_CAP - a_max.min(AIR_CAP)).max(0.0);
-    (u_star / speed.max(1.0)).clamp(0.0, 1.0).acos().to_degrees()
-}
-
-/// The fastest heading turn rate (deg/s) an air-strafe can sustain at `speed`: a perpendicular
-/// strafe adds `min(a_max, cap)` ups sideways per tick, rotating the velocity by `atan(that/speed)`.
-/// This is the ceiling [`strafe_rate`] clamps a requested rate to (and where it degenerates to the
-/// max-gain [`theta_star`] angle).
-pub fn omega_max(speed: f32, a_max: f32, dt: f32) -> f32 {
-    let a = a_max.min(AIR_CAP);
-    (a / speed.max(1.0)).atan().to_degrees() / dt.max(1e-4)
-}
-
-/// An air-strafe that turns the velocity at a *chosen* rate `omega_deg` (deg/s) rather than the
-/// speed-optimal maximum — the smooth-lobe primitive. The turn rate is set by how much sideways
-/// speed the tick adds: `a_need = speed·tan(ω·dt)`. Angling the wish so its projection onto the
-/// velocity is `cap − a_need` (i.e. `θ = acos((cap − a_need)/speed)`, forward of perpendicular)
-/// delivers exactly that sideways add while the parallel component still grows the speed. When the
-/// requested rate meets or exceeds what the tick can physically deliver, fall back to the max-rate
-/// [`theta_star`] angle (perpendicular). `sigma` is the strafe side (±1).
-///
-/// The wish (world direction `vel_yaw + sigma·θ`) is expressed with the **view riding the velocity**
-/// and the angle carried in `forward`/`side` (`MOVE·cosθ`, `−sigma·MOVE·sinθ`) rather than offsetting
-/// the view by `sigma·(θ−90)` with a single strafe key. Same wishdir, but the strafe-side flip no
-/// longer *jumps* the view yaw (the eyes just sweep with the velocity), so the gait doesn't twitch.
-pub fn strafe_rate(v_xy: Vec2, sigma: f32, omega_deg: f32, a_max: f32, dt: f32) -> Strafe {
-    let speed = v_xy.length().max(1.0);
-    let vel_yaw = yaw_of(v_xy);
-    let cap = a_max.min(AIR_CAP);
-    let a_need = speed * (omega_deg.to_radians() * dt).tan();
-    let theta = if a_need >= cap {
-        theta_star(speed, a_max)
-    } else {
-        ((AIR_CAP - a_need).max(0.0) / speed).clamp(0.0, 1.0).acos().to_degrees()
-    };
-    let tr = theta.to_radians();
-    Strafe {
-        view_yaw: vel_yaw,
-        forward: MOVE_SPEED * tr.cos(),
-        side: -sigma * MOVE_SPEED * tr.sin(),
-        sigma,
-    }
-}
-
-/// Mid-air course correction toward a fixed `bearing` — for a gap jump or rocket-jump arc, where
-/// there is no hop cycle, just an arc to steer onto the landing line. A single continuous strafe
-/// whose turn rate is proportional to the heading error and eases to zero at alignment (at `err ≈ 0`
-/// the wish projects exactly onto the [`AIR_CAP`] and adds nothing — a coast on the current heading).
-/// No mode switch and no deadband, so the returned wish never snaps. The strafe *side* still flips as
-/// `err` crosses zero, but there the turn rate is ~0 and the wish is inert, so the caller applies the
-/// wish in **world space** and steers the eyes separately — the flip never moves the view.
-pub fn air_correct(v_xy: Vec2, bearing: f32, a_max: f32, dt: f32, gain: f32) -> Strafe {
-    let speed = v_xy.length().max(1.0);
-    let vel_yaw = yaw_of(v_xy);
-    let err = wrap180(bearing - vel_yaw);
-    let omega = (err.abs() * gain).min(omega_max(speed, a_max, dt));
-    strafe_rate(v_xy, err.signum(), omega, a_max, dt)
-}
-
-/// The default air-curl gain (°/s per ° of heading error), exposed so callers passing "no override"
-/// use the tuned value. See [`AIR_CORRECT_GAIN`].
-pub const AIR_CORRECT_GAIN_DEFAULT: f32 = AIR_CORRECT_GAIN;
+// `air_accel_max`, `theta_star`, `omega_max`, `strafe_rate`, `air_correct`, and `AIR_CORRECT_GAIN_DEFAULT`
+// now live in `rtx_nav::strafe` (glob-re-exported above), shared with the navmesh build's curl certifier.
 
 /// Heading deadband (degrees) for the strafe-sign weave, sized from the physics so the sign flips
 /// ~[`FLIPS_PER_HOP`] times per hop: a perpendicular strafe rotates the velocity by
@@ -207,20 +137,6 @@ fn weave_sigma(err: f32, prev_sigma: f32, band: f32) -> f32 {
     } else {
         prev_sigma // keep curving the same way
     }
-}
-
-/// One frame's strafe usercmd, from [`strafe`] (air) or [`prestrafe`] (ground).
-#[derive(Clone, Copy, Debug)]
-pub struct Strafe {
-    /// View yaw to send (degrees).
-    pub view_yaw: f32,
-    /// `forward` move component: 0 in the air (single-key strafe); the bearing-aligned share of
-    /// the wish during a ground prestrafe.
-    pub forward: f32,
-    /// `side` move component (± [`MOVE_SPEED`]).
-    pub side: f32,
-    /// The strafe sign chosen this frame (±1), to carry into the next as sticky state.
-    pub sigma: f32,
 }
 
 /// The **max-rate** air-strafe: aim the view so a single held strafe key puts the wish direction at
@@ -354,18 +270,7 @@ pub struct Input {
     pub now: f32,
 }
 
-/// The usercmd the controller wants this frame.
-#[derive(Clone, Copy, Debug)]
-pub struct Cmd {
-    /// View yaw to send (degrees); the caller supplies pitch.
-    pub view_yaw: f32,
-    /// `forward` move component.
-    pub forward: f32,
-    /// `side` move component.
-    pub side: f32,
-    /// Press `BUTTON_JUMP` this frame.
-    pub jump: bool,
-}
+// `Cmd` (the usercmd the controller emits) now lives in `rtx_nav::strafe`, glob-re-exported above.
 
 /// The bunnyhop controller's per-bot state. Lives on `BotState`; drive with [`Bhop::step`].
 #[derive(Default, Clone, Debug)]
@@ -617,60 +522,9 @@ impl Bhop {
     }
 }
 
-// --- engine oracles (tests + documentation of the model the live engine implements) --------------
-
-/// A faithful one-tick QuakeWorld `PM_AirAccelerate`: the wish speed's projection onto the velocity
-/// is capped at [`AIR_CAP`], and `accel·wishspeed·dt` (uncapped `wishspeed`) is added along
-/// `wishdir`. Used as the unit-test oracle for the controller (and to document the model the live
-/// engine implements — the engine, not this module, applies it at runtime).
-#[allow(dead_code)]
-pub fn apply_airaccel(v: Vec2, wishdir: Vec2, wishspeed: f32, accel: f32, dt: f32) -> Vec2 {
-    let addspeed = wishspeed.min(AIR_CAP) - v.dot(wishdir);
-    if addspeed <= 0.0 {
-        return v;
-    }
-    let accelspeed = (accel * wishspeed * dt).min(addspeed);
-    v + wishdir * accelspeed
-}
-
-/// A faithful one-tick QuakeWorld `PM_Accelerate` (ground): as [`apply_airaccel`] but the
-/// projection limit is the full `wishspeed` (≤ `sv_maxspeed`), not [`AIR_CAP`].
-#[allow(dead_code)]
-pub fn apply_groundaccel(v: Vec2, wishdir: Vec2, wishspeed: f32, accel: f32, dt: f32) -> Vec2 {
-    let addspeed = wishspeed - v.dot(wishdir);
-    if addspeed <= 0.0 {
-        return v;
-    }
-    let accelspeed = (accel * wishspeed * dt).min(addspeed);
-    v + wishdir * accelspeed
-}
-
-/// A faithful one-tick QuakeWorld `PM_Friction` on flat ground: drop `max(speed, stopspeed) ·
-/// friction · dt`, floored at zero.
-#[allow(dead_code)]
-pub fn apply_friction(v: Vec2, friction: f32, stopspeed: f32, dt: f32) -> Vec2 {
-    let speed = v.length();
-    if speed < 1.0 {
-        return Vec2::ZERO;
-    }
-    let drop = speed.max(stopspeed) * friction * dt;
-    v * ((speed - drop).max(0.0) / speed)
-}
-
-/// The wish direction the engine derives from a view yaw and forward/side move components:
-/// `wishvel = forward·(cos, sin) + side·(sin, −cos)`, normalized. Exposed for tests and to make
-/// the view↔wishdir geometry explicit.
-#[allow(dead_code)]
-pub fn wishdir_fs(view_yaw: f32, forward: f32, side: f32) -> Vec2 {
-    let (sy, cy) = view_yaw.to_radians().sin_cos();
-    (Vec2::new(cy, sy) * forward + Vec2::new(sy, -cy) * side).normalize_or_zero()
-}
-
-/// [`wishdir_fs`] for the single-key air strafe (`forward = 0`).
-#[allow(dead_code)]
-pub fn wishdir_of(view_yaw: f32, side: f32) -> Vec2 {
-    wishdir_fs(view_yaw, 0.0, side)
-}
+// The one-tick engine oracles (`apply_airaccel`/`apply_groundaccel`/`apply_friction`, `wishdir_fs`,
+// `wishdir_of`) now live in `rtx_nav::strafe` (glob-re-exported above), shared with the offline pmove
+// sim and the navmesh build's curl certifier so all three drive identical physics.
 
 #[cfg(test)]
 mod tests {
