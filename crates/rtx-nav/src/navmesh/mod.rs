@@ -646,10 +646,17 @@ impl NavGraph {
                 ((horiz / avg).max(floor_cost), band_of(v_out))
             }
             LinkKind::SpeedJump => {
-                let (v_req, airtime, chained) = self
+                let (v_req, airtime, chained, curl_gain) = self
                     .speed_jump_of_link(li)
-                    .map(|t| (t.v_req, t.airtime, t.chained))
-                    .unwrap_or((MAX_SPEED, 0.0, false));
+                    .map(|t| (t.v_req, t.airtime, t.chained, t.curl_gain))
+                    .unwrap_or((MAX_SPEED, 0.0, false, 0.0));
+                // A curl speed jump was certified end-to-end at build time — the rollout solver measured
+                // a run-up that the ground circle-strafe genuinely delivers (which the conservative
+                // air-strafe recompute below has no term for and badly under-credits). So trust its
+                // stored cost and exit at its certified takeoff speed, rather than re-pricing the run-up.
+                if curl_gain > 0.0 && !chained {
+                    return Some((link.cost.max(floor_cost), band_of(v_in.max(v_req))));
+                }
                 // A chained jump has no runway: traversable only if the entry band already carries it.
                 if chained && v_in < v_req * SJ_MARGIN {
                     return None;
@@ -2078,7 +2085,7 @@ mod tests {
     fn banded_graph(
         origins: &[Vec3],
         links: &[(CellId, CellId, LinkKind, f32)],
-        sjs: &[(usize, f32, f32, bool)],
+        sjs: &[(usize, f32, f32, bool, f32)],
     ) -> NavGraph {
         let cells = origins
             .iter()
@@ -2094,8 +2101,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut speed_jumps = SideTable::default();
-        for &(li, v_req, airtime, chained) in sjs {
-            let s = speed_jumps.push(SpeedJumpTraversal { takeoff: origins[links[li].from as usize], v_req, airtime, chained, curl_gain: 0.0 });
+        for &(li, v_req, airtime, chained, curl_gain) in sjs {
+            let s = speed_jumps.push(SpeedJumpTraversal { takeoff: origins[links[li].from as usize], v_req, airtime, chained, curl_gain });
             speed_jumps.tag(li, s);
         }
         NavGraph {
@@ -2137,7 +2144,7 @@ mod tests {
             let g = banded_graph(
                 &origins,
                 &[(0, 1, kind, 3.0)],
-                if kind == LinkKind::SpeedJump { &[(0, 350.0, 0.7, false)] } else { &[] },
+                if kind == LinkKind::SpeedJump { &[(0, 350.0, 0.7, false, 0.0)] } else { &[] },
             );
             let horiz = (origins[1].xy() - origins[0].xy()).length();
             for band in 0..NBANDS as u8 {
@@ -2187,7 +2194,7 @@ mod tests {
                 (2, 3, LinkKind::Walk, 0.625),
                 (3, 4, LinkKind::SpeedJump, 1.7),
             ],
-            &[(1, 350.0, 0.7, true), (3, 350.0, 0.7, true)],
+            &[(1, 350.0, 0.7, true, 0.0), (3, 350.0, 0.7, true, 0.0)],
         );
         // Speed-unaware: the chained legs are priced away, so C is effectively unreachable.
         let flood = g.costs_from(0, &LinkCosts::default());
@@ -2202,6 +2209,27 @@ mod tests {
         );
     }
 
+    /// A certified curl speed jump is priced at its stored cost, so the planner takes it over a
+    /// detour that beats the conservative per-`v_req` recompute a *straight* speed jump still gets.
+    #[test]
+    fn banded_prefers_certified_curl_over_detour() {
+        // Direct curl R->C (cost 2.0) vs a two-JumpGap detour R->M->C (2 × 1.3 = 2.6). A straight
+        // speed jump would be repriced from v_req (391 from a standstill ≈ 3.2s) and lose to the
+        // detour; the curl's certified cost (2.0) wins. Same geometry, only the curl flag differs.
+        let origins = [Vec3::ZERO, Vec3::new(600.0, 300.0, 0.0), Vec3::new(300.0, 150.0, 0.0)];
+        let links = [
+            (0, 1, LinkKind::SpeedJump, 2.0), // the curl (or straight) under test
+            (0, 2, LinkKind::JumpGap, 1.3),   // detour leg 1
+            (2, 1, LinkKind::JumpGap, 1.3),   // detour leg 2
+        ];
+        let curl = banded_graph(&origins, &links, &[(0, 391.0, 0.68, false, 12.0)]);
+        let route = curl.find_path_banded(0, 1, MAX_SPEED, &LinkCosts::default()).expect("route exists");
+        assert_eq!(route.links, vec![0], "the certified curl must be taken over the detour");
+        let straight = banded_graph(&origins, &links, &[(0, 391.0, 0.68, false, 0.0)]);
+        let route2 = straight.find_path_banded(0, 1, MAX_SPEED, &LinkCosts::default()).expect("route exists");
+        assert_eq!(route2.links, vec![1, 2], "a straight speed jump is repriced high; the detour wins");
+    }
+
     /// Carried speed only survives a corner within the heading cone: a straight approach reaches a
     /// chained speed jump feasibly, an L-shaped one arrives demoted to band 0 and can't take it.
     #[test]
@@ -2210,7 +2238,7 @@ mod tests {
             [Vec3::ZERO, Vec3::new(2000.0, 0.0, 0.0), Vec3::new(to_x, to_y, 0.0)]
         };
         let links = [(0, 1, LinkKind::Walk, 6.25), (1, 2, LinkKind::SpeedJump, 1.7)];
-        let sj = [(1usize, 350.0, 0.7, true)];
+        let sj = [(1usize, 350.0, 0.7, true, 0.0)];
         // Straight: R→M→C all along +x — the carried band satisfies the chained jump.
         let straight = banded_graph(&long_walk(2300.0, 0.0), &links, &sj);
         assert!(

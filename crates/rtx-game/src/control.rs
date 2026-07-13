@@ -834,12 +834,17 @@ fn plant_link_json(game: &mut GameState, from: Vec3, takeoff: Vec3, tgt: Vec3, v
         let g = game.host.cvar(c"rtx_jump_curl_gain");
         if g > 0.0 { g } else { 12.0 }
     };
+    // Curl-link cost the banded planner now trusts (see `banded_step`): the honest run-up travel +
+    // flight + a JumpGap-grade commitment (a rollout-certified envelope carries less risk than the
+    // +1.0 charged to a modeled speed jump). Run-up is the `from`→lip distance at the mean build speed.
+    let runup = (takeoff.xy() - g.cell_origin(from_cell).xy()).length();
+    let cost = runup / 400.0 + airtime + 0.3;
     let tr = SpeedJumpTraversal { takeoff, v_req, airtime, chained: false, curl_gain };
-    let li = g.plant_speed_jump(from_cell, to_cell, airtime + 1.0, tr);
+    let li = g.plant_speed_jump(from_cell, to_cell, cost, tr);
     let (fo, to) = (g.cell_origin(from_cell), g.cell_origin(to_cell));
     Ok(format!(
-        "{{\"link\":{li},\"from_cell\":{from_cell},\"to_cell\":{to_cell},\"from\":{},\"tgt\":{},\"takeoff\":{},\"v_req\":{},\"airtime\":{}}}",
-        jvec3(fo), jvec3(to), jvec3(takeoff), jnum(v_req), jnum(airtime),
+        "{{\"link\":{li},\"from_cell\":{from_cell},\"to_cell\":{to_cell},\"from\":{},\"tgt\":{},\"takeoff\":{},\"v_req\":{},\"airtime\":{},\"cost\":{}}}",
+        jvec3(fo), jvec3(to), jvec3(takeoff), jnum(v_req), jnum(airtime), jnum(cost),
     ))
 }
 

@@ -589,8 +589,12 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 committed: sj_active,
                 carry,
                 hold_jump: sj_hold,
+                // The takeoff regime (hold ground prestrafe to the lip, leap once) is only for *curl*
+                // jumps, which need a run-up the ground circle-strafe builds. A straight speed jump keeps
+                // the pre-existing hop-chain takeoff — its air-strafe runway can exceed the ~490 prestrafe
+                // ceiling, which the hold-to-lip regime would cap it below. So gate on the curl flag.
                 takeoff_speed: match sj_takeoff {
-                    Some((_, v_req)) if sj_active => v_req,
+                    Some((_, v_req)) if sj_active && sj_curl_gain > 0.0 => v_req,
                     _ => 0.0,
                 },
                 // Curl only jumps flagged as curls (straight speed jumps keep the slalom untouched). The
