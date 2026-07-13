@@ -91,9 +91,13 @@ const RJ_MAX_RISE: f32 = 320.0;
 /// Lowest a target may sit above the source and still be worth a rocket jump (below this a jump or
 /// double jump already reaches — see the useful-gate).
 const RJ_MIN_RISE: f32 = 40.0;
-/// Landing acceptance window (XY / Z above the target cell), like the hook's.
+/// Landing acceptance window: how far the solved touchdown may sit from a cell for the shot to count
+/// as landing *on* it. Tight in Z — a rocket jump must put the bot squarely on the ledge, not a
+/// player-height below it. A looser Z (was 48, a full hull) let `nearest_within` snap a landing that
+/// fell ~42u short up onto the higher target cell, minting links that structurally undershoot (~24%
+/// of them). 24 keeps the snap to at most a half-hull, so a generated link actually reaches its target.
 const RJ_LAND_XY: f32 = 24.0;
-const RJ_LAND_Z: f32 = 48.0;
+const RJ_LAND_Z: f32 = 24.0;
 /// At most this many rocket-jump links per source cell — kept small (each costs the bot ~50HP to
 /// fly, so a map wants a handful of genuinely-useful ones, not a spray).
 const RJ_MAX_PER_CELL: usize = 2;
@@ -854,6 +858,7 @@ impl NavGraph {
                                 blast: s.blast,
                                 pos_blast: s.pos_blast,
                                 v0: s.v0,
+                                land: s.land,
                                 airtime: s.airtime,
                                 self_damage: s.self_damage,
                             };
@@ -1022,6 +1027,11 @@ pub struct RocketJumpTraversal {
     /// Continuation velocity just after the blast — re-flown by the build/test.
     #[allow(dead_code)]
     pub v0: Vec3,
+    /// The solver's predicted landing position (where the post-blast arc touches down). Telemetry /
+    /// test only — lets the harness tell a physics miss (runtime ≠ this) from an acceptance snap
+    /// (this ≠ the target cell).
+    #[allow(dead_code)]
+    pub land: Vec3,
     /// Simulated airtime of the parabola after the blast — the runtime's Ballistic watchdog base.
     pub airtime: f32,
     /// Pre-armor self-damage points from the blast — the runtime's health gate.

@@ -553,7 +553,7 @@ fn links_json(game: &GameState) -> Result<String, String> {
             items.push(',');
         }
         items.push_str(&format!(
-            "{{\"link\":{li},\"src\":{},\"tgt\":{},\"fire_pitch\":{},\"fire_yaw\":{},\"fire_delay\":{},\"airtime\":{},\"self_damage\":{},\"v0\":{},\"blast\":{}}}",
+            "{{\"link\":{li},\"src\":{},\"tgt\":{},\"fire_pitch\":{},\"fire_yaw\":{},\"fire_delay\":{},\"airtime\":{},\"self_damage\":{},\"v0\":{},\"blast\":{},\"pos_blast\":{},\"land\":{}}}",
             jvec3(src),
             jvec3(tgt),
             jnum(tr.fire_angles.x),
@@ -563,6 +563,8 @@ fn links_json(game: &GameState) -> Result<String, String> {
             jnum(tr.self_damage),
             jvec3(tr.v0),
             jvec3(tr.blast),
+            jvec3(tr.pos_blast),
+            jvec3(tr.land),
         ));
     }
     Ok(format!("{{\"links\":[{items}]}}"))
