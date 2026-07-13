@@ -809,6 +809,10 @@ impl NavGraph {
             return; // submerged takeoff: can't jump to start the rocket jump (the jump input swims up)
         }
         let is_solid = |p: Vec3| bsp.is_solid(p);
+        // The rocket is a zero-size point, so it collides on the render hull (hull 0) and reaches the
+        // true floor/wall — ~24u below the inflated player-hull surface `is_solid` reports. The solve
+        // detonates the shot on this hull so the blast geometry matches what the engine produces.
+        let rocket_solid = |p: Vec3| bsp.is_point_solid(p);
         // Height an RJ must clear to earn its health cost: past a plain (or double) jump's apex.
         let useful_apex = if double_jump { DOUBLE_JUMP_APEX } else { JUMP_APEX };
         // best per (compass octant, 128u elevation band): (cost, link, traversal)
@@ -821,7 +825,7 @@ impl NavGraph {
             for pitch in RJ_PITCHES {
                 for delay in RJ_DELAYS {
                     let angles = Vec3::new(pitch, fire_yaw, 0.0);
-                    let Some(s) = simulate_rocket_jump(is_solid, a, angles, delay, params) else {
+                    let Some(s) = simulate_rocket_jump(is_solid, rocket_solid, a, angles, delay, params) else {
                         continue;
                     };
                     let Some(to) = self.nearest_within(s.land, RJ_LAND_XY, RJ_LAND_Z) else {
@@ -838,7 +842,7 @@ impl NavGraph {
                     if useful
                         && in_range
                         && !self.has_direct_link(from, to)
-                        && rj_perturb_ok(is_solid, a, angles, delay, params, b)
+                        && rj_perturb_ok(is_solid, rocket_solid, a, angles, delay, params, b)
                     {
                         let cost = rocket_jump_cost(s.t_blast, s.airtime, s.vz_land, s.self_damage);
                         let key = (dir_bucket(dgx, dgy), (dz / 128.0).floor() as i32);

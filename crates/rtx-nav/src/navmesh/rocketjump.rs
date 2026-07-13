@@ -88,8 +88,15 @@ pub(super) struct RjSolution {
 /// Two-phase integration of a rocket jump from standing origin `a`, firing `fire_angles` at
 /// `fire_delay` seconds into the jump. Returns the flight outcome, or `None` if the shot finds no
 /// surface, the ascent hits a ceiling, the blast is out of self-splash range, or the arc never lands.
+///
+/// Two solidity oracles, because a rocket and a player collide on different hulls: `player_solid` is
+/// the player box (hull 1, used for the ascent-ceiling check and the post-blast landing arc), while
+/// `rocket_solid` is a point (hull 0) — the rocket is a zero-size missile, so it detonates on the
+/// *true* surface, ~24u below (16u nearer) the inflated player-hull floor. Marching the rocket on the
+/// player hull would stop it too high, overestimating the blast (this was the undershoot bug).
 pub(super) fn simulate_rocket_jump(
-    is_solid: impl Fn(Vec3) -> bool + Copy,
+    player_solid: impl Fn(Vec3) -> bool + Copy,
+    rocket_solid: impl Fn(Vec3) -> bool + Copy,
     a: Vec3,
     fire_angles: Vec3,
     fire_delay: f32,
@@ -98,17 +105,17 @@ pub(super) fn simulate_rocket_jump(
     let g = params.gravity;
     let dir = fire_dir(fire_angles);
 
-    // Muzzle at the fire moment, then march the rocket to the surface it detonates on.
+    // Muzzle at the fire moment, then march the rocket (a point, on hull 0) to the surface it detonates on.
     let (pos_fire, _) = jump_state(a, fire_delay, g);
     let muzzle = pos_fire + dir * MUZZLE_FWD + Vec3::new(0.0, 0.0, MUZZLE_Z);
-    let blast = march_to_solid(is_solid, muzzle, dir, RJ_ROCKET_RANGE)?;
+    let blast = march_to_solid(rocket_solid, muzzle, dir, RJ_ROCKET_RANGE)?;
     let t_blast = fire_delay + (blast - muzzle).length() / ROCKET_SPEED;
 
-    // The rising bot must not clip a ceiling before the blast (its head at `PLAYER_TOP_Z`).
+    // The rising bot must not clip a ceiling before the blast (its head at `PLAYER_TOP_Z`, hull 1).
     let mut t = 0.0;
     while t < t_blast {
         let (p, _) = jump_state(a, t, g);
-        if is_solid(p + Vec3::new(0.0, 0.0, PLAYER_TOP_Z)) {
+        if player_solid(p + Vec3::new(0.0, 0.0, PLAYER_TOP_Z)) {
             return None;
         }
         t += HOOK_SIM_DT;
@@ -132,7 +139,7 @@ pub(super) fn simulate_rocket_jump(
     }
     let v0 = vel_b + dv;
 
-    match simulate_arc(is_solid, pos_b, v0, g) {
+    match simulate_arc(player_solid, pos_b, v0, g) {
         ArcResult::Land { pos, airtime, vz } => Some(RjSolution {
             land: pos,
             airtime,
@@ -153,7 +160,8 @@ pub(super) fn simulate_rocket_jump(
 /// ±1.5° on each fire axis (aim-spring settle error), and ±16 u of launch-stance error. This
 /// rejects fp-fragile grazing arcs whose landing swings wildly with a hair of input change.
 pub(super) fn rj_perturb_ok(
-    is_solid: impl Fn(Vec3) -> bool + Copy,
+    player_solid: impl Fn(Vec3) -> bool + Copy,
+    rocket_solid: impl Fn(Vec3) -> bool + Copy,
     a: Vec3,
     angles: Vec3,
     delay: f32,
@@ -162,7 +170,7 @@ pub(super) fn rj_perturb_ok(
 ) -> bool {
     let lands = |la: Vec3, ang: Vec3, del: f32| {
         matches!(
-            simulate_rocket_jump(is_solid, la, ang, del, params),
+            simulate_rocket_jump(player_solid, rocket_solid, la, ang, del, params),
             Some(s)
                 if (s.land.xy() - b.xy()).length() <= RJ_LAND_XY * 2.0
                     && (s.land.z - b.z).abs() <= RJ_LAND_Z * 2.0
@@ -198,13 +206,18 @@ mod tests {
     /// past the double-jump envelope (`DOUBLE_ARC_PEAK` = 100).
     #[test]
     fn rocket_jump_two_phase_solution() {
-        let floor = |p: Vec3| p.z <= 0.0;
+        // The player box rests on a floor at z=0 (its origin a hull-height above); the point rocket
+        // reaches the true surface 24u lower (the player-hull floor is inflated by `-mins.z = 24`).
+        let player_floor = |p: Vec3| p.z <= 0.0;
+        let rocket_floor = |p: Vec3| p.z <= -24.0;
         let a = Vec3::new(0.0, 0.0, 24.0); // standing origin a hull-height above the floor
         let params = RocketJumpParams { gravity: 800.0, rj_extra: 0.0 };
-        let s = simulate_rocket_jump(floor, a, Vec3::new(80.0, 0.0, 0.0), 0.05, params)
+        let s = simulate_rocket_jump(player_floor, rocket_floor, a, Vec3::new(80.0, 0.0, 0.0), 0.05, params)
             .expect("vertical rocket jump should solve over a flat floor");
-        assert!((s.t_blast - 0.10).abs() < 0.03, "t_blast {} not ~0.10", s.t_blast);
-        assert!((45.0..=55.0).contains(&s.self_damage), "self_damage {} not ~50", s.self_damage);
+        assert!((s.t_blast - 0.12).abs() < 0.04, "t_blast {} not ~0.12", s.t_blast);
+        // Blast on the real floor (24u lower) sits further from the player box, so self-damage is a
+        // touch below the old hull-1 figure (~50): the honest health cost.
+        assert!((38.0..=52.0).contains(&s.self_damage), "self_damage {} not ~44", s.self_damage);
         // Post-blast apex above the launch, from the continuation velocity.
         let apex = s.pos_blast.z + s.v0.z * s.v0.z / (2.0 * params.gravity) - a.z;
         assert!((150.0..=340.0).contains(&apex), "apex {apex} outside the RJ envelope");
@@ -221,7 +234,9 @@ mod tests {
         let a = Vec3::new(0.0, 0.0, 24.0);
         let params = RocketJumpParams { gravity: 800.0, rj_extra: 0.0 };
         for delay in [0.05f32, 0.15, 0.25] {
-            if let Some(s) = simulate_rocket_jump(floor, a, Vec3::new(80.0, 0.0, 0.0), delay, params) {
+            // The falloff→self_damage identity holds for any blast geometry, so a single floor for both
+            // oracles suffices here (the hull distinction is exercised by rocket_jump_two_phase_solution).
+            if let Some(s) = simulate_rocket_jump(floor, floor, a, Vec3::new(80.0, 0.0, 0.0), delay, params) {
                 let d = (s.blast - (s.pos_blast + Vec3::new(0.0, 0.0, PLAYER_CENTER_Z))).length();
                 let game = (120.0 - 0.5 * d).max(0.0) * 0.5;
                 assert!((s.self_damage - game).abs() < 1e-3, "self_damage {} != game {game}", s.self_damage);
@@ -239,10 +254,10 @@ mod tests {
         let a = Vec3::new(0.0, 0.0, 24.0);
         let params = RocketJumpParams { gravity: 800.0, rj_extra: 0.0 };
         // Find any nominal solve, then confirm perturb is stricter than a bare solve near a pit edge.
-        if let Some(s) = simulate_rocket_jump(world, a, Vec3::new(60.0, 0.0, 0.0), 0.15, params) {
+        if let Some(s) = simulate_rocket_jump(world, world, a, Vec3::new(60.0, 0.0, 0.0), 0.15, params) {
             if (170.0..280.0).contains(&s.land.x) {
                 assert!(
-                    !rj_perturb_ok(world, a, Vec3::new(60.0, 0.0, 0.0), 0.15, params, s.land),
+                    !rj_perturb_ok(world, world, a, Vec3::new(60.0, 0.0, 0.0), 0.15, params, s.land),
                     "perturb accepted an arc landing at a pit edge"
                 );
             }

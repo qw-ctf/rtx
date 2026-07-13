@@ -299,6 +299,15 @@ impl Bsp {
         self.hull1_contents(p) == CONTENTS_SOLID
     }
 
+    /// Whether a **point** at `p` is inside solid world geometry, tested against the render hull
+    /// (hull 0) rather than the inflated player hull. A zero-size projectile (the rocket, spawned with
+    /// `setsize 0 0`) collides on this hull, so it reaches the *true* floor/wall — ~24u below (16u
+    /// nearer) than [`is_solid`](Self::is_solid)'s player-box surface. Used by the rocket-jump solve to
+    /// detonate the shot where the engine actually would.
+    pub fn is_point_solid(&self, p: Vec3) -> bool {
+        self.pointcontents(p) == CONTENTS_SOLID
+    }
+
     /// Trace the segment `p1 → p2` through the world's player hull (hull 1) — a port of
     /// `SV_RecursiveHullCheck`. Returns where it first hits solid (`fraction`/`endpos`) and the
     /// **surface normal** of the plane it struck (`plane_normal`, oriented against the segment), so a
