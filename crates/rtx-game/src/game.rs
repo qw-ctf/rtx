@@ -143,6 +143,9 @@ pub struct GameState {
     /// through the same precache-guaranteeing door. Use `dyn_assets.sound(&host, path)`.
     #[allow(dead_code)]
     pub(crate) dyn_assets: DynAssets,
+    /// External bot-control channel (rocket-jump tuning harness). Inert (no socket bound) unless
+    /// `rtx_control_port` is set. Persists across maps — the listener binds once. See [`crate::control`].
+    pub(crate) control: crate::control::ControlState,
 }
 
 impl GameState {
@@ -201,6 +204,7 @@ impl GameState {
             normal_bot_drive_logged: false,
             pending_roster: None,
             dyn_assets: DynAssets::default(),
+            control: crate::control::ControlState::default(),
         }
     }
 
@@ -563,6 +567,9 @@ impl GameState {
             return 1;
         }
         if is_bot_frame == 0 {
+            // Rocket-jump control harness: bind the listener (once `rtx_control_port` is set) and drain
+            // any queued commands before the bots run, so a puppet order takes effect this frame.
+            crate::control::frame_begin(self);
             world::start_frame(self);
             // Auto-advance a configured map rotation past the intermission scoreboard.
             self.map_queue_frame();
@@ -586,6 +593,9 @@ impl GameState {
                 bot::run_bots(self);
             }
             self.bot_frame_seen = false;
+            // Emit the harness's puppet lifecycle events after the bots have run (so a landing/stall
+            // this frame is observed the frame it happens). No-op unless the control channel is up.
+            crate::control::frame_end(self);
         } else {
             self.bot_frame_seen = true;
             bot::run_bots(self);

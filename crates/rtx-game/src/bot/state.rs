@@ -81,6 +81,10 @@ pub struct BotState {
     /// Rocket-jump traversal machine (see [`RjState`]): stance → jump → fire → ride the blast arc
     /// onto a high ledge.
     pub rj: RjState,
+    /// External puppet control (rocket-jump test harness, see [`crate::control`]): a scripted order
+    /// overriding the bot's own objective, plus the goto stall tracker. `order == None` for a normal,
+    /// autonomous bot — the whole harness path is inert unless the control channel issues an order.
+    pub puppet: Puppet,
 }
 
 impl BotState {
@@ -339,6 +343,104 @@ pub struct RjState {
     pub jump_time: f32,
     /// Consecutive-failure count (two aborts avoid the goal, like the hook).
     pub fails: u8,
+    /// Per-attempt telemetry for the test harness — written by the driver / `emit` as the attempt
+    /// unfolds and drained by [`crate::control`]. Inert for autonomous play (nothing consumes it; the
+    /// next Stance entry overwrites it), so it only matters under a puppet order. See [`RjTelemetry`].
+    pub telem: RjTelemetry,
+}
+
+/// One rocket-jump attempt's measurements, for the tuning harness (see [`crate::control`]). Populated
+/// as the attempt runs — the solved plan and knob biases at Stance entry, the actual jump press and
+/// rocket fire, and a terminal [`RjOutcome`] — then read once by the control poller to emit an
+/// `rj_result` event. Everything the offline solve *predicted* sits beside what the bot *did*, so the
+/// per-attempt error (stance offset, aim error, fire-timing error, landing miss) is directly derivable.
+#[derive(Default, Clone)]
+pub struct RjTelemetry {
+    /// The rocket-jump link this attempt is flying.
+    pub link: u32,
+    /// The launch cell origin (source) and the target ledge cell origin, from the graph.
+    pub src: Vec3,
+    pub tgt: Vec3,
+    /// The offline solve for this link: fire angles (pitch,yaw), fire delay after the jump, post-blast
+    /// airtime, and pre-armor self-damage.
+    pub solved_angles: Vec3,
+    pub solved_delay: f32,
+    pub airtime: f32,
+    pub self_damage: f32,
+    /// The knob biases in force at Stance entry (added to the solved delay/pitch), snapshotted so the
+    /// result reports what was actually flown even if a knob changes mid-attempt.
+    pub delay_bias: f32,
+    pub pitch_bias: f32,
+    /// The jump press (`None` until it happens), the rocket fire, and the terminal outcome.
+    pub press: Option<RjPress>,
+    pub fire: Option<RjFire>,
+    pub outcome: Option<RjOutcome>,
+}
+
+/// The jump-press moment of a rocket-jump attempt (see [`RjTelemetry`]): when it fired, the origin and
+/// post-spring view then, and the residual aim error (degrees) against the biased fire angles.
+#[derive(Clone, Copy)]
+pub struct RjPress {
+    pub t: f32,
+    pub origin: Vec3,
+    pub view: Vec3,
+    pub aim_err: f32,
+}
+
+/// The rocket-fire moment of a rocket-jump attempt (see [`RjTelemetry`]): when it fired, the actual
+/// delay since the jump press (vs the solved delay), the origin, and the post-spring view sent with
+/// `+attack` (filled in `emit`, where the settled view is known).
+#[derive(Clone, Copy)]
+pub struct RjFire {
+    pub t: f32,
+    pub actual_delay: f32,
+    pub origin: Vec3,
+    pub view: Vec3,
+}
+
+/// How a rocket-jump attempt ended (see [`RjTelemetry`]). `Landed`/`Overran` carry the touchdown
+/// origin and time so the harness can measure the landing miss; the failure variants mark *where* the
+/// attempt broke down (stance never aligned, jump swallowed, unfit, etc.).
+#[derive(Clone, Copy)]
+pub enum RjOutcome {
+    /// Touched down; `on_target` is whether it was within the on-target window of the goal.
+    Landed { on_target: bool, origin: Vec3, t: f32 },
+    /// Never landed cleanly within the airtime budget.
+    Overran { origin: Vec3, t: f32 },
+    /// The stance never aligned enough to release the jump within the timeout.
+    StanceTimeout,
+    /// The jump was pressed but the bot never left the ground (swallowed).
+    LiftoffTimeout,
+    /// The fitness pre-check failed on arrival (no RL/rocket/health, or quad running).
+    Unfit,
+    /// An enemy appeared before commitment, so combat pre-empted (never fires under a puppet order).
+    EnemyAbort,
+    /// The pinned leg is no longer a solvable rocket jump (graph rebuilt out from under the attempt).
+    LegVanished,
+}
+
+/// External puppet control state (rocket-jump test harness, see [`crate::control`]): the active order
+/// (if any) plus the goto stall tracker. Default (`order == None`) is a normal autonomous bot.
+#[derive(Default)]
+pub struct Puppet {
+    /// The scripted order overriding this bot's objective, or `None` for autonomous play.
+    pub order: Option<ControlOrder>,
+    /// Goto stall detection: the closest straight-line distance to the goto target reached so far, and
+    /// when it last improved. No improvement for a while ⇒ the target is (currently) inaccessible.
+    pub best_dist: f32,
+    pub best_since: f32,
+}
+
+/// A scripted control order for a puppeted bot (see [`crate::control`]). Lives here (not in
+/// `control.rs`) so [`BotState`] carries it without a module cycle. All-`Copy`.
+#[derive(Clone, Copy, PartialEq)]
+pub enum ControlOrder {
+    /// Stand still (between tests, or after an order completes).
+    Hold,
+    /// Navigate to a world position (normal pathfinding, no fighting). Arrival/stall reported.
+    Goto { target: Vec3 },
+    /// Fly a specific rocket-jump link (route pinned to it, repath suppressed). Result reported.
+    RocketJump { link: u32 },
 }
 
 /// The route-progress watchdogs carried on a [`BotState`]: three independent ways a bot detects it

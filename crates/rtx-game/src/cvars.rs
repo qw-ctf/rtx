@@ -121,6 +121,23 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // Costs health, so a bot only plans one when it clearly beats the walk and it's fit to fly it
         // (has the RL, a rocket, and the health). On by default.
         ("rtx_bot_rocketjump", Bool(true)),
+        // Rocket-jump test harness: a TCP control channel (localhost) an external driver connects to
+        // for scripted bot puppetry (go to a spot, fly a specific RJ link, read back telemetry). `0`
+        // (default) = disabled — no socket is bound. See [`crate::control`].
+        ("rtx_control_port", Float(0.0)),
+        // Rocket-jump driver knobs, read live each frame and threaded into the driver so the harness
+        // can tune them without a rebuild. Each default mirrors the constant it replaces, so live
+        // behaviour is unchanged until a knob is set. See [`crate::bot::rj`] / [`crate::bot`].
+        ("rtx_rj_stance", Float(crate::bot::RJ_STANCE)),
+        ("rtx_rj_aim_tol", Float(crate::bot::RJ_AIM_TOL)),
+        ("rtx_rj_stance_timeout", Float(crate::bot::RJ_STANCE_TIMEOUT)),
+        ("rtx_rj_liftoff_timeout", Float(crate::bot::RJ_LIFTOFF_TIMEOUT)),
+        ("rtx_rj_ballistic_slack", Float(crate::bot::RJ_BALLISTIC_SLACK)),
+        // Biases *added* to every solved rocket jump: `delay_bias` to the fire delay (seconds after
+        // the jump press), `pitch_bias` to the fire pitch (degrees, QW positive-down). `0` = fly the
+        // solved value; both may be negative. A blunt global tuning dial over the offline solve.
+        ("rtx_rj_delay_bias", Float(0.0)),
+        ("rtx_rj_pitch_bias", Float(0.0)),
         // Perception (human-like targeting). `rtx_bot_fov` is the view cone (full angle, degrees)
         // within which a bot can *see* a target, widened with skill; 0 = 360° (see everywhere, the
         // old behavior). `rtx_bot_reaction` is the base delay (seconds) a target must stay seen

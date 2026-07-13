@@ -25,6 +25,7 @@ mod bot;
 mod buttons;
 mod client;
 mod combat;
+mod control;
 mod cvars;
 mod defs;
 #[cfg(test)]

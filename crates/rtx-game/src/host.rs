@@ -243,8 +243,9 @@ impl HostApi {
     }
 
     /// Whether a cvar currently has a non-empty value (set in server.cfg, by a prior map, or a
-    /// default we already seeded). Used by [`cvar_default`](Self::cvar_default) to avoid clobbering.
-    fn cvar_is_set(&self, name: &str) -> bool {
+    /// default we already seeded). Used by [`cvar_default`](Self::cvar_default) to avoid clobbering,
+    /// and by [`crate::control`] to pick the immediate `cvar_set` over a create-via-`set` localcmd.
+    pub(crate) fn cvar_is_set(&self, name: &str) -> bool {
         let cname = CString::new(name).unwrap_or_default();
         let mut buf = [0u8; 64];
         !self.cvar_string(&cname, &mut buf).is_empty()

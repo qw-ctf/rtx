@@ -69,10 +69,26 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // the route and lock out combat so an enemy appearing mid-arc can't flip the goal and yank us off
     // the jump. Read here (before the repath gate and leg-advance) like `on_sj`/`on_rj`.
     let on_air = bot.air.is_some();
-    // Route committed to a ballistic traversal (hook flight, speed jump, or rocket jump): a goal flip
-    // must not replace the route and yank the bot off the leg it's flying. Gates the repath/errand
-    // logic below (`on_air`, the plain-jump commitment, is a separate, per-arc gate added alongside).
-    let route_frozen = hooking || on_sj || on_rj;
+    // Puppet rocket-jump order (test harness, see [`crate::control`]): pin the route to the single
+    // ordered link so the repath / leg-advance / errand logic below can't clobber the one-leg route
+    // the rocket-jump driver flies. Folded into `route_frozen` below, so every `!route_frozen` guard
+    // also respects the pin. A RocketJump link never auto-advances (its driver advances on landing),
+    // so the leg stays put until the attempt finishes and the control poller lifts the order. Goto/Hold
+    // orders leave `order_link` None and route normally. Rebuilds only when the route isn't already it.
+    let pinned = o.order_link.is_some();
+    if let Some(link) = o.order_link {
+        if bot.route.len() != 1 || bot.route.first() != Some(&link) {
+            bot.route = vec![link];
+            bot.route_bands = vec![0];
+            bot.route_pos = 0;
+            bot.goal_cell = Some(graph.link_target(link));
+        }
+    }
+    // Route committed to a ballistic traversal (hook flight, speed jump, or rocket jump) or pinned by a
+    // puppet order: a goal flip must not replace the route and yank the bot off the leg it's flying.
+    // Gates the repath/errand logic below (`on_air`, the plain-jump commitment, is a separate, per-arc
+    // gate added alongside).
+    let route_frozen = hooking || on_sj || on_rj || pinned;
 
     // A teleport (or any large instant displacement) invalidates the planned route — drop it
     // and re-path from where we landed. ~200u in one frame is far beyond running/falling. Skipped
@@ -659,6 +675,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             armortype,
             armorvalue,
             quad,
+            knobs: s.rj_knobs,
         },
     );
     let rj_engaged = bot.rj.phase != RjPhase::Idle;

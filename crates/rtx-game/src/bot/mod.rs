@@ -70,17 +70,20 @@ const HOOK_BALLISTIC_SLACK: f32 = 1.0;
 
 // --- rocket-jump leg execution ---
 
+// Defaults for the `rtx_rj_*` knobs (see [`crate::cvars`]); the driver reads the live cvar each
+// frame via [`RjKnobs`] and only falls back to these as the registered defaults. `pub(crate)` so the
+// cvar table can seed from them and they can't drift from the documented default.
 /// Within this of the launch cell counts as "in stance" to jump from — tighter than the hook's
 /// (the solve's ±16u launch perturb bounds how far off the spot the arc still lands).
-const RJ_STANCE: f32 = 16.0;
+pub(crate) const RJ_STANCE: f32 = 16.0;
 /// Fire the jump once the smoothed view is within this many degrees of the solved fire angles.
-const RJ_AIM_TOL: f32 = 2.0;
+pub(crate) const RJ_AIM_TOL: f32 = 2.0;
 /// Give up the stance if the RL/aim/ground alignment hasn't let the jump go within this.
-const RJ_STANCE_TIMEOUT: f32 = 2.5;
+pub(crate) const RJ_STANCE_TIMEOUT: f32 = 2.5;
 /// If the bot is still on the ground this long after pressing jump, the jump was swallowed — abort.
-const RJ_LIFTOFF_TIMEOUT: f32 = 0.3;
+pub(crate) const RJ_LIFTOFF_TIMEOUT: f32 = 0.3;
 /// Ballistic watchdog slack added to the solved airtime before we give up waiting to land.
-const RJ_BALLISTIC_SLACK: f32 = 1.0;
+pub(crate) const RJ_BALLISTIC_SLACK: f32 = 1.0;
 
 /// Advance to the next route leg once within this of the current waypoint (≈ ¾ of a grid).
 const ARRIVE_RADIUS: f32 = 24.0;
@@ -335,6 +338,10 @@ struct Objective {
     /// pool). False in a roofed tunnel, where pressing up only pins it to the ceiling — there it
     /// swims *out* to the breathing spot on the navigation move alone.
     swim_up: bool,
+    /// Puppet rocket-jump order (test harness): the link to pin the route to and fly. `Some` only
+    /// while a [`ControlOrder::RocketJump`](crate::bot::state::ControlOrder) is active — `steer` then
+    /// pins `route = [link]` and suppresses repath so the driver can take the jump. `None` otherwise.
+    order_link: Option<u32>,
 }
 
 /// Resolve what this bot pursues this frame: reconcile a stale hook, ask the mode for an intent
@@ -383,6 +390,9 @@ struct Sense {
     armortype: f32,
     armorvalue: f32,
     quad: bool,
+    /// Live rocket-jump tuning knobs (`rtx_rj_*`), read once here so the driver and `emit` stay pure
+    /// snapshot consumers. See [`rj::RjKnobs`].
+    rj_knobs: rj::RjKnobs,
 }
 
 fn sense(game: &GameState, e: EntId) -> Sense {
@@ -432,9 +442,21 @@ fn sense(game: &GameState, e: EntId) -> Sense {
     let armortype = game.entities[e].v.armortype;
     let armorvalue = game.entities[e].v.armorvalue;
     let quad = game.entities[e].combat.super_damage_finished > now;
+    // Live rocket-jump knobs — the physical windows clamp to ≥ 0 (a negative stance/timeout is
+    // nonsense); the two biases are deliberately left signed so they can pull the solved value either
+    // way. Read every frame so the harness can retune between attempts with no rebuild.
+    let rj_knobs = rj::RjKnobs {
+        stance: host.cvar(c"rtx_rj_stance").max(0.0),
+        aim_tol: host.cvar(c"rtx_rj_aim_tol").max(0.0),
+        stance_timeout: host.cvar(c"rtx_rj_stance_timeout").max(0.0),
+        liftoff_timeout: host.cvar(c"rtx_rj_liftoff_timeout").max(0.0),
+        ballistic_slack: host.cvar(c"rtx_rj_ballistic_slack").max(0.0),
+        delay_bias: host.cvar(c"rtx_rj_delay_bias"),
+        pitch_bias: host.cvar(c"rtx_rj_pitch_bias"),
+    };
     Sense {
         host, now, frametime, msec, origin, v_angle, client, weapon, on_ground, in_water, submerged, air_left, alive, vz, air_jumped, enemy_seen_time, v_xy, speed, grapple_hook, has_grapple, hook_out, on_hook, anchor, reel_half_step,
-        attack_finished, has_rl, ammo_rockets, health, armortype, armorvalue, quad,
+        attack_finished, has_rl, ammo_rockets, health, armortype, armorvalue, quad, rj_knobs,
     }
 }
 
@@ -466,6 +488,40 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     let on_sj = game.entities[e].bot.sj.is_some();
     // A rocket-jump leg freezes the route the same way (stance stands still, the arc flies fast).
     let on_rj = game.entities[e].bot.rj.phase != RjPhase::Idle;
+
+    // Puppet override (rocket-jump test harness, see [`crate::control`]): a scripted order supersedes
+    // the whole intent/item/perception pipeline. Runs *after* the invariant nets above (a stripped RL
+    // must still abort a rocket jump) but before the mode is consulted — combat is off (`enemy: None`)
+    // and item chasing is suppressed. Inert for a normal bot (`order == None`). The `RocketJump` order
+    // additionally sets `order_link`, which `steer` uses to pin the route to that one link.
+    if let Some(order) = game.entities[e].bot.puppet.order {
+        use crate::bot::state::ControlOrder;
+        game.entities[e].bot.goal.item = 0; // no item chase under a puppet order
+        let (target_origin, item_cell, order_link) = match order {
+            ControlOrder::Hold => (origin, None, None),
+            ControlOrder::Goto { target } => (target, None, None),
+            ControlOrder::RocketJump { link } => {
+                // The graph is guaranteed present (the control command validated the link before
+                // issuing the order); target the link's destination ledge.
+                let g = game.nav.graph.as_ref().unwrap();
+                let cell = g.link_target(link);
+                (g.cell_origin(cell), Some(cell), Some(link))
+            }
+        };
+        return Objective {
+            hooking, on_sj, on_rj,
+            enemy: None,
+            chasing: false,
+            polite: false,
+            vigil: false,
+            target_origin,
+            item_cell,
+            watch_point: None,
+            surfacing: false,
+            swim_up: false,
+            order_link,
+        };
+    }
 
     // Ask the active mode for this bot's intent. A round mode (Rocket Arena) returns Fight/Move to
     // drive combat or audience-roaming; FFA hunts the nearest player. Every mode-specific bot
@@ -665,7 +721,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // the normal objective leaves them off — the anti-drown override flips them on when it fires.
     Objective {
         hooking, on_sj, on_rj, enemy, chasing, polite, target_origin, item_cell, watch_point,
-        vigil: vigil.is_some(), surfacing: false, swim_up: false,
+        vigil: vigil.is_some(), surfacing: false, swim_up: false, order_link: None,
     }
 }
 
@@ -751,11 +807,21 @@ fn emit(
     // jump — pressing early would jump with the aim still swinging and fire the rocket off-angle.
     if rj.jump_ready {
         let err = wrap180(view.x - look.x).abs().max(wrap180(view.y - look.y).abs());
-        if err < RJ_AIM_TOL {
+        if err < s.rj_knobs.aim_tol {
             buttons |= BUTTON_JUMP;
             let b = &mut game.entities[e].bot;
             b.rj.phase = RjPhase::Rise;
             b.rj.jump_time = now;
+            // Harness telemetry: the actual press moment, the settled view, and the residual aim
+            // error against the (biased) fire angles. Inert without a puppet order consuming it.
+            b.rj.telem.press = Some(state::RjPress { t: now, origin: s.origin, view, aim_err: err });
+        }
+    }
+    // The rocket fires this frame (the driver set `rj.fire` in Stance-timed Rise): stamp the settled
+    // view actually sent with +attack into the fire telemetry the driver pre-filled.
+    if rj.fire {
+        if let Some(f) = game.entities[e].bot.rj.telem.fire.as_mut() {
+            f.view = view;
         }
     }
     // Flush any deferred hook release now the graph/bot borrows are done.
