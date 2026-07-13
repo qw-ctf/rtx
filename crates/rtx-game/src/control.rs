@@ -218,6 +218,11 @@ enum ControlCmd {
     Cmd { raw: String },
     /// Inspect the navmesh cell nearest a world point: its origin and every link in/out, by kind.
     Cell { pos: Vec3 },
+    /// Dump a bot's current A* route: each leg's index, kind, source and target.
+    Route { bot: u32 },
+    /// Search (offline pmove sim, live BSP) for a speed-curl jump from a source to a target world
+    /// point — the M2 curl-jump solver, validated live. Returns the best (v0, launch heading, gain).
+    Curl { src: Vec3, tgt: Vec3 },
 }
 
 /// Split the first whitespace-delimited token off `s`, returning `(token, rest)` with `rest` trimmed
@@ -312,6 +317,13 @@ fn parse_line(line: &str) -> Result<(i64, ControlCmd), String> {
             let z = parse_f32(t.next(), "z")?;
             ControlCmd::Cell { pos: Vec3::new(x, y, z) }
         }
+        "route" => ControlCmd::Route { bot: parse_u32(rest.split_whitespace().next(), "bot")? },
+        "curl" => {
+            let mut t = rest.split_whitespace();
+            let src = Vec3::new(parse_f32(t.next(), "sx")?, parse_f32(t.next(), "sy")?, parse_f32(t.next(), "sz")?);
+            let tgt = Vec3::new(parse_f32(t.next(), "tx")?, parse_f32(t.next(), "ty")?, parse_f32(t.next(), "tz")?);
+            ControlCmd::Curl { src, tgt }
+        }
         other => return Err(format!("unknown verb '{other}'")),
     };
     Ok((id, cmd))
@@ -349,6 +361,8 @@ fn exec_cmd(game: &mut GameState, id: i64, cmd: ControlCmd) {
             Ok("{\"queued\":true}".to_string())
         }
         ControlCmd::Cell { pos } => cell_json(game, pos),
+        ControlCmd::Route { bot } => route_json(game, bot),
+        ControlCmd::Curl { src, tgt } => curl_json(game, src, tgt),
     };
     match result {
         Ok(data) => reply_ok(game, id, &data),
@@ -635,6 +649,103 @@ fn cell_json(game: &GameState, pos: Vec3) -> Result<String, String> {
         cell,
         jvec3(g.cell_origin(cell))
     ))
+}
+
+/// Dump a bot's current route: `route_pos` and each leg (index, kind, source→target).
+fn route_json(game: &GameState, bot: u32) -> Result<String, String> {
+    let e = valid_bot(game, bot)?;
+    let g = game.nav.graph.as_ref().ok_or("navmesh not ready")?;
+    let b = &game.entities[e].bot;
+    let mut legs = String::new();
+    for (i, &leg) in b.route.iter().enumerate() {
+        if !legs.is_empty() {
+            legs.push(',');
+        }
+        legs.push_str(&format!(
+            "{{\"i\":{i},\"link\":{leg},\"kind\":{},\"src\":{},\"tgt\":{}}}",
+            jstr(kind_name(g.link_kind(leg))),
+            jvec3(g.cell_origin(g.link_source(leg))),
+            jvec3(g.cell_origin(g.link_target(leg))),
+        ));
+    }
+    Ok(format!(
+        "{{\"bot\":{bot},\"route_pos\":{},\"origin\":{},\"legs\":[{legs}]}}",
+        b.route_pos,
+        jvec3(game.entities[e].v.origin),
+    ))
+}
+
+/// Search the offline pmove sim (against the live BSP) for a speed-curl jump from `src` to `tgt`: a
+/// held-strafe air-curl from a run-up-built takeoff speed. Grid-searches takeoff speed `v0`, launch
+/// heading `psi0`, and turn gain, returning the lowest-speed curl that lands within tolerance — the
+/// M2 solver, exercised live. Mirrors the human demo (build speed, one leap, gentle held-strafe sweep).
+fn curl_json(game: &GameState, src: Vec3, tgt: Vec3) -> Result<String, String> {
+    use crate::bot::bhop;
+    use crate::math::{wrap180, yaw_of};
+    use crate::pmove_sim::{pm_step, PmParams, PmState};
+    let bsp = game.nav.bsp.as_ref().ok_or("no bsp loaded")?;
+    let cv = |name: &std::ffi::CStr, d: f32| {
+        let v = game.host.cvar(name);
+        if v > 0.0 { v } else { d }
+    };
+    let p = PmParams {
+        gravity: cv(c"sv_gravity", 800.0),
+        accel: cv(c"sv_accelerate", 10.0),
+        friction: cv(c"sv_friction", 4.0),
+        stopspeed: 100.0,
+        maxspeed: cv(c"sv_maxspeed", 320.0),
+    };
+    let dt = 0.013_f32;
+    let amax = bhop::air_accel_max(p.accel, p.maxspeed, dt);
+    let rollout = |v0: f32, psi0: f32, gain: f32| -> Option<Vec3> {
+        let mut s = PmState {
+            origin: src,
+            vel: Vec3::new(v0 * psi0.to_radians().cos(), v0 * psi0.to_radians().sin(), 0.0),
+            on_ground: true,
+            jump_held: false,
+        };
+        let sigma = wrap180(yaw_of(tgt.xy() - src.xy()) - psi0).signum();
+        for tick in 0..100 {
+            let cmd = if tick == 0 {
+                bhop::Cmd { view_yaw: psi0, forward: 400.0, side: 0.0, jump: true }
+            } else {
+                let v_xy = s.vel.xy();
+                let err = wrap180(yaw_of(tgt.xy() - s.origin.xy()) - yaw_of(v_xy));
+                let omega = (err.abs() * gain).min(bhop::omega_max(v_xy.length().max(1.0), amax, dt));
+                let st = bhop::strafe_rate(v_xy, sigma, omega, amax, dt);
+                bhop::Cmd { view_yaw: st.view_yaw, forward: st.forward, side: st.side, jump: false }
+            };
+            pm_step(bsp, &mut s, &cmd, &p, dt);
+            if tick > 3 && s.on_ground {
+                return Some(s.origin);
+            }
+        }
+        None
+    };
+    let chord = yaw_of(tgt.xy() - src.xy());
+    let mut best: Option<(f32, f32, f32, f32, Vec3)> = None;
+    for vi in 0..10 {
+        let v0 = 340.0 + vi as f32 * 15.0;
+        for pi in 0..24 {
+            let psi0 = chord - 60.0 + pi as f32 * 4.0;
+            for gi in 0..8 {
+                let gain = 1.0 + gi as f32 * 0.4;
+                if let Some(land) = rollout(v0, psi0, gain) {
+                    let miss = (land.xy() - tgt.xy()).length();
+                    if (land.z - tgt.z).abs() < 40.0 && best.is_none_or(|b| miss < b.3) {
+                        best = Some((v0, psi0, gain, miss, land));
+                    }
+                }
+            }
+        }
+    }
+    match best {
+        Some((v0, psi0, gain, miss, land)) => Ok(format!(
+            "{{\"found\":true,\"v0\":{},\"psi0\":{},\"chord\":{},\"gain\":{},\"miss_xy\":{},\"land\":{}}}",
+            jnum(v0), jnum(psi0), jnum(chord), jnum(gain), jnum(miss), jvec3(land)
+        )),
+        None => Ok(format!("{{\"found\":false,\"chord\":{}}}", jnum(chord))),
+    }
 }
 
 fn order_name(o: Option<ControlOrder>) -> &'static str {
