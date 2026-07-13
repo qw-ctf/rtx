@@ -165,13 +165,17 @@ pub fn strafe_rate(v_xy: Vec2, sigma: f32, omega_deg: f32, a_max: f32, dt: f32) 
 /// No mode switch and no deadband, so the returned wish never snaps. The strafe *side* still flips as
 /// `err` crosses zero, but there the turn rate is ~0 and the wish is inert, so the caller applies the
 /// wish in **world space** and steers the eyes separately — the flip never moves the view.
-pub fn air_correct(v_xy: Vec2, bearing: f32, a_max: f32, dt: f32) -> Strafe {
+pub fn air_correct(v_xy: Vec2, bearing: f32, a_max: f32, dt: f32, gain: f32) -> Strafe {
     let speed = v_xy.length().max(1.0);
     let vel_yaw = yaw_of(v_xy);
     let err = wrap180(bearing - vel_yaw);
-    let omega = (err.abs() * AIR_CORRECT_GAIN).min(omega_max(speed, a_max, dt));
+    let omega = (err.abs() * gain).min(omega_max(speed, a_max, dt));
     strafe_rate(v_xy, err.signum(), omega, a_max, dt)
 }
+
+/// The default air-curl gain (°/s per ° of heading error), exposed so callers passing "no override"
+/// use the tuned value. See [`AIR_CORRECT_GAIN`].
+pub const AIR_CORRECT_GAIN_DEFAULT: f32 = AIR_CORRECT_GAIN;
 
 /// Heading deadband (degrees) for the strafe-sign weave, sized from the physics so the sign flips
 /// ~[`FLIPS_PER_HOP`] times per hop: a perpendicular strafe rotates the velocity by

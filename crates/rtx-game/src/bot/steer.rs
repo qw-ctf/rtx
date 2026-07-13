@@ -783,10 +783,26 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // released (airborne) before it'll fire again. Gating on ground state pulses it correctly,
     // so a jump that falls short is retried on the next landing instead of the bot getting
     // stuck holding +jump against a ledge.
+    // Curl-jump knobs for plain jump legs (see cvars): a run-up speed gate on the takeoff, plus the
+    // in-air curl hold-fraction and gain applied below. All default to today's behavior.
+    let jump_maxspeed = {
+        let m = host.cvar(c"sv_maxspeed");
+        if m > 0.0 { m } else { 320.0 }
+    };
+    let jump_runup = host.cvar(c"rtx_jump_runup").max(0.0);
+    let curl_hold = host.cvar(c"rtx_jump_curl_hold").clamp(0.0, 0.95);
+    let curl_gain = {
+        let g = host.cvar(c"rtx_jump_curl_gain");
+        if g > 0.0 { g } else { bhop::AIR_CORRECT_GAIN_DEFAULT }
+    };
+    // Run-up gate: on a plain jump leg, hold the takeoff jump until the bot is running at
+    // `jump_runup · maxspeed`, so it leaves the lip with speed instead of hopping slow. `force_jump`
+    // (the stuck detector) and the bhop controller bypass it, so a genuinely wedged bot still jumps.
+    let runup_ok = jump_runup <= 0.0 || speed >= jump_runup * jump_maxspeed;
     if on_ground
         && (force_jump
             || bhop_cmd.is_some_and(|c| c.jump)
-            || matches!(kind, Some(LinkKind::JumpGap | LinkKind::DoubleJump)))
+            || (matches!(kind, Some(LinkKind::JumpGap | LinkKind::DoubleJump)) && runup_ok))
     {
         buttons |= BUTTON_JUMP;
     }
@@ -852,7 +868,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // cap all but ignores — while the eyes keep smoothing toward the target through the normal aim
     // spring (no raw-view channel, so the strafe never twitches the view). `None` when we're basically
     // on top of the target (keep whatever wish we had). See [`bhop::air_correct`].
-    let air_wish = |target: Vec3| -> Option<Vec3> {
+    let air_wish = |target: Vec3, gain: f32| -> Option<Vec3> {
         let to = target.xy() - origin.xy();
         (to.length() > 24.0).then(|| {
             let dt = frametime.clamp(0.001, 0.05);
@@ -863,7 +879,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 if maxspeed > 0.0 { maxspeed } else { 320.0 },
                 dt,
             );
-            let s = bhop::air_correct(v_xy, yaw_of(to), a_max, dt);
+            let s = bhop::air_correct(v_xy, yaw_of(to), a_max, dt, gain);
             let w = bhop::wishdir_fs(s.view_yaw, s.forward, s.side);
             Vec3::new(w.x, w.y, 0.0) * MOVE_SPEED
         })
@@ -871,8 +887,24 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // Airborne on a plain jump leg: ride the arc toward the landing (the pinned waypoint — the
     // `on_air` gate keeps it on the link target) with the air-strafe wish. `look` stays as steered
     // above, so the eyes pan smoothly toward the landing while the strafe curves the trajectory.
+    // Curl-hold: a jump link certifies only the straight source→target center line, but the bot took
+    // off offset and homing back onto the target can sweep the arc into an edge wall. For the first
+    // `curl_hold` fraction of the gap, hold the takeoff heading (steer along our own velocity — an
+    // inert coast) so the near wall is cleared, then curl onto the target at `curl_gain`.
     if on_air && !on_ground {
-        if let Some(w) = air_wish(waypoint) {
+        let held = curl_hold > 0.0
+            && cur_leg.is_some_and(|leg| {
+                let src = graph.cell_origin(graph.link_source(leg)).xy();
+                let tgt = graph.cell_origin(graph.link_target(leg)).xy();
+                let done = 1.0 - (tgt - origin.xy()).length() / (tgt - src).length().max(1.0);
+                done < curl_hold
+            });
+        let wish = if held {
+            air_wish(origin + Vec3::new(v_xy.x, v_xy.y, 0.0), curl_gain)
+        } else {
+            air_wish(waypoint, curl_gain)
+        };
+        if let Some(w) = wish {
             move_world = w;
         }
     }
@@ -927,7 +959,10 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         move_world = match rj.approach {
             _ if rj.stand => Vec3::ZERO,
             Some(src) => Vec3::new(src.x - origin.x, src.y - origin.y, 0.0).normalize_or_zero() * MOVE_SPEED,
-            None => rj.air_correct.and_then(air_wish).unwrap_or(Vec3::ZERO),
+            None => rj
+                .air_correct
+                .and_then(|t| air_wish(t, bhop::AIR_CORRECT_GAIN_DEFAULT))
+                .unwrap_or(Vec3::ZERO),
         };
         buttons &= !BUTTON_JUMP; // the launch jump is pressed only via `emit`'s post-spring gate
         if rj.select {

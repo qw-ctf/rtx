@@ -496,7 +496,7 @@ fn bot_matches_or_beats_human() {
                 while t < human_time * 1.5 + 0.5 {
                     let to = (land.xy() - st.origin.xy()).normalize_or_zero();
                     let bearing = yaw_of(to);
-                    let s = bhop::air_correct(st.vel.xy(), bearing, a_max, DT);
+                    let s = bhop::air_correct(st.vel.xy(), bearing, a_max, DT, bhop::AIR_CORRECT_GAIN_DEFAULT);
                     let cmd = bhop::Cmd { view_yaw: s.view_yaw, forward: s.forward, side: s.side, jump: false };
                     pm_step(&bsp, &mut st, &cmd, &p, DT);
                     t += DT;

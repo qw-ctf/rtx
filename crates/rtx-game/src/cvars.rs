@@ -138,6 +138,20 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // solved value; both may be negative. A blunt global tuning dial over the offline solve.
         ("rtx_rj_delay_bias", Float(0.0)),
         ("rtx_rj_pitch_bias", Float(0.0)),
+        // Curl-jump tuning for plain jump legs (JumpGap/DoubleJump). A navmesh jump link certifies only
+        // the straight source→target center line; the bot takes off offset and homes back onto the
+        // center, which can sweep its arc into an edge wall beside the certified line. These shape that:
+        //  - `rtx_jump_curl_hold`: fraction of the gap to fly holding the *takeoff* heading before the
+        //    curl engages — "curl later", so the bot clears the near wall before turning onto the target.
+        //  - `rtx_jump_curl_gain`: the air-curl proportional gain (°/s per ° of heading error, default
+        //    matches `bhop::AIR_CORRECT_GAIN`); lower = a gentler, wider, later-converging curl.
+        //  - `rtx_jump_runup`: minimum ground speed (fraction of `sv_maxspeed`) before the takeoff jump
+        //    fires, so the bot runs to the lip at speed instead of hopping slow the instant the leg
+        //    turns current — "more speed". Held at most ~1s so a cornered bot never deadlocks.
+        // All default to today's behavior.
+        ("rtx_jump_curl_hold", Float(0.0)),
+        ("rtx_jump_curl_gain", Float(6.0)),
+        ("rtx_jump_runup", Float(0.0)),
         // Perception (human-like targeting). `rtx_bot_fov` is the view cone (full angle, degrees)
         // within which a bot can *see* a target, widened with skill; 0 = 360° (see everywhere, the
         // old behavior). `rtx_bot_reaction` is the base delay (seconds) a target must stay seen
