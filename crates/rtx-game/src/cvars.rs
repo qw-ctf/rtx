@@ -157,3 +157,11 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         ("rtx_bot_model", Bool(true)),
     ]
 };
+
+/// The registered default for an rtx cvar, if it's in the table. Used to read a build-gating cvar
+/// with its intended value even before `GAME_INIT`'s `cvar_default` `set` has flushed from the engine
+/// command buffer (see [`GameState::rtx_cvar_bool`](crate::game::GameState::rtx_cvar_bool)). A small
+/// linear scan over the table — only called during a navmesh build, not per frame.
+pub(crate) fn default_of(name: &str) -> Option<CvarSeed> {
+    RTX_CVAR_DEFAULTS.iter().find(|(n, _)| *n == name).map(|&(_, seed)| seed)
+}

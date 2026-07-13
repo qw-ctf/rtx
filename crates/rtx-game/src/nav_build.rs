@@ -8,6 +8,7 @@
 use glam::Vec3;
 
 use crate::bot::goals as bot_goals;
+use crate::cvars::{default_of, CvarSeed};
 use crate::defs;
 use crate::entity::EntId;
 use crate::game::{cstring, GameState};
@@ -22,6 +23,34 @@ pub(crate) struct PlatStatus {
 }
 
 impl GameState {
+    /// Read an rtx bool cvar the navmesh build depends on, falling back to its **registered default**
+    /// when the cvar isn't set yet. `GAME_INIT`'s `cvar_default` seeds each rtx cvar through a *queued*
+    /// `set` (it can't flush during init — `pr_global_struct` is still null), and that queue is not
+    /// guaranteed to have run before the first-frame navmesh build reads the cvar. An unset live read
+    /// returns `0`/false, which would silently gate a build input off — the first-boot bug where the
+    /// first map builds with no rocket jumps (`rjump 0`) until a later `map` rebuilds correctly. This
+    /// returns the value the build *would* see once flushed: the live value if set, else the default.
+    pub(crate) fn rtx_cvar_bool(&self, name: &str) -> bool {
+        if self.host.cvar_is_set(name) {
+            self.host.cvar_bool(&cstring(name))
+        } else {
+            matches!(default_of(name), Some(CvarSeed::Bool(true)))
+        }
+    }
+
+    /// Float counterpart of [`rtx_cvar_bool`](Self::rtx_cvar_bool): the live value if the cvar is set,
+    /// else its registered default (or `0.0` for a cvar with no float default). Same first-flush
+    /// robustness for the numeric build inputs (hook speeds, …).
+    pub(crate) fn rtx_cvar_f32(&self, name: &str) -> f32 {
+        if self.host.cvar_is_set(name) {
+            self.host.cvar(&cstring(name))
+        } else if let Some(CvarSeed::Float(f)) = default_of(name) {
+            f
+        } else {
+            0.0
+        }
+    }
+
     /// Build the bot navmesh for the current map on demand — the first time bots are wanted —
     /// then cache it. Attempted at most once per map (a failed read won't retry every frame).
     /// Best-effort: if the BSP can't be read or parsed the navmesh stays empty and bots simply
@@ -96,16 +125,19 @@ impl GameState {
         // Hook links are only worth building when the map hands out the grapple. Snapshot the live
         // physics (gravity is 100 on e1m8; the hook speeds are tunable) so the arc solver on the
         // worker thread matches how the hook will actually fly in-game.
-        let hooks = (!stock && self.host.cvar_bool(c"rtx_grapple")).then(|| navmesh::HookParams {
+        // Every rtx cvar that gates a build input is read through `rtx_cvar_*` so an unflushed default
+        // on a fresh boot doesn't silently disable the links (the first-boot `rjump 0` bug); engine
+        // cvars (sv_*) are always set, so they read live.
+        let hooks = (!stock && self.rtx_cvar_bool("rtx_grapple")).then(|| navmesh::HookParams {
             gravity: self.host.cvar(c"sv_gravity").max(1.0),
-            pull: navmesh::HOOK_PULL_BASE * self.host.cvar(c"rtx_hook_pull"),
-            throw: navmesh::HOOK_THROW_BASE * self.host.cvar(c"rtx_hook_speed"),
+            pull: navmesh::HOOK_PULL_BASE * self.rtx_cvar_f32("rtx_hook_pull"),
+            throw: navmesh::HOOK_THROW_BASE * self.rtx_cvar_f32("rtx_hook_speed"),
         });
         // Double-jump links: only when the map allows the mid-air jump, so bots plan the wider gaps.
-        let double_jump = !stock && self.host.cvar_bool(c"rtx_doublejump");
+        let double_jump = !stock && self.rtx_cvar_bool("rtx_doublejump");
         // Speed-jump links (bhop-carried leaps): only when bots bunnyhop, with the physics that turn
         // a runway length into attainable speed.
-        let speed_jump = self.host.cvar_bool(c"rtx_bot_bhop").then(|| navmesh::SpeedJumpParams {
+        let speed_jump = self.rtx_cvar_bool("rtx_bot_bhop").then(|| navmesh::SpeedJumpParams {
             gravity: self.host.cvar(c"sv_gravity").max(1.0),
             accel: {
                 let a = self.host.cvar(c"sv_accelerate");
@@ -126,7 +158,7 @@ impl GameState {
         });
         // Rocket-jump links: only when bots may rocket-jump. Snapshot gravity and the `rj` self-boost
         // cvar (off by default) so the offline blast solve matches the live knockback.
-        let rocket_jump = (!stock && self.host.cvar_bool(c"rtx_bot_rocketjump")).then(|| navmesh::RocketJumpParams {
+        let rocket_jump = (!stock && self.rtx_cvar_bool("rtx_bot_rocketjump")).then(|| navmesh::RocketJumpParams {
             gravity: self.host.cvar(c"sv_gravity").max(1.0),
             rj_extra: self.host.cvar(c"rj"),
         });
