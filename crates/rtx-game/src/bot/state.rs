@@ -429,6 +429,10 @@ pub struct Puppet {
     /// when it last improved. No improvement for a while ⇒ the target is (currently) inaccessible.
     pub best_dist: f32,
     pub best_since: f32,
+    /// Per-frame flight trace of a rocket-jump attempt: `(time, origin, velocity)` sampled each frame
+    /// (post-move) while a RocketJump order is active, so the harness can compare the *actual* arc to
+    /// the offline solve's prediction. Capped and cleared when the attempt's result is emitted.
+    pub traj: Vec<(f32, Vec3, Vec3)>,
 }
 
 /// A scripted control order for a puppeted bot (see [`crate::control`]). Lives here (not in

@@ -104,7 +104,16 @@ pub(crate) fn frame_end(game: &mut GameState) {
         match game.entities[e].bot.puppet.order {
             None | Some(ControlOrder::Hold) => {}
             Some(ControlOrder::Goto { target }) => poll_goto(game, e, i, target, now),
-            Some(ControlOrder::RocketJump { link }) => poll_rj(game, e, i, link, now),
+            Some(ControlOrder::RocketJump { link }) => {
+                // Trace the flight: sample this frame's post-move origin/velocity before checking for a
+                // result, so the trajectory in `rj_result` runs from the stance through the landing.
+                let (origin, vel) = (game.entities[e].v.origin, game.entities[e].v.velocity);
+                let traj = &mut game.entities[e].bot.puppet.traj;
+                if traj.len() < 400 {
+                    traj.push((now, origin, vel));
+                }
+                poll_rj(game, e, i, link, now);
+            }
         }
     }
 }
@@ -383,6 +392,9 @@ fn do_teleport(game: &mut GameState, bot: u32, pos: Vec3) -> Result<String, Stri
     game.entities[e].v.velocity = Vec3::ZERO;
     game.host.set_origin(e, at);
     reset_nav_state(&mut game.entities[e].bot, at, now);
+    // Park the bot after placing it — otherwise, with no order, it would roam autonomously and arrive
+    // at a subsequent rocket jump with residual velocity, contaminating the standstill measurement.
+    game.entities[e].bot.puppet.order = Some(ControlOrder::Hold);
     Ok(format!("{{\"bot\":{bot},\"origin\":{}}}", jvec3(game.entities[e].v.origin)))
 }
 
@@ -436,6 +448,7 @@ fn do_rj(game: &mut GameState, bot: u32, link: u32) -> Result<String, String> {
     b.rj.telem.link = link;
     b.route.clear();
     b.repath_time = now;
+    b.puppet.traj.clear(); // fresh flight trace
     b.puppet.order = Some(ControlOrder::RocketJump { link });
     Ok(format!("{{\"bot\":{bot},\"link\":{link}}}"))
 }
@@ -540,7 +553,7 @@ fn links_json(game: &GameState) -> Result<String, String> {
             items.push(',');
         }
         items.push_str(&format!(
-            "{{\"link\":{li},\"src\":{},\"tgt\":{},\"fire_pitch\":{},\"fire_yaw\":{},\"fire_delay\":{},\"airtime\":{},\"self_damage\":{}}}",
+            "{{\"link\":{li},\"src\":{},\"tgt\":{},\"fire_pitch\":{},\"fire_yaw\":{},\"fire_delay\":{},\"airtime\":{},\"self_damage\":{},\"v0\":{},\"blast\":{}}}",
             jvec3(src),
             jvec3(tgt),
             jnum(tr.fire_angles.x),
@@ -548,6 +561,8 @@ fn links_json(game: &GameState) -> Result<String, String> {
             jnum(tr.fire_delay),
             jnum(tr.airtime),
             jnum(tr.self_damage),
+            jvec3(tr.v0),
+            jvec3(tr.blast),
         ));
     }
     Ok(format!("{{\"links\":[{items}]}}"))
@@ -598,17 +613,37 @@ fn poll_rj(game: &mut GameState, e: EntId, bot: u32, link: u32, now: f32) {
         return; // attempt still in flight
     };
     let telem = game.entities[e].bot.rj.telem.clone();
+    // The solver's predicted post-blast velocity and blast geometry for this link, to compare against
+    // the actual flight trace: what the offline model *expected* vs what the engine produced.
+    let (v0, blast, pos_blast) = game
+        .nav
+        .graph
+        .as_ref()
+        .and_then(|g| g.rocket_jump_of_link(link))
+        .map(|t| (t.v0, t.blast, t.pos_blast))
+        .unwrap_or((Vec3::ZERO, Vec3::ZERO, Vec3::ZERO));
+    let traj = std::mem::take(&mut game.entities[e].bot.puppet.traj);
     // Reset the fail counter so a harness attempt doesn't leak strikes into later autonomous play, and
     // park the bot (Hold) between tests for clean, still telemetry. `now` reserved for symmetry with
     // poll_goto; the outcome carries its own timestamps.
     let _ = now;
     game.entities[e].bot.rj.fails = 0;
     game.entities[e].bot.puppet.order = Some(ControlOrder::Hold);
-    let json = rj_result_json(bot, link, &telem, outcome);
+    let json = rj_result_json(bot, link, &telem, outcome, v0, blast, pos_blast, &traj);
     send(game, json);
 }
 
-fn rj_result_json(bot: u32, link: u32, t: &RjTelemetry, outcome: RjOutcome) -> String {
+#[allow(clippy::too_many_arguments)] // one JSON event's worth of measured + solved fields
+fn rj_result_json(
+    bot: u32,
+    link: u32,
+    t: &RjTelemetry,
+    outcome: RjOutcome,
+    v0: Vec3,
+    blast: Vec3,
+    pos_blast: Vec3,
+    traj: &[(f32, Vec3, Vec3)],
+) -> String {
     // Terminal name + (for a touchdown/overrun) the landing measurement vs the target cell.
     let (name, land) = match outcome {
         RjOutcome::Landed { on_target, origin, t: ft } => {
@@ -656,10 +691,23 @@ fn rj_result_json(bot: u32, link: u32, t: &RjTelemetry, outcome: RjOutcome) -> S
         ),
         None => "null".to_string(),
     };
+    // The flight trace: one [t, x,y,z, vx,vy,vz] per frame from stance through landing.
+    let mut trace = String::new();
+    for (ts, o, v) in traj {
+        if !trace.is_empty() {
+            trace.push(',');
+        }
+        trace.push_str(&format!(
+            "[{},{},{},{},{},{},{}]",
+            jnum(*ts), jnum(o.x), jnum(o.y), jnum(o.z), jnum(v.x), jnum(v.y), jnum(v.z)
+        ));
+    }
     format!(
         "{{\"ev\":\"rj_result\",\"bot\":{bot},\"link\":{link},\"outcome\":{},\"src\":{},\"tgt\":{},\
-         \"solved\":{{\"pitch\":{},\"yaw\":{},\"delay\":{},\"airtime\":{},\"self_damage\":{}}},\
-         \"bias\":{{\"delay\":{},\"pitch\":{}}},\"press\":{press},\"fire\":{fire},\"land\":{land}}}",
+         \"solved\":{{\"pitch\":{},\"yaw\":{},\"delay\":{},\"airtime\":{},\"self_damage\":{},\
+         \"v0\":{},\"blast\":{},\"pos_blast\":{}}},\
+         \"bias\":{{\"delay\":{},\"pitch\":{}}},\"press\":{press},\"fire\":{fire},\"land\":{land},\
+         \"traj\":[{trace}]}}",
         jstr(name),
         jvec3(t.src),
         jvec3(t.tgt),
@@ -668,6 +716,9 @@ fn rj_result_json(bot: u32, link: u32, t: &RjTelemetry, outcome: RjOutcome) -> S
         jnum(t.solved_delay),
         jnum(t.airtime),
         jnum(t.self_damage),
+        jvec3(v0),
+        jvec3(blast),
+        jvec3(pos_blast),
         jnum(t.delay_bias),
         jnum(t.pitch_bias),
     )
