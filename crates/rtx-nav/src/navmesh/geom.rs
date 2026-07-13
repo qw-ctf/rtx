@@ -8,9 +8,9 @@
 use glam::{Vec3, Vec3Swizzles};
 
 use super::physics::{jump_airtime, DOUBLE_JUMP_REACH, JUMP_APEX, JUMP_REACH, MAX_DROP};
-use super::GRID;
+use super::{GRID, GROUND_SAMPLE, GROUND_SLACK};
 use crate::bsp::Bsp;
-use crate::qphys::JUMP_VZ;
+use crate::qphys::{JUMP_VZ, STEP_HEIGHT};
 
 /// Bisect the floor origin height between a solid sample below and an empty one above.
 pub(super) fn bisect_floor(bsp: &Bsp, x: f32, y: f32, z_solid: f32, z_empty: f32) -> f32 {
@@ -47,6 +47,22 @@ pub(super) fn path_clear(bsp: &Bsp, a: Vec3, b: Vec3) -> bool {
         let t = i as f32 / steps as f32;
         let p = a.lerp(b, t);
         !bsp.is_solid(Vec3::new(p.x, p.y, z))
+    })
+}
+
+/// Whether solid floor continues *under* the straight segment between two standing origins — the
+/// floor-continuity test [`path_clear`] deliberately doesn't do (it samples the head-height corridor
+/// for walls/ceilings, so an air gap beneath the segment reads "clear"). Interior points every
+/// `GROUND_SAMPLE` must have hull-1 solid within a step below the interpolated origin height; the
+/// endpoints are carved cells (already supported), so only the span between them is checked. Because
+/// it queries the same ±16 box-expanded hull the carve uses, a floor narrower than the player box
+/// still reads supported (you can't fall through it) — so balancing along a thin wall-top survives,
+/// while a diagonal Walk/Step link whose centre line crosses an L-shaped ledge corner's air fails.
+pub(super) fn ground_along(is_solid: &impl Fn(Vec3) -> bool, a: Vec3, b: Vec3) -> bool {
+    let steps = ((b.xy() - a.xy()).length() / GROUND_SAMPLE).ceil().max(1.0) as i32;
+    (1..steps).all(|i| {
+        let p = a.lerp(b, i as f32 / steps as f32);
+        is_solid(Vec3::new(p.x, p.y, p.z - (STEP_HEIGHT + GROUND_SLACK)))
     })
 }
 

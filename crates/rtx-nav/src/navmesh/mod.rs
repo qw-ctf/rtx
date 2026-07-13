@@ -109,6 +109,13 @@ pub const GRID: f32 = 32.0;
 const PLAYER_HALF_WIDTH: f32 = 16.0;
 /// Vertical sweep step when scanning a column for floors (refined by bisection after).
 const SCAN_DZ: f32 = 8.0;
+/// Spacing of the floor-continuity samples along a grounded link (see [`geom::ground_along`]).
+/// 8 = four per grid cell; a real support gap only exists where the opening exceeds the 32u player
+/// box, so an 8u stride can't step over one.
+const GROUND_SAMPLE: f32 = 8.0;
+/// Slack added to [`STEP_HEIGHT`] when probing for floor under a grounded link: the interpolated
+/// origin height can sit up to a step off the true resting height on a riser, plus plane noise.
+const GROUND_SLACK: f32 = 4.0;
 
 /// A standable spot: the player *origin* position when standing here (feet are
 /// `ORIGIN_TO_FEET` below `origin.z`). Tagged with its grid column for neighbor lookup.
@@ -442,6 +449,14 @@ impl NavGraph {
             return None; // up beyond a jump's apex — needs the windowed ledge jumps
         };
         if !path_clear(bsp, a.origin, b.origin) {
+            return None;
+        }
+        // `path_clear` only rules out walls/ceilings along the head-height corridor; it can't see an
+        // air gap *under* the segment. For a Walk/Step to a grid-diagonal neighbor around an L-shaped
+        // ledge (a stair side, a balcony corner), the centre-to-centre line clips the corner's air —
+        // the bot walks straight off. Require floor to continue beneath the whole segment. (Drop keeps
+        // its own `has_ground_near` + `descent_clear`; JumpGap flew the `arc_clear` branch above.)
+        if matches!(kind, LinkKind::Walk | LinkKind::Step) && !ground_along(&|p| bsp.is_solid(p), a.origin, b.origin) {
             return None;
         }
         let horiz = (b.origin.xy() - a.origin.xy()).length();
@@ -1193,6 +1208,34 @@ mod tests {
             matches!(simulate_arc(boxed, r, v0, g), ArcResult::Blocked),
             "arc into a ceiling should be Blocked"
         );
+    }
+
+    /// `ground_along` keeps a link whose whole span has floor under it — flat floor, straight or
+    /// grid-diagonal. The oracle is hull-1 solidity: solid at or below the resting origin z (24 here).
+    #[test]
+    fn ground_along_keeps_continuous_floor() {
+        let floor = |p: Vec3| p.z <= 24.0;
+        assert!(ground_along(&floor, Vec3::new(0.0, 0.0, 24.0), Vec3::new(32.0, 0.0, 24.0)));
+        assert!(ground_along(&floor, Vec3::new(0.0, 0.0, 24.0), Vec3::new(32.0, 32.0, 24.0)));
+    }
+
+    /// A grid-diagonal link whose centre line crosses a hole in the floor (wider than the player box,
+    /// so the hull-1 oracle reads air there) is severed — the stair-side L-corner fall.
+    #[test]
+    fn ground_along_severs_diagonal_over_hole() {
+        // Flat floor except a 16u square hole straddling the diagonal midpoint; endpoints stay solid.
+        let holed = |p: Vec3| p.z <= 24.0 && !((8.0..24.0).contains(&p.x) && (8.0..24.0).contains(&p.y));
+        assert!(!ground_along(&holed, Vec3::new(0.0, 0.0, 24.0), Vec3::new(32.0, 32.0, 24.0)));
+    }
+
+    /// Balancing along a thin walkable strip (a wall-top) survives: a link running *along* a 32u-wide
+    /// crest keeps floor under every sample. The hull-1 oracle reports solid across a strip at least
+    /// as wide as the player box — exactly what carried the cells there in the first place.
+    #[test]
+    fn ground_along_keeps_thin_strip() {
+        let strip = |p: Vec3| p.z <= 24.0 && p.y.abs() <= 16.0;
+        assert!(ground_along(&strip, Vec3::new(0.0, 0.0, 24.0), Vec3::new(32.0, 0.0, 24.0)));
+        assert!(ground_along(&strip, Vec3::new(0.0, 0.0, 24.0), Vec3::new(64.0, 0.0, 24.0)));
     }
 
     /// Build the navmesh from a real map (`RTX_TEST_BSP`) and sanity-check it: cells and links

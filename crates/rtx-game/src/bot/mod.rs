@@ -85,6 +85,23 @@ const RJ_BALLISTIC_SLACK: f32 = 1.0;
 /// Advance to the next route leg once within this of the current waypoint (≈ ¾ of a grid).
 const ARRIVE_RADIUS: f32 = 24.0;
 
+/// Edge-safety (see the ledge brake / turn slowdown in [`steer`]). Below this speed a single frame
+/// of wish can't carry a grounded bot over an edge, so the brake stays off (avoids a stand-still lock).
+const LEDGE_MIN_SPEED: f32 = 60.0;
+/// The ledge brake fires only when the bot's velocity has drifted this far off the corridor to its
+/// waypoint (cosine — 0.5 ≈ 60°). An aligned Walk/Step leg has floor under it (the build's
+/// `ground_along`), and a thin balance-beam path keeps velocity aligned, so both stay unbraked; only a
+/// genuinely overshot corner heading off-route trips it. Must sit above the grid's 45° zigzag (cos ≈
+/// 0.707), which reads as aligned.
+const LEDGE_ALIGN_COS: f32 = 0.5;
+/// Approach distance under which the arrival slowdown considers easing off for a sharp turn at a ledge.
+const TURN_SLOW_RADIUS: f32 = 96.0;
+/// Floor the arrival-slowdown wish scale never drops below (≈200 u/s of wish at `ARRIVE_RADIUS`).
+const TURN_SLOW_MIN: f32 = 0.25;
+/// The route must turn past this (cosine — 0.5 ≈ 60°, above the grid's constant 45° zigzag) at the next
+/// leg for the arrival slowdown to engage, so flat straightaways and gentle zigzags keep full speed.
+const TURN_SLOW_COS: f32 = 0.5;
+
 /// Outcome of a ballistic-phase landing check, shared by the hook and rocket-jump drivers: both fly
 /// a frictionless arc that matches their solve, so the only questions are whether we've touched down
 /// and whether we overran the predicted airtime without a clean landing.

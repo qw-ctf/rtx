@@ -10,10 +10,11 @@
 //! `&mut GameState`. That is exactly what lets `run_bot` hold the two disjoint borrows here and then
 //! resume the `&mut game` spine (combat/grenade overlays, `emit`) once [`steer`] returns.
 
-use glam::{Vec3, Vec3Swizzles};
+use glam::{Vec2, Vec3, Vec3Swizzles};
 
 use super::*;
 use crate::bsp::Bsp;
+use rtx_nav::qphys::ORIGIN_TO_FEET;
 use crate::bot::state::{Commit, GateErrand, PlatWait};
 use crate::math::{angle_vectors, angles_to, yaw_of};
 use crate::defs::{Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP};
@@ -697,12 +698,44 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // — e.g. right at a door between it and its target (the combat layer manages the actual
     // fighting distance once it has line of sight). `polite` is never set alongside a chase or
     // a Fight intent, so it alone decides.
+    // Arrival slowdown: when a grounded Walk/Step leg is about to hand off to a sharply-turning next
+    // leg and continuing straight past the waypoint would run off a ledge, ease the wish down as we
+    // close in so we arrive slow enough to make the turn instead of overshooting the lip. Double-gated
+    // — a sharp turn AND a real drop straight ahead — so flat corners and the grid's 45° zigzag keep
+    // full speed, and a thin balance path (no turn, or floor continuing past the waypoint) is untouched.
+    let wish_scale = {
+        let eligible = on_ground
+            && !bhop_active
+            && !sj_active
+            && !hook_engaged
+            && !rj_engaged
+            && matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
+            && dist < TURN_SLOW_RADIUS;
+        let cur_dir = to_wp.normalize_or_zero();
+        let next_dir = bot
+            .route
+            .get(bot.route_pos + 1)
+            .map(|&nl| (graph.cell_origin(graph.link_target(nl)).xy() - waypoint.xy()).normalize_or_zero());
+        let sharp = cur_dir != Vec2::ZERO
+            && next_dir.is_some_and(|nd| nd != Vec2::ZERO && cur_dir.dot(nd) < TURN_SLOW_COS);
+        let over_ledge = eligible
+            && sharp
+            && bsp.is_some_and(|bsp| {
+                let feet = waypoint - Vec3::new(0.0, 0.0, ORIGIN_TO_FEET);
+                crate::hazard::ledge_ahead(&|p| bsp.is_solid(p), feet, Vec3::new(cur_dir.x, cur_dir.y, 0.0))
+            });
+        if over_ledge {
+            (dist / TURN_SLOW_RADIUS).clamp(TURN_SLOW_MIN, 1.0)
+        } else {
+            1.0
+        }
+    };
     let close_enough = final_leg && polite && dist <= POLITE_DIST;
     if !close_enough {
         let (fwd, right, _) = angle_vectors(angles);
         let dir = Vec3::new(to_wp.x, to_wp.y, 0.0).normalize_or_zero();
-        forward = (fwd.dot(dir) * MOVE_SPEED) as i32;
-        side = (right.dot(dir) * MOVE_SPEED) as i32;
+        forward = (fwd.dot(dir) * MOVE_SPEED * wish_scale) as i32;
+        side = (right.dot(dir) * MOVE_SPEED * wish_scale) as i32;
     }
     // Jump only while on the ground: QW pmove jumps once per press and needs the button
     // released (airborne) before it'll fire again. Gating on ground state pulses it correctly,
@@ -799,6 +832,34 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     if on_air && !on_ground {
         if let Some(w) = air_wish(waypoint) {
             move_world = w;
+        }
+    }
+
+    // Ledge brake: a grounded bot on a Walk/Step leg whose *velocity* has drifted well off the corridor
+    // to its waypoint (an overshot corner — e.g. run straight at a stair side) and is one stride from
+    // running off the floor: kill the wish and thrust backward to stop before the lip. After the
+    // navmesh's `ground_along` fix an *aligned* Walk/Step leg always has floor under it, so a drop
+    // along velocity is unintended; and balancing along a thin wall-top keeps velocity aligned to the
+    // waypoints, so the misalignment gate keeps this dead there. Dead too while airborne, bhopping,
+    // speed-/rocket-jumping, or hooking — those own their motion (and the hook/rj overrides below win).
+    if let Some(bsp) = bsp {
+        let braking = on_ground
+            && !on_air
+            && bot.bhop.phase == bhop::Phase::Off
+            && !bhop_active
+            && !sj_active
+            && !hook_engaged
+            && !rj_engaged
+            && matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
+            && speed > LEDGE_MIN_SPEED;
+        if braking {
+            let vdir = v_xy.normalize_or_zero();
+            let aligned = vdir.dot(to_wp.normalize_or_zero()) >= LEDGE_ALIGN_COS;
+            let vdir3 = Vec3::new(vdir.x, vdir.y, 0.0);
+            let feet = origin - Vec3::new(0.0, 0.0, ORIGIN_TO_FEET);
+            if !aligned && crate::hazard::ledge_ahead(&|p| bsp.is_solid(p), feet, vdir3) {
+                move_world = -vdir3 * MOVE_SPEED;
+            }
         }
     }
 

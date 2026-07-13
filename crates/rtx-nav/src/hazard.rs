@@ -17,6 +17,8 @@
 use glam::Vec3;
 
 use crate::bsp::{CONTENTS_EMPTY, CONTENTS_LAVA, CONTENTS_SLIME, CONTENTS_SOLID, CONTENTS_WATER};
+use crate::navmesh::GRID;
+use crate::qphys::STEP_HEIGHT;
 
 /// The eight compass directions probed around a point for a hazard.
 pub(crate) const HAZARD_DIRS: [(f32, f32); 8] = [
@@ -198,6 +200,42 @@ pub fn water_ahead(
     })
 }
 
+/// Vertical stride when marching down to test for a walkable floor under a step-ahead probe.
+const LEDGE_MARCH: f32 = 8.0;
+
+/// Whether walking from `feet` along horizontal unit `dir` runs off a plain **ledge** within a stride
+/// or two — the everyday-fall analogue of [`hazard_ahead`], which flags only lava/slime/lethal pits
+/// and runs only in combat. The floor is *allowed* to descend as you walk: a staircase steps down one
+/// [`STEP_HEIGHT`] per grid cell, so the tolerated drop grows with distance. This trips only when the
+/// floor falls away faster than that walkable rate — a real edge the route didn't mean to leave. A
+/// probe landing inside solid is a wall or step-up, not a fall, so it's skipped (mirrors
+/// `hazard_ahead`). Pure over `is_solid`; the game's path-follower uses it to brake a grounded bot
+/// before it fumbles off a stair side.
+pub fn ledge_ahead(is_solid: &impl Fn(Vec3) -> bool, feet: Vec3, dir: Vec3) -> bool {
+    for d in HAZARD_AHEAD_DISTS {
+        let p = feet + dir * d + Vec3::new(0.0, 0.0, 8.0);
+        if is_solid(p) {
+            continue; // a wall or step-up ahead — normal collision handles it, not a fall
+        }
+        // The most the floor may have legally dropped by `d` and still be a walkable descent: the 8u
+        // probe lift plus one step per grid cell covered. March down that far; no floor within = ledge.
+        let allow = 8.0 + STEP_HEIGHT * (1.0 + d / GRID);
+        let mut z = 0.0;
+        let mut grounded = false;
+        while z <= allow {
+            if is_solid(p - Vec3::new(0.0, 0.0, z)) {
+                grounded = true;
+                break;
+            }
+            z += LEDGE_MARCH;
+        }
+        if !grounded {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether open air sits directly above `p` — a surface a submerged bot can swim up to by holding
 /// jump. Marches up in strides: reaching `CONTENTS_EMPTY` means an open surface overhead (true);
 /// hitting solid first means a roofed underwater tunnel (false) — there the bot must swim *out* to
@@ -361,5 +399,37 @@ mod tests {
         // Roofed tunnel: water below z = 0, solid ceiling above — no surface overhead.
         let roofed = |p: Vec3| if p.z < 0.0 { CONTENTS_WATER as f32 } else { CONTENTS_SOLID as f32 };
         assert!(!surface_above(&roofed, Vec3::new(0.0, 0.0, -40.0)));
+    }
+
+    // `ledge_ahead` is called with `feet` at the visual floor (origin − 24) and the real hull-1
+    // `is_solid`, which reads solid up to the resting origin — 24u above the visual floor. The oracles
+    // below model that bevel: a flat floor at visual height 0 is solid for z ≤ 24.
+
+    #[test]
+    fn ledge_ahead_flat_floor_is_safe() {
+        let solid = |p: Vec3| p.z <= 24.0;
+        assert!(!ledge_ahead(&solid, Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn ledge_ahead_detects_a_drop() {
+        // Floor for x ≤ 60, bottomless beyond: stepping +x runs off the edge, −x stays on floor.
+        let solid = |p: Vec3| p.z <= 24.0 && p.x <= 60.0;
+        assert!(ledge_ahead(&solid, Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0)));
+        assert!(!ledge_ahead(&solid, Vec3::ZERO, Vec3::new(-1.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn ledge_ahead_staircase_descent_is_safe() {
+        // Steps down one STEP_HEIGHT (18) per 32u grid cell — a walkable descent, not a ledge.
+        let solid = |p: Vec3| p.z <= 24.0 - 18.0 * (p.x / 32.0).floor().max(0.0);
+        assert!(!ledge_ahead(&solid, Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn ledge_ahead_wall_is_safe() {
+        // A wall filling x > 60 at every height: a step-up/obstacle for collision, not a fall.
+        let solid = |p: Vec3| p.z <= 24.0 || p.x > 60.0;
+        assert!(!ledge_ahead(&solid, Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0)));
     }
 }

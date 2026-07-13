@@ -16,7 +16,9 @@ use std::io::{Cursor, Seek, SeekFrom};
 use binrw::{BinRead, BinReaderExt};
 use glam::Vec3;
 
+use rtx_nav::bsp::Bsp;
 use rtx_nav::navmesh::{arc_point, LinkKind, NavGraph, DOUBLE_ARC_PEAK, GRID, JUMP_APEX};
+use rtx_nav::qphys::STEP_HEIGHT;
 
 /// Quake gravity constant (`sv_gravity` default) — the parabola coefficient for the ballistic link
 /// arcs. Matches the value the navmesh solved the arcs with.
@@ -539,19 +541,40 @@ pub fn nav_lines(graph: &NavGraph, visible: &[bool; NUM_LINK_KINDS]) -> Vec<Line
     out
 }
 
-/// Build the filled **walkable surface**: a flat green quad (two triangles) on the floor under each
-/// cell, sized to the nav grid so adjacent cells tile edge-to-edge. Lifted 1u off the floor to avoid
-/// z-fighting the world mesh. Returns `TriangleList` vertices (drawn translucent).
-pub fn nav_surface(graph: &NavGraph) -> Vec<LineVertex> {
+/// Number of sub-quads per axis a cell tile is divided into when trimming it to the supported
+/// footprint — 4 = 8u sub-quads at the 32u grid pitch.
+const SURF_SUB: i32 = 4;
+
+/// Build the filled **walkable surface**: green quads on the floor under each cell, lifted 1u to avoid
+/// z-fighting the world mesh. Each 32u cell tile is subdivided into `SURF_SUB`² sub-quads and only the
+/// sub-quads whose centre is genuinely standable are emitted — floor within a step below the origin
+/// (hull-1 solid) and open at origin height (not buried in a wall/riser). This is the same physical
+/// test the build's `ground_along` enforces, so the surface stops at the real hull footprint (≤16u of
+/// honest overhang past a visual ledge) instead of padding out a full grid tile. `TriangleList`,
+/// translucent.
+pub fn nav_surface(graph: &NavGraph, bsp: &Bsp) -> Vec<LineVertex> {
     let color = link_color(LinkKind::Walk);
-    let h = GRID * 0.5;
+    let full = GRID * 0.5; // tile half-extent
+    let sub = GRID / SURF_SUB as f32; // sub-quad side
+    let hs = sub * 0.5; // sub-quad half-extent
     let mut out: Vec<LineVertex> = Vec::with_capacity(graph.cells.len() * 6);
     for cell in &graph.cells {
         let o = cell.origin;
         let z = o.z - FEET_DROP + 1.0;
-        let corner = |dx: f32, dy: f32| LineVertex { pos: [o.x + dx * h, o.y + dy * h, z], color };
-        let (a, b, c, d) = (corner(-1.0, -1.0), corner(1.0, -1.0), corner(1.0, 1.0), corner(-1.0, 1.0));
-        out.extend_from_slice(&[a, b, c, a, c, d]);
+        for iy in 0..SURF_SUB {
+            for ix in 0..SURF_SUB {
+                let cx = o.x - full + hs + ix as f32 * sub;
+                let cy = o.y - full + hs + iy as f32 * sub;
+                let supported = bsp.is_solid(Vec3::new(cx, cy, o.z - (STEP_HEIGHT + 4.0)))
+                    && !bsp.is_solid(Vec3::new(cx, cy, o.z + 1.0));
+                if !supported {
+                    continue;
+                }
+                let corner = |dx: f32, dy: f32| LineVertex { pos: [cx + dx * hs, cy + dy * hs, z], color };
+                let (a, b, c, d) = (corner(-1.0, -1.0), corner(1.0, -1.0), corner(1.0, 1.0), corner(-1.0, 1.0));
+                out.extend_from_slice(&[a, b, c, a, c, d]);
+            }
+        }
     }
     out
 }
@@ -698,8 +721,12 @@ mod tests {
             }
         }
 
-        let surface = nav_surface(&graph);
-        assert_eq!(surface.len(), graph.cells.len() * 6, "surface should be 2 triangles per cell");
+        let surface = nav_surface(&graph, &bsp);
+        // Each cell emits 0..=SURF_SUB² supported sub-quads, 6 verts (2 triangles) each.
+        assert!(surface.len() % 6 == 0, "surface verts are 2-triangle sub-quads");
+        assert!(!surface.is_empty(), "a real map has standable footprint under its cells");
+        let max = graph.cells.len() * (SURF_SUB * SURF_SUB) as usize * 6;
+        assert!(surface.len() <= max, "surface can't exceed a full SURF_SUB² tiling per cell");
         assert!(surface.iter().all(|v| v.color == link_color(LinkKind::Walk)), "surface tiles are Walk-green");
 
         let all_visible = [true; NUM_LINK_KINDS];

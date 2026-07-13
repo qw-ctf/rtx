@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use glam::{Mat4, Vec3};
+use rtx_nav::bsp::Bsp;
 use rtx_nav::navmesh::{build_navmesh, NavBuild, NavGraph, RocketJumpParams, SpeedJumpParams};
 
 use geom::NUM_LINK_KINDS;
@@ -77,9 +78,10 @@ struct App {
     proxy: EventLoopProxy<UserEvent>,
     generation: u64,
     pending_path: Option<PathBuf>,
-    /// The most recently built navmesh, kept so the overlay can be regenerated when a path-type
-    /// toggle changes without rebuilding the graph.
-    graph: Option<NavGraph>,
+    /// The most recently built navmesh, kept with its BSP so the overlay can be regenerated when a
+    /// path-type toggle changes without rebuilding the graph (the BSP is needed to trim each cell's
+    /// filled tile to its hull-1-supported footprint in [`geom::nav_surface`]).
+    nav: Option<(Bsp, NavGraph)>,
     /// Per-`LinkKind` visibility (indexed by `geom::kind_index`); `Walk` gates the filled surface.
     visible: [bool; NUM_LINK_KINDS],
     egui_ctx: egui::Context,
@@ -106,7 +108,7 @@ impl App {
             proxy,
             generation: 0,
             pending_path,
-            graph: None,
+            nav: None,
             visible: [true; NUM_LINK_KINDS],
             egui_ctx: egui::Context::default(),
             egui_state: None,
@@ -116,9 +118,9 @@ impl App {
     /// Regenerate and upload the navmesh overlay (filled walkable surface + colored link lines) from
     /// the current graph and path-type visibility. Cheap enough to redo on every toggle change.
     fn rebuild_overlay(&mut self) {
-        let (Some(gpu), Some(graph)) = (self.gpu.as_mut(), self.graph.as_ref()) else { return };
+        let (Some(gpu), Some((bsp, graph))) = (self.gpu.as_mut(), self.nav.as_ref()) else { return };
         if self.visible[geom::kind_index(rtx_nav::navmesh::LinkKind::Walk)] {
-            gpu.set_surface(&geom::nav_surface(graph));
+            gpu.set_surface(&geom::nav_surface(graph, bsp));
         } else {
             gpu.set_surface(&[]);
         }
@@ -179,7 +181,7 @@ impl App {
         gpu.set_mesh(&mesh.vertices);
         gpu.set_water(&mesh.water);
         gpu.clear_overlay();
-        self.graph = None;
+        self.nav = None;
         self.camera.frame(mesh.mins, mesh.maxs);
         self.set_title(&format!("navview — {name} (building navmesh…)"));
         if let Some(w) = &self.window {
@@ -329,13 +331,13 @@ impl ApplicationHandler<UserEvent> for App {
             return; // a newer map was dropped while this build ran — discard the stale result
         }
         match result {
-            Some((_bsp, graph)) => {
+            Some((bsp, graph)) => {
                 self.set_title(&format!(
                     "navview — {} cells, {} links",
                     graph.cells.len(),
                     graph.links.len()
                 ));
-                self.graph = Some(graph);
+                self.nav = Some((bsp, graph));
                 self.rebuild_overlay();
             }
             None => self.set_title("navview — navmesh build failed"),

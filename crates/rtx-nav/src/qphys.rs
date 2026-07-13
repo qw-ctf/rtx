@@ -23,3 +23,8 @@ pub const JUMP_VZ: f32 = 270.0;
 /// The tallest lip pmove steps over without a jump (`MAX_STEP_HEIGHT`). Shared by the navmesh
 /// (what counts as a walkable step vs a ledge) and the game-side offline pmove sim.
 pub const STEP_HEIGHT: f32 = 18.0;
+
+/// A standing player's origin sits this far above its feet (the render/visual floor): the QW player
+/// box is `mins.z = -24`. A carved cell stores the *origin* height, so drop by this to reach the
+/// floor a foot-level probe or a viewer's floor tile wants.
+pub const ORIGIN_TO_FEET: f32 = 24.0;
