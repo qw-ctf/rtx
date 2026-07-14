@@ -50,6 +50,15 @@ const POWERUP_DEFER_RATIO: f32 = 0.7;
 /// a handful of shells, but it will for the quad, an RL it lacks, or a big health/armor pickup.
 pub(crate) const COMBAT_GREED_MIN_DESIRE: f32 = 40.0;
 
+/// A health/armor pickup is a completion-critical local recovery when it adds at least this much
+/// effective strength. At critical health any positive recovery qualifies instead.
+const LOCAL_RECOVERY_GAIN: f32 = 25.0;
+/// Only pickups reachable inside this travel-time budget can pre-empt combat as a local completion.
+const LOCAL_PICKUP_TRAVEL: f32 = 1.0;
+/// Euclidean pre-filter before the local Dijkstra. It is deliberately looser than one second of
+/// stock running to admit a short stair/turn while avoiding a flood when no relevant item is nearby.
+const LOCAL_PICKUP_RADIUS: f32 = 384.0;
+
 /// Relative bonus the item a bot is *already* chasing gets in goal scoring, so a marginally-better
 /// alternative doesn't make it flip-flop between two near-equal pickups each re-selection (a loop
 /// the navigation watchdogs can't see, since the bot keeps moving). Q3's goal-selection dampening.
@@ -512,6 +521,60 @@ impl GameState {
         self.best_item_goal(bot_e)
             .filter(|&(_, _, desire)| desire >= COMBAT_GREED_MIN_DESIRE)
             .map(|(item, cell, _)| (item, cell))
+    }
+
+    /// Pick a spawned, nearby health/armor recovery or timed powerup that must be completed before
+    /// combat movement resumes. This pass is independent of `rtx_bot_greed`: greed governs optional
+    /// detours, not stepping the final metre onto armor that prevents an immediate death.
+    pub(crate) fn select_urgent_local_item(&self, bot_e: EntId) -> Option<(EntId, CellId, super::state::GoalCommit)> {
+        let graph = self.nav.graph.as_ref()?;
+        let origin = self.entities[bot_e].v.origin;
+        let stats = self.bot_stats(bot_e);
+        let now = self.time();
+
+        // First establish that a relevant pickup is geometrically local. Most frames stop here and
+        // avoid the graph flood; the exact travel-time/reachability test follows only when needed.
+        let mut nearby = Vec::new();
+        for &(idx, cell) in &self.nav.goals {
+            let item = EntId(idx);
+            let ent = &self.entities[item];
+            if ent.v.solid != Solid::Trigger
+                || self.entities[bot_e].bot.is_avoided(idx, now)
+                || (ent.v.origin - origin).length() > LOCAL_PICKUP_RADIUS
+            {
+                continue;
+            }
+            let Some(cat) = ent.classname().and_then(category) else {
+                continue;
+            };
+            let desire = self.item_desire(&stats, item, cat);
+            let commit = match cat {
+                Category::Powerup => super::state::GoalCommit::Powerup,
+                Category::Health | Category::Armor { .. }
+                    if desire >= LOCAL_RECOVERY_GAIN || (stats.health <= 40.0 && desire > 0.0) =>
+                {
+                    super::state::GoalCommit::Pickup
+                }
+                _ => continue,
+            };
+            nearby.push((item, cell, desire, commit));
+        }
+        if nearby.is_empty() {
+            return None;
+        }
+
+        let from = graph.nearest(origin)?;
+        let pricing = self.bot_link_pricing(bot_e, now);
+        let travel = graph.costs_from(from, &pricing.costs(0));
+        nearby
+            .into_iter()
+            .filter_map(|(item, cell, desire, commit)| {
+                let t = travel[cell as usize];
+                (t.is_finite() && t <= LOCAL_PICKUP_TRAVEL)
+                    .then_some((item, cell, commit, desire / (t + 0.25)))
+            })
+            .max_by(|a, b| a.3.total_cmp(&b.3).then_with(|| b.0.0.cmp(&a.0.0)))
+            .map(|(item, cell, commit, _)| (item, cell, commit))
     }
 
     /// The best `(item, cell, desire)` for a bot by `desire × (LOOKAHEAD − t) / (t + 5)`, over both

@@ -15,7 +15,7 @@ use glam::{Vec2, Vec3, Vec3Swizzles};
 use super::*;
 use crate::bsp::Bsp;
 use rtx_nav::qphys::ORIGIN_TO_FEET;
-use crate::bot::state::{Commit, GateErrand, PlatWait};
+use crate::bot::state::{AirCommit, Commit, GateErrand, PlatWait};
 use crate::math::{angle_vectors, angles_to, yaw_of};
 use crate::defs::{Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP};
 use crate::game::cstring;
@@ -65,9 +65,13 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     let Objective { hooking, on_sj, on_rj, enemy, chasing, polite, vigil, target_origin, watch_point, .. } = o;
     let gate_closed = costs.gate_closed;
 
-    // Airborne jump commitment (latched last frame at takeoff): while flying a plain jump leg, freeze
-    // the route and lock out combat so an enemy appearing mid-arc can't flip the goal and yank us off
-    // the jump. Read here (before the repath gate and leg-advance) like `on_sj`/`on_rj`.
+    // Plain-jump commitment is normally pre-armed before objective resolution. Remember the first
+    // physical airborne frame here; route kind/position is intentionally irrelevant to release.
+    if !on_ground {
+        if let Some(c) = bot.air.as_mut() {
+            c.airborne = true;
+        }
+    }
     let on_air = bot.air.is_some();
     // Puppet rocket-jump order (test harness, see [`crate::control`]): pin the route to the single
     // ordered link so the repath / leg-advance / errand logic below can't clobber the one-leg route
@@ -86,9 +90,9 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     }
     // Route committed to a ballistic traversal (hook flight, speed jump, or rocket jump) or pinned by a
     // puppet order: a goal flip must not replace the route and yank the bot off the leg it's flying.
-    // Gates the repath/errand logic below (`on_air`, the plain-jump commitment, is a separate, per-arc
-    // gate added alongside).
-    let route_frozen = hooking || on_sj || on_rj || pinned;
+    // Gates every route/errand mutation below. Plain jumps used to be a collection of separate
+    // `!on_air` guards, leaving holes such as gate errands; one ownership bit closes those seams.
+    let route_frozen = hooking || on_sj || on_rj || on_air || pinned;
 
     // A teleport (or any large instant displacement) invalidates the planned route — drop it
     // and re-path from where we landed. ~200u in one frame is far beyond running/falling. Skipped
@@ -224,7 +228,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // the waypoint pinned to the jump so steering stays on the landing point and the air-jump
     // undershoot recovery keeps firing (the leg advances naturally once we land). Like Hook/RocketJump,
     // whose drivers advance on landing, not on passing the target XY.
-    while (on_ground || !on_air) && bot.route_pos < bot.route.len() {
+    while (on_ground || (!on_air && !on_sj)) && bot.route_pos < bot.route.len() {
         let leg = bot.route[bot.route_pos];
         let target = graph.cell_origin(graph.link_target(leg));
         let arrived = match graph.link_kind(leg) {
@@ -488,20 +492,32 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     } else if bot.sj.is_some() {
         bot.sj = None;
     }
-    // Airborne commitment for a plain jump leg (JumpGap/DoubleJump): latch it (like `sj_leg`) so the
-    // route stays frozen and combat locked until we land. Latched whenever we're on such a leg (the
-    // grace in the release decision absorbs the one or two ground frames at takeoff); released on
-    // landing, on advancing off the leg, or by the watchdog if we never come down.
+    // Fallback latch for a jump leg created by this frame's repath. Ordinarily `prearm_traversal`
+    // installed it before objective resolution; this closes the first-frame route-build case.
     let on_jump_leg = matches!(kind, Some(LinkKind::JumpGap | LinkKind::DoubleJump));
     if on_jump_leg && bot.air.map(|c| c.leg) != cur_leg {
-        bot.air = cur_leg.map(|leg| Commit { leg, since: now });
+        bot.air = cur_leg.map(|leg| AirCommit {
+            leg,
+            target: graph.link_target(leg),
+            since: now,
+            airborne: !on_ground,
+        });
     }
     if let Some(committed) = bot.air {
-        match air_commit_decision(on_ground, on_jump_leg, now - committed.since) {
+        match air_commit_decision(on_ground, committed.airborne, now - committed.since) {
             AirRelease::Keep => {}
-            AirRelease::Land => bot.air = None,
+            AirRelease::Land => {
+                let target = graph.cell_origin(committed.target);
+                let on_target = (origin.xy() - target.xy()).length() <= 2.0 * ARRIVE_RADIUS;
+                if !on_target {
+                    penalize_leg(bot, Some(committed.leg), Some(graph.link_kind(committed.leg)), now);
+                    bot.route.clear();
+                    bot.repath_time = now;
+                }
+                bot.air = None;
+            }
             AirRelease::Timeout => {
-                penalize_leg(bot, Some(committed.leg), kind, now);
+                penalize_leg(bot, Some(committed.leg), Some(graph.link_kind(committed.leg)), now);
                 bot.air = None;
                 bot.route.clear();
                 bot.repath_time = now;

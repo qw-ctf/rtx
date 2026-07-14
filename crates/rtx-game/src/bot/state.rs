@@ -82,11 +82,10 @@ pub struct BotState {
     /// A committed [`LinkKind::SpeedJump`](crate::navmesh::LinkKind::SpeedJump) leg (a bhop run-up +
     /// leap) being flown. `None` = not on a speed jump. See [`Commit`].
     pub sj: Option<Commit>,
-    /// A committed plain jump leg (JumpGap/DoubleJump) being flown. Latched at takeoff, it freezes
-    /// the route and locks out combat until landing — so an enemy appearing mid-arc can't flip the
-    /// goal, replace the route, and yank the bot off the jump (the same commitment `sj`/the rocket
-    /// jump have, which plain jumps previously lacked). `None` = not committed. See [`Commit`].
-    pub air: Option<Commit>,
+    /// A committed plain jump leg (JumpGap/DoubleJump) being flown. Pre-armed before objective
+    /// selection, it freezes the route and locks out combat until a physical landing — so an enemy
+    /// appearing at the lip or mid-arc cannot flip the goal and yank the bot off the jump.
+    pub air: Option<AirCommit>,
     /// Rocket-jump traversal machine (see [`RjState`]): stance → jump → fire → ride the blast arc
     /// onto a high ledge.
     pub rj: RjState,
@@ -236,6 +235,17 @@ pub struct Commit {
     pub since: f32,
 }
 
+/// A plain gap/double-jump commitment. Unlike [`Commit`] (the speed-jump run-up latch), this records
+/// whether the bot has actually left the ground and the expected landing cell: route advancement is
+/// not evidence of landing, and a grounded takeoff frame must not release the lock.
+#[derive(Clone, Copy)]
+pub struct AirCommit {
+    pub leg: u32,
+    pub target: CellId,
+    pub since: f32,
+    pub airborne: bool,
+}
+
 /// Plat standoff (see [`crate::bot::steer`]): the navmesh plat index the bot is holding off from
 /// while it's raised, and when the hold began (the give-up timeout base). Keyed on the plat index,
 /// not the leg, so the 0.4s repath churn doesn't reset the timer.
@@ -276,12 +286,19 @@ pub struct GoalState {
     pub item_cell: u32,
     /// Earliest time the bot may re-pick its item goal (throttles the catalog scan).
     pub next_pick: f32,
+    /// Earliest time to run the cheap nearby lifesaving-pickup pre-pass. This is much faster than
+    /// normal goal selection but need not flood the navmesh every server frame.
+    pub next_urgent: f32,
     /// When the bot began chasing its current item goal. If it's *still* chasing the same item long
     /// after (one it can't actually reach — e.g. behind an elevator/button/movewall/teleporter chain
     /// the router can't thread), it abandons that goal rather than circling forever. Uses time-on-
     /// goal, not distance, so a legitimate route that walks *away* toward a teleporter isn't mistaken
     /// for being stuck.
     pub since: f32,
+    /// Completion lock for a pickup that must not lose movement ownership to combat or a periodic
+    /// goal re-pick. `Pickup` is a nearby lifesaving health/armor item; `Powerup` is a selected timed
+    /// powerup. The lock ends only on touch, invalidation, route failure, or its watchdog.
+    pub commit: GoalCommit,
     /// Handoff hold (team opponent modeling): a spawned RL/LG this bot stands on but deliberately
     /// does **not** pick up (`bot_pickup_items` skips it), reserving it for a powerup-carrying
     /// teammate that lacks it. `0` = not holding. `hold_for` is that teammate; `hold_until` the hard
@@ -294,6 +311,16 @@ pub struct GoalState {
     /// weapons-stay trigger can't re-capture the goal slot the same second). A small ring: a fresh
     /// entry evicts the soonest-to-expire slot. `(item entid, until)`; a `0` item marks an empty slot.
     pub avoid_items: [(u32, f32); 4],
+}
+
+/// How strongly the current item goal is committed. Ordinary goals remain freely re-scored;
+/// lifesaving local pickups and timed powerups own movement until completion.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GoalCommit {
+    #[default]
+    None,
+    Pickup,
+    Powerup,
 }
 
 /// Grappling-hook traversal state (see [`crate::bot::hook`]): aim at the anchor, throw, reel to

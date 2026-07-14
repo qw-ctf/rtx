@@ -34,7 +34,7 @@ pub(crate) use population::{drain_roster, RosterOp};
 #[cfg(test)]
 use population::bot_target;
 
-use crate::bot::state::{BotState, GrenadePhase, HookPhase, RjPhase, Wander};
+use crate::bot::state::{AirCommit, BotState, Commit, GoalCommit, GrenadePhase, HookPhase, RjPhase, Wander};
 use crate::defs::{
     Bits, DeadFlag, Flags, Items, Solid, TakeDamage, Weapon, BUTTON_ATTACK, BUTTON_JUMP, VEC_VIEW_OFS,
 };
@@ -185,9 +185,9 @@ const LOOK_LOS_GRACE: f32 = 2.0;
 /// detours away — riding an elevator, walking to a teleporter — isn't mistaken for being stuck.
 const GOAL_GIVEUP_TIME: f32 = 10.0;
 const GOAL_AVOID_TIME: f32 = 12.0;
-/// Airborne jump commitment (`air_leg`): once committed, still on the ground after this long means we
-/// either landed or never got airborne — release and let normal navigation resume. Covers the one or
-/// two ground frames at takeoff without oscillating.
+/// Airborne jump commitment settle grace: after the commitment has observed flight, require this
+/// much elapsed time before a grounded frame counts as touchdown. A bot that never got airborne is
+/// run-up/stalled, not landed, and remains committed until the watchdog.
 const AIR_COMMIT_GRACE: f32 = 0.2;
 /// And if we're *still airborne* after this long, no real jump arc lasts that long — we fell into the
 /// void or wedged. Abandon the leg (penalize + re-path), the speed-jump watchdog's shape.
@@ -251,35 +251,46 @@ const PICKUP_Z: f32 = 48.0;
 /// instead of re-fixating on a pickup that respawns (or lingers solid) the same second.
 const PICKUP_AVOID_TIME: f32 = 3.0;
 
+/// Whether a trigger touch is a player pickup fake clients must receive manually. Keeping this an
+/// explicit allow-list prevents the bot pass from firing doors, teleports, damage, or map scripts.
+fn bot_pickup_touch(touch: Touch) -> bool {
+    matches!(
+        touch,
+        Touch::ItemHealth
+            | Touch::ItemArmor
+            | Touch::ItemWeapon
+            | Touch::ItemAmmo
+            | Touch::ItemPowerup
+            | Touch::Backpack
+            | Touch::Flag
+            | Touch::Rune
+    )
+}
+
 /// Manually collect any item the bot is standing on. The engine doesn't run the trigger-touch
 /// phase for `SetBotCMD` fake clients the way it does for human `SV_RunCmd`, so a bot would walk
 /// onto a pickup and never actually take it — it'd just keep wanting it and circle. We replicate
 /// the touch here, guarded by `solid == Trigger` (a respawning item that's already been taken is
-/// non-solid → skipped) so this can't double-grant even if an engine *does* fire the touch.
+/// non-solid → skipped) so this can't double-grant even if an engine *does* fire the touch. The
+/// scan intentionally includes dynamic CTF flags/runes and backpacks, none of which can live in the
+/// static nav goal catalog.
 fn bot_pickup_items(game: &mut GameState, e: EntId) {
     if !game.entities[e].is_alive() {
         return;
     }
     let origin = game.entities[e].v.origin;
-    // Gather first (immutable borrow of nav/entities), then fire touches (needs `&mut game`).
-    // Catalog items (weapons/ammo/health/armor/powerups)...
-    let mut hits: Vec<EntId> = game
-        .nav
-        .goals
+    // Gather first (immutable borrow of entities), then fire touches (needs `&mut game`). A Quake
+    // server has a small fixed edict table; scanning it once per bot frame is both bounded and the
+    // only correct way to catch moving/dynamically-created pickup entities.
+    let hits: Vec<EntId> = game
+        .entities
         .iter()
-        .filter_map(|&(idx, _)| {
-            let item = EntId(idx);
-            let it = &game.entities[item];
-            (it.v.solid == Solid::Trigger && on_item(origin, it.v.origin)).then_some(item)
+        .enumerate()
+        .filter_map(|(i, it)| {
+            (it.v.solid == Solid::Trigger && bot_pickup_touch(it.touch) && on_item(origin, it.v.origin))
+                .then_some(EntId(i as u32))
         })
         .collect();
-    // ...plus any dropped backpack we're standing on. Backpacks aren't in the static catalog (they
-    // spawn on death / a teammate's toss), so without this a bot would walk over one and never take
-    // it — the engine skips the trigger-touch phase for `SetBotCMD` fake clients.
-    hits.extend(game.entities.iter().enumerate().filter_map(|(i, it)| {
-        (it.touch == Touch::Backpack && it.v.solid == Solid::Trigger && on_item(origin, it.v.origin))
-            .then_some(EntId(i as u32))
-    }));
     let now = game.time();
     let goal_item = game.entities[e].bot.goal.item;
     let hold_item = game.entities[e].bot.goal.hold_item;
@@ -296,7 +307,11 @@ fn bot_pickup_items(game: &mut GameState, e: EntId) {
             // weapons-stay trigger that lingers solid) can't recapture the goal slot the same second;
             // the slot frees up for the next-best pickup instead of re-fixating in place.
             if item.0 == goal_item {
-                game.entities[e].bot.mark_avoid(item.0, now + PICKUP_AVOID_TIME);
+                let b = &mut game.entities[e].bot;
+                b.mark_avoid(item.0, now + PICKUP_AVOID_TIME);
+                b.goal.item = 0;
+                b.goal.commit = GoalCommit::None;
+                b.goal.next_pick = now;
             }
         }
     }
@@ -322,6 +337,9 @@ struct Objective {
     enemy: Option<EntId>,
     /// Chasing a committed item goal (idle pickup or greedy combat detour).
     chasing: bool,
+    /// The item chase owns movement until touch/invalidation. Combat may aim and fire, but must not
+    /// strafe or clear navigation's jump button while this is true.
+    item_committed: bool,
     /// Stop [`POLITE_DIST`] short of the destination — set only when tailing a human (the
     /// pacifist override / no-goal follow fallback) or idle-roaming. A mode-issued Move must be
     /// walked all the way onto: a race checkpoint is a hull-sized touch box, and stopping 64u
@@ -526,6 +544,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
             hooking, on_sj, on_rj,
             enemy: None,
             chasing: false,
+            item_committed: false,
             polite: false,
             vigil: false,
             target_origin,
@@ -584,12 +603,62 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     };
 
     let greedy = matches!(intent, Some(BotIntent::Fight(_))) && host.cvar_bool(c"rtx_bot_greed");
+
+    // A mode-issued Move/Spectate is a hard objective (flag running, race checkpoint, arena
+    // audience). It supersedes an old item completion inherited from a previous Fight/idle frame.
+    if matches!(intent, Some(BotIntent::Move(_) | BotIntent::Spectate { .. })) {
+        let b = &mut game.entities[e].bot;
+        b.goal.item = 0;
+        b.goal.commit = GoalCommit::None;
+        b.goal.next_pick = now;
+    }
+
+    // Completion locks end only when the item is no longer a valid pickup (touch handling clears
+    // the common success path immediately). Validate before any periodic selection can replace it.
+    let committed_item = game.entities[e].bot.goal.item;
+    let committed = game.entities[e].bot.goal.commit != GoalCommit::None;
+    if committed && (committed_item == 0 || !game.item_goal_valid(e, EntId(committed_item), now)) {
+        let b = &mut game.entities[e].bot;
+        b.goal.item = 0;
+        b.goal.commit = GoalCommit::None;
+        b.goal.next_pick = now;
+    }
+
+    // Fast local survival pass. It is independent of greed and runs while idle or fighting, but not
+    // during a ballistic traversal whose route/view already have an indivisible owner.
+    let traversal_committed = hooking
+        || on_sj
+        || on_rj
+        || game.entities[e].bot.air.is_some();
+    let urgent_allowed = matches!(intent, None | Some(BotIntent::Fight(_))) && !traversal_committed;
+    if urgent_allowed
+        && game.entities[e].bot.goal.commit == GoalCommit::None
+        && now >= game.entities[e].bot.goal.next_urgent
+    {
+        let pick = game.select_urgent_local_item(e);
+        let b = &mut game.entities[e].bot;
+        b.goal.next_urgent = now + 0.2;
+        if let Some((item, cell, commit)) = pick {
+            if item.0 != b.goal.item {
+                b.goal.since = now;
+            }
+            (b.goal.item, b.goal.item_cell, b.goal.commit) = (item.0, cell, commit);
+            b.goal.next_pick = now + GOAL_SELECT_INTERVAL;
+        }
+    }
+
     // Handoff hold: an idle bot may reserve a spawned RL/LG for a powerup-carrying teammate (standing
     // on it without taking it). While holding, the reservation owns `goal_item`, pre-empting normal
     // item selection; a fight or move objective (idle == false) drops the hold inside this call.
-    let holding = game.update_handoff_hold(e, now, intent.is_none());
+    let holding = game.update_handoff_hold(
+        e,
+        now,
+        intent.is_none() && game.entities[e].bot.goal.commit == GoalCommit::None,
+    );
     if holding {
         // `update_handoff_hold` set `goal_item` to the held weapon — nothing else to pick this frame.
+    } else if game.entities[e].bot.goal.commit != GoalCommit::None {
+        // Nearby recovery / timed powerup completion owns the slot until its terminal condition.
     } else if intent.is_none() || greedy {
         if now >= game.entities[e].bot.goal.next_pick {
             let pick = if greedy {
@@ -598,20 +667,29 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
                 game.select_item_goal(e)
             };
             let (new_item, new_cell) = pick.map_or((0, 0), |(it, c)| (it.0, c));
+            let new_powerup = new_item != 0 && game.is_powerup_item(EntId(new_item));
             let b = &mut game.entities[e].bot;
             if new_item != b.goal.item {
                 b.goal.since = now; // restart the watchdog for a new goal
             }
             (b.goal.item, b.goal.item_cell) = (new_item, new_cell);
             b.goal.next_pick = now + GOAL_SELECT_INTERVAL;
+            b.goal.commit = if new_powerup {
+                GoalCommit::Powerup
+            } else {
+                GoalCommit::None
+            };
         }
         if game.entities[e].bot.goal.item != 0 && !game.item_goal_valid(e, EntId(game.entities[e].bot.goal.item), now) {
             let b = &mut game.entities[e].bot;
             b.goal.item = 0;
+            b.goal.commit = GoalCommit::None;
             b.goal.next_pick = now; // re-pick next frame
         }
     } else {
-        game.entities[e].bot.goal.item = 0; // a Move objective supersedes any item chase
+        let b = &mut game.entities[e].bot;
+        b.goal.item = 0; // a Move objective supersedes any item chase
+        b.goal.commit = GoalCommit::None;
     }
 
     // Item vigil: if the goal item isn't collectable yet (mid-respawn, or a weapon held for a
@@ -659,8 +737,9 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         let vig = vigil.is_some() as i32;
         // Arena spectating: which fighter (edict) this bot is watching, `0` = none.
         let wat = if let Some(BotIntent::Spectate { watch, .. }) = intent { watch.0 } else { 0 };
+        let commit = b.goal.commit;
         let msg = cstring(&format!(
-            "rtx bot{client}: want={goal} dist={dist:.0} on_item={overlap} ownLG={own_lg} cells={:.0} pen={pen} aware={aware} est={est} hold={hold} vig={vig} watch={wat}\n",
+            "rtx bot{client}: want={goal} dist={dist:.0} on_item={overlap} ownLG={own_lg} cells={:.0} pen={pen} aware={aware} est={est} hold={hold} commit={commit:?} vig={vig} watch={wat}\n",
             game.entities[e].v.ammo_cells,
         ));
         host.conprint(&msg); // conprint always shows; dprint needs `developer 1`
@@ -678,6 +757,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // then); the detour only steers navigation while the enemy is *out* of sight, when navigation
     // would otherwise just beeline the enemy. This is ktx's "the enemy is one more goal" in effect.
     let chasing = game.entities[e].bot.goal.item != 0;
+    let item_committed = game.entities[e].bot.goal.commit != GoalCommit::None;
     let goal_item_org = {
         let it = EntId(game.entities[e].bot.goal.item);
         (game.entities[it].v.origin, Some(game.entities[e].bot.goal.item_cell))
@@ -720,6 +800,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         let b = &mut game.entities[e].bot;
         b.mark_avoid(b.goal.item, now + GOAL_AVOID_TIME);
         b.goal.item = 0;
+        b.goal.commit = GoalCommit::None;
         b.goal.next_pick = now; // re-pick (skipping the abandoned item) next frame
     }
 
@@ -734,7 +815,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // `surfacing`/`swim_up` are decided in `run_bot` (they need the borrowed graph + bot cell), so
     // the normal objective leaves them off — the anti-drown override flips them on when it fires.
     Objective {
-        hooking, on_sj, on_rj, enemy, chasing, polite, target_origin, item_cell, watch_point,
+        hooking, on_sj, on_rj, enemy, chasing, item_committed, polite, target_origin, item_cell, watch_point,
         vigil: vigil.is_some(), surfacing: false, swim_up: false, order_link: None,
     }
 }
@@ -868,6 +949,48 @@ fn emit(
     host.set_bot_cmd(client, msec, view, forward, side, 0, buttons, impulse);
 }
 
+/// Pre-arm an indivisible jump traversal from the route that existed at frame start. This runs
+/// before objective resolution; the steering core repeats the latch defensively after any fresh
+/// repath. Existing commitments are never cleared here — only their physical lifecycle may do so.
+fn prearm_traversal(game: &mut GameState, e: EntId, now: f32, on_ground: bool) {
+    let current = {
+        let Some(graph) = game.nav.graph.as_ref() else {
+            return;
+        };
+        let b = &game.entities[e].bot;
+        b.route.get(b.route_pos).copied().map(|leg| {
+            (
+                leg,
+                graph.link_kind(leg),
+                graph.link_target(leg),
+            )
+        })
+    };
+    let Some((leg, kind, target)) = current else {
+        return;
+    };
+    let bhop = game.host().cvar_bool(c"rtx_bot_bhop");
+    let b = &mut game.entities[e].bot;
+    match kind {
+        LinkKind::JumpGap | LinkKind::DoubleJump => {
+            if b.air.map(|c| c.leg) != Some(leg) {
+                b.air = Some(AirCommit {
+                    leg,
+                    target,
+                    since: now,
+                    airborne: !on_ground,
+                });
+            } else if !on_ground {
+                b.air.as_mut().unwrap().airborne = true;
+            }
+        }
+        LinkKind::SpeedJump if bhop && b.sj.map(|c| c.leg) != Some(leg) => {
+            b.sj = Some(Commit { leg, since: now });
+        }
+        _ => {}
+    }
+}
+
 fn run_bot(game: &mut GameState, e: EntId) {
     let s = sense(game, e);
     // The spine reads only these; `steer` re-destructures the full snapshot from `s` via `SteerCtx`.
@@ -887,6 +1010,8 @@ fn run_bot(game: &mut GameState, e: EntId) {
             (b.goal.hold_item, b.goal.hold_for, b.goal.hold_until) = (0, 0, 0.0);
         }
         b.air = None;
+        b.sj = None;
+        b.goal.commit = GoalCommit::None;
     }
 
     // Connected but never spawned (health 0, not dead): the engine defers `PutClientInServer` — the
@@ -914,6 +1039,12 @@ fn run_bot(game: &mut GameState, e: EntId) {
     }
 
     let idle = |angles: Vec3| host.set_bot_cmd(client, msec, angles, 0, 0, 0, 0, 0);
+
+    // Arm traversal ownership *before* resolving this frame's mode/enemy/item objective. The route
+    // was selected on an earlier frame; once its current leg is a gap/double/speed jump, a newly
+    // perceived enemy must not get one frame in which to replace that route or turn the view at the
+    // lip. `steer` owns the physical lifecycle and fallback latch.
+    prearm_traversal(game, e, now, s.on_ground);
 
     let mut o = resolve_objective(game, e, now, origin, client);
     // The spine and prologue read a few fields; `steer` re-destructures the rest from `o` via `SteerCtx`.
@@ -1032,11 +1163,20 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // ONGROUND, so `combat_move`'s hazard filter never runs and it would strafe in place until it
     // drowns. In water we restore this route move (which the water surcharge aims at shore).
     let nav_move = cmd.move_world;
+    let nav_jump = cmd.buttons & BUTTON_JUMP;
 
     // Combat overlay: with an enemy in sight, `engage` picks the look (live aim with drifting error)
     // and its own movement; traversal-critical legs are locked out (see `SteerOut::traversal_lock`).
     if let Some(en) = enemy.filter(|_| !traversal_lock) {
         combat::engage(game, e, en, origin, now, &mut cmd);
+    }
+
+    // Completion-critical pickups own travel even with line of sight. Combat still supplies aim,
+    // weapon choice, and +attack, but it may not strafe away from armor/health/powerup or clear the
+    // route driver's jump input on the final approach.
+    if o.item_committed {
+        cmd.move_world = nav_move;
+        cmd.buttons = (cmd.buttons & !BUTTON_JUMP) | nav_jump;
     }
 
     // In water, navigation owns *travel* — combat keeps aiming and firing, but the bot heads for
@@ -1052,7 +1192,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // Splash-weapon overlays, after `engage`: react to live grenades, finish a lob->shoot combo, take
     // a one-shot rocket hazard shove, else start a grenade combo. Skipped while hooking/rj/bhop-ing or
     // locked into a jump traversal (movement/buttons already spoken for) — that is `overlays_ok`.
-    if overlays_ok {
+    if overlays_ok && !o.item_committed {
         let handled = combat::grenade_tactics(game, e, enemy, origin, &mut cmd);
         if handled {
             game.entities[e].bot.grenade.phase = GrenadePhase::Idle; // defence drops a stale combo
@@ -1178,16 +1318,16 @@ fn plat_standoff(origin: Vec3, fp_min: Vec2, fp_max: Vec2) -> Vec3 {
 enum AirRelease {
     /// Stay committed — freeze the route and lock out combat.
     Keep,
-    /// Landed (or advanced off the jump leg): release; normal navigation/stuck handling resumes.
+    /// Physically landed after an observed airborne phase; normal navigation resumes.
     Land,
     /// Still airborne well past any real arc: abandon the leg (penalize + re-path).
     Timeout,
 }
 
-/// Pure core of the airborne-commitment lifecycle. `on_jump_leg` is whether the current leg is still a
-/// JumpGap/DoubleJump; `elapsed` is time since the commitment latched.
-fn air_commit_decision(on_ground: bool, on_jump_leg: bool, elapsed: f32) -> AirRelease {
-    if !on_jump_leg || (on_ground && elapsed > AIR_COMMIT_GRACE) {
+/// Pure core of the airborne-commitment lifecycle. Route advancement is deliberately absent: only
+/// an observed airborne phase followed by settled ground contact proves a landing.
+fn air_commit_decision(on_ground: bool, was_airborne: bool, elapsed: f32) -> AirRelease {
+    if was_airborne && on_ground && elapsed > AIR_COMMIT_GRACE {
         AirRelease::Land
     } else if elapsed > AIR_COMMIT_MAX {
         AirRelease::Timeout
@@ -1636,16 +1776,37 @@ mod tests {
     /// Run with `RTX_TEST_BSP=…/dm6.bsp`; skipped (vacuously green) when unset.
     #[test]
     fn air_commit_lifecycle() {
-        // Airborne on the jump leg, within the arc window → stay committed.
+        // Airborne within the arc window → stay committed.
         assert_eq!(air_commit_decision(false, true, 0.5), AirRelease::Keep);
-        // On the takeoff frame (grounded, tiny elapsed) → still committed (grace absorbs it).
-        assert_eq!(air_commit_decision(true, true, 0.1), AirRelease::Keep);
-        // Landed (grounded past the grace) → release.
+        // Grounded before ever leaving the floor is still run-up, even beyond the grace.
+        assert_eq!(air_commit_decision(true, false, 0.5), AirRelease::Keep);
+        // A route-index change while airborne cannot release the physical commitment; route state
+        // is not an input to this function.
+        assert_eq!(air_commit_decision(false, true, 1.0), AirRelease::Keep);
+        // Landed after having been airborne (grounded past the grace) → release.
         assert_eq!(air_commit_decision(true, true, 0.3), AirRelease::Land);
-        // Advanced off the jump leg (kind no longer a jump) → release regardless of ground state.
-        assert_eq!(air_commit_decision(false, false, 0.5), AirRelease::Land);
-        // Still airborne long past any real arc → watchdog timeout.
+        // Never took off, or still airborne, long past the budget → watchdog timeout.
+        assert_eq!(air_commit_decision(true, false, 3.0), AirRelease::Timeout);
         assert_eq!(air_commit_decision(false, true, 3.0), AirRelease::Timeout);
+    }
+
+    #[test]
+    fn fake_client_pickup_allowlist_includes_dynamic_ctf_objects_only() {
+        for touch in [
+            Touch::ItemHealth,
+            Touch::ItemArmor,
+            Touch::ItemWeapon,
+            Touch::ItemAmmo,
+            Touch::ItemPowerup,
+            Touch::Backpack,
+            Touch::Flag,
+            Touch::Rune,
+        ] {
+            assert!(bot_pickup_touch(touch), "{touch:?} should be collected manually");
+        }
+        for touch in [Touch::Teleport, Touch::Hurt, Touch::ButtonTouch, Touch::Multi, Touch::PlatCenter] {
+            assert!(!bot_pickup_touch(touch), "{touch:?} must remain engine/map-owned");
+        }
     }
 
     #[test]
