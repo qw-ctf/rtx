@@ -726,7 +726,14 @@ race_set_teleport_flags_by_name odd RACEFLAG_BOGUS
             return;
         };
         let routes_dir = std::env::var("RTX_TEST_ROUTES").ok();
-        let sj = crate::navmesh::SpeedJumpParams { gravity: 800.0, accel: 10.0, maxspeed: 320.0 };
+        let sj = crate::navmesh::SpeedJumpParams {
+            gravity: 800.0,
+            accel: 10.0,
+            maxspeed: 320.0,
+            friction: 4.0,
+            stopspeed: 100.0,
+            curl: false,
+        };
         let mut names: Vec<String> = std::fs::read_dir(&maps_dir)
             .expect("read maps dir")
             .filter_map(|e| {

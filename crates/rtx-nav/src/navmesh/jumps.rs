@@ -5,12 +5,15 @@
 //! measurer. Each pass floods candidates off ledge edges, dedups them per compass octant, arc-tests
 //! clearance, and splices the survivors into the graph. Runs on the parallel build's worker cells.
 
-use glam::{Vec3, Vec3Swizzles};
+use glam::{Vec2, Vec3, Vec3Swizzles};
 
 use super::geom::*;
 use super::physics::*;
 use super::*;
 use crate::bsp::Bsp;
+use crate::math::{wrap180, yaw_of};
+use crate::pmove::{pm_step, PmParams, PmState};
+use crate::strafe::{air_accel_max, air_correct, Cmd, MOVE_SPEED};
 
 impl NavGraph {
     /// Jump links out of `from`: only from a **ledge edge** (the adjacent column toward the
@@ -180,6 +183,138 @@ impl NavGraph {
         for (link, tr) in pending.into_iter().flatten() {
             self.push_speed_jump(link, tr);
         }
+        // Curl jumps second (after the straight speed jumps are spliced, so the per-target dedup can
+        // see them): a separate certified pass for gaps that need a run-up *and* an air-turn.
+        if params.curl {
+            let this = &*self;
+            let curls: Vec<Vec<(Link, SpeedJumpTraversal)>> = (0..this.cells.len() as CellId)
+                .into_par_iter()
+                .map(|ledge| {
+                    let mut out = Vec::new();
+                    this.solve_curl_jumps_from(bsp, ledge, params, k, &mut out);
+                    out
+                })
+                .collect();
+            for (link, tr) in curls.into_iter().flatten() {
+                self.push_speed_jump(link, tr);
+            }
+        }
+    }
+
+    /// The curl-jump links leaving ledge cell `ledge`: targets offset off the run-up heading that a
+    /// straight speed jump can't own (too fast for the air-strafe credit, or its arc is blocked), each
+    /// certified by a `pm_step` rollout of the game's takeoff regime (ground prestrafe to the lip, leap
+    /// along the corridor, `air_correct`-curl onto the landing). Emitted as a self-contained SpeedJump
+    /// carrying its certified `curl_gain`, so the banded planner prices it by its stored cost and the
+    /// runtime flies it with the curl controller. Its own per-cell budget, so it never evicts a straight
+    /// jump.
+    fn solve_curl_jumps_from(&self, bsp: &Bsp, ledge: CellId, params: SpeedJumpParams, k: f32, out: &mut Vec<(Link, SpeedJumpTraversal)>) {
+        let a = self.cells[ledge as usize];
+        if bsp.is_liquid_at(a.origin) {
+            return; // submerged takeoff: can't jump
+        }
+        let p = PmParams {
+            gravity: params.gravity,
+            accel: params.accel,
+            friction: params.friction,
+            stopspeed: params.stopspeed,
+            maxspeed: params.maxspeed,
+        };
+        let mut cands: Vec<(f32, Link, SpeedJumpTraversal)> = Vec::new(); // (horiz, link, tr)
+        for (dgx, dgy) in COMPASS {
+            // Leap into a gap (no ground the leap way); measure the corridor run-up behind the lip.
+            if self.has_ground_near(a.gx + dgx.signum(), a.gy + dgy.signum(), a.origin.z) {
+                continue;
+            }
+            let runway = self.measure_runway(bsp, &a, dgx, dgy);
+            if runway < CURL_MIN_RUNWAY {
+                continue; // too little run-up for the ground prestrafe to build curl speed
+            }
+            let v_deliver = prestrafe_delivered(runway, params.accel, params.maxspeed, params.friction, params.stopspeed);
+            let v_max_straight = SPEED_JUMP_V_CAP.min(BHOP_EFF * attainable_speed(MAX_SPEED, runway, k));
+            let psi0 = yaw_of(Vec2::new(dgx as f32, dgy as f32)); // corridor / takeoff heading
+            let reach = v_deliver * jump_airtime(-SJ_MAX_DROP, params.gravity);
+            let scan = ((reach / GRID).ceil() as i32).max(1);
+            for to in self.neighbors_within(a.gx, a.gy, scan) {
+                if to == ledge {
+                    continue;
+                }
+                let b = self.cells[to as usize];
+                let dz = b.origin.z - a.origin.z;
+                let horiz = (b.origin.xy() - a.origin.xy()).length();
+                if !(-SJ_MAX_DROP..=JUMP_APEX).contains(&dz) || horiz <= JUMP_REACH {
+                    continue;
+                }
+                // The target must sit off the corridor by [LO, HI]° — a genuine curl, not a straight leap.
+                let off = wrap180(yaw_of(b.origin.xy() - a.origin.xy()) - psi0).abs();
+                if !(CURL_ANGLE_LO..=CURL_ANGLE_HI).contains(&off) {
+                    continue;
+                }
+                if self.has_direct_link(ledge, to) {
+                    continue; // a plain jump / existing link already leaves the ledge for here
+                }
+                let airtime = jump_airtime(dz, params.gravity);
+                if airtime <= 0.0 {
+                    continue;
+                }
+                // Only curl what the straight pass could NOT own: too fast for its air-strafe credit, or
+                // an arc it can't fly through. (A target the straight pass covers needs no curl.)
+                let steps = ((horiz / 24.0).ceil() as i32).max(8);
+                let arc_ok = arc_clear_peak(bsp, a.origin, b.origin, JUMP_APEX, steps);
+                let v_req_straight = v_required(horiz, dz, params.gravity);
+                if arc_ok && v_req_straight * SJ_MARGIN <= v_max_straight {
+                    continue;
+                }
+                // (No separate slide-out check: `certify_curl` below requires an actual on-ground
+                // touchdown resolving to the target cell within tolerance, which is the landing proof.)
+                // The expensive step, reached only by the survivors: certify a curl by rollout. Search
+                // the takeoff *back* along the run-up — a fast run-up overshoots a leap right at the pit
+                // edge, so the leap point slides back (over the near ground, which the arc clears) until
+                // the delivered speed matches the distance. First (latest) leap that certifies wins.
+                let dir = Vec3::new(dgx.signum() as f32, dgy.signum() as f32, 0.0).normalize_or_zero();
+                let t_max = (runway - CURL_MIN_RUNWAY).clamp(0.0, CURL_TAKEOFF_BACKOFF);
+                let mut solved: Option<(Vec3, f32, f32)> = None; // (takeoff, v_req, gain)
+                let mut t = 0.0;
+                loop {
+                    let takeoff = a.origin - dir * t;
+                    if self.nearest_within(takeoff, GRID * 0.75, STEP_HEIGHT * 2.0).is_some() {
+                        // Cheap scout first — one mid-gain center rollout — so the full 48-corner certify
+                        // only runs where a landing is already near the target (else this pass is ~50× slower).
+                        let near = curl_land_point(bsp, takeoff, b.origin, v_deliver, psi0, 10.0, &p).is_some_and(|land| {
+                            (land.xy() - b.origin.xy()).length() <= CURL_MISS_TOL * 2.0 && (land.z - b.origin.z).abs() <= CURL_Z_TOL
+                        });
+                        if near {
+                            if let Some((v_req, gain)) = certify_curl(bsp, takeoff, b.origin, psi0, v_deliver, &p) {
+                                solved = Some((takeoff, v_req, gain));
+                                break;
+                            }
+                        }
+                    }
+                    t += GRID * 1.5;
+                    if t > t_max {
+                        break;
+                    }
+                }
+                let Some((takeoff, v_req, gain)) = solved else {
+                    continue;
+                };
+                // Place the run-up start behind the (backed-off) takeoff along the corridor.
+                let back = (takeoff.xy() - a.origin.xy()).length();
+                let Some(start) = self.nearest_within(takeoff - dir * (runway - back), GRID * 1.5, STEP_HEIGHT * 3.0) else {
+                    continue;
+                };
+                if start == to || self.has_direct_link(start, to) {
+                    continue;
+                }
+                let cost = runway / ((MAX_SPEED + v_deliver) * 0.5) + airtime + CURL_COMMIT;
+                let link = Link { from: start, to, kind: LinkKind::SpeedJump, cost };
+                let tr = SpeedJumpTraversal { takeoff, v_req, airtime, chained: false, curl_gain: gain };
+                cands.push((horiz, link, tr)); // every certified curl; the per-cell cap trims below
+            }
+        }
+        cands.sort_by(|x, y| x.0.total_cmp(&y.0));
+        cands.truncate(SPEED_JUMP_CURL_MAX_PER_CELL);
+        out.extend(cands.into_iter().map(|(_, l, t)| (l, t)));
     }
 
     /// The speed-jump links leaving ledge cell `ledge` (the takeoff), appended to `out`.
@@ -324,4 +459,100 @@ impl NavGraph {
         }
         len
     }
+}
+
+impl NavGraph {
+    /// Debug probe (harness): from `takeoff` along `psi0` (degrees) with the speed a `runway` delivers,
+    /// report the predicted takeoff speed, whether the full envelope certifies, and per-gain the
+    /// center-corner landing point — so the harness can see *why* a curl candidate is/ isn't emitted.
+    pub fn curl_probe(&self, bsp: &Bsp, takeoff: Vec3, target: Vec3, psi0: f32, runway: f32, params: SpeedJumpParams) -> (f32, Option<(f32, f32)>, Vec<(f32, Vec3)>) {
+        let p = PmParams {
+            gravity: params.gravity,
+            accel: params.accel,
+            friction: params.friction,
+            stopspeed: params.stopspeed,
+            maxspeed: params.maxspeed,
+        };
+        let v_deliver = prestrafe_delivered(runway, params.accel, params.maxspeed, params.friction, params.stopspeed);
+        let detail: Vec<(f32, Vec3)> = CURL_GAINS
+            .iter()
+            .map(|&gain| (gain, curl_land_point(bsp, takeoff, target, v_deliver, psi0, gain, &p).unwrap_or(Vec3::ZERO)))
+            .collect();
+        (v_deliver, certify_curl(bsp, takeoff, target, psi0, v_deliver, &p), detail)
+    }
+}
+
+/// Roll a curl and return the landing origin (or `None` if it never touched down after the leap) — the
+/// probe variant of [`curl_lands`], without the accept tolerances.
+fn curl_land_point(bsp: &Bsp, takeoff: Vec3, target: Vec3, v0: f32, psi: f32, gain: f32, p: &PmParams) -> Option<Vec3> {
+    let dt = CURL_DT;
+    let amax = air_accel_max(p.accel, p.maxspeed, dt);
+    let (s0, c0) = psi.to_radians().sin_cos();
+    let mut s = PmState { origin: takeoff, vel: Vec3::new(v0 * c0, v0 * s0, 0.0), on_ground: true, jump_held: false };
+    for tick in 0..CURL_MAX_TICKS {
+        let cmd = if tick == 0 {
+            Cmd { view_yaw: psi, forward: MOVE_SPEED, side: 0.0, jump: true }
+        } else {
+            let v_xy = s.vel.xy();
+            let st = air_correct(v_xy, yaw_of(target.xy() - s.origin.xy()), amax, dt, gain);
+            Cmd { view_yaw: st.view_yaw, forward: st.forward, side: st.side, jump: false }
+        };
+        pm_step(bsp, &mut s, &cmd, p, dt);
+        if tick > 3 && s.on_ground {
+            return Some(s.origin);
+        }
+    }
+    None
+}
+
+/// Certify a curl from `takeoff` onto `target`: the run-up delivers ~`v_deliver` ups along `psi0` (the
+/// corridor heading, degrees); find the gentlest [`CURL_GAINS`] gain whose `air_correct` arc lands the
+/// target cell across the whole delivered-speed × launch-heading envelope. Returns `(v_req, gain)` —
+/// `v_req` the envelope's low corner (what the runtime must at least deliver) — or `None`.
+fn certify_curl(bsp: &Bsp, takeoff: Vec3, target: Vec3, psi0: f32, v_deliver: f32, p: &PmParams) -> Option<(f32, f32)> {
+    let v_lo = v_deliver * CURL_V_LO_FRAC;
+    // Envelope corners: {v_lo, v_deliver} × {psi0−tol, psi0, psi0+tol}.
+    let corners = [(v_lo, -CURL_PSI_TOL), (v_lo, 0.0), (v_lo, CURL_PSI_TOL), (v_deliver, -CURL_PSI_TOL), (v_deliver, 0.0), (v_deliver, CURL_PSI_TOL)];
+    for &gain in &CURL_GAINS {
+        if corners.iter().all(|&(v0, dp)| curl_lands(bsp, takeoff, target, v0, psi0 + dp, gain, p)) {
+            return Some((v_lo, gain));
+        }
+    }
+    None
+}
+
+/// Roll one curl and test whether it lands on the target cell: `pm_step` from `takeoff` seeded at
+/// (`v0`, `psi` degrees), leap on tick 0, then per-tick `air_correct` toward the target at `gain` — the
+/// exact runtime air policy. Accepts the first touchdown after the leap that resolves to the target
+/// within tolerance; rejects a heading that crosses the target bearing mid-flight (an overshoot the
+/// held-sign air-strafe diverges from) or an arc that falls well below / flies past the target.
+fn curl_lands(bsp: &Bsp, takeoff: Vec3, target: Vec3, v0: f32, psi: f32, gain: f32, p: &PmParams) -> bool {
+    let dt = CURL_DT;
+    let amax = air_accel_max(p.accel, p.maxspeed, dt);
+    let (s0, c0) = psi.to_radians().sin_cos();
+    let mut s = PmState { origin: takeoff, vel: Vec3::new(v0 * c0, v0 * s0, 0.0), on_ground: true, jump_held: false };
+    let mut prev_sign = 0.0f32;
+    for tick in 0..CURL_MAX_TICKS {
+        let cmd = if tick == 0 {
+            Cmd { view_yaw: psi, forward: MOVE_SPEED, side: 0.0, jump: true }
+        } else {
+            let v_xy = s.vel.xy();
+            let bearing = yaw_of(target.xy() - s.origin.xy());
+            let err = wrap180(bearing - yaw_of(v_xy));
+            if prev_sign != 0.0 && err.signum() != prev_sign && err.abs() > 2.0 {
+                return false; // overshot the target bearing — the runtime curl would diverge here
+            }
+            prev_sign = err.signum();
+            let st = air_correct(v_xy, bearing, amax, dt, gain);
+            Cmd { view_yaw: st.view_yaw, forward: st.forward, side: st.side, jump: false }
+        };
+        pm_step(bsp, &mut s, &cmd, p, dt);
+        if s.vel.z < 0.0 && s.origin.z < target.z - 100.0 {
+            return false; // fell past the target's level — undershoot
+        }
+        if tick > 3 && s.on_ground {
+            return (s.origin.xy() - target.xy()).length() <= CURL_MISS_TOL && (s.origin.z - target.z).abs() <= CURL_Z_TOL;
+        }
+    }
+    false
 }

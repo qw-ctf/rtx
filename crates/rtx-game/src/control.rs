@@ -231,6 +231,12 @@ enum ControlCmd {
     Cell { pos: Vec3 },
     /// Dump a bot's current A* route: each leg's index, kind, source and target.
     Route { bot: u32 },
+    /// List every generated curl link (a SpeedJump with `curl_gain > 0`): index, from, takeoff, target,
+    /// v_req, gain — for verifying which gaps the build's curl certifier covered.
+    Curls,
+    /// Probe the build-time curl certifier from `takeoff` along `psi0`° with the speed `runway` delivers,
+    /// onto `tgt`: reports predicted takeoff speed, whether the envelope certifies, and per-gain landings.
+    Probe { takeoff: Vec3, tgt: Vec3, psi0: f32, runway: f32 },
     /// Search (offline pmove sim, live BSP) for a speed-curl jump from a source to a target world
     /// point — the M2 curl-jump solver, validated live. Returns the best (v0, launch heading, gain).
     Curl { src: Vec3, tgt: Vec3 },
@@ -339,6 +345,15 @@ fn parse_line(line: &str) -> Result<(i64, ControlCmd), String> {
             ControlCmd::Cell { pos: Vec3::new(x, y, z) }
         }
         "route" => ControlCmd::Route { bot: parse_u32(rest.split_whitespace().next(), "bot")? },
+        "curls" => ControlCmd::Curls,
+        "probe" => {
+            let mut t = rest.split_whitespace();
+            let takeoff = Vec3::new(parse_f32(t.next(), "ox")?, parse_f32(t.next(), "oy")?, parse_f32(t.next(), "oz")?);
+            let tgt = Vec3::new(parse_f32(t.next(), "tx")?, parse_f32(t.next(), "ty")?, parse_f32(t.next(), "tz")?);
+            let psi0 = parse_f32(t.next(), "psi0")?;
+            let runway = parse_f32(t.next(), "runway")?;
+            ControlCmd::Probe { takeoff, tgt, psi0, runway }
+        }
         "curl" => {
             let mut t = rest.split_whitespace();
             let src = Vec3::new(parse_f32(t.next(), "sx")?, parse_f32(t.next(), "sy")?, parse_f32(t.next(), "sz")?);
@@ -392,6 +407,8 @@ fn exec_cmd(game: &mut GameState, id: i64, cmd: ControlCmd) {
         }
         ControlCmd::Cell { pos } => cell_json(game, pos),
         ControlCmd::Route { bot } => route_json(game, bot),
+        ControlCmd::Curls => curls_json(game),
+        ControlCmd::Probe { takeoff, tgt, psi0, runway } => probe_json(game, takeoff, tgt, psi0, runway),
         ControlCmd::Curl { src, tgt } => curl_json(game, src, tgt),
         ControlCmd::PlanLink { from, takeoff, tgt, v_req } => plant_link_json(game, from, takeoff, tgt, v_req),
     };
@@ -846,6 +863,65 @@ fn plant_link_json(game: &mut GameState, from: Vec3, takeoff: Vec3, tgt: Vec3, v
         "{{\"link\":{li},\"from_cell\":{from_cell},\"to_cell\":{to_cell},\"from\":{},\"tgt\":{},\"takeoff\":{},\"v_req\":{},\"airtime\":{},\"cost\":{}}}",
         jvec3(fo), jvec3(to), jvec3(takeoff), jnum(v_req), jnum(airtime), jnum(cost),
     ))
+}
+
+/// Probe the build-time curl certifier — see `ControlCmd::Probe`.
+fn probe_json(game: &GameState, takeoff: Vec3, tgt: Vec3, psi0: f32, runway: f32) -> Result<String, String> {
+    let bsp = game.nav.bsp.as_ref().ok_or("no bsp")?;
+    let g = game.nav.graph.as_ref().ok_or("navmesh not ready")?;
+    let cv = |n: &std::ffi::CStr, d: f32| {
+        let v = game.host.cvar(n);
+        if v > 0.0 { v } else { d }
+    };
+    let params = crate::navmesh::SpeedJumpParams {
+        gravity: cv(c"sv_gravity", 800.0),
+        accel: cv(c"sv_accelerate", 10.0),
+        maxspeed: cv(c"sv_maxspeed", 320.0),
+        friction: cv(c"sv_friction", 4.0),
+        stopspeed: cv(c"sv_stopspeed", 100.0),
+        curl: true,
+    };
+    let (v_deliver, cert, detail) = g.curl_probe(bsp, takeoff, tgt, psi0, runway, params);
+    let mut d = String::new();
+    for (gain, land) in detail {
+        if !d.is_empty() {
+            d.push(',');
+        }
+        let miss = (land.truncate() - tgt.truncate()).length();
+        d.push_str(&format!("{{\"gain\":{},\"land\":{},\"miss_xy\":{},\"miss_z\":{}}}", jnum(gain), jvec3(land), jnum(miss), jnum((land.z - tgt.z).abs())));
+    }
+    let cert_s = match cert {
+        Some((v_req, gain)) => format!("{{\"v_req\":{},\"gain\":{}}}", jnum(v_req), jnum(gain)),
+        None => "null".to_string(),
+    };
+    Ok(format!("{{\"v_deliver\":{},\"certified\":{cert_s},\"gains\":[{d}]}}", jnum(v_deliver)))
+}
+
+/// List every generated curl link (SpeedJump with `curl_gain > 0`).
+fn curls_json(game: &GameState) -> Result<String, String> {
+    let g = game.nav.graph.as_ref().ok_or("navmesh not ready")?;
+    let mut items = String::new();
+    for li in 0..g.links.len() as u32 {
+        if g.link_kind(li) != LinkKind::SpeedJump {
+            continue;
+        }
+        let Some(tr) = g.speed_jump_of_link(li) else { continue };
+        if tr.curl_gain <= 0.0 {
+            continue;
+        }
+        if !items.is_empty() {
+            items.push(',');
+        }
+        items.push_str(&format!(
+            "{{\"link\":{li},\"from\":{},\"takeoff\":{},\"tgt\":{},\"v_req\":{},\"gain\":{}}}",
+            jvec3(g.cell_origin(g.link_source(li))),
+            jvec3(tr.takeoff),
+            jvec3(g.cell_origin(g.link_target(li))),
+            jnum(tr.v_req),
+            jnum(tr.curl_gain),
+        ));
+    }
+    Ok(format!("{{\"curls\":[{items}]}}"))
 }
 
 fn order_name(o: Option<ControlOrder>) -> &'static str {

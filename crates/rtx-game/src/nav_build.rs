@@ -155,6 +155,25 @@ impl GameState {
                     320.0
                 }
             },
+            friction: {
+                let f = self.host.cvar(c"sv_friction");
+                if f > 0.0 {
+                    f
+                } else {
+                    4.0
+                }
+            },
+            stopspeed: {
+                let s = self.host.cvar(c"sv_stopspeed");
+                if s > 0.0 {
+                    s
+                } else {
+                    100.0
+                }
+            },
+            // Curl jumps (run-up + air-turn onto an offset landing), certified by a pmove rollout in
+            // the build. Sub-toggle of bhop; on by default so bots take the human curl routes.
+            curl: self.rtx_cvar_bool("rtx_bot_curljump"),
         });
         // Rocket-jump links: only when bots may rocket-jump. Snapshot gravity and the `rj` self-boost
         // cvar (off by default) so the offline blast solve matches the live knockback.

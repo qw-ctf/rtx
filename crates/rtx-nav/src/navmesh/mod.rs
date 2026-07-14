@@ -999,6 +999,11 @@ pub struct SpeedJumpParams {
     pub gravity: f32,
     pub accel: f32,
     pub maxspeed: f32,
+    /// `sv_friction` / `sv_stopspeed` — needed by the curl certifier's ground-prestrafe rollout.
+    pub friction: f32,
+    pub stopspeed: f32,
+    /// Generate curl jumps (run-up + air-turn onto an offset landing), certified by a pmove rollout.
+    pub curl: bool,
 }
 
 /// A solved hook traversal, stored per hook link in a side table (parallel to `links`, like
@@ -1547,6 +1552,9 @@ mod tests {
             gravity: 800.0,
             accel: 10.0,
             maxspeed: MAX_SPEED,
+            friction: 4.0,
+            stopspeed: 100.0,
+            curl: false, // this test asserts straight-speed-jump invariants
         };
         let k = bhop_k(params.accel, params.maxspeed);
         let mut gs = NavGraph::build(&bsp);
@@ -1655,6 +1663,9 @@ mod tests {
             gravity: 800.0,
             accel: 10.0,
             maxspeed: MAX_SPEED,
+            friction: 4.0,
+            stopspeed: 100.0,
+            curl: true, // cover the curl-generation pass's determinism
         });
         let rj = Some(RocketJumpParams { gravity: 800.0, rj_extra: 0.0 });
         // All solvers on, no entity splices (they're serial and not the subject here).
@@ -1713,6 +1724,7 @@ mod tests {
                 mix(&mut h, t.v_req.to_bits() as u64);
                 mix(&mut h, t.airtime.to_bits() as u64);
                 mix(&mut h, t.chained as u64);
+                mix(&mut h, t.curl_gain.to_bits() as u64);
             }
             for &x in g.rocket_jumps.idx_raw() {
                 mix(&mut h, x as u32 as u64);

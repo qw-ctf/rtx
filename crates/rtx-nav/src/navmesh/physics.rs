@@ -76,6 +76,69 @@ pub(super) const SPEED_JUMP_MAX_PER_CELL: usize = 3;
 /// chained candidate never evicts a self-contained stand-start jump from the per-cell budget.
 pub(super) const SPEED_JUMP_CHAINED_MAX_PER_CELL: usize = 2;
 
+// --- curl jumps (run-up along a corridor, turn in the air onto an offset landing) ---------------
+//
+// A curl jump is a speed jump whose run-up and leap are *not* collinear: the bot circle-strafes a
+// corridor to the lip (the game's takeoff regime builds far past the air-strafe model's credit — the
+// ground prestrafe equilibrium, ~1.5·maxspeed), leaps along the corridor, then `air_correct`-curls the
+// velocity onto a platform offset to the side. Certified by a `pm_step` rollout against the BSP, so
+// these constants bound that search rather than a closed-form reach.
+
+/// Minimum run-up (units) behind the lip for a curl: enough for the ground prestrafe to reach its
+/// equilibrium (it saturates by ~150u), so a curl's takeoff speed is the equilibrium regardless.
+pub(super) const CURL_MIN_RUNWAY: f32 = 192.0;
+/// The target must sit this far *off* the run-up heading (degrees, either side): below, the straight
+/// speed-jump pass owns it; above, `air_correct` at curl speed can't converge within the airtime.
+pub(super) const CURL_ANGLE_LO: f32 = 15.0;
+pub(super) const CURL_ANGLE_HI: f32 = 78.0;
+/// Landing tolerances for accepting a certified curl: horizontal miss and vertical miss to the target
+/// cell centre, across every envelope corner.
+pub(super) const CURL_MISS_TOL: f32 = 24.0;
+pub(super) const CURL_Z_TOL: f32 = 24.0;
+/// Half-width (degrees) of the launch-heading envelope the certified gain must cover — the ground
+/// prestrafe exits mid-weave, so the real takeoff heading wanders this much around the corridor.
+pub(super) const CURL_PSI_TOL: f32 = 6.0;
+/// The certified gain must also land the low corner of the delivered-speed envelope, this fraction of
+/// the predicted takeoff speed (the run-up build varies run to run).
+pub(super) const CURL_V_LO_FRAC: f32 = 0.94;
+/// Air-curl gains tried, gentlest first (the gentlest that lands the whole envelope is chosen — a firm
+/// gain is needed only because the overbuilt takeoff would otherwise overshoot).
+pub(super) const CURL_GAINS: [f32; 8] = [4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 20.0];
+/// Commitment slack added to a certified curl's cost — a rollout-certified envelope carries far less
+/// risk than the `+1.0` charged to a modelled speed jump, so price it like a plain JumpGap.
+pub(super) const CURL_COMMIT: f32 = 0.3;
+/// At most this many curl links per source cell (its own budget, so a curl never evicts a straight jump).
+pub(super) const SPEED_JUMP_CURL_MAX_PER_CELL: usize = 2;
+/// How far back along the run-up the certifier may slide the takeoff (units). A leap right at the pit
+/// edge overshoots at the delivered curl speed; sliding it back (over the near ground the arc clears)
+/// lengthens the flight until the distance matches the speed. Bounded so the search stays cheap.
+pub(super) const CURL_TAKEOFF_BACKOFF: f32 = 240.0;
+/// Rollout tick step (the quantized ~77 Hz bot tick) and a hard tick cap per rollout.
+pub(super) const CURL_DT: f32 = 1.0 / 77.0;
+pub(super) const CURL_MAX_TICKS: usize = 120;
+
+/// The takeoff speed the ground circle-strafe delivers over a `runway` from a run start, rolled with
+/// the shared ground oracles at the ground-optimal wish angle. Saturates at the friction equilibrium
+/// (~1.5·maxspeed at stock cvars), so any run-up past [`CURL_MIN_RUNWAY`] arrives near the ceiling.
+pub(super) fn prestrafe_delivered(runway: f32, accel: f32, maxspeed: f32, friction: f32, stopspeed: f32) -> f32 {
+    use crate::strafe::{apply_friction, apply_groundaccel};
+    use glam::Vec2;
+    let dt = CURL_DT;
+    let a_g = accel * maxspeed * dt; // ground accel cap per tick
+    let u_star = (maxspeed - a_g).max(0.0); // speed above which angling the wish pays off
+    let mut v = Vec2::new(MAX_SPEED, 0.0); // start at a run
+    let steps = (runway / (MAX_SPEED * dt)).ceil() as i32;
+    for _ in 0..steps.max(1) {
+        let speed = v.length().max(1.0);
+        let theta = (u_star / speed).clamp(0.0, 1.0).acos(); // ground-optimal angle off the velocity
+        let vel_yaw = v.y.atan2(v.x);
+        let (s, c) = (vel_yaw + theta).sin_cos(); // one side is enough for a speed estimate
+        v = apply_friction(v, friction, stopspeed, dt);
+        v = apply_groundaccel(v, Vec2::new(c, s), maxspeed, accel, dt);
+    }
+    v.length()
+}
+
 // --- speed bands (kinodynamic planning over (cell, band); see `find_path_banded`) ---
 
 /// Coarse entry-speed classes for the banded planner. A route's carried speed changes both the
