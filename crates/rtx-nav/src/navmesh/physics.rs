@@ -87,6 +87,12 @@ pub(super) const SPEED_JUMP_CHAINED_MAX_PER_CELL: usize = 2;
 /// Minimum run-up (units) behind the lip for a curl: enough for the ground prestrafe to reach its
 /// equilibrium (it saturates by ~150u), so a curl's takeoff speed is the equilibrium regardless.
 pub(super) const CURL_MIN_RUNWAY: f32 = 192.0;
+/// The run-up a curl link actually *commits* — capped short of the measured corridor (which can run
+/// thousands of units). The ground prestrafe saturates by ~200u for the *speed*, but the from-cell is
+/// placed this far back for *routing*: too short and the curl splits into walk-then-leap that ties a
+/// competing route down the same corridor; far enough back it captures the whole approach as one leg
+/// and wins cleanly (as short corridors like the bravado LG need), while race-map runways stay bounded.
+pub(super) const CURL_RUNUP_CAP: f32 = 512.0;
 /// The target must sit this far *off* the run-up heading (degrees, either side): below, the straight
 /// speed-jump pass owns it; above, `air_correct` at curl speed can't converge within the airtime.
 pub(super) const CURL_ANGLE_LO: f32 = 15.0;
@@ -109,10 +115,18 @@ pub(super) const CURL_GAINS: [f32; 8] = [4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 
 pub(super) const CURL_COMMIT: f32 = 0.3;
 /// At most this many curl links per source cell (its own budget, so a curl never evicts a straight jump).
 pub(super) const SPEED_JUMP_CURL_MAX_PER_CELL: usize = 2;
+/// At most this many curl links *landing on the same target cell* (global dedup): a dozen corridors
+/// certifying a curl onto one platform is noise the planner never needs — keep the cheapest couple.
+pub(super) const CURL_TARGET_MAX: usize = 2;
 /// How far back along the run-up the certifier may slide the takeoff (units). A leap right at the pit
 /// edge overshoots at the delivered curl speed; sliding it back (over the near ground the arc clears)
 /// lengthens the flight until the distance matches the speed. Bounded so the search stays cheap.
 pub(super) const CURL_TAKEOFF_BACKOFF: f32 = 240.0;
+/// How far *before* the certified takeoff the runtime actually leaps: the bhop takeoff regime jumps on
+/// the frame it crosses the takeoff line (progress `< LIP_REACH`), so on average it leaps ~a lip-reach
+/// early. The certifier adds this as a position corner so a whole population of curls doesn't land
+/// short. MUST match `bhop::LIP_REACH` in the game crate (the runtime threshold it models).
+pub(super) const CURL_LIP_REACH: f32 = 28.0;
 /// Rollout tick step (the quantized ~77 Hz bot tick) and a hard tick cap per rollout.
 pub(super) const CURL_DT: f32 = 1.0 / 77.0;
 pub(super) const CURL_MAX_TICKS: usize = 120;
@@ -121,14 +135,22 @@ pub(super) const CURL_MAX_TICKS: usize = 120;
 /// the shared ground oracles at the ground-optimal wish angle. Saturates at the friction equilibrium
 /// (~1.5·maxspeed at stock cvars), so any run-up past [`CURL_MIN_RUNWAY`] arrives near the ceiling.
 pub(super) fn prestrafe_delivered(runway: f32, accel: f32, maxspeed: f32, friction: f32, stopspeed: f32) -> f32 {
+    prestrafe_delivered_from(MAX_SPEED, runway, accel, maxspeed, friction, stopspeed)
+}
+
+/// As [`prestrafe_delivered`] but from an arbitrary starting speed `v0` — so the runtime can ask
+/// "given my *current* speed, will the remaining run-up still build `v_req` by the lip?" (the curl
+/// too-slow abort). Rolls the shared ground oracles at the ground-optimal wish angle; the step count
+/// is bounded so a bogus runway can't spin the loop.
+pub fn prestrafe_delivered_from(v0: f32, runway: f32, accel: f32, maxspeed: f32, friction: f32, stopspeed: f32) -> f32 {
     use crate::strafe::{apply_friction, apply_groundaccel};
     use glam::Vec2;
     let dt = CURL_DT;
     let a_g = accel * maxspeed * dt; // ground accel cap per tick
     let u_star = (maxspeed - a_g).max(0.0); // speed above which angling the wish pays off
-    let mut v = Vec2::new(MAX_SPEED, 0.0); // start at a run
-    let steps = (runway / (MAX_SPEED * dt)).ceil() as i32;
-    for _ in 0..steps.max(1) {
+    let mut v = Vec2::new(v0.max(1.0), 0.0);
+    let steps = ((runway.max(0.0) / (MAX_SPEED * dt)).ceil() as i32).clamp(1, 600);
+    for _ in 0..steps {
         let speed = v.length().max(1.0);
         let theta = (u_star / speed).clamp(0.0, 1.0).acos(); // ground-optimal angle off the velocity
         let vel_yaw = v.y.atan2(v.x);

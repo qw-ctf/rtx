@@ -476,8 +476,10 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             bot.sj = cur_leg.map(|leg| Commit { leg, since: now });
         }
         // Watchdog: the route is frozen mid-leg, so if the run-up stalls (blocked, shoved, never
-        // built speed) abandon it and re-path rather than wedging on the runway forever.
+        // built speed) abandon it and re-path rather than wedging on the runway forever. Penalize the
+        // leg so the deterministic A* actually diverts instead of handing back the same run-up.
         if bot.sj.is_some_and(|c| now - c.since > 4.0) {
+            penalize_leg(bot, cur_leg, kind, now);
             bot.sj = None;
             bot.route.clear();
             bot.repath_time = now;
@@ -513,6 +515,47 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         .map(|tr| (tr.takeoff, tr.v_req));
     // A curl speed jump carries a nonzero air-curl gain; a straight one carries 0 (keeps the slalom).
     let sj_curl_gain = cur_leg.and_then(|l| graph.speed_jump_of_link(l)).map(|tr| tr.curl_gain).unwrap_or(0.0);
+    let sj_curl = sj_active && sj_curl_gain > 0.0;
+    // Signed along-corridor distance from the bot to a curl's takeoff (>0 behind the lip, <0 past it):
+    // the run-up direction is the link's `from`→takeoff line. Used to trigger the leap on crossing the
+    // takeoff *line* (not a radial ball the weave can skirt into a U-turn) and to gate the run-up aim.
+    let sj_progress: Option<f32> = if sj_curl {
+        if let (Some((takeoff, _)), Some(leg)) = (sj_takeoff, cur_leg) {
+            let dir = (takeoff.xy() - graph.cell_origin(graph.link_source(leg)).xy()).normalize_or_zero();
+            Some((takeoff.xy() - origin.xy()).dot(dir))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // Curl too-slow abort: the bhop takeoff regime leaps a curl *unconditionally* at the lip, so if the
+    // bot won't build `v_req` by the lip from where it is now (shoved, blocked, or dropped onto the leg
+    // slow by a repath), bail the leg here rather than leap short into the pit. Predict the lip speed
+    // from the current state via the ground-prestrafe oracle; abort (penalize + repath) when it falls
+    // well short. Edge-avoidance — restored the moment `sj_active` clears — then keeps the bot off the
+    // ledge. Left running (the run-up recovers a low *early* speed over the remaining distance).
+    if let (true, Some((_, v_req)), Some(progress)) = (sj_curl, sj_takeoff, sj_progress) {
+        let cv = |n: &std::ffi::CStr, d: f32| {
+            let x = host.cvar(n);
+            if x > 0.0 { x } else { d }
+        };
+        let predicted = crate::navmesh::prestrafe_delivered_from(
+            speed,
+            progress.max(0.0),
+            cv(c"sv_accelerate", 10.0),
+            cv(c"sv_maxspeed", 320.0),
+            cv(c"sv_friction", 4.0),
+            cv(c"sv_stopspeed", 100.0),
+        );
+        if predicted < v_req * 0.85 {
+            penalize_leg(bot, cur_leg, kind, now);
+            bot.sj = None;
+            bot.route.clear();
+            bot.repath_time = now;
+            sj_active = false;
+        }
+    }
     let sj_hold = sj_active && {
         match sj_takeoff {
             Some((takeoff, v_req)) => {
@@ -548,8 +591,13 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             // leap not collinear) tracks its corridor instead of cutting across it and off the edge.
             // For a straight speed jump takeoff and target are collinear, so this is a no-op.
             _ if sj_active => {
-                let aim = match sj_takeoff {
-                    Some((takeoff, _)) if on_ground => takeoff,
+                let aim = match (sj_takeoff, sj_progress) {
+                    // Curl run-up: aim at the takeoff (follow the corridor) while still behind the lip —
+                    // grounded *or* briefly airborne (a bumped or carried-airborne entry) — so it never
+                    // curls toward the offset landing while still over the run-up and pulls off the edge.
+                    (Some((takeoff, _)), Some(p)) if p > bhop::LIP_REACH => takeoff,
+                    // Straight speed jump on the ground: aim at the takeoff (collinear → no-op vs landing).
+                    (Some((takeoff, _)), None) if on_ground => takeoff,
                     _ => waypoint,
                 };
                 aim.xy() - origin.xy()
@@ -559,8 +607,11 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         let to_wp = waypoint.xy() - origin.xy();
         let dir = if ahead.length() > 8.0 { ahead } else { to_wp };
         let bearing = yaw_of(dir);
-        let bhop_runway = match sj_takeoff {
-            Some((takeoff, _)) if sj_active => (takeoff.xy() - origin.xy()).length(),
+        let bhop_runway = match (sj_takeoff, sj_progress) {
+            // Curl: signed along-corridor distance to the takeoff (past-lip goes negative → leap).
+            (_, Some(p)) => p,
+            // Straight speed jump: radial distance to the takeoff edge (collinear run-up).
+            (Some((takeoff, _)), None) if sj_active => (takeoff.xy() - origin.xy()).length(),
             _ => runway_dist,
         };
         // Forward wall probe: how far the bot can fly straight ahead before a wall — one hull trace

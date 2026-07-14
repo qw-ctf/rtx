@@ -49,6 +49,8 @@ const GOTO_ARRIVE_Z: f32 = 48.0;
 /// "unreachable even after diverting", the signal a rocket-jump *source* cell can't be stood on.
 const STALL_EPS: f32 = 16.0;
 const STALL_SECS: f32 = 4.0;
+/// A FlyLink attempt gives up after this long with no touchdown (see `poll_fly`).
+const FLY_TIMEOUT: f32 = 8.0;
 
 /// The control channel's live state, carried on [`GameState`]. Persists across map loads (the socket
 /// binds once); `started` guards against re-binding. All fields stay untouched — the whole harness is
@@ -551,6 +553,7 @@ fn do_fly(game: &mut GameState, bot: u32, link: u32) -> Result<String, String> {
     b.puppet.traj.clear(); // fresh flight trace
     b.puppet.fly_airborne = false;
     b.puppet.fly_takeoff_speed = 0.0;
+    b.puppet.best_since = now; // FlyLink stall clock (poll_fly gives up after FLY_TIMEOUT)
     b.puppet.order = Some(ControlOrder::FlyLink { link });
     Ok(format!("{{\"bot\":{bot},\"link\":{link}}}"))
 }
@@ -1011,6 +1014,22 @@ fn poll_rj(game: &mut GameState, e: EntId, bot: u32, link: u32, now: f32) {
 /// frame past the lip, so corridor hops on the run-up don't count), and on the next touchdown emit a
 /// `fly_result` with the landing measurement vs the target cell. Then park the bot (Hold).
 fn poll_fly(game: &mut GameState, e: EntId, bot: u32, link: u32, now: f32) {
+    // Stall timeout: a FlyLink that never gets airborne past the lip (blocked run-up, aborted-and-
+    // repathed, or fell) would otherwise pin the order forever and hang the harness. Give up after
+    // FLY_TIMEOUT with a `timeout` result so a fly-rate sweep always advances.
+    if now - game.entities[e].bot.puppet.best_since > FLY_TIMEOUT {
+        let origin = game.entities[e].v.origin;
+        game.entities[e].bot.puppet.fly_airborne = false;
+        game.entities[e].bot.puppet.order = Some(ControlOrder::Hold);
+        game.entities[e].bot.rj.fails = 0;
+        let _ = std::mem::take(&mut game.entities[e].bot.puppet.traj);
+        send(game, format!(
+            "{{\"ev\":\"fly_result\",\"bot\":{bot},\"link\":{link},\"on_target\":false,\"timeout\":true,\
+             \"land\":{},\"miss_xy\":9999,\"miss_z\":9999,\"takeoff_speed\":0,\"peak\":0,\"traj\":[]}}",
+            jvec3(origin),
+        ));
+        return;
+    }
     let og = game.entities[e].v.flags.has(Flags::ONGROUND);
     let origin = game.entities[e].v.origin;
     let speed = game.entities[e].v.velocity.xy().length();

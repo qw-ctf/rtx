@@ -294,8 +294,9 @@ pub const BUTTON_ATTACK: i32 = 1;
 pub const BUTTON_JUMP: i32 = 2;
 
 /// Bot usercmd move-component scale (matches ktx: project the desired world direction onto the
-/// view vectors and scale by this; pmove then clamps to `sv_maxspeed`).
-pub const BOT_MOVE_SPEED: f32 = 800.0;
+/// view vectors and scale by this; pmove then clamps to `sv_maxspeed`). Single-sourced from the
+/// movement-oracle crate so the controller and the navmesh build can't drift on the wish magnitude.
+pub const BOT_MOVE_SPEED: f32 = rtx_nav::strafe::MOVE_SPEED;
 
 /// Declare a `#[repr(i32)]` enum for one of QuakeC's discrete-valued `f32` entity fields
 /// (`.solid`, `.movetype`, `.deadflag`, …), with the `as_f32`/`from_f32` bridge those

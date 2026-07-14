@@ -71,9 +71,11 @@ const PRESTRAFE_MIN_RUNWAY: f32 = 512.0;
 /// Takeoff regime: how close (units, run-up remaining) the takeoff edge must be before a committed
 /// high-speed jump leaps. The bot keeps the ground circle-strafe until it's within this of the lip,
 /// then jumps *once* — so the takeoff point stays where the link was certified. Kept small (a couple
-/// of ticks of travel) so the leap point tracks the certified edge; the certification carries the
-/// matching slack. Distinct from the eager [`LAUNCH_MIN_FRAC`] leap a plain hop takes.
-const LIP_REACH: f32 = 28.0;
+/// of ticks of travel) so the leap point tracks the certified edge. For a curl the caller passes a
+/// *signed along-corridor* runway, so crossing the takeoff line (progress `< LIP_REACH`, incl. negative
+/// past it) triggers the leap — a radial ball the weave can skirt would U-turn. Distinct from the eager
+/// [`LAUNCH_MIN_FRAC`] leap a plain hop takes. `pub` so steer gates the run-up aim on the same threshold.
+pub const LIP_REACH: f32 = 28.0;
 /// Fixed runway required to engage — enough for one worthwhile hop (a flat hop at walk speed
 /// covers ~216u). Deliberately *not* speed-scaled: the old `speed·0.9` bar rose as the bot gained
 /// speed and disengaged it mid-run — the policy capped the very thing it built.
@@ -904,6 +906,44 @@ mod sim {
         let (spd, rw) = takeoff.expect("never took off");
         assert!(spd >= 400.0, "took off at {spd} ups on the short runway, want ≥ 400 (build to ~v_req)");
         assert!(rw < LIP_REACH + 8.0, "leaped {rw}u short of the lip, want at the edge");
+    }
+
+    #[test]
+    fn curl_past_lip_leaps_immediately() {
+        // Signed runway: a committed curl already past the takeoff line (negative runway — the weave
+        // skirted the radial ball, or a repath dropped it past the lip) must leap at once, not hold
+        // ground and U-turn back toward the takeoff. (Whether it *should* leap that slow is steer's
+        // abort call; the controller's job is: past the lip → commit, never reverse.)
+        let mut w = World::grounded(450.0);
+        let mut b = Bhop::default();
+        let mut leaped = false;
+        for f in 0..20 {
+            let now = f as f32 * DT;
+            let input = Input {
+                v_xy: w.v,
+                on_ground: w.on_ground,
+                bearing: 0.0,
+                runway: -20.0, // past the lip
+                eligible: false,
+                zigzag: false,
+                sustain: false,
+                veto: false,
+                committed: true,
+                carry: false,
+                hold_jump: false,
+                takeoff_speed: 415.0,
+                curl_gain: 12.0,
+                clear: f32::INFINITY,
+                now,
+            };
+            let cmd = b.step(&input, &ENV).unwrap_or(run_cmd(0.0));
+            if cmd.jump {
+                leaped = true;
+                break;
+            }
+            pm_frame(&mut w, &cmd, false);
+        }
+        assert!(leaped, "a committed curl past the lip (negative runway) must leap, not hold");
     }
 
     #[test]

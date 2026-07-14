@@ -172,8 +172,11 @@ impl GameState {
                 }
             },
             // Curl jumps (run-up + air-turn onto an offset landing), certified by a pmove rollout in
-            // the build. Sub-toggle of bhop; on by default so bots take the human curl routes.
-            curl: self.rtx_cvar_bool("rtx_bot_curljump"),
+            // the build. Sub-toggle of bhop; on by default so bots take the human curl routes. Disabled
+            // on a genuinely slick server (`sv_friction` set below ~1): the ground prestrafe never
+            // reaches an equilibrium there, so the certifier's takeoff-speed model — and every curl it
+            // mints — would be wrong (the bot arrives far over the certified envelope and overshoots).
+            curl: self.rtx_cvar_bool("rtx_bot_curljump") && self.host.cvar(c"sv_friction") >= 1.0,
         });
         // Rocket-jump links: only when bots may rocket-jump. Snapshot gravity and the `rj` self-boost
         // cvar (off by default) so the offline blast solve matches the live knockback.

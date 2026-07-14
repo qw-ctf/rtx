@@ -34,8 +34,8 @@ use hook::{hook_cost, march_to_solid, perturb_ok, HOOK_PITCHES};
 #[cfg(test)]
 use hook::{simulate_arc, ArcResult};
 pub use physics::{
-    attainable_speed, band_of, bhop_k, BAND_EDGES, BAND_FLOOR, BAND_V_MAX, BHOP_EFF, DOUBLE_ARC_PEAK, JUMP_APEX,
-    MAX_SPEED, NBANDS,
+    attainable_speed, band_of, bhop_k, prestrafe_delivered_from, BAND_EDGES, BAND_FLOOR, BAND_V_MAX, BHOP_EFF,
+    DOUBLE_ARC_PEAK, JUMP_APEX, MAX_SPEED, NBANDS,
 };
 use physics::*;
 use rocketjump::{rj_perturb_ok, rocket_jump_cost, simulate_rocket_jump, RJ_DELAYS, RJ_PITCHES};
@@ -653,9 +653,12 @@ impl NavGraph {
                 // A curl speed jump was certified end-to-end at build time — the rollout solver measured
                 // a run-up that the ground circle-strafe genuinely delivers (which the conservative
                 // air-strafe recompute below has no term for and badly under-credits). So trust its
-                // stored cost and exit at its certified takeoff speed, rather than re-pricing the run-up.
+                // stored cost. Exit at the certified takeoff *floor* (`v_req`), NOT the carried entry: the
+                // takeoff regime grounds the whole run-up, so friction caps the takeoff at the prestrafe
+                // equilibrium regardless of how fast the bot arrived — crediting `v_in` would plan a
+                // downstream chained jump off a band the runtime can't actually carry through the curl.
                 if curl_gain > 0.0 && !chained {
-                    return Some((link.cost.max(floor_cost), band_of(v_in.max(v_req))));
+                    return Some((link.cost.max(floor_cost), band_of(v_req)));
                 }
                 // A chained jump has no runway: traversable only if the entry band already carries it.
                 if chained && v_in < v_req * SJ_MARGIN {
