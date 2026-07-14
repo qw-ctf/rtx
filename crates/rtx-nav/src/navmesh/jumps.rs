@@ -321,9 +321,10 @@ impl NavGraph {
                         });
                         if scout_ok {
                             if let Some((v_req, gain)) = certify_curl(bsp, takeoff, b.origin, psi0, v_del, &p) {
-                                // From-cell one committed run-up behind the takeoff; honest curl cost.
+                                // From-cell one committed run-up behind the takeoff; honest curl cost at
+                                // the *solved* takeoff speed the runtime will hold (not the equilibrium).
                                 let from_pt = takeoff - dir * runup_len;
-                                let cost = runup_len / ((MAX_SPEED + v_del) * 0.5) + airtime + CURL_COMMIT;
+                                let cost = runup_len / ((MAX_SPEED + v_req) * 0.5) + airtime + CURL_COMMIT;
                                 solved = Some((takeoff, from_pt, v_req, gain, cost));
                                 break;
                             }
@@ -546,24 +547,46 @@ fn curl_land_point(bsp: &Bsp, takeoff: Vec3, target: Vec3, v0: f32, psi: f32, ga
 /// target cell across the whole delivered-speed × launch-heading envelope. Returns `(v_req, gain)` —
 /// `v_req` the envelope's low corner (what the runtime must at least deliver) — or `None`.
 fn certify_curl(bsp: &Bsp, takeoff: Vec3, target: Vec3, psi0: f32, v_deliver: f32, p: &PmParams) -> Option<(f32, f32)> {
-    let v_lo = v_deliver * CURL_V_LO_FRAC;
     let (s0, c0) = psi0.to_radians().sin_cos();
-    // The runtime leaps on crossing the takeoff *line*, up to a lip-reach *before* the certified point
-    // (the frame progress < LIP_REACH, at ~6u/tick), so also certify that early leap point — else the
-    // whole population lands ~a lip-reach short. Corners: {certified takeoff, early} × {delivered, its
-    // 0.94 low corner (run-up variation)} + a ±heading guard. A gain must land every one on the target.
+    // The runtime leaps on crossing the takeoff *line*, up to a lip-reach *before* this point (the frame
+    // progress < LIP_REACH, at ~6u/tick), so every corner is proven from both leap points.
     let early = takeoff - Vec3::new(c0, s0, 0.0) * CURL_LIP_REACH;
-    let corners = [
-        (takeoff, v_deliver, 0.0),
-        (takeoff, v_lo, 0.0),
-        (early, v_deliver, 0.0),
-        (early, v_lo, 0.0),
-        (takeoff, v_deliver, CURL_PSI_TOL),
-        (early, v_deliver, -CURL_PSI_TOL),
-    ];
-    for &gain in &CURL_GAINS {
-        if corners.iter().all(|&(tk, v0, dp)| curl_lands(bsp, tk, target, v0, psi0 + dp, gain, p)) {
-            return Some((v_lo, gain));
+    // Solve the takeoff *speed*. Certifying only at what the run-up maxes out to (the ~484 prestrafe
+    // equilibrium, 327u of flat reach) makes every moderate gap uncertifiable — it overshoots. A human
+    // holds a controlled speed instead (396-416 across the recorded demos), so scan a ladder from the
+    // ballistic floor up to what the run-up can deliver and take the *lowest* speed whose whole envelope
+    // lands; the runtime's takeoff regime then holds exactly this (see `bhop`'s hold band).
+    let horiz = (target.xy() - takeoff.xy()).length();
+    let dz = target.z - takeoff.z;
+    let v_floor = v_required(horiz, dz, p.gravity);
+    let v_ceil = v_deliver * CURL_V_LO_FRAC;
+    if !v_floor.is_finite() || v_floor > v_ceil {
+        return None;
+    }
+    let steps = (((v_ceil - v_floor) / CURL_V_STEP).ceil() as i32).clamp(1, 24);
+    for i in 0..=steps {
+        let v = (v_floor + i as f32 * CURL_V_STEP).min(v_ceil);
+        // Cheap scout at this speed before the full envelope (keeps rejected candidates ~1 rollout each).
+        let scout = curl_land_point(bsp, takeoff, target, v, psi0, 10.0, p).is_some_and(|land| {
+            (land.xy() - target.xy()).length() <= CURL_MISS_TOL * 2.5 && (land.z - target.z).abs() <= CURL_Z_TOL * 2.0
+        });
+        if !scout {
+            continue;
+        }
+        // Envelope: both leap points × the speed band the runtime holds × a ±heading guard.
+        let (lo, hi) = (v * (1.0 - CURL_V_HOLD_TOL), v * (1.0 + CURL_V_HOLD_TOL));
+        let corners = [
+            (takeoff, hi, 0.0),
+            (takeoff, lo, 0.0),
+            (early, hi, 0.0),
+            (early, lo, 0.0),
+            (takeoff, v, CURL_PSI_TOL),
+            (early, v, -CURL_PSI_TOL),
+        ];
+        for &gain in &CURL_GAINS {
+            if corners.iter().all(|&(tk, v0, dp)| curl_lands(bsp, tk, target, v0, psi0 + dp, gain, p)) {
+                return Some((v, gain)); // v* — the runtime holds this
+            }
         }
     }
     None

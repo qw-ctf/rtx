@@ -35,7 +35,7 @@ use hook::{hook_cost, march_to_solid, perturb_ok, HOOK_PITCHES};
 use hook::{simulate_arc, ArcResult};
 pub use physics::{
     attainable_speed, band_of, bhop_k, prestrafe_delivered_from, BAND_EDGES, BAND_FLOOR, BAND_V_MAX, BHOP_EFF,
-    DOUBLE_ARC_PEAK, JUMP_APEX, MAX_SPEED, NBANDS,
+    CURL_V_HOLD_TOL, DOUBLE_ARC_PEAK, JUMP_APEX, MAX_SPEED, NBANDS,
 };
 use physics::*;
 use rocketjump::{rj_perturb_ok, rocket_jump_cost, simulate_rocket_jump, RJ_DELAYS, RJ_PITCHES};

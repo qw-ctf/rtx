@@ -84,8 +84,10 @@ pub(super) const SPEED_JUMP_CHAINED_MAX_PER_CELL: usize = 2;
 // velocity onto a platform offset to the side. Certified by a `pm_step` rollout against the BSP, so
 // these constants bound that search rather than a closed-form reach.
 
-/// Minimum run-up (units) behind the lip for a curl: enough for the ground prestrafe to reach its
-/// equilibrium (it saturates by ~150u), so a curl's takeoff speed is the equilibrium regardless.
+/// Minimum run-up (units) behind the lip for a curl: enough corridor to fund the solved takeoff speed
+/// and give the runtime's too-slow abort room. (The prestrafe oracle itself saturates by ~90-150u, so
+/// this is a *corridor-quality* floor, not a speed one — dropping it to ~96 admits far more marginal
+/// ledges than it buys and roughly doubled the per-map curl count without covering the demo jumps.)
 pub(super) const CURL_MIN_RUNWAY: f32 = 192.0;
 /// The run-up a curl link actually *commits* — capped short of the measured corridor (which can run
 /// thousands of units). The ground prestrafe saturates by ~200u for the *speed*, but the from-cell is
@@ -95,6 +97,9 @@ pub(super) const CURL_MIN_RUNWAY: f32 = 192.0;
 pub(super) const CURL_RUNUP_CAP: f32 = 512.0;
 /// The target must sit this far *off* the run-up heading (degrees, either side): below, the straight
 /// speed-jump pass owns it; above, `air_correct` at curl speed can't converge within the airtime.
+/// (Lowering this floor to admit near-straight prestrafe jumps — the dm3 `curl_mid` / dm4 chain demos —
+/// roughly doubled the per-map curl count for no demo coverage: those are blocked by the *interior*
+/// takeoff and off-compass run-up heading, not by the angle. See the curl-jump memory.)
 pub(super) const CURL_ANGLE_LO: f32 = 15.0;
 pub(super) const CURL_ANGLE_HI: f32 = 78.0;
 /// Landing tolerances for accepting a certified curl: horizontal miss and vertical miss to the target
@@ -104,9 +109,17 @@ pub(super) const CURL_Z_TOL: f32 = 24.0;
 /// Half-width (degrees) of the launch-heading envelope the certified gain must cover — the ground
 /// prestrafe exits mid-weave, so the real takeoff heading wanders this much around the corridor.
 pub(super) const CURL_PSI_TOL: f32 = 6.0;
-/// The certified gain must also land the low corner of the delivered-speed envelope, this fraction of
-/// the predicted takeoff speed (the run-up build varies run to run).
+/// Ceiling fraction of the run-up's delivered speed that a curl may be certified at — headroom so the
+/// runtime can actually reach and hold the solved takeoff speed.
 pub(super) const CURL_V_LO_FRAC: f32 = 0.94;
+/// Step (ups) of the takeoff-speed ladder the certifier solves over. A curl is certified at the *lowest*
+/// speed whose envelope lands — the human holds a controlled ~400 rather than maxing to the ~484
+/// prestrafe equilibrium, whose 327u flat reach overshoots any moderate gap.
+pub(super) const CURL_V_STEP: f32 = 12.0;
+/// How tightly the runtime holds the solved takeoff speed (fraction): the takeoff regime coasts above
+/// the band and circle-strafes below it, so the leap lands inside ±this. The certifier proves both
+/// corners of the band, so it must match `bhop`'s hold tolerance.
+pub const CURL_V_HOLD_TOL: f32 = 0.03;
 /// Air-curl gains tried, gentlest first (the gentlest that lands the whole envelope is chosen — a firm
 /// gain is needed only because the overbuilt takeoff would otherwise overshoot).
 pub(super) const CURL_GAINS: [f32; 8] = [4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 20.0];

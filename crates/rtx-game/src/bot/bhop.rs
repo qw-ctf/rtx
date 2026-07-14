@@ -20,6 +20,9 @@
 use glam::Vec2;
 
 use crate::math::{wrap180, yaw_of};
+// The band the takeoff regime holds a curl's solved speed within — single-sourced from the certifier,
+// which proves the landing across exactly this band.
+use crate::navmesh::CURL_V_HOLD_TOL;
 use rtx_nav::qphys::AIR_CAP;
 // The pure movement oracles + `Cmd`/`Strafe`/`MOVE_SPEED` now live in `rtx_nav::strafe`, so the
 // navmesh build can run the exact physics the controller flies (curl-jump certification). Glob
@@ -367,7 +370,8 @@ impl Bhop {
                     || i.runway < speed * T_HOP * 2.0 + HOP_MARGIN // keep room to actually hop
             };
             if !launch {
-                return Some(self.ground_cmd(i, a_g, env.maxspeed, f32::INFINITY));
+                // `takeoff_cmd` holds a curl's solved speed; a plain prestrafe (takeoff_speed 0) builds.
+                return Some(self.takeoff_cmd(i, a_g, env.maxspeed));
             }
             self.phase = Phase::Hop;
             self.phase_start = i.now;
@@ -409,7 +413,8 @@ impl Bhop {
         let sj_takeoff = i.committed && i.takeoff_speed > 0.0;
         if sj_takeoff {
             if i.runway >= LIP_REACH {
-                return Some(self.ground_cmd(i, a_g, maxspeed, f32::INFINITY));
+                // Hold the solved takeoff speed to the lip (coast above the band, build below).
+                return Some(self.takeoff_cmd(i, a_g, maxspeed));
             }
         } else if i.hold_jump || speed < LAUNCH_MIN_FRAC * maxspeed || i.clear < speed * T_HOP * WALL_HOLD_FRAC {
             return Some(self.ground_cmd(i, a_g, maxspeed, f32::INFINITY));
@@ -418,6 +423,11 @@ impl Bhop {
         self.jump_prev = jump;
         if jump {
             self.hops += 1;
+            // A curl leaps straight down the corridor — the certifier's tick-0 is a bearing-forward wish,
+            // so don't spend the launch frame on a slalom lobe that skews the takeoff heading.
+            if sj_takeoff {
+                return Some(Cmd { view_yaw: i.bearing, forward: MOVE_SPEED, side: 0.0, jump: true });
+            }
             let s = self.air_strafe(i, speed, a_max, dt);
             Some(Cmd { view_yaw: s.view_yaw, forward: s.forward, side: s.side, jump: true })
         } else {
@@ -456,6 +466,21 @@ impl Bhop {
         let omega = (OMEGA_BASE + err.abs() / T_HOP + (err.abs() - LOBE_DEADBAND).max(0.0) * ERR_GAIN)
             .min(omega_max(speed, a_max, dt));
         strafe_rate(i.v_xy, self.sigma, omega, a_max, dt)
+    }
+
+    /// The takeoff regime's ground frame: *hold* the link's solved takeoff speed rather than max out.
+    /// Above the hold band, coast on the bearing — ground accel adds nothing past `sv_maxspeed`, so
+    /// friction bleeds toward the target while the heading re-centres on the corridor (which also keeps
+    /// the launch heading inside the certified guard); below it, circle-strafe to build. A human holds a
+    /// controlled speed exactly this way (396-416 across the recorded demos) instead of leaping at the
+    /// ~484 prestrafe equilibrium, whose reach overshoots any moderate gap. The certifier proves the
+    /// landing across this same [`CURL_V_HOLD_TOL`] band, so the two must stay in step.
+    fn takeoff_cmd(&mut self, i: &Input, a_g: f32, maxspeed: f32) -> Cmd {
+        if i.takeoff_speed > 0.0 && i.v_xy.length() > i.takeoff_speed * (1.0 + CURL_V_HOLD_TOL) {
+            self.jump_prev = false;
+            return Cmd { view_yaw: i.bearing, forward: MOVE_SPEED, side: 0.0, jump: false };
+        }
+        self.ground_cmd(i, a_g, maxspeed, f32::INFINITY)
     }
 
     /// A prestrafe cmd, with sigma/flip bookkeeping. `band_cap` clamps the weave deadband — `∞` for
@@ -906,6 +931,52 @@ mod sim {
         let (spd, rw) = takeoff.expect("never took off");
         assert!(spd >= 400.0, "took off at {spd} ups on the short runway, want ≥ 400 (build to ~v_req)");
         assert!(rw < LIP_REACH + 8.0, "leaped {rw}u short of the lip, want at the edge");
+    }
+
+    #[test]
+    fn curl_takeoff_holds_the_solved_speed() {
+        // The takeoff regime holds the link's *solved* takeoff speed rather than maxing to the ~484
+        // prestrafe equilibrium (whose reach overshoots any moderate gap — a human holds ~400 too, as
+        // every recorded demo does). From a slow entry it must build up into the band; from a hot
+        // bhop-carry entry it must coast down into it. Either way it leaps at the lip, in-band — which
+        // is exactly the speed envelope the certifier proves the landing across.
+        const V_STAR: f32 = 400.0;
+        for entry in [320.0f32, 480.0] {
+            let start_runway = 480.0f32;
+            let mut w = World::grounded(entry);
+            let mut b = Bhop::default();
+            let mut takeoff = None;
+            for f in 0..400 {
+                let now = f as f32 * DT;
+                let runway = start_runway - w.pos.x; // signed: negative past the lip
+                let input = Input {
+                    v_xy: w.v,
+                    on_ground: w.on_ground,
+                    bearing: 0.0,
+                    runway,
+                    eligible: false,
+                    zigzag: false,
+                    sustain: false,
+                    veto: false,
+                    committed: true,
+                    carry: false,
+                    hold_jump: false,
+                    takeoff_speed: V_STAR,
+                    curl_gain: 12.0,
+                    clear: f32::INFINITY,
+                    now,
+                };
+                let cmd = b.step(&input, &ENV).unwrap_or(run_cmd(0.0));
+                if cmd.jump && takeoff.is_none() {
+                    takeoff = Some((w.v.length(), runway));
+                }
+                pm_frame(&mut w, &cmd, false);
+            }
+            let (spd, rw) = takeoff.expect("never took off");
+            let band = V_STAR * CURL_V_HOLD_TOL * 2.0; // the hold ripple may span the band either side
+            assert!((spd - V_STAR).abs() <= band, "entry {entry}: took off at {spd} ups, want {V_STAR} ±{band}");
+            assert!(rw < LIP_REACH + 8.0, "entry {entry}: leaped {rw}u short of the lip");
+        }
     }
 
     #[test]
