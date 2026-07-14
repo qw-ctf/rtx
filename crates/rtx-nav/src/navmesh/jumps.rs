@@ -299,40 +299,49 @@ impl NavGraph {
                 // the takeoff *back* along the run-up — a fast run-up overshoots a leap right at the pit
                 // edge, so the leap point slides back (over the near ground, which the arc clears) until
                 // the delivered speed matches the distance. First (latest) leap that certifies wins.
-                let dir = Vec3::new(dgx.signum() as f32, dgy.signum() as f32, 0.0).normalize_or_zero();
                 let t_max = (runway - CURL_MIN_RUNWAY).clamp(0.0, CURL_TAKEOFF_BACKOFF);
                 let mut solved: Option<(Vec3, Vec3, f32, f32, f32)> = None; // (takeoff, from_pt, v_req, gain, cost)
-                let mut t = 0.0;
-                loop {
-                    // Snap the leap point to an actual cell: gives the correct z on a stepped run-up, and
-                    // steps the search exactly over the grid so a narrow certify window isn't jumped past.
-                    if let Some(cell) = self.nearest_within(a.origin - dir * t, GRID * 0.75, STEP_HEIGHT * 2.0) {
-                        let takeoff = self.cells[cell as usize].origin;
-                        let back = (takeoff.xy() - a.origin.xy()).length();
-                        // The committed run-up is capped (CURL_RUNUP_CAP) but must fit behind this takeoff.
-                        let runup_len = (runway - back).min(CURL_RUNUP_CAP);
-                        let v_del = prestrafe_delivered(runup_len, params.accel, params.maxspeed, params.friction, params.stopspeed);
-                        // Cheap scout first — one mid-gain rollout with a generous tolerance — so the full
-                        // envelope certify only runs where a landing is already near the target (else the
-                        // pass is ~50× slower). Wide enough that a candidate whose *only* working gain is
-                        // gentle/tight (landing farther off at the scout's gain) still reaches the certify.
-                        let scout_ok = curl_land_point(bsp, takeoff, b.origin, v_del, psi0, 10.0, &p).is_some_and(|land| {
-                            (land.xy() - b.origin.xy()).length() <= CURL_MISS_TOL * 2.5 && (land.z - b.origin.z).abs() <= CURL_Z_TOL * 2.0
-                        });
-                        if scout_ok {
-                            if let Some((v_req, gain)) = certify_curl(bsp, takeoff, b.origin, psi0, v_del, &p) {
-                                // From-cell one committed run-up behind the takeoff; honest curl cost at
-                                // the *solved* takeoff speed the runtime will hold (not the equilibrium).
-                                let from_pt = takeoff - dir * runup_len;
-                                let cost = runup_len / ((MAX_SPEED + v_req) * 0.5) + airtime + CURL_COMMIT;
-                                solved = Some((takeoff, from_pt, v_req, gain, cost));
-                                break;
+                // The runtime takes off along the from→takeoff line, so that heading is ours to choose —
+                // and certification is sharply sensitive to it (a real lip's approach is rarely exactly on
+                // a compass axis; the dm3 curl_mid certifies at 6° off but not at 0°). Sample a few
+                // headings around the corridor axis and place the from-cell along whichever certifies, so
+                // the bot flies precisely the line that was proven.
+                'psi: for dpsi in CURL_PSI_SAMPLES {
+                    let psi = psi0 + dpsi;
+                    let (sp, cp) = psi.to_radians().sin_cos();
+                    let dir = Vec3::new(cp, sp, 0.0);
+                    let mut t = 0.0;
+                    loop {
+                        // Snap the leap point to an actual cell: correct z on a stepped run-up, and steps the
+                        // search over the grid so a narrow certify window isn't jumped past.
+                        if let Some(cell) = self.nearest_within(a.origin - dir * t, GRID * 0.75, STEP_HEIGHT * 2.0) {
+                            let takeoff = self.cells[cell as usize].origin;
+                            let back = (takeoff.xy() - a.origin.xy()).length();
+                            // The committed run-up is capped (CURL_RUNUP_CAP) but must fit behind this takeoff.
+                            let runup_len = (runway - back).min(CURL_RUNUP_CAP);
+                            let v_del = prestrafe_delivered(runup_len, params.accel, params.maxspeed, params.friction, params.stopspeed);
+                            // Cheap scout first — one mid-gain rollout with a generous tolerance — so the full
+                            // envelope certify only runs where a landing is already near the target (else the
+                            // pass is ~50× slower).
+                            let scout_ok = curl_land_point(bsp, takeoff, b.origin, v_del, psi, 10.0, &p).is_some_and(|land| {
+                                (land.xy() - b.origin.xy()).length() <= CURL_MISS_TOL * 2.5 && (land.z - b.origin.z).abs() <= CURL_Z_TOL * 2.0
+                            });
+                            if scout_ok {
+                                if let Some((v_req, gain)) = certify_curl(bsp, takeoff, b.origin, psi, v_del, &p) {
+                                    // From-cell one committed run-up back *along the certified heading*, so the
+                                    // runtime's run-up line is the one that was proven. Honest cost at the solved
+                                    // takeoff speed the runtime will hold (not the equilibrium).
+                                    let from_pt = takeoff - dir * runup_len;
+                                    let cost = runup_len / ((MAX_SPEED + v_req) * 0.5) + airtime + CURL_COMMIT;
+                                    solved = Some((takeoff, from_pt, v_req, gain, cost));
+                                    break 'psi;
+                                }
                             }
                         }
-                    }
-                    t += GRID;
-                    if t > t_max {
-                        break;
+                        t += GRID;
+                        if t > t_max {
+                            break;
+                        }
                     }
                 }
                 let Some((takeoff, from_pt, v_req, gain, cost)) = solved else {

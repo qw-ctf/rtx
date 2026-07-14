@@ -100,7 +100,7 @@ pub(super) const CURL_RUNUP_CAP: f32 = 512.0;
 /// (Lowering this floor to admit near-straight prestrafe jumps — the dm3 `curl_mid` / dm4 chain demos —
 /// roughly doubled the per-map curl count for no demo coverage: those are blocked by the *interior*
 /// takeoff and off-compass run-up heading, not by the angle. See the curl-jump memory.)
-pub(super) const CURL_ANGLE_LO: f32 = 15.0;
+pub(super) const CURL_ANGLE_LO: f32 = 5.0;
 pub(super) const CURL_ANGLE_HI: f32 = 78.0;
 /// Landing tolerances for accepting a certified curl: horizontal miss and vertical miss to the target
 /// cell centre, across every envelope corner.
@@ -109,6 +109,11 @@ pub(super) const CURL_Z_TOL: f32 = 24.0;
 /// Half-width (degrees) of the launch-heading envelope the certified gain must cover — the ground
 /// prestrafe exits mid-weave, so the real takeoff heading wanders this much around the corridor.
 pub(super) const CURL_PSI_TOL: f32 = 6.0;
+/// Run-up headings tried around the corridor's compass axis (degrees). A real lip's approach is rarely
+/// exactly on an axis and certification is sharply heading-sensitive, so the from-cell is placed along
+/// whichever of these certifies — the runtime then flies precisely the proven line. On-axis first, so
+/// the common case costs nothing extra.
+pub(super) const CURL_PSI_SAMPLES: [f32; 5] = [0.0, -6.0, 6.0, -12.0, 12.0];
 /// Ceiling fraction of the run-up's delivered speed that a curl may be certified at — headroom so the
 /// runtime can actually reach and hold the solved takeoff speed.
 pub(super) const CURL_V_LO_FRAC: f32 = 0.94;
