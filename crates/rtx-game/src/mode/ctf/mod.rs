@@ -239,8 +239,8 @@ const DEFEND_RADIUS: f32 = 700.0;
 const MIDFIELD_ENGAGE: f32 = 650.0;
 
 /// Split a bot's job on its team. Roles are what turn "every bot rushes the same flag" into a team:
-/// most bots [`Attack`](CtfRole::Attack) (grab and run the enemy flag), a minority
-/// [`Defend`](CtfRole::Defend) (hold the base, retrieve the flag, intercept attackers).
+/// attackers grab/run/escort, defenders hold/retrieve/intercept, and a midfielder controls the
+/// central powerup/rune lane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CtfRole {
     Attack,

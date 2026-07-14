@@ -47,9 +47,8 @@ pub(crate) const POWERUP_GIVEUP: f32 = 35.0;
 const POWERUP_DEFER_RATIO: f32 = 0.7;
 
 /// Minimum *desire* an item must have for a bot to break off combat and detour for it (the
-/// `rtx_bot_greed` behavior). Set so powerups (200+) and a genuinely wanted weapon/health/armor
-/// swing clear it, while a minor ammo top-off (≈2.5) doesn't — a bot won't abandon a firefight for
-/// a handful of shells, but it will for the quad, an RL it lacks, or a big health/armor pickup.
+/// optional `rtx_bot_greed` behavior). Set so a genuinely wanted weapon/health/armor swing clears
+/// it while a minor ammo top-off (≈2.5) doesn't. Major powerups bypass this optional gate entirely.
 pub(crate) const COMBAT_GREED_MIN_DESIRE: f32 = 40.0;
 
 /// A health/armor pickup is a completion-critical local recovery when it adds at least this much
@@ -650,6 +649,13 @@ impl GameState {
     pub(crate) fn select_combat_item(&self, bot_e: EntId) -> Option<ItemPlan> {
         self.best_item_plan(bot_e)
             .filter(|p| p.first_desire >= COMBAT_GREED_MIN_DESIRE || p.contains_powerup)
+    }
+
+    /// Major pickup planning while optional combat greed is disabled. A timed powerup or CTF rune
+    /// is a match objective, not a personality detour; an ordinary first leg is allowed only when
+    /// the bounded plan proves it bridges to that major pickup.
+    pub(crate) fn select_major_item(&self, bot_e: EntId) -> Option<ItemPlan> {
+        self.best_item_plan(bot_e).filter(|p| p.contains_powerup)
     }
 
     /// Pick a spawned, nearby health/armor recovery or timed powerup that must be completed before

@@ -26,7 +26,7 @@ use crate::defs::{
     Bits, Content, FieldEq, Flags, Items, Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK,
     BUTTON_JUMP, VEC_VIEW_OFS,
 };
-use crate::entity::EntId;
+use crate::entity::{EntId, Touch};
 use crate::game::GameState;
 use crate::math::{angle_vectors, angles_to, wrap180};
 
@@ -413,6 +413,38 @@ fn safe_flee_choice(footing: &impl Fn(Vec3) -> Footing, away: Vec3, grounded: bo
     }
 }
 
+/// Bias a combat strafe away from a visible enemy's current horizontal aim line. `dodge_perp` is
+/// the bot's normal lateral combat axis; once the bot is already to one side of a line passing close
+/// by, keep moving farther to that side. Outside the danger tube (or behind the aim origin), retain
+/// the ordinary time-varying sign.
+fn aim_line_escape_sign(
+    line_origin: Vec3,
+    line_forward: Vec3,
+    bot_origin: Vec3,
+    dodge_perp: Vec3,
+    default: f32,
+) -> f32 {
+    let forward = Vec3::new(line_forward.x, line_forward.y, 0.0).normalize_or_zero();
+    if forward == Vec3::ZERO {
+        return default;
+    }
+    let rel = Vec3::new(bot_origin.x - line_origin.x, bot_origin.y - line_origin.y, 0.0);
+    let along = rel.dot(forward);
+    if along <= 0.0 {
+        return default;
+    }
+    let off = rel - forward * along;
+    if off.length() >= 96.0 {
+        return default;
+    }
+    let side = off.dot(dodge_perp);
+    if side.abs() < 1.0 {
+        default
+    } else {
+        side.signum()
+    }
+}
+
 /// Whether this entity is standing in lava or slime deep enough to take damage. The game's
 /// `apply_liquid_damage` burns at `waterlevel >= 1` (feet touching) for a lava/slime `watertype`, with
 /// no deeper gate — so this is the exact condition under which a bot must keep moving out of the pool
@@ -666,7 +698,7 @@ fn feed_forward(game: &mut GameState, e: EntId, now: f32, skill: f32, clean: Vec
 /// the only hull that reports liquids); airborne or map-less it's the original blind composition.
 fn combat_move(game: &mut GameState, e: EntId, enemy: EntId, now: f32, origin: Vec3, to_enemy: Vec3) -> Vec3 {
     let health = game.entities[e].v.health;
-    let strafe_sign = if ((now * 0.9) + e.0 as f32).sin() >= 0.0 {
+    let default_strafe = if ((now * 0.9) + e.0 as f32).sin() >= 0.0 {
         1.0
     } else {
         -1.0
@@ -685,6 +717,9 @@ fn combat_move(game: &mut GameState, e: EntId, enemy: EntId, now: f32, origin: V
     };
     let dir = Vec3::new(to_enemy.x, to_enemy.y, 0.0).normalize_or_zero();
     let perp = Vec3::new(-dir.y, dir.x, 0.0);
+    let enemy_eye = game.entities[enemy].v.origin + VEC_VIEW_OFS;
+    let enemy_forward = angle_vectors(game.entities[enemy].v.v_angle).0;
+    let strafe_sign = aim_line_escape_sign(enemy_eye, enemy_forward, origin, perp, default_strafe);
     let grounded_self = game.entities[e].v.flags.has(Flags::ONGROUND);
     let burning = is_burning(&game.entities[e].v);
     match (grounded_self, game.nav.bsp.as_ref()) {
@@ -894,6 +929,176 @@ pub(crate) fn engage(
         // The engine paces shots via `attack_finished`; holding fire shoots at the weapon's rate.
         cmd.buttons |= BUTTON_ATTACK;
     }
+}
+
+// --- live projectile survival ------------------------------------------------------------------
+
+/// Exact closest approach for a constant-velocity projectile relative to a moving bot.
+fn linear_closest_approach(relative: Vec3, relative_velocity: Vec3, horizon: f32) -> (f32, Vec3) {
+    let speed2 = relative_velocity.length_squared();
+    let t = if speed2 > 1e-6 {
+        (-relative.dot(relative_velocity) / speed2).clamp(0.0, horizon.max(0.0))
+    } else {
+        0.0
+    };
+    (t, relative + relative_velocity * t)
+}
+
+/// Short-horizon grenade approach under gravity. Live bounce state is already reflected in the
+/// entity's current velocity; sampling the next second catches the incoming/fuse threat without
+/// pretending to know future collision normals. Twelve samples are cheap (projectile counts are
+/// tiny) and keep the maximum temporal gap below a normal human reaction beat.
+fn ballistic_closest_approach(relative: Vec3, relative_velocity: Vec3, horizon: f32, gravity: f32) -> (f32, Vec3) {
+    const SAMPLES: usize = 12;
+    let mut best = (0.0, relative);
+    let mut best_dist = relative.length_squared();
+    for i in 1..=SAMPLES {
+        let t = horizon.max(0.0) * i as f32 / SAMPLES as f32;
+        let at = relative + relative_velocity * t - Vec3::new(0.0, 0.0, 0.5 * gravity * t * t);
+        let d = at.length_squared();
+        if d < best_dist {
+            best = (t, at);
+            best_dist = d;
+        }
+    }
+    best
+}
+
+/// Dodge any visible live rocket, grenade, or nail whose predicted closest approach enters its
+/// damage tube. Unlike [`grenade_tactics`], this works when grenades are not shootable and covers
+/// every projectile weapon. Skill controls only how early the threat is noticed; every skill level
+/// understands the same geometry. Returns true when survival claimed movement this frame.
+pub(crate) fn projectile_dodge(
+    game: &mut GameState,
+    e: EntId,
+    origin: Vec3,
+    now: f32,
+    cmd: &mut BotCmd,
+) -> bool {
+    let skill = game.host().cvar(c"rtx_bot_skill").clamp(0.0, 7.0);
+    let horizon = 0.35 + 0.1 * skill;
+    let awareness = 400.0 + 60.0 * skill;
+    let gravity = game.host().cvar(c"sv_gravity");
+    let bot_velocity = game.entities[e].v.velocity;
+    let my_team = game.entities[e].mode_p.team;
+    let shootable_grenades = game.host().cvar_bool(c"rtx_shootable_grenades");
+    let eye = origin + VEC_VIEW_OFS;
+    let live: Vec<_> = game
+        .entities
+        .iter()
+        .enumerate()
+        .filter_map(|(i, ent)| {
+            matches!(ent.touch, Touch::Missile | Touch::Grenade | Touch::Spike | Touch::SuperSpike)
+                .then_some((
+                    EntId(i as u32),
+                    ent.touch,
+                    ent.v.origin,
+                    ent.v.velocity,
+                    ent.owner(),
+                    ent.v.nextthink,
+                    ent.in_use && ent.combat.voided == 0.0,
+                ))
+        })
+        // Own rockets/nails cannot turn back; own grenades can bounce back into their thrower and
+        // remain a real threat once their velocity reverses.
+        .filter(|&(_, touch, _, _, owner, _, live)| live && (owner != e || touch == Touch::Grenade))
+        .collect();
+
+    // (score, projectile position at danger, velocity) — lower score is more urgent.
+    let mut best: Option<(f32, Vec3, Vec3)> = None;
+    for (projectile, touch, pos, velocity, owner, nextthink, _) in live {
+        let enemy_owned = owner.is_some()
+            && owner != e
+            && (my_team == 0 || game.entities[owner].mode_p.team != my_team);
+        if touch == Touch::Grenade && shootable_grenades && enemy_owned {
+            continue; // grenade_tactics gets first choice to shoot this one down safely
+        }
+        if (pos - origin).length() > awareness {
+            continue;
+        }
+        // A wall blocks both sight and the current projectile path. Very close open projectiles are
+        // still seen even when their point-sized entity is not the trace hit.
+        let sight = game.traceline(eye, pos, false, e);
+        if sight.ent != projectile && sight.fraction < 0.95 {
+            continue;
+        }
+        let fuse = (nextthink - now).max(0.0);
+        let lookahead = if touch == Touch::Grenade {
+            horizon.min(fuse)
+        } else {
+            horizon
+        };
+        let relative = pos - origin;
+        let relative_velocity = velocity - bot_velocity;
+        let (mut t, _) = if touch == Touch::Grenade {
+            ballistic_closest_approach(relative, relative_velocity, lookahead, gravity)
+        } else {
+            linear_closest_approach(relative, relative_velocity, lookahead)
+        };
+        // A projectile already moving away is no longer a threat merely because it is momentarily
+        // close. A grenade with an imminent fuse remains dangerous even while rolling away.
+        if t <= 0.01 && relative.dot(relative_velocity) >= 0.0 && !(touch == Touch::Grenade && fuse <= 0.25) {
+            continue;
+        }
+
+        let ballistic_drop = if touch == Touch::Grenade {
+            Vec3::new(0.0, 0.0, 0.5 * gravity * t * t)
+        } else {
+            Vec3::ZERO
+        };
+        let mut danger = pos + velocity * t - ballistic_drop;
+        // Respect an imminent world/entity collision. Rockets explode there; nails stop there;
+        // grenades bounce, but the contact point is still the conservative near-term danger point.
+        if t > 0.0 {
+            let path = game.traceline(pos, danger, false, projectile);
+            if path.fraction < 1.0 {
+                if matches!(touch, Touch::Spike | Touch::SuperSpike) && path.ent != e {
+                    continue; // the nail is stopped before reaching this bot
+                }
+                t *= path.fraction;
+                danger = path.endpos;
+            }
+        }
+        let bot_at = origin + bot_velocity * t;
+        let dist = (danger - bot_at).length();
+        let radius = match touch {
+            Touch::Missile => GRENADE_BLAST_RADIUS + 24.0,
+            Touch::Grenade => GRENADE_BLAST_RADIUS + 16.0,
+            Touch::Spike | Touch::SuperSpike => 40.0,
+            _ => unreachable!(),
+        };
+        if dist > radius {
+            continue;
+        }
+        let score = t + 0.2 * dist / radius;
+        if best.is_none_or(|(old, _, _)| score < old) {
+            best = Some((score, danger, velocity));
+        }
+    }
+
+    let Some((_, danger, velocity)) = best else {
+        return false;
+    };
+    let mut away = Vec3::new(origin.x - danger.x, origin.y - danger.y, 0.0).normalize_or_zero();
+    if away == Vec3::ZERO {
+        // A direct intercept has no radial side yet; step perpendicular to its travel, with a stable
+        // per-bot side so adjacent teammates do not all dodge into one another.
+        away = Vec3::new(-velocity.y, velocity.x, 0.0).normalize_or_zero();
+        if e.0.is_multiple_of(2) {
+            away = -away;
+        }
+    }
+    if away == Vec3::ZERO {
+        // A grenade falling vertically onto the bot has no horizontal travel axis. Pick a stable
+        // orthogonal escape rather than accepting the direct overhead blast.
+        away = if e.0.is_multiple_of(2) { Vec3::X } else { Vec3::Y };
+    }
+    let (mv, may_hop) = safe_flee_move(game, e, origin, away);
+    cmd.move_world = mv;
+    if may_hop {
+        cmd.buttons |= BUTTON_JUMP;
+    }
+    true
 }
 
 // --- shootable-grenade tactics -----------------------------------------------------------------
@@ -1189,6 +1394,55 @@ mod tests {
         assert_eq!(
             safe_flee_choice(&away_hazard_dry_minus_y, AWAY, true, true),
             (Vec3::new(0.0, -1.0, 0.0) * MOVE_SPEED, true)
+        );
+    }
+
+    #[test]
+    fn live_projectile_closest_approach_detects_crossings_and_departures() {
+        let (t, at) = linear_closest_approach(
+            Vec3::new(500.0, 0.0, 0.0),
+            Vec3::new(-1000.0, 0.0, 0.0),
+            1.0,
+        );
+        assert!((t - 0.5).abs() < 1e-5);
+        assert!(at.length() < 1e-4);
+
+        let (t, at) = linear_closest_approach(
+            Vec3::new(100.0, 100.0, 0.0),
+            Vec3::new(-100.0, 0.0, 0.0),
+            2.0,
+        );
+        assert!((t - 1.0).abs() < 1e-5);
+        assert!((at.length() - 100.0).abs() < 1e-4);
+        assert_eq!(
+            linear_closest_approach(Vec3::X * 100.0, Vec3::X * 100.0, 1.0).0,
+            0.0,
+            "a projectile already departing has no future approach",
+        );
+    }
+
+    #[test]
+    fn grenade_approach_includes_gravity() {
+        let (t, at) = ballistic_closest_approach(
+            Vec3::new(0.0, 0.0, 100.0),
+            Vec3::ZERO,
+            0.5,
+            800.0,
+        );
+        assert!((t - 0.5).abs() < 1e-5);
+        assert!(at.length() < 1e-4);
+    }
+
+    #[test]
+    fn aim_line_strafe_keeps_moving_away_from_the_line() {
+        let line = Vec3::X;
+        let dodge = Vec3::Y;
+        assert_eq!(aim_line_escape_sign(Vec3::ZERO, line, Vec3::new(100.0, 20.0, 0.0), dodge, -1.0), 1.0);
+        assert_eq!(aim_line_escape_sign(Vec3::ZERO, line, Vec3::new(100.0, -20.0, 0.0), dodge, 1.0), -1.0);
+        assert_eq!(
+            aim_line_escape_sign(Vec3::ZERO, line, Vec3::new(100.0, 120.0, 0.0), dodge, -1.0),
+            -1.0,
+            "outside the danger tube the ordinary strafe schedule remains",
         );
     }
 

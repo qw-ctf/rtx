@@ -169,7 +169,7 @@ through the same player-move code as humans, so gravity, stepping, and jumps com
 | `rtx_bot_alone` | `0` | Keep bots on the server even when **no humans** are connected (`0` = bots leave an empty server; `1` = they stay and play it out). |
 | `rtx_bot_skill` | `3` | Bot skill (0–7): tightens aim, speeds how fast a bot turns/tracks, widens its view cone, and shortens its reaction time. |
 | `rtx_bot_pacifist` | `0` | Make bots **not fight** in **any** mode — they just trail the nearest human around the map (for experimenting). `0` = bots play the mode normally. |
-| `rtx_bot_greed` | `1` | Let a fighting bot **break off to grab a compelling nearby pickup** — a powerup (quad/pent), a weapon it lacks, or a big health/armor swing — while it can't see its target, instead of only chasing the enemy. `0` = bots only pursue items when the mode leaves the brain idle. |
+| `rtx_bot_greed` | `1` | Let a fighting bot take **optional ordinary item detours** — a missing weapon or worthwhile health/armor swing. Critical local recovery and major objectives (quad/pent/ring and CTF runes) are never disabled by this cvar. |
 | `rtx_bot_fov` | `120` | View cone (full angle, degrees) within which a bot can **see** a target; widened with skill. A nominated enemy outside the cone (or behind cover) isn't engaged until seen, heard firing, or felt as damage. `0` = 360° sight (the old always-aware behavior). |
 | `rtx_bot_reaction` | `0.4` | Base **reaction delay** (seconds) a target must stay in sight before the bot acts on it; shortened with skill (floored so even skill 7 isn't instant). `0` = react instantly. |
 
@@ -186,28 +186,40 @@ firing nearby, or **felt** as incoming damage before the bot engages it — so i
 beelining an unseen enemy it patrols and collects until real contact, and when it loses sight it
 **hunts the last spot it saw them** for a few seconds before giving up rather than tracking them
 through walls. Aim is loosest on first glimpse and while moving, tightening as it holds a target in
-view. In **team and CTF** modes a team **spreads its fire** across the enemy
-side instead of all piling on the nearest, **doesn't race itself** to the same pickup, **escorts** a
-teammate carrying the flag, and **staggers** its defenders around the base.
+view. In **team and CTF** modes coordination is always active: a team **spreads its fire** across the
+enemy side, gives each pickup a stable nearest-bot reservation, and sends only the nearest responder
+to a teammate's recent damage call (two for a flag carrier). Bots avoid ally splash and stagger routes
+around occupied teleporter exits. CTF teams split into stable **attack, midfield, and defense** roles;
+attackers can detour for major items, midfielders control powerups/runes and crossings, defenders
+spread around the base, and escorts peel for the carrier.
 
 Navigation is **loop-resistant**: when a bot fails to traverse a link (a jump it keeps undershooting,
 a spot it wedges on, a leg that makes no headway toward the goal) that link gets a temporary per-bot
 cost penalty, so its next path **routes around** the trouble instead of the planner handing back the
 identical dead route to retry until a timeout fires. A dash of per-bot path jitter also keeps two
-bots from treading an identical line.
+bots from treading an identical line. Gap/double/speed-jump traversal is an **indivisible action**:
+it is armed before combat arbitration, freezes route advancement while airborne, and releases only
+after a physical landing, so spotting an enemy at the lip cannot make a bot turn and fall into the gap.
 
 Bots value pickups the way ktx does: each item's **desire** is the marginal effective-HP (health,
-armor), firepower (weapons, ammo), or flat dominance (powerups) it would give *this* bot right now,
-weighted by how soon it can reach and collect it (`desire × (lookahead − t) / (t + 5)`) — so they
-skip health at full, weapons they own, and ammo they're capped on, time an item's respawn, and prize
-the **quad/pent** above almost anything. When a bot reaches an item that hasn't respawned yet, it
+armor), firepower (weapons, ammo), or flat dominance (powerups/runes) it would give *this* bot now,
+weighted by travel and respawn time. The planner evaluates a bounded **two-pickup sequence**, so a
+nearby useful item can become the first stop on the way to armor or quad; the second stop is promoted
+and revalidated after the first touch rather than followed blindly. A perceived opponent's estimated
+need adds denial value, while a weaker bot yields an ordinary contest the enemy reaches first. Bots
+skip health at full, owned weapons, capped ammo, and anything that cannot be collected before a timed
+match ends, while treating **quad, pent, ring, and CTF runes** as completion-critical objectives.
+When a bot reaches an item that hasn't respawned yet, it
 doesn't stand and twitch on the spot — it **cruises** a short walk around the spawn, panning the view
 to **scan for enemies** (which genuinely widens what it can see), and heads back to stand on the point
 just as the item returns. Dropped **backpacks** (a dead player's weapon + ammo, or a
-teammate's toss) are sought and collected the same way. With `rtx_bot_greed` on (the default), a bot
-in the thick of a fight will **detour for the quad, a weapon it's missing, or a big health/armor
-pickup** whenever its target slips out of sight — the enemy is just one more goal competing with the
-items. Otherwise (when a mode leaves the brain in charge) it pathfinds to the best reachable **item
+teammate's toss) are sought and collected the same way. In combat, a hysteretic
+**Recover / Hold / Press** posture compares effective strength and firepower using observation-gated
+opponent estimates. A weak or critically hurt bot commits movement to reachable health, armor, or a
+needed weapon; combat may keep aiming/firing but cannot strafe it off the final pickup. The same lock
+protects a powerup plan, and a universal fake-client pickup pass covers flags and runes as well as
+ordinary items. `rtx_bot_greed` controls only additional ordinary combat detours. Otherwise (when a
+mode leaves the brain in charge) it pathfinds to the best reachable **item
 pickup**, or **follows the nearest human** (through doors, off ledges, across jumps, recovering after
 a missed jump). On open, roughly-straight stretches they **bunnyhop** (`rtx_bot_bhop`) — chaining jumps
 and **air-strafing** (sweeping the view while holding one strafe key) to exploit QuakeWorld's
@@ -251,6 +263,13 @@ to reach it — aim a ballistic arc (solved from the launcher's fixed speed/loft
 switch to a hitscan gun, and detonate in flight. With no hazard the grenade combo becomes a plain
 airburst. All of it is safety-checked — never self-splash, never a
 teammate, never a shove the wrong way, never a lob into a wall.
+
+Projectile survival does not depend on shootable grenades: bots predict the closest approach of live
+**rockets and nails**, sample the next part of a grenade's gravity arc and fuse, respect intervening
+world collisions, and take a hazard-checked lateral escape when the damage tube intersects them.
+Higher skill notices the same geometry earlier. During a visible duel the normal strafe is also biased
+away from the opponent's current aim line. These evasions cannot interrupt a committed gap jump or
+the final approach to a critical pickup.
 
 They also throw **indirect bank shots** at enemies with **no line of sight**: a solver simulates a
 bouncing grenade against the map's collision hull (a real `SV_RecursiveHullCheck` trace, reflecting

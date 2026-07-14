@@ -593,11 +593,11 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     //
     // Three cases feed the same `goal_item` slot:
     //  - No mode intent → the full item brain (idle pickup, or follow-a-human fallback below).
-    //  - A **Fight** intent with `rtx_bot_greed` → a *combat detour*: still pick a compelling item
-    //    (`select_combat_item` bars trivial ones) so the bot can break off to grab the quad / a
-    //    needed weapon / big health, ktx-style, without abandoning combat — `enemy` stays set, so
-    //    the combat overlay keeps aiming and firing whenever it has line of sight (see below).
-    //  - Any other mode intent (a **Move** objective, or Fight with greed off) → no item chase.
+    //  - A **Fight** intent always considers major powerups/runes; `rtx_bot_greed` additionally lets
+    //    a compelling ordinary weapon/health/armor plan compete. `enemy` stays set, so combat can
+    //    keep aiming/firing while a completion-critical pickup owns movement.
+    //  - A soft **Advance** intent (CTF lane/escort) runs the full item brain, then resumes its lane.
+    //  - A hard **Move/Spectate** intent (flag run/return, race, arena audience) forbids item detours.
     // Perception gate: a mode nominates a target, but a human-like bot only acts on one it has
     // actually perceived. Downgrade a Fight the bot is *unaware* of to no intent (so it patrols and
     // collects until real contact — the biggest believability change); keep an *aware but unseen*
@@ -711,12 +711,12 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         // `update_handoff_hold` set `goal_item` to the held weapon — nothing else to pick this frame.
     } else if game.entities[e].bot.goal.commit != GoalCommit::None {
         // Nearby recovery / timed powerup completion owns the slot until its terminal condition.
-    } else if intent.is_none() || greedy || matches!(intent, Some(BotIntent::Advance(_))) {
+    } else if intent.is_none() || matches!(intent, Some(BotIntent::Fight(_) | BotIntent::Advance(_))) {
         if now >= game.entities[e].bot.goal.next_pick {
-            let pick = if greedy {
-                game.select_combat_item(e)
-            } else {
-                game.select_item_goal(e)
+            let pick = match intent {
+                Some(BotIntent::Fight(_)) if greedy => game.select_combat_item(e),
+                Some(BotIntent::Fight(_)) => game.select_major_item(e),
+                _ => game.select_item_goal(e),
             };
             let (new_item, new_cell, next_item, next_cell, commit, next_commit) = match pick {
                 Some(plan) => {
@@ -823,8 +823,8 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     } else {
         None
     };
-    // A committed item goal drives *movement* — set by the idle brain, or by the greedy combat
-    // detour (Fight + `rtx_bot_greed`). Under a Fight intent the enemy is still tracked above, so
+    // A committed item goal drives *movement* — set by the idle brain, major-objective planning,
+    // strategic recovery, or a greedy ordinary combat detour. Under Fight the enemy stays tracked, so
     // the combat overlay keeps aiming/firing on line of sight (and its range-keeping owns movement
     // then); the detour only steers navigation while the enemy is *out* of sight, when navigation
     // would otherwise just beeline the enemy. This is ktx's "the enemy is one more goal" in effect.
@@ -1266,11 +1266,13 @@ fn run_bot(game: &mut GameState, e: EntId) {
             cmd.buttons |= BUTTON_JUMP;
         }
     }
-    // Splash-weapon overlays, after `engage`: react to live grenades, finish a lob->shoot combo, take
-    // a one-shot rocket hazard shove, else start a grenade combo. Skipped while hooking/rj/bhop-ing or
-    // locked into a jump traversal (movement/buttons already spoken for) — that is `overlays_ok`.
+    // Splash/projectile overlays, after `engage`: shoot/flee a live grenade when possible, dodge any
+    // incoming rocket/grenade/nail, finish a lob->shoot combo, take a one-shot rocket hazard shove,
+    // else start a grenade combo. Skipped while hooking/rj/bhop-ing or locked into a jump traversal
+    // (movement/buttons already spoken for) — that is `overlays_ok`.
     if overlays_ok && !o.item_committed {
-        let handled = combat::grenade_tactics(game, e, enemy, origin, &mut cmd);
+        let handled = combat::projectile_dodge(game, e, origin, now, &mut cmd)
+            || combat::grenade_tactics(game, e, enemy, origin, &mut cmd);
         if handled {
             game.entities[e].bot.grenade.phase = GrenadePhase::Idle; // defence drops a stale combo
         } else {
