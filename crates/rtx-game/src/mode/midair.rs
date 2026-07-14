@@ -136,7 +136,9 @@ impl GameMode for Midair {
         // nearest living player in a free-for-all. The shared combat overlay leads airborne targets;
         // a bot rocketing a grounded enemy launches them, then airshots — emergent.
         if crate::mode::team::lifecycle_active(g) {
-            return crate::mode::team::nearest_enemy(g, bot).map(BotIntent::Fight);
+            return crate::mode::team::help_target(g, bot)
+                .or_else(|| crate::mode::team::nearest_enemy(g, bot))
+                .map(BotIntent::Fight);
         }
         nearest_player(g, bot).map(BotIntent::Fight)
     }

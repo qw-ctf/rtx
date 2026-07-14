@@ -24,7 +24,7 @@ use glam::Vec3;
 
 use super::team;
 use super::{players, BotIntent, DamageOutcome, GameMode};
-use crate::defs::{PrintLevel, RUNE_HASTE, RUNE_RESISTANCE, RUNE_STRENGTH};
+use crate::defs::{PrintLevel, Solid, RUNE_HASTE, RUNE_RESISTANCE, RUNE_STRENGTH};
 use crate::entity::{EntId, FlagPhase};
 use crate::game::GameState;
 
@@ -235,14 +235,34 @@ impl Ctf {
 const ATTACK_ENGAGE: f32 = 500.0;
 /// How close to our base an enemy must be for a defender to leave the flag and engage.
 const DEFEND_RADIUS: f32 = 700.0;
+/// Midfielders contest enemies crossing the central powerup/rune lane inside this radius.
+const MIDFIELD_ENGAGE: f32 = 650.0;
 
 /// Split a bot's job on its team. Roles are what turn "every bot rushes the same flag" into a team:
 /// most bots [`Attack`](CtfRole::Attack) (grab and run the enemy flag), a minority
 /// [`Defend`](CtfRole::Defend) (hold the base, retrieve the flag, intercept attackers).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CtfRole {
     Attack,
+    Midfield,
     Defend,
+}
+
+/// Stable role distribution by sorted team-bot rank. A solo bot attacks; two split attack/defense;
+/// larger teams keep roughly one defender per three players and add one midfielder to contest
+/// powerups, runes, and crossings; everyone else attacks.
+fn role_for_rank(size: usize, rank: usize) -> CtfRole {
+    if size <= 1 {
+        return CtfRole::Attack;
+    }
+    let defenders = (size / 3).max(1);
+    if rank < defenders {
+        CtfRole::Defend
+    } else if size >= 3 && rank == defenders {
+        CtfRole::Midfield
+    } else {
+        CtfRole::Attack
+    }
 }
 
 /// Assign `bot` a stable role among its team's bots: sort the team's bots by edict id and make the
@@ -254,13 +274,8 @@ fn ctf_role(g: &GameState, bot: EntId, team: u8) -> CtfRole {
         .filter(|&e| g.entities[e].mode_p.team == team && g.entities[e].bot.is_bot)
         .collect();
     mates.sort_unstable_by_key(|e| e.0);
-    let defenders = if mates.len() <= 1 { 0 } else { (mates.len() / 3).max(1) };
     let rank = mates.iter().position(|&e| e == bot).unwrap_or(0);
-    if rank < defenders {
-        CtfRole::Defend
-    } else {
-        CtfRole::Attack
-    }
+    role_for_rank(mates.len(), rank)
 }
 
 /// A living teammate (other than `bot`) carrying the enemy flag — the runner an attacker escorts.
@@ -278,6 +293,16 @@ fn defender_offset(bot: EntId) -> Vec3 {
     Vec3::new(a.cos(), a.sin(), 0.0) * 150.0
 }
 
+/// Midpoint between both flag homes (or the available base), used as the soft midfield anchor.
+fn midfield_point(g: &GameState, team: u8, fallback: Vec3) -> Vec3 {
+    match (base_flag(g, team), enemy_flag(g, team)) {
+        (Some(ours), Some(theirs)) => (g.entities[ours].flag.home + g.entities[theirs].flag.home) * 0.5,
+        (Some(ours), None) => g.entities[ours].flag.home,
+        (None, Some(theirs)) => g.entities[theirs].flag.home,
+        (None, None) => fallback,
+    }
+}
+
 /// The team-aware CTF bot brain. Carrying the flag always overrides to a run home; otherwise the
 /// bot's [`CtfRole`] picks between pushing the enemy flag and holding our own base. All navigation is
 /// the generic `Move`/`Fight` seam.
@@ -287,13 +312,18 @@ fn ctf_bot_intent(g: &mut GameState, bot: EntId) -> Option<BotIntent> {
         return None;
     }
     let origin = g.entities[bot].v.origin;
-    let teamwork = g.host().cvar_bool(c"rtx_bot_teamwork");
 
     // Carrying the enemy flag → run to our base to capture (all roles; don't stop to fight).
     if g.entities[bot].mode_p.ctf.carrying != 0 {
         if let Some(hf) = base_flag(g, team) {
             return Some(BotIntent::Move(g.entities[hf].flag.home));
         }
+    }
+
+    // A real, recent teammate damage call may pull the nearest responder off their normal lane.
+    // Carrier calls get two responders; ordinary calls only one (see team::help_target).
+    if let Some(attacker) = team::help_target(g, bot) {
+        return Some(BotIntent::Fight(attacker));
     }
 
     match ctf_role(g, bot, team) {
@@ -317,18 +347,46 @@ fn ctf_bot_intent(g: &mut GameState, bot: EntId) -> Option<BotIntent> {
                 // When holding, stagger defenders to per-bot posts around the flag so they cover
                 // approaches instead of stacking on the exact spot.
                 let target = if matches!(phase, FlagPhase::Home) {
-                    if teamwork {
-                        home + defender_offset(bot)
-                    } else {
-                        home
-                    }
+                    home + defender_offset(bot)
                 } else {
                     flag_pos
                 };
-                return Some(BotIntent::Move(target));
+                return Some(if matches!(phase, FlagPhase::Home) {
+                    BotIntent::Advance(target)
+                } else {
+                    BotIntent::Move(target)
+                });
             }
         }
+        CtfRole::Midfield => {
+            let mid = midfield_point(g, team, origin);
+            // Help the carrier through the central lane before looking for a fresh contest.
+            if let Some(carrier) = team_carrier(g, team, bot) {
+                let carrier_org = g.entities[carrier].v.origin;
+                let home = base_flag(g, team).map_or(carrier_org, |f| g.entities[f].flag.home);
+                let rear = (carrier_org - home).normalize_or_zero();
+                return Some(BotIntent::Advance(carrier_org + rear * 180.0));
+            }
+            if let Some(en) = team::nearest_enemy_to(g, team, mid) {
+                if (g.entities[en].v.origin - mid).length_squared() < MIDFIELD_ENGAGE * MIDFIELD_ENGAGE {
+                    return Some(BotIntent::Fight(en));
+                }
+            }
+            // Advance is deliberately soft: the shared item planner may insert quad/pent/runes or
+            // useful stack on the way, then resumes this central anchor.
+            return Some(BotIntent::Advance(mid));
+        }
         CtfRole::Attack => {
+            // Once the flag is within the final few steps, finish the touch before accepting a
+            // nearby duel. This is the flag equivalent of the shared critical-pickup commitment.
+            if let Some(ef) = enemy_flag(g, team) {
+                let flag_org = g.entities[ef].v.origin;
+                if g.entities[ef].v.solid == Solid::Trigger
+                    && (flag_org - origin).length_squared() < 256.0 * 256.0
+                {
+                    return Some(BotIntent::Move(flag_org));
+                }
+            }
             // A close enemy in the way → fight it (escorts included), otherwise move.
             if let Some(en) = team::nearest_enemy(g, bot) {
                 if (g.entities[en].v.origin - origin).length_squared() < ATTACK_ENGAGE * ATTACK_ENGAGE {
@@ -338,16 +396,16 @@ fn ctf_bot_intent(g: &mut GameState, bot: EntId) -> Option<BotIntent> {
             // No close enemy: half the attackers (by id parity) escort a teammate flag carrier home
             // — trailing between the runner and the enemy base as a rearguard — while the rest keep
             // pushing the enemy flag. Splits the team into capture pressure *and* carrier protection.
-            if teamwork && bot.0.is_multiple_of(2) {
+            if bot.0.is_multiple_of(2) {
                 if let Some(carrier) = team_carrier(g, team, bot) {
                     let carrier_org = g.entities[carrier].v.origin;
                     let home = base_flag(g, team).map_or(carrier_org, |f| g.entities[f].flag.home);
                     let back = (carrier_org - home).normalize_or_zero();
-                    return Some(BotIntent::Move(carrier_org + back * 150.0));
+                    return Some(BotIntent::Advance(carrier_org + back * 150.0));
                 }
             }
             if let Some(ef) = enemy_flag(g, team) {
-                return Some(BotIntent::Move(g.entities[ef].v.origin));
+                return Some(BotIntent::Advance(g.entities[ef].v.origin));
             }
         }
     }
@@ -365,4 +423,22 @@ fn enemy_flag(g: &GameState, team: u8) -> Option<EntId> {
         let t = g.entities[f].flag.team;
         t != 0 && t != team
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{role_for_rank, CtfRole};
+
+    #[test]
+    fn ctf_roles_add_midfield_without_abandoning_attack() {
+        assert_eq!(role_for_rank(1, 0), CtfRole::Attack);
+        assert_eq!(role_for_rank(2, 0), CtfRole::Defend);
+        assert_eq!(role_for_rank(2, 1), CtfRole::Attack);
+        assert_eq!(role_for_rank(3, 0), CtfRole::Defend);
+        assert_eq!(role_for_rank(3, 1), CtfRole::Midfield);
+        assert_eq!(role_for_rank(3, 2), CtfRole::Attack);
+        assert_eq!(role_for_rank(6, 1), CtfRole::Defend);
+        assert_eq!(role_for_rank(6, 2), CtfRole::Midfield);
+        assert_eq!(role_for_rank(6, 5), CtfRole::Attack);
+    }
 }

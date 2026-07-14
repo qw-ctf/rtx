@@ -20,7 +20,9 @@
 use glam::Vec3;
 
 use crate::arsenal::AmmoKind;
-use crate::defs::{Bits, Items, Solid};
+use crate::defs::{
+    Bits, Items, Solid, RUNE_HASTE, RUNE_MASK, RUNE_REGEN, RUNE_RESISTANCE, RUNE_STRENGTH,
+};
 use crate::entity::{EntId, Think, Touch};
 use crate::game::GameState;
 use crate::navmesh::CellId;
@@ -125,6 +127,22 @@ enum Category {
     },
     Weapon(WeaponKind),
     Ammo(AmmoKind),
+}
+
+/// Strategic value of a CTF rune. Resistance/Strength decide direct fights most strongly, while
+/// Haste and Regeneration still outrank ordinary inventory. A bot already holding any rune scores
+/// all rune pickups at zero (the game allows one).
+fn rune_desire(held: u8, bit: u8) -> f32 {
+    if held & RUNE_MASK != 0 {
+        return 0.0;
+    }
+    match bit {
+        RUNE_RESISTANCE => 240.0,
+        RUNE_STRENGTH => 220.0,
+        RUNE_HASTE => 200.0,
+        RUNE_REGEN => 180.0,
+        _ => 0.0,
+    }
 }
 
 /// A bounded item plan returned to the objective arbiter. `second` is promoted and revalidated after
@@ -597,6 +615,10 @@ impl GameState {
         if ent.touch == Touch::Backpack {
             return ent.v.solid == Solid::Trigger && self.backpack_desire(&self.bot_stats(bot_e), item) > 0.0;
         }
+        if ent.touch == Touch::Rune {
+            return ent.v.solid == Solid::Trigger
+                && rune_desire(self.entities[bot_e].mode_p.ctf.runes, ent.item.rune_bit) > 0.0;
+        }
         let Some(cat) = ent.classname().and_then(category) else {
             return false;
         };
@@ -717,7 +739,7 @@ impl GameState {
         let pricing = self.bot_link_pricing(bot_e, now);
         let costs = graph.costs_from(from, &pricing.costs(0));
         let my_team = self.entities[bot_e].mode_p.team;
-        let teamwork = my_team != 0 && self.host().cvar_bool(c"rtx_bot_teamwork");
+        let teamwork = my_team != 0;
         self.nav
             .goals
             .iter()
@@ -756,19 +778,24 @@ impl GameState {
     /// the static catalog and live backpacks. `desire` is returned so callers can apply their own
     /// bar (combat-detour vs. idle pickup). Backpacks are on the floor now, so their `t` is pure
     /// travel; the catalog folds in respawn-wait via [`item_collect_time`].
-    /// Whether a living teammate bot is already fetching item `idx` (its `goal_item`) — the claim
-    /// signal the item-scoring discount reads, so bots on a team don't converge on the same pickup.
+    /// Whether a living teammate bot has the stable reservation for item `idx`. Every current
+    /// claimant plus this bot is ordered by straight-line distance and then edict id, so update order
+    /// cannot make two bots repeatedly yield the pickup back and forth.
     fn item_claimed_by_teammate(&self, bot_e: EntId, my_team: u8, idx: u32) -> bool {
         if idx == 0 {
             return false;
         }
+        let point = self.entities[EntId(idx)].v.origin;
         let maxclients = self.host().cvar(c"maxclients") as u32;
-        (1..=maxclients).map(EntId).any(|t| {
-            t != bot_e && {
+        let mut candidates = vec![(bot_e, (self.entities[bot_e].v.origin - point).length_squared())];
+        candidates.extend((1..=maxclients).map(EntId).filter_map(|t| {
+            (t != bot_e && {
                 let e = &self.entities[t];
                 e.bot.is_bot && e.v.health > 0.0 && e.mode_p.team == my_team && e.bot.goal.item == idx
-            }
-        })
+            })
+            .then_some((t, (self.entities[t].v.origin - point).length_squared()))
+        }));
+        reservation_owner(&candidates).is_some_and(|owner| owner != bot_e)
     }
 
     /// Whether any living enemy player is believed — in this bot's shared opponent-model pool — to
@@ -793,12 +820,11 @@ impl GameState {
     /// carrier arrives, or taking it itself when the reservation lapses (denial beats a no-show).
     /// Returns whether the bot is holding this frame (its `goal_item` then points at the weapon and
     /// `bot_pickup_items` suppresses the grab). Team modes only, gated by `rtx_bot_model` +
-    /// `rtx_bot_teamwork`; a non-idle bot (one with a fight or a move objective) never holds.
+    /// `rtx_bot_model`; a non-idle bot (one with a fight or a move objective) never holds.
     pub(crate) fn update_handoff_hold(&mut self, e: EntId, now: f32, idle: bool) -> bool {
         let enabled = idle
             && self.entities[e].mode_p.team != 0
-            && self.host().cvar_bool(c"rtx_bot_model")
-            && self.host().cvar_bool(c"rtx_bot_teamwork");
+            && self.host().cvar_bool(c"rtx_bot_model");
         if !enabled {
             self.clear_hold(e);
             return false;
@@ -964,7 +990,7 @@ impl GameState {
         // teammates spread across pickups instead of racing the same one. A powerup's dominating
         // desire still beats the discount, so the quad stays contested. Off in FFA (no team).
         let my_team = self.entities[bot_e].mode_p.team;
-        let teamwork = my_team != 0 && self.host().cvar_bool(c"rtx_bot_teamwork");
+        let teamwork = my_team != 0;
         // Item denial (opponent modeling): raise the desire to hold a big weapon the enemy side is
         // believed to lack, so a team secures/guards the RL and LG spawns. Team play only, and only
         // when modeling is on (else "no belief" would masquerade as "enemy lacks it").
@@ -1009,19 +1035,6 @@ impl GameState {
                 continue;
             };
             let powerup = matches!(cat, Category::Powerup);
-            // Powerup team-split: the quad/pent is dominant, so left alone every team bot would
-            // dogpile it. Instead a bot *defers* — skips it entirely — when a teammate has already
-            // claimed it or is substantially nearer, and then picks the next-best item (armor/weapon
-            // control). "You take quad, I take RA." Team modes only; FFA keeps everyone contesting.
-            if powerup && teamwork {
-                let item_org = self.entities[item].v.origin;
-                let my_dist = (item_org - self.entities[bot_e].v.origin).length();
-                let mate_dist = self.nearest_teammate_dist(bot_e, my_team, item_org);
-                let claimed = self.item_claimed_by_teammate(bot_e, my_team, idx);
-                if defer_powerup_to_teammate(claimed, my_dist, mate_dist) {
-                    continue;
-                }
-            }
             let mut desire = self.item_desire(&s, item, cat);
             // Denial floor: an owned RL/LG normally scores ~0 desire, but if the enemy side lacks it
             // and it won't stay on the map, holding it still has value. Applied before the >0 gate so
@@ -1042,10 +1055,27 @@ impl GameState {
             if self.team_match.live_until > now && now + t >= self.team_match.live_until {
                 continue; // it cannot be collected before the structured match ends
             }
-            let (desire, contest_mult) = if let Some((enemy_stats, enemy_costs, weaker)) = &enemy_context {
-                let enemy_desire = self.item_desire(enemy_stats, item, cat);
+            let enemy_eta = enemy_context.as_ref().and_then(|(_, enemy_costs, _)| {
                 let eta = enemy_costs[cell as usize];
-                contest_adjust(desire, enemy_desire, t, eta.is_finite().then_some(eta), *weaker, powerup)
+                eta.is_finite()
+                    .then(|| self.item_collect_time(item, eta, now))
+                    .flatten()
+            });
+            // Split uncontested powerups deterministically: one bot takes quad while teammates take
+            // armor/weapons. If a known enemy can arrive within 1.5 s of us, keep backup coverage —
+            // a contested major pickup is more important than perfect reservation efficiency.
+            if powerup && teamwork && !enemy_eta.is_some_and(|eta| eta <= t + 1.5) {
+                let item_org = self.entities[item].v.origin;
+                let my_dist = (item_org - self.entities[bot_e].v.origin).length();
+                let mate_dist = self.nearest_teammate_dist(bot_e, my_team, item_org);
+                let claimed = self.item_claimed_by_teammate(bot_e, my_team, idx);
+                if defer_powerup_to_teammate(claimed, my_dist, mate_dist) {
+                    continue;
+                }
+            }
+            let (desire, contest_mult) = if let Some((enemy_stats, _, weaker)) = &enemy_context {
+                let enemy_desire = self.item_desire(enemy_stats, item, cat);
+                contest_adjust(desire, enemy_desire, t, enemy_eta, *weaker, powerup)
             } else {
                 (desire, 1.0)
             };
@@ -1053,6 +1083,41 @@ impl GameState {
                 continue;
             }
             consider(item, cell, desire, t, claim_mult(idx) * contest_mult, powerup);
+        }
+
+        // CTF runes spawn and relocate dynamically, so they cannot live in the map-start static
+        // catalog. Treat a live rune as a major powerup goal and feed it through the same bounded
+        // planner/reservation rules. A holder cannot take another rune and therefore never scores it.
+        for (i, ent) in self.entities.iter().enumerate() {
+            if ent.touch != Touch::Rune || ent.v.solid != Solid::Trigger || skip(i as u32) {
+                continue;
+            }
+            let desire = rune_desire(self.entities[bot_e].mode_p.ctf.runes, ent.item.rune_bit);
+            if desire <= 0.0 {
+                continue;
+            }
+            let Some(cell) = graph.nearest(ent.v.origin) else {
+                continue;
+            };
+            let travel = costs[cell as usize];
+            if !travel.is_finite()
+                || (self.team_match.live_until > now && now + travel >= self.team_match.live_until)
+            {
+                continue;
+            }
+            let enemy_eta = enemy_context.as_ref().and_then(|(_, enemy_costs, _)| {
+                let eta = enemy_costs[cell as usize];
+                eta.is_finite().then_some(eta)
+            });
+            if teamwork && !enemy_eta.is_some_and(|eta| eta <= travel + 1.5) {
+                let my_dist = (ent.v.origin - self.entities[bot_e].v.origin).length();
+                let mate_dist = self.nearest_teammate_dist(bot_e, my_team, ent.v.origin);
+                let claimed = self.item_claimed_by_teammate(bot_e, my_team, i as u32);
+                if defer_powerup_to_teammate(claimed, my_dist, mate_dist) {
+                    continue;
+                }
+            }
+            consider(EntId(i as u32), cell, desire, travel, claim_mult(i as u32), true);
         }
 
         // Live backpacks aren't in the static catalog (they spawn on death / a teammate's toss and
@@ -1146,14 +1211,25 @@ impl GameState {
             .min_by(f32::total_cmp)
     }
 
-    /// Whether an item entity is a powerup pickup (quad/pentagram/ring) — the goal watchdog gives
-    /// these a longer leash ([`POWERUP_GIVEUP`]) since a cross-map powerup run is legitimately slow.
+    /// Whether an item entity is a major timed pickup (quad/pentagram/ring or a CTF rune) — the goal
+    /// watchdog gives these a longer leash ([`POWERUP_GIVEUP`]) since a cross-map run is legitimate.
     pub(crate) fn is_powerup_item(&self, item: EntId) -> bool {
-        self.entities[item]
-            .classname()
-            .and_then(category)
-            .is_some_and(|c| matches!(c, Category::Powerup))
+        self.entities[item].touch == Touch::Rune
+            || self.entities[item]
+                .classname()
+                .and_then(category)
+                .is_some_and(|c| matches!(c, Category::Powerup))
     }
+}
+
+/// Stable owner of an item reservation: shortest distance, then lowest edict id. Callers include
+/// the evaluating bot even before it has published a goal, making sequential bot frames converge
+/// on the same owner regardless of who selected first.
+fn reservation_owner(candidates: &[(EntId, f32)]) -> Option<EntId> {
+    candidates
+        .iter()
+        .min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.0.cmp(&b.0.0)))
+        .map(|&(e, _)| e)
 }
 
 /// Pure core of the powerup team-split: defer (skip the powerup as a goal) when a teammate has
@@ -1271,6 +1347,24 @@ mod tests {
         assert_eq!(posture_step(Recover, 100.0, 84.0, Some(100.0)), Recover);
         assert_eq!(posture_step(Recover, 60.0, 85.0, Some(100.0)), Hold);
         assert_eq!(posture_step(Hold, 100.0, 136.0, Some(100.0)), Press);
+    }
+
+    #[test]
+    fn rune_goals_are_major_and_one_per_holder() {
+        assert!(rune_desire(0, RUNE_RESISTANCE) > rune_desire(0, RUNE_STRENGTH));
+        assert!(rune_desire(0, RUNE_STRENGTH) > rune_desire(0, RUNE_HASTE));
+        assert!(rune_desire(0, RUNE_HASTE) > rune_desire(0, RUNE_REGEN));
+        assert_eq!(rune_desire(RUNE_REGEN, RUNE_RESISTANCE), 0.0);
+        assert_eq!(rune_desire(0, 0xff), 0.0);
+    }
+
+    #[test]
+    fn reservation_owner_is_distance_then_entity_id() {
+        let tied = [(EntId(7), 100.0), (EntId(3), 100.0), (EntId(5), 25.0)];
+        assert_eq!(reservation_owner(&tied), Some(EntId(5)));
+        let id_tie = [(EntId(7), 25.0), (EntId(3), 25.0)];
+        assert_eq!(reservation_owner(&id_tie), Some(EntId(3)));
+        assert_eq!(reservation_owner(&[]), None);
     }
 
     #[test]

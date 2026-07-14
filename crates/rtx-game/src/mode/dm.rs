@@ -30,7 +30,9 @@ impl GameMode for Dm {
         // human-less server (the "bots stand still with no human" bug). `None` only when this bot is
         // the last one alive, and the roam fallback in `run_bot` keeps even that moving.
         if team::lifecycle_active(g) {
-            return team::nearest_enemy(g, bot).map(BotIntent::Fight);
+            return team::help_target(g, bot)
+                .or_else(|| team::nearest_enemy(g, bot))
+                .map(BotIntent::Fight);
         }
         nearest_player(g, bot).map(BotIntent::Fight)
     }

@@ -237,8 +237,19 @@ impl GameState {
         if let Some(bit) = inflictor_weapon {
             self.model_note_weapon_of_attacker(targ, attacker, bit);
         }
+        let time = self.time();
+        let target_team = self.entities[targ].mode_p.team;
+        if attacker != targ
+            && target_team != 0
+            && self.entities[targ].is_player()
+            && self.entities[attacker].is_player()
+            && self.entities[attacker].mode_p.team != target_team
+        {
+            let signal = &mut self.entities[targ].mode_p.team_signal;
+            signal.attacker = attacker.0;
+            signal.hurt_at = time;
+        }
         if self.entities[targ].bot.is_bot && attacker != targ && attacker != EntId::WORLD {
-            let time = self.time();
             let targ_org = self.entities[targ].v.origin;
             let atk_org = self.entities[attacker].v.origin;
             let (r_lat, r_dist) = (self.random(), self.random());

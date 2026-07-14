@@ -680,7 +680,8 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
 
     // Fast local survival pass. It is independent of greed and runs while idle or fighting, but not
     // during a ballistic traversal whose route/view already have an indivisible owner.
-    let urgent_allowed = matches!(intent, None | Some(BotIntent::Fight(_))) && !traversal_committed;
+    let urgent_allowed = matches!(intent, None | Some(BotIntent::Fight(_) | BotIntent::Advance(_)))
+        && !traversal_committed;
     if urgent_allowed
         && game.entities[e].bot.goal.commit == GoalCommit::None
         && now >= game.entities[e].bot.goal.next_urgent
@@ -710,7 +711,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         // `update_handoff_hold` set `goal_item` to the held weapon — nothing else to pick this frame.
     } else if game.entities[e].bot.goal.commit != GoalCommit::None {
         // Nearby recovery / timed powerup completion owns the slot until its terminal condition.
-    } else if intent.is_none() || greedy {
+    } else if intent.is_none() || greedy || matches!(intent, Some(BotIntent::Advance(_))) {
         if now >= game.entities[e].bot.goal.next_pick {
             let pick = if greedy {
                 game.select_combat_item(e)
@@ -840,6 +841,8 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         // Visible → the enemy's live origin (combat owns aim on sight); aware-but-unseen → the
         // last-seen spot, so the bot searches where they went instead of tracking through walls.
         Some(BotIntent::Fight(en)) => (combat_last_seen.unwrap_or(game.entities[en].v.origin), None),
+        Some(BotIntent::Advance(_)) if chasing => vigil.unwrap_or(goal_item_org),
+        Some(BotIntent::Advance(pos)) => (pos, None),
         Some(BotIntent::Move(pos)) => (pos, None),
         // Spectate navigates exactly like Move; the watched fighter only redirects the eyes (below).
         Some(BotIntent::Spectate { goal, .. }) => (goal, None),
@@ -1296,6 +1299,22 @@ fn link_penalty_secs(strikes: u8) -> f32 {
     ((strikes as f32).powi(2) * PENALTY_STEP).min(PENALTY_CAP)
 }
 
+/// Radius around a teleport destination that counts as occupied by a teammate, and the modest
+/// route surcharge used to stagger arrivals. It diverts only when an alternative is competitive;
+/// the teleport remains usable when it is the sole route.
+const TELEPORT_EXIT_CLEAR: f32 = 96.0;
+const TELEPORT_TEAM_SURCHARGE: f32 = 2.0;
+
+/// Add or merge a transient per-link surcharge. Failed-link and team-occupancy penalties can target
+/// the same link; merging matters because the nav query intentionally stores one extra per link.
+fn merge_link_penalty(penalties: &mut Vec<(u32, f32)>, link: u32, extra: f32) {
+    if let Some((_, old)) = penalties.iter_mut().find(|(li, _)| *li == link) {
+        *old += extra;
+    } else {
+        penalties.push((link, extra));
+    }
+}
+
 /// A bot's per-frame A* pricing inputs, gathered from an immutable `&GameState` so the owned Vecs
 /// outlive the disjoint `&mut bot` borrow: the live closed-gate flags, this bot's unexpired
 /// failed-link surcharges, and its rocket-jump fitness gate. Build once with
@@ -1324,13 +1343,36 @@ impl GameState {
     /// Gather bot `e`'s live A* pricing (see [`LinkPricing`]) — closed gates, its failed-link
     /// surcharges (expired entries dropped), and its rocket-jump fitness gate.
     pub(crate) fn bot_link_pricing(&self, e: EntId, now: f32) -> LinkPricing {
-        let penalties = self.entities[e]
+        let mut penalties: Vec<(u32, f32)> = self.entities[e]
             .bot
             .failed_links
             .iter()
             .filter(|&&(_, until, _)| until > now)
             .map(|&(li, _, strikes)| (li, link_penalty_secs(strikes)))
             .collect();
+        let my_team = self.entities[e].mode_p.team;
+        if my_team != 0 {
+            if let Some(graph) = &self.nav.graph {
+                let maxclients = self.host().cvar(c"maxclients") as u32;
+                for li in 0..graph.links.len() as u32 {
+                    if graph.link_kind(li) != LinkKind::Teleport {
+                        continue;
+                    }
+                    let exit = graph.cell_origin(graph.link_target(li));
+                    let occupied = (1..=maxclients).map(EntId).any(|mate| {
+                        let m = &self.entities[mate];
+                        mate != e
+                            && m.is_player()
+                            && m.is_alive()
+                            && m.mode_p.team == my_team
+                            && (m.v.origin - exit).length_squared() < TELEPORT_EXIT_CLEAR * TELEPORT_EXIT_CLEAR
+                    });
+                    if occupied {
+                        merge_link_penalty(&mut penalties, li, TELEPORT_TEAM_SURCHARGE);
+                    }
+                }
+            }
+        }
         let rj_extra = rj::rocket_jump_extra(&self.entities[e].v, self.entities[e].combat.super_damage_finished, now);
         LinkPricing {
             gate_closed: self.gate_closed_flags(),
@@ -1892,6 +1934,14 @@ mod tests {
         // The cap must stay far below the navmesh's closed-gate penalty (100_000s) so a failed-link
         // surcharge only reshapes a route, never forces one through a shut door.
         const { assert!(PENALTY_CAP < 1_000.0) };
+    }
+
+    #[test]
+    fn transient_link_penalties_merge_instead_of_masking_each_other() {
+        let mut penalties = vec![(7, 3.0)];
+        merge_link_penalty(&mut penalties, 7, 2.0);
+        merge_link_penalty(&mut penalties, 9, 1.5);
+        assert_eq!(penalties, vec![(7, 5.0), (9, 1.5)]);
     }
 
     #[test]

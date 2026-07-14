@@ -510,17 +510,80 @@ pub(crate) fn smallest_team(g: &GameState) -> u8 {
 /// Beyond this many teammate bots already committed to an enemy, others spread to a fresher target
 /// instead of piling on — so a team splits its attention across the opposing side.
 const MAX_ATTACKERS: u32 = 2;
+/// A landed enemy hit remains an actionable teammate help request for this long.
+const HELP_WINDOW: f32 = 3.0;
+/// One responder answers an ordinary call; a CTF flag carrier gets a second escort/peel slot.
+const HELP_RESPONDERS: usize = 1;
+const CARRIER_HELP_RESPONDERS: usize = 2;
 
-/// The enemy `bot` should engage. With `rtx_bot_teamwork` (the default) it deconflicts: prefer the
-/// nearest enemy that fewer than [`MAX_ATTACKERS`] teammates are already on, so bots don't dogpile
-/// whoever's closest; if every enemy is saturated it falls back to nearest, so no bot idles. With
-/// teamwork off it's plain nearest-enemy — the team-aware picker the FFA/Arena/Midair ones lack.
+/// Pick the nearest `cap` responders with an edict-id tie break. Pure so simultaneous bot decisions
+/// use the same stable ownership rule instead of every teammate answering the same call.
+fn selected_responders(mut candidates: Vec<(EntId, f32)>, cap: usize) -> Vec<EntId> {
+    candidates.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.0.cmp(&b.0.0)));
+    candidates.into_iter().take(cap).map(|(e, _)| e).collect()
+}
+
+/// A recent attacker this bot should peel off a teammate. Requests come from actual damage events,
+/// not live enemy scans. The whole team deterministically chooses the same highest-priority request
+/// (carrier first, then critical health, then newest) and only the nearest one or two bots answer.
+pub(crate) fn help_target(g: &GameState, bot: EntId) -> Option<EntId> {
+    let team = g.entities[bot].mode_p.team;
+    if team == 0 {
+        return None;
+    }
+    let now = g.time();
+    let victim = players(g)
+        .into_iter()
+        .filter(|&mate| {
+            let m = &g.entities[mate];
+            let signal = &m.mode_p.team_signal;
+            let attacker = EntId(signal.attacker);
+            mate != bot
+                && m.is_alive()
+                && m.mode_p.team == team
+                && attacker.0 != 0
+                && now - signal.hurt_at <= HELP_WINDOW
+                && g.entities[attacker].is_alive()
+                && g.entities[attacker].mode_p.team != team
+        })
+        .min_by(|&a, &b| {
+            let ae = &g.entities[a];
+            let be = &g.entities[b];
+            let apri = (ae.mode_p.ctf.carrying == 0, ae.v.health > 40.0);
+            let bpri = (be.mode_p.ctf.carrying == 0, be.v.health > 40.0);
+            apri
+                .cmp(&bpri)
+                .then_with(|| be.mode_p.team_signal.hurt_at.total_cmp(&ae.mode_p.team_signal.hurt_at))
+                .then_with(|| a.0.cmp(&b.0))
+        })?;
+    let victim_org = g.entities[victim].v.origin;
+    let cap = if g.entities[victim].mode_p.ctf.carrying != 0 {
+        CARRIER_HELP_RESPONDERS
+    } else {
+        HELP_RESPONDERS
+    };
+    let responders = selected_responders(
+        players(g)
+            .into_iter()
+            .filter(|&mate| {
+                let m = &g.entities[mate];
+                mate != victim && m.bot.is_bot && m.is_alive() && m.mode_p.team == team
+            })
+            .map(|mate| (mate, (g.entities[mate].v.origin - victim_org).length_squared()))
+            .collect(),
+        cap,
+    );
+    responders
+        .contains(&bot)
+        .then_some(EntId(g.entities[victim].mode_p.team_signal.attacker))
+}
+
+/// The enemy `bot` should engage. In a team composition it deconflicts: prefer the nearest enemy
+/// that fewer than [`MAX_ATTACKERS`] teammates are already on, so bots don't dogpile whoever's
+/// closest; if every enemy is saturated it falls back to nearest, so no bot idles.
 pub(crate) fn nearest_enemy(g: &GameState, bot: EntId) -> Option<EntId> {
     let origin = g.entities[bot].v.origin;
     let my_team = g.entities[bot].mode_p.team;
-    if !g.host().cvar_bool(c"rtx_bot_teamwork") {
-        return nearest_enemy_to(g, my_team, origin);
-    }
     // Opponent modeling nudges the choice toward weaker / better-armed enemies (a finishable frag,
     // and in deathmatch 1 a kill that resets an armed player's kit). The bias is a distance²
     // multiplier that returns 1.0 when modeling is off, so this stays plain nearest then.
@@ -671,5 +734,15 @@ mod tests {
         assert_eq!(assign_target(&saturated), Some(EntId(4)));
         // One enemy, unsaturated → it, trivially.
         assert_eq!(assign_target(&[(EntId(9), 500.0, 1)]), Some(EntId(9)));
+    }
+
+    #[test]
+    fn help_responders_are_nearest_then_stable_by_id() {
+        use super::selected_responders;
+        use crate::entity::EntId;
+
+        let candidates = vec![(EntId(8), 25.0), (EntId(3), 9.0), (EntId(2), 9.0)];
+        assert_eq!(selected_responders(candidates.clone(), 1), vec![EntId(2)]);
+        assert_eq!(selected_responders(candidates, 2), vec![EntId(2), EntId(3)]);
     }
 }

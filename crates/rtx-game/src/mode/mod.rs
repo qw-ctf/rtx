@@ -70,10 +70,21 @@ pub(crate) struct ModePlayer {
     /// Team id in a team match (`1..=N`; `0` = unassigned/none). Only the team modes read it. See
     /// [`crate::mode::team`].
     pub team: u8,
+    /// Most recent enemy damage call this player can ask teammates to answer. Written by the common
+    /// damage seam, consumed only when bot teamwork is enabled.
+    pub team_signal: TeamSignal,
     /// CTF carry / rune / assist bookkeeping.
     pub ctf: CtfPlayer,
     /// Race run progress (next node / clock / best time). See [`crate::mode::race`].
     pub race: RaceSlot,
+}
+
+/// A short-lived, event-backed help request. Keeping the attacker and timestamp on the damaged
+/// teammate avoids omniscient scans: responders act on a real hit their side can communicate.
+#[derive(Default)]
+pub(crate) struct TeamSignal {
+    pub attacker: u32,
+    pub hurt_at: f32,
 }
 
 /// A player's Rocket-Arena round standing: fighting in the arena, or waiting in the audience.
@@ -126,6 +137,10 @@ pub(crate) struct CtfPlayer {
 pub(crate) enum BotIntent {
     /// Navigate to and fight this enemy (the combat overlay engages once there's line of sight).
     Fight(EntId),
+    /// Make progress toward a tactical destination, but allow the shared item planner to insert a
+    /// worthwhile pickup first. Used by CTF attack/escort/midfield routes; unlike [`Move`](Self::Move)
+    /// it is not an indivisible mode objective.
+    Advance(Vec3),
     /// Roam toward this world position without fighting (e.g. an arena audience member).
     Move(Vec3),
     /// Roam toward `goal` while keeping the eyes on `watch` — an arena audience member spectating

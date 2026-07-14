@@ -172,7 +172,6 @@ through the same player-move code as humans, so gravity, stepping, and jumps com
 | `rtx_bot_greed` | `1` | Let a fighting bot **break off to grab a compelling nearby pickup** — a powerup (quad/pent), a weapon it lacks, or a big health/armor swing — while it can't see its target, instead of only chasing the enemy. `0` = bots only pursue items when the mode leaves the brain idle. |
 | `rtx_bot_fov` | `120` | View cone (full angle, degrees) within which a bot can **see** a target; widened with skill. A nominated enemy outside the cone (or behind cover) isn't engaged until seen, heard firing, or felt as damage. `0` = 360° sight (the old always-aware behavior). |
 | `rtx_bot_reaction` | `0.4` | Base **reaction delay** (seconds) a target must stay in sight before the bot acts on it; shortened with skill (floored so even skill 7 isn't instant). `0` = react instantly. |
-| `rtx_bot_teamwork` | `1` | In **team compositions / CTF**, coordinate: **spread targets** across the enemy team instead of dogpiling the nearest, **don't race teammates** to the same item, **escort** a friendly flag carrier, and **stagger** defender posts. `0` = each bot decides independently. No effect in open free-for-all. |
 
 In open play each bot **hunts and frags the nearest player** — everyone's an enemy, so a
 bots-only server plays itself — pathing to them and, once in sight, aiming and shooting via the
@@ -187,7 +186,7 @@ firing nearby, or **felt** as incoming damage before the bot engages it — so i
 beelining an unseen enemy it patrols and collects until real contact, and when it loses sight it
 **hunts the last spot it saw them** for a few seconds before giving up rather than tracking them
 through walls. Aim is loosest on first glimpse and while moving, tightening as it holds a target in
-view. In **team and CTF** modes (`rtx_bot_teamwork`) a team **spreads its fire** across the enemy
+view. In **team and CTF** modes a team **spreads its fire** across the enemy
 side instead of all piling on the nearest, **doesn't race itself** to the same pickup, **escorts** a
 teammate carrying the flag, and **staggers** its defenders around the base.
 

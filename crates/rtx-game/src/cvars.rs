@@ -163,16 +163,12 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // before the bot reacts, shortened with skill; 0 = instant. Both 0 ≈ pre-perception bots.
         ("rtx_bot_fov", Float(120.0)),
         ("rtx_bot_reaction", Float(0.4)),
-        // Team coordination (team/CTF modes): spread targets across the enemy team instead of
-        // dogpiling the nearest, don't race teammates to the same item, and stagger CTF roles/posts.
-        // 1 = on; 0 = each bot decides independently (the old behavior). No effect in FFA.
-        ("rtx_bot_teamwork", Bool(true)),
         // Opponent modeling: bots keep a shared, observation-gated hypothesis of each opponent's
         // health/armor stack and arsenal (per-team blackboards; the FFA bots share one), reset on
         // death, updated only from events a bot could witness (pickups/gunfire in earshot, damage it
-        // dealt). Feeds item denial, target selection, and combat risk. The team-only consumers
-        // (weapon denial, powerup handoff) additionally require rtx_bot_teamwork. 0 = the old
-        // estimate-free behavior.
+        // dealt). Feeds item denial, target selection, and combat risk. Team coordination itself is
+        // unconditional in a team composition; this switch controls only the inferred enemy model.
+        // 0 = the old estimate-free behavior.
         ("rtx_bot_model", Bool(true)),
     ]
 };

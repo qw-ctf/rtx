@@ -220,6 +220,35 @@ fn choose_weapon(inv: Loadout, dist: f32, gl_air: bool, gl_ground: bool, underwa
         .map_or_else(|| WeaponChoice::of(Weapon::Axe), WeaponChoice::of)
 }
 
+/// Best non-explosive fallback when a teammate occupies the intended splash area. This keeps a bot
+/// fighting instead of merely holding an unsafe rocket: close range favors shotguns, medium range
+/// lightning, then nails and the remaining fed hitscan guns. `None` means explosives/axe are all it
+/// has, in which case the final fire gate simply withholds the unsafe shot.
+fn safe_direct_choice(inv: Loadout, dist: f32, underwater: bool) -> Option<WeaponChoice> {
+    let ordered = if dist < SPLASH_RANGE {
+        [
+            Weapon::SuperShotgun,
+            Weapon::Shotgun,
+            Weapon::Lightning,
+            Weapon::SuperNailgun,
+            Weapon::Nailgun,
+        ]
+    } else {
+        [
+            Weapon::Lightning,
+            Weapon::SuperNailgun,
+            Weapon::Nailgun,
+            Weapon::SuperShotgun,
+            Weapon::Shotgun,
+        ]
+    };
+    ordered
+        .into_iter()
+        .filter(|&w| !(underwater && w == Weapon::Lightning))
+        .find(|&w| inv.fed(w))
+        .map(WeaponChoice::of)
+}
+
 /// One player caught inside a would-be discharge blast, as the bot's belief sees them: distance from
 /// the blast centre, estimated effective HP, and whether they're believed to hold quad.
 struct DischargeVictim {
@@ -728,7 +757,10 @@ fn fire_gate(game: &mut GameState, e: EntId, enemy: EntId, origin: Vec3, skill: 
     } else {
         true // hitscan: the eye-ray LoS above already governs the shot
     };
-    on_target && lof_clear && !switching_to_gl
+    let explosive = matches!(choice.weapon, Weapon::RocketLauncher | Weapon::GrenadeLauncher);
+    let my_team = game.entities[e].mode_p.team;
+    let friendly_clear = !explosive || !teammate_in_blast(game, e, my_team, aim);
+    on_target && lof_clear && friendly_clear && !switching_to_gl
 }
 
 /// Overlay combat onto the frame's decisions. `look` is the desired view (smoothed downstream by
@@ -808,11 +840,21 @@ pub(crate) fn engage(
     // unavailable) — not a clock or geometry threshold — so it can't flip mid-jump and re-slew the
     // aim off the shot; RL/GL share ammo, so the only transition is the pool running dry, grounding
     // both at once. Midair's RL-only loadout never reaches the grenade path.
-    let choice = if discharge {
+    let mut choice = if discharge {
         WeaponChoice::of(Weapon::Lightning)
     } else {
         choose_weapon(inv, dist, plan.air_gl.is_some(), plan.gl_ground.is_some(), underwater)
     };
+    // Do not even select an explosive weapon when a teammate already occupies the target blast.
+    // The fire gate repeats the check at the fully led aim point to catch motion between planning
+    // and firing; this earlier branch gives the bot a useful non-splash fallback instead of silence.
+    let explosive = matches!(choice.weapon, Weapon::RocketLauncher | Weapon::GrenadeLauncher);
+    let my_team = game.entities[e].mode_p.team;
+    if explosive && teammate_in_blast(game, e, my_team, tgt.org) {
+        if let Some(direct) = safe_direct_choice(inv, dist, underwater) {
+            choice = direct;
+        }
+    }
     // Switch weapon only when we don't already hold the desired one (setting `impulse` re-runs
     // W_ChangeWeapon each frame otherwise).
     if game.entities[e].v.weapon != choice.weapon {
@@ -1370,6 +1412,17 @@ mod tests {
         assert_eq!(choose_weapon(lg_only, 400.0, false, false, true).weapon, Weapon::Axe);
         // Dry, that same LG-only bot fires the LG as usual (regression guard on the gate).
         assert_eq!(choose_weapon(lg_only, 400.0, false, false, false).weapon, Weapon::Lightning);
+    }
+
+    #[test]
+    fn friendly_splash_fallback_keeps_fighting_with_a_direct_gun() {
+        let all = armed(
+            Items::ROCKET_LAUNCHER | Items::LIGHTNING | Items::SUPER_SHOTGUN | Items::SHOTGUN,
+        );
+        assert_eq!(safe_direct_choice(all, 500.0, false).unwrap().weapon, Weapon::Lightning);
+        assert_eq!(safe_direct_choice(all, 100.0, false).unwrap().weapon, Weapon::SuperShotgun);
+        assert_eq!(safe_direct_choice(all, 500.0, true).unwrap().weapon, Weapon::SuperShotgun);
+        assert!(safe_direct_choice(armed(Items::ROCKET_LAUNCHER), 500.0, false).is_none());
     }
 
     #[test]
