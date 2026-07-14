@@ -690,6 +690,28 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // during a ballistic traversal whose route/view already have an indivisible owner.
     let urgent_allowed = matches!(intent, None | Some(BotIntent::Fight(_) | BotIntent::Advance(_)))
         && !traversal_committed;
+    // A timed powerup commitment normally freezes item selection, but a known respawn wait is spare
+    // route time: use it to collect a nearby health/armor/weapon only when the complete two-leg path
+    // still preserves the powerup arrival. Keep the powerup as a completion-critical continuation,
+    // so touching the bridge item immediately resumes the quad/pent run.
+    if urgent_allowed
+        && game.entities[e].bot.goal.commit == GoalCommit::Powerup
+        && now >= game.entities[e].bot.goal.next_urgent
+    {
+        let powerup = EntId(game.entities[e].bot.goal.item);
+        let powerup_cell = game.entities[e].bot.goal.item_cell;
+        let pick = game.select_powerup_bridge_item(e, powerup, powerup_cell, now);
+        let b = &mut game.entities[e].bot;
+        b.goal.next_urgent = now + 0.2;
+        if let Some((item, cell)) = pick {
+            b.goal.since = now;
+            (b.goal.item, b.goal.item_cell, b.goal.commit) =
+                (item.0, cell, GoalCommit::Pickup);
+            (b.goal.next_item, b.goal.next_cell, b.goal.next_commit) =
+                (powerup.0, powerup_cell, GoalCommit::Powerup);
+            b.goal.next_pick = now + GOAL_SELECT_INTERVAL;
+        }
+    }
     if urgent_allowed
         && game.entities[e].bot.goal.commit == GoalCommit::None
         && now >= game.entities[e].bot.goal.next_urgent

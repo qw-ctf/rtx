@@ -211,7 +211,9 @@ and revalidated after the first touch rather than followed blindly. A perceived 
 need adds denial value, while a weaker bot yields an ordinary contest the enemy reaches first. Bots
 skip health at full, owned weapons, capped ammo, and anything that cannot be collected before a timed
 match ends, while treating **quad, pent, ring, and CTF runes** as completion-critical objectives.
-When a bot reaches an item that hasn't respawned yet, it
+While timing a hidden quad/pent/ring, the bot may insert a nearby spawned health, armor, or weapon
+only when the complete detour still reaches the powerup on time, turning respawn wait into useful
+preparation instead of walking past yellow armor to idle. When a bot reaches an item that hasn't respawned yet, it
 doesn't stand and twitch on the spot — it **cruises** a short walk around the spawn, panning the view
 to **scan for enemies** (which genuinely widens what it can see), and heads back to stand on the point
 just as the item returns. Dropped **backpacks** (a dead player's weapon + ammo, or a

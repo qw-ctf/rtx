@@ -59,6 +59,15 @@ const LOCAL_PICKUP_TRAVEL: f32 = 1.0;
 /// Euclidean pre-filter before the local Dijkstra. It is deliberately looser than one second of
 /// stock running to admit a short stair/turn while avoiding a flood when no relevant item is nearby.
 const LOCAL_PICKUP_RADIUS: f32 = 384.0;
+/// While committed to a respawning powerup, only consider ordinary pickups this close and this
+/// quick to reach. The second leg is checked against the powerup timer below, so this is a cost
+/// bound as well as a guard against scanning/flooding unrelated items across the room.
+const POWERUP_BRIDGE_TRAVEL: f32 = 1.5;
+/// Navigation costs are quantized at cell/link granularity and the item touch happens before the
+/// next route is built. Allow half a second over the direct arrival so a pickup lying on the route
+/// is not rejected by those small bookkeeping differences; a real detour still has to fit inside
+/// the respawn wait.
+const POWERUP_BRIDGE_SLACK: f32 = 0.5;
 /// Strategic recovery may break contact for an item reachable inside this many seconds.
 const RECOVERY_TRAVEL: f32 = 4.0;
 
@@ -712,6 +721,86 @@ impl GameState {
             .map(|(item, cell, commit, _)| (item, cell, commit))
     }
 
+    /// Find a useful ordinary pickup that can be collected without arriving late for a powerup the
+    /// bot is already timing. A powerup commitment deliberately blocks normal re-scoring, but that
+    /// must not make a bot walk past yellow armor and then idle on a hidden quad. This narrow bridge
+    /// is allowed only while the target has a known respawn time, only for a spawned nearby
+    /// health/armor/weapon, and only when the complete `bot -> pickup -> powerup` route reaches the
+    /// powerup no later than the direct route (plus [`POWERUP_BRIDGE_SLACK`]). Respawn slack therefore
+    /// becomes useful preparation time without weakening the actual quad/pent commitment.
+    pub(crate) fn select_powerup_bridge_item(
+        &self,
+        bot_e: EntId,
+        powerup: EntId,
+        powerup_cell: CellId,
+        now: f32,
+    ) -> Option<(EntId, CellId)> {
+        let graph = self.nav.graph.as_ref()?;
+        let power = &self.entities[powerup];
+        if power.v.solid == Solid::Trigger
+            || !matches!(power.think, Think::SubRegen)
+            || power.v.nextthink <= now
+        {
+            return None;
+        }
+
+        let origin = self.entities[bot_e].v.origin;
+        let from = graph.nearest(origin)?;
+        let stats = self.bot_stats(bot_e);
+        let pricing = self.bot_link_pricing(bot_e, now);
+        let link_costs = pricing.costs(0);
+        let from_costs = graph.costs_from(from, &link_costs);
+        let direct = from_costs.get(powerup_cell as usize).copied()?;
+        if !direct.is_finite() {
+            return None;
+        }
+        let respawn_wait = power.v.nextthink - now;
+
+        let mut candidates = Vec::new();
+        for &(idx, cell) in &self.nav.goals {
+            if idx == powerup.0 || self.entities[bot_e].bot.is_avoided(idx, now) {
+                continue;
+            }
+            let item = EntId(idx);
+            let ent = &self.entities[item];
+            if ent.v.solid != Solid::Trigger
+                || (ent.v.origin - origin).length() > LOCAL_PICKUP_RADIUS
+            {
+                continue;
+            }
+            let Some(cat) = ent.classname().and_then(category) else {
+                continue;
+            };
+            if !matches!(cat, Category::Health | Category::Armor { .. } | Category::Weapon(_)) {
+                continue;
+            }
+            let desire = self.item_desire(&stats, item, cat);
+            let first_leg = from_costs[cell as usize];
+            if desire <= 0.0 || !first_leg.is_finite() || first_leg > POWERUP_BRIDGE_TRAVEL {
+                continue;
+            }
+            candidates.push((item, cell, desire, first_leg));
+        }
+
+        candidates
+            .into_iter()
+            .filter_map(|(item, cell, desire, first_leg)| {
+                let second_leg = graph.costs_from(cell, &link_costs)[powerup_cell as usize];
+                if !second_leg.is_finite()
+                    || !powerup_bridge_arrives_in_time(
+                        direct,
+                        first_leg + second_leg,
+                        respawn_wait,
+                    )
+                {
+                    return None;
+                }
+                Some((item, cell, desire / (first_leg + 0.25)))
+            })
+            .max_by(|a, b| a.2.total_cmp(&b.2).then_with(|| b.0.0.cmp(&a.0.0)))
+            .map(|(item, cell, _)| (item, cell))
+    }
+
     /// Strategic fight posture plus its best recovery target. Relative power uses only the shared
     /// opponent estimate; with modeling disabled/unavailable, critical health still triggers but no
     /// hidden enemy stack is read. Recovery is cancelled when no useful reachable pickup exists.
@@ -1268,9 +1357,25 @@ fn secondary_item_score(desire: f32, total_t: f32, powerup: bool) -> Option<f32>
     }
 }
 
+/// Whether an ordinary first stop preserves the timing of a committed respawning powerup.
+fn powerup_bridge_arrives_in_time(direct: f32, via: f32, respawn_wait: f32) -> bool {
+    via.max(respawn_wait) <= direct.max(respawn_wait) + POWERUP_BRIDGE_SLACK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn powerup_bridge_uses_respawn_slack_without_missing_spawn() {
+        // A four-second side trip is free when both routes still arrive before a ten-second spawn.
+        assert!(powerup_bridge_arrives_in_time(2.0, 6.0, 10.0));
+        // The same trip is a real delay once the powerup is already due.
+        assert!(!powerup_bridge_arrives_in_time(2.0, 6.0, 0.0));
+        // Cell-level path noise on a pickup lying along the route gets the documented tolerance.
+        assert!(powerup_bridge_arrives_in_time(2.0, 2.5, 0.0));
+        assert!(!powerup_bridge_arrives_in_time(2.0, 2.51, 0.0));
+    }
 
     #[test]
     fn denial_floor_gates() {
