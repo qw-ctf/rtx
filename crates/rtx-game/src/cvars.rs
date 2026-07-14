@@ -39,7 +39,7 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         ("rtx_bot_bhop", Bool(true)),
         // Generate curl jumps (run-up down a corridor, air-turn onto an offset platform), certified by
         // a pmove rollout in the navmesh build. A sub-toggle of bhop (`rtx_bot_bhop 0` disables it too).
-        ("rtx_bot_curljump", Bool(true)),
+        ("rtx_bot_curljump", Bool(false)),
         // Bots ground-zigzag (circle-strafe) on straight corridors too short to hop; on by default.
         // A sub-toggle of the bhop controller — `rtx_bot_bhop 0` disables it regardless.
         ("rtx_bot_zigzag", Bool(true)),
