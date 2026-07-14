@@ -202,7 +202,14 @@ impl App {
                 Vec::new(),
                 None,
                 true,
-                Some(SpeedJumpParams { gravity: 800.0, accel: 10.0, maxspeed: 320.0 }),
+                Some(SpeedJumpParams {
+                    gravity: 800.0,
+                    accel: 10.0,
+                    maxspeed: 320.0,
+                    friction: 4.0,
+                    stopspeed: 100.0,
+                    curl: true,
+                }),
                 Some(RocketJumpParams { gravity: 800.0, rj_extra: 0.0 }),
             );
             let _ = proxy.send_event(UserEvent::NavBuilt { generation, result });
