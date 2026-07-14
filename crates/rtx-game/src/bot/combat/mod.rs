@@ -24,7 +24,7 @@ use crate::bot::state::GrenadePhase;
 use crate::bot::{grenade, BotCmd};
 use crate::defs::{
     Bits, Content, FieldEq, Flags, Items, Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK,
-    BUTTON_JUMP, VEC_VIEW_OFS,
+    BUTTON_JUMP, RUNE_RESISTANCE, RUNE_STRENGTH, VEC_VIEW_OFS,
 };
 use crate::entity::{EntId, Touch};
 use crate::game::GameState;
@@ -39,6 +39,13 @@ const NAIL_SPEED: f32 = 1000.0;
 const PREFERRED_RANGE: f32 = 400.0;
 /// Below this we're in self-splash territory for the RL — switch to the super shotgun.
 const SPLASH_RANGE: f32 = 140.0;
+/// KTX's `AvoidQuadBore` treats an enemy inside 250 units as a quad-explosive danger even though
+/// the physical radius is 160: quad turns the normally-small edge splash into a fight-ending hit,
+/// and the projectile strikes the near face of the target rather than its reported origin.
+const QUAD_SPLASH_CAUTION_RANGE: f32 = 250.0;
+/// A direct rocket aimed at a player detonates on the near side of their hull, not at the aim point.
+/// Subtract this conservative hull allowance before projecting our own splash damage.
+const EXPLOSIVE_IMPACT_MARGIN: f32 = 24.0;
 /// How far short of the aim point a projectile may land and still count as a clear shot. A wall
 /// that stops the rocket more than this before `aim` means the muzzle→aim path is blocked (corner
 /// self-splash; blast radius is 160 and attacker self-damage is only halved). Matches the slack in
@@ -247,6 +254,94 @@ fn safe_direct_choice(inv: Loadout, dist: f32, underwater: bool) -> Option<Weapo
         .filter(|&w| !(underwater && w == Weapon::Lightning))
         .find(|&w| inv.fed(w))
         .map(WeaponChoice::of)
+}
+
+/// The pieces of a bot's current stack that determine health lost to its own explosive. Kept as a
+/// pure snapshot so quad/rune/armor arithmetic and policy can be tested without a live game.
+#[derive(Clone, Copy)]
+struct OwnSplashState {
+    health: f32,
+    armor_value: f32,
+    armor_type: f32,
+    damage_scale: f32,
+    quad: bool,
+    immune: bool,
+}
+
+impl OwnSplashState {
+    fn of(game: &GameState, e: EntId) -> Self {
+        let now = game.time();
+        let ent = &game.entities[e];
+        let quad = ent.combat.super_damage_finished > now;
+        let mut damage_scale = if quad {
+            if game.level.deathmatch == 4 { 8.0 } else { 4.0 }
+        } else {
+            1.0
+        };
+        // CTF's mode hook applies these after quad and before armor, including to self-splash.
+        if game.mode.name() == "ctf" {
+            if ent.mode_p.ctf.runes & RUNE_STRENGTH != 0 {
+                damage_scale *= 2.0;
+            }
+            if ent.mode_p.ctf.runes & RUNE_RESISTANCE != 0 {
+                damage_scale *= 0.5;
+            }
+        }
+        Self {
+            health: ent.v.health,
+            armor_value: ent.v.armorvalue,
+            armor_type: ent.v.armortype,
+            damage_scale,
+            quad,
+            // `t_damage` protects health under pent/god; Midair's mode hook makes every self-shot
+            // damage-free while preserving rocket knockback. KTX likewise exempts pent/Midair.
+            immune: ent.v.flags.has(Flags::GODMODE)
+                || ent.combat.invincible_finished >= now
+                || game.mode.name() == "midair",
+        }
+    }
+}
+
+/// Health that gets through armor from our own rocket/grenade at an exact blast-centre distance.
+/// Mirrors `t_radius_damage`'s attacker half-damage, `t_damage`'s quad/mode multiplier, and
+/// `apply_armor`'s ceil/clamp arithmetic. Pent/god/Midair return zero health damage.
+fn own_splash_health_damage(state: OwnSplashState, distance: f32) -> f32 {
+    if state.immune {
+        return 0.0;
+    }
+    let damage = blast_self_damage(distance) * 0.5 * state.damage_scale;
+    let save = (state.armor_type * damage).ceil().min(state.armor_value);
+    (damage - save).ceil().max(0.0)
+}
+
+/// Safety policy for deliberately creating our own explosion. Quad gets KTX's enlarged 250-unit
+/// caution zone; otherwise (and beyond it) projected post-armor health loss may consume at most the
+/// same half-health budget used by grenade tactics. This is substantially stricter than merely
+/// avoiding a lethal shot and leaves room for damage received while the projectile is in flight.
+fn own_splash_safe(state: OwnSplashState, distance: f32, impact_margin: f32) -> bool {
+    if state.immune {
+        return true;
+    }
+    if state.quad && distance <= QUAD_SPLASH_CAUTION_RANGE {
+        return false;
+    }
+    let blast_distance = (distance - impact_margin).max(0.0);
+    own_splash_health_damage(state, blast_distance)
+        <= state.health.max(1.0) * GRENADE_SHOOT_HEALTH_FRAC
+}
+
+/// Exact-centre variant used by the owned-grenade/rocket tactics module.
+pub(crate) fn own_explosion_safe_at(game: &GameState, e: EntId, distance: f32) -> bool {
+    own_splash_safe(OwnSplashState::of(game, e), distance, 0.0)
+}
+
+/// Intended-aim variant used for a rocket/GL shot: account for impact on the near face of a hull.
+fn own_explosive_aim_safe(game: &GameState, e: EntId, distance: f32) -> bool {
+    own_splash_safe(
+        OwnSplashState::of(game, e),
+        distance,
+        EXPLOSIVE_IMPACT_MARGIN,
+    )
 }
 
 /// One player caught inside a would-be discharge blast, as the bot's belief sees them: distance from
@@ -795,7 +890,19 @@ fn fire_gate(game: &mut GameState, e: EntId, enemy: EntId, origin: Vec3, skill: 
     let explosive = matches!(choice.weapon, Weapon::RocketLauncher | Weapon::GrenadeLauncher);
     let my_team = game.entities[e].mode_p.team;
     let friendly_clear = !explosive || !teammate_in_blast(game, e, my_team, aim);
-    on_target && lof_clear && friendly_clear && !switching_to_gl
+    let self_clear = !explosive || own_explosive_aim_safe(game, e, (aim - origin).length());
+    // If the safety fallback selected a direct gun while an explosive is still physically in hand,
+    // wait for that switch to land. Otherwise a swallowed impulse could loose the old quad rocket
+    // along angles intended for the replacement gun.
+    let held = game.entities[e].v.weapon;
+    let switching_from_explosive = held != choice.weapon
+        && matches!(held, Weapon::RocketLauncher | Weapon::GrenadeLauncher);
+    on_target
+        && lof_clear
+        && friendly_clear
+        && self_clear
+        && !switching_to_gl
+        && !switching_from_explosive
 }
 
 /// Overlay combat onto the frame's decisions. `look` is the desired view (smoothed downstream by
@@ -880,12 +987,16 @@ pub(crate) fn engage(
     } else {
         choose_weapon(inv, dist, plan.air_gl.is_some(), plan.gl_ground.is_some(), underwater)
     };
-    // Do not even select an explosive weapon when a teammate already occupies the target blast.
-    // The fire gate repeats the check at the fully led aim point to catch motion between planning
-    // and firing; this earlier branch gives the bot a useful non-splash fallback instead of silence.
+    // Do not even select an explosive weapon when a teammate occupies the target blast or its own
+    // projected splash is too costly (especially KTX's enlarged quad caution zone). The fire gate
+    // repeats both checks at the fully led aim point to catch motion between planning and firing;
+    // this earlier branch gives the bot a useful non-splash fallback instead of silence.
     let explosive = matches!(choice.weapon, Weapon::RocketLauncher | Weapon::GrenadeLauncher);
     let my_team = game.entities[e].mode_p.team;
-    if explosive && teammate_in_blast(game, e, my_team, tgt.org) {
+    if explosive
+        && (teammate_in_blast(game, e, my_team, tgt.org)
+            || !own_explosive_aim_safe(game, e, dist))
+    {
         if let Some(direct) = safe_direct_choice(inv, dist, underwater) {
             choice = direct;
         }
@@ -1489,6 +1600,50 @@ mod tests {
         assert_eq!(blast_self_damage(160.0), 0.0); // past the radius
         assert!((blast_self_damage(140.0) - 50.0).abs() < 0.01);
         assert_eq!(blast_self_damage(400.0), 0.0);
+    }
+
+    #[test]
+    fn quad_self_splash_scales_before_armor() {
+        let bare = OwnSplashState {
+            health: 100.0,
+            armor_value: 0.0,
+            armor_type: 0.0,
+            damage_scale: 1.0,
+            quad: false,
+            immune: false,
+        };
+        assert_eq!(own_splash_health_damage(bare, 140.0), 25.0);
+        let quad = OwnSplashState { damage_scale: 4.0, quad: true, ..bare };
+        assert_eq!(own_splash_health_damage(quad, 140.0), 100.0);
+        let yellow = OwnSplashState {
+            armor_value: 150.0,
+            armor_type: 0.6,
+            ..quad
+        };
+        // f32 `0.6 * 100` sits just above 60, so the engine's ceil saves 61 and passes 39.
+        assert_eq!(own_splash_health_damage(yellow, 140.0), 39.0);
+        assert_eq!(own_splash_health_damage(OwnSplashState { immune: true, ..quad }, 0.0), 0.0);
+    }
+
+    #[test]
+    fn quad_explosives_use_the_enlarged_caution_zone() {
+        let normal = OwnSplashState {
+            health: 100.0,
+            armor_value: 0.0,
+            armor_type: 0.0,
+            damage_scale: 1.0,
+            quad: false,
+            immune: false,
+        };
+        let quad = OwnSplashState { damage_scale: 4.0, quad: true, ..normal };
+        // No physical splash reaches 200u, but quad still uses KTX's conservative bore guard.
+        assert!(own_splash_safe(normal, 200.0, 0.0));
+        assert!(!own_splash_safe(quad, 200.0, 0.0));
+        assert!(!own_splash_safe(quad, QUAD_SPLASH_CAUTION_RANGE, 0.0));
+        assert!(own_splash_safe(quad, QUAD_SPLASH_CAUTION_RANGE + 0.01, 0.0));
+        assert!(own_splash_safe(OwnSplashState { immune: true, ..quad }, 1.0, 0.0));
+        // Even without quad, a 20-health bot refuses a 25-health self-hit.
+        assert!(!own_splash_safe(OwnSplashState { health: 20.0, ..normal }, 140.0, 0.0));
     }
 
     #[test]

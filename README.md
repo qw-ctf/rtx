@@ -252,6 +252,10 @@ the audience like everyone else. The combat layer (`src/bot_combat.rs`) is gener
 any mode that hands a bot an enemy. A bot's view **lerps** toward its target angle rather than
 snapping, so it turns naturally when spectated; both the turn/track speed and aim tightness scale
 with `rtx_bot_skill` (a low-skill bot visibly swings onto a target more slowly).
+Explosive fire projects the bot's own post-armor health loss using the live quad multiplier (4×, or
+8× in deathmatch 4) and CTF rune scaling. Quad rockets/grenades use KTX's conservative **250-unit
+self-splash caution zone**: the bot switches to a direct gun when possible and the final trigger
+gate withholds a dangerous shot if it cannot, while pent/god mode and Midair self-rockets stay exempt.
 
 Bots also play the **shootable-grenade** game (above). Defensively they shoot down an **incoming**
 grenade — but only from outside its blast, weighed against their own health (the closer it is, the

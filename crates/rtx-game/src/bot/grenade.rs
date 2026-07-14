@@ -15,8 +15,8 @@ use glam::{Vec3, Vec3Swizzles};
 
 use crate::bot::BotCmd;
 use crate::bot::combat::{
-    blast_self_damage, can_hit_grenade, hitscan_choice, shoot_grenade, teammate_in_blast, GRENADE_MIN_SHOOT,
-    GRENADE_SHOOT_HEALTH_FRAC,
+    can_hit_grenade, hitscan_choice, own_explosion_safe_at, shoot_grenade, teammate_in_blast,
+    GRENADE_MIN_SHOOT,
 };
 use crate::defs::{
     Bits, Flags, Items, MoveType, Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK,
@@ -510,8 +510,7 @@ fn try_start(game: &mut GameState, e: EntId, en: EntId, origin: Vec3, now: f32) 
 
     // Safety on the blast point: outside our own splash, no teammate caught, a clear line to the
     // enemy (so the blast actually reaches them), and — for a shove — not driving them toward us.
-    let self_splash = blast_self_damage((target - origin).length()) * 0.5;
-    if self_splash > health * GRENADE_SHOOT_HEALTH_FRAC
+    if !own_explosion_safe_at(game, e, (target - origin).length())
         || (target - origin).length() < GRENADE_MIN_SHOOT
         || teammate_in_blast(game, e, my_team, target)
     {
@@ -704,14 +703,14 @@ fn detonate(game: &mut GameState, e: EntId, en: EntId, origin: Vec3, now: f32, c
         combo_reset(game, e, now + COMBO_DONE_COOLDOWN);
         return;
     }
-    let (health, my_team) = (game.entities[e].v.health, game.entities[e].mode_p.team);
+    let my_team = game.entities[e].mode_p.team;
     let gpos = game.entities[g].v.origin;
     let eye = origin + VEC_VIEW_OFS;
     cmd.look = angles_to(eye, gpos);
 
     // Never blow it up in our own face, or on a teammate. Back away if it's drifted too close.
     let d_self = (gpos - origin).length();
-    if blast_self_damage(d_self) * 0.5 > health * GRENADE_SHOOT_HEALTH_FRAC
+    if !own_explosion_safe_at(game, e, d_self)
         || d_self < GRENADE_MIN_SHOOT
         || teammate_in_blast(game, e, my_team, gpos)
     {
@@ -757,9 +756,9 @@ pub(crate) fn rocket_shove(
     let Some(en) = enemy else {
         return false;
     };
-    let (items, ammo, health, my_team) = {
+    let (items, ammo, my_team) = {
         let ent = &game.entities[e];
-        (ent.v.items, ent.v.ammo_rockets, ent.v.health, ent.mode_p.team)
+        (ent.v.items, ent.v.ammo_rockets, ent.mode_p.team)
     };
     if !items.has(Items::ROCKET_LAUNCHER) || ammo < 1.0 {
         return false;
@@ -792,7 +791,7 @@ pub(crate) fn rocket_shove(
     }
     // Don't splash ourselves (attacker damage is halved), and don't stand on top of the blast.
     let d_self = (b - origin).length();
-    if blast_self_damage(d_self) * 0.5 > health * GRENADE_SHOOT_HEALTH_FRAC || d_self < GRENADE_MIN_SHOOT {
+    if !own_explosion_safe_at(game, e, d_self) || d_self < GRENADE_MIN_SHOOT {
         return false;
     }
     // We need a clear straight shot to `B`: the rocket must reach that ground spot, not detonate on
