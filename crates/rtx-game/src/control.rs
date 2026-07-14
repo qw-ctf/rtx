@@ -706,9 +706,11 @@ fn cell_json(game: &GameState, pos: Vec3) -> Result<String, String> {
         if g.link_source(li) == cell {
             let e = if out.is_empty() { "" } else { "," };
             out.push_str(&format!(
-                "{e}{{\"link\":{li},\"kind\":{},\"to\":{}}}",
+                "{e}{{\"link\":{li},\"kind\":{},\"to\":{},\"cost\":{:.2},\"tgt_hazard\":{}}}",
                 jstr(kind_name(g.link_kind(li))),
-                jvec3(g.cell_origin(g.link_target(li)))
+                jvec3(g.cell_origin(g.link_target(li))),
+                g.link_cost(li),
+                jstr(&format!("{:?}", g.cell_hazard(g.link_target(li))))
             ));
         }
         if g.link_target(li) == cell {
@@ -721,9 +723,10 @@ fn cell_json(game: &GameState, pos: Vec3) -> Result<String, String> {
         }
     }
     Ok(format!(
-        "{{\"cell\":{},\"origin\":{},\"out\":[{out}],\"in\":[{inc}]}}",
+        "{{\"cell\":{},\"origin\":{},\"hazard\":{},\"out\":[{out}],\"in\":[{inc}]}}",
         cell,
-        jvec3(g.cell_origin(cell))
+        jvec3(g.cell_origin(cell)),
+        jstr(&format!("{:?}", g.cell_hazard(cell)))
     ))
 }
 
