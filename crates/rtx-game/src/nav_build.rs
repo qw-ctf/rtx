@@ -297,6 +297,9 @@ impl GameState {
                     // World-XY footprint of the brush (XY is the same at pos1/pos2 — travel is Z-only).
                     fp_min: glam::Vec2::new(pos1.x + mins.x, pos1.y + mins.y),
                     fp_max: glam::Vec2::new(pos1.x + maxs.x, pos1.y + maxs.y),
+                    // The brush's bottom face with the lift at rest — the shaft floor the swept volume
+                    // starts at (cells below it are under that floor, not in the lift's way).
+                    bottom: pos2.z + mins.z,
                 }
             })
             .collect()

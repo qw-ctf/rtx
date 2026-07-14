@@ -312,6 +312,15 @@ impl NavGraph {
         self.hazard.get(cell as usize).copied().flatten()
     }
 
+    /// The lift whose swept volume covers this cell, as an index into `plats` — the same index space as
+    /// [`plat`](Self::plat) and [`plat_of_link`](Self::plat_of_link), so the game's `plat_statuses()`
+    /// (built over `0..plat_count()`) indexes straight with it. `None` is open ground. A body resting on
+    /// such a cell blocks the lift's descent, so bots transit these cells but never park on them. Set by
+    /// [`add_plats`](Self::add_plats); an unmarked graph reads as all-clear.
+    pub fn cell_under_plat(&self, cell: CellId) -> Option<usize> {
+        self.under_plat.get(cell as usize).copied().flatten().map(usize::from)
+    }
+
     /// Counts per link kind, for the load-time debug line.
     pub fn summary(&self) -> LinkCounts {
         let mut c = LinkCounts::default();

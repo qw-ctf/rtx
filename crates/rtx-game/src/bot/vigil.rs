@@ -127,7 +127,11 @@ fn update(game: &mut GameState, e: EntId, origin: Vec3, item_org: Vec3, holding:
     } else if let Some((cell, p)) = g.nearest(origin).and_then(|from| pick_post(g, from, item_org, POST_MIN, max_r, r_post)) {
         (p, Some(cell), p, now + POST_HOLD + r_hold * POST_JITTER)
     } else {
-        (item_org, g.nearest(item_org), Vec3::ZERO, post_until) // no trivial post — sit on the item
+        // No trivial post anywhere in the ring — sit on the item itself. The one spot a vigil can still
+        // put a bot under a raised lift, and only when the item is *itself* in the shaft and not one cell
+        // of the surrounding ring could be walked to; on a real map the ring always has something. Left
+        // as-is rather than grown a special case: `GOAL_GIVEUP_TIME` already bounds a wait that never pays.
+        (item_org, g.nearest(item_org), Vec3::ZERO, post_until)
     };
 
     let b = &mut game.entities[e].bot;
@@ -172,13 +176,15 @@ fn pick_scan(eye: Vec3, prev: Vec3, r: f32) -> Vec3 {
 
 /// A reachable cell in the `[min, max]` XY ring around `item` on roughly its floor, whose route from
 /// `from` is trivial (only `Walk`/`Step` legs, no gate) — so the cruise leg is a short stroll and can
-/// never turn into a gate errand. Candidates are tried from a random offset; `None` if none validate.
+/// never turn into a gate errand. Cells under a raised lift are barred outright: a post is a spot to
+/// *stand* for seconds at a time, and a body in the shaft holds the lift up. Candidates are tried from
+/// a random offset; `None` if none validate.
 fn pick_post(g: &NavGraph, from: CellId, item: Vec3, min: f32, max: f32, r: f32) -> Option<(CellId, Vec3)> {
     let ring: Vec<CellId> = (0..g.cells.len() as CellId)
         .filter(|&c| {
             let o = g.cells[c as usize].origin;
             let d = (o.xy() - item.xy()).length();
-            d >= min && d <= max && (o.z - item.z).abs() < POST_DZ
+            d >= min && d <= max && (o.z - item.z).abs() < POST_DZ && g.cell_under_plat(c).is_none()
         })
         .collect();
     if ring.is_empty() {

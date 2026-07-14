@@ -24,7 +24,7 @@ use crate::bot::state::GrenadePhase;
 use crate::bot::{grenade, BotCmd};
 use crate::defs::{
     Bits, Content, FieldEq, Flags, Items, Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK,
-    BUTTON_JUMP, RUNE_RESISTANCE, RUNE_STRENGTH, VEC_VIEW_OFS,
+    BUTTON_JUMP, RUNE_RESISTANCE, RUNE_STRENGTH, VEC_HULL_MAX, VEC_VIEW_OFS,
 };
 use crate::entity::{EntId, Touch};
 use crate::game::GameState;
@@ -452,6 +452,41 @@ fn safe_combat_move(
     candidates.into_iter().find(|&mv| footing(mv) != Footing::Hazard).unwrap_or(hold)
 }
 
+/// How far ahead the footing oracles probe for a lift shaft — the same one-stride reach the hazard/water
+/// probes use, so a dodge is judged by where it actually puts the body, not where it starts.
+const PLAT_PROBE_AHEAD: f32 = 48.0;
+
+/// The XY boxes of every lift currently raised *above* `origin`, grown by the player half-width (a body
+/// that far outside the brush still overlaps it). Stepping into one parks the bot where the lift wants to
+/// come down — it blocks the descent and resets the lower-timer — so the footing oracles demote such a
+/// move exactly like water: dodge elsewhere when anything else is open, take it only if the alternative
+/// is worse. The `origin.z` guard keeps a fight *on top of* the raised plat, or on the floor it delivers
+/// to, unaffected. Mirrors `plat_statuses` (see `nav_build`); a map has a handful of plats, so the scan is
+/// cheap enough to run per combat frame.
+fn raised_plat_boxes(game: &GameState, origin: Vec3) -> Vec<(glam::Vec2, glam::Vec2)> {
+    let Some(graph) = game.nav.graph.as_ref() else {
+        return Vec::new();
+    };
+    let m = VEC_HULL_MAX.xy(); // the player's own half-width — the reach of the body we mustn't park there
+    (0..graph.plat_count())
+        .filter_map(|pi| {
+            let p = graph.plat(pi);
+            let ent = &game.entities[EntId(p.entity)];
+            let raised = ent.in_use && ent.mover.state != crate::entity::MoverPhase::Bottom;
+            let below = origin.z < ent.v.origin.z + ent.v.maxs.z;
+            (raised && below).then(|| (p.fp_min - m, p.fp_max + m))
+        })
+        .collect()
+}
+
+/// Whether a step `d` from `feet` lands inside one of `plats`' footprints (see [`raised_plat_boxes`]).
+fn steps_under_plat(plats: &[(glam::Vec2, glam::Vec2)], feet: Vec3, d: Vec3) -> bool {
+    let p = (feet + d * PLAT_PROBE_AHEAD).xy();
+    plats
+        .iter()
+        .any(|&(lo, hi)| crate::bot::in_footprint(p, lo, hi, 0.0))
+}
+
 /// A fleeing bot's move away from a threat at heading `away` (a horizontal unit vector), kept off
 /// hazards: straight away when that's clear, else the safer perpendicular, else hold ground. The
 /// returned bool is whether the bot may still hop to clear the blast — suppressed when every escape
@@ -462,6 +497,7 @@ fn safe_flee_move(game: &GameState, e: EntId, origin: Vec3, away: Vec3) -> (Vec3
     let Some(bsp) = game.nav.bsp.as_ref() else {
         return (away * MOVE_SPEED, grounded);
     };
+    let plats = raised_plat_boxes(game, origin);
     let host = game.host();
     let is_solid = |p: Vec3| bsp.is_solid(p);
     let contents = |p: Vec3| host.pointcontents(p);
@@ -472,7 +508,7 @@ fn safe_flee_move(game: &GameState, e: EntId, origin: Vec3, away: Vec3) -> (Vec3
             Footing::Dry
         } else if crate::hazard::hazard_ahead(&is_solid, &contents, feet, n).is_some() {
             Footing::Hazard
-        } else if crate::hazard::water_ahead(&is_solid, &contents, feet, n) {
+        } else if crate::hazard::water_ahead(&is_solid, &contents, feet, n) || steps_under_plat(&plats, feet, n) {
             Footing::Wet
         } else {
             Footing::Dry
@@ -790,7 +826,8 @@ fn feed_forward(game: &mut GameState, e: EntId, now: f32, skill: f32, clean: Vec
 /// `press` is false when modeling is off, leaving the range logic unchanged. Grounded near a hazard
 /// the move is filtered so the bot won't strafe or backpedal into lava/slime or off a ledge (the
 /// probes reuse the offensive-shove oracles — clip-hull solidity plus the engine's `pointcontents`,
-/// the only hull that reports liquids); airborne or map-less it's the original blind composition.
+/// the only hull that reports liquids), nor orbit a fight into a raised lift's shaft, where its body
+/// would hold the lift up; airborne or map-less it's the original blind composition.
 fn combat_move(game: &mut GameState, e: EntId, enemy: EntId, now: f32, origin: Vec3, to_enemy: Vec3) -> Vec3 {
     let health = game.entities[e].v.health;
     let default_strafe = if ((now * 0.9) + e.0 as f32).sin() >= 0.0 {
@@ -819,6 +856,7 @@ fn combat_move(game: &mut GameState, e: EntId, enemy: EntId, now: f32, origin: V
     let burning = is_burning(&game.entities[e].v);
     match (grounded_self, game.nav.bsp.as_ref()) {
         (true, Some(bsp)) => {
+            let plats = raised_plat_boxes(game, origin);
             let host = game.host();
             let is_solid = |p: Vec3| bsp.is_solid(p);
             let contents = |p: Vec3| host.pointcontents(p);
@@ -829,8 +867,12 @@ fn combat_move(game: &mut GameState, e: EntId, enemy: EntId, now: f32, origin: V
                     Footing::Dry
                 } else if crate::hazard::hazard_ahead(&is_solid, &contents, feet, d).is_some() {
                     Footing::Hazard
-                } else if crate::hazard::water_ahead(&is_solid, &contents, feet, d) {
-                    Footing::Wet // slow and exposed — dodge to dry ground when we can, wade only if forced
+                } else if crate::hazard::water_ahead(&is_solid, &contents, feet, d)
+                    || steps_under_plat(&plats, feet, d)
+                {
+                    // Wet, not Hazard: a lift shaft is somewhere to leave, not something that kills —
+                    // dodge to open ground when there is any, step in only if every other way is worse.
+                    Footing::Wet
                 } else {
                     Footing::Dry
                 }

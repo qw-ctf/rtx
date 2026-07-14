@@ -1422,7 +1422,7 @@ fn progress_stalled(best: f32, since: f32, remaining: f32, now: f32) -> bool {
 }
 
 /// Whether `p` lies within the box `[fp_min, fp_max]` grown by `margin` on every side.
-fn in_footprint(p: Vec2, fp_min: Vec2, fp_max: Vec2, margin: f32) -> bool {
+pub(crate) fn in_footprint(p: Vec2, fp_min: Vec2, fp_max: Vec2, margin: f32) -> bool {
     p.x >= fp_min.x - margin
         && p.x <= fp_max.x + margin
         && p.y >= fp_min.y - margin
@@ -1618,13 +1618,16 @@ fn roam_target(game: &mut GameState, e: EntId, origin: Vec3, now: f32) -> Vec3 {
         return origin;
     }
     let pick = |r: f32| ((r * g.cells.len() as f32) as usize).min(g.cells.len() - 1);
-    // Prefer a safe, dry destination — roaming into water to turn around is loiter, and roaming onto
-    // lava/slime is suicide. Take the first draw that is neither; if every draw lands wet or burning
-    // (a mostly-flooded/flooded-with-liquid map) keep the last.
+    // Prefer a safe, dry destination clear of the lifts — roaming into water to turn around is loiter,
+    // roaming onto lava/slime is suicide, and roaming under a raised plat parks a body where it blocks
+    // the lift's descent. Take the first draw that is none of those; if every draw lands wet, burning or
+    // under a lift (a mostly-flooded/flooded-with-liquid map) keep the last.
     let idx = draws
         .iter()
         .map(|&r| pick(r))
-        .find(|&i| !g.cell_in_water(i as u32) && g.cell_hazard(i as u32).is_none())
+        .find(|&i| {
+            !g.cell_in_water(i as u32) && g.cell_hazard(i as u32).is_none() && g.cell_under_plat(i as u32).is_none()
+        })
         .unwrap_or_else(|| pick(draws[7]));
     let cell = g.cell_origin(idx as u32);
     game.entities[e].bot.wander.target = cell; // disjoint field from game.nav — coexists with `g`

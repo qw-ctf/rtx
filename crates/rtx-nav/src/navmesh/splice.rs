@@ -11,6 +11,7 @@ use glam::Vec3;
 use super::geom::*;
 use super::*;
 use crate::bsp::Bsp;
+use crate::qphys::ORIGIN_TO_FEET;
 
 /// The two standing positions a `func_plat` connects: the player-origin spot on the plat
 /// surface at the bottom of travel (`board`) and at the top (`exit`), plus the edict id and
@@ -24,6 +25,9 @@ pub struct PlatInfo {
     /// World-XY footprint of the plat brush (XY is travel-invariant), for the standoff box.
     pub fp_min: Vec2,
     pub fp_max: Vec2,
+    /// World-z of the plat body's bottom face at rest — the shaft floor, and the lower bound of the
+    /// under-plat cell stamp (anything below it is beneath the floor the lift rests on, not in the shaft).
+    pub bottom: f32,
 }
 
 /// A `trigger_teleport`: its world-space trigger box (`tmin`/`tmax`) and the player-origin
@@ -122,6 +126,46 @@ impl NavGraph {
                         pi,
                     );
                 }
+            }
+            self.stamp_under_plat(p, pi);
+        }
+    }
+
+    /// Mark every cell inside plat `p`'s swept volume with its index, so the planner can price the shaft
+    /// as transit-only and the runtime can tell a bot it is standing where the lift wants to land (see
+    /// the `under_plat` column). The box is the footprint grown by the player half-width — a body that
+    /// far outside the brush still overlaps it and blocks the descent — spanning from the shaft floor up
+    /// to just under the raised surface, so the floor cells the lift *delivers* to (origin ≈ `exit.z`)
+    /// stay open ground. The board cell is stamped on purpose: the lift surface is no place to camp
+    /// either, and boarding is unaffected because every link entering it is plat-tagged and so exempt
+    /// from [`surcharge_under_plat_links`](Self::surcharge_under_plat_links).
+    fn stamp_under_plat(&mut self, p: &PlatInfo, pi: usize) {
+        let m = PLAYER_HALF_WIDTH;
+        let lo = Vec3::new(p.fp_min.x - m, p.fp_min.y - m, p.bottom);
+        let hi = Vec3::new(p.fp_max.x + m, p.fp_max.y + m, p.exit.z - ORIGIN_TO_FEET - 1.0);
+        // Sized here rather than once up front: `add_cell` (the board cell above) appends as we go, and
+        // a short column would silently read as all-clear.
+        self.under_plat.resize(self.cells.len(), None);
+        for c in self.cells_in_box(lo, hi) {
+            self.under_plat[c as usize] = Some(pi as u16);
+        }
+    }
+
+    /// Charge [`UNDER_PLAT_EXTRA`] on every link *entering* an under-plat cell, so routes prefer any
+    /// comparable way around a lift shaft. Plat-tagged links — the ride and the jump-aboards — keep their
+    /// solved cost: reaching those cells is the whole point of boarding. Pure (the stamp is build-side
+    /// geometry), so unlike the water/hazard passes this runs inside the worker build.
+    pub fn surcharge_under_plat_links(&mut self) {
+        if self.under_plat.is_empty() {
+            return; // no plats spliced — nothing to price
+        }
+        for li in 0..self.links.len() {
+            if self.plats.index_of_link(li as u32).is_some() {
+                continue;
+            }
+            let to = self.links[li].to as usize;
+            if self.under_plat.get(to).copied().flatten().is_some() {
+                self.links[li].cost += UNDER_PLAT_EXTRA;
             }
         }
     }
@@ -254,5 +298,114 @@ impl NavGraph {
     /// The gate (if any) whose shut door link `li` passes through.
     pub fn gate_of_link(&self, li: u32) -> Option<usize> {
         self.gates.index_of_link(li)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A graph with no geometry, to hang synthetic cells off (`add_cell` fills the grid `cells_in_box`
+    /// reads). Building the real thing needs a BSP; the stamp only needs cells and a plat box.
+    fn bare_graph() -> NavGraph {
+        NavGraph {
+            cells: Vec::new(),
+            links: Vec::new(),
+            adjacency: Vec::new(),
+            water: Vec::new(),
+            breathable: Vec::new(),
+            hazard: Vec::new(),
+            under_plat: Vec::new(),
+            grid: GridIndex::default(),
+            gates: SideTable::default(),
+            hooks: SideTable::default(),
+            speed_jumps: SideTable::default(),
+            rocket_jumps: SideTable::default(),
+            plats: SideTable::default(),
+            sj_k: bhop_k(10.0, MAX_SPEED),
+        }
+    }
+
+    /// A lift resting at `z = -24` whose raised surface delivers to a floor at `z = 200`, footprint
+    /// ±32 about the origin. The stamp box is that footprint grown by the 16u half-width, spanning
+    /// `[-24, 175]` in z — so `exit.z` (200) sits above it.
+    fn plat() -> PlatInfo {
+        PlatInfo {
+            board: Vec3::new(0.0, 0.0, 0.0),
+            exit: Vec3::new(0.0, 0.0, 200.0),
+            entity: 7,
+            fp_min: Vec2::splat(-32.0),
+            fp_max: Vec2::splat(32.0),
+            bottom: -24.0,
+        }
+    }
+
+    /// The stamp covers the shaft a body would block — including the sliver just outside the brush that
+    /// a 32u-wide player still overlaps — and stops short of the floor the lift delivers to, which is
+    /// ordinary ground a bot must be free to stand on.
+    #[test]
+    fn stamp_covers_the_shaft_but_not_the_delivery_floor() {
+        let mut g = bare_graph();
+        let shaft = g.add_cell(Vec3::new(0.0, 0.0, 0.0)); // on the lift at rest
+        let lip = g.add_cell(Vec3::new(40.0, 0.0, 0.0)); // 8u outside the brush — still in the way
+        let away = g.add_cell(Vec3::new(200.0, 0.0, 0.0)); // open floor across the room
+        let top = g.add_cell(Vec3::new(0.0, 0.0, 200.0)); // the floor the raised lift delivers to
+        let cellar = g.add_cell(Vec3::new(0.0, 0.0, -100.0)); // under the shaft floor, not in it
+        g.stamp_under_plat(&plat(), 0);
+
+        assert_eq!(g.cell_under_plat(shaft), Some(0), "the lift's own resting spot is under it");
+        assert_eq!(g.cell_under_plat(lip), Some(0), "a body 8u outside the brush still blocks it");
+        assert_eq!(g.cell_under_plat(away), None, "open floor wrongly stamped");
+        assert_eq!(g.cell_under_plat(top), None, "the delivery floor must stay open ground");
+        assert_eq!(g.cell_under_plat(cellar), None, "a cell below the shaft floor is not in the way");
+    }
+
+    /// Routing pays to *enter* the shaft, but boarding the lift is untouched — the ride and jump-aboard
+    /// links are what the stamped cells exist for.
+    #[test]
+    fn surcharge_prices_entry_but_spares_boarding_and_exits() {
+        let mut g = bare_graph();
+        let shaft = g.add_cell(Vec3::new(0.0, 0.0, 0.0));
+        let away = g.add_cell(Vec3::new(200.0, 0.0, 0.0));
+        let walk = |from: CellId, to: CellId| Link {
+            from,
+            to,
+            kind: LinkKind::Walk,
+            cost: 1.0,
+        };
+        g.push_link(walk(away, shaft)); // 0: into the shaft — priced
+        g.push_link(walk(shaft, away)); // 1: back out — free, so the way out is never taxed
+        let pi = g.plats.push(Plat {
+            entity: 7,
+            fp_min: Vec2::splat(-32.0),
+            fp_max: Vec2::splat(32.0),
+        });
+        g.push_plat_link(walk(away, shaft), pi); // 2: a jump-aboard onto the same cell — exempt
+        g.stamp_under_plat(&plat(), pi);
+        g.surcharge_under_plat_links();
+
+        assert_eq!(g.links[0].cost, 1.0 + UNDER_PLAT_EXTRA, "entering the shaft not priced");
+        assert_eq!(g.links[1].cost, 1.0, "leaving the shaft wrongly priced");
+        assert_eq!(g.links[2].cost, 1.0, "boarding the lift must keep its solved cost");
+    }
+
+    /// A map with no plats leaves every link at its solved cost (and the column empty — the all-clear
+    /// default every `cell_under_plat` caller relies on).
+    #[test]
+    fn no_plats_leaves_costs_and_column_untouched() {
+        let mut g = bare_graph();
+        let a = g.add_cell(Vec3::ZERO);
+        let b = g.add_cell(Vec3::new(32.0, 0.0, 0.0));
+        g.push_link(Link {
+            from: a,
+            to: b,
+            kind: LinkKind::Walk,
+            cost: 1.0,
+        });
+        g.surcharge_under_plat_links();
+
+        assert_eq!(g.links[0].cost, 1.0);
+        assert_eq!(g.cell_under_plat(a), None);
+        assert_eq!(g.cell_under_plat(b), None);
     }
 }

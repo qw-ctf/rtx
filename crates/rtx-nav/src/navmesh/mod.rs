@@ -212,6 +212,14 @@ pub struct NavGraph {
     /// alongside `water` by [`surcharge_hazard_links`](Self::surcharge_hazard_links); an empty vec
     /// reads as "no cell burns" via [`cell_hazard`](Self::cell_hazard).
     hazard: Vec<Option<crate::hazard::HazardKind>>,
+    /// Per-cell "this spot is inside a `func_plat`'s swept volume" (parallel to `cells`), holding the
+    /// lift's index in `plats`. A body resting here blocks the lift's descent *and* keeps resetting
+    /// its inner trigger's lower-timer, so a raised plat never comes down — hence these cells are
+    /// transit-only: a bot may cross one or grab an item on it, but must never park there. Unlike
+    /// `water`/`hazard` this is pure build-side geometry (no engine `pointcontents` needed), so
+    /// [`add_plats`](Self::add_plats) fills it on the worker build; an empty vec reads as "no cell is
+    /// under a lift" via [`cell_under_plat`](Self::cell_under_plat).
+    under_plat: Vec<Option<u16>>,
     grid: GridIndex,
     /// The closed door/movewall each link's segment passes through — the "navmesh aware of dynamic
     /// geometry" core, so pathfinding can price a link by its door's live state (see
@@ -317,6 +325,7 @@ impl NavGraph {
             water: Vec::new(),      // filled at graph-swap by surcharge_water_links
             breathable: Vec::new(), // (needs the engine's liquid-carrying pointcontents)
             hazard: Vec::new(),     // filled at graph-swap by surcharge_hazard_links (same reason)
+            under_plat: Vec::new(), // filled by add_plats (pure geometry — no engine callback needed)
             grid: cells_grid.1,
             gates: SideTable::default(),
             hooks: SideTable::default(),
@@ -1134,6 +1143,16 @@ const LAVA_CELL_EXTRA: f32 = 2.0;
 /// well under lava: bots still shortcut a narrow slime moat when the dry detour is long.
 const SLIME_CELL_EXTRA: f32 = 1.0;
 
+/// Extra travel-time on every non-plat link *entering* a cell under a `func_plat`'s swept volume (see
+/// [`NavGraph::surcharge_under_plat_links`]). Standing in a lift's shaft blocks its descent and resets
+/// its lower-timer, so the shaft is a corridor to cross, not one to choose. Moderate by design: a shaft
+/// spans 2–4 cells, so cutting through costs ~1.5–3s and any parallel corridor within that detour wins,
+/// while an item under the lift stays worth a couple of seconds against its desirability and is still
+/// fetched. Finite, like every other extra here, so a shaft that is the only way through is still taken.
+/// This only *biases* routing — the runtime linger latch (the game's `bot::steer`) is what guarantees a
+/// bot never parks there.
+const UNDER_PLAT_EXTRA: f32 = 0.75;
+
 /// Multiplier on the cost of every link *entering* an underwater cell (see
 /// [`NavGraph::surcharge_water_links`]). Water is not lethal like lava, so it's a soft bias, not the
 /// flat [`HAZARD_LINK_EXTRA`] surcharge: a flat add on each of a pool's many short swim links would
@@ -1243,6 +1262,9 @@ pub fn build_navmesh(
         graph.add_plats(&bsp, &plats);
         graph.add_teleports(&teleports);
         graph.add_gates(&gates);
+        // Last: prices links entering a lift shaft, so it must see every link the splices above added
+        // (a teleport that lands under a plat, a jump-aboard from the shaft floor).
+        graph.surcharge_under_plat_links();
         Some((bsp, graph))
     };
     // Run the (rayon-parallel) build on a transient pool sized to leave one core for the caller.
@@ -1440,6 +1462,7 @@ mod tests {
                 entity: 7,
                 fp_min: board.xy() - Vec2::splat(32.0),
                 fp_max: board.xy() + Vec2::splat(32.0),
+                bottom: board.z - 48.0,
             }],
         );
         assert_eq!(g.summary().plat, 1, "plat ride not added");
@@ -1866,6 +1889,7 @@ mod tests {
             water: Vec::new(),
             breathable: Vec::new(),
             hazard: Vec::new(),
+            under_plat: Vec::new(),
             grid: GridIndex::default(),
             gates: SideTable::default(),
             hooks: SideTable::default(),
@@ -1899,6 +1923,7 @@ mod tests {
             water: Vec::new(),
             breathable: Vec::new(),
             hazard: Vec::new(),
+            under_plat: Vec::new(),
             grid: GridIndex::default(),
             gates: SideTable::default(),
             hooks: SideTable::default(),
@@ -2018,6 +2043,7 @@ mod tests {
             water: Vec::new(),
             breathable: Vec::new(),
             hazard: Vec::new(),
+            under_plat: Vec::new(),
             grid,
             gates: SideTable::default(),
             hooks: SideTable::default(),
@@ -2067,6 +2093,7 @@ mod tests {
             water: Vec::new(),
             breathable: Vec::new(),
             hazard: Vec::new(),
+            under_plat: Vec::new(),
             grid: GridIndex::default(),
             gates: SideTable::default(),
             hooks: SideTable::default(),
@@ -2168,6 +2195,7 @@ mod tests {
             water: Vec::new(),
             breathable: Vec::new(),
             hazard: Vec::new(),
+            under_plat: Vec::new(),
             grid,
             gates: SideTable::default(),
             hooks: SideTable::default(),
@@ -2226,6 +2254,7 @@ mod tests {
             water: Vec::new(),
             breathable: Vec::new(),
             hazard: Vec::new(),
+            under_plat: Vec::new(),
             grid,
             gates: SideTable::default(),
             hooks: SideTable::default(),
@@ -2288,6 +2317,7 @@ mod tests {
             water: Vec::new(),
             breathable: Vec::new(),
             hazard: Vec::new(),
+            under_plat: Vec::new(),
             grid: GridIndex::default(),
             gates: SideTable::default(),
             hooks: SideTable::default(),

@@ -289,6 +289,13 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 origin.z > st.surface_z + 8.0 && in_footprint(origin.xy(), p.fp_min, p.fp_max, 0.0);
             !st.down && !riding && in_footprint(origin.xy(), p.fp_min, p.fp_max, PLAT_ENGAGE)
         });
+    // Note there is deliberately no "the bot is loitering under a raised lift, walk it out" reflex here.
+    // Standing in a shaft is not a state to detect and recover from on a timer — it is a state nothing
+    // should ever choose. Every spot a bot comes to rest on is picked by a chooser that now refuses
+    // shaft cells (`roam_target`, `vigil::pick_post`) and combat's footing demotes a dodge into one, so
+    // a bot only ever *crosses* a shaft — and a crossing needs no permission to end. Anything else that
+    // leaves a bot standing there is a bug in the chooser, and belongs fixed there rather than papered
+    // over by a grace period that would, by construction, still stand under the lift for its duration.
     // While holding, steer to the standoff point and borrow the Plat leg's driver treatment (no
     // jump-press, no bhop entry, no air-latch, progress-watchdog exempt) by presenting `kind` as Plat.
     let (waypoint, kind) = match plat_hold {
