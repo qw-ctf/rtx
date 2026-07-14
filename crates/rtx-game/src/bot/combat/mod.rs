@@ -487,6 +487,30 @@ fn steps_under_plat(plats: &[(glam::Vec2, glam::Vec2)], feet: Vec3, d: Vec3) -> 
         .any(|&(lo, hi)| crate::bot::in_footprint(p, lo, hi, 0.0))
 }
 
+/// Classify where a horizontal step `mv` from `feet` lands, for the combat/flee/dodge hazard ladders.
+/// A zero move is Dry — holding ground is never a step into anything. A raised lift's shaft rates Wet,
+/// not Hazard: somewhere to leave, not something that kills — move to open ground when there is any,
+/// step in only if every other way is worse. Pure over the oracles (clip-hull solidity plus the
+/// engine's `pointcontents`, the only hull that reports liquids).
+fn step_footing(
+    is_solid: &impl Fn(Vec3) -> bool,
+    contents: &impl Fn(Vec3) -> f32,
+    plats: &[(glam::Vec2, glam::Vec2)],
+    feet: Vec3,
+    mv: Vec3,
+) -> Footing {
+    let d = Vec3::new(mv.x, mv.y, 0.0).normalize_or_zero();
+    if d == Vec3::ZERO {
+        Footing::Dry
+    } else if crate::hazard::hazard_ahead(is_solid, contents, feet, d).is_some() {
+        Footing::Hazard
+    } else if crate::hazard::water_ahead(is_solid, contents, feet, d) || steps_under_plat(plats, feet, d) {
+        Footing::Wet
+    } else {
+        Footing::Dry
+    }
+}
+
 /// A fleeing bot's move away from a threat at heading `away` (a horizontal unit vector), kept off
 /// hazards: straight away when that's clear, else the safer perpendicular, else hold ground. The
 /// returned bool is whether the bot may still hop to clear the blast — suppressed when every escape
@@ -502,18 +526,7 @@ fn safe_flee_move(game: &GameState, e: EntId, origin: Vec3, away: Vec3) -> (Vec3
     let is_solid = |p: Vec3| bsp.is_solid(p);
     let contents = |p: Vec3| host.pointcontents(p);
     let feet = origin - Vec3::new(0.0, 0.0, 24.0);
-    let footing = |d: Vec3| {
-        let n = Vec3::new(d.x, d.y, 0.0).normalize_or_zero();
-        if n == Vec3::ZERO {
-            Footing::Dry
-        } else if crate::hazard::hazard_ahead(&is_solid, &contents, feet, n).is_some() {
-            Footing::Hazard
-        } else if crate::hazard::water_ahead(&is_solid, &contents, feet, n) || steps_under_plat(&plats, feet, n) {
-            Footing::Wet
-        } else {
-            Footing::Dry
-        }
-    };
+    let footing = |d: Vec3| step_footing(&is_solid, &contents, &plats, feet, d);
     safe_flee_choice(&footing, away, grounded, is_burning(&game.entities[e].v))
 }
 
@@ -542,6 +555,53 @@ fn safe_flee_choice(footing: &impl Fn(Vec3) -> Footing, away: Vec3, grounded: bo
     } else {
         (Vec3::ZERO, false) // hazards on every side — hold, don't hop off the edge
     }
+}
+
+/// A dodging bot's move across an incoming projectile's travel line: `dodge` is the chosen lateral
+/// heading (a horizontal unit vector, see [`dodge_side_sign`]), `away` the radial escape from the
+/// blast point kept as a last resort for when the lane is walled off by hazards on both sides. Same
+/// two-pass ladder as [`safe_combat_move`] — a candidate on dry ground wins outright, else the first
+/// that isn't lethal (wading beats eating a rocket) — then the burning split from [`safe_flee_choice`]:
+/// on safe ground, hazards every way mean hold rather than dodge off a ledge; already cooking in lava,
+/// take the dodge anyway. Zero candidates are filtered because `footing(ZERO)` is Dry — a degenerate
+/// radial would otherwise "win" the dry pass as a stand-still. The returned bool is whether footing
+/// permits a hop; the caller gates it further on established lateral speed. Pure over the oracle.
+fn safe_dodge_choice(
+    footing: &impl Fn(Vec3) -> Footing,
+    dodge: Vec3,
+    away: Vec3,
+    grounded: bool,
+    burning: bool,
+) -> (Vec3, bool) {
+    let candidates = [dodge, -dodge, away];
+    let mut open = candidates.into_iter().filter(|&d| d != Vec3::ZERO);
+    if let Some(d) = open.clone().find(|&d| footing(d) == Footing::Dry) {
+        return (d * MOVE_SPEED, grounded);
+    }
+    if let Some(d) = open.find(|&d| footing(d) != Footing::Hazard) {
+        return (d * MOVE_SPEED, grounded);
+    }
+    if burning {
+        (dodge * MOVE_SPEED, grounded) // every side burns anyway — cross the line, keep moving
+    } else {
+        (Vec3::ZERO, false) // hazards on every side — hold, don't dodge off the edge
+    }
+}
+
+/// [`safe_dodge_choice`] over the live world: the same clip-hull/`pointcontents` oracles and raised-lift
+/// footprints the combat and flee moves use. Mapless, the dodge goes through unfiltered.
+fn safe_dodge_move(game: &GameState, e: EntId, origin: Vec3, dodge: Vec3, away: Vec3) -> (Vec3, bool) {
+    let grounded = game.entities[e].v.flags.has(Flags::ONGROUND);
+    let Some(bsp) = game.nav.bsp.as_ref() else {
+        return (dodge * MOVE_SPEED, grounded);
+    };
+    let plats = raised_plat_boxes(game, origin);
+    let host = game.host();
+    let is_solid = |p: Vec3| bsp.is_solid(p);
+    let contents = |p: Vec3| host.pointcontents(p);
+    let feet = origin - Vec3::new(0.0, 0.0, 24.0);
+    let footing = |d: Vec3| step_footing(&is_solid, &contents, &plats, feet, d);
+    safe_dodge_choice(&footing, dodge, away, grounded, is_burning(&game.entities[e].v))
 }
 
 /// Bias a combat strafe away from a visible enemy's current horizontal aim line. `dodge_perp` is
@@ -795,13 +855,21 @@ fn aim_error(game: &mut GameState, e: EntId, now: f32, skill: f32, aim: Vec3, my
     b.aim.err
 }
 
+/// How fast the smoothed rate estimate chases the raw one (1/s), giving a time constant near 0.1s —
+/// long enough to average out the per-frame noise in a finite-difference rate, short enough that the
+/// lead is already there when a strafer reverses.
+const LEAD_RATE_SMOOTH: f32 = 10.0;
+
 /// Feed-forward lead for the aim spring. The spring tracks a moving solution with a steady-state lag
 /// of 2·rate/ω, so on a constant strafer the crosshair would trail forever. Estimate how fast the
 /// solution is moving (from last frame's clean angles) and aim ahead by the expected lag —
 /// skill-scaled, so skill 7 locks onto strafers while low skill keeps trailing them. A jump too fast
 /// for human tracking is treated as a discontinuity (target/weapon switch or teleport), not motion,
-/// so no phantom slew is fed forward.
+/// so no phantom slew is fed forward. The estimate is smoothed before it reaches the view
+/// ([`LEAD_RATE_SMOOTH`]): the raw per-frame rate is noisy enough that feeding it straight through
+/// shakes the crosshair, which is what a spectator sees as the bot's aim buzzing left and right.
 fn feed_forward(game: &mut GameState, e: EntId, now: f32, skill: f32, clean: Vec3) -> Vec3 {
+    let frametime = game.globals.frametime;
     let b = &mut game.entities[e].bot;
     let dt = now - b.aim.look_prev_time;
     let raw = if b.aim.look_prev_time > 0.0 && dt > 1e-3 && dt < 0.25 {
@@ -817,7 +885,15 @@ fn feed_forward(game: &mut GameState, e: EntId, now: f32, skill: f32, clean: Vec
     };
     b.aim.look_prev = clean;
     b.aim.look_prev_time = now;
-    rate * (2.0 / aim_omega(skill)) * (skill / 7.0)
+    // Chase the estimate rather than take it raw. A one-frame difference of the solution angle is the
+    // tracking motion plus noise — in a close duel it swings by well over a hundred deg/s between
+    // frames, and a sample rejected as a discontinuity drops it to zero outright. The lead scales all
+    // of that by 2/ω (±36° at skill 7), so feeding it straight to the view snaps the crosshair frame
+    // to frame and the aim visibly shakes — worst airborne, where a duel's angular rates peak.
+    // Smoothing over ~0.1s still tracks a strafer's swing while averaging the noise away.
+    let t = (LEAD_RATE_SMOOTH * frametime).min(1.0);
+    b.aim.rate += (rate - b.aim.rate) * t;
+    b.aim.rate * (2.0 / aim_omega(skill)) * (skill / 7.0)
 }
 
 /// The world-space combat movement: hold a preferred range and strafe to dodge, retreating when
@@ -861,22 +937,7 @@ fn combat_move(game: &mut GameState, e: EntId, enemy: EntId, now: f32, origin: V
             let is_solid = |p: Vec3| bsp.is_solid(p);
             let contents = |p: Vec3| host.pointcontents(p);
             let feet = origin - Vec3::new(0.0, 0.0, 24.0);
-            let footing = |mv: Vec3| {
-                let d = Vec3::new(mv.x, mv.y, 0.0).normalize_or_zero();
-                if d == Vec3::ZERO {
-                    Footing::Dry
-                } else if crate::hazard::hazard_ahead(&is_solid, &contents, feet, d).is_some() {
-                    Footing::Hazard
-                } else if crate::hazard::water_ahead(&is_solid, &contents, feet, d)
-                    || steps_under_plat(&plats, feet, d)
-                {
-                    // Wet, not Hazard: a lift shaft is somewhere to leave, not something that kills —
-                    // dodge to open ground when there is any, step in only if every other way is worse.
-                    Footing::Wet
-                } else {
-                    Footing::Dry
-                }
-            };
+            let footing = |mv: Vec3| step_footing(&is_solid, &contents, &plats, feet, mv);
             safe_combat_move(&footing, dir, perp, want_forward, strafe_sign, burning)
         }
         _ => dir * want_forward + perp * (strafe_sign * MOVE_SPEED),
@@ -1086,6 +1147,40 @@ pub(crate) fn engage(
 
 // --- live projectile survival ------------------------------------------------------------------
 
+/// Predicted lateral miss (units) below which the closest-approach offset carries no side — about half
+/// the player hull's width. A well-aimed rocket lands inside this, where the offset is aim noise that
+/// flips sign frame to frame rather than a side worth widening.
+const DODGE_MISS_EPS: f32 = 16.0;
+
+/// Lateral speed (units/s) that counts as a strafe already under way and worth reinforcing. Above the
+/// ~30u/s an airborne bot can wish itself sideways and above ground friction jitter, well under a run.
+const DODGE_VEL_EPS: f32 = 50.0;
+
+/// Speed (units/s) along the chosen dodge before a hop may extend it. Ground runs cap at `sv_maxspeed`
+/// (320), so this is a committed side-dodge carrying real ground speed into the air — a QuakeWorld
+/// side-jump. Below it a jump is a standing pogo: it trades ground acceleration for the ~30u/s air-wish
+/// cap and builds no separation at all, which is exactly the bug this gate exists to kill. Absolute, not
+/// a fraction of [`MOVE_SPEED`] — that is a wish magnitude (800), not a speed the bot can ever reach.
+const DODGE_HOP_SPEED: f32 = 200.0;
+
+/// Which side of a linear projectile's travel line to dodge toward, as a sign on the lateral axis.
+/// A predicted miss wide enough to be real is widened — the shot is already going to one side, so
+/// commit to that side. Failing that, an established strafe carries on: reading the bot's own lateral
+/// velocity makes the choice self-reinforcing, holding a direction across frames without new state.
+/// Failing both (a dead-on shot at a standing bot), a stable per-bot parity, so adjacent teammates
+/// split rather than pile into one another.
+fn dodge_side_sign(off: f32, lateral_vel: f32, even: bool) -> f32 {
+    if off.abs() > DODGE_MISS_EPS {
+        off.signum()
+    } else if lateral_vel.abs() > DODGE_VEL_EPS {
+        lateral_vel.signum()
+    } else if even {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
 /// Exact closest approach for a constant-velocity projectile relative to a moving bot.
 fn linear_closest_approach(relative: Vec3, relative_velocity: Vec3, horizon: f32) -> (f32, Vec3) {
     let speed2 = relative_velocity.length_squared();
@@ -1121,6 +1216,12 @@ fn ballistic_closest_approach(relative: Vec3, relative_velocity: Vec3, horizon: 
 /// damage tube. Unlike [`grenade_tactics`], this works when grenades are not shootable and covers
 /// every projectile weapon. Skill controls only how early the threat is noticed; every skill level
 /// understands the same geometry. Returns true when survival claimed movement this frame.
+///
+/// A flying projectile is escaped *sideways*, across its travel line ([`dodge_side_sign`] picks which
+/// side, [`safe_dodge_move`] keeps it off lava and ledges) — the one direction that opens distance from
+/// something far faster than the bot. A grenade, whose blast is centred on a landing point rather than
+/// strung along a line, is still fled radially. Either way a jump only ever extends a dodge already
+/// moving ([`DODGE_HOP_SPEED`]): a standing hop builds no separation and just hangs the bot in the air.
 pub(crate) fn projectile_dodge(
     game: &mut GameState,
     e: EntId,
@@ -1157,8 +1258,9 @@ pub(crate) fn projectile_dodge(
         .filter(|&(_, touch, _, _, owner, _, live)| live && (owner != e || touch == Touch::Grenade))
         .collect();
 
-    // (score, projectile position at danger, velocity) — lower score is more urgent.
-    let mut best: Option<(f32, Vec3, Vec3)> = None;
+    // (score, time of closest approach, projectile position at danger, kind, velocity) — lower score
+    // is more urgent.
+    let mut best: Option<(f32, f32, Vec3, Touch, Vec3)> = None;
     for (projectile, touch, pos, velocity, owner, nextthink, _) in live {
         let enemy_owned = owner.is_some()
             && owner != e
@@ -1224,31 +1326,49 @@ pub(crate) fn projectile_dodge(
             continue;
         }
         let score = t + 0.2 * dist / radius;
-        if best.is_none_or(|(old, _, _)| score < old) {
-            best = Some((score, danger, velocity));
+        if best.is_none_or(|(old, _, _, _, _)| score < old) {
+            best = Some((score, t, danger, touch, velocity));
         }
     }
 
-    let Some((_, danger, velocity)) = best else {
+    let Some((_, t, danger, touch, velocity)) = best else {
         return false;
     };
-    let mut away = Vec3::new(origin.x - danger.x, origin.y - danger.y, 0.0).normalize_or_zero();
-    if away == Vec3::ZERO {
-        // A direct intercept has no radial side yet; step perpendicular to its travel, with a stable
-        // per-bot side so adjacent teammates do not all dodge into one another.
-        away = Vec3::new(-velocity.y, velocity.x, 0.0).normalize_or_zero();
-        if e.0.is_multiple_of(2) {
-            away = -away;
+    let axis = Vec3::new(velocity.x, velocity.y, 0.0).normalize_or_zero();
+    let radial = Vec3::new(origin.x - danger.x, origin.y - danger.y, 0.0).normalize_or_zero();
+    let (mv, may_hop) = if touch == Touch::Grenade || axis == Vec3::ZERO {
+        // A grenade's blast is centred on where it comes to rest, not strung along a line — and a
+        // projectile dropping dead vertical has no travel line to cross. Radial escape is the geometry.
+        let mut away = radial;
+        if away == Vec3::ZERO {
+            // A direct intercept has no radial side yet; step perpendicular to its travel, with a stable
+            // per-bot side so adjacent teammates do not all dodge into one another.
+            away = Vec3::new(-velocity.y, velocity.x, 0.0).normalize_or_zero();
+            if e.0.is_multiple_of(2) {
+                away = -away;
+            }
         }
-    }
-    if away == Vec3::ZERO {
-        // A grenade falling vertically onto the bot has no horizontal travel axis. Pick a stable
-        // orthogonal escape rather than accepting the direct overhead blast.
-        away = if e.0.is_multiple_of(2) { Vec3::X } else { Vec3::Y };
-    }
-    let (mv, may_hop) = safe_flee_move(game, e, origin, away);
+        if away == Vec3::ZERO {
+            // A grenade falling vertically onto the bot has no horizontal travel axis. Pick a stable
+            // orthogonal escape rather than accepting the direct overhead blast.
+            away = if e.0.is_multiple_of(2) { Vec3::X } else { Vec3::Y };
+        }
+        safe_flee_move(game, e, origin, away)
+    } else {
+        // A rocket or nail is dodged *across* its travel line, never along it. The radial escape is
+        // useless here: for a well-aimed shot the danger point sits on the bot, so `origin - danger`
+        // is noise that flips every frame, and head-on it degenerates into a backpedal — no bot
+        // outruns a rocket. The projectile's own velocity gives a lateral axis that stays put.
+        let perp = Vec3::new(-axis.y, axis.x, 0.0);
+        let off = (origin + bot_velocity * t - danger).dot(perp); // the predicted miss a dodge widens
+        let sign = dodge_side_sign(off, bot_velocity.dot(perp), e.0.is_multiple_of(2));
+        safe_dodge_move(game, e, origin, perp * sign, radial)
+    };
     cmd.move_world = mv;
-    if may_hop {
+    // A hop may only *extend* a dodge already carrying speed — that is a side-jump, and it keeps the
+    // ground velocity it took off with. Hopping from a standstill is the pogo this gate exists to
+    // prevent: it surrenders ground acceleration for the air-wish cap and moves the bot nowhere.
+    if may_hop && bot_velocity.dot(mv.normalize_or_zero()) > DODGE_HOP_SPEED {
         cmd.buttons |= BUTTON_JUMP;
     }
     true
@@ -1548,6 +1668,82 @@ mod tests {
             safe_flee_choice(&away_hazard_dry_minus_y, AWAY, true, true),
             (Vec3::new(0.0, -1.0, 0.0) * MOVE_SPEED, true)
         );
+    }
+
+    // Dodge geometry: the projectile flies along +x, so the lateral escape axis is ±y and the chosen
+    // side is +y; `RADIAL` (−x, straight back down the travel line) is the last-resort escape.
+    const DODGE: Vec3 = Vec3::new(0.0, 1.0, 0.0);
+    const RADIAL: Vec3 = Vec3::new(-1.0, 0.0, 0.0);
+
+    #[test]
+    fn safe_dodge_choice_takes_preferred_side() {
+        // Open ground → cross the travel line at full speed on the chosen side. The hop rides on
+        // footing alone here; the caller's speed gate is what decides a side-jump.
+        let dry = |_: Vec3| Footing::Dry;
+        assert_eq!(safe_dodge_choice(&dry, DODGE, RADIAL, true, false), (DODGE * MOVE_SPEED, true));
+        assert!(!safe_dodge_choice(&dry, DODGE, RADIAL, false, false).1, "airborne never hops");
+    }
+
+    #[test]
+    fn safe_dodge_choice_flips_before_radial() {
+        // The chosen side is a hazard: cross the line the other way rather than fall back to the
+        // radial — a sidestep still opens distance from the projectile, backing off does not.
+        let hazard_plus_y = |d: Vec3| if d.y > 0.0 { Footing::Hazard } else { Footing::Dry };
+        assert_eq!(
+            safe_dodge_choice(&hazard_plus_y, DODGE, RADIAL, true, false),
+            (-DODGE * MOVE_SPEED, true)
+        );
+    }
+
+    #[test]
+    fn safe_dodge_choice_prefers_dry_flip_over_wet_preferred() {
+        // The chosen side wades, the other is dry → take the dry side, even though the wet one is a
+        // legal (non-hazard) move and comes first in the candidate order.
+        let wet_plus_y = |d: Vec3| if d.y > 0.0 { Footing::Wet } else { Footing::Dry };
+        assert_eq!(safe_dodge_choice(&wet_plus_y, DODGE, RADIAL, true, false), (-DODGE * MOVE_SPEED, true));
+    }
+
+    #[test]
+    fn safe_dodge_choice_radial_when_both_sides_hazard() {
+        // A catwalk along the rocket's line: neither sidestep survives, so back off radially rather
+        // than stand still and eat it.
+        let hazard_lateral = |d: Vec3| if d.y != 0.0 { Footing::Hazard } else { Footing::Dry };
+        assert_eq!(
+            safe_dodge_choice(&hazard_lateral, DODGE, RADIAL, true, false),
+            (RADIAL * MOVE_SPEED, true)
+        );
+    }
+
+    #[test]
+    fn safe_dodge_choice_holds_when_surrounded_unless_burning() {
+        // Hazards every way: a grounded bot holds and drops the hop rather than dodge off the edge —
+        // but one already standing in lava has no footing worth saving, so it dodges and keeps the hop.
+        let all_hazard = |_: Vec3| Footing::Hazard;
+        assert_eq!(safe_dodge_choice(&all_hazard, DODGE, RADIAL, true, false), (Vec3::ZERO, false));
+        assert_eq!(safe_dodge_choice(&all_hazard, DODGE, RADIAL, true, true), (DODGE * MOVE_SPEED, true));
+    }
+
+    #[test]
+    fn safe_dodge_choice_skips_zero_radial() {
+        // A dead-on shot leaves no radial (`origin - danger` collapses). Zero footing rates Dry, so an
+        // unfiltered candidate list would hand back a stand-still *with the hop kept* — the pogo. Both
+        // sides blocked must mean hold, hop suppressed.
+        let hazard_lateral = |d: Vec3| if d.y != 0.0 { Footing::Hazard } else { Footing::Dry };
+        assert_eq!(
+            safe_dodge_choice(&hazard_lateral, DODGE, Vec3::ZERO, true, false),
+            (Vec3::ZERO, false)
+        );
+    }
+
+    #[test]
+    fn dodge_side_sign_prefers_miss_then_velocity_then_parity() {
+        // A real predicted miss picks the side, outranking a strafe running the other way.
+        assert_eq!(dodge_side_sign(-40.0, 300.0, true), -1.0);
+        // Miss inside the noise band → carry on with the strafe already under way.
+        assert_eq!(dodge_side_sign(4.0, -150.0, true), -1.0);
+        // Neither: a dead-on shot at a near-stationary bot splits on parity.
+        assert_eq!(dodge_side_sign(4.0, 10.0, true), 1.0);
+        assert_eq!(dodge_side_sign(4.0, 10.0, false), -1.0);
     }
 
     #[test]

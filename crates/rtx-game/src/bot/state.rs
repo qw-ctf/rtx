@@ -199,6 +199,11 @@ pub struct Aim {
     /// against a strafing target.
     pub look_prev: Vec3,
     pub look_prev_time: f32,
+    /// That rate, smoothed (deg/s). The raw one-frame difference carries the real tracking motion but
+    /// also per-frame excursions of hundreds of deg/s, and drops to zero whenever a sample is rejected
+    /// as a discontinuity. The lead multiplies all of it, so the view chases the smoothed estimate —
+    /// per-frame white noise reads as jitter here for the same reason it does in `err`.
+    pub rate: Vec3,
 }
 
 /// Audience-wander state: where a spectating bot is strolling in a round mode's stands, and the next
