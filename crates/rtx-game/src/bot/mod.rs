@@ -79,7 +79,14 @@ const HOOK_BALLISTIC_SLACK: f32 = 1.0;
 /// (the solve's ±16u launch perturb bounds how far off the spot the arc still lands).
 pub(crate) const RJ_STANCE: f32 = 16.0;
 /// Fire the jump once the smoothed view is within this many degrees of the solved fire angles.
-pub(crate) const RJ_AIM_TOL: f32 = 2.0;
+///
+/// Derived from the solver's certified aim envelope, not chosen: `rj_perturb_ok` only proves the arc
+/// still lands under ±[`RJ_CERT_AIM_DEG`] of aim error, so releasing the shot anywhere outside that
+/// flies an uncertified arc. This was 2.0 — *wider* than the 1.5 that was certified — and the bot duly
+/// scattered: same link landing dead-on once and 300u away the next try, because a degree or two of
+/// pitch near a corner moves the detonation onto a different surface and the knockback with it. A
+/// third of the envelope leaves room for the aim spring's own settle error inside what was proven.
+pub(crate) const RJ_AIM_TOL: f32 = rtx_nav::navmesh::RJ_CERT_AIM_DEG / 3.0;
 /// Give up the stance if the RL/aim/ground alignment hasn't let the jump go within this.
 pub(crate) const RJ_STANCE_TIMEOUT: f32 = 2.5;
 /// If the bot is still on the ground this long after pressing jump, the jump was swallowed — abort.

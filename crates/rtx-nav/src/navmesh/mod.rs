@@ -38,6 +38,7 @@ pub use physics::{
     CURL_V_HOLD_TOL, DOUBLE_ARC_PEAK, JUMP_APEX, MAX_SPEED, NBANDS,
 };
 use physics::*;
+pub use rocketjump::RJ_CERT_AIM_DEG;
 use rocketjump::{rj_perturb_ok, rocket_jump_cost, simulate_rocket_jump, RJ_DELAYS, RJ_PITCHES};
 use sidetable::SideTable;
 pub use splice::{Gate, GateInfo, Plat, PlatInfo, TeleportInfo};
@@ -98,6 +99,12 @@ const RJ_MIN_RISE: f32 = 40.0;
 /// of them). 24 keeps the snap to at most a half-hull, so a generated link actually reaches its target.
 const RJ_LAND_XY: f32 = 24.0;
 const RJ_LAND_Z: f32 = 24.0;
+/// How far the arc must apex *above* its target to be worth minting. A rocket jump that peaks level
+/// with the ledge has to thread the lip exactly; a human instead overshoots and settles down onto the
+/// platform, and that spare height is what absorbs aim and timing error. Without this gate the
+/// cheapest-arc rule below actively selects *against* margin — `rocket_jump_cost` charges airtime, so
+/// the flattest arc that still scrapes the edge always outbids the safe one over it.
+const RJ_APEX_MARGIN: f32 = 32.0;
 /// At most this many rocket-jump links per source cell — kept small (each costs the bot ~50HP to
 /// fly, so a map wants a handful of genuinely-useful ones, not a spray).
 const RJ_MAX_PER_CELL: usize = 2;
@@ -895,8 +902,13 @@ impl NavGraph {
                     let horiz = (b.xy() - a.xy()).length();
                     let useful = dz > useful_apex; // height is the whole point of an RJ in v1
                     let in_range = (RJ_MIN_RISE..=RJ_MAX_RISE).contains(&dz) && horiz <= RJ_RANGE_XY;
+                    // Peak of the post-blast parabola. Closed-form is exact here: `simulate_rocket_jump`
+                    // only returns a solution when the arc flew unobstructed to a floor, so nothing
+                    // clipped the rise.
+                    let apex = s.pos_blast.z + s.v0.z.max(0.0).powi(2) / (2.0 * params.gravity);
                     if useful
                         && in_range
+                        && apex >= b.z + RJ_APEX_MARGIN
                         && !self.has_direct_link(from, to)
                         && rj_perturb_ok(is_solid, rocket_solid, a, angles, delay, params, b)
                     {

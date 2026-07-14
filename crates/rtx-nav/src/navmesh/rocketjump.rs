@@ -154,11 +154,18 @@ pub(super) fn simulate_rocket_jump(
     }
 }
 
+/// Aim error (degrees, each fire axis) the robustness sweep below proves a candidate arc survives.
+/// The runtime's fire-release tolerance must stay *inside* this — a bot that shoots while further off
+/// than this is flying an arc nobody certified, and near a corner a fraction of a degree changes which
+/// surface the rocket detonates on, flipping the knockback. `bot::RJ_AIM_TOL` is derived from this for
+/// exactly that reason; don't set one without the other.
+pub const RJ_CERT_AIM_DEG: f32 = 1.5;
+
 /// Robustness sweep — the conservative core. A failed rocket jump wastes ~50HP, so a candidate is
 /// accepted only if it still lands within **2×** the acceptance window of target `b` under every
 /// perturbation a live bot introduces: ±25 ms of fire timing (≈ two bot frames of delay error),
-/// ±1.5° on each fire axis (aim-spring settle error), and ±16 u of launch-stance error. This
-/// rejects fp-fragile grazing arcs whose landing swings wildly with a hair of input change.
+/// ±[`RJ_CERT_AIM_DEG`] on each fire axis (aim-spring settle error), and ±16 u of launch-stance
+/// error. This rejects fp-fragile grazing arcs whose landing swings wildly with a hair of input change.
 pub(super) fn rj_perturb_ok(
     player_solid: impl Fn(Vec3) -> bool + Copy,
     rocket_solid: impl Fn(Vec3) -> bool + Copy,
@@ -176,12 +183,13 @@ pub(super) fn rj_perturb_ok(
                     && (s.land.z - b.z).abs() <= RJ_LAND_Z * 2.0
         )
     };
+    let aim = RJ_CERT_AIM_DEG;
     lands(a, angles, (delay - 0.025).max(0.0))
         && lands(a, angles, delay + 0.025)
-        && lands(a, angles + Vec3::new(1.5, 0.0, 0.0), delay)
-        && lands(a, angles + Vec3::new(-1.5, 0.0, 0.0), delay)
-        && lands(a, angles + Vec3::new(0.0, 1.5, 0.0), delay)
-        && lands(a, angles + Vec3::new(0.0, -1.5, 0.0), delay)
+        && lands(a, angles + Vec3::new(aim, 0.0, 0.0), delay)
+        && lands(a, angles + Vec3::new(-aim, 0.0, 0.0), delay)
+        && lands(a, angles + Vec3::new(0.0, aim, 0.0), delay)
+        && lands(a, angles + Vec3::new(0.0, -aim, 0.0), delay)
         && lands(a + Vec3::new(16.0, 0.0, 0.0), angles, delay)
         && lands(a + Vec3::new(-16.0, 0.0, 0.0), angles, delay)
 }

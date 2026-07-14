@@ -20,16 +20,24 @@ pub(super) enum ArcResult {
     /// The parabola descended onto solid: the standing position just above it, airtime, and the
     /// vertical speed at impact (for fall-damage pricing).
     Land { pos: Vec3, airtime: f32, vz: f32 },
-    /// Ran into solid while level or ascending — a wall/ceiling blocks this arc.
+    /// Ran into solid while level or ascending, or *struck a wall side-on* while descending — the
+    /// arc is obstructed, not landed.
     Blocked,
     /// Never landed within the airtime cap.
     Timeout,
 }
 
 /// Integrate a ballistic arc from `r` with initial velocity `v0` under `gravity`, stepping so no
-/// step advances more than `HOOK_SAMPLE`, until it hits solid (landing if descending, blocked
-/// otherwise) or the airtime cap. Pure: the world enters only through the `is_solid` oracle, so
-/// this is unit-testable against the closed-form parabola with a synthetic floor.
+/// step advances more than `HOOK_SAMPLE`, until it hits solid (landing if descending onto a floor,
+/// blocked otherwise) or the airtime cap. Pure: the world enters only through the `is_solid` oracle,
+/// so this is unit-testable against the closed-form parabola with a synthetic floor.
+///
+/// A descending hit is only a *landing* if the blocker is underneath. Descending into the side of a
+/// wall is not: the bot scrapes it and slides down to whatever is below, far from here. Accepting
+/// those was the "certified" rocket jump that flies into a pillar face and falls back to the floor —
+/// and because a wall face is perfectly stable under perturbation, the robustness sweep rated it the
+/// *safest* link on the map. Classify by re-testing the step with the horizontal component removed:
+/// solid on the pure-vertical move ⇒ floor beneath ⇒ a true touchdown.
 pub(super) fn simulate_arc(is_solid: impl Fn(Vec3) -> bool, r: Vec3, v0: Vec3, gravity: f32) -> ArcResult {
     let mut p = r;
     let mut v = v0;
@@ -38,7 +46,8 @@ pub(super) fn simulate_arc(is_solid: impl Fn(Vec3) -> bool, r: Vec3, v0: Vec3, g
         let dt = (HOOK_SAMPLE / v.length().max(1.0)).min(HOOK_SIM_DT);
         let next = p + v * dt;
         if is_solid(next) {
-            return if v.z < 0.0 {
+            let onto_floor = is_solid(Vec3::new(p.x, p.y, next.z));
+            return if v.z < 0.0 && onto_floor {
                 ArcResult::Land {
                     pos: p,
                     airtime: t,
@@ -122,4 +131,32 @@ pub(super) fn hook_cost(rope: f32, release_dist: f32, airtime: f32, vz_land: f32
         c += 1.0;
     }
     c
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Descending into the *side* of a wall is not a landing — the bot scrapes the face and slides
+    /// down to whatever is below. Only a blocker underneath is a touchdown. Certifying wall strikes
+    /// is what minted stronghold's rocket jumps into the quad pillar: the solver read the contact
+    /// point as a landing on top of the pillar, and since a wall face never moves under perturbation,
+    /// the robustness sweep confirmed it as rock solid. The bot flew into the wall every single time.
+    #[test]
+    fn descending_into_a_wall_face_is_blocked_not_landed() {
+        // Floor at z=0, and a wall filling x >= 64 (up to z=200).
+        let solid = |p: Vec3| p.z <= 0.0 || (p.x >= 64.0 && p.z <= 200.0);
+        // Launched up-and-toward the wall: apexes at x=25, then meets the face at z~91 descending.
+        let arc = simulate_arc(solid, Vec3::new(0.0, 0.0, 100.0), Vec3::new(200.0, 0.0, 100.0), 800.0);
+        assert!(matches!(arc, ArcResult::Blocked), "wall strike must not certify as a landing");
+    }
+
+    /// The same descent with the wall removed lands on the floor beneath — the classifier rejects
+    /// side-on hits without rejecting ordinary touchdowns.
+    #[test]
+    fn descending_onto_floor_still_lands() {
+        let solid = |p: Vec3| p.z <= 0.0;
+        let arc = simulate_arc(solid, Vec3::new(0.0, 0.0, 100.0), Vec3::new(200.0, 0.0, 100.0), 800.0);
+        assert!(matches!(arc, ArcResult::Land { .. }), "a plain floor landing must still certify");
+    }
 }
