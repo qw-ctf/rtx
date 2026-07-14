@@ -34,7 +34,9 @@ pub(crate) use population::{drain_roster, RosterOp};
 #[cfg(test)]
 use population::bot_target;
 
-use crate::bot::state::{AirCommit, BotState, Commit, GoalCommit, GrenadePhase, HookPhase, RjPhase, Wander};
+use crate::bot::state::{
+    AirCommit, BotState, CombatPosture, Commit, GoalCommit, GrenadePhase, HookPhase, RjPhase, Wander,
+};
 use crate::defs::{
     Bits, DeadFlag, Flags, Items, Solid, TakeDamage, Weapon, BUTTON_ATTACK, BUTTON_JUMP, VEC_VIEW_OFS,
 };
@@ -293,6 +295,9 @@ fn bot_pickup_items(game: &mut GameState, e: EntId) {
         .collect();
     let now = game.time();
     let goal_item = game.entities[e].bot.goal.item;
+    let next_item = game.entities[e].bot.goal.next_item;
+    let next_cell = game.entities[e].bot.goal.next_cell;
+    let next_commit = game.entities[e].bot.goal.next_commit;
     let hold_item = game.entities[e].bot.goal.hold_item;
     let holding = hold_item != 0 && now < game.entities[e].bot.goal.hold_until;
     for item in hits {
@@ -309,9 +314,16 @@ fn bot_pickup_items(game: &mut GameState, e: EntId) {
             if item.0 == goal_item {
                 let b = &mut game.entities[e].bot;
                 b.mark_avoid(item.0, now + PICKUP_AVOID_TIME);
-                b.goal.item = 0;
-                b.goal.commit = GoalCommit::None;
-                b.goal.next_pick = now;
+                if next_item != 0 {
+                    (b.goal.item, b.goal.item_cell, b.goal.commit) = (next_item, next_cell, next_commit);
+                    b.goal.since = now;
+                    b.goal.next_pick = now + GOAL_SELECT_INTERVAL;
+                } else {
+                    b.goal.item = 0;
+                    b.goal.commit = GoalCommit::None;
+                    b.goal.next_pick = now;
+                }
+                (b.goal.next_item, b.goal.next_cell, b.goal.next_commit) = (0, 0, GoalCommit::None);
             }
         }
     }
@@ -528,6 +540,9 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     if let Some(order) = game.entities[e].bot.puppet.order {
         use crate::bot::state::ControlOrder;
         game.entities[e].bot.goal.item = 0; // no item chase under a puppet order
+        game.entities[e].bot.goal.next_item = 0;
+        game.entities[e].bot.goal.commit = GoalCommit::None;
+        game.entities[e].bot.goal.next_commit = GoalCommit::None;
         let (target_origin, item_cell, order_link) = match order {
             ControlOrder::Hold => (origin, None, None),
             ControlOrder::Goto { target } => (target, None, None),
@@ -609,7 +624,9 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     if matches!(intent, Some(BotIntent::Move(_) | BotIntent::Spectate { .. })) {
         let b = &mut game.entities[e].bot;
         b.goal.item = 0;
+        b.goal.next_item = 0;
         b.goal.commit = GoalCommit::None;
+        b.goal.next_commit = GoalCommit::None;
         b.goal.next_pick = now;
     }
 
@@ -620,16 +637,49 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     if committed && (committed_item == 0 || !game.item_goal_valid(e, EntId(committed_item), now)) {
         let b = &mut game.entities[e].bot;
         b.goal.item = 0;
+        b.goal.next_item = 0;
         b.goal.commit = GoalCommit::None;
+        b.goal.next_commit = GoalCommit::None;
         b.goal.next_pick = now;
     }
 
-    // Fast local survival pass. It is independent of greed and runs while idle or fighting, but not
-    // during a ballistic traversal whose route/view already have an indivisible owner.
     let traversal_committed = hooking
         || on_sj
         || on_rj
         || game.entities[e].bot.air.is_some();
+
+    // Strategic recovery: relative strength/firepower and critical health can make a reachable
+    // health/armor/weapon pickup own movement for several seconds. A powerup plan normally wins;
+    // only a genuinely critical (≤20 hp) bot inserts recovery ahead of it and preserves the old
+    // target as the continuation.
+    if let Some(BotIntent::Fight(en)) = intent {
+        if !traversal_committed {
+            let previous = game.entities[e].bot.posture;
+            let (posture, recovery) = game.recovery_decision(e, en, now, previous);
+            game.entities[e].bot.posture = posture;
+            let may_preempt = game.entities[e].bot.goal.commit != GoalCommit::Powerup
+                || game.entities[e].v.health <= 20.0;
+            if may_preempt {
+                if let Some((item, cell)) = recovery {
+                    let b = &mut game.entities[e].bot;
+                    let preserve = (b.goal.commit == GoalCommit::Powerup && b.goal.item != 0)
+                        .then_some((b.goal.item, b.goal.item_cell, GoalCommit::Powerup));
+                    if item.0 != b.goal.item {
+                        b.goal.since = now;
+                    }
+                    (b.goal.item, b.goal.item_cell, b.goal.commit) = (item.0, cell, GoalCommit::Pickup);
+                    (b.goal.next_item, b.goal.next_cell, b.goal.next_commit) =
+                        preserve.unwrap_or((0, 0, GoalCommit::None));
+                    b.goal.next_pick = now + GOAL_SELECT_INTERVAL;
+                }
+            }
+        }
+    } else {
+        game.entities[e].bot.posture = CombatPosture::Hold;
+    }
+
+    // Fast local survival pass. It is independent of greed and runs while idle or fighting, but not
+    // during a ballistic traversal whose route/view already have an indivisible owner.
     let urgent_allowed = matches!(intent, None | Some(BotIntent::Fight(_))) && !traversal_committed;
     if urgent_allowed
         && game.entities[e].bot.goal.commit == GoalCommit::None
@@ -643,6 +693,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
                 b.goal.since = now;
             }
             (b.goal.item, b.goal.item_cell, b.goal.commit) = (item.0, cell, commit);
+            (b.goal.next_item, b.goal.next_cell, b.goal.next_commit) = (0, 0, GoalCommit::None);
             b.goal.next_pick = now + GOAL_SELECT_INTERVAL;
         }
     }
@@ -666,30 +717,49 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
             } else {
                 game.select_item_goal(e)
             };
-            let (new_item, new_cell) = pick.map_or((0, 0), |(it, c)| (it.0, c));
-            let new_powerup = new_item != 0 && game.is_powerup_item(EntId(new_item));
+            let (new_item, new_cell, next_item, next_cell, commit, next_commit) = match pick {
+                Some(plan) => {
+                    let (first, first_cell) = plan.first;
+                    let (next, next_cell) = plan.second.map_or((0, 0), |(it, cell)| (it.0, cell));
+                    let first_powerup = game.is_powerup_item(first);
+                    let next_powerup = next != 0 && game.is_powerup_item(EntId(next));
+                    let commit = if first_powerup || plan.contains_powerup {
+                        GoalCommit::Powerup
+                    } else {
+                        GoalCommit::None
+                    };
+                    let next_commit = if next_powerup {
+                        GoalCommit::Powerup
+                    } else {
+                        GoalCommit::None
+                    };
+                    (first.0, first_cell, next, next_cell, commit, next_commit)
+                }
+                None => (0, 0, 0, 0, GoalCommit::None, GoalCommit::None),
+            };
             let b = &mut game.entities[e].bot;
             if new_item != b.goal.item {
                 b.goal.since = now; // restart the watchdog for a new goal
             }
             (b.goal.item, b.goal.item_cell) = (new_item, new_cell);
+            (b.goal.next_item, b.goal.next_cell, b.goal.next_commit) = (next_item, next_cell, next_commit);
             b.goal.next_pick = now + GOAL_SELECT_INTERVAL;
-            b.goal.commit = if new_powerup {
-                GoalCommit::Powerup
-            } else {
-                GoalCommit::None
-            };
+            b.goal.commit = commit;
         }
         if game.entities[e].bot.goal.item != 0 && !game.item_goal_valid(e, EntId(game.entities[e].bot.goal.item), now) {
             let b = &mut game.entities[e].bot;
             b.goal.item = 0;
+            b.goal.next_item = 0;
             b.goal.commit = GoalCommit::None;
+            b.goal.next_commit = GoalCommit::None;
             b.goal.next_pick = now; // re-pick next frame
         }
     } else {
         let b = &mut game.entities[e].bot;
         b.goal.item = 0; // a Move objective supersedes any item chase
+        b.goal.next_item = 0;
         b.goal.commit = GoalCommit::None;
+        b.goal.next_commit = GoalCommit::None;
     }
 
     // Item vigil: if the goal item isn't collectable yet (mid-respawn, or a weapon held for a
@@ -738,8 +808,9 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         // Arena spectating: which fighter (edict) this bot is watching, `0` = none.
         let wat = if let Some(BotIntent::Spectate { watch, .. }) = intent { watch.0 } else { 0 };
         let commit = b.goal.commit;
+        let posture = b.posture;
         let msg = cstring(&format!(
-            "rtx bot{client}: want={goal} dist={dist:.0} on_item={overlap} ownLG={own_lg} cells={:.0} pen={pen} aware={aware} est={est} hold={hold} commit={commit:?} vig={vig} watch={wat}\n",
+            "rtx bot{client}: want={goal} dist={dist:.0} on_item={overlap} ownLG={own_lg} cells={:.0} pen={pen} aware={aware} est={est} hold={hold} commit={commit:?} posture={posture:?} vig={vig} watch={wat}\n",
             game.entities[e].v.ammo_cells,
         ));
         host.conprint(&msg); // conprint always shows; dprint needs `developer 1`
@@ -800,7 +871,9 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         let b = &mut game.entities[e].bot;
         b.mark_avoid(b.goal.item, now + GOAL_AVOID_TIME);
         b.goal.item = 0;
+        b.goal.next_item = 0;
         b.goal.commit = GoalCommit::None;
+        b.goal.next_commit = GoalCommit::None;
         b.goal.next_pick = now; // re-pick (skipping the abandoned item) next frame
     }
 
@@ -1012,6 +1085,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
         b.air = None;
         b.sj = None;
         b.goal.commit = GoalCommit::None;
+        b.posture = CombatPosture::Hold;
     }
 
     // Connected but never spawned (health 0, not dead): the engine defers `PutClientInServer` — the

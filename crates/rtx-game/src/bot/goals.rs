@@ -58,6 +58,23 @@ const LOCAL_PICKUP_TRAVEL: f32 = 1.0;
 /// Euclidean pre-filter before the local Dijkstra. It is deliberately looser than one second of
 /// stock running to admit a short stair/turn while avoiding a flood when no relevant item is nearby.
 const LOCAL_PICKUP_RADIUS: f32 = 384.0;
+/// Strategic recovery may break contact for an item reachable inside this many seconds.
+const RECOVERY_TRAVEL: f32 = 4.0;
+
+/// Bounded two-leg planning: only the strongest one-step candidates receive a second nav flood.
+/// This makes the worst-case query count explicit (one origin flood + this many continuation floods).
+const PLAN_PRIMARY_LIMIT: usize = 6;
+/// Total time window for a second ordinary pickup. The first leg keeps the tighter [`LOOKAHEAD`]
+/// so a bot does not cross the map for a shard; a useful nearby pickup may, however, bridge toward
+/// the next strategic item in the KTX two-goal style.
+const PLAN_LOOKAHEAD: f32 = 30.0;
+/// A future pickup is valuable but less certain than the one we can collect first: availability,
+/// combat, and inventory may change before arrival, so discount its score.
+const SECONDARY_WEIGHT: f32 = 0.5;
+/// How much of an observed opponent's item need becomes denial value for this bot.
+const ENEMY_DENIAL_WEIGHT: f32 = 0.5;
+/// A weaker bot yields an ordinary pickup when the known enemy reaches it first by this multiplier.
+const LOST_CONTEST_MULT: f32 = 0.35;
 
 /// Relative bonus the item a bot is *already* chasing gets in goal scoring, so a marginally-better
 /// alternative doesn't make it flip-flop between two near-equal pickups each re-selection (a loop
@@ -108,6 +125,28 @@ enum Category {
     },
     Weapon(WeaponKind),
     Ammo(AmmoKind),
+}
+
+/// A bounded item plan returned to the objective arbiter. `second` is promoted and revalidated after
+/// touching `first`; it is never followed blindly. `contains_powerup` makes a bridge-to-powerup plan
+/// completion-critical even when its first pickup is ordinary.
+#[derive(Clone, Copy)]
+pub(crate) struct ItemPlan {
+    pub first: (EntId, CellId),
+    pub second: Option<(EntId, CellId)>,
+    pub first_desire: f32,
+    pub contains_powerup: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ItemCandidate {
+    item: EntId,
+    cell: CellId,
+    desire: f32,
+    time: f32,
+    mult: f32,
+    powerup: bool,
+    one_score: f32,
 }
 
 /// Classify a pickup by its classname (the enviro suit and anything unlisted return `None`, so
@@ -297,6 +336,75 @@ fn firepower(items: f32, shells: f32, nails: f32, rockets: f32, cells: f32) -> f
         fp = fp.max(shells.min(20.0));
     }
     fp.max(shells.min(10.0)).min(100.0) // shotgun/axe baseline
+}
+
+/// Convert an observation-gated opponent estimate into the same scoring currency as the bot. Ammo
+/// is not observable after a pickup, so assume a modest fed loadout for weapons known to be owned;
+/// this is used only for relative risk and denial, never aiming or exact damage prediction.
+fn estimated_stats(est: crate::bot::model::OpponentEstimate, weapons_stay: bool) -> Stats {
+    let has = |bit: Items| est.items.has(bit);
+    let shells = if has(Items::SUPER_SHOTGUN) { 20.0 } else { 10.0 };
+    let nails = if has(Items::NAILGUN) || has(Items::SUPER_NAILGUN) { 50.0 } else { 0.0 };
+    let rockets = if has(Items::GRENADE_LAUNCHER) || has(Items::ROCKET_LAUNCHER) { 10.0 } else { 0.0 };
+    let cells = if has(Items::LIGHTNING) { 30.0 } else { 0.0 };
+    let strength = total_strength(est.health, est.armor_value, est.armor_type);
+    Stats {
+        health: est.health,
+        armor_value: est.armor_value,
+        armor_type: est.armor_type,
+        items: est.items,
+        shells,
+        nails,
+        rockets,
+        cells,
+        strength,
+        armor: est.armor_type * est.armor_value,
+        firepower: firepower(est.items, shells, nails, rockets, cells),
+        weapons_stay,
+    }
+}
+
+/// Denial/contest adjustment in pure form for tests. A known enemy's need makes the item more useful
+/// to take away; if that enemy reaches an ordinary item first and the bot is weaker, the route is
+/// discounted rather than feeding a losing fight. Powerups remain contest-worthy.
+fn contest_adjust(
+    own_desire: f32,
+    enemy_desire: f32,
+    my_eta: f32,
+    enemy_eta: Option<f32>,
+    weaker: bool,
+    powerup: bool,
+) -> (f32, f32) {
+    let desire = own_desire.max(0.0) + ENEMY_DENIAL_WEIGHT * enemy_desire.max(0.0);
+    let lost = enemy_eta.is_some_and(|eta| eta + 0.25 < my_eta);
+    let mult = if lost && weaker && !powerup {
+        LOST_CONTEST_MULT
+    } else {
+        1.0
+    };
+    (desire, mult)
+}
+
+fn posture_step(
+    previous: super::state::CombatPosture,
+    health: f32,
+    own_power: f32,
+    enemy_power: Option<f32>,
+) -> super::state::CombatPosture {
+    use super::state::CombatPosture::*;
+    let ratio = enemy_power.filter(|&p| p > 0.0).map_or(1.0, |p| own_power / p);
+    if previous == Recover {
+        if health < 60.0 || ratio < 0.85 {
+            return Recover;
+        }
+    } else if health <= 40.0 || ratio < 0.6 {
+        return Recover;
+    }
+    if ratio > 1.35 {
+        Press
+    } else {
+        Hold
+    }
 }
 
 /// Desire for a weapon the bot doesn't yet own (ktx's firepower-gap weighting).
@@ -510,17 +618,16 @@ impl GameState {
     /// Pick the highest-scoring reachable item goal for a bot, or `None` to fall back to following
     /// a human. Scans the static per-map catalog *and* any live dropped backpacks against a single
     /// Dijkstra flood from the bot.
-    pub(crate) fn select_item_goal(&self, bot_e: EntId) -> Option<(EntId, CellId)> {
-        self.best_item_goal(bot_e).map(|(item, cell, _)| (item, cell))
+    pub(crate) fn select_item_goal(&self, bot_e: EntId) -> Option<ItemPlan> {
+        self.best_item_plan(bot_e)
     }
 
     /// Pick an item worth *breaking off combat* for — the same best goal, but only returned when
     /// its desire clears [`COMBAT_GREED_MIN_DESIRE`]. Lets a fighting bot detour for the quad, a
     /// weapon it lacks, or a big health/armor pickup without chasing every trivial ammo box.
-    pub(crate) fn select_combat_item(&self, bot_e: EntId) -> Option<(EntId, CellId)> {
-        self.best_item_goal(bot_e)
-            .filter(|&(_, _, desire)| desire >= COMBAT_GREED_MIN_DESIRE)
-            .map(|(item, cell, _)| (item, cell))
+    pub(crate) fn select_combat_item(&self, bot_e: EntId) -> Option<ItemPlan> {
+        self.best_item_plan(bot_e)
+            .filter(|p| p.first_desire >= COMBAT_GREED_MIN_DESIRE || p.contains_powerup)
     }
 
     /// Pick a spawned, nearby health/armor recovery or timed powerup that must be completed before
@@ -575,6 +682,74 @@ impl GameState {
             })
             .max_by(|a, b| a.3.total_cmp(&b.3).then_with(|| b.0.0.cmp(&a.0.0)))
             .map(|(item, cell, commit, _)| (item, cell, commit))
+    }
+
+    /// Strategic fight posture plus its best recovery target. Relative power uses only the shared
+    /// opponent estimate; with modeling disabled/unavailable, critical health still triggers but no
+    /// hidden enemy stack is read. Recovery is cancelled when no useful reachable pickup exists.
+    pub(crate) fn recovery_decision(
+        &self,
+        bot_e: EntId,
+        enemy: EntId,
+        now: f32,
+        previous: super::state::CombatPosture,
+    ) -> (super::state::CombatPosture, Option<(EntId, CellId)>) {
+        use super::state::CombatPosture::*;
+        let s = self.bot_stats(bot_e);
+        let own_power = s.strength * s.firepower.max(10.0);
+        let enemy_power = self.opponent_est(bot_e, enemy, now).map(|est| {
+            let es = estimated_stats(est, s.weapons_stay);
+            es.strength * es.firepower.max(10.0)
+        });
+        let posture = posture_step(previous, s.health, own_power, enemy_power);
+        if posture != Recover {
+            return (posture, None);
+        }
+        let Some(item) = self.select_recovery_item(bot_e, &s, now) else {
+            return (Hold, None);
+        };
+        (Recover, Some(item))
+    }
+
+    fn select_recovery_item(&self, bot_e: EntId, s: &Stats, now: f32) -> Option<(EntId, CellId)> {
+        let graph = self.nav.graph.as_ref()?;
+        let from = graph.nearest(self.entities[bot_e].v.origin)?;
+        let pricing = self.bot_link_pricing(bot_e, now);
+        let costs = graph.costs_from(from, &pricing.costs(0));
+        let my_team = self.entities[bot_e].mode_p.team;
+        let teamwork = my_team != 0 && self.host().cvar_bool(c"rtx_bot_teamwork");
+        self.nav
+            .goals
+            .iter()
+            .filter_map(|&(idx, cell)| {
+                let item = EntId(idx);
+                let ent = &self.entities[item];
+                if ent.v.solid != Solid::Trigger || self.entities[bot_e].bot.is_avoided(idx, now) {
+                    return None;
+                }
+                let cat = ent.classname().and_then(category)?;
+                let desire = self.item_desire(s, item, cat);
+                let useful = match cat {
+                    Category::Health | Category::Armor { .. } => desire > 0.0,
+                    Category::Weapon(_) => desire >= COMBAT_GREED_MIN_DESIRE,
+                    _ => false,
+                };
+                if !useful {
+                    return None;
+                }
+                let t = costs[cell as usize];
+                if !t.is_finite() || t > RECOVERY_TRAVEL {
+                    return None;
+                }
+                let claim = if teamwork && self.item_claimed_by_teammate(bot_e, my_team, idx) {
+                    CLAIM_DISCOUNT
+                } else {
+                    1.0
+                };
+                Some((item, cell, desire * claim / (t + 0.5)))
+            })
+            .max_by(|a, b| a.2.total_cmp(&b.2).then_with(|| b.0.0.cmp(&a.0.0)))
+            .map(|(item, cell, _)| (item, cell))
     }
 
     /// The best `(item, cell, desire)` for a bot by `desire × (LOOKAHEAD − t) / (t + 5)`, over both
@@ -753,7 +928,7 @@ impl GameState {
         best.map(|(item, _)| (item, mate))
     }
 
-    fn best_item_goal(&self, bot_e: EntId) -> Option<(EntId, CellId, f32)> {
+    fn best_item_plan(&self, bot_e: EntId) -> Option<ItemPlan> {
         let graph = self.nav.graph.as_ref()?;
         let bot_cell = graph.nearest(self.entities[bot_e].v.origin)?;
         let now = self.time();
@@ -765,6 +940,24 @@ impl GameState {
         let pricing = self.bot_link_pricing(bot_e, now);
         let costs = graph.costs_from(bot_cell, &pricing.costs(0));
         let s = self.bot_stats(bot_e);
+        let own_power = s.strength * s.firepower.max(10.0);
+        // Only a currently remembered opponent contributes denial/contest information. Position is
+        // the perception hypothesis (exact only when seen), and inventory/stack comes exclusively
+        // from the observation-gated model — never from the live enemy edict.
+        let enemy_context = {
+            let p = &self.entities[bot_e].bot.percept;
+            let enemy = EntId(p.known_enemy);
+            if enemy.0 != 0 && now < p.known_until && self.entities[enemy].v.health > 0.0 {
+                self.opponent_est(bot_e, enemy, now).and_then(|est| {
+                    let cell = graph.nearest(p.last_seen)?;
+                    let stats = estimated_stats(est, s.weapons_stay);
+                    let power = stats.strength * stats.firepower.max(10.0);
+                    Some((stats, graph.costs_from(cell, &pricing.costs(0)), own_power < 0.6 * power))
+                })
+            } else {
+                None
+            }
+        };
         // The item we're already chasing, for the hysteresis bonus below.
         let current_goal = self.entities[bot_e].bot.goal.item;
         // Item claims (teamwork): an item a living teammate bot is already fetching is discounted, so
@@ -785,18 +978,26 @@ impl GameState {
         };
         let skip = |idx: u32| self.entities[bot_e].bot.is_avoided(idx, now);
 
-        // best = (item, cell, desire, score) — score orders the search, desire is handed back.
-        let mut best: Option<(EntId, CellId, f32, f32)> = None;
+        let mut candidates = Vec::new();
         let mut consider = |item: EntId, cell: CellId, desire: f32, t: f32, mult: f32, powerup: bool| {
-            if let Some(base) = item_score(desire, t, powerup) {
-                let mut score = base * mult;
-                if item.0 == current_goal {
-                    score *= GOAL_HYSTERESIS; // stick with the current goal against a near-tie
-                }
-                if best.is_none_or(|(_, _, _, b)| score > b) {
-                    best = Some((item, cell, desire, score));
-                }
+            if t >= PLAN_LOOKAHEAD {
+                return;
             }
+            // Beyond the tight first-goal horizon an ordinary item has no one-step score, but it
+            // remains eligible as a second leg from one of the six useful nearby primaries.
+            let mut score = item_score(desire, t, powerup).unwrap_or(0.0) * mult;
+            if score > 0.0 && item.0 == current_goal {
+                score *= GOAL_HYSTERESIS; // stick with the current goal against a near-tie
+            }
+            candidates.push(ItemCandidate {
+                item,
+                cell,
+                desire,
+                time: t,
+                mult,
+                powerup,
+                one_score: score,
+            });
         };
 
         for &(idx, cell) in &self.nav.goals {
@@ -831,9 +1032,6 @@ impl GameState {
                     desire = desire.max(denial_floor(w, s.weapons_stay, enemy_has));
                 }
             }
-            if desire <= 0.0 {
-                continue;
-            }
             let travel = costs[cell as usize];
             if !travel.is_finite() {
                 continue; // unreachable from here
@@ -841,7 +1039,20 @@ impl GameState {
             let Some(t) = self.item_collect_time(item, travel, now) else {
                 continue;
             };
-            consider(item, cell, desire, t, claim_mult(idx), powerup);
+            if self.team_match.live_until > now && now + t >= self.team_match.live_until {
+                continue; // it cannot be collected before the structured match ends
+            }
+            let (desire, contest_mult) = if let Some((enemy_stats, enemy_costs, weaker)) = &enemy_context {
+                let enemy_desire = self.item_desire(enemy_stats, item, cat);
+                let eta = enemy_costs[cell as usize];
+                contest_adjust(desire, enemy_desire, t, eta.is_finite().then_some(eta), *weaker, powerup)
+            } else {
+                (desire, 1.0)
+            };
+            if desire <= 0.0 {
+                continue;
+            }
+            consider(item, cell, desire, t, claim_mult(idx) * contest_mult, powerup);
         }
 
         // Live backpacks aren't in the static catalog (they spawn on death / a teammate's toss and
@@ -865,7 +1076,57 @@ impl GameState {
             consider(item, cell, desire, travel, claim_mult(i as u32), false);
         }
 
-        best.map(|(item, cell, desire, _)| (item, cell, desire))
+        // KTX-style two-goal evaluation, bounded to six continuation floods. A second goal changes
+        // which first pickup is best (e.g. grab nearby rockets on the way to quad) without making
+        // the bot blindly retain stale future state: the caller stores it only as a revalidated
+        // continuation. Stable entity-id tie breaks keep identical matches deterministic.
+        candidates.sort_by(|a, b| {
+            b.one_score
+                .total_cmp(&a.one_score)
+                .then_with(|| a.item.0.cmp(&b.item.0))
+        });
+        let pricing = self.bot_link_pricing(bot_e, now);
+        let link_costs = pricing.costs(0);
+        let mut best: Option<(ItemCandidate, Option<ItemCandidate>, f32)> = None;
+        for &first in candidates.iter().filter(|c| c.one_score > 0.0).take(PLAN_PRIMARY_LIMIT) {
+            let from_first = graph.costs_from(first.cell, &link_costs);
+            let mut best_second: Option<(ItemCandidate, f32)> = None;
+            for &second in &candidates {
+                if second.item == first.item {
+                    continue;
+                }
+                let leg = from_first[second.cell as usize];
+                if !leg.is_finite() {
+                    continue;
+                }
+                let raw_total = first.time + leg;
+                let Some(total) = self.item_collect_time(second.item, raw_total, now) else {
+                    continue;
+                };
+                if self.team_match.live_until > now && now + total >= self.team_match.live_until {
+                    continue;
+                }
+                let Some(score) = secondary_item_score(second.desire, total, second.powerup) else {
+                    continue;
+                };
+                let score = score * second.mult * SECONDARY_WEIGHT;
+                if best_second.is_none_or(|(_, old)| score > old) {
+                    best_second = Some((second, score));
+                }
+            }
+            let total = first.one_score + best_second.map_or(0.0, |(_, score)| score);
+            if best.is_none_or(|(old, _, old_score)| {
+                total > old_score || (total == old_score && first.item.0 < old.item.0)
+            }) {
+                best = Some((first, best_second.map(|(second, _)| second), total));
+            }
+        }
+        best.map(|(first, second, _)| ItemPlan {
+            first: (first.item, first.cell),
+            second: second.map(|s| (s.item, s.cell)),
+            first_desire: first.desire,
+            contains_powerup: first.powerup || second.is_some_and(|s| s.powerup),
+        })
     }
 
     /// The distance from the nearest living teammate (excluding `bot_e`, humans included) to `point`,
@@ -911,6 +1172,17 @@ fn item_score(desire: f32, t: f32, powerup: bool) -> Option<f32> {
         (t < POWERUP_LOOKAHEAD).then(|| desire * POWERUP_LOOKAHEAD / (t + 5.0))
     } else {
         (t < LOOKAHEAD).then(|| desire * (LOOKAHEAD - t) / (t + 5.0))
+    }
+}
+
+/// Continuation score: timed powerups keep their dominant powerup curve; ordinary second legs use
+/// the wider total-plan horizon because the first pickup is already useful and makes the route a
+/// deliberate sequence rather than a long single-item detour.
+fn secondary_item_score(desire: f32, total_t: f32, powerup: bool) -> Option<f32> {
+    if powerup {
+        item_score(desire, total_t, true)
+    } else {
+        (total_t < PLAN_LOOKAHEAD).then(|| desire * (PLAN_LOOKAHEAD - total_t) / (total_t + 5.0))
     }
 }
 
@@ -962,6 +1234,43 @@ mod tests {
         assert!(item_score(200.0, 12.0, true).is_some());
         // A powerup past its own (wider) horizon is dropped.
         assert!(item_score(200.0, POWERUP_LOOKAHEAD, true).is_none());
+    }
+
+    #[test]
+    fn secondary_item_extends_only_the_continuation_horizon() {
+        // An ordinary item is too far away to begin a plan, but remains useful as the second stop
+        // after a worthwhile nearby pickup has already put the bot on that route.
+        assert!(item_score(60.0, LOOKAHEAD + 1.0, false).is_none());
+        assert!(secondary_item_score(60.0, LOOKAHEAD + 1.0, false).is_some());
+        assert!(secondary_item_score(60.0, PLAN_LOOKAHEAD - 0.1, false).is_some());
+        assert!(secondary_item_score(60.0, PLAN_LOOKAHEAD, false).is_none());
+    }
+
+    #[test]
+    fn observed_enemy_need_adds_denial_without_forcing_a_lost_fight() {
+        let (desire, mult) = contest_adjust(40.0, 80.0, 2.0, Some(3.0), false, false);
+        assert_eq!(desire, 80.0);
+        assert_eq!(mult, 1.0);
+
+        // A substantially earlier, stronger enemy makes an ordinary pickup a poor feed. Timed
+        // powerups are still worth contesting because yielding those can decide the whole fight.
+        let (_, lost_mult) = contest_adjust(40.0, 80.0, 3.0, Some(2.0), true, false);
+        assert_eq!(lost_mult, LOST_CONTEST_MULT);
+        let (_, powerup_mult) = contest_adjust(40.0, 80.0, 3.0, Some(2.0), true, true);
+        assert_eq!(powerup_mult, 1.0);
+    }
+
+    #[test]
+    fn recovery_posture_has_stable_entry_and_exit_thresholds() {
+        use super::super::state::CombatPosture::{Hold, Press, Recover};
+
+        assert_eq!(posture_step(Hold, 40.0, 100.0, Some(100.0)), Recover);
+        assert_eq!(posture_step(Hold, 100.0, 50.0, Some(100.0)), Recover);
+        // Once recovering, crossing only one exit threshold is not enough to oscillate back.
+        assert_eq!(posture_step(Recover, 59.0, 100.0, Some(100.0)), Recover);
+        assert_eq!(posture_step(Recover, 100.0, 84.0, Some(100.0)), Recover);
+        assert_eq!(posture_step(Recover, 60.0, 85.0, Some(100.0)), Hold);
+        assert_eq!(posture_step(Hold, 100.0, 136.0, Some(100.0)), Press);
     }
 
     #[test]

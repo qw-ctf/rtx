@@ -49,6 +49,9 @@ pub struct BotState {
     pub seen: SeenEnemy,
     /// Perception memory (hear/feel as well as sight). See [`Perception`].
     pub percept: Perception,
+    /// Strategic fight posture derived from relative effective strength/firepower. Recovery owns
+    /// movement toward a useful item; Hold/Press leave full movement to combat.
+    pub posture: CombatPosture,
     /// Audience-wander state (a round mode's stands). See [`Wander`].
     pub wander: Wander,
     /// Anti-drown surface target: the air spot the nearest-breathable flood picked, with a short TTL
@@ -139,6 +142,9 @@ impl BotState {
             if chasing {
                 self.mark_avoid(self.goal.item, now + super::GOAL_AVOID_TIME);
                 self.goal.item = 0;
+                self.goal.next_item = 0;
+                self.goal.commit = GoalCommit::None;
+                self.goal.next_commit = GoalCommit::None;
                 self.goal.next_pick = now;
             }
         }
@@ -284,6 +290,11 @@ pub struct GoalState {
     /// sits in.
     pub item: u32,
     pub item_cell: u32,
+    /// Revalidated continuation from the bounded two-leg planner. Touching `item` promotes this
+    /// candidate, but the normal validity pass may discard it immediately if world state changed.
+    pub next_item: u32,
+    pub next_cell: u32,
+    pub next_commit: GoalCommit,
     /// Earliest time the bot may re-pick its item goal (throttles the catalog scan).
     pub next_pick: f32,
     /// Earliest time to run the cheap nearby lifesaving-pickup pre-pass. This is much faster than
@@ -321,6 +332,16 @@ pub enum GoalCommit {
     None,
     Pickup,
     Powerup,
+}
+
+/// Strategic combat posture with hysteresis. This is intentionally independent of aim skill: low
+/// skill reacts and shoots less precisely, but does not become strategically suicidal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CombatPosture {
+    Recover,
+    #[default]
+    Hold,
+    Press,
 }
 
 /// Grappling-hook traversal state (see [`crate::bot::hook`]): aim at the anchor, throw, reel to
