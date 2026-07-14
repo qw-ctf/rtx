@@ -23,8 +23,8 @@ use crate::arsenal::{self, AmmoKind};
 use crate::bot::state::GrenadePhase;
 use crate::bot::{grenade, BotCmd};
 use crate::defs::{
-    Bits, Flags, Items, Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP,
-    VEC_VIEW_OFS,
+    Bits, Content, FieldEq, Flags, Items, Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK,
+    BUTTON_JUMP, VEC_VIEW_OFS,
 };
 use crate::entity::EntId;
 use crate::game::GameState;
@@ -303,12 +303,18 @@ enum Footing {
 /// option is a hazard the bot holds ground rather than walking off. Backpedal is dropped before the
 /// strafe, so a bot pinned at a lava edge sidesteps rather than backing in. `footing` classifies where
 /// a horizontal move lands. Pure over the oracle, so the priority order is unit-testable.
+///
+/// The one exception is `burning` — the bot is *already standing in* lava/slime, not merely beside it.
+/// Then holding ground means cooking, so the all-hazard fallback takes the wanted move (candidate 0)
+/// and walks off the damage instead of freezing on it; the routing gradient and its own probes steer
+/// it to the nearest shore.
 fn safe_combat_move(
     footing: &impl Fn(Vec3) -> Footing,
     dir: Vec3,
     perp: Vec3,
     want_forward: f32,
     strafe_sign: f32,
+    burning: bool,
 ) -> Vec3 {
     let fwd = dir * want_forward;
     let strafe = perp * (strafe_sign * MOVE_SPEED);
@@ -316,7 +322,10 @@ fn safe_combat_move(
     if let Some(&mv) = candidates.iter().find(|&&mv| footing(mv) == Footing::Dry) {
         return mv; // dry footing preferred — bias the dodge toward the bank
     }
-    candidates.into_iter().find(|&mv| footing(mv) != Footing::Hazard).unwrap_or(Vec3::ZERO)
+    // Candidate 0 (the wanted move + strafe) is always nonzero — the strafe term is ±MOVE_SPEED — so a
+    // burning bot moves off rather than settling for Vec3::ZERO on the coals.
+    let hold = if burning { candidates[0] } else { Vec3::ZERO };
+    candidates.into_iter().find(|&mv| footing(mv) != Footing::Hazard).unwrap_or(hold)
 }
 
 /// A fleeing bot's move away from a threat at heading `away` (a horizontal unit vector), kept off
@@ -345,9 +354,18 @@ fn safe_flee_move(game: &GameState, e: EntId, origin: Vec3, away: Vec3) -> (Vec3
             Footing::Dry
         }
     };
-    // Straight away is the best escape vector — take it unless it's a lethal hazard, even through
-    // water (fleeing a blast beats staying dry). Only when away is blocked do we sidestep, and there
-    // prefer a dry perpendicular over a wet one.
+    safe_flee_choice(&footing, away, grounded, is_burning(&game.entities[e].v))
+}
+
+/// The flee decision over a footing oracle, split out of [`safe_flee_move`] so the hazard ladder —
+/// and the burning override in particular — is unit-testable. Straight away is the best escape vector,
+/// taken unless it's a lethal hazard even through water (fleeing a blast beats staying dry); only when
+/// that's blocked do we sidestep, preferring a dry perpendicular over a wet one. The final fallback is
+/// the burning split: on safe ground, hazards on every side mean *hold* — a jump surrenders the ground
+/// control needed to stop at an edge. But a bot already standing in the liquid has no safe edge to
+/// protect (its footing is the damage), so it flees straight away regardless and keeps the hop, which
+/// preserves flee momentum out of the blast and can clear a shallow basin lip.
+fn safe_flee_choice(footing: &impl Fn(Vec3) -> Footing, away: Vec3, grounded: bool, burning: bool) -> (Vec3, bool) {
     if footing(away) != Footing::Hazard {
         return (away * MOVE_SPEED, grounded);
     }
@@ -359,7 +377,19 @@ fn safe_flee_move(game: &GameState, e: EntId, origin: Vec3, away: Vec3) -> (Vec3
     if let Some(&d) = sides.iter().find(|&&d| footing(d) != Footing::Hazard) {
         return (d * MOVE_SPEED, grounded);
     }
-    (Vec3::ZERO, false) // hazards on every side — hold, don't hop off the edge
+    if burning {
+        (away * MOVE_SPEED, grounded) // every side burns anyway — flee the blast, keep the hop
+    } else {
+        (Vec3::ZERO, false) // hazards on every side — hold, don't hop off the edge
+    }
+}
+
+/// Whether this entity is standing in lava or slime deep enough to take damage. The game's
+/// `apply_liquid_damage` burns at `waterlevel >= 1` (feet touching) for a lava/slime `watertype`, with
+/// no deeper gate — so this is the exact condition under which a bot must keep moving out of the pool
+/// rather than hold ground on it. Reads the engine-populated ABI fields, like [`sense`].
+pub(crate) fn is_burning(v: &EntVars) -> bool {
+    v.waterlevel >= 1.0 && (v.watertype.is(Content::Lava) || v.watertype.is(Content::Slime))
 }
 
 /// Verdict on one line-of-fire trace for a splash projectile. Clear when the shot reached the enemy,
@@ -627,6 +657,7 @@ fn combat_move(game: &mut GameState, e: EntId, enemy: EntId, now: f32, origin: V
     let dir = Vec3::new(to_enemy.x, to_enemy.y, 0.0).normalize_or_zero();
     let perp = Vec3::new(-dir.y, dir.x, 0.0);
     let grounded_self = game.entities[e].v.flags.has(Flags::ONGROUND);
+    let burning = is_burning(&game.entities[e].v);
     match (grounded_self, game.nav.bsp.as_ref()) {
         (true, Some(bsp)) => {
             let host = game.host();
@@ -645,7 +676,7 @@ fn combat_move(game: &mut GameState, e: EntId, enemy: EntId, now: f32, origin: V
                     Footing::Dry
                 }
             };
-            safe_combat_move(&footing, dir, perp, want_forward, strafe_sign)
+            safe_combat_move(&footing, dir, perp, want_forward, strafe_sign, burning)
         }
         _ => dir * want_forward + perp * (strafe_sign * MOVE_SPEED),
     }
@@ -1029,7 +1060,7 @@ mod tests {
     fn safe_combat_move_passes_through_when_clear() {
         // All dry → the exact original composition (dir·forward + perp·strafe·speed).
         let dry = |_: Vec3| Footing::Dry;
-        let mv = safe_combat_move(&dry, DIR, PERP, MOVE_SPEED, 1.0);
+        let mv = safe_combat_move(&dry, DIR, PERP, MOVE_SPEED, 1.0, false);
         assert_eq!(mv, DIR * MOVE_SPEED + PERP * MOVE_SPEED);
     }
 
@@ -1037,7 +1068,7 @@ mod tests {
     fn safe_combat_move_prefers_flip() {
         // Holding range (no forward), strafing +y is a hazard → flip to −y, same speed.
         let hazard_plus_y = |mv: Vec3| if mv.y > 0.0 { Footing::Hazard } else { Footing::Dry };
-        let mv = safe_combat_move(&hazard_plus_y, DIR, PERP, 0.0, 1.0);
+        let mv = safe_combat_move(&hazard_plus_y, DIR, PERP, 0.0, 1.0, false);
         assert_eq!(mv, PERP * -MOVE_SPEED);
     }
 
@@ -1045,7 +1076,7 @@ mod tests {
     fn safe_combat_move_drops_backpedal_before_strafe() {
         // Retreating (−x) is a hazard but the strafe is fine → take the strafe alone, no backpedal.
         let hazard_back = |mv: Vec3| if mv.x < 0.0 { Footing::Hazard } else { Footing::Dry };
-        let mv = safe_combat_move(&hazard_back, DIR, PERP, -MOVE_SPEED, 1.0);
+        let mv = safe_combat_move(&hazard_back, DIR, PERP, -MOVE_SPEED, 1.0, false);
         assert_eq!(mv, PERP * MOVE_SPEED); // strafe only, no −x component
         assert_eq!(mv.x, 0.0);
     }
@@ -1054,7 +1085,7 @@ mod tests {
     fn safe_combat_move_holds_ground_when_surrounded() {
         // Every real move steps toward a hazard → hold ground rather than walk into it.
         let all_hazard = |mv: Vec3| if mv == Vec3::ZERO { Footing::Dry } else { Footing::Hazard };
-        let mv = safe_combat_move(&all_hazard, DIR, PERP, -MOVE_SPEED, 1.0);
+        let mv = safe_combat_move(&all_hazard, DIR, PERP, -MOVE_SPEED, 1.0, false);
         assert_eq!(mv, Vec3::ZERO);
     }
 
@@ -1063,7 +1094,7 @@ mod tests {
         // Holding range: strafing +y is into water, −y is dry → pick the dry side even though the
         // wet one is a valid (non-hazard) move and comes first in the candidate order.
         let wet_plus_y = |mv: Vec3| if mv.y > 0.0 { Footing::Wet } else { Footing::Dry };
-        let mv = safe_combat_move(&wet_plus_y, DIR, PERP, 0.0, 1.0);
+        let mv = safe_combat_move(&wet_plus_y, DIR, PERP, 0.0, 1.0, false);
         assert_eq!(mv, PERP * -MOVE_SPEED);
     }
 
@@ -1072,8 +1103,51 @@ mod tests {
         // Every real move heads into water (none dry, none a hazard) → still move: take the first
         // wet candidate rather than freezing (wading out beats treading water).
         let all_wet = |mv: Vec3| if mv == Vec3::ZERO { Footing::Dry } else { Footing::Wet };
-        let mv = safe_combat_move(&all_wet, DIR, PERP, MOVE_SPEED, 1.0);
+        let mv = safe_combat_move(&all_wet, DIR, PERP, MOVE_SPEED, 1.0, false);
         assert_eq!(mv, DIR * MOVE_SPEED + PERP * MOVE_SPEED); // the first candidate, fwd+strafe
+    }
+
+    #[test]
+    fn safe_combat_move_burning_never_holds() {
+        // Standing *in* lava with every real move a hazard: a non-burning bot would hold (Vec3::ZERO),
+        // but a burning one must keep moving — it takes the wanted move (fwd+strafe) and walks off.
+        let all_hazard = |mv: Vec3| if mv == Vec3::ZERO { Footing::Dry } else { Footing::Hazard };
+        let mv = safe_combat_move(&all_hazard, DIR, PERP, -MOVE_SPEED, 1.0, true);
+        assert_ne!(mv, Vec3::ZERO, "a burning bot must not freeze on the coals");
+        assert_eq!(mv, DIR * -MOVE_SPEED + PERP * MOVE_SPEED, "the wanted move (candidate 0)");
+    }
+
+    #[test]
+    fn safe_combat_move_burning_still_prefers_dry() {
+        // Burning doesn't abandon the priority order: a dry candidate still wins outright, so the bot
+        // dodges toward the bank rather than blindly taking the wanted (hazardous) move.
+        let hazard_plus_y = |mv: Vec3| if mv.y > 0.0 { Footing::Hazard } else { Footing::Dry };
+        let mv = safe_combat_move(&hazard_plus_y, DIR, PERP, 0.0, 1.0, true);
+        assert_eq!(mv, PERP * -MOVE_SPEED, "still flips to the dry −y side");
+    }
+
+    // Flee geometry: threat behind, so the escape heading `AWAY` is +x; the perpendiculars are ±y.
+    const AWAY: Vec3 = Vec3::new(1.0, 0.0, 0.0);
+
+    #[test]
+    fn safe_flee_choice_burning_flees_and_keeps_hop() {
+        // Every side a hazard: a non-burning grounded bot holds and suppresses the hop; a burning one
+        // flees straight away and keeps the hop (its footing is the damage — no edge worth guarding).
+        let all_hazard = |_: Vec3| Footing::Hazard;
+        assert_eq!(safe_flee_choice(&all_hazard, AWAY, true, false), (Vec3::ZERO, false));
+        assert_eq!(safe_flee_choice(&all_hazard, AWAY, true, true), (AWAY * MOVE_SPEED, true));
+    }
+
+    #[test]
+    fn safe_flee_choice_burning_still_takes_dry_perp() {
+        // Away is a hazard but one perpendicular (−y) is dry: burning or not, take the dry side — the
+        // burning bot exits the pool and dodges in one move rather than fleeing straight into more.
+        let away_hazard_dry_minus_y =
+            |d: Vec3| if d.x > 0.0 { Footing::Hazard } else if d.y < 0.0 { Footing::Dry } else { Footing::Hazard };
+        assert_eq!(
+            safe_flee_choice(&away_hazard_dry_minus_y, AWAY, true, true),
+            (Vec3::new(0.0, -1.0, 0.0) * MOVE_SPEED, true)
+        );
     }
 
     // Line-of-fire verdict: bot at the origin, aim 400u downrange along +x unless noted.

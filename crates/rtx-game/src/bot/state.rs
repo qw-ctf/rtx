@@ -55,6 +55,15 @@ pub struct BotState {
     /// (`time`) so a drowning bot doesn't re-run the graph Dijkstra every frame. `target == ZERO`
     /// (or an expired `time`) means "recompute". Reuses the [`Wander`] `{target, time}` shape.
     pub surface: Wander,
+    /// Burn-escape target: the nearest non-hazard cell the escape flood picked when the bot is stuck
+    /// standing in lava/slime, cached with the same short TTL as [`surface`](Self::surface). A separate
+    /// cache because deep lava can trip both reflexes at once and the targets differ — breathable air
+    /// for drowning vs. any safe footing for burning.
+    pub burn: Wander,
+    /// When the bot first started burning (standing in lava/slime), or `0.0` when not. The escape
+    /// reflex fires only once this has persisted past [`BURN_PANIC_SECS`](crate::bot::BURN_PANIC_SECS),
+    /// so a deliberate moat/bridge crossing isn't hijacked.
+    pub burn_since: f32,
     /// Audience watch (Rocket Arena): the fighter this bot's eyes are held on. See [`Watch`].
     pub watch: Watch,
     /// Item vigil ([`crate::bot::vigil`]): cruise-and-scan while waiting on an uncollectable goal

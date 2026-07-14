@@ -305,6 +305,13 @@ impl NavGraph {
         self.breathable.get(cell as usize).copied().unwrap_or(true)
     }
 
+    /// The liquid a bot standing on this cell is *in* — lava/slime at its feet, which the game burns
+    /// it for — or `None` for safe footing. Set by [`surcharge_hazard_links`](Self::surcharge_hazard_links);
+    /// an unmarked graph reads as all-safe.
+    pub fn cell_hazard(&self, cell: CellId) -> Option<crate::hazard::HazardKind> {
+        self.hazard.get(cell as usize).copied().flatten()
+    }
+
     /// Counts per link kind, for the load-time debug line.
     pub fn summary(&self) -> LinkCounts {
         let mut c = LinkCounts::default();

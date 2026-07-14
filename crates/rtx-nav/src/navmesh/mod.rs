@@ -206,6 +206,12 @@ pub struct NavGraph {
     /// empty vec reads as "all breathable" via [`cell_breathable`](Self::cell_breathable) — the safe
     /// default for an unmarked (dry) graph.
     breathable: Vec<bool>,
+    /// Per-cell "a bot standing here is *in* lava or slime" (parallel to `cells`): the engine's
+    /// waterlevel-1 sample (feet+1) reads that liquid, so the game burns anyone standing on the cell —
+    /// including interior cells of a shallow film the liquid-edge probe can't see. Never `Pit`. Filled
+    /// alongside `water` by [`surcharge_hazard_links`](Self::surcharge_hazard_links); an empty vec
+    /// reads as "no cell burns" via [`cell_hazard`](Self::cell_hazard).
+    hazard: Vec<Option<crate::hazard::HazardKind>>,
     grid: GridIndex,
     /// The closed door/movewall each link's segment passes through — the "navmesh aware of dynamic
     /// geometry" core, so pathfinding can price a link by its door's live state (see
@@ -310,6 +316,7 @@ impl NavGraph {
             links: Vec::new(),
             water: Vec::new(),      // filled at graph-swap by surcharge_water_links
             breathable: Vec::new(), // (needs the engine's liquid-carrying pointcontents)
+            hazard: Vec::new(),     // filled at graph-swap by surcharge_hazard_links (same reason)
             grid: cells_grid.1,
             gates: SideTable::default(),
             hooks: SideTable::default(),
@@ -508,24 +515,45 @@ impl NavGraph {
         out
     }
 
-    /// Surcharge links that route a bot alongside a lava or slime pool, so the planner keeps its
-    /// distance whenever a comparable safe route exists. For each cell we probe its *open* compass
-    /// sides — those with no walkable neighbour, i.e. an edge — a stride out and down; a liquid
-    /// below flags the cell, and every link *entering* a flagged cell pays [`HAZARD_LINK_EXTRA`].
+    /// Surcharge links that route a bot into or alongside a lava or slime pool, so the planner keeps
+    /// its distance whenever a comparable safe route exists. Two kinds of cell pay:
+    ///
+    ///  * **standing *in* the liquid** — the cell's own footing (feet+1, the engine's waterlevel-1
+    ///    sample) is lava/slime, so the game burns a bot parked there. Persisted in `self.hazard`,
+    ///    priced per link entering by [`LAVA_CELL_EXTRA`] / [`SLIME_CELL_EXTRA`]. This catches shallow
+    ///    films *and* interior cells of a walkable-bottom pool, which the edge probe below cannot see.
+    ///  * **on the liquid's *edge*** — an open side a stride out drops onto lava/slime (a bank a bot
+    ///    walks along). Priced by the smaller [`HAZARD_LINK_EXTRA`]. Transient; an in-liquid cell
+    ///    doesn't also pay the edge tax (it's already the worse case).
     ///
     /// Pits are deliberately not flagged here (every balcony/ledge cell borders a drop — that would
     /// surcharge half the map); the runtime combat guard [`crate::hazard::hazard_ahead`] keeps bots
     /// from stepping off edges in a fight. Only *liquids* get a routing bias, and the pure
     /// worker-thread build can't see them — the clip hull it reads carries no liquid contents — so
     /// this takes the engine's `pointcontents` as `contents` and runs at graph-swap time (from the
-    /// game's navmesh poll) rather than inside [`build_navmesh`].
+    /// game's navmesh poll) rather than inside [`build_navmesh`]. All surcharges are finite adds, so a
+    /// lava bridge that is the only route stays crossable and the graph is never severed.
     pub fn surcharge_hazard_links(&mut self, is_solid: &impl Fn(Vec3) -> bool, contents: &impl Fn(Vec3) -> f32) {
-        let hazard: Vec<bool> = (0..self.cells.len() as CellId)
+        // A bot's own footing on each cell: feet sit 24u below the origin (player `mins.z`), and the
+        // engine's SV_CheckWater burns from feet+1 — sample there so this matches the damage exactly.
+        self.hazard = self
+            .cells
+            .iter()
+            .map(|c| match contents(c.origin - Vec3::new(0.0, 0.0, 23.0)) {
+                x if x == crate::bsp::CONTENTS_LAVA as f32 => Some(crate::hazard::HazardKind::Lava),
+                x if x == crate::bsp::CONTENTS_SLIME as f32 => Some(crate::hazard::HazardKind::Slime),
+                _ => None,
+            })
+            .collect();
+        let edge: Vec<bool> = (0..self.cells.len() as CellId)
             .map(|id| self.cell_on_liquid_edge(id, is_solid, contents))
             .collect();
         for link in &mut self.links {
-            if hazard[link.to as usize] {
-                link.cost += HAZARD_LINK_EXTRA;
+            match self.hazard[link.to as usize] {
+                Some(crate::hazard::HazardKind::Lava) => link.cost += LAVA_CELL_EXTRA,
+                Some(crate::hazard::HazardKind::Slime) => link.cost += SLIME_CELL_EXTRA,
+                _ if edge[link.to as usize] => link.cost += HAZARD_LINK_EXTRA,
+                _ => {}
             }
         }
     }
@@ -1089,6 +1117,22 @@ const HAZARD_PROBE_R: f32 = 48.0;
 /// a parallel safe corridor when one exists within a short detour, yet still crosses a lava bridge
 /// that is the only way; finite, so it never disconnects the graph (like the gate/RJ penalties).
 const HAZARD_LINK_EXTRA: f32 = 0.5;
+
+/// Extra travel-time on every link *entering* a cell whose own footing is **lava** (a bot standing
+/// there burns — see [`NavGraph::surcharge_hazard_links`]). A flat add, not a [`WATER_COST_MULT`]-style
+/// multiplier: in-pool links are each roughly one grid pitch (~0.1s), so a multiplier honest about
+/// swim speed would price a lethal wade far below the health it costs; a flat add instead stacks with
+/// pool width exactly as the tick-quantized damage does (10 HP·waterlevel per 0.2s). Magnitude: one
+/// wading cell eats one-to-two 10 HP ticks ⇒ ~0.7–1.4s at the crate's rocket-jump `RJ_HEALTH_SECS_PER_HP`
+/// (0.07 s/HP), doubled for tail risk (waterlevel 2 doubles the tick, a stumble doubles the dwell, and
+/// unlike a rocket jump the spend is uncontrolled). Finite by design — a 4-cell lava bridge that is the
+/// only route costs +8s and is still taken.
+const LAVA_CELL_EXTRA: f32 = 2.0;
+/// Extra travel-time on every link *entering* a cell whose own footing is **slime**. Slime's honest
+/// price is an order under lava's (4 HP·waterlevel per 1.0s tick — the entry tick alone is ~4 HP ≈
+/// 0.28s at 0.07 s/HP, plus a slow drip while wading), so half [`HAZARD_LINK_EXTRA`]'s big brother and
+/// well under lava: bots still shortcut a narrow slime moat when the dry detour is long.
+const SLIME_CELL_EXTRA: f32 = 1.0;
 
 /// Multiplier on the cost of every link *entering* an underwater cell (see
 /// [`NavGraph::surcharge_water_links`]). Water is not lethal like lava, so it's a soft bias, not the
@@ -1821,6 +1865,7 @@ mod tests {
             adjacency: vec![vec![0, 2], vec![1], vec![3], vec![]],
             water: Vec::new(),
             breathable: Vec::new(),
+            hazard: Vec::new(),
             grid: GridIndex::default(),
             gates: SideTable::default(),
             hooks: SideTable::default(),
@@ -1853,6 +1898,7 @@ mod tests {
             adjacency: vec![vec![0, 1], vec![], vec![]],
             water: Vec::new(),
             breathable: Vec::new(),
+            hazard: Vec::new(),
             grid: GridIndex::default(),
             gates: SideTable::default(),
             hooks: SideTable::default(),
@@ -1971,6 +2017,7 @@ mod tests {
             adjacency: vec![vec![0], vec![1]],
             water: Vec::new(),
             breathable: Vec::new(),
+            hazard: Vec::new(),
             grid,
             gates: SideTable::default(),
             hooks: SideTable::default(),
@@ -2019,6 +2066,7 @@ mod tests {
             adjacency: vec![vec![0], vec![1]],
             water: Vec::new(),
             breathable: Vec::new(),
+            hazard: Vec::new(),
             grid: GridIndex::default(),
             gates: SideTable::default(),
             hooks: SideTable::default(),
@@ -2093,6 +2141,119 @@ mod tests {
         );
     }
 
+    /// A cell whose *own footing* is lava (a bot standing on it burns) is flagged in `cell_hazard` and
+    /// pays the big per-link surcharge on entry, while the exit link stays cheap — the shore gradient
+    /// that pulls a bot back out, mirroring water. This is the shallow-film / interior-pool case the
+    /// edge probe misses.
+    #[test]
+    fn flags_cell_standing_in_liquid_and_surcharges_entry() {
+        let cell = |x: f32, gx: i32| Cell {
+            origin: Vec3::new(x, 0.0, 0.0),
+            gx,
+            gy: 0,
+        };
+        let link = |from: CellId, to: CellId| Link {
+            from,
+            to,
+            kind: LinkKind::Walk,
+            cost: 1.0,
+        };
+        let mut grid = GridIndex::default();
+        grid.insert((0, 0), vec![0]);
+        grid.insert((1, 0), vec![1]);
+        let mut g = NavGraph {
+            cells: vec![cell(0.0, 0), cell(32.0, 1)],
+            links: vec![link(0, 1), link(1, 0)],
+            adjacency: vec![vec![0], vec![1]],
+            water: Vec::new(),
+            breathable: Vec::new(),
+            hazard: Vec::new(),
+            grid,
+            gates: SideTable::default(),
+            hooks: SideTable::default(),
+            speed_jumps: SideTable::default(),
+            rocket_jumps: SideTable::default(),
+            plats: SideTable::default(),
+            sj_k: bhop_k(10.0, MAX_SPEED),
+        };
+        // Floor well below the cells; a tight lava pool sits on it directly under cell 1 (x = 32), so
+        // cell 1's feet+1 sample (origin − 23) reads lava while cell 0 (x = 0) keeps dry footing.
+        let is_solid = |p: Vec3| p.z <= -40.0;
+        let contents = |p: Vec3| {
+            if (p.x - 32.0).abs() < 8.0 && p.y.abs() < 8.0 && (-40.0..0.0).contains(&p.z) {
+                crate::bsp::CONTENTS_LAVA as f32
+            } else {
+                crate::bsp::CONTENTS_EMPTY as f32
+            }
+        };
+        g.surcharge_hazard_links(&is_solid, &contents);
+        assert_eq!(g.cell_hazard(1), Some(crate::hazard::HazardKind::Lava), "cell 1 stands in lava");
+        assert_eq!(g.cell_hazard(0), None, "cell 0 is dry footing");
+        // Entering the burning cell pays the full lava surcharge; leaving it stays cheap.
+        assert!(
+            (g.links[0].cost - (1.0 + LAVA_CELL_EXTRA)).abs() < 1e-6,
+            "into-lava link: {}",
+            g.links[0].cost
+        );
+        assert_eq!(g.links[1].cost, 1.0, "exit link must stay cheap (the gradient back to dry ground)");
+        assert!(g.find_path(0, 1, &LinkCosts::default()).is_some(), "finite surcharge never severs");
+    }
+
+    /// The interior cell of a shallow film — every compass neighbour walkable, so the edge probe never
+    /// fires, and here `is_solid` reads solid right at the probe height, blinding it further — is still
+    /// caught by the per-cell own-footing check, which reads `contents` at feet+1 directly. A slime
+    /// film prices entry by [`SLIME_CELL_EXTRA`].
+    #[test]
+    fn flags_interior_pool_cell_the_edge_probe_cannot_see() {
+        let cell = |x: f32, gx: i32| Cell {
+            origin: Vec3::new(x, 0.0, 0.0),
+            gx,
+            gy: 0,
+        };
+        let link = |from: CellId, to: CellId| Link {
+            from,
+            to,
+            kind: LinkKind::Walk,
+            cost: 1.0,
+        };
+        let mut grid = GridIndex::default();
+        grid.insert((0, 0), vec![0]);
+        grid.insert((1, 0), vec![1]);
+        let mut g = NavGraph {
+            cells: vec![cell(0.0, 0), cell(32.0, 1)],
+            links: vec![link(0, 1), link(1, 0)],
+            adjacency: vec![vec![0], vec![1]],
+            water: Vec::new(),
+            breathable: Vec::new(),
+            hazard: Vec::new(),
+            grid,
+            gates: SideTable::default(),
+            hooks: SideTable::default(),
+            speed_jumps: SideTable::default(),
+            rocket_jumps: SideTable::default(),
+            plats: SideTable::default(),
+            sj_k: bhop_k(10.0, MAX_SPEED),
+        };
+        // Solid right at the probe height everywhere blinds the edge probe (it reads a wall a stride
+        // out, never the liquid below); a thin slime film at the feet+1 sample depth covers both cells.
+        let is_solid = |p: Vec3| p.z <= 0.0;
+        let contents = |p: Vec3| {
+            if (-24.0..-20.0).contains(&p.z) {
+                crate::bsp::CONTENTS_SLIME as f32
+            } else {
+                crate::bsp::CONTENTS_EMPTY as f32
+            }
+        };
+        g.surcharge_hazard_links(&is_solid, &contents);
+        assert_eq!(g.cell_hazard(0), Some(crate::hazard::HazardKind::Slime), "interior cell 0 in slime");
+        assert_eq!(g.cell_hazard(1), Some(crate::hazard::HazardKind::Slime), "interior cell 1 in slime");
+        assert!(
+            (g.links[0].cost - (1.0 + SLIME_CELL_EXTRA)).abs() < 1e-6,
+            "into-slime link priced by SLIME_CELL_EXTRA: {}",
+            g.links[0].cost
+        );
+    }
+
     // --- speed-band planning (Phase B) ---
 
     /// Build a synthetic graph for banded-planner tests: cells at the given origins, directed links
@@ -2126,6 +2287,7 @@ mod tests {
             adjacency,
             water: Vec::new(),
             breathable: Vec::new(),
+            hazard: Vec::new(),
             grid: GridIndex::default(),
             gates: SideTable::default(),
             hooks: SideTable::default(),

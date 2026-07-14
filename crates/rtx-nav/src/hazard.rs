@@ -82,8 +82,16 @@ enum Below {
 
 /// March straight down from `p`, reporting the first liquid or solid floor met (water short-circuits
 /// like the others — it never lets the march run past its surface to the floor below).
+///
+/// The march is coarse (24u strides), but a *shallow* liquid film pooled on a floor is thinner than
+/// one stride and can fall entirely between two samples — its surface below the last open sample,
+/// yet above the solid the next sample hits. So when a stride lands in solid, we don't take that at
+/// face value: [`solid_or_film`] refines the exact boundary and runs the engine's own waterlevel-1
+/// test there, catching the film the coarse march stepped over. (The very first sample landing solid
+/// has no open bracket above it to refine — that's a wall, reported as plain solid.)
 fn probe_below(is_solid: &impl Fn(Vec3) -> bool, contents: &impl Fn(Vec3) -> f32, p: Vec3) -> Below {
     let mut d = 0.0;
+    let mut open_above = None; // depth of the last sample that was neither solid nor liquid
     while d <= HAZARD_PROBE_DEPTH {
         let q = p - Vec3::new(0.0, 0.0, d);
         let c = contents(q);
@@ -97,11 +105,57 @@ fn probe_below(is_solid: &impl Fn(Vec3) -> bool, contents: &impl Fn(Vec3) -> f32
             return Below::Water;
         }
         if is_solid(q) {
-            return Below::Solid(d);
+            return match open_above {
+                Some(lo) => solid_or_film(is_solid, contents, p, lo, d),
+                None => Below::Solid(0.0), // solid at the very first sample — a wall, no bracket to refine
+            };
         }
+        open_above = Some(d);
         d += 24.0;
     }
     Below::Bottomless
+}
+
+/// Refine the open→solid transition between depths `lo` (last open sample) and `hi` (first solid
+/// sample), then run the engine's own waterlevel-1 test at the spot a player would rest there — the
+/// crux of shallow-film detection.
+///
+/// `is_solid` reads the *clip hull* (hull 1), inflated by the player's bounding box, so a floor's
+/// top face bevels up by `|mins.z|` = 24u: the boundary the binary search finds is where a standing
+/// player's *origin* rests, not where its feet touch. The liquid film — carried only by the render
+/// hull `contents` samples — sits on the true floor 24u below that. The engine's `SV_CheckWater`
+/// sets waterlevel 1 (and the game's `apply_liquid_damage` burns you) from a probe at
+/// `origin + mins.z + 1` = feet+1, so we sample `contents` at `boundary − 23`. A liquid there is
+/// precisely a film that scalds a player standing at this boundary while being too thin for the
+/// coarse march to land inside — the whole reason ankle-deep lava used to read as safe ground.
+fn solid_or_film(
+    is_solid: &impl Fn(Vec3) -> bool,
+    contents: &impl Fn(Vec3) -> f32,
+    p: Vec3,
+    lo: f32,
+    hi: f32,
+) -> Below {
+    // Bisect the bracket (known-open `lo`, known-solid `hi`): five halvings pin the 24u stride to
+    // under 1u. `hi` stays the shallowest depth proven solid — the boundary.
+    let (mut lo, mut hi) = (lo, hi);
+    for _ in 0..5 {
+        let mid = 0.5 * (lo + hi);
+        if is_solid(p - Vec3::new(0.0, 0.0, mid)) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let c = contents(p - Vec3::new(0.0, 0.0, hi + 23.0));
+    if c == CONTENTS_LAVA as f32 {
+        Below::Lava
+    } else if c == CONTENTS_SLIME as f32 {
+        Below::Slime
+    } else if c == CONTENTS_WATER as f32 {
+        Below::Water
+    } else {
+        Below::Solid(hi) // refined depth — at worst 24u shallower than the coarse march's, a hair more accurate against HAZARD_DROP
+    }
 }
 
 /// Classify what's below `p` by marching down: lava/slime (from `contents`) or a big drop / pit
@@ -416,6 +470,69 @@ mod tests {
         // A wall ahead (solid at the probe) is not water.
         let wall = |p: Vec3| p.z <= 0.0 || p.x > 60.0;
         assert!(!water_ahead(&wall, &empty, feet, Vec3::new(1.0, 0.0, 0.0)));
+    }
+
+    // Shallow-liquid films: a thin sheet of lava/slime/water resting on a floor, too thin for the
+    // coarse 24u down-march to land a sample inside. `is_solid` is the hull-1 clip test, so a floor
+    // bevels up to the resting origin — these oracles model that bevel (walkway solid to z ≤ 24 with
+    // feet at the visual floor z = 0, like the `ledge_ahead` tests below), with a short drop into a
+    // basin beyond and a 4u-thick film hovering just above the basin floor. From feet+8 = z 8 the
+    // march steps clean to z −16, over the film — this is the ankle-deep lava that used to read safe.
+    // The film band (−32, −28) is where boundary−23 lands: basin solid begins ≈ z −8 (depth ≈ 16.5
+    // below the probe), and 8 − (16.5 + 23) ≈ −31.5.
+
+    #[test]
+    fn hazard_ahead_detects_shallow_lava_film() {
+        let solid = |p: Vec3| if p.x <= 60.0 { p.z <= 24.0 } else { p.z <= -8.0 };
+        let film = |p: Vec3| {
+            if p.x > 60.0 && (-32.0..-28.0).contains(&p.z) {
+                CONTENTS_LAVA as f32
+            } else {
+                CONTENTS_EMPTY as f32
+            }
+        };
+        assert_eq!(
+            hazard_ahead(&solid, &film, Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0)),
+            Some(HazardKind::Lava)
+        );
+    }
+
+    #[test]
+    fn shallow_dry_basin_is_not_a_hazard() {
+        // Same geometry with the film removed: the refined boundary sample finds plain floor, so a
+        // bot may step into the shallow basin — the guard that we didn't just start flagging drops.
+        let solid = |p: Vec3| if p.x <= 60.0 { p.z <= 24.0 } else { p.z <= -8.0 };
+        let empty = |_: Vec3| CONTENTS_EMPTY as f32;
+        assert!(hazard_ahead(&solid, &empty, Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0)).is_none());
+    }
+
+    #[test]
+    fn water_ahead_detects_shallow_water_film() {
+        // A puddle-thin water film reads as Wet (deprioritized) — never as a lethal hazard.
+        let solid = |p: Vec3| if p.x <= 60.0 { p.z <= 24.0 } else { p.z <= -8.0 };
+        let film = |p: Vec3| {
+            if p.x > 60.0 && (-32.0..-28.0).contains(&p.z) {
+                CONTENTS_WATER as f32
+            } else {
+                CONTENTS_EMPTY as f32
+            }
+        };
+        assert!(water_ahead(&solid, &film, Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0)));
+        assert!(hazard_ahead(&solid, &film, Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0)).is_none());
+    }
+
+    #[test]
+    fn hazard_below_sees_shallow_slime_film() {
+        // The same thin-film refinement catches slime a stride out over the basin.
+        let solid = |p: Vec3| if p.x <= 60.0 { p.z <= 24.0 } else { p.z <= -8.0 };
+        let film = |p: Vec3| {
+            if p.x > 60.0 && (-32.0..-28.0).contains(&p.z) {
+                CONTENTS_SLIME as f32
+            } else {
+                CONTENTS_EMPTY as f32
+            }
+        };
+        assert_eq!(hazard_below(&solid, &film, Vec3::new(72.0, 0.0, 8.0)), Some(HazardKind::Slime));
     }
 
     #[test]

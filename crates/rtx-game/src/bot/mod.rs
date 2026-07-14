@@ -142,8 +142,15 @@ const POLITE_DIST: f32 = 64.0;
 /// is 12s (see [`crate::client::movement`]); triggering with 5 left leaves ~1100u of swimming
 /// (0.7·MAX_SPEED for the panic window) before drown damage — ample slack for any id1 water pocket.
 const DROWN_PANIC_SECS: f32 = 5.0;
+/// How long a bot must stand *in* lava/slime before the escape reflex hijacks its goal toward the
+/// nearest safe cell. Short — the game burns from the first frame (`apply_liquid_damage`) — but not
+/// zero: a bot deliberately crossing a slime moat or lava bridge is off it within a damage tick or
+/// two, so gating on dwell lets those intentional crossings through while still rescuing a bot parked
+/// on liquid by a plat standoff, a polite yield, or a knockback.
+const BURN_PANIC_SECS: f32 = 0.75;
 /// How long the anti-drown surface target is reused before re-flooding the graph — a short cache so
-/// a drowning bot doesn't run a full Dijkstra every frame while it swims out.
+/// a drowning bot doesn't run a full Dijkstra every frame while it swims out. Shared by the burn
+/// escape reflex, which floods the same way.
 const SURFACE_CACHE_TTL: f32 = 0.5;
 /// Minimum seconds between A* re-paths (the human keeps moving).
 const REPATH_INTERVAL: f32 = 0.4;
@@ -367,6 +374,10 @@ struct Sense {
     /// Fully submerged (`waterlevel == 3`, eyes underwater): the only state that *drowns* — the air
     /// tank counts down here (see [`crate::client::movement`]). Drives the anti-drown override.
     submerged: bool,
+    /// Standing in lava or slime deep enough to burn (`waterlevel >= 1` on a lava/slime watertype —
+    /// the exact gate `apply_liquid_damage` uses). Drives the escape reflex that hijacks the goal
+    /// toward safe ground; see [`combat::is_burning`].
+    burning: bool,
     /// Seconds of air left before drowning (`combat.air_finished - now`): the 12s tank, ticking down
     /// only while `submerged`, refreshed on every surfacing breath. Read only when `submerged`.
     air_left: f32,
@@ -410,6 +421,8 @@ fn sense(game: &GameState, e: EntId) -> Sense {
     let in_water = game.entities[e].v.waterlevel >= 2.0;
     // Fully under (waterlevel == 3) is the drowning state; snapshot the air tank for the override.
     let submerged = game.entities[e].v.waterlevel >= 3.0;
+    // Feet in lava/slime (waterlevel >= 1 on that watertype) — burning now, the escape-reflex trigger.
+    let burning = combat::is_burning(&game.entities[e].v);
     let air_left = game.entities[e].combat.air_finished - now;
     let alive = game.entities[e].is_alive();
     // Vertical speed and whether the once-per-air-travel double jump is still available — snapshot
@@ -455,7 +468,7 @@ fn sense(game: &GameState, e: EntId) -> Sense {
         pitch_bias: host.cvar(c"rtx_rj_pitch_bias"),
     };
     Sense {
-        host, now, frametime, msec, origin, v_angle, client, weapon, on_ground, in_water, submerged, air_left, alive, vz, air_jumped, enemy_seen_time, v_xy, speed, grapple_hook, has_grapple, hook_out, on_hook, anchor, reel_half_step,
+        host, now, frametime, msec, origin, v_angle, client, weapon, on_ground, in_water, submerged, burning, air_left, alive, vz, air_jumped, enemy_seen_time, v_xy, speed, grapple_hook, has_grapple, hook_out, on_hook, anchor, reel_half_step,
         attack_finished, has_rl, ammo_rockets, health, armortype, armorvalue, quad, rj_knobs,
     }
 }
@@ -961,6 +974,27 @@ fn run_bot(game: &mut GameState, e: EntId) {
         }
     }
 
+    // Burn-escape reflex: standing in lava/slime burns from the first frame, but a bot deliberately
+    // crossing a moat/bridge is off it within a tick — so only once it's been stuck burning past
+    // `BURN_PANIC_SECS` do we hijack the goal onto the nearest safe cell (the same flood as anti-drown).
+    // `burn_since` stamps when the burn began and clears when it ends. Unlike drowning this sets no
+    // `surfacing`/`swim_up`: while a fight owns movement the combat guard keeps the bot off the coals,
+    // and the redirected goal takes over the instant combat releases it.
+    if !s.burning {
+        game.entities[e].bot.burn_since = 0.0;
+    } else if game.entities[e].bot.burn_since == 0.0 {
+        game.entities[e].bot.burn_since = now;
+    }
+    if s.burning && now - game.entities[e].bot.burn_since >= BURN_PANIC_SECS {
+        let safe = escape_target(&mut game.entities[e].bot.burn, graph, bot_cell, &costs, now);
+        if let Some(cell) = safe.and_then(|a| graph.nearest(a)) {
+            goal_cell = cell;
+            o.target_origin = graph.cell_origin(cell);
+            o.item_cell = Some(cell);
+            o.polite = false;
+        }
+    }
+
     // Race mode: the offline-optimized racing line's look-ahead point to bias the bhop bearing
     // toward (`None` outside race, with the feature off, or when the bot has strayed off the line —
     // then it recovers on the plain navmesh route). Computed here while only `graph` is borrowed.
@@ -1296,9 +1330,14 @@ fn roam_target(game: &mut GameState, e: EntId, origin: Vec3, now: f32) -> Vec3 {
         return origin;
     }
     let pick = |r: f32| ((r * g.cells.len() as f32) as usize).min(g.cells.len() - 1);
-    // Prefer a dry destination — roaming into water just to turn around is the loiter we avoid. Take
-    // the first non-water draw; if every draw lands in water (a mostly-flooded map) keep the last.
-    let idx = draws.iter().map(|&r| pick(r)).find(|&i| !g.cell_in_water(i as u32)).unwrap_or_else(|| pick(draws[7]));
+    // Prefer a safe, dry destination — roaming into water to turn around is loiter, and roaming onto
+    // lava/slime is suicide. Take the first draw that is neither; if every draw lands wet or burning
+    // (a mostly-flooded/flooded-with-liquid map) keep the last.
+    let idx = draws
+        .iter()
+        .map(|&r| pick(r))
+        .find(|&i| !g.cell_in_water(i as u32) && g.cell_hazard(i as u32).is_none())
+        .unwrap_or_else(|| pick(draws[7]));
     let cell = g.cell_origin(idx as u32);
     game.entities[e].bot.wander.target = cell; // disjoint field from game.nav — coexists with `g`
     game.entities[e].bot.wander.time = now + 5.0;
@@ -1327,6 +1366,31 @@ fn surface_target(cache: &mut Wander, graph: &NavGraph, bot_cell: CellId, costs:
         return Some(cache.target);
     }
     let picked = nearest_air(graph, bot_cell, costs).map(|c| graph.cell_origin(c));
+    cache.target = picked.unwrap_or(Vec3::ZERO);
+    cache.time = now + SURFACE_CACHE_TTL;
+    picked
+}
+
+/// The nearest cell to `bot_cell` (by travel cost) with safe footing — the burn-escape target. Floods
+/// link costs once and takes the cheapest cell that isn't lava/slime (water counts as safe here:
+/// diving into a pool to escape lava is right). `None` only if every reachable cell burns.
+fn nearest_safe_ground(graph: &NavGraph, bot_cell: CellId, costs: &LinkCosts) -> Option<CellId> {
+    let flood = graph.costs_from(bot_cell, costs);
+    flood
+        .iter()
+        .enumerate()
+        .filter(|&(c, &d)| d.is_finite() && graph.cell_hazard(c as CellId).is_none())
+        .min_by(|&(_, &a), &(_, &b)| a.total_cmp(&b))
+        .map(|(c, _)| c as CellId)
+}
+
+/// The origin of the nearest safe-footing spot for a burning bot, cached in `cache` for
+/// [`SURFACE_CACHE_TTL`] like [`surface_target`]. `None` if no safe cell is reachable.
+fn escape_target(cache: &mut Wander, graph: &NavGraph, bot_cell: CellId, costs: &LinkCosts, now: f32) -> Option<Vec3> {
+    if cache.target != Vec3::ZERO && now < cache.time {
+        return Some(cache.target);
+    }
+    let picked = nearest_safe_ground(graph, bot_cell, costs).map(|c| graph.cell_origin(c));
     cache.target = picked.unwrap_or(Vec3::ZERO);
     cache.time = now + SURFACE_CACHE_TTL;
     picked
