@@ -1076,7 +1076,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     }
 
     // Bundle the frame's decisions into one command for the combat/grenade overlays to mutate.
-    let cmd = BotCmd { look, move_world, buttons, impulse };
+    let cmd = BotCmd { look, move_world, buttons, impulse, shot: None };
 
     // Traversal-critical legs lock out the combat/grenade overlays: `engage` owns movement and
     // clears +jump, which cancels the planner's route if done mid gap/double/speed jump.

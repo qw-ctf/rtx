@@ -230,6 +230,10 @@ pub(crate) struct BotCmd {
     pub move_world: Vec3,
     pub buttons: i32,
     pub impulse: i32,
+    /// The combat shot awaiting the fire gate, armed by `engage`. The gate runs in `emit` *after* the
+    /// aim spring, so it judges the very view the shot flies along. An overlay that takes the trigger
+    /// for itself clears this, or the gun would re-arm behind its back.
+    pub shot: Option<combat::Shot>,
 }
 
 // --- per-frame driving (P2 follow + P4 behavior) ---
@@ -950,7 +954,8 @@ fn emit(
     enemy: Option<EntId>,
 ) {
     let Sense { host, now, frametime, v_angle, client, msec, speed, .. } = s;
-    let BotCmd { look, move_world, mut buttons, impulse } = cmd;
+    let BotCmd { look, move_world, mut buttons, impulse, shot } = cmd;
+    let skill = host.cvar(c"rtx_bot_skill").clamp(0.0, 7.0);
 
     // View + move for the frame. When the bhop controller is driving, translate its usercmd into a
     // world-space wish and a swept view target (yaw = the velocity heading it chose) so it can go
@@ -968,7 +973,6 @@ fn emit(
     };
     let (view, forward, side) = {
         let dt = frametime.clamp(0.001, 0.05);
-        let skill = host.cvar(c"rtx_bot_skill").clamp(0.0, 7.0);
         // Spring stiffness (1/s): sluggish → pro-snappy. Shared with the combat feed-forward,
         // whose lag compensation assumes exactly this spring.
         let omega = combat::aim_omega(skill);
@@ -993,6 +997,16 @@ fn emit(
             vr.dot(move_world).round() as i32,
         )
     };
+
+    // Combat fire, decided *after* the spring for the same reason the hook throw and the rocket-jump
+    // launch below are: the shot leaves along `view`, so `view` is what the gate must judge. Deciding
+    // it back in `engage` measured last frame's aim and let a marginal solve pass, then the spring
+    // moved and the rocket left wide.
+    if let Some(sh) = shot.as_ref() {
+        if combat::fire_pending(game, e, skill, view, sh) {
+            buttons |= BUTTON_ATTACK;
+        }
+    }
 
     // Hook fire, decided *after* the spring: the hook flies along `v_angle` (the smoothed view we're
     // about to send), so the throw must wait until that view has actually settled onto the anchor —

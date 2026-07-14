@@ -630,6 +630,7 @@ fn windup(game: &mut GameState, e: EntId, now: f32, cmd: &mut BotCmd) {
     cmd.look = want;
     cmd.move_world = Vec3::ZERO; // hold the firing stance
     cmd.buttons &= !BUTTON_ATTACK; // don't fire the current gun at lob pitch
+    cmd.shot = None; // ...and disarm engage's shot, or `emit` re-arms the gun along that very pitch
     let (weapon, attack_finished) = {
         let ent = &game.entities[e];
         (ent.v.weapon, ent.combat.attack_finished)
@@ -807,8 +808,11 @@ pub(crate) fn rocket_shove(
     if (hit - b).length() > 48.0 {
         return false; // a wall stops the rocket short of B
     }
-    // Aim the rocket at the ground point, select the launcher, and fire once the view is on it.
+    // Aim the rocket at the ground point, select the launcher, and fire once the view is on it. The
+    // shove owns the trigger from here: engage's shot is solved against the enemy, not this ground
+    // point, so leaving it armed would let `emit` fire along the shove's view on its own terms.
     cmd.look = angles_to(eye, aim);
+    cmd.shot = None;
     if game.entities[e].v.weapon != Weapon::RocketLauncher {
         cmd.impulse = 7;
         cmd.buttons &= !BUTTON_ATTACK;

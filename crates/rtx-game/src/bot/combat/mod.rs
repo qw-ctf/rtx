@@ -692,12 +692,19 @@ struct BallisticPlan {
 
 /// The resolved shot for the fire gate: which weapon, where it aims, the clean angles to there, the
 /// projectile spawn height, and whether it must land a direct hull hit (vs. leaning on splash).
-struct Shot {
+/// Self-contained — it carries the target and the frame's origin too, so the gate can be judged
+/// later in `emit` against the settled view without re-deriving the frame's combat context.
+#[derive(Clone, Copy)]
+pub(crate) struct Shot {
     choice: WeaponChoice,
     aim: Vec3,
     clean: Vec3,
     muzzle_base: Vec3,
     gate_direct: bool,
+    /// The enemy this shot is solved against — the trace-hit identity the line-of-fire rays accept.
+    enemy: EntId,
+    /// The bot's origin at solve time: the muzzle/launch point and the self-splash range come off it.
+    origin: Vec3,
 }
 
 /// Solve the geometry-aware projectile options against the real BSP hull, all inside one immutable
@@ -944,32 +951,36 @@ fn combat_move(game: &mut GameState, e: EntId, enemy: EntId, now: f32, origin: V
     }
 }
 
-/// Whether to pull the trigger this frame. Fire only when the crosshair is on the spot *and* the
-/// line of fire is clear. The shot leaves along the *smoothed* view (`bot.aim.angles`, last frame's spring
-/// output) — firing every frame would put rockets wherever the lagging view points, behind a strafer
-/// no matter how good the intercept. Projectiles gate on the predicted *miss distance* at intercept
-/// range (a direct-hit shot needs the hull, a splash shot leans on the blast); hitscan keeps the
-/// per-weapon cone plus low-skill leniency. A rocket also traces its real muzzle→aim line *twice*
-/// (the steady `clean` ray and the ray it will actually fly along the smoothed view) and needs both
-/// clear — the corner self-splash fix. Fire is held while a switch to the GL is still pending, so the
-/// held gun doesn't loose along the ~18°-high grenade-loft view.
-fn fire_gate(game: &mut GameState, e: EntId, enemy: EntId, origin: Vec3, skill: f32, shot: &Shot) -> bool {
-    let Shot { choice, aim, clean, muzzle_base, gate_direct } = *shot;
-    let s = choice.projectile_speed;
-    let view = game.entities[e].bot.aim.angles;
-    let on_target = if s > 0.0 {
+/// Whether `view` puts the shot on the spot: projectiles by the predicted *miss distance* at intercept
+/// range (a direct-hit shot needs the hull, a splash shot leans on the blast), hitscan by a per-weapon
+/// cone — the lightning beam tight, the shotguns/axe looser — plus low-skill leniency. Pure over the
+/// resolved shot, so the tolerance model is unit-testable without a live frame.
+fn shot_on_target(view: Vec3, shot: &Shot, skill: f32) -> bool {
+    let Shot { choice, aim, clean, muzzle_base, gate_direct, origin, .. } = *shot;
+    if choice.projectile_speed > 0.0 {
         let launch = if choice.grenade_arc { origin } else { muzzle_base };
         let range = (aim - launch).length().max(1.0);
-        view == Vec3::ZERO || miss_distance(view, clean, range) <= fire_tolerance(skill, gate_direct)
+        miss_distance(view, clean, range) <= fire_tolerance(skill, gate_direct)
     } else {
-        // Per-weapon base cone (RL is a projectile, gated above): the lightning beam is tight, the
-        // shotguns/axe looser — plus low-skill leniency.
         let base_cone = if choice.weapon == Weapon::Lightning { 2.5 } else { 5.0 };
         let cone = base_cone + (7.0 - skill);
         let dp = wrap180(view.x - clean.x);
         let dy = wrap180(view.y - clean.y);
-        view == Vec3::ZERO || (dp * dp + dy * dy).sqrt() <= cone
-    };
+        (dp * dp + dy * dy).sqrt() <= cone
+    }
+}
+
+/// Whether to pull the trigger. Fire only when the crosshair is on the spot *and* the line of fire is
+/// clear. `view` is the *settled* view this frame's usercmd carries — the exact angles the shot flies
+/// along — so the gate judges the shot it is actually about to take (see [`fire_pending`], which runs
+/// this from `emit` after the aim spring). A rocket also traces its real muzzle→aim line *twice* (the
+/// steady `clean` ray and the ray it will actually fly) and needs both clear — the corner self-splash
+/// fix. Fire is held while a switch to the GL is still pending, so the held gun doesn't loose along
+/// the ~18°-high grenade-loft view.
+fn fire_gate(game: &mut GameState, e: EntId, skill: f32, view: Vec3, shot: &Shot) -> bool {
+    let Shot { choice, aim, clean, gate_direct: _, enemy, origin, .. } = *shot;
+    let s = choice.projectile_speed;
+    let on_target = shot_on_target(view, shot, skill);
     let switching_to_gl = choice.grenade_arc && game.entities[e].v.weapon != Weapon::GrenadeLauncher;
     // Muzzle matches `w_fire_rocket` (origin + forward·8 + 16 up), taken from each ray's own forward.
     // A grenade arc keeps its own geometry check (bounce sim / arc_land) and skips this straight-line
@@ -985,8 +996,7 @@ fn fire_gate(game: &mut GameState, e: EntId, enemy: EntId, origin: Vec3, skill: 
     let lof_clear = if choice.grenade_arc {
         true
     } else if s > 0.0 {
-        // The view ray needs a spring sample; on the first frame (view == ZERO) lean on `clean` alone.
-        ray_clear(clean) && (view == Vec3::ZERO || ray_clear(view))
+        ray_clear(clean) && ray_clear(view)
     } else {
         true // hitscan: the eye-ray LoS above already governs the shot
     };
@@ -1006,6 +1016,19 @@ fn fire_gate(game: &mut GameState, e: EntId, enemy: EntId, origin: Vec3, skill: 
         && self_clear
         && !switching_to_gl
         && !switching_from_explosive
+}
+
+/// The combat fire decision, run from `emit` once the aim spring has settled — `view` is the very
+/// angle the projectile will fly along this frame, so the gate approves the shot it actually takes
+/// rather than the one last frame's view would have taken. Judging it a frame early let a marginal
+/// aim pass and the shot leave wide: the spring keeps moving after the gate looks.
+///
+/// Deliberately *no* `attack_finished` check. Holding +attack under cooldown is free — the engine's
+/// `w_weapon_frame` swallows the press and paces refire — and the LG beam and the nail streams need
+/// `button0` held continuously to sustain, so dropping the button on cooldown frames would stutter
+/// them. Every frame is a fresh decision regardless, so a held button is never a stale one.
+pub(crate) fn fire_pending(game: &mut GameState, e: EntId, skill: f32, view: Vec3, shot: &Shot) -> bool {
+    fire_gate(game, e, skill, view, shot)
 }
 
 /// Overlay combat onto the frame's decisions. `look` is the desired view (smoothed downstream by
@@ -1126,22 +1149,20 @@ pub(crate) fn engage(
     cmd.move_world = combat_move(game, e, enemy, now, origin, to_enemy);
     cmd.buttons &= !BUTTON_JUMP; // don't bunny-hop while dueling
 
-    let shot = Shot { choice, aim, clean, muzzle_base, gate_direct };
     let holding_lg = game.entities[e].v.weapon == Weapon::Lightning;
-    let fire = if discharge {
-        // Deliberate discharge: radius damage needs no aim, but wait until the LG is actually in hand
-        // so the still-held weapon doesn't loose first (the switch takes a frame).
-        holding_lg
+    if discharge {
+        // Deliberate discharge: radius damage needs no aim, so it never goes through the gate — but
+        // wait until the LG is actually in hand so the still-held weapon doesn't loose first (the
+        // switch takes a frame).
+        if holding_lg {
+            cmd.buttons |= BUTTON_ATTACK;
+        }
     } else if underwater && holding_lg {
         // Still holding the LG underwater with no worthwhile discharge (a mid-fight dive, or the
         // switch to another gun hasn't landed yet): never pull the trigger — it would discharge.
-        false
     } else {
-        fire_gate(game, e, enemy, origin, skill, &shot)
-    };
-    if fire {
-        // The engine paces shots via `attack_finished`; holding fire shoots at the weapon's rate.
-        cmd.buttons |= BUTTON_ATTACK;
+        // Arm the shot; `emit` gates it after the aim spring, against the view it will fly along.
+        cmd.shot = Some(Shot { choice, aim, clean, muzzle_base, gate_direct, enemy, origin });
     }
 }
 
@@ -1452,6 +1473,10 @@ pub(crate) fn shoot_grenade(game: &mut GameState, e: EntId, grenade: EntId, cmd:
     let eye = game.entities[e].v.origin + VEC_VIEW_OFS;
     let gpos = game.entities[grenade].v.origin;
     cmd.look = angles_to(eye, gpos);
+    // The grenade shot owns the trigger: engage's shot is solved against the *enemy*, and the view is
+    // now swinging onto the grenade instead, so leaving it armed lets `emit` loose a round at the enemy
+    // on its own tolerance while this code is still lining up. One trigger, one owner.
+    cmd.shot = None;
     if game.entities[e].v.weapon != weapon {
         cmd.impulse = imp; // switching takes a frame; fire once we hold it
         return true;
@@ -1979,6 +2004,90 @@ mod tests {
         assert!((after.x - (100.0 + 200.0 * 0.5)).abs() < 1e-3, "x {}", after.x);
         // Never predicted below the floor — the whole point of the clamp.
         assert!(ballistic_pos(p0, v0, g, land, 5.0).z >= 0.0);
+    }
+
+    /// A shot solved 400u downrange along +x, clean angles dead ahead — the geometry the on-target
+    /// tests vary a view against. `speed`/`arc`/`direct` pick which gate branch is exercised.
+    fn test_shot(weapon: Weapon, speed: f32, arc: bool, direct: bool) -> Shot {
+        Shot {
+            choice: WeaponChoice { impulse: 0, weapon, projectile_speed: speed, grenade_arc: arc },
+            aim: Vec3::new(400.0, 0.0, 0.0),
+            clean: Vec3::ZERO,
+            muzzle_base: Vec3::ZERO,
+            gate_direct: direct,
+            enemy: EntId(2),
+            origin: Vec3::ZERO,
+        }
+    }
+
+    #[test]
+    fn shot_on_target_projectile_tolerance_boundary() {
+        // Skill 7 direct rocket at 400u: the gate is the ±16u hull, i.e. ~2.3° of slack.
+        let shot = test_shot(Weapon::RocketLauncher, 1000.0, false, true);
+        assert!(shot_on_target(Vec3::new(0.0, 2.0, 0.0), &shot, 7.0), "2° ≈ 14u — inside the hull");
+        assert!(!shot_on_target(Vec3::new(0.0, 3.0, 0.0), &shot, 7.0), "3° ≈ 21u — past it");
+    }
+
+    #[test]
+    fn shot_on_target_splash_looser_than_direct() {
+        // The same geometry riding the blast instead of the hull: 40u at skill 7 passes what the
+        // direct gate rejects — this is why a grounded rocket fires sooner than a mid-air one.
+        let splash = test_shot(Weapon::RocketLauncher, 1000.0, false, false);
+        let direct = test_shot(Weapon::RocketLauncher, 1000.0, false, true);
+        assert!(shot_on_target(Vec3::new(0.0, 5.0, 0.0), &splash, 7.0), "5° ≈ 35u — inside the blast");
+        assert!(!shot_on_target(Vec3::new(0.0, 5.0, 0.0), &direct, 7.0));
+    }
+
+    #[test]
+    fn shot_on_target_hitscan_cone() {
+        // Hitscan ignores range and gates on the per-weapon cone: the beam is tight, the pellets wide.
+        let lg = test_shot(Weapon::Lightning, 0.0, false, true);
+        assert!(shot_on_target(Vec3::new(0.0, 2.0, 0.0), &lg, 7.0));
+        assert!(!shot_on_target(Vec3::new(0.0, 3.0, 0.0), &lg, 7.0));
+        let sg = test_shot(Weapon::SuperShotgun, 0.0, false, true);
+        assert!(shot_on_target(Vec3::new(0.0, 4.0, 0.0), &sg, 7.0));
+        assert!(!shot_on_target(Vec3::new(0.0, 6.0, 0.0), &sg, 7.0));
+    }
+
+    #[test]
+    fn shot_on_target_low_skill_fires_looser() {
+        // A low-skill bot must still shoot — loose, and miss — rather than freeze waiting on a cone
+        // its lagging aim never reaches.
+        let shot = test_shot(Weapon::RocketLauncher, 1000.0, false, true);
+        assert!(!shot_on_target(Vec3::new(0.0, 6.0, 0.0), &shot, 7.0));
+        assert!(shot_on_target(Vec3::new(0.0, 6.0, 0.0), &shot, 0.0));
+    }
+
+    #[test]
+    fn shot_on_target_grenade_arc_ranges_from_origin() {
+        // A lobbed grenade leaves the body, not the raised muzzle, so its range comes off `origin`.
+        // Push `muzzle_base` far downrange: only the arc branch is unmoved by it.
+        let mut arc = test_shot(Weapon::GrenadeLauncher, 600.0, true, false);
+        let mut straight = test_shot(Weapon::GrenadeLauncher, 600.0, false, false);
+        arc.muzzle_base = Vec3::new(396.0, 0.0, 0.0); // a mere 4u of range if it were the launch point
+        straight.muzzle_base = Vec3::new(396.0, 0.0, 0.0);
+        // 8° is ~56u wide at 400u (past the 40u splash gate) but ~0.6u at 4u (trivially on target),
+        // so the two branches disagree only because they measure range from different points.
+        let view = Vec3::new(0.0, 8.0, 0.0);
+        assert!(!shot_on_target(view, &arc, 7.0), "arc ranges from origin: 8° at 400u ≈ 56u > 40u");
+        assert!(shot_on_target(view, &straight, 7.0), "straight ranges from muzzle_base: 8° at 4u ≈ 0.6u");
+    }
+
+    #[test]
+    fn one_spring_step_closes_the_gap() {
+        // The defect in miniature. A view 3° off a 400u direct solve fails the gate — but one
+        // critically-damped spring step toward `clean` brings it inside. Gating on the *pre*-step
+        // view (as `engage` used to) approves a shot that then leaves along the *post*-step view;
+        // only judging the settled view describes the shot actually taken.
+        let shot = test_shot(Weapon::RocketLauncher, 1000.0, false, true);
+        let (omega, dt) = (aim_omega(7.0), 1.0 / 72.0);
+        let (mut a, mut v) = (3.0_f32, 0.0_f32);
+        for _ in 0..8 {
+            v += (omega * omega * (0.0 - a) - 2.0 * omega * v) * dt;
+            a += v * dt;
+        }
+        assert!(!shot_on_target(Vec3::new(0.0, 3.0, 0.0), &shot, 7.0), "pre-step: wide");
+        assert!(shot_on_target(Vec3::new(0.0, a, 0.0), &shot, 7.0), "settled at {a}°: on target");
     }
 
     #[test]
