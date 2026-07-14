@@ -444,6 +444,9 @@ impl GameState {
 
     /// `DropBackpack` — drop the player's current weapon + ammo on death.
     pub(crate) fn drop_backpack(&mut self, e: EntId) {
+        if !self.mode.allows_item_drops() {
+            return;
+        }
         let (shells, nails, rockets, cells, weapon, origin) = {
             let v = &self.entities[e].v;
             (
@@ -504,7 +507,7 @@ impl GameState {
     /// `TossBackpack` (impulse 20) — drop a capped slice of your ammo for a teammate: up to 20
     /// shells / 20 nails / 10 rockets / 20 cells, deducted from you. Gated by `rtx_dropitems`.
     pub(crate) fn toss_ammo(&mut self, e: EntId) {
-        if !self.host.cvar_bool(c"rtx_dropitems") || !self.is_live_player(e) {
+        if !self.mode.allows_item_drops() || !self.host.cvar_bool(c"rtx_dropitems") || !self.is_live_player(e) {
             return;
         }
         let (have, origin) = {
@@ -536,7 +539,7 @@ impl GameState {
     /// `TossWeapon` (impulse 21) — drop your current weapon as a pickup for a teammate and switch to
     /// your next-best weapon. The axe, single shotgun, and grapple stay put. Gated by `rtx_dropitems`.
     pub(crate) fn toss_weapon(&mut self, e: EntId) {
-        if !self.host.cvar_bool(c"rtx_dropitems") || !self.is_live_player(e) {
+        if !self.mode.allows_item_drops() || !self.host.cvar_bool(c"rtx_dropitems") || !self.is_live_player(e) {
             return;
         }
         let weapon = self.entities[e].v.weapon;

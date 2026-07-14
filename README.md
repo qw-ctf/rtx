@@ -76,7 +76,7 @@ mode doesn't touch the generic gameplay or bot code.
 | `rtx_race_route` | `0` | Race: which of the current map's routes to run (0-based, clamped). Read live — changing it moves everyone to the new route's start. |
 | `rtx_runes` | `0` | CTF runes: `0` = on (Haste adds move speed), `1` = off, `2` = on without the speed boost. |
 | `rtx_ctf_tossflag` / `rtx_ctf_tossrune` | `0` / `0` | CTF: allow tossing your carried flag (impulse 26) / held rune (impulse 24). |
-| `rtx_dropitems` | `0` | Any mode: let players hand items to teammates — a **capped ammo backpack** (impulse 20; up to 20 shells / 20 nails / 10 rockets / 20 cells, deducted from you) and your **current weapon** (impulse 21; drops it as a pickup and switches you to your next-best gun — the axe, single shotgun, and grapple stay). Ported from purectf. |
+| `rtx_dropitems` | `0` | Outside Race: let players hand items to teammates — a **capped ammo backpack** (impulse 20; up to 20 shells / 20 nails / 10 rockets / 20 cells, deducted from you) and your **current weapon** (impulse 21; drops it as a pickup and switches you to your next-best gun — the axe, single shotgun, and grapple stay). Race never creates dropped items. Ported from purectf. |
 
 **`ra` — Rocket Arena.** Round-based 1v1 duels following the classic arena loop (ported from the
 Frogbot-Rocket-Arena QuakeC, minus its clan-arena team machinery). Two players fight in the arena
@@ -145,7 +145,9 @@ external **`race/routes/{mapname}.route`** command files (race1–10, ztricks, z
 examples into the gamedir). Everyone spawns on the active route's start pad (**axe only**, KTX
 `raceWeaponNo`); the clock starts when the runner leaves the start box, checkpoints must be touched
 **in order**, the finish broadcasts the time, and `race_route_timeout` without finishing resets the
-run. Because race maps are authored for **stock movement + bunnyhop only**, the mode reports
+run. Deaths and manual toss commands never leave backpacks or dropped weapons on the course, and a
+bot always keeps the next checkpoint/finish as its hard objective. Because race maps are authored
+for **stock movement + bunnyhop only**, the mode reports
 `stock_movement_only`: double jump, wall jump, elevator jump, grapple and rocket jumps are switched
 **off** — both as live mechanics and as navmesh links — so bots must reach everything by bhop and
 speed jumps, and a failed pathfind is honest. At map load the mode prints a **routability report**,
@@ -168,7 +170,7 @@ through the same player-move code as humans, so gravity, stepping, and jumps com
 | `rtx_bot_count` | `0` | How many bots to keep on the server. The population is reconciled to this count (spawning/removing as needed), leaving room for humans. Bots only spawn once the map's navmesh is built. |
 | `rtx_bot_alone` | `0` | Keep bots on the server even when **no humans** are connected (`0` = bots leave an empty server; `1` = they stay and play it out). |
 | `rtx_bot_skill` | `3` | Bot skill (0–7): tightens aim, speeds how fast a bot turns/tracks, widens its view cone, and shortens its reaction time. |
-| `rtx_bot_pacifist` | `0` | Make bots **not fight** in **any** mode — they just trail the nearest human around the map (for experimenting). `0` = bots play the mode normally. |
+| `rtx_bot_pacifist` | `0` | Make bots **not fight** outside Race — they just trail the nearest human around the map (for experimenting). Race bots always follow their checkpoint/finish route, which is already non-combat. `0` = bots play the mode normally. |
 | `rtx_bot_greed` | `1` | Let a fighting bot take **optional ordinary item detours** — a missing weapon or worthwhile health/armor swing. Critical local recovery and major objectives (quad/pent/ring and CTF runes) are never disabled by this cvar. |
 | `rtx_bot_fov` | `120` | View cone (full angle, degrees) within which a bot can **see** a target; widened with skill. A nominated enemy outside the cone (or behind cover) isn't engaged until seen, heard firing, or felt as damage. `0` = 360° sight (the old always-aware behavior). |
 | `rtx_bot_reaction` | `0.4` | Base **reaction delay** (seconds) a target must stay in sight before the bot acts on it; shortened with skill (floored so even skill 7 isn't instant). `0` = react instantly. |
@@ -176,7 +178,7 @@ through the same player-move code as humans, so gravity, stepping, and jumps com
 In open play each bot **hunts and frags the nearest player** — everyone's an enemy, so a
 bots-only server plays itself — pathing to them and, once in sight, aiming and shooting via the
 shared combat layer (retreating when hurt, grabbing items it passes over). Set `rtx_bot_pacifist 1`
-— in any mode — and they stop fighting and just tail the nearest human instead. With nothing to
+and, outside Race, they stop fighting and just tail the nearest human instead. With nothing to
 chase and no human to follow, a bot **roams** to a random reachable spot rather than standing on its
 spawn.
 

@@ -503,6 +503,13 @@ fn sense(game: &GameState, e: EntId) -> Sense {
     }
 }
 
+/// Whether a mode intent is indivisible and therefore forbids every item-plan detour. Race uses
+/// `Move(next checkpoint)`, so this is the small policy seam that keeps a stale backpack or queued
+/// pickup from surviving a restart and replacing the course objective.
+fn hard_mode_objective(intent: Option<BotIntent>) -> bool {
+    matches!(intent, Some(BotIntent::Move(_) | BotIntent::Spectate { .. }))
+}
+
 fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, client: i32) -> Objective {
     let host = *game.host();
     // Hook invariant net: if we're mid-hook but no longer hold the grapple (a mode loadout stripped
@@ -581,8 +588,9 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     let intent = if crate::mode::team::benched(game, e) {
         // Benched spectator (structured match, off the locked roster): stroll the stands, no fighting.
         Some(BotIntent::Move(crate::mode::wander_point(game, e, "info_player_deathmatch", |_| None)))
-    } else if host.cvar_bool(c"rtx_bot_pacifist") {
-        // Global override, any mode: don't fight — just tail the nearest human around the map.
+    } else if host.cvar_bool(c"rtx_bot_pacifist") && mode.allows_bot_pacifist_override() {
+        // Global override where the mode permits it: don't fight — just tail the nearest human.
+        // Race refuses this because its hard Move intent is the ordered checkpoint/finish route.
         polite = true;
         nearest_human(game, e).map(|h| BotIntent::Move(game.entities[h].v.origin))
     } else {
@@ -621,7 +629,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
 
     // A mode-issued Move/Spectate is a hard objective (flag running, race checkpoint, arena
     // audience). It supersedes an old item completion inherited from a previous Fight/idle frame.
-    if matches!(intent, Some(BotIntent::Move(_) | BotIntent::Spectate { .. })) {
+    if hard_mode_objective(intent) {
         let b = &mut game.entities[e].bot;
         b.goal.item = 0;
         b.goal.next_item = 0;
@@ -1694,6 +1702,18 @@ mod tests {
     use crate::bsp::Bsp;
     use crate::mode::team::MatchConfig;
     use crate::navmesh::NavGraph;
+
+    #[test]
+    fn hard_mode_objectives_forbid_item_detours() {
+        assert!(hard_mode_objective(Some(BotIntent::Move(Vec3::ZERO))));
+        assert!(hard_mode_objective(Some(BotIntent::Spectate {
+            goal: Vec3::ZERO,
+            watch: EntId(1),
+        })));
+        assert!(!hard_mode_objective(Some(BotIntent::Advance(Vec3::ZERO))));
+        assert!(!hard_mode_objective(Some(BotIntent::Fight(EntId(1)))));
+        assert!(!hard_mode_objective(None));
+    }
 
     /// The corridor scan (used pure, no NavGraph): a straight level corridor is all runway; a sharp
     /// bend or an ascending staircase truncates it; a lone step or a descent does not.

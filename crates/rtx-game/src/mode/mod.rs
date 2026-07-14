@@ -274,6 +274,13 @@ pub(crate) trait GameMode: Sync {
     /// check for a round end. Default: nothing.
     fn on_death(&self, _g: &mut GameState, _victim: EntId, _attacker: EntId) {}
 
+    /// May players create dropped backpack-like items in this mode? Covers the automatic death
+    /// backpack and the voluntary ammo/weapon toss commands. Default: yes. Race disables every
+    /// such drop so a failed run cannot leave loot behind as a distraction on the next attempt.
+    fn allows_item_drops(&self) -> bool {
+        true
+    }
+
     /// May a dead player respawn now via the death-think button press? A mode that drives
     /// respawns itself can return false. Default: yes (input-driven, as stock).
     fn allow_respawn(&self, _g: &GameState, _e: EntId) -> bool {
@@ -285,6 +292,13 @@ pub(crate) trait GameMode: Sync {
     /// to a spot); `None` leaves the default behavior in charge. Default: `None`.
     fn bot_intent(&self, _g: &mut GameState, _bot: EntId) -> Option<BotIntent> {
         None
+    }
+
+    /// May `rtx_bot_pacifist` replace this mode's bot intent with "follow the nearest human"?
+    /// Default: yes. Race disables the override because its checkpoint/finish route is already
+    /// pacifist and must remain the runner's sole strategic objective.
+    fn allows_bot_pacifist_override(&self) -> bool {
+        true
     }
 
     /// The active mode's own map-(re)load hook, run by [`on_worldspawn`] after the shared Arena /
@@ -299,8 +313,9 @@ pub(crate) trait GameMode: Sync {
     /// the Regeneration rune's periodic heal. Default: nothing.
     fn player_prethink(&self, _g: &mut GameState, _e: EntId) {}
 
-    /// The player's body is dying (`player_die`, after the backpack drop and before the corpse is
-    /// tossed). Used by CTF to drop the carried flag and any held runes. Default: nothing.
+    /// The player's body is dying (`player_die`, after any mode-permitted backpack drop and before
+    /// the corpse is tossed). Used by CTF to drop the carried flag and any held runes. Default:
+    /// nothing.
     fn player_died(&self, _g: &mut GameState, _e: EntId) {}
 
     /// Offer a pending player impulse to the mode; return `true` if the mode consumed it (skipping
@@ -639,7 +654,23 @@ pub(crate) fn wander_point(
 
 #[cfg(test)]
 mod tests {
-    use super::countdown_announce;
+    use super::{countdown_announce, select_mode};
+
+    #[test]
+    fn race_keeps_its_route_and_never_drops_items() {
+        let race = select_mode("race");
+        assert!(!race.allows_item_drops());
+        assert!(!race.allows_bot_pacifist_override());
+
+        for name in ["dm", "ra", "midair", "ctf"] {
+            let mode = select_mode(name);
+            assert!(mode.allows_item_drops(), "{name} should keep normal item drops");
+            assert!(
+                mode.allows_bot_pacifist_override(),
+                "{name} should keep the pacifist experiment"
+            );
+        }
+    }
 
     /// Each whole second of a countdown is announced exactly once (only while positive); the same
     /// second polled again yields nothing, and zero/negative print nothing (the caller owns "FIGHT!").

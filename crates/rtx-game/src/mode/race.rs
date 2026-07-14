@@ -64,6 +64,17 @@ impl GameMode for Race {
         true
     }
 
+    /// A death or toss must not leave loot on the course for a later attempt to notice.
+    fn allows_item_drops(&self) -> bool {
+        false
+    }
+
+    /// The route is already non-combat; even the global pacifist experiment must not replace it
+    /// with human-following and pull a runner away from the next checkpoint.
+    fn allows_bot_pacifist_override(&self) -> bool {
+        false
+    }
+
     fn tick(&self, g: &mut GameState) {
         // Build the navmesh even on a bot-less server — the routability report is this mode's
         // whole point and must not depend on rtx_bot_count. Idempotent once built.
