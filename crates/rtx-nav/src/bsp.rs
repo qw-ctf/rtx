@@ -194,10 +194,33 @@ struct LeafV2 {
     contents: i32,
 }
 
+/// A render-node child as a clipnode child: a leaf becomes its contents, a node stays an index
+/// (`Mod_MakeHull0`).
+fn leaf_or_node(child: i32, leaf_contents: &[i32]) -> i32 {
+    if child < 0 {
+        leaf_contents.get((-1 - child) as usize).copied().unwrap_or(CONTENTS_SOLID)
+    } else {
+        child
+    }
+}
+
 /// The subset of a parsed BSP the navmesh consumes.
 pub struct Bsp {
     pub planes: Vec<Plane>,
+    /// Hull 1's tree — the *standing player* hull, whose planes were beveled by the player box at
+    /// compile time.
     pub clipnodes: Vec<ClipNode>,
+    /// Hull 0's tree: the render nodes, rewritten into clipnode form (`Mod_MakeHull0`).
+    ///
+    /// Hull 0 is the **point** hull — no bevel, real surfaces — and it's the one to ask about
+    /// shooting: QuakeC's `traceline` passes a zero-size box, which `SV_HullForEntity` reads as hull
+    /// 0. Hull 1 is for *moving*. Answering sight from hull 1 has a bot believe every gap narrower
+    /// than itself is a wall; measured over real maps, that hides 39–84% of the sightlines that
+    /// genuinely exist (see `hull0_sees_further_than_hull1`).
+    ///
+    /// qbsp compiles four hulls: 0 a point, 1 the 32×32×56 player, 2 the 64×64×88 big monsters, 3
+    /// unused. Navigation and a deathmatch client need the first two, so those are what's here.
+    hull0_clipnodes: Vec<ClipNode>,
     /// `models[0].headnode[1]` — the world's hull-1 (player) clipnode tree root.
     pub hull1_headnode: i32,
     /// World model bounding box (float coords), the volume the navmesh voxelizes.
@@ -257,6 +280,19 @@ impl Bsp {
         }
         let world = *models.first()?;
 
+        // `Mod_MakeHull0`: the render tree, rewritten as clipnodes. A node child stays a node index;
+        // a leaf child becomes that leaf's *contents*, because that's what a clipnode leaf is.
+        let hull0_clipnodes = render_nodes
+            .iter()
+            .map(|n| ClipNode {
+                plane: n.plane,
+                children: [
+                    leaf_or_node(n.children[0], &leaf_contents),
+                    leaf_or_node(n.children[1], &leaf_contents),
+                ],
+            })
+            .collect();
+
         // Latin-1, not UTF-8: the entity string is bytes, and a mapper's name with a high-bit
         // character in it shouldn't cost us the whole map.
         let (eo, es) = (header.entities.offset as usize, header.entities.size as usize);
@@ -275,6 +311,7 @@ impl Bsp {
             maxs: world.maxs,
             entities,
             models,
+            hull0_clipnodes,
             render_nodes,
             leaf_contents,
             render_headnode: world.render_head,
@@ -326,9 +363,14 @@ impl Bsp {
     /// (`SV_HullPointContents`). Out-of-range indices in a malformed file resolve to
     /// `CONTENTS_SOLID` — conservative, and never panics (this runs inside the engine).
     pub fn hull_contents(&self, headnode: i32, p: Vec3) -> i32 {
+        self.contents_in(&self.clipnodes, headnode, p)
+    }
+
+    /// [`hull_contents`](Self::hull_contents) against an explicit tree.
+    fn contents_in(&self, nodes: &[ClipNode], headnode: i32, p: Vec3) -> i32 {
         let mut num = headnode;
         while num >= 0 {
-            let Some(node) = self.clipnodes.get(num as usize) else {
+            let Some(node) = nodes.get(num as usize) else {
                 return CONTENTS_SOLID;
             };
             let Some(plane) = self.planes.get(node.plane as usize) else {
@@ -369,6 +411,21 @@ impl Bsp {
     /// bouncing projectile can reflect off it. `fraction == 1` means the whole segment is clear.
     /// `start_solid` means `p1` was already inside solid. Pure over `planes`/`clipnodes`, no syscall.
     pub fn hull1_trace(&self, p1: Vec3, p2: Vec3) -> HullTrace {
+        self.trace_in(&self.clipnodes, self.hull1_headnode, p1, p2)
+    }
+
+    /// Trace the segment `p1 → p2` through the world's **point** hull (hull 0).
+    ///
+    /// This is what QuakeC's `traceline` does — it passes a zero-size box, and `SV_HullForEntity`
+    /// reads that as hull 0 — so it's the right question for line of sight, for "can I shoot from
+    /// here to there", and for anything else about a thing with no width. [`hull1_trace`] answers a
+    /// different question: would a *player* fit.
+    pub fn hull0_trace(&self, p1: Vec3, p2: Vec3) -> HullTrace {
+        self.trace_in(&self.hull0_clipnodes, self.render_headnode, p1, p2)
+    }
+
+    /// The body of both traces, over whichever tree.
+    fn trace_in(&self, nodes: &[ClipNode], headnode: i32, p1: Vec3, p2: Vec3) -> HullTrace {
         let mut trace = HullTrace {
             fraction: 1.0,
             endpos: p2,
@@ -376,13 +433,24 @@ impl Bsp {
             start_solid: false,
             all_solid: true,
         };
-        self.recursive_hull_check(self.hull1_headnode, 0.0, 1.0, p1, p2, &mut trace);
+        self.recursive_hull_check(nodes, headnode, headnode, 0.0, 1.0, p1, p2, &mut trace);
         trace
     }
 
     /// The recursion behind [`hull1_trace`] (`SV_RecursiveHullCheck`). Returns `true` while the
     /// segment stays out of solid; `false` once it records an impact.
-    fn recursive_hull_check(&self, num: i32, p1f: f32, p2f: f32, p1: Vec3, p2: Vec3, trace: &mut HullTrace) -> bool {
+    #[allow(clippy::too_many_arguments)]
+    fn recursive_hull_check(
+        &self,
+        nodes: &[ClipNode],
+        headnode: i32,
+        num: i32,
+        p1f: f32,
+        p2f: f32,
+        p1: Vec3,
+        p2: Vec3,
+        trace: &mut HullTrace,
+    ) -> bool {
         // Leaf: negative `num` is a CONTENTS_* value, not a node index.
         if num < 0 {
             if num != CONTENTS_SOLID {
@@ -392,7 +460,7 @@ impl Bsp {
             }
             return true;
         }
-        let Some(node) = self.clipnodes.get(num as usize) else {
+        let Some(node) = nodes.get(num as usize) else {
             trace.start_solid = true;
             return true;
         };
@@ -407,10 +475,10 @@ impl Bsp {
             (plane.normal.dot(p1) - plane.dist, plane.normal.dot(p2) - plane.dist)
         };
         if t1 >= 0.0 && t2 >= 0.0 {
-            return self.recursive_hull_check(node.children[0], p1f, p2f, p1, p2, trace);
+            return self.recursive_hull_check(nodes, headnode, node.children[0], p1f, p2f, p1, p2, trace);
         }
         if t1 < 0.0 && t2 < 0.0 {
-            return self.recursive_hull_check(node.children[1], p1f, p2f, p1, p2, trace);
+            return self.recursive_hull_check(nodes, headnode, node.children[1], p1f, p2f, p1, p2, trace);
         }
         // The segment crosses this plane — split it `DIST_EPSILON` onto the near side.
         let mut frac = if t1 < 0.0 {
@@ -423,12 +491,12 @@ impl Bsp {
         let mut mid = p1 + (p2 - p1) * frac;
         let side = usize::from(t1 < 0.0);
         // Walk the near side first.
-        if !self.recursive_hull_check(node.children[side], p1f, midf, p1, mid, trace) {
+        if !self.recursive_hull_check(nodes, headnode, node.children[side], p1f, midf, p1, mid, trace) {
             return false;
         }
         // If the far side isn't solid at the crossing, keep going into it.
-        if self.hull_contents(node.children[side ^ 1], mid) != CONTENTS_SOLID {
-            return self.recursive_hull_check(node.children[side ^ 1], midf, p2f, mid, p2, trace);
+        if self.contents_in(nodes, node.children[side ^ 1], mid) != CONTENTS_SOLID {
+            return self.recursive_hull_check(nodes, headnode, node.children[side ^ 1], midf, p2f, mid, p2, trace);
         }
         if trace.all_solid {
             return false; // never got out of the solid area
@@ -436,7 +504,7 @@ impl Bsp {
         // Impact: the far side is solid. Record the (segment-facing) plane normal.
         trace.plane_normal = if side == 0 { plane.normal } else { -plane.normal };
         // Back the impact point out of solid if the epsilon split left it just inside.
-        while self.hull_contents(self.hull1_headnode, mid) == CONTENTS_SOLID {
+        while self.contents_in(nodes, headnode, mid) == CONTENTS_SOLID {
             frac -= 0.1;
             if frac < 0.0 {
                 trace.fraction = midf;
@@ -534,6 +602,7 @@ mod tests {
             mins: Vec3::splat(-256.0),
             maxs: Vec3::splat(256.0),
             entities: String::new(),
+            hull0_clipnodes: Vec::new(),
             // One model (the world) and no submodels: this hull has no doors to be shaped like.
             models: vec![Model {
                 mins: Vec3::splat(-256.0),
@@ -570,6 +639,65 @@ mod tests {
         // Starting inside the solid half is flagged.
         let inside = bsp.hull1_trace(Vec3::new(150.0, 0.0, 0.0), Vec3::new(160.0, 0.0, 0.0));
         assert!(inside.start_solid);
+    }
+
+    /// Hull 0 and hull 1 answer different questions, and a real map is the only place to see it.
+    ///
+    /// Hull 1's planes were pushed out by the player box at compile time, so a *point* traced through
+    /// it is really asking "would a player fit". Hull 0 is the true surfaces. Anything about sight or
+    /// shooting is a hull-0 question — QuakeC's `traceline` passes a zero-size box, which
+    /// `SV_HullForEntity` reads as hull 0 — and answering it from hull 1 makes a bot believe every
+    /// gap narrower than a player is a wall.
+    #[test]
+    fn hull0_sees_further_than_hull1() {
+        let Ok(path) = std::env::var("RTX_TEST_BSP") else {
+            eprintln!("RTX_TEST_BSP not set; skipping");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read bsp");
+        let bsp = Bsp::parse(&bytes).expect("parse bsp");
+        assert!(!bsp.hull0_clipnodes.is_empty(), "hull 0 must have a tree of its own");
+
+        // Sample sightlines across the map and count how many each hull calls clear. Both are
+        // tracing the same segments; only the geometry differs.
+        let (mut clear0, mut clear1, mut sampled) = (0, 0, 0);
+        let span = bsp.maxs - bsp.mins;
+        let mut seed = 12345u32;
+        let mut rand = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / (1 << 24) as f32
+        };
+        for _ in 0..40_000 {
+            let a = bsp.mins + Vec3::new(rand(), rand(), rand()) * span;
+            let b = bsp.mins + Vec3::new(rand(), rand(), rand()) * span;
+            // Only sample from open air — a point inside rock says nothing about sightlines.
+            if bsp.hull_contents(bsp.hull1_headnode, a) == CONTENTS_SOLID {
+                continue;
+            }
+            sampled += 1;
+            clear0 += u32::from(bsp.hull0_trace(a, b).fraction >= 1.0);
+            clear1 += u32::from(bsp.hull1_trace(a, b).fraction >= 1.0);
+        }
+        eprintln!(
+            "{path}: of {sampled} sightlines, hull0 clear {clear0}, hull1 clear {clear1} \
+             (hull1 misses {:.0}%)",
+            100.0 * (clear0.saturating_sub(clear1)) as f32 / clear0.max(1) as f32
+        );
+
+        assert!(sampled > 100, "not enough open space sampled to conclude anything");
+        // The inflated hull can only ever block *more*: every one of its planes sits further into
+        // the open than the surface it came from.
+        assert!(
+            clear0 >= clear1,
+            "hull 0 must never see less than hull 1 — the player hull is the inflated one"
+        );
+        // And the difference is not academic: on a real map hull 1 refuses a large share of the
+        // sightlines that genuinely exist — half of them on catalyst — which is a bot declining
+        // shots it could take. Only assert that where enough sightlines exist to mean anything; a
+        // small, boxy map sampled this way yields a handful and proves nothing either way.
+        if clear0 > 10 {
+            assert!(clear0 > clear1, "the two hulls should visibly disagree on an open map");
+        }
     }
 
     /// The entity string is what a client spawns its shadow world from — no entities, no items, no

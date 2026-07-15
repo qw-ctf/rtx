@@ -153,18 +153,23 @@ impl GameState {
         true
     }
 
-    /// `SV_Move`, client side: trace a line against the map and the players in it.
+    /// `PF_traceline`, client side: trace a line against the map and the players in it.
     ///
-    /// Enough for what the brain asks of it — "can I see you", "is there a wall between us", "what
-    /// is under my feet". It knows about the world hull and player boxes, and deliberately not
-    /// about the rest: a client's entity picture is PVS-culled anyway, so a trace here is already a
-    /// question about what we can see.
+    /// Note *which* hull. QuakeC's `traceline` passes a zero-size box, which `SV_HullForEntity`
+    /// reads as hull 0 — the point hull, real surfaces. Hull 1's planes were pushed out by the
+    /// player box at compile time, so answering with it says "would a player fit" when the question
+    /// was "can I see". On catalyst that mistake hides **half** the sightlines that exist: a bot
+    /// that declines every shot through a gap narrower than itself.
+    ///
+    /// It knows about the world and the players in it, and deliberately nothing else: a client's
+    /// entity picture is PVS-culled anyway, so a trace here is already a question about what we can
+    /// see.
     pub(crate) fn client_traceline(&mut self, start: Vec3, end: Vec3, ignore: EntId) -> TraceResult {
         // The map lives on the host, not in `nav` — the navmesh is built *later*, from the world
         // this very trap helps spawn. Reading it from `nav.bsp` would make every trace during the
         // spawn hit a map that isn't loaded yet, and `droptofloor` would delete the map's items as
         // having "fallen out of the level".
-        let world = self.host.world_trace(start, end);
+        let world = self.host.world_trace_point(start, end);
 
         let mut best = TraceResult {
             allsolid: world.all_solid,
@@ -204,12 +209,20 @@ impl GameState {
 ///
 /// Quake doesn't trace boxes; it traces *points* through hulls whose planes were pushed out by a
 /// box's size at compile time. To move a box of your own, you offset into the hull that matches it.
-/// Which hull that is depends on the box's width — under 3 units is a point (hull 0), up to 32 the
-/// player hull (1), larger the crouch hull (2) — and we only have hull 1's clipnodes, which covers
-/// items and players. A wider entity traces a little small, which for a client that never moves one
-/// is a detail; it would matter to a server.
+/// qbsp compiles four, chosen by the box's width:
+///
+/// | hull | box | what uses it |
+/// |---|---|---|
+/// | 0 | a point | shooting, sight — anything with no width |
+/// | 1 | 32×32×56 | players, and everything player-sized: items, packs |
+/// | 2 | 64×64×88 | the big monsters (a shambler) |
+/// | 3 | — | unused by Quake |
+///
+/// We carry hulls 0 and 1, which is every question a deathmatch client asks: nothing here is
+/// shambler-sized, and hull 3 doesn't exist. A wider entity would trace a little small — a detail
+/// for a client that never moves one, and a bug for a server.
 fn hull_offset(mins: Vec3, maxs: Vec3) -> Vec3 {
-    let _ = maxs; // hull choice is by width alone, but the box is what's being mapped
+    let _ = maxs; // the hull is chosen by width, but it's the box's mins the offset maps
     crate::defs::VEC_HULL_MIN - mins
 }
 

@@ -206,9 +206,13 @@ pub(crate) trait ClientHost {
     fn infokey<'b>(&self, ent: EntId, key: &CStr, buf: &'b mut [u8]) -> &'b str;
     /// Point contents at `p`, from the map's render hull — the liquids the clip hull can't see.
     fn pointcontents(&self, p: Vec3) -> f32;
-    /// Trace a point through the map's player hull. The host owns the map, so it owns this — and it
-    /// must answer from the moment a map is bound, because the world is *spawned* against it.
+    /// Trace through the map's **player** hull (hull 1) — "would a player fit". The host owns the
+    /// map, so it owns this, and it must answer from the moment a map is bound, because the world is
+    /// *spawned* against it.
     fn world_trace(&self, start: Vec3, end: Vec3) -> rtx_nav::bsp::HullTrace;
+    /// Trace through the map's **point** hull (hull 0) — "is there anything in the way". What
+    /// QuakeC's `traceline` asks, and the right question for sight and for shooting.
+    fn world_trace_point(&self, start: Vec3, end: Vec3) -> rtx_nav::bsp::HullTrace;
     /// The bounds of inline submodel `n` — the shape of a door, plat or trigger.
     fn submodel_bounds(&self, n: usize) -> Option<(Vec3, Vec3)>;
     /// Read a whole file, searching the gamedir then the base game.
@@ -267,11 +271,20 @@ impl HostApi {
         Self { backend: Backend::Client(host), ents }
     }
 
-    /// Trace through the map, client-side. See [`ClientHost::world_trace`].
+    /// Trace the player hull, client-side. See [`ClientHost::world_trace`].
     #[cfg(feature = "netclient")]
     pub(crate) fn world_trace(&self, start: Vec3, end: Vec3) -> rtx_nav::bsp::HullTrace {
         match self.backend {
             Backend::Client(c) => c.world_trace(start, end),
+            Backend::Pr2(_) => unreachable!("client-only: a server traces through its own engine"),
+        }
+    }
+
+    /// Trace the point hull, client-side. See [`ClientHost::world_trace_point`].
+    #[cfg(feature = "netclient")]
+    pub(crate) fn world_trace_point(&self, start: Vec3, end: Vec3) -> rtx_nav::bsp::HullTrace {
+        match self.backend {
+            Backend::Client(c) => c.world_trace_point(start, end),
             Backend::Pr2(_) => unreachable!("client-only: a server traces through its own engine"),
         }
     }

@@ -251,6 +251,20 @@ impl NetHost {
     }
 }
 
+/// The answer when there's no map: everything is solid.
+///
+/// Fail closed, deliberately. A clear line would have the caller believe it can see through the
+/// world, and `droptofloor` believe every item in the map is floating in space — which deletes them.
+fn no_map(start: Vec3) -> rtx_nav::bsp::HullTrace {
+    rtx_nav::bsp::HullTrace {
+        all_solid: true,
+        start_solid: true,
+        fraction: 0.0,
+        endpos: start,
+        plane_normal: Vec3::ZERO,
+    }
+}
+
 /// The characters that are a token all by themselves, even with no space around them
 /// (`COM_Parse`). `{` and `}` are the ones that matter — they delimit every entity block.
 const PUNCTUATION: [char; 6] = ['{', '}', '(', ')', '\'', ':'];
@@ -364,19 +378,19 @@ impl ClientHost for NetHost {
     }
 
     fn world_trace(&self, start: Vec3, end: Vec3) -> rtx_nav::bsp::HullTrace {
+        // Hull 1 is the standing-player hull, beveled by the player box at compile time — so a
+        // *point* traced through it answers "would a player fit".
         match self.bsp.borrow().as_ref() {
-            // Hull 1 is the standing-player hull, beveled by the player box at compile time — so a
-            // *point* traced through it answers "would a player fit".
             Some(bsp) => bsp.hull1_trace(start, end),
-            // No map: fail closed. A clear line would have the caller believe it can see through
-            // the world, and `droptofloor` believe every item is floating in space.
-            None => rtx_nav::bsp::HullTrace {
-                all_solid: true,
-                start_solid: true,
-                fraction: 0.0,
-                endpos: start,
-                plane_normal: Vec3::ZERO,
-            },
+            None => no_map(start),
+        }
+    }
+
+    fn world_trace_point(&self, start: Vec3, end: Vec3) -> rtx_nav::bsp::HullTrace {
+        // Hull 0 is the real surfaces — what a bullet or a sightline meets.
+        match self.bsp.borrow().as_ref() {
+            Some(bsp) => bsp.hull0_trace(start, end),
+            None => no_map(start),
         }
     }
 
