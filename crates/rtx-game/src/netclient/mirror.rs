@@ -29,7 +29,8 @@ use glam::Vec3;
 use rtx_proto::protocol::stat;
 use rtx_proto::svc::{PlayerInfo, SvcEvent};
 
-use crate::defs::{Bits, DeadFlag, Flags, Items, MoveType, Solid, Weapon};
+use crate::bot::model::PickupKind;
+use crate::defs::{Bits, DeadFlag, Effects, Flags, Items, MoveType, Solid, Weapon};
 use crate::entity::{EntId, Entity, Touch};
 use crate::game::GameState;
 use crate::netclient::frames::EntityState;
@@ -48,7 +49,6 @@ struct Tracked {
 }
 
 /// Everything the mirror remembers between frames, per connection.
-#[derive(Default)]
 pub(crate) struct Mirror {
     /// Our own player slot, once the server has told us.
     playernum: u8,
@@ -62,10 +62,38 @@ pub(crate) struct Mirror {
     brushes: std::collections::HashMap<usize, EntId>,
     /// Networked entities we're mirroring into their own slots, by server entity number.
     tracked: std::collections::HashMap<u16, Tracked>,
+    /// The sound list. `svc_sound` carries an index into it, and the *name* is what says whether we
+    /// just heard a rocket launcher or a footstep — so the bot's ears are downstream of this.
+    sounds: Vec<String>,
+    /// Who we last believed was alive, so a death is noticed as it happens. `PF_DEAD` is on the
+    /// wire and authoritative — far better evidence than reading the obituary, and it works on any
+    /// mod, whatever it calls the message.
+    alive: [bool; 32],
+    /// Who we last saw glowing, and in which colour, so a powerup is noticed the moment it lights up
+    /// rather than every frame it stays lit.
+    glowing: [Effects; 32],
     /// How many projectiles we've ever seen fly, and the most at once. A path that never runs looks
     /// exactly like one with nothing to do — this tells them apart.
     pub(crate) projectiles_seen: u32,
     pub(crate) projectiles_peak: usize,
+}
+
+impl Default for Mirror {
+    fn default() -> Self {
+        Mirror {
+            playernum: 0,
+            stats: [0; stat::COUNT],
+            embodied: false,
+            items: Vec::new(),
+            brushes: Default::default(),
+            tracked: Default::default(),
+            sounds: Vec::new(),
+            alive: [false; 32],
+            glowing: [Effects::empty(); 32],
+            projectiles_seen: 0,
+            projectiles_peak: 0,
+        }
+    }
 }
 
 impl Mirror {
@@ -97,6 +125,34 @@ impl Mirror {
                 self.write_own_stats(game);
             }
             SvcEvent::PlayerInfo(pi) => self.write_player(game, pi),
+            // The bot's ears. Sounds carry by PHS rather than PVS — you hear things through walls,
+            // which is the whole point of listening — so this reaches further than sight, and is
+            // exactly what a player works from when they say "he's got the rocket launcher".
+            SvcEvent::Sound { entity, sound, origin, .. } => {
+                let name = self.sounds.get(*sound as usize).map(String::as_str).unwrap_or("");
+                if let Some(weapon) = super::adapters::fire_sound(name) {
+                    let e = EntId(*entity as u32);
+                    if is_player_slot(game, e) {
+                        game.client_heard_fire(e, weapon, *origin);
+                    }
+                }
+            }
+            // Being shot. Tells us someone's there and roughly where — a bearing, not a position.
+            SvcEvent::Damage { armor, blood, from } => {
+                let e = self.own();
+                if game.entities[e].in_use {
+                    game.client_felt_damage(e, *from, *armor as f32, *blood as f32);
+                }
+            }
+            SvcEvent::SoundList(list) => {
+                // Index 0 is a placeholder the server never sends; pad so the indices line up, or
+                // every sound is named as the one before it.
+                if self.sounds.is_empty() {
+                    self.sounds.push(String::new());
+                }
+                self.sounds.truncate((list.start as usize).max(1));
+                self.sounds.extend_from_slice(&list.names);
+            }
             SvcEvent::UpdateUserinfo { player, userinfo, .. } => {
                 self.write_userinfo(game, *player, userinfo)
             }
@@ -160,6 +216,13 @@ impl Mirror {
         let e = self.own();
         let health = self.stat(stat::HEALTH);
         let items = Items::from_bits_truncate(self.stat(stat::ITEMS) as u32);
+
+        // A powerup's countdown isn't on the wire — only the bit. The moment it appears is the
+        // moment it started, so the *rise* is the event and the previous value is needed to see it.
+        let before = Items::from_bits_truncate(game.entities[e].v.items as u32);
+        if before != items {
+            game.client_note_own_powerups(e, before, items);
+        }
 
         let v = &mut game.entities[e].v;
         v.health = health as f32;
@@ -232,6 +295,35 @@ impl Mirror {
                 // decimal point on it.
                 v.health = if pi.dead() { 0.0 } else { 100.0 };
             }
+        }
+
+        // A powerup is not a secret: the quad glows blue and the pentagram red, and `svc_playerinfo`
+        // carries the effect bits, so a bot learns who has one the same way a player does — by
+        // looking at them. Noting the moment it appears is what dates the ~30s window.
+        if !own {
+            let glow = Effects::from_bits_truncate(pi.effects.unwrap_or(0) as u32);
+            let known = &mut self.glowing[pi.player as usize % 32];
+            for (bit, kind) in [
+                (Effects::BLUE, PickupKind::Quad),
+                (Effects::RED, PickupKind::Pent),
+            ] {
+                let lit = glow.contains(bit);
+                if lit && !known.contains(bit) {
+                    game.client_saw_pickup(e, kind);
+                }
+                known.set(bit, lit);
+            }
+        }
+
+        // A death is the one moment an estimate stops being a guess: whoever that was is about to be
+        // a fresh spawn, so everything we believed about how hurt they were is void. Noticing the
+        // *transition* is what makes it an event rather than a state.
+        if let Some(was) = self.alive.get_mut(pi.player as usize) {
+            let now_alive = !pi.dead();
+            if *was && !now_alive {
+                game.client_saw_death(e);
+            }
+            *was = now_alive;
         }
 
         // Water is not on the wire either, but it's not a secret: anyone can see where the water is.
@@ -635,6 +727,15 @@ impl Mirror {
             .filter(|(e, _)| game.entities[*e].think == crate::entity::Think::SubRegen)
             .count();
         (up, waiting, self.tracked.len())
+    }
+
+    /// What we believe about everyone, into the fields a stray direct read would find. Called once
+    /// per frame, before the brain runs.
+    pub(crate) fn write_estimates(&mut self, game: &mut GameState) {
+        let e = self.own();
+        if game.entities[e].in_use {
+            game.client_write_enemy_estimates(e);
+        }
     }
 
     /// Note the map's items, so their absence can be reasoned about. Called once per map, after the

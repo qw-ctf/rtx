@@ -42,6 +42,7 @@
 //! writes network truth into the entities the brain reads — is the next milestone, and until it
 //! lands the bots have nothing to think about, so `--spectate` is the honest way to run this.
 
+pub(crate) mod adapters;
 pub mod config;
 pub(crate) mod frames;
 pub(crate) mod host;
@@ -55,6 +56,7 @@ use std::time::{Duration, Instant};
 pub use config::{parse as parse_args, Config, USAGE};
 use rtx_proto::info::UserinfoBuilder;
 use rtx_proto::svc::SvcEvent;
+use crate::entity::EntId;
 use frames::EntityState;
 use mirror::Mirror;
 use session::{Session, Signon};
@@ -244,8 +246,11 @@ impl Client {
         //    items are actually there.
         self.mirror_entities();
 
-        // 6. Drive the bots. The same `run_bots` the server calls, over the same world — it has no
-        //    idea it isn't one. Needs a navmesh, which it checks for itself.
+        // 6. Fold in what we believe about everyone, then drive the bots. The same `run_bots` the
+        //    server calls, over the same world — it has no idea it isn't one.
+        for m in &mut self.mirrors {
+            m.write_estimates(&mut self.game);
+        }
         crate::bot::run_bots(&mut self.game);
         self.measure_travel();
 
@@ -256,6 +261,7 @@ impl Client {
         //    emitted nothing (no navmesh yet, or still connecting) still sends: the server needs a
         //    packet from us to not time us out, and the netchan needs one to carry signon replies.
         let cmds = self.host.take_cmds();
+        let mut fired: Vec<EntId> = Vec::new();
         for (i, s) in self.sessions.iter_mut().enumerate() {
             if s.signon() == Signon::Disconnected {
                 continue;
@@ -266,10 +272,21 @@ impl Client {
             }
             let client = s.playernum() as i32 + 1;
             match cmds.iter().find(|c| c.client == client) {
-                Some(c) => s.send_move(c.angles, c.forward, c.side, c.up, c.buttons as u8, c.impulse as u8)?,
+                Some(c) => {
+                    // Nothing tells a client when its own gun is ready — the server owns
+                    // `attack_finished` and never sends it. But we know what we fired and when we
+                    // pressed, and the delay is the table the server fires by.
+                    if c.buttons & rtx_proto::clc::button::ATTACK as i32 != 0 {
+                        fired.push(EntId(client as u32));
+                    }
+                    s.send_move(c.angles, c.forward, c.side, c.up, c.buttons as u8, c.impulse as u8)?
+                }
                 None => s.send_move(glam::Vec3::ZERO, 0, 0, 0, 0, 0)?,
             }
             let _ = i;
+        }
+        for e in fired {
+            self.game.client_note_own_fire(e);
         }
         Ok(())
     }
