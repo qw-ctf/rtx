@@ -82,6 +82,35 @@ impl GameState {
         (self.level.deathmatch != 2).then_some(base)
     }
 
+    /// How long until an item of this kind comes back, without having to pick it up to find out.
+    ///
+    /// The pickup handlers below each know their own delay, which is fine when you're the server and
+    /// the item is in your hand. A **client** watching an item vanish across the map has to work it
+    /// out from what it can see — the classname and the deathmatch mode — so the rule lives here,
+    /// beside the handlers, rather than being copied somewhere it would quietly drift out of step.
+    ///
+    /// `None` means it isn't coming back on a timer (deathmatch 2, or a megahealth, which rots
+    /// rather than respawns).
+    pub(crate) fn respawn_delay_of(&self, classname: &str) -> Option<f32> {
+        let dm = self.level.deathmatch;
+        match classname {
+            // Weapons stay put in dm 3/5, so there's nothing to wait for; elsewhere they're quick.
+            c if c.starts_with("weapon_") => {
+                if dm == 3 || dm == 5 {
+                    Some(15.0)
+                } else {
+                    self.respawn_delay(30.0)
+                }
+            }
+            "item_artifact_invulnerability" => Some(60.0 * 5.0),
+            c if c.starts_with("item_artifact_") => Some(60.0),
+            // A megahealth rots back down instead of respawning, and when it returns is a function
+            // of how much over-health the taker had left — not knowable from outside.
+            "item_health" => self.respawn_delay(20.0),
+            _ => self.respawn_delay(20.0),
+        }
+    }
+
     /// Schedule an item respawn (`SUB_regen`) after `delay`, then fire targets.
     fn pickup_finish(&mut self, e: EntId, other: EntId, delay: Option<f32>) {
         self.pickup_hide(e);

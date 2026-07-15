@@ -55,6 +55,7 @@ use std::time::{Duration, Instant};
 pub use config::{parse as parse_args, Config, USAGE};
 use rtx_proto::info::UserinfoBuilder;
 use rtx_proto::svc::SvcEvent;
+use frames::EntityState;
 use mirror::Mirror;
 use session::{Session, Signon};
 
@@ -239,12 +240,16 @@ impl Client {
             self.game.ensure_navmesh();
         }
 
-        // 5. Drive the bots. The same `run_bots` the server calls, over the same world — it has no
+        // 5. Fold this frame's entities in — the rockets in the air, the doors that moved, which
+        //    items are actually there.
+        self.mirror_entities();
+
+        // 6. Drive the bots. The same `run_bots` the server calls, over the same world — it has no
         //    idea it isn't one. Needs a navmesh, which it checks for itself.
         crate::bot::run_bots(&mut self.game);
         self.measure_travel();
 
-        // 6. Send. Once a bot is embodied this carries its usercmd; until then it is the keepalive
+        // 7. Send. Once a bot is embodied this carries its usercmd; until then it is the keepalive
         //    that stops the server timing us out, and the carrier the netchan needs to get the
         //    reliable signon messages out.
         //    Whatever the brain emitted for each bot this frame becomes that bot's move. A bot that
@@ -291,6 +296,11 @@ impl Client {
             self.game.entities[crate::entity::EntId(i)] = crate::entity::Entity::default();
         }
         self.game.spawn_shadow_world();
+        // The items are what the mirror reasons about the *absence* of, so it has to know where
+        // they all are before the first frame lands.
+        for m in &mut self.mirrors {
+            m.index_items(&self.game);
+        }
 
         // The counts are the shadow world's proof of life, and worth printing rather than trusting:
         // if `droptofloor` misfires, items are *deleted* as having fallen out of the level, and a
@@ -311,6 +321,33 @@ impl Client {
             "rtx-client: world: {map} — {} entities, {items} items, {spawns} spawn points",
             self.game.entities.live().count(),
         );
+    }
+
+    /// Fold every bot's view of this frame into the one shared world.
+    ///
+    /// A squad is several clients watching the same game from different places, so each sees a
+    /// different subset — the server culls what it sends by what you could see. The **union** is
+    /// what the team collectively knows, which is exactly what the bots share inside qwprogs, and
+    /// taking any one bot's view alone would have the others forget everything they can't see.
+    fn mirror_entities(&mut self) {
+        let mut seen: Vec<EntityState> = Vec::new();
+        for s in &self.sessions {
+            for e in s.frames.current() {
+                if !seen.iter().any(|x| x.number == e.number) {
+                    seen.push(*e);
+                }
+            }
+        }
+        // The model list names what each entity is; it's per map, and identical across a squad.
+        let models: Vec<String> = self.sessions.first().map(|s| s.models().to_vec()).unwrap_or_default();
+        if models.is_empty() {
+            return;
+        }
+        // One mirror does the shared world (they'd otherwise fight over it); the rest keep only
+        // their own body and stats, which they already did on the way in.
+        if let Some(m) = self.mirrors.first_mut() {
+            m.apply_frame(&mut self.game, &seen, &models);
+        }
     }
 
     /// Track how far each bot has moved.
@@ -378,6 +415,12 @@ impl Client {
                 ent.v.health,
                 ent.v.armorvalue,
                 ent.v.frags,
+            );
+            let (up, waiting, tracked) = self.mirrors[i].census(&self.game);
+            eprintln!("rtx-client:      items: {up} up, {waiting} timed; {tracked} tracked now");
+            eprintln!(
+                "rtx-client:      projectiles: {} seen in flight (peak {} at once)",
+                self.mirrors[i].projectiles_seen, self.mirrors[i].projectiles_peak,
             );
         }
     }

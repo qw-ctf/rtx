@@ -30,13 +30,21 @@ use rtx_proto::protocol::stat;
 use rtx_proto::svc::{PlayerInfo, SvcEvent};
 
 use crate::defs::{Bits, DeadFlag, Flags, Items, MoveType, Solid, Weapon};
-use crate::entity::{EntId, Entity};
+use crate::entity::{EntId, Entity, Touch};
 use crate::game::GameState;
+use crate::netclient::frames::EntityState;
 
 /// The wire's player slot as an entity id. Slots are 0-based; entity 0 is the world, so players
 /// start at 1.
 fn slot_to_ent(slot: u8) -> EntId {
     EntId(slot as u32 + 1)
+}
+
+/// A networked entity we're tracking, and when we last saw it.
+struct Tracked {
+    origin: Vec3,
+    #[allow(dead_code)]
+    seen: f32,
 }
 
 /// Everything the mirror remembers between frames, per connection.
@@ -48,6 +56,16 @@ pub(crate) struct Mirror {
     stats: [i32; stat::COUNT],
     /// Whether our body has been set up as a bot the brain will drive.
     embodied: bool,
+    /// The map's items and where they live, so their *absence* can be reasoned about.
+    items: Vec<(EntId, Vec3)>,
+    /// Submodel index → the shadow entity we spawned from it, so a moving door finds its twin.
+    brushes: std::collections::HashMap<usize, EntId>,
+    /// Networked entities we're mirroring into their own slots, by server entity number.
+    tracked: std::collections::HashMap<u16, Tracked>,
+    /// How many projectiles we've ever seen fly, and the most at once. A path that never runs looks
+    /// exactly like one with nothing to do — this tells them apart.
+    pub(crate) projectiles_seen: u32,
+    pub(crate) projectiles_peak: usize,
 }
 
 impl Mirror {
@@ -287,6 +305,355 @@ impl Mirror {
         ent.mode_p.team = team_id(info.get("team").unwrap_or(""));
     }
 }
+
+/// What a networked entity turned out to be.
+///
+/// The wire says only "entity 43, model 17, here". Everything else — is that a rocket, is that the
+/// red armour, is that the door — is inference from the model's *name*, which is why the model list
+/// matters as much as the entity list.
+enum Kind {
+    /// Part of the level: a door, a plat, a trigger. `"*3"` — we have a shadow twin of it already,
+    /// and the wire is telling us where it has moved to.
+    Brush(usize),
+    /// Something that flies and hurts.
+    Projectile(Touch),
+    /// A dead player's dropped weapon and ammo.
+    Backpack,
+    /// Decoration: gibs, blood, the player models we already track through `svc_playerinfo`.
+    Ignore,
+}
+
+/// Read an entity's model name as what the entity *is*.
+fn classify(model: &str) -> Kind {
+    if let Some(n) = model.strip_prefix('*').and_then(|n| n.parse().ok()) {
+        return Kind::Brush(n);
+    }
+    match model {
+        "progs/missile.mdl" => Kind::Projectile(Touch::Missile),
+        "progs/grenade.mdl" => Kind::Projectile(Touch::Grenade),
+        "progs/spike.mdl" => Kind::Projectile(Touch::Spike),
+        "progs/s_spike.mdl" => Kind::Projectile(Touch::SuperSpike),
+        "progs/backpack.mdl" => Kind::Backpack,
+        _ => Kind::Ignore,
+    }
+}
+
+/// How long a grenade burns before it goes off. The wire never says — a grenade looks like any
+/// other model — so the fuse is counted from when we first saw it, which is what a player does.
+const GRENADE_FUSE: f32 = 2.5;
+
+/// How close a networked entity must be to a shadow item to *be* that item. Items don't move, so
+/// this only has to absorb the difference between where the mapper put it and where it settled.
+const ITEM_MATCH_DIST: f32 = 48.0;
+
+/// Beyond this, an item's absence says nothing: it's out of the server's PVS and simply isn't being
+/// sent, whether it's there or not.
+const ITEM_SIGHT_RANGE: f32 = 2000.0;
+
+/// What this frame said about one item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Evidence {
+    /// We can see it. It's there.
+    Present,
+    /// We can see where it lives, and it isn't there. Someone took it.
+    Taken,
+    /// We couldn't have seen it either way, so this frame says nothing about it.
+    Unknown,
+}
+
+/// What to conclude about an item, given what we saw and whether we *could* have seen it.
+///
+/// Split out from the looking so the rule can be read on its own, because the rule is the whole
+/// point: presence is proof, and absence is proof only when we had a clear look at the spot. Anything
+/// else is a guess, and a bot that guesses about items is a bot that walks across the map for
+/// nothing — or, worse, one that knows where the quad is without anybody having gone to check.
+fn item_evidence(visible_now: bool, in_range: bool, clear_line: bool) -> Evidence {
+    if visible_now {
+        Evidence::Present
+    } else if in_range && clear_line {
+        Evidence::Taken
+    } else {
+        Evidence::Unknown
+    }
+}
+
+impl Mirror {
+    /// Fold this frame's entities into the world.
+    ///
+    /// Called once per frame with the union of what every bot can see — a squad shares one world, so
+    /// an item one bot can see is an item they all know about, exactly as it is inside qwprogs.
+    pub(crate) fn apply_frame(&mut self, game: &mut GameState, seen: &[EntityState], models: &[String]) {
+        let now = game.time();
+        let name = |m: u16| models.get(m as usize).map(String::as_str).unwrap_or("");
+
+        // Anything we tracked last frame and don't see now is gone — a rocket that hit something, a
+        // grenade that went off. Retire them before the new set lands.
+        self.retire_unseen(game, seen);
+
+        for e in seen {
+            match classify(name(e.model)) {
+                Kind::Brush(n) => self.write_brush(game, n, e),
+                Kind::Projectile(touch) => self.write_projectile(game, e, touch, now),
+                Kind::Backpack => self.write_backpack(game, e),
+                Kind::Ignore => {}
+            }
+        }
+        self.write_item_presence(game, seen, models, now);
+        self.projectiles_peak = self.projectiles_peak.max(self.tracked.len());
+    }
+
+    /// A piece of the level that has moved: a door opening, a plat rising.
+    ///
+    /// We spawned a twin of it from the map, so it already knows what it is and where it belongs;
+    /// all the wire adds is where it is *now*. Matching is by submodel index, which
+    /// `client_set_model` parked in `modelindex` for exactly this.
+    fn write_brush(&mut self, game: &mut GameState, submodel: usize, e: &EntityState) {
+        let Some(twin) = self.brush_twin(game, submodel) else { return };
+        game.set_origin(twin, e.origin);
+        game.entities[twin].v.angles = e.angles;
+    }
+
+    /// The shadow entity built from submodel `n`, if the map had one.
+    fn brush_twin(&mut self, game: &GameState, submodel: usize) -> Option<EntId> {
+        if let Some(&e) = self.brushes.get(&submodel) {
+            return Some(e);
+        }
+        let found = game
+            .entities
+            .live()
+            .find(|(_, x)| x.v.modelindex == submodel as f32 && x.v.solid != Solid::Trigger)
+            .map(|(i, _)| i)?;
+        self.brushes.insert(submodel, found);
+        Some(found)
+    }
+
+    /// Something in flight.
+    ///
+    /// Velocity isn't sent — a client sees a rocket's *position*, once per frame, like everyone
+    /// else — so it's differenced from where the thing was last frame. That's a frame behind, which
+    /// is exactly how far behind a player's read of it is too.
+    fn write_projectile(&mut self, game: &mut GameState, e: &EntityState, touch: Touch, now: f32) {
+        let slot = EntId(e.number as u32);
+        let first = !self.tracked.contains_key(&e.number);
+        let previous = self.tracked.get(&e.number).map(|t| t.origin);
+
+        let ent = &mut game.entities[slot];
+        if first {
+            *ent = Entity::default();
+            ent.in_use = true;
+            ent.v.movetype = MoveType::FlyMissile;
+            ent.v.solid = Solid::BBox;
+            ent.set_touch(touch);
+            // A grenade's fuse starts when we first see it. A rocket has no fuse; a nail has none
+            // that matters.
+            if touch == Touch::Grenade {
+                ent.classname = Some("grenade".into());
+                ent.think = crate::entity::Think::GrenadeExplode;
+                ent.v.nextthink = now + GRENADE_FUSE;
+            }
+        }
+        if first {
+            self.projectiles_seen += 1;
+        }
+        ent.v.origin = e.origin;
+        ent.v.angles = e.angles;
+        ent.v.modelindex = e.model as f32;
+        ent.combat.voided = 0.0;
+
+        // Differenced velocity. A first sighting has nothing to difference against, so a rocket's
+        // heading is taken from its angles — it flies where it points — which beats claiming it's
+        // stationary for the one frame that matters most.
+        let dt = game.globals.frametime.max(1e-3);
+        ent.v.velocity = match previous {
+            Some(p) if p != e.origin => (e.origin - p) / dt,
+            _ if touch == Touch::Missile => {
+                let (fwd, _, _) = crate::math::angle_vectors(e.angles);
+                fwd * ROCKET_SPEED
+            }
+            _ => ent.v.velocity,
+        };
+        game.link_edict(slot);
+        self.tracked.insert(e.number, Tracked { origin: e.origin, seen: now });
+    }
+
+    /// A dead player's dropped kit.
+    ///
+    /// It's mirrored as a real entity so it exists to be seen and walked over, but deliberately not
+    /// made a *goal*: what's inside is not on the wire, and a bot that pathed to a pack knowing what
+    /// it held would know something it has no way of knowing. Reasoning about that from evidence —
+    /// who died there, and what we last saw them holding — is the opponent model's business.
+    fn write_backpack(&mut self, game: &mut GameState, e: &EntityState) {
+        let slot = EntId(e.number as u32);
+        if !self.tracked.contains_key(&e.number) {
+            let ent = &mut game.entities[slot];
+            *ent = Entity::default();
+            ent.in_use = true;
+            ent.set_touch(Touch::Backpack);
+            ent.v.solid = Solid::Not; // present, but not a goal — see above
+            ent.v.mins = Vec3::new(-16.0, -16.0, 0.0);
+            ent.v.maxs = Vec3::new(16.0, 16.0, 56.0);
+        }
+        game.entities[slot].v.origin = e.origin;
+        game.link_edict(slot);
+        self.tracked.insert(e.number, Tracked { origin: e.origin, seen: game.time() });
+    }
+
+    /// Which of the map's items are actually there.
+    ///
+    /// The shadow world spawns every item the map has, all of them available, because that's the
+    /// state a map file describes. The server then never mentions an item again until someone can
+    /// see it — so *presence* is easy and *absence* is the interesting half.
+    ///
+    /// An absent item is only known taken if we'd have seen it: within range, and with a clear line
+    /// to where it should be. That's the same thing a player knows — you looked at the spot and the
+    /// armour wasn't there — and it's why a bot can't tell whether the quad across the map is up
+    /// until someone goes and looks.
+    fn write_item_presence(&mut self, game: &mut GameState, seen: &[EntityState], models: &[String], now: f32) {
+        // What's visibly present this frame: anything that isn't level brushwork, a projectile or a
+        // pack, standing where an item lives.
+        //
+        // Deliberately *not* filtered by model name. An item is not necessarily a `progs/*.mdl` —
+        // Quake ships health and ammo boxes as brush models in their own `.bsp` files
+        // (`maps/b_bh25.bsp`, `maps/b_rock0.bsp`), which look nothing like the armour beside them.
+        // Requiring a name pattern silently declared every health box on the map taken. Position is
+        // the reliable signal: items don't move, so anything standing exactly where one lives almost
+        // certainly is one. A stray gib landing on a spawn can say "up" when it isn't, which costs a
+        // bot a walk to go and look — the opposite mistake sends it away from an item that's there.
+        let mut present: Vec<Vec3> = Vec::new();
+        for e in seen {
+            let name = models.get(e.model as usize).map(String::as_str).unwrap_or("");
+            if matches!(classify(name), Kind::Ignore) {
+                present.push(e.origin);
+            }
+        }
+
+        let eyes = self.eye_position(game);
+        for idx in 0..self.items.len() {
+            let (item, home) = self.items[idx];
+            let visible_now = present.iter().any(|p| p.distance(home) < ITEM_MATCH_DIST);
+
+            // Only pay for a trace when the answer could change anything.
+            let (in_range, clear_line) = match (visible_now, eyes) {
+                (false, Some(eyes)) if eyes.distance(home) <= ITEM_SIGHT_RANGE => {
+                    let to = home + Vec3::new(0.0, 0.0, 24.0);
+                    (true, game.client_traceline(eyes, to, self.own()).fraction >= 1.0)
+                }
+                _ => (false, false),
+            };
+
+            match item_evidence(visible_now, in_range, clear_line) {
+                Evidence::Present => self.restore_item(game, item),
+                Evidence::Taken => self.take_item(game, item, now),
+                // Nothing seen either way — but a timer we started earlier can still come due.
+                // That's *item timing*: we watched it go, we know the rule the server brings it back
+                // by, so we know when to be there. An expectation, not a fact: the moment we can see
+                // the spot again, what's actually there wins.
+                Evidence::Unknown => self.expect_respawn(game, item, now),
+            }
+        }
+    }
+
+    /// Bring an item back on schedule, if its timer has come due.
+    fn expect_respawn(&mut self, game: &mut GameState, item: EntId, now: f32) {
+        let ent = &mut game.entities[item];
+        if ent.think == crate::entity::Think::SubRegen && ent.v.nextthink <= now {
+            ent.v.solid = Solid::Trigger;
+            ent.think = crate::entity::Think::None;
+            ent.v.nextthink = 0.0;
+        }
+    }
+
+    /// Where this bot is looking from, for "would I have seen it".
+    fn eye_position(&self, game: &GameState) -> Option<Vec3> {
+        let e = self.own();
+        let ent = game.entities.get(e.0 as usize)?;
+        ent.in_use.then(|| ent.v.origin + Vec3::new(0.0, 0.0, 22.0))
+    }
+
+    /// Mark an item as taken, and expect it back on the server's schedule.
+    ///
+    /// Writes exactly what the server's own pickup writes — non-solid, with a `SubRegen` think
+    /// scheduled — so `item_goal_valid` and `item_collect_time` read it without knowing the
+    /// difference. A bot will still route to it and wait, which is what it should do.
+    fn take_item(&mut self, game: &mut GameState, item: EntId, now: f32) {
+        if game.entities[item].v.solid != Solid::Trigger {
+            return; // already known gone
+        }
+        // The same rule the server's own pickup uses (`items.rs`), asked rather than copied.
+        let delay = game.entities[item]
+            .classname()
+            .map(str::to_owned)
+            .and_then(|cn| game.respawn_delay_of(&cn));
+        let ent = &mut game.entities[item];
+        ent.v.solid = Solid::Not;
+        ent.v.modelindex = 0.0;
+        match delay {
+            Some(d) => {
+                ent.think = crate::entity::Think::SubRegen;
+                ent.v.nextthink = now + d;
+            }
+            // Deathmatch 2 doesn't respawn items at all, and neither does a dropped one.
+            None => ent.think = crate::entity::Think::None,
+        }
+    }
+
+    /// Mark an item as present.
+    fn restore_item(&mut self, game: &mut GameState, item: EntId) {
+        let ent = &mut game.entities[item];
+        ent.v.solid = Solid::Trigger;
+        ent.think = crate::entity::Think::None;
+        ent.v.nextthink = 0.0;
+    }
+
+    /// Drop anything we were tracking that the server has stopped sending.
+    fn retire_unseen(&mut self, game: &mut GameState, seen: &[EntityState]) {
+        let live: std::collections::HashSet<u16> = seen.iter().map(|e| e.number).collect();
+        self.tracked.retain(|&num, _| {
+            if live.contains(&num) {
+                return true;
+            }
+            let slot = EntId(num as u32);
+            if let Some(ent) = game.entities.get_mut(slot.0 as usize) {
+                *ent = Entity::default();
+            }
+            false
+        });
+    }
+
+    /// What the mirror currently believes, for the report: items up, items known taken, and how
+    /// many things are in the air.
+    pub(crate) fn census(&self, game: &GameState) -> (usize, usize, usize) {
+        let up = self
+            .items
+            .iter()
+            .filter(|(e, _)| game.entities[*e].v.solid == Solid::Trigger)
+            .count();
+        // "Waiting" rather than "gone": we saw it taken and we know when it's due back.
+        let waiting = self
+            .items
+            .iter()
+            .filter(|(e, _)| game.entities[*e].think == crate::entity::Think::SubRegen)
+            .count();
+        (up, waiting, self.tracked.len())
+    }
+
+    /// Note the map's items, so their absence can be reasoned about. Called once per map, after the
+    /// shadow world is spawned.
+    pub(crate) fn index_items(&mut self, game: &GameState) {
+        self.items = game
+            .entities
+            .live()
+            .filter(|(_, e)| e.classname().is_some_and(crate::bot::goals::is_goal_classname))
+            .map(|(i, e)| (i, e.v.origin))
+            .collect();
+        self.brushes.clear();
+        self.tracked.clear();
+    }
+}
+
+/// A rocket's speed. Fixed in QuakeWorld, and the reason a rocket's heading can be read off its
+/// angles the moment it appears, before there are two frames to difference.
+const ROCKET_SPEED: f32 = 1000.0;
 
 /// Whether a slot holds someone worth reasoning about.
 fn is_player_slot(game: &GameState, e: EntId) -> bool {
@@ -571,6 +938,241 @@ mod tests {
         m.apply(&mut g, &SvcEvent::SetAngle { kind: Some(1), angles });
         assert_eq!(g.entities[m.own()].v.v_angle, angles);
         assert_eq!(g.entities[m.own()].bot.aim.angles, angles, "the spring goes too");
+    }
+
+    fn state(number: u16, model: u16, origin: Vec3) -> EntityState {
+        EntityState { number, model, origin, ..Default::default() }
+    }
+
+    /// A model list shaped like a real one: index 0 is the placeholder, 1 the map.
+    fn models() -> Vec<String> {
+        ["", "maps/dm4.bsp", "progs/missile.mdl", "progs/grenade.mdl", "progs/backpack.mdl",
+         "progs/armor.mdl", "maps/b_bh25.bsp", "*3", "progs/gib1.mdl"]
+            .iter().map(|s| s.to_string()).collect()
+    }
+
+    /// An entity is only what its *model name* says. The trap worth pinning: Quake ships health and
+    /// ammo boxes as brush models in their own `.bsp` files, so "is it an item" is emphatically not
+    /// "does it start with progs/".
+    #[test]
+    fn classifies_entities_by_model_name() {
+        assert!(matches!(classify("*3"), Kind::Brush(3)));
+        assert!(matches!(classify("*17"), Kind::Brush(17)));
+        assert!(matches!(classify("progs/missile.mdl"), Kind::Projectile(Touch::Missile)));
+        assert!(matches!(classify("progs/grenade.mdl"), Kind::Projectile(Touch::Grenade)));
+        assert!(matches!(classify("progs/spike.mdl"), Kind::Projectile(Touch::Spike)));
+        assert!(matches!(classify("progs/backpack.mdl"), Kind::Backpack));
+
+        // Items — including the ones that are `.bsp` files and look nothing like the rest.
+        assert!(matches!(classify("progs/armor.mdl"), Kind::Ignore));
+        assert!(matches!(classify("maps/b_bh25.bsp"), Kind::Ignore));
+        assert!(matches!(classify("maps/b_rock0.bsp"), Kind::Ignore));
+        assert!(matches!(classify(""), Kind::Ignore));
+    }
+
+    /// A rocket in flight becomes something the dodge logic can reason about — and its velocity is
+    /// differenced from where it was, because the wire never says how fast anything is going.
+    #[test]
+    fn tracks_a_rocket_and_differences_its_velocity() {
+        let mut g = game();
+        g.globals.frametime = 0.1;
+        let mut m = Mirror::default();
+        m.set_playernum(0);
+        let models = models();
+
+        // First sighting: nothing to difference against, so the heading comes off its angles — a
+        // rocket flies where it points, and that one frame is the one that matters most.
+        let mut e = state(50, 2, Vec3::new(0.0, 0.0, 0.0));
+        e.angles = Vec3::ZERO; // facing +x
+        m.apply_frame(&mut g, &[e], &models);
+
+        let slot = EntId(50);
+        assert!(g.entities[slot].in_use);
+        assert_eq!(g.entities[slot].touch, Touch::Missile);
+        assert!(g.entities[slot].v.velocity.x > 900.0, "{:?}", g.entities[slot].v.velocity);
+        assert_eq!(m.projectiles_seen, 1);
+
+        // Second frame: a real difference.
+        m.apply_frame(&mut g, &[state(50, 2, Vec3::new(100.0, 0.0, 0.0))], &models);
+        assert_eq!(g.entities[slot].v.velocity, Vec3::new(1000.0, 0.0, 0.0));
+        assert_eq!(g.entities[slot].v.origin.x, 100.0);
+
+        // It hits something and the server stops sending it — the slot must be released, or the bot
+        // dodges a rocket that no longer exists.
+        m.apply_frame(&mut g, &[], &models);
+        assert!(!g.entities[slot].in_use);
+    }
+
+    /// A grenade has a fuse, and the wire never mentions it. Counting from first sighting is what a
+    /// player does, and what makes "is it about to go off" answerable at all.
+    #[test]
+    fn a_grenade_gets_a_fuse_from_when_we_first_saw_it() {
+        let mut g = game();
+        g.globals.time = 100.0;
+        let mut m = Mirror::default();
+        m.set_playernum(0);
+
+        m.apply_frame(&mut g, &[state(60, 3, Vec3::ZERO)], &models());
+        let ent = &g.entities[EntId(60)];
+        assert_eq!(ent.touch, Touch::Grenade);
+        assert_eq!(ent.classname(), Some("grenade"));
+        assert_eq!(ent.v.nextthink, 100.0 + GRENADE_FUSE);
+    }
+
+    /// A pack is mirrored so it exists, but is deliberately not a goal: what's in it isn't on the
+    /// wire, and a bot that pathed to one knowing its contents would know something it can't.
+    #[test]
+    fn a_backpack_exists_but_is_not_a_goal() {
+        let mut g = game();
+        let mut m = Mirror::default();
+        m.set_playernum(0);
+        m.apply_frame(&mut g, &[state(70, 4, Vec3::new(5.0, 5.0, 5.0))], &models());
+
+        let ent = &g.entities[EntId(70)];
+        assert!(ent.in_use);
+        assert_eq!(ent.touch, Touch::Backpack);
+        assert_ne!(ent.v.solid, Solid::Trigger, "the goal scan requires Trigger — it must not qualify");
+    }
+
+    /// Put a real item into the world at `home`, the way the shadow world would.
+    fn place_item(g: &mut GameState, at: Vec3, classname: &'static str) -> EntId {
+        let e = EntId(1500);
+        let ent = &mut g.entities[e];
+        *ent = Entity::default();
+        ent.in_use = true;
+        ent.classname = Some(classname.into());
+        ent.v.origin = at;
+        ent.v.solid = Solid::Trigger;
+        e
+    }
+
+    /// The heart of item knowledge, and the reason it's honest: an item's *absence* only means
+    /// something if we'd have seen it. Out of range, it says nothing at all — which is why a bot
+    /// can't know whether the quad across the map is up until someone goes and looks.
+    #[test]
+    fn an_items_absence_is_only_evidence_when_we_could_see_it() {
+        let mut g = game();
+        g.globals.time = 50.0;
+        let mut m = Mirror::default();
+        m.set_playernum(0);
+        m.apply(&mut g, &SvcEvent::UpdateStat { stat: stat::HEALTH, value: 100 });
+
+        // An item far across the map, and us standing at the origin.
+        let far = Vec3::new(9999.0, 0.0, 0.0);
+        let item = place_item(&mut g, far, "item_armor2");
+        m.items = vec![(item, far)];
+        g.entities[m.own()].v.origin = Vec3::ZERO;
+
+        m.apply_frame(&mut g, &[], &models());
+        assert_eq!(g.entities[item].v.solid, Solid::Trigger, "too far away to conclude anything");
+    }
+
+    /// Seeing it is the simple half.
+    #[test]
+    fn seeing_an_item_says_it_is_there() {
+        let mut g = game();
+        let mut m = Mirror::default();
+        m.set_playernum(0);
+        m.apply(&mut g, &SvcEvent::UpdateStat { stat: stat::HEALTH, value: 100 });
+
+        let at = Vec3::new(64.0, 0.0, 0.0);
+        let item = place_item(&mut g, at, "item_armor2");
+        m.items = vec![(item, at)];
+        // Believed taken…
+        g.entities[item].v.solid = Solid::Not;
+        g.entities[item].think = crate::entity::Think::SubRegen;
+
+        // …then we see it. What's actually there always wins over what we expected.
+        m.apply_frame(&mut g, &[state(90, 5, at)], &models());
+        assert_eq!(g.entities[item].v.solid, Solid::Trigger);
+        assert_eq!(g.entities[item].think, crate::entity::Think::None);
+    }
+
+    /// The rule, on its own: presence is proof; absence is proof only when we had a clear look.
+    /// Anything else is a guess — and a bot that guesses about items either walks across the map for
+    /// nothing, or knows where the quad is without anybody having gone to check.
+    #[test]
+    fn absence_is_only_evidence_with_a_clear_look() {
+        // Seen: there, whatever else is true.
+        assert_eq!(item_evidence(true, false, false), Evidence::Present);
+        assert_eq!(item_evidence(true, true, true), Evidence::Present);
+
+        // Not seen, and we had a clear line to the spot: someone took it.
+        assert_eq!(item_evidence(false, true, true), Evidence::Taken);
+
+        // Not seen, but we couldn't have seen it — that's not evidence of anything.
+        assert_eq!(item_evidence(false, true, false), Evidence::Unknown, "no line of sight");
+        assert_eq!(item_evidence(false, false, true), Evidence::Unknown, "out of range");
+        assert_eq!(item_evidence(false, false, false), Evidence::Unknown);
+    }
+
+    /// Item timing: we watched it go, we know the rule it comes back by, so we know when to be
+    /// there.    /// Item timing: we watched it go, we know the rule it comes back by, so we know when to be
+    /// there. The brain reads this as `SubRegen` + `nextthink` — the same fields the server's own
+    /// pickup writes — so `item_goal_valid` still routes a bot there to wait.
+    #[test]
+    fn a_taken_item_is_timed_and_comes_back_on_schedule() {
+        let mut g = game();
+        g.globals.time = 100.0;
+        g.level.deathmatch = 1;
+        let mut m = Mirror::default();
+        m.set_playernum(0);
+
+        let at = Vec3::new(64.0, 0.0, 0.0);
+        let item = place_item(&mut g, at, "item_armor2");
+
+        // We looked, and it was gone.
+        m.take_item(&mut g, item, 100.0);
+        assert_eq!(g.entities[item].v.solid, Solid::Not);
+        assert_eq!(g.entities[item].think, crate::entity::Think::SubRegen);
+        assert_eq!(g.entities[item].v.nextthink, 120.0, "armour is a 20-second item");
+
+        // Not due yet, and we still can't see it.
+        m.expect_respawn(&mut g, item, 115.0);
+        assert_eq!(g.entities[item].v.solid, Solid::Not);
+
+        // Due — expect it back, without having watched it return.
+        m.expect_respawn(&mut g, item, 121.0);
+        assert_eq!(g.entities[item].v.solid, Solid::Trigger, "timed back in");
+        assert_eq!(g.entities[item].think, crate::entity::Think::None);
+    }
+
+    /// An item that never respawns must not be timed back in, or a bot queues forever for something
+    /// that isn't coming.
+    #[test]
+    fn an_item_that_never_respawns_is_not_timed() {
+        let mut g = game();
+        g.level.deathmatch = 2; // nothing respawns here
+        let mut m = Mirror::default();
+        m.set_playernum(0);
+
+        let item = place_item(&mut g, Vec3::ZERO, "item_armor2");
+        m.take_item(&mut g, item, 100.0);
+        assert_eq!(g.entities[item].v.solid, Solid::Not);
+        assert_eq!(g.entities[item].think, crate::entity::Think::None, "no schedule to wait on");
+
+        m.expect_respawn(&mut g, item, 100_000.0);
+        assert_eq!(g.entities[item].v.solid, Solid::Not, "and it never comes back");
+    }
+
+    /// The respawn rule is the server's, and it's asked rather than copied — including the modes
+    /// where the answer changes.
+    #[test]
+    fn respawn_timing_follows_the_servers_rules() {
+        let mut g = game();
+
+        g.level.deathmatch = 1;
+        assert_eq!(g.respawn_delay_of("item_armor2"), Some(20.0));
+        assert_eq!(g.respawn_delay_of("weapon_rocketlauncher"), Some(30.0));
+        assert_eq!(g.respawn_delay_of("item_artifact_super_damage"), Some(60.0));
+        assert_eq!(g.respawn_delay_of("item_artifact_invulnerability"), Some(300.0));
+
+        // Weapons stay put in dm 3/5, so a weapon is quick; dm 2 respawns nothing at all.
+        g.level.deathmatch = 3;
+        assert_eq!(g.respawn_delay_of("weapon_rocketlauncher"), Some(15.0));
+        g.level.deathmatch = 2;
+        assert_eq!(g.respawn_delay_of("item_armor2"), None);
+        assert_eq!(g.respawn_delay_of("weapon_rocketlauncher"), None);
     }
 
     /// Armour type comes from which `IT_ARMOR*` bit is held, not from a stat — and the best one
