@@ -51,8 +51,8 @@ impl GameState {
             ent.v.movetype = MoveType::Toss;
             ent.v.solid = Solid::Trigger;
         }
-        self.host.set_model(e, model);
-        self.host
+        self.set_model(e, model);
+        self
             .set_size(e, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
         let jx = -500.0 + self.random() * 1000.0;
         let jy = -500.0 + self.random() * 1000.0;
@@ -64,7 +64,7 @@ impl GameState {
             ent.v.nextthink = time + RUNE_RESPAWN_TIME;
         }
         self.entities[e].set_touch(Touch::Rune);
-        self.host.set_origin(e, origin + Vec3::new(0.0, 0.0, 4.0));
+        self.set_origin(e, origin + Vec3::new(0.0, 0.0, 4.0));
         e
     }
 

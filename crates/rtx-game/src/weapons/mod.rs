@@ -63,7 +63,7 @@ impl GameState {
     /// return straight-ahead `v_forward` (after refreshing the angle vectors).
     pub(crate) fn aim_dir(&mut self, e: EntId) -> Vec3 {
         let v_angle = self.entities[e].v.v_angle;
-        self.host.make_vectors(v_angle);
+        self.make_vectors(v_angle);
         self.globals.v_forward
     }
 

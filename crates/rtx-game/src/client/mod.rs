@@ -331,12 +331,12 @@ impl GameState {
         // internal links — this is what makes the player visible/collidable to others).
         // The "eyes" model is set first purely to capture its modelindex (QuakeC's hack for
         // the Ring of Shadows), then the real player model.
-        self.host.set_model(player, Model::PROGS_EYES);
+        self.set_model(player, Model::PROGS_EYES);
         self.level.modelindex_eyes = self.entities[player].v.modelindex;
-        self.host.set_model(player, Model::PROGS_PLAYER);
+        self.set_model(player, Model::PROGS_PLAYER);
         self.level.modelindex_player = self.entities[player].v.modelindex;
-        self.host.set_size(player, VEC_HULL_MIN, VEC_HULL_MAX);
-        self.host.set_origin(player, origin);
+        self.set_size(player, VEC_HULL_MIN, VEC_HULL_MAX);
+        self.set_origin(player, origin);
 
         // Telefrag anyone already standing here, then kick off the idle animation loop.
         self.spawn_tdeath(origin, player);
@@ -358,7 +358,7 @@ impl GameState {
             return; // intermission or finale
         }
         let v_angle = self.entities[e].v.v_angle;
-        self.host.make_vectors(v_angle);
+        self.make_vectors(v_angle);
         self.entities[e].deathtype = DeathType::None;
 
         self.check_rules(e);

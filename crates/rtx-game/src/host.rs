@@ -206,6 +206,11 @@ pub(crate) trait ClientHost {
     fn infokey<'b>(&self, ent: EntId, key: &CStr, buf: &'b mut [u8]) -> &'b str;
     /// Point contents at `p`, from the map's render hull — the liquids the clip hull can't see.
     fn pointcontents(&self, p: Vec3) -> f32;
+    /// Trace a point through the map's player hull. The host owns the map, so it owns this — and it
+    /// must answer from the moment a map is bound, because the world is *spawned* against it.
+    fn world_trace(&self, start: Vec3, end: Vec3) -> rtx_nav::bsp::HullTrace;
+    /// The bounds of inline submodel `n` — the shape of a door, plat or trigger.
+    fn submodel_bounds(&self, n: usize) -> Option<(Vec3, Vec3)>;
     /// Read a whole file, searching the gamedir then the base game.
     fn read_file(&self, name: &CStr) -> Option<Vec<u8>>;
     /// The next token of the map's entity string; `false` when exhausted.
@@ -262,6 +267,24 @@ impl HostApi {
         Self { backend: Backend::Client(host), ents }
     }
 
+    /// Trace through the map, client-side. See [`ClientHost::world_trace`].
+    #[cfg(feature = "netclient")]
+    pub(crate) fn world_trace(&self, start: Vec3, end: Vec3) -> rtx_nav::bsp::HullTrace {
+        match self.backend {
+            Backend::Client(c) => c.world_trace(start, end),
+            Backend::Pr2(_) => unreachable!("client-only: a server traces through its own engine"),
+        }
+    }
+
+    /// An inline submodel's bounds, client-side. See [`ClientHost::submodel_bounds`].
+    #[cfg(feature = "netclient")]
+    pub(crate) fn submodel_bounds(&self, n: usize) -> Option<(Vec3, Vec3)> {
+        match self.backend {
+            Backend::Client(c) => c.submodel_bounds(n),
+            Backend::Pr2(_) => unreachable!("client-only: a server's setmodel does this itself"),
+        }
+    }
+
     /// Whether we're running inside a network client rather than as a server's game module.
     ///
     /// The brain shouldn't branch on this — the whole point of the seam is that it doesn't have
@@ -277,9 +300,11 @@ impl HostApi {
 
     /// The engine's syscall.
     ///
-    /// Every caller is a trap only a server can answer — broadcasting, fake clients, the signon.
-    /// In client mode there's nobody to ask, and reaching here means some server-side path ran that
-    /// shouldn't have, so it says so rather than silently doing nothing.
+    /// Reaching this in client mode means a server-side path ran that shouldn't have. The traps a
+    /// client legitimately meets — the ones the module's own spawn code reaches for on its way past
+    /// — carry an explicit [`told_nobody`](Self::told_nobody) arm instead, each saying why doing
+    /// nothing is the right answer. This is for the rest, and it's deliberately loud: silently
+    /// returning zero from, say, `add_bot` would leave a bug to be found in a live match.
     #[inline]
     fn syscall(&self) -> SyscallFn {
         match self.backend {
@@ -287,6 +312,19 @@ impl HostApi {
             #[cfg(feature = "netclient")]
             Backend::Client(_) => unreachable!("server-only trap reached from the network client"),
         }
+    }
+
+    /// Whether this trap has nobody to talk to, and should quietly do nothing.
+    ///
+    /// True in client mode, for the traps whose whole purpose is telling *other* players something:
+    /// a lightstyle, a sound, an obituary, a temp entity. The server does all of that; we're one of
+    /// the players being told. They're reached because the shadow world runs the module's real spawn
+    /// code — `worldspawn` assigns lightstyles, an item spawn plays no sound but precaches one — and
+    /// running that real code is the entire point, so the traps it passes through must be harmless
+    /// rather than fatal.
+    #[inline]
+    fn told_nobody(&self) -> bool {
+        self.is_client()
     }
 
     /// `G_GETAPIVERSION` — the engine's supported API version.
@@ -319,11 +357,19 @@ impl HostApi {
 
     /// `G_BPRINT` — broadcast print to all clients at `level` (PrintLevel::Low..PrintLevel::Chat).
     pub fn bprint(&self, level: PrintLevel, msg: &CStr) {
+        #[cfg(feature = "netclient")]
+        if self.told_nobody() {
+            return;
+        }
         unsafe { (self.syscall())(B::BPrint as isize, level.as_i32() as isize, msg.as_ptr() as isize, 0) };
     }
 
     /// `G_SPRINT` — print to a single client at `level`.
     pub fn sprint(&self, ent: EntId, level: PrintLevel, msg: &CStr) {
+        #[cfg(feature = "netclient")]
+        if self.told_nobody() {
+            return;
+        }
         unsafe {
             (self.syscall())(
                 B::SPrint as isize,
@@ -423,6 +469,10 @@ impl HostApi {
 
     /// `G_LIGHTSTYLE` — assign an animation string ("a".."z") to a light style slot.
     pub fn lightstyle(&self, style: i32, value: &CStr) {
+        #[cfg(feature = "netclient")]
+        if self.told_nobody() {
+            return;
+        }
         unsafe { (self.syscall())(B::LightStyle as isize, style as isize, value.as_ptr() as isize) };
     }
 
@@ -430,6 +480,10 @@ impl HostApi {
     /// new one. Must be called per entity during `GAME_LOADENTS` or the signon overflows and
     /// later entities never reach clients (matches ktx's spawn loop).
     pub fn flush_signon(&self) {
+        #[cfg(feature = "netclient")]
+        if self.told_nobody() {
+            return;
+        }
         unsafe { (self.syscall())(B::FlushSignon as isize) };
     }
 
@@ -515,16 +569,28 @@ impl HostApi {
     /// `G_SOUND` — play `sample` from `ent` on `channel`. Takes a [`Sound`] handle, which can
     /// only come from a precached source — so playing an unprecached sound is unrepresentable.
     pub fn sound(&self, ent: EntId, channel: Channel, sample: Sound, volume: f32, attenuation: Attenuation) {
+        #[cfg(feature = "netclient")]
+        if self.told_nobody() {
+            return;
+        }
         self.sound_raw(ent, channel.as_i32(), sample.path(), volume, attenuation);
     }
 
     /// As [`sound`](Self::sound), but with the `CHAN_NO_PHS_ADD` modifier (channel bit 3) set so
     /// the sound bypasses the PHS cull — used for door/plat movement, audible through walls.
     pub fn sound_no_phs(&self, ent: EntId, channel: Channel, sample: Sound, volume: f32, attenuation: Attenuation) {
+        #[cfg(feature = "netclient")]
+        if self.told_nobody() {
+            return;
+        }
         self.sound_raw(ent, channel.as_i32() | 8, sample.path(), volume, attenuation);
     }
 
     fn sound_raw(&self, ent: EntId, channel: i32, sample: &CStr, volume: f32, attenuation: Attenuation) {
+        #[cfg(feature = "netclient")]
+        if self.told_nobody() {
+            return;
+        }
         unsafe {
             (self.syscall())(
                 B::Sound as isize,
@@ -636,6 +702,10 @@ impl HostApi {
 
     /// `G_CENTERPRINT` — center-screen message to one client.
     pub fn centerprint(&self, ent: EntId, msg: &CStr) {
+        #[cfg(feature = "netclient")]
+        if self.told_nobody() {
+            return;
+        }
         unsafe { (self.syscall())(B::CenterPrint as isize, ent.0 as isize, msg.as_ptr() as isize) };
     }
 
@@ -651,11 +721,19 @@ impl HostApi {
 
     /// `G_LOGFRAG` — record a frag for stats/MVD.
     pub fn logfrag(&self, killer: EntId, killee: EntId) {
+        #[cfg(feature = "netclient")]
+        if self.told_nobody() {
+            return;
+        }
         unsafe { (self.syscall())(B::LogFrag as isize, killer.0 as isize, killee.0 as isize) };
     }
 
     /// `G_STUFFCMD` — send a command to a client's console.
     pub fn stuffcmd(&self, ent: EntId, cmd: &CStr) {
+        #[cfg(feature = "netclient")]
+        if self.told_nobody() {
+            return;
+        }
         unsafe { (self.syscall())(B::StuffCmd as isize, ent.0 as isize, cmd.as_ptr() as isize, 0) };
     }
 
@@ -673,16 +751,28 @@ impl HostApi {
 
     /// `G_MAKESTATIC` — turn an entity into a static (client-side only) entity and remove it.
     pub fn makestatic(&self, ent: EntId) {
+        #[cfg(feature = "netclient")]
+        if self.told_nobody() {
+            return;
+        }
         unsafe { (self.syscall())(B::MakeStatic as isize, ent.0 as isize) };
     }
 
     /// `G_SETPAUSE`.
     pub fn set_pause(&self, paused: bool) {
+        #[cfg(feature = "netclient")]
+        if self.told_nobody() {
+            return;
+        }
         unsafe { (self.syscall())(B::SetPause as isize, paused as isize) };
     }
 
     /// `G_AMBIENTSOUND` — attach a looping ambient sound at a point.
     pub fn ambient_sound(&self, pos: Vec3, sample: Sound, volume: f32, attenuation: Attenuation) {
+        #[cfg(feature = "netclient")]
+        if self.told_nobody() {
+            return;
+        }
         unsafe {
             (self.syscall())(
                 B::AmbientSound as isize,
@@ -700,6 +790,10 @@ impl HostApi {
 
     /// `G_MULTICAST` — send the buffered `write_*` message to a recipient set.
     pub fn multicast(&self, origin: Vec3, to: Multicast) {
+        #[cfg(feature = "netclient")]
+        if self.told_nobody() {
+            return;
+        }
         unsafe {
             (self.syscall())(
                 B::Multicast as isize,
@@ -712,32 +806,68 @@ impl HostApi {
     }
 
     pub fn write_byte(&self, to: MsgDest, v: i32) {
+        #[cfg(feature = "netclient")]
+        if self.told_nobody() {
+            return;
+        }
         unsafe { (self.syscall())(B::WriteByte as isize, to.as_i32() as isize, v as isize) };
     }
     pub fn write_char(&self, to: MsgDest, v: i32) {
+        #[cfg(feature = "netclient")]
+        if self.told_nobody() {
+            return;
+        }
         unsafe { (self.syscall())(B::WriteChar as isize, to.as_i32() as isize, v as isize) };
     }
     pub fn write_short(&self, to: MsgDest, v: i32) {
+        #[cfg(feature = "netclient")]
+        if self.told_nobody() {
+            return;
+        }
         unsafe { (self.syscall())(B::WriteShort as isize, to.as_i32() as isize, v as isize) };
     }
     pub fn write_long(&self, to: MsgDest, v: i32) {
+        #[cfg(feature = "netclient")]
+        if self.told_nobody() {
+            return;
+        }
         unsafe { (self.syscall())(B::WriteLong as isize, to.as_i32() as isize, v as isize) };
     }
     pub fn write_coord(&self, to: MsgDest, v: f32) {
+        #[cfg(feature = "netclient")]
+        if self.told_nobody() {
+            return;
+        }
         unsafe { (self.syscall())(B::WriteCoord as isize, to.as_i32() as isize, pf(v)) };
     }
     pub fn write_angle(&self, to: MsgDest, v: f32) {
+        #[cfg(feature = "netclient")]
+        if self.told_nobody() {
+            return;
+        }
         unsafe { (self.syscall())(B::WriteAngle as isize, to.as_i32() as isize, pf(v)) };
     }
     pub fn write_string(&self, to: MsgDest, s: &CStr) {
+        #[cfg(feature = "netclient")]
+        if self.told_nobody() {
+            return;
+        }
         unsafe { (self.syscall())(B::WriteString as isize, to.as_i32() as isize, s.as_ptr() as isize) };
     }
     pub fn write_entity(&self, to: MsgDest, ent: EntId) {
+        #[cfg(feature = "netclient")]
+        if self.told_nobody() {
+            return;
+        }
         unsafe { (self.syscall())(B::WriteEntity as isize, to.as_i32() as isize, ent.0 as isize) };
     }
 
     /// Write a server-to-client opcode byte (`svc_*`).
     pub fn write_svc(&self, to: MsgDest, svc: Svc) {
+        #[cfg(feature = "netclient")]
+        if self.told_nobody() {
+            return;
+        }
         self.write_byte(to, svc.as_i32());
     }
 
@@ -745,6 +875,10 @@ impl HostApi {
     /// The caller follows with the effect's payload (coords / entity / count) and a
     /// [`multicast`](Self::multicast).
     pub fn write_te(&self, to: MsgDest, te: Te) {
+        #[cfg(feature = "netclient")]
+        if self.told_nobody() {
+            return;
+        }
         self.write_byte(to, Svc::TempEntity.as_i32());
         self.write_byte(to, te.as_i32());
     }

@@ -53,7 +53,7 @@ impl GameState {
             let v = &self.entities[player].v;
             (v.origin, v.v_angle)
         };
-        self.host.make_vectors(v_angle);
+        self.make_vectors(v_angle);
         let v_forward = self.globals.v_forward;
         let now = self.globals.time;
         let throw_speed = HOOK_THROW_SPEED * self.host.cvar(c"rtx_hook_speed");
@@ -71,9 +71,9 @@ impl GameState {
             hook.think = Think::BuildChain; // defer the links a frame, as the QC does
             hook.v.nextthink = now + 0.1;
         }
-        self.host.set_model(m, Model::PROGS_STAR);
-        self.host.set_size(m, Vec3::ZERO, Vec3::ZERO);
-        self.host
+        self.set_model(m, Model::PROGS_STAR);
+        self.set_size(m, Vec3::ZERO, Vec3::ZERO);
+        self
             .set_origin(m, origin + v_forward * 16.0 + Vec3::new(0.0, 0.0, 16.0));
 
         let p = &mut self.entities[player];
@@ -165,7 +165,7 @@ impl GameState {
                 return;
             }
             let epos = self.entities[enemy].v.origin;
-            self.host.set_origin(hook, epos);
+            self.set_origin(hook, epos);
             self.entities[hook].v.origin = epos;
             self.t_damage(enemy, hook, owner, 1.0);
             self.spawn_blood(epos, 1);
@@ -272,9 +272,9 @@ impl GameState {
             link.v.avelocity = Vec3::new(200.0, 200.0, 200.0);
             link.classname = Some("hook_link".into());
         }
-        self.host.set_model(m, Model::PROGS_BIT);
-        self.host.set_size(m, Vec3::ZERO, Vec3::ZERO);
-        self.host.set_origin(m, origin);
+        self.set_model(m, Model::PROGS_BIT);
+        self.set_size(m, Vec3::ZERO, Vec3::ZERO);
+        self.set_origin(m, origin);
         m
     }
 
@@ -315,7 +315,7 @@ impl GameState {
 
     /// `setorigin` for a chain link, keeping our shadowed `v.origin` in sync.
     fn move_link(&mut self, link: EntId, pos: Vec3) {
-        self.host.set_origin(link, pos);
+        self.set_origin(link, pos);
         self.entities[link].v.origin = pos;
     }
 }

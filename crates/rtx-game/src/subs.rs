@@ -66,7 +66,7 @@ impl GameState {
         } else if angles == Vec3::new(0.0, -2.0, 0.0) {
             Vec3::new(0.0, 0.0, -1.0)
         } else {
-            self.host.make_vectors(angles);
+            self.make_vectors(angles);
             self.globals.v_forward
         };
         let ent = &mut self.entities[e];
@@ -122,7 +122,7 @@ impl GameState {
     /// `SUB_CalcMoveDone` — snap to the exact destination and fire `think1`.
     pub(crate) fn sub_calc_move_done(&mut self, e: EntId) {
         let dest = self.entities[e].mover.finaldest;
-        self.host.set_origin(e, dest);
+        self.set_origin(e, dest);
         {
             let ent = &mut self.entities[e];
             ent.v.origin = dest;

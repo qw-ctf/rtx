@@ -15,7 +15,7 @@ impl GameState {
     /// `W_FireAxe` — short melee trace.
     pub(crate) fn w_fire_axe(&mut self, e: EntId) {
         let v_angle = self.entities[e].v.v_angle;
-        self.host.make_vectors(v_angle);
+        self.make_vectors(v_angle);
         let v_forward = self.globals.v_forward;
         let source = self.entities[e].v.origin + Vec3::new(0.0, 0.0, 16.0);
         let end = source + v_forward * 64.0;
@@ -52,7 +52,7 @@ impl GameState {
     /// combining hits on the same target into one `T_Damage` call.
     fn fire_bullets(&mut self, e: EntId, shotcount: i32, dir: Vec3, spread: Vec3, dtype: DeathType) {
         let v_angle = self.entities[e].v.v_angle;
-        self.host.make_vectors(v_angle);
+        self.make_vectors(v_angle);
         let v_right = self.globals.v_right;
         let v_up = self.globals.v_up;
         let v_forward = self.globals.v_forward;
@@ -242,7 +242,7 @@ impl GameState {
         self.consume_ammo(e, AmmoKind::Cells, 1.0);
 
         let v_angle = self.entities[e].v.v_angle;
-        self.host.make_vectors(v_angle);
+        self.make_vectors(v_angle);
         let v_forward = self.globals.v_forward;
         let org = self.entities[e].v.origin + Vec3::new(0.0, 0.0, 16.0);
         let tr = self.traceline(org, org + v_forward * 600.0, true, e);

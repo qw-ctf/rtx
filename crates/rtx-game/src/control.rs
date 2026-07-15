@@ -471,7 +471,7 @@ fn do_teleport(game: &mut GameState, bot: u32, pos: Vec3) -> Result<String, Stri
     let now = game.time();
     let at = pos + Vec3::new(0.0, 0.0, 1.0);
     game.entities[e].v.velocity = Vec3::ZERO;
-    game.host.set_origin(e, at);
+    game.set_origin(e, at);
     reset_nav_state(&mut game.entities[e].bot, at, now);
     // Park the bot after placing it — otherwise, with no order, it would roam autonomously and arrive
     // at a subsequent rocket jump with residual velocity, contaminating the standstill measurement.

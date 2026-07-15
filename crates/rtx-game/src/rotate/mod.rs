@@ -57,7 +57,7 @@ impl GameState {
             let v = &self.entities[e].v;
             (v.angles, v.origin, v.oldorigin)
         };
-        self.host.make_vectors(angles);
+        self.make_vectors(angles);
         let (vf, vr, vu) = {
             let g = &self.globals;
             (g.v_forward, g.v_right, g.v_up)
@@ -166,7 +166,7 @@ impl GameState {
     /// `setorigin(e, pos)` keeping our shadowed `v.origin` in sync (the engine writes the shared
     /// field too, but later same-tick reads go through our copy).
     pub(super) fn place(&mut self, e: EntId, pos: Vec3) {
-        self.host.set_origin(e, pos);
+        self.set_origin(e, pos);
         self.entities[e].v.origin = pos;
     }
 
@@ -177,7 +177,7 @@ impl GameState {
             let v = &self.entities[e].v;
             (v.mins, v.maxs)
         };
-        self.host.set_size(e, mins, maxs);
+        self.set_size(e, mins, maxs);
     }
 
     // ----------------------------------------------------------------------------------------
@@ -464,7 +464,7 @@ impl GameState {
         }
         self.link_brush(e);
         let origin = self.entities[e].v.origin;
-        self.host.set_origin(e, origin);
+        self.set_origin(e, origin);
         let ent = &mut self.entities[e];
         ent.rot.phase = RotPhase::Closed;
         ent.use_ = Use::RotateDoorUse;

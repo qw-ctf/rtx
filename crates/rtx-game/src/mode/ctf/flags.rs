@@ -43,12 +43,12 @@ impl GameState {
             ent.v.movetype = MoveType::Toss;
             ent.v.solid = Solid::Trigger;
         }
-        self.host.set_model(e, Model::PROGS_FLAG);
-        self.host
+        self.set_model(e, Model::PROGS_FLAG);
+        self
             .set_size(e, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 74.0));
         // Settle to the floor (best effort) and remember the base position for returns.
         self.entities[e].v.origin.z += 6.0;
-        let _ = self.host.droptofloor(e);
+        let _ = self.droptofloor(e);
         let home = self.entities[e].v.origin;
         let time = self.time();
         let ent = &mut self.entities[e];
@@ -140,8 +140,8 @@ impl GameState {
             f.v.movetype = MoveType::Toss;
             f.v.velocity = dir * 300.0;
         }
-        self.host.set_model(flag, Model::PROGS_FLAG);
-        self.host.set_origin(flag, origin);
+        self.set_model(flag, Model::PROGS_FLAG);
+        self.set_origin(flag, origin);
         let (tname, _) = team::team_identity(team);
         let name = self.netname_of(player);
         self.broadcast(PrintLevel::High, &format!("{name} tossed the {tname} flag!\n"));
@@ -253,8 +253,8 @@ impl GameState {
             f.v.movetype = MoveType::Toss;
             f.v.velocity = velocity;
         }
-        self.host.set_model(flag, Model::PROGS_FLAG);
-        self.host.set_origin(flag, pos);
+        self.set_model(flag, Model::PROGS_FLAG);
+        self.set_origin(flag, pos);
     }
 
     /// Drop a carried flag where its carrier is, starting the auto-return countdown.

@@ -122,7 +122,7 @@ impl GameState {
             tmin.y = (mins.y + maxs.y) / 2.0;
             tmax.y = tmin.y + 1.0;
         }
-        self.host.set_size(t, tmin, tmax);
+        self.set_size(t, tmin, tmax);
     }
 
     /// `func_plat` spawn.
@@ -159,13 +159,13 @@ impl GameState {
             ent.v.movetype = MoveType::Push;
         }
         let origin = self.entities[e].v.origin;
-        self.host.set_origin(e, origin);
+        self.set_origin(e, origin);
         self.set_brush_model(e);
         let (mins, maxs) = {
             let v = &self.entities[e].v;
             (v.mins, v.maxs)
         };
-        self.host.set_size(e, mins, maxs);
+        self.set_size(e, mins, maxs);
 
         self.entities[e].set_blocked(Blocked::PlatBlocked);
         {
@@ -191,7 +191,7 @@ impl GameState {
             ent.use_ = Use::PlatUse;
         } else {
             let pos2 = self.entities[e].mover.pos2;
-            self.host.set_origin(e, pos2);
+            self.set_origin(e, pos2);
             let ent = &mut self.entities[e];
             ent.v.origin = pos2;
             ent.mover.state = MoverPhase::Bottom;
@@ -276,7 +276,7 @@ impl GameState {
         };
         self.entities[e].target = next_target;
         let mins = self.entities[e].v.mins;
-        self.host.set_origin(e, targ_origin - mins);
+        self.set_origin(e, targ_origin - mins);
         self.entities[e].v.origin = targ_origin - mins;
         if self.entities[e].targetname.is_none() {
             let ltime = self.entities[e].v.ltime;
@@ -324,8 +324,8 @@ impl GameState {
             let v = &self.entities[e].v;
             (v.mins, v.maxs, v.origin)
         };
-        self.host.set_size(e, mins, maxs);
-        self.host.set_origin(e, origin);
+        self.set_size(e, mins, maxs);
+        self.set_origin(e, origin);
         let ltime = self.entities[e].v.ltime;
         let ent = &mut self.entities[e];
         ent.v.nextthink = ltime + 0.1;

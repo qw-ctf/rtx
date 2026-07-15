@@ -76,7 +76,7 @@ impl GameState {
         let movedir = self.entities[e].v.movedir;
         if movedir != Vec3::ZERO {
             let angles = self.entities[other].v.angles;
-            self.host.make_vectors(angles);
+            self.make_vectors(angles);
             if self.globals.v_forward.dot(movedir) < 0.0 {
                 return;
             }
@@ -147,7 +147,7 @@ impl GameState {
             ent.v.takedamage = TakeDamage::Yes;
             ent.v.solid = Solid::BBox;
             let origin = ent.v.origin;
-            self.host.set_origin(e, origin);
+            self.set_origin(e, origin);
         } else if !self.entities[e].v.spawnflags.has(TriggerFlags::NOTOUCH) {
             self.entities[e].set_touch(Touch::Multi);
         }
@@ -279,8 +279,8 @@ impl GameState {
             ent.think = Think::SubRemove;
             ent.set_owner(death_owner);
         }
-        self.host.set_size(d, mins - Vec3::ONE, maxs + Vec3::ONE);
-        self.host.set_origin(d, org);
+        self.set_size(d, mins - Vec3::ONE, maxs + Vec3::ONE);
+        self.set_origin(d, org);
         self.globals.force_retouch = 2.0;
     }
 
@@ -319,12 +319,12 @@ impl GameState {
             let v = &self.entities[dest];
             (v.v.origin, v.mover.mangle)
         };
-        self.host.make_vectors(t_mangle);
+        self.make_vectors(t_mangle);
         let v_forward = self.globals.v_forward;
         self.spawn_tfog(t_org + v_forward * 32.0);
         self.spawn_tdeath(t_org, other);
 
-        self.host.set_origin(other, t_org);
+        self.set_origin(other, t_org);
         {
             let o = &mut self.entities[other].v;
             o.origin = t_org;

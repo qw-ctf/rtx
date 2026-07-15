@@ -36,7 +36,7 @@ impl GameState {
         }
         self.link_brush(e);
         let origin = self.entities[e].v.origin;
-        self.host.set_origin(e, origin);
+        self.set_origin(e, origin);
 
         // Start on the second frame, once the corners have spawned.
         let t = self.time();

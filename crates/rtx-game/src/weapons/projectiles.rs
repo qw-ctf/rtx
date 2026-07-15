@@ -70,9 +70,9 @@ impl GameState {
             mis.think = Think::SubRemove;
             mis.classname = Some("rocket".into());
         }
-        self.host.set_model(m, Model::PROGS_MISSILE);
-        self.host.set_size(m, Vec3::ZERO, Vec3::ZERO);
-        self.host.set_origin(m, rocket_muzzle(origin, v_forward));
+        self.set_model(m, Model::PROGS_MISSILE);
+        self.set_size(m, Vec3::ZERO, Vec3::ZERO);
+        self.set_origin(m, rocket_muzzle(origin, v_forward));
         // Stamp the shooter's firing origin (set after `set_origin` so it isn't clobbered): the
         // midair mode scores airshots by the vertical shooter→victim distance. Unused otherwise —
         // `FlyMissile` physics never touch `oldorigin`.
@@ -123,7 +123,7 @@ impl GameState {
             let v = &self.entities[e].v;
             (v.origin, v.v_angle)
         };
-        self.host.make_vectors(v_angle);
+        self.make_vectors(v_angle);
         let v_forward = self.globals.v_forward;
         let v_right = self.globals.v_right;
         let v_up = self.globals.v_up;
@@ -156,13 +156,13 @@ impl GameState {
                 mis.th_die = Die::GrenadeExplode;
             }
         }
-        self.host.set_model(m, Model::PROGS_GRENADE);
+        self.set_model(m, Model::PROGS_GRENADE);
         if shootable {
-            self.host.set_size(m, SHOOTABLE_GRENADE_MINS, SHOOTABLE_GRENADE_MAXS);
+            self.set_size(m, SHOOTABLE_GRENADE_MINS, SHOOTABLE_GRENADE_MAXS);
         } else {
-            self.host.set_size(m, Vec3::ZERO, Vec3::ZERO);
+            self.set_size(m, Vec3::ZERO, Vec3::ZERO);
         }
-        self.host.set_origin(m, origin);
+        self.set_origin(m, origin);
     }
 
     // --- nails (spikes) ---
@@ -184,9 +184,9 @@ impl GameState {
             mis.v.nextthink = time + 6.0;
             mis.v.velocity = dir * 1000.0;
         }
-        self.host.set_model(m, Model::PROGS_SPIKE);
-        self.host.set_size(m, Vec3::ZERO, Vec3::ZERO);
-        self.host.set_origin(m, org);
+        self.set_model(m, Model::PROGS_SPIKE);
+        self.set_size(m, Vec3::ZERO, Vec3::ZERO);
+        self.set_origin(m, org);
         m
     }
 
@@ -201,8 +201,8 @@ impl GameState {
         let org = self.entities[e].v.origin + Vec3::new(0.0, 0.0, 16.0);
         let m = self.launch_spike(e, org, dir);
         self.entities[m].set_touch(Touch::SuperSpike);
-        self.host.set_model(m, Model::PROGS_S_SPIKE);
-        self.host.set_size(m, Vec3::ZERO, Vec3::ZERO);
+        self.set_model(m, Model::PROGS_S_SPIKE);
+        self.set_size(m, Vec3::ZERO, Vec3::ZERO);
         self.small_kick(e);
     }
 
@@ -210,7 +210,7 @@ impl GameState {
     pub(crate) fn w_fire_spikes(&mut self, e: EntId, ox: f32) {
         let time = self.time();
         let v_angle = self.entities[e].v.v_angle;
-        self.host.make_vectors(v_angle);
+        self.make_vectors(v_angle);
         let v_right = self.globals.v_right;
 
         let (ammo_nails, weapon) = {

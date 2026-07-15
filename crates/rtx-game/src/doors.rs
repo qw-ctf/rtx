@@ -238,7 +238,7 @@ impl GameState {
             trig.set_owner(master);
         }
         let margin = Vec3::new(60.0, 60.0, 8.0);
-        self.host.set_size(t, fmins - margin, fmaxs + margin);
+        self.set_size(t, fmins - margin, fmaxs + margin);
         t
     }
 
@@ -343,7 +343,7 @@ impl GameState {
             ent.v.movetype = MoveType::Push;
         }
         let origin = self.entities[e].v.origin;
-        self.host.set_origin(e, origin);
+        self.set_origin(e, origin);
         self.set_brush_model(e);
         self.entities[e].classname = Some("door".into());
         self.entities[e].use_ = Use::DoorUse;
@@ -376,7 +376,7 @@ impl GameState {
 
         if self.entities[e].v.spawnflags.has(DoorFlags::START_OPEN) {
             let pos2 = self.entities[e].mover.pos2;
-            self.host.set_origin(e, pos2);
+            self.set_origin(e, pos2);
             let ent = &mut self.entities[e];
             ent.v.origin = pos2;
             ent.mover.pos2 = ent.mover.pos1;

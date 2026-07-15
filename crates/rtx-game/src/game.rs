@@ -403,6 +403,10 @@ impl GameState {
     /// `traceline` — trace from `start` to `end` and read the result out of the engine
     /// globals into a value (so callers don't juggle the shared `trace_*` block).
     pub(crate) fn traceline(&mut self, start: Vec3, end: Vec3, nomonsters: bool, ignore: EntId) -> TraceResult {
+        #[cfg(feature = "netclient")]
+        if self.host.is_client() {
+            return self.client_traceline(start, end, ignore);
+        }
         // The traceline builtin takes the ignore entity as an edict *index* (it runs
         // `EdictNum(arg)`), unlike entvars `.entity` fields which store byte offsets.
         self.host.traceline(start, end, nomonsters, ignore);
@@ -419,12 +423,78 @@ impl GameState {
         }
     }
 
+    /// `setorigin` — move an entity and relink it.
+    ///
+    /// In server mode the engine does this through our entity array; in client mode we do it
+    /// ourselves, because a [`ClientHost`](crate::host::ClientHost) writing this memory would alias
+    /// the `&mut self` we're holding right now. Hence a `GameState` method rather than a trap —
+    /// see the [`host`](crate::host) module docs.
+    pub(crate) fn set_origin(&mut self, e: EntId, origin: Vec3) {
+        #[cfg(feature = "netclient")]
+        if self.host.is_client() {
+            self.entities[e].v.origin = origin;
+            self.link_edict(e);
+            return;
+        }
+        self.host.set_origin(e, origin);
+    }
+
+    /// `setsize` — give an entity a bounding box and relink it.
+    pub(crate) fn set_size(&mut self, e: EntId, min: Vec3, max: Vec3) {
+        #[cfg(feature = "netclient")]
+        if self.host.is_client() {
+            let v = &mut self.entities[e].v;
+            (v.mins, v.maxs, v.size) = (min, max, max - min);
+            self.link_edict(e);
+            return;
+        }
+        self.host.set_size(e, min, max);
+    }
+
+    /// `setmodel` for a precached [`Model`] handle (also sets `modelindex` and the bounds).
+    pub(crate) fn set_model(&mut self, e: EntId, model: crate::assets::Model) {
+        #[cfg(feature = "netclient")]
+        if self.host.is_client() {
+            self.client_set_model(e, model.path());
+            return;
+        }
+        self.host.set_model(e, model);
+    }
+
+    /// `droptofloor` — drop an entity onto whatever is under it. `false` if there's nothing within
+    /// 256 units, which is how a mapper's floating item gets noticed.
+    pub(crate) fn droptofloor(&mut self, e: EntId) -> bool {
+        #[cfg(feature = "netclient")]
+        if self.host.is_client() {
+            return self.client_droptofloor(e);
+        }
+        self.host.droptofloor(e)
+    }
+
+    /// `makevectors` — decompose `angles` into the `v_forward`/`v_right`/`v_up` globals.
+    pub(crate) fn make_vectors(&mut self, angles: Vec3) {
+        #[cfg(feature = "netclient")]
+        if self.host.is_client() {
+            let (f, r, u) = crate::math::angle_vectors(angles);
+            (self.globals.v_forward, self.globals.v_right, self.globals.v_up) = (f, r, u);
+            return;
+        }
+        self.host.make_vectors(angles);
+    }
+
     /// `setmodel(self, self.model)` for a brush model (`*N`). The owned `CString` is parked in
     /// the entity so the pointer the engine keeps stays valid for the entity's lifetime.
     pub(crate) fn set_brush_model(&mut self, e: EntId) {
         let Some(m) = self.entities[e].model.clone() else {
             return;
         };
+        #[cfg(feature = "netclient")]
+        if self.host.is_client() {
+            // This is how every door, plat and trigger gets its shape, and where their bounds come
+            // from is the BSP — so the client answers it from the map rather than from a server.
+            self.client_set_model(e, &cstring(&m));
+            return;
+        }
         let host = self.host;
         let ptr = self.entities[e].model_cs.insert(cstring(&m));
         host.set_model_brush(e, ptr);
@@ -666,6 +736,12 @@ impl GameState {
     /// Free an entity slot, both on our side and in the engine.
     pub(crate) fn free(&mut self, id: EntId) {
         self.entities[id].in_use = false;
+        // The trap only tells the *engine* to stop sending the entity to clients. With no engine
+        // there's nobody to tell, and the line above is the whole of what freeing means.
+        #[cfg(feature = "netclient")]
+        if self.host.is_client() {
+            return;
+        }
         self.host.remove(id);
     }
 

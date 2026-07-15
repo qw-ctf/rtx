@@ -66,8 +66,8 @@ enum Version {
 #[br(little)]
 struct Header {
     version: Version,
-    #[br(pad_before = 8)]
-    planes: Lump, // lump 1
+    entities: Lump, // lump 0 — the map's entity string
+    planes: Lump,   // lump 1
     #[br(pad_before = 24)]
     nodes: Lump, // lump 5 (render tree) — skip textures/vertexes/vis
     #[br(pad_before = 24)]
@@ -114,19 +114,33 @@ impl From<ClipNodeV1> for ClipNode {
     }
 }
 
-/// The world model (`models[0]`): its bounding box, the render-tree headnode (`headnode[0]`, for
+/// A brush model (`dmodel_t`): its bounding box, the render-tree headnode (`headnode[0]`, for
 /// `pointcontents`), and the hull-1 headnode (`headnode[1]`); the trailing fields aren't read.
-#[derive(BinRead)]
+///
+/// `models[0]` is the world. The rest are the map's **inline submodels** — the shapes its doors,
+/// plats, buttons and triggers are made of, which entities claim by name as `"*1"`, `"*2"`, …
+#[derive(BinRead, Clone, Copy)]
 #[br(little)]
-struct Model {
+pub struct Model {
+    /// Bounding box, in world coordinates.
     #[br(map = Vec3::from_array)]
-    mins: Vec3,
+    pub mins: Vec3,
     #[br(map = Vec3::from_array)]
-    maxs: Vec3,
+    pub maxs: Vec3,
+    /// `headnode[0]` — render (hull 0) tree root.
     #[br(pad_before = 12)] // skip origin (12)
-    render_head: i32,      // headnode[0] — render (hull 0) tree root
-    clip1: i32,            // headnode[1] — hull-1 (player clip) tree root
+    pub render_head: i32,
+    /// `headnode[1]` — hull-1 (player clip) tree root. The `pad_after` completes `dmodel_t`'s 64
+    /// bytes (`headnode[2..4]`, `visleafs`, `firstface`, `numfaces`) — load-bearing, because the
+    /// models lump is read as a strided run and each record must consume its whole stride or every
+    /// model after the first is read from the middle of its predecessor.
+    #[br(pad_after = 20)]
+    pub clip1: i32,
 }
+
+/// `sizeof(dmodel_t)` — the stride of the models lump. Unchanged between v29/HL and BSP2, which
+/// widen the node/leaf/clipnode records but leave this one alone.
+const MODEL_SIZE: usize = 64;
 
 /// `dnode_t` render node (v29/HL): `i16` children. Only the split plane and children are needed for
 /// a point-contents descent; the bbox and face range are skipped.
@@ -189,6 +203,14 @@ pub struct Bsp {
     /// World model bounding box (float coords), the volume the navmesh voxelizes.
     pub mins: Vec3,
     pub maxs: Vec3,
+    /// The map's entity string: the `{ "key" "value" … }` blocks a server spawns its items, doors,
+    /// spawn points and triggers from. The navmesh doesn't read it — a server hands it entities
+    /// already spawned — but a *client* has no server to do that, so it spawns them from here.
+    pub entities: String,
+    /// Every brush model in the map, world first. `models[N]` is what an entity naming itself
+    /// `"*N"` is shaped like — how a door or a plat gets its bounds, and therefore how big a lift
+    /// the navmesh thinks it is.
+    pub models: Vec<Model>,
     /// The render (hull 0) tree — nodes + per-leaf contents + root — used only by `pointcontents`
     /// to tell which liquid (if any) a point is in. Private: callers go through `pointcontents`.
     render_nodes: Vec<RenderNode>,
@@ -222,19 +244,52 @@ impl Bsp {
             read_lump_stride::<LeafV1, LeafV1>(&mut c, &header.leafs, 28).ok()?.iter().map(|l| l.contents).collect()
         };
 
-        c.seek(SeekFrom::Start(header.models.offset as u64)).ok()?;
-        let model: Model = c.read_le().ok()?;
+        let mut models = read_lump_stride::<Model, Model>(&mut c, &header.models, MODEL_SIZE).ok()?;
+        // "Spread the mins / maxs by a pixel" — Quake's `Mod_LoadSubmodels`, verbatim, and not
+        // cosmetic. qbsp *shrinks* every model's bounds by a unit per axis on the way out (it
+        // removes the padding it added while compiling), and every engine expands them by a unit on
+        // the way in. Skip it and a paper-thin brush — a teleport trigger, a flat door — arrives
+        // inside-out (`mins.y > maxs.y`), so nothing is ever inside it: teleporters that teleport
+        // nobody, doors with no extent.
+        for m in &mut models {
+            m.mins -= Vec3::ONE;
+            m.maxs += Vec3::ONE;
+        }
+        let world = *models.first()?;
+
+        // Latin-1, not UTF-8: the entity string is bytes, and a mapper's name with a high-bit
+        // character in it shouldn't cost us the whole map.
+        let (eo, es) = (header.entities.offset as usize, header.entities.size as usize);
+        let entities = bytes
+            .get(eo..eo.checked_add(es)?)?
+            .iter()
+            .take_while(|&&b| b != 0)
+            .map(|&b| b as char)
+            .collect();
 
         Some(Bsp {
             planes,
             clipnodes,
-            hull1_headnode: model.clip1,
-            mins: model.mins,
-            maxs: model.maxs,
+            hull1_headnode: world.clip1,
+            mins: world.mins,
+            maxs: world.maxs,
+            entities,
+            models,
             render_nodes,
             leaf_contents,
-            render_headnode: model.render_head,
+            render_headnode: world.render_head,
         })
+    }
+
+    /// The bounds of inline submodel `n` (the shape of an entity whose model is `"*n"`), or `None`
+    /// if the map has no such submodel.
+    ///
+    /// Note these are **world** coordinates, not an origin-relative box: a `func_door`'s brushes
+    /// are modelled where the mapper drew them. Quake's `SV_SetModel` copies them straight into
+    /// `mins`/`maxs` and leaves the entity at origin zero, which is why brush entities move by
+    /// changing `origin` from a base of nothing.
+    pub fn submodel(&self, n: usize) -> Option<Model> {
+        self.models.get(n).copied()
     }
 
     /// The `CONTENTS_*` value at `p` in the render hull (hull 0) — the one that carries liquids
@@ -478,6 +533,14 @@ mod tests {
             hull1_headnode: 0,
             mins: Vec3::splat(-256.0),
             maxs: Vec3::splat(256.0),
+            entities: String::new(),
+            // One model (the world) and no submodels: this hull has no doors to be shaped like.
+            models: vec![Model {
+                mins: Vec3::splat(-256.0),
+                maxs: Vec3::splat(256.0),
+                render_head: 0,
+                clip1: 0,
+            }],
             // No render tree in this hand-built hull — pointcontents isn't exercised here.
             render_nodes: Vec::new(),
             leaf_contents: Vec::new(),
@@ -507,6 +570,85 @@ mod tests {
         // Starting inside the solid half is flagged.
         let inside = bsp.hull1_trace(Vec3::new(150.0, 0.0, 0.0), Vec3::new(160.0, 0.0, 0.0));
         assert!(inside.start_solid);
+    }
+
+    /// The entity string is what a client spawns its shadow world from — no entities, no items, no
+    /// navmesh goals, no bots. Check it's real text with the blocks a spawner expects.
+    #[test]
+    fn reads_the_entity_lump_of_a_real_bsp() {
+        let Ok(path) = std::env::var("RTX_TEST_BSP") else {
+            eprintln!("RTX_TEST_BSP not set; skipping");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read bsp");
+        let bsp = Bsp::parse(&bytes).expect("parse bsp");
+
+        let opens = bsp.entities.matches('{').count();
+        let closes = bsp.entities.matches('}').count();
+        eprintln!("{path}: {} bytes of entities, {opens} blocks", bsp.entities.len());
+
+        assert!(opens > 1, "a real map has a worldspawn and then some");
+        assert_eq!(opens, closes, "every block closes");
+        assert!(bsp.entities.contains("\"classname\" \"worldspawn\""), "worldspawn comes first");
+        // A deathmatch map has somewhere to spawn. This is the field the shadow world lives or dies
+        // on: no spawn points means no bots.
+        assert!(
+            bsp.entities.contains("info_player_deathmatch") || bsp.entities.contains("info_player_start"),
+            "no spawn points in the entity string — is the lump offset right?"
+        );
+        // The lump is NUL-terminated in the file; the terminator must not survive into the string,
+        // or a tokenizer would trip on it.
+        assert!(!bsp.entities.contains('\0'));
+    }
+
+    /// A map's inline submodels are the shapes of its doors, plats and triggers. An entity with no
+    /// bounds is an entity the navmesh sizes wrong — a plat whose `pos2` is computed from its own
+    /// height would land at the wrong floor — so parsing them is not cosmetic.
+    #[test]
+    fn reads_inline_submodels_of_a_real_bsp() {
+        let Ok(path) = std::env::var("RTX_TEST_BSP") else {
+            eprintln!("RTX_TEST_BSP not set; skipping");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read bsp");
+        let bsp = Bsp::parse(&bytes).expect("parse bsp");
+
+        // Cross-check the count against an independent header read.
+        let lump_models = 14;
+        let base = 4 + lump_models * 8;
+        let size = u32::from_le_bytes(bytes[base + 4..base + 8].try_into().unwrap()) as usize;
+        assert_eq!(bsp.models.len(), size / MODEL_SIZE);
+        assert!(!bsp.models.is_empty(), "every map has at least the world");
+
+        // models[0] is the world, and is what the top-level fields were taken from.
+        assert_eq!(bsp.submodel(0).map(|m| m.mins), Some(bsp.mins));
+        assert_eq!(bsp.submodel(0).map(|m| m.clip1), Some(bsp.hull1_headnode));
+        assert!(bsp.submodel(bsp.models.len()).is_none(), "and asking past the end is None");
+
+        // Every box must come out the right way round. It's the `Mod_LoadSubmodels` spread that
+        // makes that true: on disk, qbsp's shrink leaves a paper-thin brush inside-out (catalyst's
+        // `*1` is y 515..514, a 1-unit-thin teleport trigger), and only the +1 expansion turns it
+        // back into the unit of extent the mapper drew. Without it nothing is ever inside such a
+        // trigger. A stride bug looks different again — denormal garbage (`1e-42`) — which the
+        // world-bounds check below catches.
+        eprintln!("{}: {} models", path, bsp.models.len());
+        for (i, m) in bsp.models.iter().enumerate() {
+            assert!(m.mins.is_finite() && m.maxs.is_finite(), "submodel *{i}: {:?}..{:?}", m.mins, m.maxs);
+            assert!(
+                (m.maxs - m.mins).min_element() > 0.0,
+                "submodel *{i} is inside-out: {:?}..{:?} — was the load-time spread applied?",
+                m.mins, m.maxs
+            );
+            // Inside Quake's map limit. Note this deliberately isn't "inside the world's box":
+            // `models[0]` bounds only the *world* brushes, so a submodel can legitimately sit
+            // outside them (dm1's `*8` is 128 units past the world's y). What it can't do is land
+            // outside the coordinate system, which is what misread bytes look like.
+            assert!(
+                m.mins.cmpge(Vec3::splat(-4096.0)).all() && m.maxs.cmple(Vec3::splat(4096.0)).all(),
+                "submodel *{i} {:?}..{:?} is outside the ±4096 map limit — wrong stride?",
+                m.mins, m.maxs
+            );
+        }
     }
 
     /// Parse a real map (path from `RTX_TEST_BSP`, e.g. a Quake `dm2.bsp`) and check the parser

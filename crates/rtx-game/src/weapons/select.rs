@@ -66,7 +66,7 @@ impl GameState {
         }
         let time = self.time();
         let v_angle = self.entities[e].v.v_angle;
-        self.host.make_vectors(v_angle);
+        self.make_vectors(v_angle);
         self.entities[e].combat.show_hostile = time + 1.0;
 
         // Opponent modeling: a genuine shot (ammo checked) is world-audible, so any side with a bot in

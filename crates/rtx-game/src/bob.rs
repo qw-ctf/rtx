@@ -50,7 +50,7 @@ impl GameState {
         }
         self.link_brush(e);
         let origin = self.entities[e].v.origin;
-        self.host.set_origin(e, origin); // relink at the spawn position
+        self.set_origin(e, origin); // relink at the spawn position
         self.set_movedir(e); // bob axis from the `angle`/`angles` key
 
         // `delay` staggers nearby bobs by delaying the first tick; a negative value randomises it.

@@ -332,6 +332,8 @@ impl Session {
                     let next = self.continuation(self.models.len(), list.next);
                     self.stringcmd(&format!("modellist {} {next}", self.servercount));
                 } else {
+                    // The model list names the map, which is everything the client has been waiting
+                    // for: it can now read the map, prove it has the same one, and build its world.
                     self.prespawn(host);
                 }
             }

@@ -270,7 +270,10 @@ impl GameState {
             .enumerate()
             .filter_map(|(i, ent)| {
                 let cn = ent.classname()?;
-                if i == 0 || !bot_goals::is_goal_classname(cn) {
+                // `in_use` matters: a freed slot keeps its classname until something reuses it, and
+                // an item that failed `droptofloor` at load was deleted for having fallen out of the
+                // level. Cataloguing it anyway would send bots to stand forever where an item isn't.
+                if i == 0 || !ent.in_use || !bot_goals::is_goal_classname(cn) {
                     return None;
                 }
                 Some((i as u32, graph.nearest(ent.v.origin)?))

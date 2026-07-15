@@ -21,7 +21,7 @@ impl GameState {
     /// Set an item's model handle (kept for respawn — see `entity.rs`).
     fn set_item_model(&mut self, e: EntId, model: Model) {
         self.entities[e].model_cstr = Some(model);
-        self.host.set_model(e, model);
+        self.set_model(e, model);
     }
 
     /// `StartItem` — schedule the item to drop to the floor after other solids settle.
@@ -52,7 +52,7 @@ impl GameState {
             ent.v.velocity = Vec3::ZERO;
             ent.v.origin.z += 6.0;
         }
-        if !self.host.droptofloor(e) {
+        if !self.droptofloor(e) {
             self.free(e);
         }
     }
@@ -60,13 +60,13 @@ impl GameState {
     /// `SUB_regen` — re-show a picked-up item after its respawn delay.
     pub(crate) fn sub_regen(&mut self, e: EntId) {
         if let Some(model) = self.entities[e].model_cstr {
-            self.host.set_model(e, model);
+            self.set_model(e, model);
         }
         self.entities[e].v.solid = Solid::Trigger;
         self.host
             .sound(e, Channel::Voice, Sound::ITEMS_ITEMBK2, 1.0, Attenuation::Norm);
         let origin = self.entities[e].v.origin;
-        self.host.set_origin(e, origin);
+        self.set_origin(e, origin);
     }
 
     /// Hide a just-taken item (the native ABI hides via `modelindex`, not the model string).
@@ -496,8 +496,8 @@ impl GameState {
             it.v.nextthink = time + 120.0;
             it.think = Think::SubRemove;
         }
-        self.host.set_model(item, model);
-        self.host
+        self.set_model(item, model);
+        self
             .set_size(item, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
         item
     }
@@ -669,7 +669,7 @@ impl GameState {
             ent.item.healamount = 25.0;
             ent.item.healtype = 1.0;
         }
-        self.host.set_size(e, Vec3::ZERO, Vec3::new(32.0, 32.0, 56.0));
+        self.set_size(e, Vec3::ZERO, Vec3::new(32.0, 32.0, 56.0));
         self.start_item(e);
         true
     }
@@ -678,7 +678,7 @@ impl GameState {
         self.entities[e].set_touch(Touch::ItemArmor);
         self.set_item_model(e, Model::PROGS_ARMOR);
         self.entities[e].v.skin = skin;
-        self.host
+        self
             .set_size(e, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
         self.start_item(e);
         true
@@ -706,7 +706,7 @@ impl GameState {
         self.set_item_model(e, model);
         self.entities[e].set_touch(Touch::ItemWeapon);
         self.entities[e].netname = Some(spec.pickup_name.into());
-        self.host
+        self
             .set_size(e, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
         self.start_item(e);
         true
@@ -740,7 +740,7 @@ impl GameState {
             ent.v.weapon = Weapon::from_f32(weapon_code);
             ent.netname = Some(netname.into());
         }
-        self.host.set_size(e, Vec3::ZERO, Vec3::new(32.0, 32.0, 56.0));
+        self.set_size(e, Vec3::ZERO, Vec3::new(32.0, 32.0, 56.0));
         self.start_item(e);
         true
     }
@@ -763,7 +763,7 @@ impl GameState {
             ent.v.items = item_bit.as_f32();
             ent.v.effects = ent.v.effects.with(effect);
         }
-        self.host
+        self
             .set_size(e, Vec3::new(-16.0, -16.0, -24.0), Vec3::new(16.0, 16.0, 32.0));
         self.start_item(e);
         true

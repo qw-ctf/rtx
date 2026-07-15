@@ -633,16 +633,16 @@ impl GameState {
             gib.v.frame = 0.0;
             gib.v.flags = 0.0;
         }
-        self.host.set_model(g, gibname);
-        self.host.set_size(g, Vec3::ZERO, Vec3::ZERO);
-        self.host.set_origin(g, origin);
+        self.set_model(g, gibname);
+        self.set_size(g, Vec3::ZERO, Vec3::ZERO);
+        self.set_origin(g, origin);
     }
 
     /// `ThrowHead` — turn the player entity itself into a flying head gib.
     fn throw_head(&mut self, e: EntId, gibname: Model, dm: f32) {
         let vel = self.velocity_for_damage(e, dm);
         let avel = self.rng_unit() * Vec3::new(0.0, 600.0, 0.0);
-        self.host.set_model(e, gibname);
+        self.set_model(e, gibname);
         {
             let ent = &mut self.entities[e];
             ent.v.frame = 0.0;
@@ -655,11 +655,11 @@ impl GameState {
             ent.v.flags = ent.v.flags.without(Flags::ONGROUND);
             ent.v.avelocity = avel;
         }
-        self.host
+        self
             .set_size(e, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
         let mut origin = self.entities[e].v.origin;
         origin.z -= 24.0;
-        self.host.set_origin(e, origin);
+        self.set_origin(e, origin);
         self.entities[e].v.origin = origin;
     }
 

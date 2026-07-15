@@ -46,6 +46,7 @@ pub mod config;
 pub(crate) mod frames;
 pub(crate) mod host;
 pub(crate) mod session;
+pub(crate) mod world;
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -70,6 +71,8 @@ pub struct Client {
     config: Config,
     /// Wall clock at the last tick, for the frame time the game runs on.
     last_tick: Instant,
+    /// The map the shadow world was built for, so a level change is noticed.
+    world_map: String,
 }
 
 impl Client {
@@ -98,6 +101,7 @@ impl Client {
             sessions: Vec::new(),
             config,
             last_tick: Instant::now(),
+            world_map: String::new(),
         }
     }
 
@@ -205,16 +209,26 @@ impl Client {
             }
         }
 
-        // 2. Advance the game's clock. The brain's timers — reaction delay, respawn waits, powerup
+        // 2. Build the world, if the map changed under us.
+        self.rebuild_world_if_map_changed();
+
+        // 3. Advance the game's clock. The brain's timers — reaction delay, respawn waits, powerup
         //    countdowns — all read this, so it has to move whether or not there's a world yet.
         self.game.globals.frametime = dt;
         self.game.globals.time += dt;
 
-        // 3. Drive the bots — once there is something to drive. The mirror that gives them a world
-        //    is the next milestone; running the brain against an empty one would only teach it that
-        //    the map is deserted.
+        // 4. Build the navmesh, off-thread, as the server does — but only once the world exists.
+        //    `ensure_navmesh` gives up permanently if it can't read the map, so calling it before
+        //    we know which map that is would disable the bots for the whole connection.
+        if !self.world_map.is_empty() {
+            self.game.ensure_navmesh();
+        }
 
-        // 4. Send. Once a bot is embodied this carries its usercmd; until then it is the keepalive
+        // 5. Drive the bots — once there is something to drive. The mirror that fills the world
+        //    with *live* players and projectiles is the next milestone; the shadow world above is
+        //    only the furniture.
+
+        // 6. Send. Once a bot is embodied this carries its usercmd; until then it is the keepalive
         //    that stops the server timing us out, and the carrier the netchan needs to get the
         //    reliable signon messages out.
         for s in &mut self.sessions {
@@ -225,6 +239,50 @@ impl Client {
             }
         }
         Ok(())
+    }
+
+    /// Spawn the shadow world when the session binds a map, and again when the map changes.
+    ///
+    /// Keyed off the session having read the map, which happens at `prespawn` — by which point the
+    /// host has the BSP and the entity string, and the whole of the module's spawn code can run
+    /// against them exactly as it would on a server.
+    fn rebuild_world_if_map_changed(&mut self) {
+        let Some(map) = self.sessions.first().map(|s| s.mapname().to_string()) else {
+            return;
+        };
+        if map.is_empty() || map == self.world_map {
+            return;
+        }
+        self.world_map = map.clone();
+
+        // A new level voids every entity: the shadow furniture belongs to the old map, and the
+        // network numbers are about to be reassigned. A server module gets this done for it by the
+        // engine's edict clear; here it's ours to do. Note `reset()` marks a slot *spawned* — what's
+        // wanted is a free one, so this is `default()` rather than a reset.
+        for i in 0..self.game.entities.len() as u32 {
+            self.game.entities[crate::entity::EntId(i)] = crate::entity::Entity::default();
+        }
+        self.game.spawn_shadow_world();
+
+        // The counts are the shadow world's proof of life, and worth printing rather than trusting:
+        // if `droptofloor` misfires, items are *deleted* as having fallen out of the level, and a
+        // world with no items looks exactly like a working one until a bot has nothing to collect.
+        let items = self
+            .game
+            .entities
+            .live()
+            .filter(|(_, e)| e.classname().is_some_and(crate::bot::goals::is_goal_classname))
+            .count();
+        let spawns = self
+            .game
+            .entities
+            .live()
+            .filter(|(_, e)| e.classname() == Some("info_player_deathmatch"))
+            .count();
+        eprintln!(
+            "rtx-client: world: {map} — {} entities, {items} items, {spawns} spawn points",
+            self.game.entities.live().count(),
+        );
     }
 
     /// Say the things worth saying while there's no mirror to consume them.
