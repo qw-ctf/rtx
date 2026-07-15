@@ -35,12 +35,18 @@
 //! opponent model the bots already use for observation-gated estimates, which is the honest answer
 //! and, not by coincidence, the one that makes them play like a player rather than a cheat.
 //!
-//! # Status
+//! # A squad is one world
 //!
-//! The seam, the wire session and the tick loop are in place: a client connects, completes signon,
-//! tracks the entity delta chain, and holds a connection. The **world mirror** — the part that
-//! writes network truth into the entities the brain reads — is the next milestone, and until it
-//! lands the bots have nothing to think about, so `--spectate` is the honest way to run this.
+//! One process hosts N connections and **one** [`GameState`]. That isn't a shortcut: it's what the
+//! bots already have inside qwprogs, where teammates share an opponent model and a set of item
+//! timers because they talk to each other. Each bot's *body* and *stats* are its own connection's
+//! and nobody else's; the world they write into is shared, and what any one of them can see, all of
+//! them know.
+//!
+//! The shape has one consequence worth stating plainly, because every squad bug so far has been a
+//! variation on it: **each connection receives everything, including messages about our own other
+//! bots**. A mirror can tell its own body from the rest, but not a squadmate's from a stranger's —
+//! so the rules that need that distinction take a [`Squad`](mirror::Squad) and ask.
 
 pub(crate) mod adapters;
 pub mod config;
@@ -67,6 +73,11 @@ use host::NetHost;
 /// The rate to send at before the server has said otherwise. QuakeWorld's traditional server frame
 /// rate; KTX commonly runs 77.
 const DEFAULT_MAXFPS: f32 = 72.0;
+
+/// The most latency worth aiming across. A quarter-second is already a bad transatlantic link; past
+/// it the bot is guessing, and a guess that lands 100 units in front of a strafing player is worse
+/// than aiming where it can see. Also a NaN/garbage stop, since this multiplies a velocity.
+const MAX_LEAD: f32 = 0.25;
 
 /// A bot client: the brain, hosted by [`NetHost`] instead of a server.
 pub struct Client {
@@ -120,14 +131,15 @@ impl Client {
         }
     }
 
-    /// The host, for tests and for the session to feed.
-    #[allow(dead_code)]
+    /// The host the brain asks about the map and the tunables. Only the tests reach for it from
+    /// outside — everything else already holds one.
+    #[cfg(test)]
     pub(crate) fn host(&self) -> &'static NetHost {
         self.host
     }
 
-    /// The world the brain reads. The mirror writes it; until then, only the tests look.
-    #[allow(dead_code)]
+    /// The world the brain reads. Likewise: the tick loop owns it directly.
+    #[cfg(test)]
     pub(crate) fn game(&mut self) -> &mut GameState {
         &mut self.game
     }
@@ -218,12 +230,18 @@ impl Client {
         let dt = now.duration_since(self.last_tick).as_secs_f32();
         self.last_tick = now;
 
-        // 1. Read, and write what was said into the world.
-        for i in 0..self.sessions.len() {
-            let events = self.sessions[i].poll(self.host)?;
-            for ev in &events {
+        // 1. Read everything every connection has to say, before writing any of it. The order is
+        //    load-bearing for a squad: the shape of the squad — which slots are our own bots' — is
+        //    established by these reads, and the writes below need it settled before the first one.
+        let mut inbox: Vec<Vec<SvcEvent>> = Vec::with_capacity(self.sessions.len());
+        for s in &mut self.sessions {
+            inbox.push(s.poll(self.host)?);
+        }
+        let squad = self.squad();
+        for (i, events) in inbox.iter().enumerate() {
+            for ev in events {
                 self.observe(i, ev);
-                self.mirrors[i].apply(&mut self.game, ev);
+                self.mirrors[i].apply(&mut self.game, &squad, ev);
             }
         }
 
@@ -243,14 +261,14 @@ impl Client {
         }
 
         // 5. Fold this frame's entities in — the rockets in the air, the doors that moved, which
-        //    items are actually there.
-        self.mirror_entities();
+        //    items are actually there. The squad is rebuilt: the bots have bodies now, and where
+        //    those bodies are looking from is what decides whether an item's absence means anything.
+        let squad = self.squad();
+        self.mirror_entities(&squad);
 
-        // 6. Fold in what we believe about everyone, then drive the bots. The same `run_bots` the
-        //    server calls, over the same world — it has no idea it isn't one.
-        for m in &mut self.mirrors {
-            m.write_estimates(&mut self.game);
-        }
+        // 6. How far behind the world we're shooting, and then drive the bots. The same `run_bots`
+        //    the server calls, over the same world — it has no idea it isn't one.
+        self.game.client_lead = self.latency();
         crate::bot::run_bots(&mut self.game);
         self.measure_travel();
 
@@ -260,9 +278,10 @@ impl Client {
         //    Whatever the brain emitted for each bot this frame becomes that bot's move. A bot that
         //    emitted nothing (no navmesh yet, or still connecting) still sends: the server needs a
         //    packet from us to not time us out, and the netchan needs one to carry signon replies.
+        self.flush_console();
         let cmds = self.host.take_cmds();
         let mut fired: Vec<EntId> = Vec::new();
-        for (i, s) in self.sessions.iter_mut().enumerate() {
+        for s in self.sessions.iter_mut() {
             if s.signon() == Signon::Disconnected {
                 continue;
             }
@@ -283,7 +302,6 @@ impl Client {
                 }
                 None => s.send_move(glam::Vec3::ZERO, 0, 0, 0, 0, 0)?,
             }
-            let _ = i;
         }
         for e in fired {
             self.game.client_note_own_fire(e);
@@ -340,30 +358,104 @@ impl Client {
         );
     }
 
+    /// How far behind the world we are, in seconds.
+    ///
+    /// The round trip: we see the enemy where they were half a trip ago, and the server judges our
+    /// shot half a trip from now. One number for the squad, because every connection here runs from
+    /// one machine to one server — they don't have meaningfully different latencies, and a bot that
+    /// believed it did would only be modelling jitter. Sanity-bounded, because an early estimate
+    /// is built from very few samples and a bot leading a second and a half would simply never hit.
+    fn latency(&self) -> f32 {
+        self.sessions
+            .iter()
+            .filter(|s| s.signon() == Signon::Active)
+            .map(|s| s.rtt())
+            .fold(0.0f32, f32::max) // nobody connected yet ⇒ 0: nothing to be behind
+            .clamp(0.0, MAX_LEAD)
+    }
+
+    /// Send on anything the game asked a console to run.
+    ///
+    /// A server module's `localcmd` reaches the server's own console; a client hasn't got one, so
+    /// the honest equivalent is what a real client's console does with a word it doesn't recognise —
+    /// send it to the server as a `clc_stringcmd`. `set` never arrives here ([`NetHost::localcmd`]
+    /// interprets those itself, since there's no console to interpret them for it), which leaves the
+    /// control channel's `console` verb: an operator asking the server something down a bot's
+    /// connection. It goes out on the first live one, because it's the *server* being addressed and
+    /// which bot carries the question doesn't matter.
+    fn flush_console(&mut self) {
+        let queued = self.host.take_pending_cmds();
+        if queued.is_empty() {
+            return;
+        }
+        let Some(s) = self.sessions.iter_mut().find(|s| s.signon() == Signon::Active) else {
+            return; // nobody in the game to say it through; the operator can ask again
+        };
+        for cmd in queued {
+            s.stringcmd(&cmd);
+        }
+    }
+
+    /// Which slots are our own bots', and where each of them is looking from.
+    ///
+    /// Rebuilt every tick rather than kept, because both halves move: a bot's slot is reassigned on
+    /// reconnect and on a map change, and its eyes are wherever it walked to since the last frame.
+    fn squad(&self) -> mirror::Squad {
+        let mut slots = [false; mirror::MAX_CLIENTS];
+        let mut eyes = Vec::new();
+        for (s, m) in self.sessions.iter().zip(&self.mirrors) {
+            if s.signon() != Signon::Active {
+                continue;
+            }
+            if let Some(slot) = slots.get_mut(s.playernum() as usize) {
+                *slot = !m.spectating();
+            }
+            eyes.extend(m.eyes(&self.game));
+        }
+        mirror::Squad::new(slots, eyes)
+    }
+
     /// Fold every bot's view of this frame into the one shared world.
     ///
     /// A squad is several clients watching the same game from different places, so each sees a
     /// different subset — the server culls what it sends by what you could see. The **union** is
     /// what the team collectively knows, which is exactly what the bots share inside qwprogs, and
     /// taking any one bot's view alone would have the others forget everything they can't see.
-    fn mirror_entities(&mut self) {
-        let mut seen: Vec<EntityState> = Vec::new();
-        for s in &self.sessions {
+    ///
+    /// Where two views disagree about the same entity, the newer one wins. That matters less for the
+    /// frame or so that separates two healthy connections than for an unhealthy one: a session that
+    /// stops receiving keeps its last snapshot indefinitely, and without a freshness rule its frozen
+    /// rockets would hang in the air over every live view of them for the rest of the run.
+    fn mirror_entities(&mut self, squad: &mirror::Squad) {
+        let mut seen: Vec<(EntityState, Instant)> = Vec::new();
+        for s in self.sessions.iter().filter(|s| s.signon() == Signon::Active) {
+            let at = s.frames_at();
             for e in s.frames.current() {
-                if !seen.iter().any(|x| x.number == e.number) {
-                    seen.push(*e);
+                match seen.iter_mut().find(|(x, _)| x.number == e.number) {
+                    Some(held) if held.1 < at => *held = (*e, at),
+                    Some(_) => {}
+                    None => seen.push((*e, at)),
                 }
             }
         }
+        let seen: Vec<EntityState> = seen.into_iter().map(|(e, _)| e).collect();
+
         // The model list names what each entity is; it's per map, and identical across a squad.
         let models: Vec<String> = self.sessions.first().map(|s| s.models().to_vec()).unwrap_or_default();
         if models.is_empty() {
             return;
         }
         // One mirror does the shared world (they'd otherwise fight over it); the rest keep only
-        // their own body and stats, which they already did on the way in.
-        if let Some(m) = self.mirrors.first_mut() {
-            m.apply_frame(&mut self.game, &seen, &models);
+        // their own body and stats, which they already did on the way in. It has to be one that's
+        // actually in the game — a mirror still connecting has no map indexed and no items to
+        // reason about, and would conclude the map was bare.
+        let writer = self
+            .sessions
+            .iter()
+            .position(|s| s.signon() == Signon::Active)
+            .and_then(|i| self.mirrors.get_mut(i));
+        if let Some(m) = writer {
+            m.apply_frame(&mut self.game, squad, &seen, &models);
         }
     }
 
@@ -442,11 +534,6 @@ impl Client {
         }
     }
 
-    /// How far every bot has got, for a caller that wants to know without printing.
-    #[allow(dead_code)]
-    pub(crate) fn signons(&self) -> Vec<Signon> {
-        self.sessions.iter().map(|s| s.signon()).collect()
-    }
 }
 
 /// Run a bot client from a parsed command line.

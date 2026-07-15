@@ -782,7 +782,12 @@ fn plan_ballistics(
 /// linear lead if the fixed point can't settle), aimed at the hull centre (+4) for the most
 /// direct-hit margin; grounded/swimming targets get a linear lead from the eye (a grounded RL
 /// strafer gets the shin-drop so a near miss becomes floor splash, but nailguns need a direct hit).
-/// Hitscan aims straight at the eye with no lead.
+/// Hitscan aims straight at the eye, led only by `lead`.
+///
+/// `lead` is the latency the shot is fired across — zero inside a server, and a network client's
+/// round trip otherwise (see [`GameState::aim_lead`]). It's simply added to the flight time, because
+/// that is exactly what it is: time in which the target moves and we cannot see it. That makes it a
+/// hitscan's *whole* lead, which is why the last branch has one at all.
 fn aim_solution(
     choice: WeaponChoice,
     tgt: &Target,
@@ -791,6 +796,7 @@ fn aim_solution(
     gravity: f32,
     land: Option<(f32, Vec3)>,
     grenade_sol: Option<GrenadeSol>,
+    lead: f32,
 ) -> (Vec3, Vec3, bool) {
     let s = choice.projectile_speed;
     if choice.grenade_arc {
@@ -802,7 +808,9 @@ fn aim_solution(
         if tgt.airborne {
             let seed =
                 intercept_time(tgt.org - muzzle_base, tgt.vel, s).unwrap_or((tgt.org - muzzle_base).length() / s);
-            let pos_at = |t: f32| ballistic_pos(tgt.org, tgt.vel, gravity, land, t);
+            // The parabola is evaluated `lead` further along than the flight alone: an airborne
+            // target keeps falling through our latency, so the meet point drops with it.
+            let pos_at = |t: f32| ballistic_pos(tgt.org, tgt.vel, gravity, land, t + lead);
             // Fallback (fixed point didn't settle — a target falling away near projectile speed):
             // the linear-seed flight time evaluated on the *clamped* `pos_at`, so a target that lands
             // mid-flight still resolves to the landing spot rather than a point below the floor.
@@ -817,14 +825,17 @@ fn aim_solution(
                 Vec3::new(tgt.vel.x, tgt.vel.y, 0.0)
             };
             let t = intercept_time(tgt.eye - my_eye, pred_vel, s).unwrap_or(tgt.dist / s);
-            let mut aim = tgt.eye + pred_vel * t;
+            let mut aim = tgt.eye + pred_vel * (t + lead);
             if !tgt.swimming && choice.weapon == Weapon::RocketLauncher && pred_vel.xy().length() > 150.0 {
                 aim.z -= 38.0; // eye (+22 over origin) → shin (−16)
             }
             (aim, angles_to(my_eye, aim), choice.weapon != Weapon::RocketLauncher)
         }
     } else {
-        (tgt.eye, angles_to(my_eye, tgt.eye), false)
+        // Hitscan: no flight time, so `lead` is the whole of it — nothing inside a server, and the
+        // round trip on a server that won't rewind for us.
+        let aim = tgt.eye + Vec3::new(tgt.vel.x, tgt.vel.y, 0.0) * lead;
+        (aim, angles_to(my_eye, aim), false)
     }
 }
 
@@ -1160,7 +1171,9 @@ pub(crate) fn engage(
     // direct hull hit vs. one that can lean on splash.
     let muzzle_base = origin + Vec3::new(0.0, 0.0, 16.0); // rocket/grenade spawn height (w_fire_rocket)
     let grenade_sol = plan.air_gl.or(plan.gl_ground);
-    let (aim, clean, gate_direct) = aim_solution(choice, &tgt, my_eye, muzzle_base, gravity, plan.land, grenade_sol);
+    let lead = game.aim_lead(choice.projectile_speed > 0.0);
+    let (aim, clean, gate_direct) =
+        aim_solution(choice, &tgt, my_eye, muzzle_base, gravity, plan.land, grenade_sol, lead);
 
     // Compose the view: clean angles + feed-forward lead + drifting skill error. `aim_error` also
     // records the "last seen" spot/time for the hold-the-angle behavior.
@@ -1623,6 +1636,65 @@ mod tests {
     // Combat-move geometry for the hazard-guard tests: enemy along +x, so `dir = +x`, `perp = +y`.
     const DIR: Vec3 = Vec3::new(1.0, 0.0, 0.0);
     const PERP: Vec3 = Vec3::new(0.0, 1.0, 0.0);
+
+    /// An enemy 400 units away along +x, running sideways at full speed.
+    fn strafing_target() -> Target {
+        let org = Vec3::new(400.0, 0.0, 0.0);
+        Target {
+            org,
+            eye: org + Vec3::new(0.0, 0.0, 22.0),
+            vel: Vec3::new(0.0, 320.0, 0.0),
+            dist: 400.0,
+            swimming: false,
+            airborne: false,
+        }
+    }
+
+    fn solve(weapon: Weapon, tgt: &Target, lead: f32) -> Vec3 {
+        let my_eye = Vec3::new(0.0, 0.0, 22.0);
+        let (aim, _, _) = aim_solution(
+            WeaponChoice::of(weapon),
+            tgt,
+            my_eye,
+            Vec3::new(0.0, 0.0, 16.0),
+            800.0,
+            None,
+            None,
+            lead,
+        );
+        aim
+    }
+
+    /// Latency is time in which the target moves and we cannot see it, so it adds to the flight time
+    /// — and for a hitscan, where there is no flight time, it *is* the lead.
+    ///
+    /// Zero inside a server, where the bot is the world: every one of these folds back to aiming at
+    /// what it can see, which is why the same code serves both hosts.
+    #[test]
+    fn latency_leads_a_shot_by_exactly_the_time_we_cannot_see() {
+        let tgt = strafing_target();
+
+        // A server-side bot: no lead beyond the shot's own flight.
+        let bullet = solve(Weapon::Lightning, &tgt, 0.0);
+        assert_eq!(bullet, tgt.eye, "hitscan aims where it looks");
+
+        // A client 100ms behind: the target has had 100ms to run since we saw it here.
+        let led = solve(Weapon::Lightning, &tgt, 0.1);
+        assert!((led.y - (tgt.eye.y + 32.0)).abs() < 0.01, "320u/s for 0.1s = 32u: {led:?}");
+
+        // A rocket is led by its flight *and* the latency, so more than by flight alone.
+        let rocket_now = solve(Weapon::RocketLauncher, &tgt, 0.0);
+        let rocket_late = solve(Weapon::RocketLauncher, &tgt, 0.1);
+        assert!(rocket_now.y > tgt.eye.y, "flight time alone already leads");
+        assert!(
+            (rocket_late.y - rocket_now.y - 32.0).abs() < 0.5,
+            "and latency adds its own 32u on top: {rocket_now:?} vs {rocket_late:?}",
+        );
+
+        // A target standing still is where it is, however far behind we are.
+        let still = Target { vel: Vec3::ZERO, ..strafing_target() };
+        assert_eq!(solve(Weapon::Lightning, &still, 0.25), still.eye);
+    }
 
     #[test]
     fn safe_combat_move_passes_through_when_clear() {

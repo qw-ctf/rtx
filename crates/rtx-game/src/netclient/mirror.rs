@@ -31,6 +31,7 @@ use rtx_proto::svc::{PlayerInfo, SvcEvent};
 
 use crate::bot::model::PickupKind;
 use crate::defs::{Bits, DeadFlag, Effects, Flags, Items, MoveType, Solid, Weapon};
+use crate::entity::MoverPhase;
 use crate::entity::{EntId, Entity, Touch};
 use crate::game::GameState;
 use crate::netclient::frames::EntityState;
@@ -41,17 +42,60 @@ fn slot_to_ent(slot: u8) -> EntId {
     EntId(slot as u32 + 1)
 }
 
-/// A networked entity we're tracking, and when we last saw it.
-struct Tracked {
-    origin: Vec3,
-    #[allow(dead_code)]
-    seen: f32,
+/// QuakeWorld's hard limit on player slots, and the width of everything a slot number indexes.
+///
+/// The wire's slot is a byte, so a server could name slot 200. Everything here is 32 wide, and the
+/// difference between checking that and folding it around is a player written into a stranger's body.
+pub(crate) const MAX_CLIENTS: usize = 32;
+
+/// What a mirror needs to know that no single connection can answer.
+///
+/// A squad is several clients watching one game and writing into one world. Two of the rules for
+/// writing it can only be stated across the whole squad, and a mirror on its own gets both wrong:
+///
+/// - **Whose body is that?** Every bot receives everyone's `svc_playerinfo`, our own squadmates'
+///   included. A mirror can tell *its* body from the rest, but not a squadmate's from a stranger's
+///   — so it writes a stranger's placeholder health over a body whose exact health another mirror
+///   already knows from its own stats.
+/// - **Could we have seen it?** An item's absence is only evidence if somebody had a clear look at
+///   the spot. The world is the union of what the squad can see, so the looking has to be too:
+///   asking one bot's eyes about a spot another bot is standing next to declares a plainly-present
+///   item taken.
+#[derive(Default)]
+pub(crate) struct Squad {
+    /// The slots our own bots occupy. Not "is it mine" — "is it ours".
+    slots: [bool; MAX_CLIENTS],
+    /// Each of our live bots: its body, and where that body looks from. Paired, because a trace has
+    /// to ignore the body it starts inside — an eye sits within its own player box, so a trace that
+    /// doesn't skip it hits it immediately and reports the whole map blocked.
+    eyes: Vec<(EntId, Vec3)>,
+}
+
+impl Squad {
+    /// Build from what each connection knows about itself.
+    pub(crate) fn new(slots: [bool; MAX_CLIENTS], eyes: Vec<(EntId, Vec3)>) -> Self {
+        Squad { slots, eyes }
+    }
+
+    /// Whether a slot holds one of our own bots — whose truth its own mirror owns, and no other
+    /// mirror may touch.
+    fn ours(&self, slot: u8) -> bool {
+        self.slots.get(slot as usize).copied().unwrap_or(false)
+    }
 }
 
 /// Everything the mirror remembers between frames, per connection.
 pub(crate) struct Mirror {
     /// Our own player slot, once the server has told us.
     playernum: u8,
+    /// Whether we joined to watch rather than to play.
+    ///
+    /// A spectator holds a slot and a scoreboard entry but has no body — so there is nothing here to
+    /// drive, and nothing that should try. It matters more than it sounds: mvdsv sends a spectator
+    /// the *tracked player's* stats, so a mirror that embodied anyway would take a stranger's health
+    /// and ammo for its own and play off them, and the respawn pulse it sent for the 0-health slot it
+    /// started on would cycle the camera through the server's players instead.
+    spectator: bool,
     /// Our stats, as last sent. Kept whole because the server sends only what changed.
     stats: [i32; stat::COUNT],
     /// Whether our body has been set up as a bot the brain will drive.
@@ -60,18 +104,27 @@ pub(crate) struct Mirror {
     items: Vec<(EntId, Vec3)>,
     /// Submodel index → the shadow entity we spawned from it, so a moving door finds its twin.
     brushes: std::collections::HashMap<usize, EntId>,
-    /// Networked entities we're mirroring into their own slots, by server entity number.
-    tracked: std::collections::HashMap<u16, Tracked>,
+    /// Networked entities we are mirroring into their own slots: where each was last frame, by
+    /// server entity number. The previous position is the whole point — nothing sends a velocity,
+    /// so a rocket's heading is the difference between two sightings of it.
+    tracked: std::collections::HashMap<u16, Vec3>,
+    /// The slots the nails live in.
+    ///
+    /// Nails come in a message of their own with no entity numbers attached, so unlike everything
+    /// else on the wire they have nowhere to be written until we give them somewhere. Allocated once
+    /// per map and reused every frame, because `svc_nails` is not a delta — it carries the whole set
+    /// in flight, every time.
+    nails: Vec<EntId>,
     /// The sound list. `svc_sound` carries an index into it, and the *name* is what says whether we
     /// just heard a rocket launcher or a footstep — so the bot's ears are downstream of this.
     sounds: Vec<String>,
     /// Who we last believed was alive, so a death is noticed as it happens. `PF_DEAD` is on the
     /// wire and authoritative — far better evidence than reading the obituary, and it works on any
     /// mod, whatever it calls the message.
-    alive: [bool; 32],
+    alive: [bool; MAX_CLIENTS],
     /// Who we last saw glowing, and in which colour, so a powerup is noticed the moment it lights up
     /// rather than every frame it stays lit.
-    glowing: [Effects; 32],
+    glowing: [Effects; MAX_CLIENTS],
     /// How many projectiles we've ever seen fly, and the most at once. A path that never runs looks
     /// exactly like one with nothing to do — this tells them apart.
     pub(crate) projectiles_seen: u32,
@@ -82,14 +135,16 @@ impl Default for Mirror {
     fn default() -> Self {
         Mirror {
             playernum: 0,
+            spectator: false,
             stats: [0; stat::COUNT],
             embodied: false,
             items: Vec::new(),
             brushes: Default::default(),
             tracked: Default::default(),
+            nails: Vec::new(),
             sounds: Vec::new(),
-            alive: [false; 32],
-            glowing: [Effects::empty(); 32],
+            alive: [false; MAX_CLIENTS],
+            glowing: [Effects::empty(); MAX_CLIENTS],
             projectiles_seen: 0,
             projectiles_peak: 0,
         }
@@ -97,9 +152,11 @@ impl Default for Mirror {
 }
 
 impl Mirror {
-    /// Point the mirror at a player slot. Called when `svc_serverdata` says which one we are.
-    pub(crate) fn set_playernum(&mut self, playernum: u8) {
+    /// Point the mirror at a player slot. Called when `svc_serverdata` says which one we are — and
+    /// whether we're here to play or only to watch.
+    pub(crate) fn set_slot(&mut self, playernum: u8, spectator: bool) {
         self.playernum = playernum;
+        self.spectator = spectator;
         self.stats = [0; stat::COUNT];
         self.embodied = false;
     }
@@ -109,22 +166,27 @@ impl Mirror {
         slot_to_ent(self.playernum)
     }
 
+    /// Whether this connection is watching rather than playing.
+    pub(crate) fn spectating(&self) -> bool {
+        self.spectator
+    }
+
     /// A stat, as last sent.
     pub(crate) fn stat(&self, which: u8) -> i32 {
         self.stats.get(which as usize).copied().unwrap_or(0)
     }
 
     /// Fold one server message into the world.
-    pub(crate) fn apply(&mut self, game: &mut GameState, ev: &SvcEvent) {
+    pub(crate) fn apply(&mut self, game: &mut GameState, squad: &Squad, ev: &SvcEvent) {
         match ev {
-            SvcEvent::ServerData(sd) => self.set_playernum(sd.playernum),
+            SvcEvent::ServerData(sd) => self.set_slot(sd.playernum, sd.spectator),
             SvcEvent::UpdateStat { stat, value } => {
                 if let Some(slot) = self.stats.get_mut(*stat as usize) {
                     *slot = *value;
                 }
                 self.write_own_stats(game);
             }
-            SvcEvent::PlayerInfo(pi) => self.write_player(game, pi),
+            SvcEvent::PlayerInfo(pi) => self.write_player(game, squad, pi),
             // The bot's ears. Sounds carry by PHS rather than PVS — you hear things through walls,
             // which is the whole point of listening — so this reaches further than sight, and is
             // exactly what a player works from when they say "he's got the rocket launcher".
@@ -153,6 +215,7 @@ impl Mirror {
                 self.sounds.truncate((list.start as usize).max(1));
                 self.sounds.extend_from_slice(&list.names);
             }
+            SvcEvent::Nails(nails) => self.write_nails(game, nails),
             SvcEvent::UpdateUserinfo { player, userinfo, .. } => {
                 self.write_userinfo(game, *player, userinfo)
             }
@@ -180,12 +243,18 @@ impl Mirror {
     /// A bot inside a server is created by the server; here we *are* the client, so the body already
     /// exists on the wire and this only has to describe it the way the brain expects: a player, in
     /// use, flagged as bot-driven, with the client number its usercmds will be tagged with.
+    ///
+    /// A spectator has none of that and gets none of this.
     fn embody(&mut self, game: &mut GameState) {
+        if self.spectator {
+            return;
+        }
         let e = self.own();
         let client = e.0 as i32;
         // The engine seeds a client's move cap from this extended field; without it a bot can jump
         // but not walk (`entity.rs`). Read before the entity borrow.
         let maxspeed = game.host().cvar(c"sv_maxspeed");
+        let now = game.time();
         let ent = &mut game.entities[e];
         ent.in_use = true;
         ent.classname = Some("player".into());
@@ -200,6 +269,20 @@ impl Mirror {
         ent.v.mins = crate::defs::VEC_HULL_MIN;
         ent.v.maxs = crate::defs::VEC_HULL_MAX;
         ent.maxspeed = maxspeed;
+
+        // Dead until the server says otherwise, which it is about to: our first `STAT_HEALTH` is
+        // moments away and overwrites this.
+        //
+        // The default would be `No`, and a body with no health that isn't dead is a body the *server*
+        // never spawned — so `run_bot` reaches for `put_client_in_server` to finish the job, which
+        // teleports our shadow body to a spawn point and invents it a loadout. That's the engine's
+        // work, and a client that does it is inventing a game the server isn't playing. Starting from
+        // `Dead` puts the only honest reading of "no health yet" in the field: the respawn pulse,
+        // which is exactly what a real client sends at a respawn prompt.
+        ent.v.deadflag = DeadFlag::Dead;
+        // A full tank, as `PutClientInServer` gives a fresh body. `write_air` keeps it topped up
+        // from here; this is only for a body that starts its life underwater.
+        ent.combat.air_finished = now + AIR_TIME;
         self.embodied = true;
     }
 
@@ -210,6 +293,12 @@ impl Mirror {
     /// client does) or to play. Deriving it from health rather than guessing keeps the server-only
     /// spawn path — which a client must never take — permanently out of reach.
     fn write_own_stats(&mut self, game: &mut GameState) {
+        // A spectator's "own" stats are whoever they're tracking — mvdsv sends the tracked player's
+        // health and ammo, or zeros when tracking nobody. Neither is ours; adopting either would be
+        // playing a stranger's body from the sidelines.
+        if self.spectator {
+            return;
+        }
         if !self.embodied {
             self.embody(game);
         }
@@ -243,9 +332,12 @@ impl Mirror {
     }
 
     /// One player's per-frame state.
-    fn write_player(&mut self, game: &mut GameState, pi: &PlayerInfo) {
+    fn write_player(&mut self, game: &mut GameState, squad: &Squad, pi: &PlayerInfo) {
+        if pi.player as usize >= MAX_CLIENTS {
+            return; // not a slot this server has; everything below indexes by it
+        }
         let e = slot_to_ent(pi.player);
-        let own = pi.player == self.playernum;
+        let own = !self.spectator && pi.player == self.playernum;
         if own && !self.embodied {
             self.embody(game);
         }
@@ -286,9 +378,15 @@ impl Mirror {
             v.flags = v.flags.with(Flags::CLIENT);
 
             // Death is on the wire. Health is not — for anyone but us — so a dead body is known
-            // exactly while a live one's condition is a guess. Our own health arrives via stats and
-            // must not be clobbered here.
-            if !own {
+            // exactly while a live one's condition is a guess.
+            //
+            // Our own health arrives via stats and must not be clobbered here. Neither must a
+            // squadmate's: they are another client of ours, with their own stats and their own mirror
+            // that knows their health exactly, and this mirror has no more business overwriting it
+            // than a stranger's. Every bot receives *everyone's* playerinfo, so without the squad
+            // test each bot's health would be whatever the last mirror to run decided — which is the
+            // placeholder below, forever, for all of them.
+            if !own && !squad.ours(pi.player) {
                 v.deadflag = if pi.dead() { DeadFlag::Dead } else { DeadFlag::No };
                 // Enough to be "alive" for the brain's gates. What it's actually *worth* is the
                 // opponent model's business, and writing a real number here would be a lie with a
@@ -302,7 +400,7 @@ impl Mirror {
         // looking at them. Noting the moment it appears is what dates the ~30s window.
         if !own {
             let glow = Effects::from_bits_truncate(pi.effects.unwrap_or(0) as u32);
-            let known = &mut self.glowing[pi.player as usize % 32];
+            let known = &mut self.glowing[pi.player as usize];
             for (bit, kind) in [
                 (Effects::BLUE, PickupKind::Quad),
                 (Effects::RED, PickupKind::Pent),
@@ -318,18 +416,79 @@ impl Mirror {
         // A death is the one moment an estimate stops being a guess: whoever that was is about to be
         // a fresh spawn, so everything we believed about how hurt they were is void. Noticing the
         // *transition* is what makes it an event rather than a state.
-        if let Some(was) = self.alive.get_mut(pi.player as usize) {
-            let now_alive = !pi.dead();
-            if *was && !now_alive {
-                game.client_saw_death(e);
-            }
-            *was = now_alive;
+        let now_alive = !pi.dead();
+        if self.alive[pi.player as usize] && !now_alive {
+            game.client_saw_death(e);
         }
+        self.alive[pi.player as usize] = now_alive;
 
         // Water is not on the wire either, but it's not a secret: anyone can see where the water is.
         // The map says, and we have the map.
         self.write_waterlevel(game, e);
+        if own {
+            self.write_air(game, e);
+        }
         game.link_edict(e);
+    }
+
+    /// How long we can hold our breath.
+    ///
+    /// `WaterMove`'s rule, exactly: anything short of fully under refills the tank, because your head
+    /// is out and you're breathing. Nothing sends it — the server owns `air_finished` and never
+    /// mentions it — but the rule is public and the input (are we underwater) we work out from the map.
+    ///
+    /// Left unwritten it sits at zero, and `air_left` becomes `-now`: a number that starts negative
+    /// and gets worse for as long as the process runs. The bot then meets the drowning panic the
+    /// instant its eyes go under — drop everything, make for the surface — and can never leave it,
+    /// because the panic's own way out is a breath, and a breath refills a tank nobody was filling.
+    /// Only ours: nothing reads a stranger's air, and we'd be inventing it.
+    fn write_air(&mut self, game: &mut GameState, e: EntId) {
+        if game.entities[e].v.waterlevel < 3.0 {
+            game.entities[e].combat.air_finished = game.time() + AIR_TIME;
+        }
+    }
+
+    /// The nails in the air.
+    ///
+    /// Nails travel in a message of their own, six bit-packed bytes each, because a nailgun puts
+    /// enough of them in the air to matter to the bandwidth — which is the same reason they matter
+    /// to a bot. The dodge already knows what to do with a `Touch::Spike`; it had simply never been
+    /// shown one, so a bot would stroll through a stream of nails it could see coming.
+    ///
+    /// Unlike an entity delta this is the **whole** set every frame, so the pool is rewritten from
+    /// scratch and the tail cleared: a nail that hit something is a nail the next message just
+    /// doesn't mention.
+    ///
+    /// No velocity is sent — but none is needed. A nail flies where it points at a speed the game
+    /// fixes, so its heading *is* its velocity, which is more than can be said for a rocket's first
+    /// frame.
+    fn write_nails(&mut self, game: &mut GameState, nails: &[rtx_proto::svc::Nail]) {
+        while self.nails.len() < nails.len() {
+            let slot = game.host().spawn();
+            if slot <= 0 {
+                break; // out of slots; mirror what fits rather than nothing
+            }
+            self.nails.push(EntId(slot as u32));
+        }
+
+        for (i, &slot) in self.nails.iter().enumerate() {
+            let Some(nail) = nails.get(i) else {
+                // Past the end of this frame's set: whatever was here has landed or expired.
+                game.entities[slot] = Entity::default();
+                continue;
+            };
+            let ent = &mut game.entities[slot];
+            *ent = Entity::default();
+            ent.in_use = true;
+            ent.v.movetype = MoveType::FlyMissile;
+            ent.v.solid = Solid::BBox;
+            ent.set_touch(Touch::Spike);
+            ent.v.origin = nail.origin;
+            ent.v.angles = Vec3::new(nail.pitch, nail.yaw, 0.0);
+            let (fwd, _, _) = crate::math::angle_vectors(ent.v.angles);
+            ent.v.velocity = fwd * NAIL_SPEED;
+            game.link_edict(slot);
+        }
     }
 
     /// Where a player is relative to the water, from the map rather than from the server.
@@ -438,6 +597,11 @@ const GRENADE_FUSE: f32 = 2.5;
 /// this only has to absorb the difference between where the mapper put it and where it settled.
 const ITEM_MATCH_DIST: f32 = 48.0;
 
+/// How near its end a mover has to be to count as resting there. The same eight units
+/// `gate_closed_flags` calls a closed door, and for the same reason: the wire quantizes coordinates,
+/// so "arrived" is a neighbourhood rather than a point.
+const MOVER_REST: f32 = 8.0;
+
 /// Beyond this, an item's absence says nothing: it's out of the server's PVS and simply isn't being
 /// sent, whether it's there or not.
 const ITEM_SIGHT_RANGE: f32 = 2000.0;
@@ -453,20 +617,34 @@ enum Evidence {
     Unknown,
 }
 
-/// What to conclude about an item, given what we saw and whether we *could* have seen it.
+/// What to conclude about an item, given what we saw and whether anybody had a look at the spot.
 ///
 /// Split out from the looking so the rule can be read on its own, because the rule is the whole
 /// point: presence is proof, and absence is proof only when we had a clear look at the spot. Anything
 /// else is a guess, and a bot that guesses about items is a bot that walks across the map for
 /// nothing — or, worse, one that knows where the quad is without anybody having gone to check.
-fn item_evidence(visible_now: bool, in_range: bool, clear_line: bool) -> Evidence {
+fn item_evidence(visible_now: bool, looked: bool) -> Evidence {
     if visible_now {
         Evidence::Present
-    } else if in_range && clear_line {
+    } else if looked {
         Evidence::Taken
     } else {
         Evidence::Unknown
     }
+}
+
+/// Whether anyone in the squad had a clear look at where an item lives.
+///
+/// The conditions are joined per *eye*, and that's the whole subtlety: near enough **and** with a
+/// clear line, both from the same body. Testing them separately across a squad — one bot close, a
+/// different bot with the angle — concludes a look that nobody actually took.
+fn anyone_looked(game: &mut GameState, squad: &Squad, home: Vec3) -> bool {
+    let to = home + Vec3::new(0.0, 0.0, 24.0);
+    squad
+        .eyes
+        .iter()
+        .filter(|(_, eye)| eye.distance(home) <= ITEM_SIGHT_RANGE)
+        .any(|&(body, eye)| game.client_traceline(eye, to, body).fraction >= 1.0)
 }
 
 impl Mirror {
@@ -474,7 +652,7 @@ impl Mirror {
     ///
     /// Called once per frame with the union of what every bot can see — a squad shares one world, so
     /// an item one bot can see is an item they all know about, exactly as it is inside qwprogs.
-    pub(crate) fn apply_frame(&mut self, game: &mut GameState, seen: &[EntityState], models: &[String]) {
+    pub(crate) fn apply_frame(&mut self, game: &mut GameState, squad: &Squad, seen: &[EntityState], models: &[String]) {
         let now = game.time();
         let name = |m: u16| models.get(m as usize).map(String::as_str).unwrap_or("");
 
@@ -490,33 +668,81 @@ impl Mirror {
                 Kind::Ignore => {}
             }
         }
-        self.write_item_presence(game, seen, models, now);
+        self.write_item_presence(game, squad, seen, models, now);
         self.projectiles_peak = self.projectiles_peak.max(self.tracked.len());
     }
 
     /// A piece of the level that has moved: a door opening, a plat rising.
     ///
     /// We spawned a twin of it from the map, so it already knows what it is and where it belongs;
-    /// all the wire adds is where it is *now*. Matching is by submodel index, which
-    /// `client_set_model` parked in `modelindex` for exactly this.
+    /// all the wire adds is where it is *now*.
     fn write_brush(&mut self, game: &mut GameState, submodel: usize, e: &EntityState) {
         let Some(twin) = self.brush_twin(game, submodel) else { return };
+        let was = game.entities[twin].v.origin;
         game.set_origin(twin, e.origin);
         game.entities[twin].v.angles = e.angles;
+        self.write_mover_phase(game, twin, was);
     }
 
     /// The shadow entity built from submodel `n`, if the map had one.
+    ///
+    /// Matched by the model's **name**, which is the only thing that identifies it. The submodel
+    /// index looks like a tempting shortcut — `client_set_model` parks it in `modelindex` — but that
+    /// field carries a flat `1.0` for every *external* model (a rocket, a backpack: their real index
+    /// would come from the model list, and nothing client-side needs it). So `modelindex == 1` says
+    /// "submodel `*1`" and "some rocket" in the same breath, and matching on it hands `*1`'s door
+    /// updates to whichever unrelated entity happens to sit at a lower slot — an explosive box, say,
+    /// which the door then drags around the map for the rest of the run, since the match is cached.
+    ///
+    /// A trigger can't be matched by mistake, incidentally: `InitTrigger` clears the name it was
+    /// spawned with, because a trigger is invisible and the server never sends it either.
     fn brush_twin(&mut self, game: &GameState, submodel: usize) -> Option<EntId> {
         if let Some(&e) = self.brushes.get(&submodel) {
             return Some(e);
         }
+        let name = format!("*{submodel}");
         let found = game
             .entities
             .live()
-            .find(|(_, x)| x.v.modelindex == submodel as f32 && x.v.solid != Solid::Trigger)
+            .find(|(_, x)| x.model.as_deref() == Some(name.as_str()))
             .map(|(i, _)| i)?;
         self.brushes.insert(submodel, found);
         Some(found)
+    }
+
+    /// Where a lift has got to in its travel.
+    ///
+    /// The server never sends a mover's *phase* — only its position, like everything else — but the
+    /// phase is what the bots read. `plat_statuses` uses it to hold a bot **outside** a raised lift's
+    /// trigger until it comes down, and that standoff exists for a reason: a body standing in the
+    /// shaft resets the lift's lower-timer, so a bot that walks in to wait is a bot waiting for a
+    /// lift it is personally holding up. Left unwritten, the phase keeps its spawn value forever —
+    /// `Bottom` for the common untargeted lift — and every raised lift reads as down.
+    ///
+    /// Only plats need this, which is a mercy. `pos1` and `pos2` mean *opposite* things for the two
+    /// kinds of mover, faithfully reproduced from the original QuakeC: a door goes down to `pos1` and
+    /// up to `pos2`; a plat goes up to `pos1` and down to `pos2`. Reading one the other's way would
+    /// have a bot board a lift at the top of its shaft believing it was at the bottom. Doors are
+    /// spared the question — nothing reads a door's phase, because the gate logic asks where the door
+    /// *is* (`gate_closed_flags` compares its origin against the closed one), which the wire says
+    /// outright.
+    fn write_mover_phase(&mut self, game: &mut GameState, e: EntId, was: Vec3) {
+        if game.entities[e].classname() != Some("func_plat") {
+            return;
+        }
+        let (now, top, bottom) = {
+            let ent = &game.entities[e];
+            (ent.v.origin, ent.mover.pos1, ent.mover.pos2)
+        };
+        game.entities[e].mover.state = if now.distance(bottom) < MOVER_REST {
+            MoverPhase::Bottom
+        } else if now.distance(top) < MOVER_REST {
+            MoverPhase::Top
+        } else if now.z >= was.z {
+            MoverPhase::Up
+        } else {
+            MoverPhase::Down
+        };
     }
 
     /// Something in flight.
@@ -527,7 +753,10 @@ impl Mirror {
     fn write_projectile(&mut self, game: &mut GameState, e: &EntityState, touch: Touch, now: f32) {
         let slot = EntId(e.number as u32);
         let first = !self.tracked.contains_key(&e.number);
-        let previous = self.tracked.get(&e.number).map(|t| t.origin);
+        let previous = self.tracked.get(&e.number).copied();
+
+        // Who fired it, decided once, at the only moment the question is answerable.
+        let owner = first.then(|| shooter_of(game, e.origin)).flatten();
 
         let ent = &mut game.entities[slot];
         if first {
@@ -536,6 +765,9 @@ impl Mirror {
             ent.v.movetype = MoveType::FlyMissile;
             ent.v.solid = Solid::BBox;
             ent.set_touch(touch);
+            if let Some(owner) = owner {
+                ent.set_owner(owner);
+            }
             // A grenade's fuse starts when we first see it. A rocket has no fuse; a nail has none
             // that matters.
             if touch == Touch::Grenade {
@@ -543,8 +775,6 @@ impl Mirror {
                 ent.think = crate::entity::Think::GrenadeExplode;
                 ent.v.nextthink = now + GRENADE_FUSE;
             }
-        }
-        if first {
             self.projectiles_seen += 1;
         }
         ent.v.origin = e.origin;
@@ -565,7 +795,7 @@ impl Mirror {
             _ => ent.v.velocity,
         };
         game.link_edict(slot);
-        self.tracked.insert(e.number, Tracked { origin: e.origin, seen: now });
+        self.tracked.insert(e.number, e.origin);
     }
 
     /// A dead player's dropped kit.
@@ -587,7 +817,7 @@ impl Mirror {
         }
         game.entities[slot].v.origin = e.origin;
         game.link_edict(slot);
-        self.tracked.insert(e.number, Tracked { origin: e.origin, seen: game.time() });
+        self.tracked.insert(e.number, e.origin);
     }
 
     /// Which of the map's items are actually there.
@@ -596,11 +826,18 @@ impl Mirror {
     /// state a map file describes. The server then never mentions an item again until someone can
     /// see it — so *presence* is easy and *absence* is the interesting half.
     ///
-    /// An absent item is only known taken if we'd have seen it: within range, and with a clear line
-    /// to where it should be. That's the same thing a player knows — you looked at the spot and the
-    /// armour wasn't there — and it's why a bot can't tell whether the quad across the map is up
-    /// until someone goes and looks.
-    fn write_item_presence(&mut self, game: &mut GameState, seen: &[EntityState], models: &[String], now: f32) {
+    /// An absent item is only known taken if one of us would have seen it: within range, and with a
+    /// clear line to where it should be. That's the same thing a player knows — you looked at the
+    /// spot and the armour wasn't there — and it's why a bot can't tell whether the quad across the
+    /// map is up until someone goes and looks.
+    fn write_item_presence(
+        &mut self,
+        game: &mut GameState,
+        squad: &Squad,
+        seen: &[EntityState],
+        models: &[String],
+        now: f32,
+    ) {
         // What's visibly present this frame: anything that isn't level brushwork, a projectile or a
         // pack, standing where an item lives.
         //
@@ -619,21 +856,14 @@ impl Mirror {
             }
         }
 
-        let eyes = self.eye_position(game);
         for idx in 0..self.items.len() {
             let (item, home) = self.items[idx];
             let visible_now = present.iter().any(|p| p.distance(home) < ITEM_MATCH_DIST);
 
-            // Only pay for a trace when the answer could change anything.
-            let (in_range, clear_line) = match (visible_now, eyes) {
-                (false, Some(eyes)) if eyes.distance(home) <= ITEM_SIGHT_RANGE => {
-                    let to = home + Vec3::new(0.0, 0.0, 24.0);
-                    (true, game.client_traceline(eyes, to, self.own()).fraction >= 1.0)
-                }
-                _ => (false, false),
-            };
+            // Only pay for the traces when the answer could change anything.
+            let looked = !visible_now && anyone_looked(game, squad, home);
 
-            match item_evidence(visible_now, in_range, clear_line) {
+            match item_evidence(visible_now, looked) {
                 Evidence::Present => self.restore_item(game, item),
                 Evidence::Taken => self.take_item(game, item, now),
                 // Nothing seen either way — but a timer we started earlier can still come due.
@@ -655,11 +885,17 @@ impl Mirror {
         }
     }
 
-    /// Where this bot is looking from, for "would I have seen it".
-    fn eye_position(&self, game: &GameState) -> Option<Vec3> {
+    /// This bot's body and where it looks from, for "would anyone have seen it".
+    ///
+    /// A spectator contributes nothing: we don't know where its camera is, and it has no body to
+    /// trace from or to ignore.
+    pub(crate) fn eyes(&self, game: &GameState) -> Option<(EntId, Vec3)> {
+        if self.spectator {
+            return None;
+        }
         let e = self.own();
         let ent = game.entities.get(e.0 as usize)?;
-        ent.in_use.then(|| ent.v.origin + Vec3::new(0.0, 0.0, 22.0))
+        (ent.in_use && ent.is_alive()).then(|| (e, ent.v.origin + Vec3::new(0.0, 0.0, 22.0)))
     }
 
     /// Mark an item as taken, and expect it back on the server's schedule.
@@ -729,15 +965,6 @@ impl Mirror {
         (up, waiting, self.tracked.len())
     }
 
-    /// What we believe about everyone, into the fields a stray direct read would find. Called once
-    /// per frame, before the brain runs.
-    pub(crate) fn write_estimates(&mut self, game: &mut GameState) {
-        let e = self.own();
-        if game.entities[e].in_use {
-            game.client_write_enemy_estimates(e);
-        }
-    }
-
     /// Note the map's items, so their absence can be reasoned about. Called once per map, after the
     /// shadow world is spawned.
     pub(crate) fn index_items(&mut self, game: &GameState) {
@@ -749,12 +976,51 @@ impl Mirror {
             .collect();
         self.brushes.clear();
         self.tracked.clear();
+        // The slots these named belong to the old map — `spawn_shadow_world` has reset the
+        // allocator, and holding them would hand the new map's furniture to the nails.
+        self.nails.clear();
     }
 }
 
 /// A rocket's speed. Fixed in QuakeWorld, and the reason a rocket's heading can be read off its
 /// angles the moment it appears, before there are two frames to difference.
 const ROCKET_SPEED: f32 = 1000.0;
+
+/// A nail's speed (`W_FireSpikes`). Fixed too, and the whole of what makes a nail's packed pitch and
+/// yaw enough to know where it's going.
+const NAIL_SPEED: f32 = 1000.0;
+
+/// How long a lungful lasts (`WaterMove`).
+const AIR_TIME: f32 = 12.0;
+
+/// How near a projectile's first sighting a player has to be to have fired it.
+///
+/// A rocket is spawned at the muzzle, a stride in front of the shooter's eyes, and the first frame
+/// we see it has already flown for one server frame — about 14 units at rocket speed. Generous
+/// enough to survive both, tight enough that a bystander doesn't get the credit.
+const MUZZLE_DIST: f32 = 160.0;
+
+/// Who fired the thing that just appeared here.
+///
+/// The wire doesn't say — an entity update is a position and a model, and `owner` is a server-side
+/// field no client ever receives. But it isn't a mystery either: a projectile is born at its
+/// shooter's muzzle, so the player standing where it appeared is the one who fired it, which is
+/// exactly the inference a human makes from the same sight.
+///
+/// It matters more than attribution usually does. `owner` is what the dodge reads to skip **our own**
+/// rockets, so a projectile with no owner is one every bot flinches from — including the bot that
+/// just fired it, at the exact moment it wants to hold its aim. It's also what marks a grenade as
+/// *enemy* owned, without which the shoot-it-down tactic never triggers at all.
+fn shooter_of(game: &GameState, at: Vec3) -> Option<EntId> {
+    let maxclients = game.host().cvar(c"maxclients") as u32;
+    (1..=maxclients)
+        .map(EntId)
+        .filter(|&p| game.entities[p].in_use && game.entities[p].is_alive())
+        .map(|p| (p, game.entities[p].v.origin.distance(at)))
+        .filter(|&(_, d)| d <= MUZZLE_DIST)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(p, _)| p)
+}
 
 /// Whether a slot holds someone worth reasoning about.
 fn is_player_slot(game: &GameState, e: EntId) -> bool {
@@ -820,7 +1086,41 @@ mod tests {
 
     fn game() -> GameState {
         let host: &'static NetHost = Box::leak(Box::new(NetHost::new(PathBuf::from("/nonexistent"))));
+        host.set("maxclients", "8");
         GameState::new_client(host)
+    }
+
+    /// A live body standing at `at`, the way a mirrored player is.
+    fn player(g: &mut GameState, slot: u32, at: Vec3) -> EntId {
+        let e = EntId(slot);
+        let ent = &mut g.entities[e];
+        ent.in_use = true;
+        ent.classname = Some("player".into());
+        ent.v.health = 100.0;
+        ent.v.origin = at;
+        ent.v.mins = crate::defs::VEC_HULL_MIN;
+        ent.v.maxs = crate::defs::VEC_HULL_MAX;
+        e
+    }
+
+    /// The squad as the tick loop builds it, for a client of one: this mirror's slot, and its eyes.
+    fn squad_of(m: &Mirror, g: &GameState) -> Squad {
+        let mut slots = [false; MAX_CLIENTS];
+        slots[m.playernum as usize] = !m.spectating();
+        Squad::new(slots, m.eyes(g).into_iter().collect())
+    }
+
+    /// Fold in one message the way the tick loop does: work out the squad from the world as it
+    /// currently stands, then write.
+    fn apply(m: &mut Mirror, g: &mut GameState, ev: &SvcEvent) {
+        let squad = squad_of(m, g);
+        m.apply(g, &squad, ev);
+    }
+
+    /// Likewise for a frame's worth of entities.
+    fn apply_frame(m: &mut Mirror, g: &mut GameState, seen: &[EntityState], models: &[String]) {
+        let squad = squad_of(m, g);
+        m.apply_frame(g, &squad, seen, models);
     }
 
     fn playerinfo(player: u8, flags: u32) -> Box<PlayerInfo> {
@@ -856,8 +1156,8 @@ mod tests {
     fn embodies_our_own_player() {
         let mut g = game();
         let mut m = Mirror::default();
-        m.set_playernum(2);
-        m.apply(&mut g, &SvcEvent::UpdateStat { stat: stat::HEALTH, value: 100 });
+        m.set_slot(2, false);
+        apply(&mut m, &mut g, &SvcEvent::UpdateStat { stat: stat::HEALTH, value: 100 });
 
         let e = m.own();
         assert_eq!(e, EntId(3));
@@ -875,7 +1175,7 @@ mod tests {
     fn writes_our_stats_where_the_brain_reads_them() {
         let mut g = game();
         let mut m = Mirror::default();
-        m.set_playernum(0);
+        m.set_slot(0, false);
 
         for (s, v) in [
             (stat::HEALTH, 87),
@@ -891,7 +1191,7 @@ mod tests {
                 (Items::ROCKET_LAUNCHER | Items::LIGHTNING | Items::ARMOR2 | Items::QUAD).bits() as i32,
             ),
         ] {
-            m.apply(&mut g, &SvcEvent::UpdateStat { stat: s, value: v });
+            apply(&mut m, &mut g, &SvcEvent::UpdateStat { stat: s, value: v });
         }
 
         let v = &g.entities[m.own()].v;
@@ -911,18 +1211,18 @@ mod tests {
     fn health_drives_deadflag_both_ways() {
         let mut g = game();
         let mut m = Mirror::default();
-        m.set_playernum(0);
+        m.set_slot(0, false);
 
-        m.apply(&mut g, &SvcEvent::UpdateStat { stat: stat::HEALTH, value: 100 });
+        apply(&mut m, &mut g, &SvcEvent::UpdateStat { stat: stat::HEALTH, value: 100 });
         assert!(g.entities[m.own()].is_alive());
         assert_eq!(g.entities[m.own()].v.deadflag, DeadFlag::No);
 
-        m.apply(&mut g, &SvcEvent::UpdateStat { stat: stat::HEALTH, value: 0 });
+        apply(&mut m, &mut g, &SvcEvent::UpdateStat { stat: stat::HEALTH, value: 0 });
         assert!(!g.entities[m.own()].is_alive());
         assert_eq!(g.entities[m.own()].v.deadflag, DeadFlag::Dead);
 
         // And back, on respawn.
-        m.apply(&mut g, &SvcEvent::UpdateStat { stat: stat::HEALTH, value: 100 });
+        apply(&mut m, &mut g, &SvcEvent::UpdateStat { stat: stat::HEALTH, value: 100 });
         assert!(g.entities[m.own()].is_alive());
     }
 
@@ -932,8 +1232,8 @@ mod tests {
     fn writes_another_players_position_and_aim() {
         let mut g = game();
         let mut m = Mirror::default();
-        m.set_playernum(0);
-        m.apply(&mut g, &SvcEvent::UpdateUserinfo {
+        m.set_slot(0, false);
+        apply(&mut m, &mut g, &SvcEvent::UpdateUserinfo {
             player: 3,
             userid: 7,
             userinfo: "\\name\\victim".to_string(),
@@ -942,7 +1242,7 @@ mod tests {
         let mut pi = playerinfo(3, rtx_proto::svc::pf::ONGROUND);
         pi.velocity = Vec3::new(320.0, 0.0, 0.0);
         pi.command = Some(Usercmd { angles: Vec3::new(-10.0, 90.0, 0.0), ..Default::default() });
-        m.apply(&mut g, &SvcEvent::PlayerInfo(pi));
+        apply(&mut m, &mut g, &SvcEvent::PlayerInfo(pi));
 
         let e = slot_to_ent(3);
         assert_eq!(g.entities[e].netname.as_deref(), Some("victim"));
@@ -955,7 +1255,7 @@ mod tests {
 
         // Airborne — the thing a rocket is for, and knowable only because we asked for
         // Z_EXT_PF_ONGROUND at connect.
-        m.apply(&mut g, &SvcEvent::PlayerInfo(playerinfo(3, 0)));
+        apply(&mut m, &mut g, &SvcEvent::PlayerInfo(playerinfo(3, 0)));
         assert!(!g.entities[slot_to_ent(3)].v.flags.has(Flags::ONGROUND));
     }
 
@@ -964,20 +1264,98 @@ mod tests {
     fn another_players_death_is_known_but_their_health_is_not() {
         let mut g = game();
         let mut m = Mirror::default();
-        m.set_playernum(0);
-        m.apply(&mut g, &SvcEvent::UpdateUserinfo {
+        m.set_slot(0, false);
+        apply(&mut m, &mut g, &SvcEvent::UpdateUserinfo {
             player: 1,
             userid: 1,
             userinfo: "\\name\\enemy".to_string(),
         });
 
-        m.apply(&mut g, &SvcEvent::PlayerInfo(playerinfo(1, rtx_proto::svc::pf::DEAD)));
+        apply(&mut m, &mut g, &SvcEvent::PlayerInfo(playerinfo(1, rtx_proto::svc::pf::DEAD)));
         assert!(!g.entities[slot_to_ent(1)].is_alive(), "death is authoritative");
 
-        m.apply(&mut g, &SvcEvent::PlayerInfo(playerinfo(1, 0)));
+        apply(&mut m, &mut g, &SvcEvent::PlayerInfo(playerinfo(1, 0)));
         let v = &g.entities[slot_to_ent(1)].v;
         assert!(v.health > 0.0, "alive enough for the brain's gates");
         assert_eq!(v.armorvalue, 0.0, "and no invented armour — that's the opponent model's job");
+    }
+
+    /// A squadmate's body belongs to the squadmate's own mirror.
+    ///
+    /// Every bot receives *everyone's* playerinfo, our own bots' included, and a mirror can tell its
+    /// own body from the rest but not a friend's from a stranger's. Without the squad to ask, each
+    /// mirror writes the "alive enough" placeholder over the others — so every bot in the squad reads
+    /// its own health as 100 no matter what the server just did to it, and none of them ever retreats.
+    #[test]
+    fn a_squadmate_keeps_the_health_its_own_mirror_knows() {
+        let mut g = game();
+        // Two of ours: slot 0 (this mirror) and slot 1. Slot 2 is a stranger.
+        let mut ours = [false; MAX_CLIENTS];
+        (ours[0], ours[1]) = (true, true);
+        let mate = player(&mut g, slot_to_ent(1).0, Vec3::ZERO);
+        player(&mut g, slot_to_ent(2).0, Vec3::ZERO);
+
+        // Our squadmate is badly hurt, as their own mirror's stats established.
+        g.entities[mate].v.health = 12.0;
+
+        let mut m = Mirror::default();
+        m.set_slot(0, false);
+        let squad = Squad::new(ours, Vec::new());
+        m.apply(&mut g, &squad, &SvcEvent::PlayerInfo(playerinfo(1, 0)));
+        assert_eq!(g.entities[mate].v.health, 12.0, "not this mirror's to overwrite");
+
+        // A stranger is a different matter: we've no stats for them and never will, so the
+        // placeholder is the honest thing to write.
+        m.apply(&mut g, &squad, &SvcEvent::PlayerInfo(playerinfo(2, 0)));
+        assert_eq!(g.entities[slot_to_ent(2)].v.health, 100.0, "alive, and that's all we can say");
+    }
+
+    /// A body with no health that isn't dead is a body the server never spawned — and `run_bot` will
+    /// try to finish the job itself, which is the engine's work and a client's business never. The
+    /// window is small (our first stat is moments away) and it reopens on every map change, so the
+    /// mirror closes it at the only moment it can: the instant the body exists.
+    #[test]
+    fn a_body_starts_dead_rather_than_unspawned() {
+        let mut g = game();
+        let mut m = Mirror::default();
+        m.set_slot(0, false);
+
+        // Playerinfo arrives before any stat — the body exists, its health doesn't yet.
+        apply(&mut m, &mut g, &SvcEvent::PlayerInfo(playerinfo(0, 0)));
+        let ent = &g.entities[m.own()];
+        assert!(ent.in_use && ent.bot.is_bot, "embodied");
+        assert!(!ent.is_alive());
+        assert_eq!(ent.v.deadflag, DeadFlag::Dead, "so run_bot pulses +attack, as a real client does");
+
+        // And the moment the server says otherwise, it's alive.
+        apply(&mut m, &mut g, &SvcEvent::UpdateStat { stat: stat::HEALTH, value: 100 });
+        assert!(g.entities[m.own()].is_alive());
+    }
+
+    /// A spectator has a slot and a scoreboard entry but no body. Nothing here may drive one.
+    ///
+    /// It matters because mvdsv sends a spectator the *tracked player's* stats: a mirror that
+    /// embodied anyway would take a stranger's health and ammo for its own and play off them, and the
+    /// respawn pulse for the 0-health slot it started on would cycle the camera through the server's
+    /// players. `--spectate` is how this thing is soaked, so it has to be genuinely quiet.
+    #[test]
+    fn a_spectator_watches_and_nothing_more() {
+        let mut g = game();
+        let mut m = Mirror::default();
+        m.set_slot(3, true);
+        assert!(m.spectating());
+
+        // The stats of whoever the server is showing us. Not ours.
+        for (s, v) in [(stat::HEALTH, 100), (stat::ARMOR, 200), (stat::ROCKETS, 30)] {
+            apply(&mut m, &mut g, &SvcEvent::UpdateStat { stat: s, value: v });
+        }
+        let ent = &g.entities[m.own()];
+        assert!(!ent.in_use, "no body");
+        assert!(!ent.bot.is_bot, "and so nothing for run_bots to pick up and drive");
+        assert_eq!(ent.v.health, 0.0, "and no stranger's health worn as our own");
+
+        // It contributes no eyes either — we don't know where a spectator's camera is.
+        assert_eq!(m.eyes(&g), None);
     }
 
     /// A spectator holds a slot but isn't in the game, and an emptied slot is gone. Either one left
@@ -986,9 +1364,9 @@ mod tests {
     fn spectators_and_leavers_are_not_players() {
         let mut g = game();
         let mut m = Mirror::default();
-        m.set_playernum(0);
+        m.set_slot(0, false);
 
-        m.apply(&mut g, &SvcEvent::UpdateUserinfo {
+        apply(&mut m, &mut g, &SvcEvent::UpdateUserinfo {
             player: 4,
             userid: 4,
             userinfo: "\\name\\watcher\\*spectator\\1".to_string(),
@@ -996,7 +1374,7 @@ mod tests {
         assert!(!g.entities[slot_to_ent(4)].is_player());
 
         // Joins for real…
-        m.apply(&mut g, &SvcEvent::UpdateUserinfo {
+        apply(&mut m, &mut g, &SvcEvent::UpdateUserinfo {
             player: 4,
             userid: 4,
             userinfo: "\\name\\watcher".to_string(),
@@ -1004,7 +1382,7 @@ mod tests {
         assert!(g.entities[slot_to_ent(4)].is_player());
 
         // …then leaves.
-        m.apply(&mut g, &SvcEvent::UpdateUserinfo {
+        apply(&mut m, &mut g, &SvcEvent::UpdateUserinfo {
             player: 4,
             userid: 4,
             userinfo: String::new(),
@@ -1032,11 +1410,11 @@ mod tests {
     fn setangle_moves_the_aim_with_the_view() {
         let mut g = game();
         let mut m = Mirror::default();
-        m.set_playernum(0);
-        m.apply(&mut g, &SvcEvent::UpdateStat { stat: stat::HEALTH, value: 100 });
+        m.set_slot(0, false);
+        apply(&mut m, &mut g, &SvcEvent::UpdateStat { stat: stat::HEALTH, value: 100 });
 
         let angles = Vec3::new(0.0, 135.0, 0.0);
-        m.apply(&mut g, &SvcEvent::SetAngle { kind: Some(1), angles });
+        apply(&mut m, &mut g, &SvcEvent::SetAngle { kind: Some(1), angles });
         assert_eq!(g.entities[m.own()].v.v_angle, angles);
         assert_eq!(g.entities[m.own()].bot.aim.angles, angles, "the spring goes too");
     }
@@ -1078,14 +1456,14 @@ mod tests {
         let mut g = game();
         g.globals.frametime = 0.1;
         let mut m = Mirror::default();
-        m.set_playernum(0);
+        m.set_slot(0, false);
         let models = models();
 
         // First sighting: nothing to difference against, so the heading comes off its angles — a
         // rocket flies where it points, and that one frame is the one that matters most.
         let mut e = state(50, 2, Vec3::new(0.0, 0.0, 0.0));
         e.angles = Vec3::ZERO; // facing +x
-        m.apply_frame(&mut g, &[e], &models);
+        apply_frame(&mut m, &mut g, &[e], &models);
 
         let slot = EntId(50);
         assert!(g.entities[slot].in_use);
@@ -1094,14 +1472,196 @@ mod tests {
         assert_eq!(m.projectiles_seen, 1);
 
         // Second frame: a real difference.
-        m.apply_frame(&mut g, &[state(50, 2, Vec3::new(100.0, 0.0, 0.0))], &models);
+        apply_frame(&mut m, &mut g, &[state(50, 2, Vec3::new(100.0, 0.0, 0.0))], &models);
         assert_eq!(g.entities[slot].v.velocity, Vec3::new(1000.0, 0.0, 0.0));
         assert_eq!(g.entities[slot].v.origin.x, 100.0);
 
         // It hits something and the server stops sending it — the slot must be released, or the bot
         // dodges a rocket that no longer exists.
-        m.apply_frame(&mut g, &[], &models);
+        apply_frame(&mut m, &mut g, &[], &models);
         assert!(!g.entities[slot].in_use);
+    }
+
+    /// Put a lift into the world the way `spawn_func_plat` does: `pos1` at the top of its travel,
+    /// `pos2` at the bottom, resting at the bottom.
+    fn place_plat(g: &mut GameState, model: &'static str, top: f32) -> EntId {
+        let e = EntId(1200);
+        let ent = &mut g.entities[e];
+        *ent = Entity::default();
+        ent.in_use = true;
+        ent.classname = Some("func_plat".into());
+        ent.model = Some(model.into());
+        ent.mover.pos1 = Vec3::new(0.0, 0.0, top);
+        ent.mover.pos2 = Vec3::ZERO;
+        ent.v.origin = Vec3::ZERO;
+        ent.mover.state = MoverPhase::Bottom;
+        e
+    }
+
+    /// A lift's phase, from the only thing the wire says about it: where it is.
+    ///
+    /// Nothing sends a mover's phase, and it's the phase the bots read — `plat_statuses` holds a bot
+    /// outside a raised lift's trigger until it descends, because a body in the shaft resets the
+    /// lower-timer and the lift then never comes down for it. Unwritten, the phase keeps its spawn
+    /// value (`Bottom`) forever, and the bot walks into the shaft of a lift at the top of its travel
+    /// and waits there for a lift it is itself holding up.
+    #[test]
+    fn a_lift_gets_its_phase_from_where_it_has_got_to() {
+        let mut g = game();
+        let mut m = Mirror::default();
+        m.set_slot(0, false);
+        let plat = place_plat(&mut g, "*3", 128.0);
+        let models = models(); // index 7 is "*3"
+
+        // At the top of its shaft. It is emphatically not down, whatever it spawned believing.
+        apply_frame(&mut m, &mut g, &[state(80, 7, Vec3::new(0.0, 0.0, 128.0))], &models);
+        assert_eq!(g.entities[plat].mover.state, MoverPhase::Top);
+
+        // On its way down, and still not down.
+        apply_frame(&mut m, &mut g, &[state(80, 7, Vec3::new(0.0, 0.0, 64.0))], &models);
+        assert_eq!(g.entities[plat].mover.state, MoverPhase::Down);
+
+        // Arrived — now a bot may board it.
+        apply_frame(&mut m, &mut g, &[state(80, 7, Vec3::new(0.0, 0.0, 2.0))], &models);
+        assert_eq!(g.entities[plat].mover.state, MoverPhase::Bottom, "within the resting tolerance");
+
+        // And back up, called by someone else.
+        apply_frame(&mut m, &mut g, &[state(80, 7, Vec3::new(0.0, 0.0, 40.0))], &models);
+        assert_eq!(g.entities[plat].mover.state, MoverPhase::Up);
+    }
+
+    /// A brush is matched by its model's **name**, not by the index parked in `modelindex`.
+    ///
+    /// Every external model carries a flat `modelindex` of 1, so matching on the number makes `*1`
+    /// ambiguous with every rocket and crate on the map — and the match is cached, so a door that
+    /// grabs an explosive box drags it around for the rest of the run.
+    #[test]
+    fn a_door_finds_its_own_twin_and_not_a_lookalike() {
+        let mut g = game();
+        let mut m = Mirror::default();
+        m.set_slot(0, false);
+
+        // An external-model entity at a lower slot, wearing the `modelindex` that used to collide.
+        let decoy = EntId(20);
+        g.entities[decoy].in_use = true;
+        g.entities[decoy].classname = Some("misc_explobox".into());
+        g.entities[decoy].model = Some("progs/b_explob.bsp".into());
+        g.entities[decoy].v.modelindex = 1.0;
+        g.entities[decoy].v.solid = Solid::BBox;
+
+        let plat = place_plat(&mut g, "*1", 128.0);
+        g.entities[plat].v.modelindex = 1.0; // as `client_set_model` leaves a submodel `*1`
+
+        let mut models = models();
+        models[7] = "*1".to_string();
+        apply_frame(&mut m, &mut g, &[state(80, 7, Vec3::new(0.0, 0.0, 128.0))], &models);
+
+        assert_eq!(g.entities[plat].v.origin.z, 128.0, "the door moved");
+        assert_eq!(g.entities[decoy].v.origin, Vec3::ZERO, "and the box stayed where it was");
+    }
+
+    /// Who fired it is not on the wire — `owner` is a server-side field no client receives — but it
+    /// isn't a mystery: a rocket is born at its shooter's muzzle, so whoever is standing where it
+    /// appeared fired it. That's the same inference a human makes from the same sight.
+    ///
+    /// Without it every projectile is owned by the world, and the dodge's "not my own rocket" test
+    /// passes for *everything* — so a bot flinches from the rocket it just fired, at precisely the
+    /// moment it wants to hold its aim on what it fired at.
+    #[test]
+    fn a_rocket_belongs_to_whoever_it_appeared_in_front_of() {
+        let mut g = game();
+        let mut m = Mirror::default();
+        m.set_slot(0, false);
+
+        let shooter = player(&mut g, 2, Vec3::new(100.0, 0.0, 0.0));
+        let bystander = player(&mut g, 3, Vec3::new(600.0, 0.0, 0.0));
+
+        // A rocket appears at the shooter's muzzle, a stride in front of them.
+        apply_frame(&mut m, &mut g, &[state(50, 2, Vec3::new(130.0, 0.0, 16.0))], &models());
+        assert_eq!(g.entities[EntId(50)].owner(), shooter);
+        assert!(g.entities[EntId(50)].owner().is_some(), "or the shootable-grenade tactic never fires");
+
+        // One that appears in the open belongs to nobody, and a bystander doesn't get the credit.
+        apply_frame(&mut m, &mut g, &[state(51, 2, Vec3::new(2000.0, 0.0, 16.0))], &models());
+        assert_ne!(g.entities[EntId(51)].owner(), bystander);
+        assert!(!g.entities[EntId(51)].owner().is_some(), "nobody was near enough to have fired it");
+
+        // And a dead body fires nothing.
+        g.entities[shooter].v.health = 0.0;
+        g.entities[shooter].v.deadflag = DeadFlag::Dead;
+        apply_frame(&mut m, &mut g, &[state(52, 2, Vec3::new(130.0, 0.0, 16.0))], &models());
+        assert_ne!(g.entities[EntId(52)].owner(), shooter);
+    }
+
+    /// Nails travel in a message of their own — six packed bytes each, because a nailgun puts enough
+    /// of them in the air to matter — and they carry no entity number, so unlike everything else on
+    /// the wire they need somewhere to be put. Unconsumed, a stream of nails is invisible: the dodge
+    /// knows what a `Touch::Spike` is and had simply never been shown one.
+    #[test]
+    fn nails_get_slots_and_a_heading() {
+        use rtx_proto::svc::Nail;
+        let mut g = game();
+        let mut m = Mirror::default();
+        m.set_slot(0, false);
+
+        let nail = |x: f32, yaw: f32| Nail { number: None, origin: Vec3::new(x, 0.0, 0.0), pitch: 0.0, yaw };
+        apply(&mut m, &mut g, &SvcEvent::Nails(vec![nail(10.0, 0.0), nail(20.0, 90.0)]));
+
+        assert_eq!(m.nails.len(), 2);
+        let first = &g.entities[m.nails[0]];
+        assert!(first.in_use);
+        assert_eq!(first.touch, Touch::Spike, "which is exactly what the dodge is looking for");
+        assert_eq!(first.v.origin.x, 10.0);
+        // No velocity is sent, and none is needed: a nail flies where it points, at a fixed speed.
+        assert!(first.v.velocity.x > 900.0, "{:?}", first.v.velocity);
+        assert!(g.entities[m.nails[1]].v.velocity.y > 900.0, "yawed 90° — flying +y");
+
+        // The message is the *whole* set every frame, not a delta: one that hit something is simply
+        // not mentioned again, and must not hang in the air for a bot to keep dodging.
+        apply(&mut m, &mut g, &SvcEvent::Nails(vec![nail(30.0, 0.0)]));
+        assert!(g.entities[m.nails[0]].in_use);
+        assert!(!g.entities[m.nails[1]].in_use, "gone, not still flying");
+
+        // And the pool is reused rather than regrown — the slots are the same ones.
+        let pool = m.nails.clone();
+        apply(&mut m, &mut g, &SvcEvent::Nails(vec![nail(40.0, 0.0), nail(50.0, 0.0)]));
+        assert_eq!(m.nails, pool);
+    }
+
+    /// The air tank. Nothing sends it — the server owns `air_finished` and never mentions it — but
+    /// `WaterMove`'s rule is public: anything short of fully under is a breath.
+    ///
+    /// Unwritten it sits at zero, and the bot's `air_left` becomes `-now`: a number that starts
+    /// negative and grows worse for as long as the process runs. The bot then hits the drowning panic
+    /// the instant its eyes go under and can never leave it, because the panic's own way out is a
+    /// breath — and a breath refills a tank nobody was filling.
+    #[test]
+    fn a_breath_refills_the_tank_and_being_under_does_not() {
+        let mut g = game();
+        g.globals.time = 500.0;
+        let mut m = Mirror::default();
+        m.set_slot(0, false);
+        apply(&mut m, &mut g, &SvcEvent::UpdateStat { stat: stat::HEALTH, value: 100 });
+
+        // A body starts with a full one, as `PutClientInServer` gives it.
+        assert_eq!(g.entities[m.own()].combat.air_finished, 500.0 + AIR_TIME);
+
+        // Out of the water: topped up, every frame, from now.
+        g.globals.time = 520.0;
+        apply(&mut m, &mut g, &SvcEvent::PlayerInfo(playerinfo(0, 0)));
+        assert_eq!(g.entities[m.own()].v.waterlevel, 0.0, "the map has no water in it — nor a map");
+        assert_eq!(g.entities[m.own()].combat.air_finished, 520.0 + AIR_TIME);
+
+        // Fully under: the tank runs down, because that's the whole idea of a tank.
+        g.entities[m.own()].v.waterlevel = 3.0;
+        g.globals.time = 525.0;
+        m.write_air(&mut g, m.own());
+        assert_eq!(g.entities[m.own()].combat.air_finished, 532.0, "still counting down from the last breath");
+
+        // Head back out and it's a fresh lungful.
+        g.entities[m.own()].v.waterlevel = 2.0;
+        m.write_air(&mut g, m.own());
+        assert_eq!(g.entities[m.own()].combat.air_finished, 525.0 + AIR_TIME);
     }
 
     /// A grenade has a fuse, and the wire never mentions it. Counting from first sighting is what a
@@ -1111,9 +1671,9 @@ mod tests {
         let mut g = game();
         g.globals.time = 100.0;
         let mut m = Mirror::default();
-        m.set_playernum(0);
+        m.set_slot(0, false);
 
-        m.apply_frame(&mut g, &[state(60, 3, Vec3::ZERO)], &models());
+        apply_frame(&mut m, &mut g, &[state(60, 3, Vec3::ZERO)], &models());
         let ent = &g.entities[EntId(60)];
         assert_eq!(ent.touch, Touch::Grenade);
         assert_eq!(ent.classname(), Some("grenade"));
@@ -1126,8 +1686,8 @@ mod tests {
     fn a_backpack_exists_but_is_not_a_goal() {
         let mut g = game();
         let mut m = Mirror::default();
-        m.set_playernum(0);
-        m.apply_frame(&mut g, &[state(70, 4, Vec3::new(5.0, 5.0, 5.0))], &models());
+        m.set_slot(0, false);
+        apply_frame(&mut m, &mut g, &[state(70, 4, Vec3::new(5.0, 5.0, 5.0))], &models());
 
         let ent = &g.entities[EntId(70)];
         assert!(ent.in_use);
@@ -1155,8 +1715,8 @@ mod tests {
         let mut g = game();
         g.globals.time = 50.0;
         let mut m = Mirror::default();
-        m.set_playernum(0);
-        m.apply(&mut g, &SvcEvent::UpdateStat { stat: stat::HEALTH, value: 100 });
+        m.set_slot(0, false);
+        apply(&mut m, &mut g, &SvcEvent::UpdateStat { stat: stat::HEALTH, value: 100 });
 
         // An item far across the map, and us standing at the origin.
         let far = Vec3::new(9999.0, 0.0, 0.0);
@@ -1164,7 +1724,7 @@ mod tests {
         m.items = vec![(item, far)];
         g.entities[m.own()].v.origin = Vec3::ZERO;
 
-        m.apply_frame(&mut g, &[], &models());
+        apply_frame(&mut m, &mut g, &[], &models());
         assert_eq!(g.entities[item].v.solid, Solid::Trigger, "too far away to conclude anything");
     }
 
@@ -1173,8 +1733,8 @@ mod tests {
     fn seeing_an_item_says_it_is_there() {
         let mut g = game();
         let mut m = Mirror::default();
-        m.set_playernum(0);
-        m.apply(&mut g, &SvcEvent::UpdateStat { stat: stat::HEALTH, value: 100 });
+        m.set_slot(0, false);
+        apply(&mut m, &mut g, &SvcEvent::UpdateStat { stat: stat::HEALTH, value: 100 });
 
         let at = Vec3::new(64.0, 0.0, 0.0);
         let item = place_item(&mut g, at, "item_armor2");
@@ -1184,28 +1744,46 @@ mod tests {
         g.entities[item].think = crate::entity::Think::SubRegen;
 
         // …then we see it. What's actually there always wins over what we expected.
-        m.apply_frame(&mut g, &[state(90, 5, at)], &models());
+        apply_frame(&mut m, &mut g, &[state(90, 5, at)], &models());
         assert_eq!(g.entities[item].v.solid, Solid::Trigger);
         assert_eq!(g.entities[item].think, crate::entity::Think::None);
     }
 
-    /// The rule, on its own: presence is proof; absence is proof only when we had a clear look.
+    /// The rule, on its own: presence is proof; absence is proof only when somebody had a clear look.
     /// Anything else is a guess — and a bot that guesses about items either walks across the map for
     /// nothing, or knows where the quad is without anybody having gone to check.
     #[test]
     fn absence_is_only_evidence_with_a_clear_look() {
         // Seen: there, whatever else is true.
-        assert_eq!(item_evidence(true, false, false), Evidence::Present);
-        assert_eq!(item_evidence(true, true, true), Evidence::Present);
+        assert_eq!(item_evidence(true, false), Evidence::Present);
+        assert_eq!(item_evidence(true, true), Evidence::Present);
 
-        // Not seen, and we had a clear line to the spot: someone took it.
-        assert_eq!(item_evidence(false, true, true), Evidence::Taken);
+        // Not seen, and somebody had a clear look at the spot: someone took it.
+        assert_eq!(item_evidence(false, true), Evidence::Taken);
 
-        // Not seen, but we couldn't have seen it — that's not evidence of anything.
-        assert_eq!(item_evidence(false, true, false), Evidence::Unknown, "no line of sight");
-        assert_eq!(item_evidence(false, false, true), Evidence::Unknown, "out of range");
-        assert_eq!(item_evidence(false, false, false), Evidence::Unknown);
+        // Not seen, and nobody looked — that's not evidence of anything.
+        assert_eq!(item_evidence(false, false), Evidence::Unknown);
     }
+
+    /// Nobody looks through a map we haven't got.
+    ///
+    /// A trace with no BSP behind it reports solid ([`super::host::no_map`]), so `anyone_looked` says
+    /// no and every item keeps whatever we last knew about it. That's fail-closed, and the direction
+    /// worth failing in: a client that concluded "taken" from a trace it couldn't answer would empty
+    /// the map of items on the strength of not having read it, and send its bots to stand hopefully
+    /// over bare floor. It's also why the tests around this one are honest about asserting so little
+    /// — without a map on disk there's no geometry here to see anything through.
+    #[test]
+    fn nobody_looks_through_a_map_we_do_not_have() {
+        let mut g = game();
+        let home = Vec3::new(500.0, 0.0, 0.0);
+
+        assert!(!anyone_looked(&mut g, &Squad::default(), home), "nobody to do the looking");
+
+        let near = Squad::new([false; MAX_CLIENTS], vec![(EntId(1), Vec3::new(600.0, 0.0, 0.0))]);
+        assert!(!anyone_looked(&mut g, &near, home), "right there, and still no map to look through");
+    }
+
 
     /// Item timing: we watched it go, we know the rule it comes back by, so we know when to be
     /// there.    /// Item timing: we watched it go, we know the rule it comes back by, so we know when to be
@@ -1217,7 +1795,7 @@ mod tests {
         g.globals.time = 100.0;
         g.level.deathmatch = 1;
         let mut m = Mirror::default();
-        m.set_playernum(0);
+        m.set_slot(0, false);
 
         let at = Vec3::new(64.0, 0.0, 0.0);
         let item = place_item(&mut g, at, "item_armor2");
@@ -1245,7 +1823,7 @@ mod tests {
         let mut g = game();
         g.level.deathmatch = 2; // nothing respawns here
         let mut m = Mirror::default();
-        m.set_playernum(0);
+        m.set_slot(0, false);
 
         let item = place_item(&mut g, Vec3::ZERO, "item_armor2");
         m.take_item(&mut g, item, 100.0);

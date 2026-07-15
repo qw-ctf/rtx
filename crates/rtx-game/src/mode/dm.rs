@@ -4,8 +4,9 @@
 //! nothing about how the game plays), so it exists to make deathmatch *a* mode rather than *the*
 //! mode. The one behavior it supplies is the **bot brain**: bots hunt and frag the nearest enemy
 //! (breaking off to grab health when hurt), which is what turns them from item-collecting wanderers
-//! into deathmatch opponents. Under an open composition everyone is an enemy; under a team
-//! composition (`rtx_match 2on2`/…) it defers to the team-aware picker so bots don't shoot allies.
+//! into deathmatch opponents. Under an open composition everyone is an enemy; the moment a bot has a
+//! team — an rtx composition (`rtx_match 2on2`/…), or a server's own teamplay as a network client
+//! reads it off userinfo — it defers to the team-aware picker so bots don't shoot allies.
 //! (The global `rtx_bot_pacifist` override, which tails the nearest human in *any* mode, lives in
 //! `bot::run_bot`.)
 
@@ -22,14 +23,22 @@ impl GameMode for Dm {
     }
 
     fn bot_intent(&self, g: &mut GameState, bot: EntId) -> Option<BotIntent> {
-        // In a team composition, hunt the nearest *enemy* (the team-aware picker skips allies and
-        // deconflicts); otherwise everyone is an enemy — hunt the nearest living player (human or
-        // bot). The mode-agnostic combat layer (`bot_combat`) paths to them, aims, shoots, and
-        // retreats when hurt; items along the way are picked up automatically. Deliberately *not*
-        // gated on health/ammo — falling back to the item/follow brain would idle a bot on a
-        // human-less server (the "bots stand still with no human" bug). `None` only when this bot is
-        // the last one alive, and the roam fallback in `run_bot` keeps even that moving.
-        if team::lifecycle_active(g) {
+        // Whoever has a side hunts the other side (the team-aware picker skips allies and
+        // deconflicts, and answers a teammate's call for help first); in open play everyone is an
+        // enemy — hunt the nearest living player (human or bot). The mode-agnostic combat layer
+        // (`bot_combat`) paths to them, aims, shoots, and retreats when hurt; items along the way are
+        // picked up automatically. Deliberately *not* gated on health/ammo — falling back to the
+        // item/follow brain would idle a bot on a human-less server (the "bots stand still with no
+        // human" bug). `None` only when this bot is the last one alive, and the roam fallback in
+        // `run_bot` keeps even that moving.
+        //
+        // The question is "have I got a side", not "is rtx running a match", because those come apart
+        // in the one place it matters most. A bot embodied as a network client gets its team from the
+        // *server's* userinfo, on a server whose team rules are its own business and whose match
+        // lifecycle is no part of ours — so it has allies and no `team_match` whatsoever. Asking the
+        // lifecycle would have it hunt the nearest player on a teamplay server, which is its own
+        // teammate about a third of the time.
+        if team::lifecycle_active(g) || g.entities[bot].mode_p.team != 0 {
             return team::help_target(g, bot)
                 .or_else(|| team::nearest_enemy(g, bot))
                 .map(BotIntent::Fight);

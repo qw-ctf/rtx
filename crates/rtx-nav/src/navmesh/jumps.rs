@@ -507,11 +507,34 @@ impl NavGraph {
     }
 }
 
+/// What a curl probe saw. Every field is an *answer to a question the harness asked*, which is why
+/// they're named rather than positional: a bare `(f32, Option<(f32, f32)>, Vec<(f32, Vec3)>)` needs
+/// this comment read before it can be indexed at all.
+pub struct CurlProbe {
+    /// The takeoff speed the run-up actually delivers.
+    pub v_deliver: f32,
+    /// The certified envelope, if one lands: the gentlest gain that works, and the low corner of the
+    /// speed envelope — what the runtime must at least deliver. `None` when nothing certifies, which
+    /// is the case the harness is usually asking about.
+    pub certified: Option<(f32, f32)>,
+    /// Where the centre corner lands, per gain tried. The miss distances are the *why* behind a
+    /// `certified: None`.
+    pub landings: Vec<(f32, Vec3)>,
+}
+
 impl NavGraph {
     /// Debug probe (harness): from `takeoff` along `psi0` (degrees) with the speed a `runway` delivers,
     /// report the predicted takeoff speed, whether the full envelope certifies, and per-gain the
     /// center-corner landing point — so the harness can see *why* a curl candidate is/ isn't emitted.
-    pub fn curl_probe(&self, bsp: &Bsp, takeoff: Vec3, target: Vec3, psi0: f32, runway: f32, params: SpeedJumpParams) -> (f32, Option<(f32, f32)>, Vec<(f32, Vec3)>) {
+    pub fn curl_probe(
+        &self,
+        bsp: &Bsp,
+        takeoff: Vec3,
+        target: Vec3,
+        psi0: f32,
+        runway: f32,
+        params: SpeedJumpParams,
+    ) -> CurlProbe {
         let p = PmParams {
             gravity: params.gravity,
             accel: params.accel,
@@ -520,11 +543,14 @@ impl NavGraph {
             maxspeed: params.maxspeed,
         };
         let v_deliver = prestrafe_delivered(runway, params.accel, params.maxspeed, params.friction, params.stopspeed);
-        let detail: Vec<(f32, Vec3)> = CURL_GAINS
-            .iter()
-            .map(|&gain| (gain, curl_land_point(bsp, takeoff, target, v_deliver, psi0, gain, &p).unwrap_or(Vec3::ZERO)))
-            .collect();
-        (v_deliver, certify_curl(bsp, takeoff, target, psi0, v_deliver, &p), detail)
+        CurlProbe {
+            v_deliver,
+            certified: certify_curl(bsp, takeoff, target, psi0, v_deliver, &p),
+            landings: CURL_GAINS
+                .iter()
+                .map(|&gain| (gain, curl_land_point(bsp, takeoff, target, v_deliver, psi0, gain, &p).unwrap_or(Vec3::ZERO)))
+                .collect(),
+        }
     }
 }
 

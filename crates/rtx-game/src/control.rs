@@ -55,6 +55,7 @@ const FLY_TIMEOUT: f32 = 8.0;
 /// The control channel's live state, carried on [`GameState`]. Persists across map loads (the socket
 /// binds once); `started` guards against re-binding. All fields stay untouched — the whole harness is
 /// inert — until `rtx_control_port` is set to a real port and the first frame binds the listener.
+#[derive(Default)]
 pub(crate) struct ControlState {
     /// Whether the listener has been (attempted to be) bound. Set once, so a bind is tried at most once.
     started: bool,
@@ -62,12 +63,6 @@ pub(crate) struct ControlState {
     lines_rx: Option<Receiver<String>>,
     /// Outbound JSON lines (replies + events). The writer thread owns the receiving half.
     events_tx: Option<Sender<String>>,
-}
-
-impl Default for ControlState {
-    fn default() -> Self {
-        ControlState { started: false, lines_rx: None, events_tx: None }
-    }
 }
 
 /// Frame prologue: lazily bind the listener once the port cvar is set, then drain and execute every
@@ -892,20 +887,20 @@ fn probe_json(game: &GameState, takeoff: Vec3, tgt: Vec3, psi0: f32, runway: f32
         stopspeed: cv(c"sv_stopspeed", 100.0),
         curl: true,
     };
-    let (v_deliver, cert, detail) = g.curl_probe(bsp, takeoff, tgt, psi0, runway, params);
+    let probe = g.curl_probe(bsp, takeoff, tgt, psi0, runway, params);
     let mut d = String::new();
-    for (gain, land) in detail {
+    for (gain, land) in probe.landings {
         if !d.is_empty() {
             d.push(',');
         }
         let miss = (land.truncate() - tgt.truncate()).length();
         d.push_str(&format!("{{\"gain\":{},\"land\":{},\"miss_xy\":{},\"miss_z\":{}}}", jnum(gain), jvec3(land), jnum(miss), jnum((land.z - tgt.z).abs())));
     }
-    let cert_s = match cert {
+    let cert_s = match probe.certified {
         Some((v_req, gain)) => format!("{{\"v_req\":{},\"gain\":{}}}", jnum(v_req), jnum(gain)),
         None => "null".to_string(),
     };
-    Ok(format!("{{\"v_deliver\":{},\"certified\":{cert_s},\"gains\":[{d}]}}", jnum(v_deliver)))
+    Ok(format!("{{\"v_deliver\":{},\"certified\":{cert_s},\"gains\":[{d}]}}", jnum(probe.v_deliver)))
 }
 
 /// List every generated curl link (SpeedJump with `curl_gain > 0`).

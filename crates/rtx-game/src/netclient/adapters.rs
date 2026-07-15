@@ -23,6 +23,17 @@
 //!   `T_Damage` leaves on a server-side bot: a bearing, not a position.
 //! - **Read** — the obituary tells us who died, which is the one moment an estimate is *known*
 //!   rather than guessed: a dead player is a fresh spawn.
+//!
+//! # Where a belief lives
+//!
+//! Every channel here feeds the **opponent model**, and none of them writes what we believe into an
+//! enemy's entity. That's deliberate, and it's the same rule in both hosts: an entity holds one body's
+//! truth, and a belief is not a truth — it belongs to whoever holds it. The model is already per
+//! observer (`opponent_est(observer, target, …)`), which the entity can never be: a squad is several
+//! bots with different evidence about the same enemy, and one `v.health` field cannot hold both of
+//! their opinions. So the brain asks the model, exactly as it does inside qwprogs, and the enemy
+//! fields the mirror does write — position, aim, on-ground, dead — are the ones a client genuinely
+//! observes.
 
 use glam::Vec3;
 
@@ -151,35 +162,6 @@ impl GameState {
             }
         }
         best.map(|(_, p)| p)
-    }
-
-    /// Write what we believe about every opponent into the fields the brain reads them from.
-    ///
-    /// The brain's own strength/posture logic already goes through `opponent_est`, so this is mostly
-    /// belt and braces for the paths that read an entity directly. What matters is what it does
-    /// *not* do: `health` here is an estimate wearing health's clothes, and nothing about it is
-    /// authoritative. Death isn't sourced from here — that's `PF_DEAD`, on the wire, and true.
-    pub(crate) fn client_write_enemy_estimates(&mut self, observer: EntId) {
-        let now = self.time();
-        let maxclients = self.host.cvar(c"maxclients") as u32;
-        for i in 1..=maxclients {
-            let p = EntId(i);
-            if p == observer || !self.entities[p].in_use || !self.entities[p].is_player() {
-                continue;
-            }
-            // A dead body's condition isn't in question.
-            if !self.entities[p].is_alive() {
-                continue;
-            }
-            let Some(est) = self.opponent_est(observer, p, now) else {
-                continue;
-            };
-            let v = &mut self.entities[p].v;
-            v.health = est.health.max(1.0);
-            v.armorvalue = est.armor_value;
-            v.armortype = est.armor_type;
-            v.items = est.items;
-        }
     }
 
     /// Our own weapon re-arm, tracked because there's nothing else to track it with.
@@ -405,24 +387,31 @@ mod tests {
         assert_eq!(g.entities[me].combat.super_damage_finished, 0.0);
     }
 
-    /// The estimates are written where a stray direct read would find them, but they are estimates:
-    /// death comes from the wire, never from here.
+    /// A belief belongs in the opponent model, and an entity holds what we *observe* — so nothing
+    /// here writes what we believe about an enemy into that enemy's entity.
+    ///
+    /// It's the module's own rule ("write network truth into exactly the fields the brain already
+    /// reads, never teach the brain a second way to ask") pointed at the one thing a client cannot
+    /// observe. The brain never needed the second way: every strength decision already goes through
+    /// `opponent_est`, and `goals.rs` says so where it makes them — *"inventory/stack comes
+    /// exclusively from the observation-gated model — never from the live enemy edict"*. What reads
+    /// an enemy's `v.health` directly only ever asks whether they're alive, which `PF_DEAD` answers
+    /// off the wire and truthfully.
     #[test]
-    fn enemy_estimates_are_written_but_never_claim_death() {
+    fn what_we_believe_about_an_enemy_stays_out_of_their_entity() {
         let mut g = game();
         let me = player(&mut g, 1, Vec3::ZERO);
         let them = player(&mut g, 2, Vec3::new(300.0, 0.0, 0.0));
         g.entities[me].bot.is_bot = true;
 
+        // We watch the enemy take a beating, and we believe it.
         g.model_note_damage(me, them, 60.0);
-        g.client_write_enemy_estimates(me);
-        assert!(g.entities[them].v.health < 100.0, "what we believe, in health's clothes");
-        assert!(g.entities[them].is_alive(), "an estimate must never kill anyone");
+        let est = g.opponent_est(me, them, g.time()).expect("model on");
+        assert!(est.health < 100.0, "the belief is held, and the brain reads it here");
 
-        // A body the wire says is dead is left alone — that fact isn't ours to revise.
-        g.entities[them].v.health = 0.0;
-        g.entities[them].v.deadflag = crate::defs::DeadFlag::Dead;
-        g.client_write_enemy_estimates(me);
-        assert_eq!(g.entities[them].v.health, 0.0, "the wire said dead; we don't argue");
+        // The body carries no claim of ours. The mirror's placeholder stands — it means "alive",
+        // which is all a client can honestly say about a stranger's health.
+        assert_eq!(g.entities[them].v.health, 100.0, "what was observed, not what was inferred");
+        assert!(g.entities[them].is_alive());
     }
 }

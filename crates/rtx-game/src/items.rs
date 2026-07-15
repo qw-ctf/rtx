@@ -91,6 +91,10 @@ impl GameState {
     ///
     /// `None` means it isn't coming back on a timer (deathmatch 2, or a megahealth, which rots
     /// rather than respawns).
+    ///
+    /// Only a client ever has to ask — inside the server the handlers know — but the answer belongs
+    /// here regardless, next to the code it has to agree with.
+    #[cfg(feature = "netclient")]
     pub(crate) fn respawn_delay_of(&self, classname: &str) -> Option<f32> {
         let dm = self.level.deathmatch;
         match classname {

@@ -1163,6 +1163,19 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // can't help it (`death_think` only runs for `deadflag >= Dead`). Seed fresh spawn parms before
     // spawning; FFA/team keep those decoded parms, while fixed-kit modes overwrite them.
     if !alive && game.entities[e].v.deadflag == DeadFlag::No {
+        // Spawning a body is the *server's* act, and a bot embodied as a network client doesn't have
+        // one to spawn — the server already made it, and will respawn it when asked. Doing this here
+        // would teleport our mirror of that body to a spawn point of our choosing and hand it a
+        // loadout nobody issued, leaving our idea of the game disagreeing with the only copy that
+        // counts. The mirror keeps us out of here by starting a body dead (`netclient::mirror`), so
+        // the pulse below is what a client uses instead; this is the backstop for that contract.
+        debug_assert!(
+            !game.host().is_client(),
+            "a network client must never take the server's spawn path",
+        );
+        if game.host().is_client() {
+            return;
+        }
         // Don't place onto an occupied spot the mode can't telefrag clear (Rocket Arena): postpone
         // and retry next bot frame — an early return without a command is this branch's own shape.
         let mode = game.mode;

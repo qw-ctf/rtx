@@ -34,8 +34,6 @@ use crate::host::ClientHost;
 
 /// A usercmd the brain emitted this frame, waiting to be packed into a `clc_move`.
 ///
-/// Read by the session that packs it — the next milestone.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EmittedCmd {
     /// Which of our connections it belongs to (1-based client number).
@@ -58,10 +56,6 @@ pub(crate) struct EmittedCmd {
 ///
 /// One per process, leaked so [`HostApi`](crate::host::HostApi) can stay `Copy`, and rebound per
 /// map via [`rebind`](Self::rebind).
-///
-/// Several fields are read only by the session that feeds them — the next milestone — but they're
-/// exercised by this module's tests today.
-#[allow(dead_code)]
 pub(crate) struct NetHost {
     /// Where the game's files live (the directory holding `qw/`, `id1/`, …).
     basedir: PathBuf,
@@ -142,7 +136,6 @@ const MOVEVAR_CVARS: &[(&str, MoveVarField)] = &[
     ("sv_entgravity", |m| m.entgravity),
 ];
 
-#[allow(dead_code)]
 impl NetHost {
     /// A host rooted at `basedir`, with the rtx tunables seeded to their defaults.
     pub(crate) fn new(basedir: PathBuf) -> Self {
@@ -255,7 +248,7 @@ impl NetHost {
 ///
 /// Fail closed, deliberately. A clear line would have the caller believe it can see through the
 /// world, and `droptofloor` believe every item in the map is floating in space — which deletes them.
-fn no_map(start: Vec3) -> rtx_nav::bsp::HullTrace {
+pub(crate) fn no_map(start: Vec3) -> rtx_nav::bsp::HullTrace {
     rtx_nav::bsp::HullTrace {
         all_solid: true,
         start_solid: true,

@@ -119,6 +119,15 @@ pub struct GameState {
     /// Shared, observation-gated opponent hypotheses (per-side strength/arsenal estimates). Reset to
     /// the mode's spawn kit each map load in `mode::on_worldspawn`. See [`crate::bot::model`].
     pub(crate) opponents: bot::model::OpponentModel,
+    /// How far behind the world a shot is fired, in seconds. **Zero inside a server**, where the bot
+    /// *is* the world and there's nothing to be behind.
+    ///
+    /// A network client sees the enemy where they were half a round trip ago and its shot lands half
+    /// a round trip from now, so by the time the server judges it the enemy has had a whole round
+    /// trip to move. Aiming at what you can see is therefore aiming behind, and always by the same
+    /// amount — which is what makes it correctable rather than an excuse. It's one number for the
+    /// process because every connection here shares a link. See [`Self::aim_lead`].
+    pub(crate) client_lead: f32,
     /// Set by each engine **bot frame** (`GAME_START_FRAME` with `is_bot_frame`) and cleared by the
     /// next normal frame. The engine only issues bot frames once a real client is connected, so on an
     /// empty (bots-only) server this stays clear and the normal frame drives the bots itself. See
@@ -216,6 +225,7 @@ impl GameState {
             nav: navmesh::NavState::default(),
             race: race::RaceState::default(),
             opponents: bot::model::OpponentModel::default(),
+            client_lead: 0.0,
             bot_frame_seen: false,
             map_spawned: false,
             normal_bot_drive_logged: false,

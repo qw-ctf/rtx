@@ -266,7 +266,7 @@ where
     T: BinRead,
     for<'a> <T as BinRead>::Args<'a>: Default,
 {
-    if lump.size as usize % rec_size != 0 {
+    if !(lump.size as usize).is_multiple_of(rec_size) {
         eprintln!("navview: {what} lump size {} is not a multiple of {rec_size} — not this BSP version", lump.size);
         return None;
     }
@@ -730,7 +730,7 @@ mod tests {
 
         let surface = nav_surface(&graph, &bsp);
         // Each cell emits 0..=SURF_SUB² supported sub-quads, 6 verts (2 triangles) each.
-        assert!(surface.len() % 6 == 0, "surface verts are 2-triangle sub-quads");
+        assert!(surface.len().is_multiple_of(6), "surface verts are 2-triangle sub-quads");
         assert!(!surface.is_empty(), "a real map has standable footprint under its cells");
         let max = graph.cells.len() * (SURF_SUB * SURF_SUB) as usize * 6;
         assert!(surface.len() <= max, "surface can't exceed a full SURF_SUB² tiling per cell");
@@ -738,7 +738,7 @@ mod tests {
 
         let all_visible = [true; NUM_LINK_KINDS];
         let lines = nav_lines(&graph, &all_visible);
-        assert!(lines.len() % 2 == 0, "lines are LineList pairs");
+        assert!(lines.len().is_multiple_of(2), "lines are LineList pairs");
         assert!(!lines.is_empty(), "a real map should have non-Walk links (steps/jumps/drops)");
         assert!(
             !lines.iter().any(|v| v.color == link_color(LinkKind::Walk)),

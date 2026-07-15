@@ -103,6 +103,10 @@ pub(crate) struct Session {
 
     /// The entity snapshot ring, and the delta chain.
     pub(crate) frames: Frames,
+    /// When the snapshot last advanced. A squad merges several views of one world, and this is what
+    /// says which of two disagreeing views is the current one — a connection that has gone quiet
+    /// still has a perfectly well-formed snapshot of a world that has since moved on.
+    frames_at: Instant,
     /// The last three usercmds, oldest first — every move packet carries all three.
     cmds: [Usercmd; 3],
 
@@ -121,9 +125,8 @@ pub(crate) struct Session {
     pub(crate) chokes: u32,
 }
 
-// The accessors below exist for the world mirror — the next milestone — which is the only thing
-// that will ask a session what it saw. The session's own tests exercise them meanwhile.
-#[allow(dead_code)]
+// A session answers two callers: the tick loop, which drives it, and the world mirror, which asks
+// what it saw.
 impl Session {
     /// Open a socket and ask for a challenge. Doesn't block: the reply arrives via
     /// [`poll`](Self::poll).
@@ -146,6 +149,7 @@ impl Session {
             serverinfo: Info::new(),
             playernum: 0,
             frames: Frames::default(),
+            frames_at: now,
             cmds: [Usercmd::default(); 3],
             sent_at: vec![now; super::frames::UPDATE_BACKUP],
             challenge: 0,
@@ -167,17 +171,6 @@ impl Session {
         self.playernum
     }
 
-    /// The negotiated protocol.
-    pub(crate) fn proto(&self) -> &ProtoState {
-        &self.proto
-    }
-
-    /// The sound list — `svc_sound` carries an index into this, and the name is what says whether
-    /// it was a rocket launcher or a footstep.
-    pub(crate) fn sounds(&self) -> &[String] {
-        &self.sounds
-    }
-
     /// The model list — entity deltas carry an index into this.
     pub(crate) fn models(&self) -> &[String] {
         &self.models
@@ -193,14 +186,14 @@ impl Session {
         &self.mapname
     }
 
-    /// The gamedir the server is running.
-    pub(crate) fn gamedir(&self) -> &str {
-        &self.gamedir
-    }
-
     /// Smoothed round-trip time, in seconds.
     pub(crate) fn rtt(&self) -> f32 {
         self.rtt
+    }
+
+    /// When this connection's entity snapshot last advanced.
+    pub(crate) fn frames_at(&self) -> Instant {
+        self.frames_at
     }
 
     /// Queue a console command for the server (`say`, `kill`, `join`, …).
@@ -382,6 +375,8 @@ impl Session {
                     // lost. Everything in it is unusable; asking for a full update is the only way
                     // back, and that happens by simply not sending clc_delta next time.
                     eprintln!("rtx-client: entity delta from a frame we lack; requesting a full update");
+                } else {
+                    self.frames_at = Instant::now();
                 }
                 // The first entity frame is what "in the game" actually means.
                 if self.signon == Signon::Loading {

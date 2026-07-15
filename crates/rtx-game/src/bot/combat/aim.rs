@@ -12,6 +12,30 @@ use crate::math::wrap180;
 
 /// Aim-spring stiffness (1/s) for a given skill — the single source shared with the spring
 /// integrator in `bot.rs`, so the feed-forward lag estimate here matches the actual spring.
+impl crate::game::GameState {
+    /// How far ahead of what we can see to aim, for a shot of this kind.
+    ///
+    /// Inside a server this is zero and every branch below folds away: the bot reads the enemy's
+    /// position as the server has it, and its shot is judged the instant it's taken. As a network
+    /// client both halves are late — we see where the enemy *was* half a trip ago, and the server
+    /// judges our shot half a trip from now — so the enemy has a full round trip in which to move,
+    /// on top of any flight time. Aiming at what you can see is aiming behind by exactly that.
+    ///
+    /// **Antilag** is why a projectile and a bullet want different answers. A server running it
+    /// rewinds the players to where the shooter saw them before tracing an instant hit — the whole
+    /// point being that a laggy player aims where they look — so a bullet must *not* be led, and one
+    /// that is misses in front. It can't do the same for a rocket: that's a real object, spawned when
+    /// the command lands and flying in the server's present, so the round trip counts for it either
+    /// way.
+    pub(crate) fn aim_lead(&self, projectile: bool) -> f32 {
+        if projectile || !self.host.cvar_bool(c"sv_antilag") {
+            self.client_lead
+        } else {
+            0.0
+        }
+    }
+}
+
 pub(crate) fn aim_omega(skill: f32) -> f32 {
     6.0 + skill * 2.0
 }

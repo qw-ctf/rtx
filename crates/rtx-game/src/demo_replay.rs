@@ -278,7 +278,7 @@ fn straight_window(frames: &[Frame]) -> (usize, usize) {
                 let rel = f.origin.xy() - base.xy();
                 (rel - axis * rel.dot(axis)).length() <= CORRIDOR
                     && (f.origin.z - base.z).abs() <= FLAT
-                    && f.vel.map_or(true, |v| v.xy().length() >= MIN_SPEED)
+                    && f.vel.is_none_or(|v| v.xy().length() >= MIN_SPEED)
             });
             if !ok {
                 break; // extending b only makes the corridor worse

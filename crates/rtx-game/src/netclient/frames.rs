@@ -208,24 +208,11 @@ impl Frames {
     }
 
     /// The current entity set, or empty before the first update lands.
-    ///
-    /// The world mirror reads this; until it lands, only the tests do.
-    #[allow(dead_code)]
-    pub(crate) fn current(&self) -> &[EntityState] {
+        pub(crate) fn current(&self) -> &[EntityState] {
         self.valid
             .and_then(|s| self.ring[s as usize & UPDATE_MASK].as_ref())
             .map(|s| s.entities.as_slice())
             .unwrap_or(&[])
-    }
-
-    /// Stop requesting deltas; the next update must be a full one. The last good snapshot stays —
-    /// this says "I can't extend the chain", not "I can't see".
-    ///
-    /// The chain retires itself through [`delta_sequence`](Self::delta_sequence)'s age check, so
-    /// this is for a caller that learns the chain is broken some other way.
-    #[allow(dead_code)]
-    pub(crate) fn invalidate(&mut self) {
-        self.delta_base = None;
     }
 
     /// Fold one `svc_packetentities` / `svc_deltapacketentities` into a new snapshot at `sequence`.
