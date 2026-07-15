@@ -430,8 +430,14 @@ enum Footing {
 ///
 /// The one exception is `burning` — the bot is *already standing in* lava/slime, not merely beside it.
 /// Then holding ground means cooking, so the all-hazard fallback takes the wanted move (candidate 0)
-/// and walks off the damage instead of freezing on it; the routing gradient and its own probes steer
-/// it to the nearest shore.
+/// and walks off the damage instead of freezing on it.
+///
+/// That fallback is a last resort, not the plan: it moves the bot *somewhere*, but somewhere is chosen
+/// by where the enemy is, not where the bank is. This used to be the whole answer, and the bot duly
+/// circle-strafed its opponent inside the pool until it died — the comment here claimed the routing
+/// gradient would steer it ashore, but a fight overwrites `move_world`, so the route never reached the
+/// feet. [`combat_move`] now heads for the shore itself before consulting this at all; by the time the
+/// `burning` arm below fires, the bot has no fix on a bank to walk to.
 fn safe_combat_move(
     footing: &impl Fn(Vec3) -> Footing,
     dir: Vec3,
@@ -937,6 +943,23 @@ fn combat_move(game: &mut GameState, e: EntId, enemy: EntId, now: f32, origin: V
     let strafe_sign = aim_line_escape_sign(enemy_eye, enemy_forward, origin, perp, default_strafe);
     let grounded_self = game.entities[e].v.flags.has(Flags::ONGROUND);
     let burning = is_burning(&game.entities[e].v);
+    // Standing in the fire outranks the duel — for the feet. The aim and the trigger above are
+    // untouched, so the bot fights its way out rather than breaking off; it just stops choosing where
+    // to stand by where the enemy is.
+    //
+    // This is the whole of the "bots throw their lives away in lava for no reason" case. The guard
+    // below picks between *combat's* candidates by probing 40-72u around the body, and deep in a pool
+    // every one of those reads lava — so it falls through to the wanted move and the bot circle-strafes
+    // its opponent, in the lava, until it dies. Its route knows where the bank is, but a fight
+    // overwrites `move_world` outright, so the routing gradient never reaches the feet. The burn goal
+    // has already fixed the nearest shore (`run_bot`); walk at it.
+    if burning {
+        let shore = game.entities[e].bot.burn.target;
+        let out = Vec3::new(shore.x - origin.x, shore.y - origin.y, 0.0).normalize_or_zero();
+        if shore != Vec3::ZERO && out != Vec3::ZERO {
+            return out * MOVE_SPEED;
+        }
+    }
     match (grounded_self, game.nav.bsp.as_ref()) {
         (true, Some(bsp)) => {
             let plats = raised_plat_boxes(game, origin);
