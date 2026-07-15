@@ -1073,7 +1073,12 @@ impl GameState {
                     let cell = graph.nearest(p.last_seen)?;
                     let stats = estimated_stats(est, s.weapons_stay);
                     let power = stats.strength * stats.firepower.max(10.0);
-                    Some((stats, graph.costs_from(cell, &pricing.costs(0)), own_power < 0.6 * power))
+                    // Flood from *their* position priced by *their* strength: how far the enemy can
+                    // get is no business of our health. Our own pricing was near enough while it only
+                    // carried our failed links, but hazards are valued by the health of whoever is
+                    // wading — reading our own here would model their nerve as ours.
+                    let theirs = pricing.for_strength(stats.strength);
+                    Some((stats, graph.costs_from(cell, &theirs.costs(0)), own_power < 0.6 * power))
                 })
             } else {
                 None

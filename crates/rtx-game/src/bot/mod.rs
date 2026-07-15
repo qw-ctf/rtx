@@ -44,7 +44,7 @@ use crate::entity::{EntId, Entity, Touch};
 use crate::game::{cstring, GameState};
 use crate::math::{angle_vectors, wrap180, yaw_of};
 use crate::mode::BotIntent;
-use crate::navmesh::{CellId, LinkCosts, LinkKind, NavGraph};
+use crate::navmesh::{CellId, HazardPrice, LinkCosts, LinkKind, NavGraph};
 
 /// Impulse to select the shotgun (for shooting a health-gated button).
 const IMPULSE_SHOTGUN: i32 = 2;
@@ -157,6 +157,14 @@ const DROWN_PANIC_SECS: f32 = 5.0;
 /// two, so gating on dwell lets those intentional crossings through while still rescuing a bot parked
 /// on liquid by a plat standoff, a polite yield, or a knockback.
 const BURN_PANIC_SECS: f32 = 0.75;
+/// The effective strength hazard links are priced against when a bot's own health must not decide:
+/// once it's already standing in the pool, and under `rtx_bot_hazard_health 0`. A bare spawn — so the
+/// price lands where the hand-tuned flat surcharge this replaced used to sit.
+const HAZARD_STRENGTH_NEUTRAL: f32 = 100.0;
+/// How much a biosuit is worth as nerve when pricing a lava shortcut: it stretches lava's damage tick
+/// from 0.2s to 1.0s (`apply_liquid_damage`), so the same wade costs a fifth of the health — which
+/// this spends as five times the effective strength rather than a second damage model.
+const RADSUIT_NERVE: f32 = 5.0;
 /// How long the anti-drown surface target is reused before re-flooding the graph — a short cache so
 /// a drowning bot doesn't run a full Dijkstra every frame while it swims out. Shared by the burn
 /// escape reflex, which floods the same way.
@@ -1244,13 +1252,18 @@ fn run_bot(game: &mut GameState, e: EntId) {
     } else if game.entities[e].bot.burn_since == 0.0 {
         game.entities[e].bot.burn_since = now;
     }
-    if s.burning && now - game.entities[e].bot.burn_since >= BURN_PANIC_SECS {
+    if s.burning {
+        // Fix the shore from the *first* burning frame, not after the panic window: while a fight owns
+        // the feet the goal below is inert, so the combat controller steers by this cached point
+        // instead — and it can't spend 0.75s of cooking working out where the bank is.
         let safe = escape_target(&mut game.entities[e].bot.burn, graph, bot_cell, &costs, now);
-        if let Some(cell) = safe.and_then(|a| graph.nearest(a)) {
-            goal_cell = cell;
-            o.target_origin = graph.cell_origin(cell);
-            o.item_cell = Some(cell);
-            o.polite = false;
+        if now - game.entities[e].bot.burn_since >= BURN_PANIC_SECS {
+            if let Some(cell) = safe.and_then(|a| graph.nearest(a)) {
+                goal_cell = cell;
+                o.target_origin = graph.cell_origin(cell);
+                o.item_cell = Some(cell);
+                o.polite = false;
+            }
         }
     }
 
@@ -1378,6 +1391,7 @@ pub(crate) struct LinkPricing {
     gate_closed: Vec<bool>,
     penalties: Vec<(u32, f32)>,
     rj_extra: f32,
+    hazard: Option<HazardPrice>,
 }
 
 impl LinkPricing {
@@ -1388,6 +1402,19 @@ impl LinkPricing {
             penalties: &self.penalties,
             jitter_seed,
             rocket_jump_extra: self.rj_extra,
+            hazard: self.hazard,
+        }
+    }
+
+    /// The same pricing, but valuing hazards for a fighter of effective `strength` instead of the
+    /// owning bot — for the flood that models an *enemy's* reach, where our own health is no part of
+    /// how far *they* can get.
+    pub(crate) fn for_strength(&self, strength: f32) -> LinkPricing {
+        LinkPricing {
+            gate_closed: self.gate_closed.clone(),
+            penalties: self.penalties.clone(),
+            rj_extra: self.rj_extra,
+            hazard: self.hazard.map(|h| HazardPrice { strength, ..h }),
         }
     }
 }
@@ -1431,6 +1458,37 @@ impl GameState {
             gate_closed: self.gate_closed_flags(),
             penalties,
             rj_extra,
+            hazard: Some(HazardPrice {
+                strength: self.bot_hazard_strength(e, now),
+                k: self.host().cvar(c"rtx_bot_hazard_k").max(0.0),
+            }),
+        }
+    }
+
+    /// How much this bot values its skin when a route offers a lava/slime shortcut, as the effective
+    /// strength [`NavGraph::link_extra`] prices hazard links against: its `total_strength` (health
+    /// through armor — lava damage really is absorbed by armor, so plate genuinely buys nerve).
+    ///
+    /// Two adjustments:
+    ///
+    ///  * **Already standing in it ⇒ neutral.** Health weighs the decision to *enter* a hazard, never
+    ///    one made from inside. Otherwise a bot that waded in at full health and is now at 60 reprices
+    ///    the cells still ahead of it, turns around, and walks back out through the lava it already
+    ///    paid for — eating the damage to arrive nowhere. Pricing stops moving once committed, so it
+    ///    finishes the crossing. Neutral rather than free: leaving still prefers the shortest wade out.
+    ///  * **Biosuit.** It stretches lava's tick to a fifth and exempts slime outright, so a suited bot
+    ///    can take the lava line — which is exactly the trade the suit exists for.
+    fn bot_hazard_strength(&self, e: EntId, now: f32) -> f32 {
+        let v = &self.entities[e].v;
+        // Already in it — the engine's own waterlevel says so — or the weighting is switched off.
+        if combat::is_burning(v) || !self.rtx_cvar_bool("rtx_bot_hazard_health") {
+            return HAZARD_STRENGTH_NEUTRAL;
+        }
+        let strength = goals::total_strength(v.health, v.armorvalue, v.armortype);
+        if self.entities[e].combat.radsuit_finished > now {
+            strength * RADSUIT_NERVE
+        } else {
+            strength
         }
     }
 }

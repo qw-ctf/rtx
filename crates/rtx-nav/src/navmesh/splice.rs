@@ -308,22 +308,7 @@ mod tests {
     /// A graph with no geometry, to hang synthetic cells off (`add_cell` fills the grid `cells_in_box`
     /// reads). Building the real thing needs a BSP; the stamp only needs cells and a plat box.
     fn bare_graph() -> NavGraph {
-        NavGraph {
-            cells: Vec::new(),
-            links: Vec::new(),
-            adjacency: Vec::new(),
-            water: Vec::new(),
-            breathable: Vec::new(),
-            hazard: Vec::new(),
-            under_plat: Vec::new(),
-            grid: GridIndex::default(),
-            gates: SideTable::default(),
-            hooks: SideTable::default(),
-            speed_jumps: SideTable::default(),
-            rocket_jumps: SideTable::default(),
-            plats: SideTable::default(),
-            sj_k: bhop_k(10.0, MAX_SPEED),
-        }
+        NavGraph::test_graph(Vec::new(), Vec::new())
     }
 
     /// A lift resting at `z = -24` whose raised surface delivers to a floor at `z = 200`, footprint

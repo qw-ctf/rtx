@@ -288,9 +288,22 @@ impl NavGraph {
         self.links[link_idx as usize].kind
     }
 
-    /// A link's planner cost in seconds, including any hazard/water surcharge already folded in.
+    /// A link's static travel-time cost in seconds. Liquid risk is **not** in here — see
+    /// [`link_hazard_hp`](Self::link_hazard_hp) and [`link_water_extra`](Self::link_water_extra).
     pub fn link_cost(&self, link_idx: u32) -> f32 {
         self.links[link_idx as usize].cost
+    }
+
+    /// The health a bot expects to lose taking this link (lava/slime contact, or the risk premium on
+    /// a pool's edge); `0.0` for the overwhelming majority. Seconds only once valued against a
+    /// particular bot's strength — see `hazard_cost`.
+    pub fn link_hazard_hp(&self, link_idx: u32) -> f32 {
+        self.hazard_hp.get(link_idx as usize).copied().unwrap_or(0.0)
+    }
+
+    /// The extra seconds this link costs for swimming rather than running it.
+    pub fn link_water_extra(&self, link_idx: u32) -> f32 {
+        self.water_extra.get(link_idx as usize).copied().unwrap_or(0.0)
     }
 
     /// The standing player-origin position of a cell (the point a bot steers toward).

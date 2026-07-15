@@ -46,6 +46,14 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // Bots plan over speed bands (kinodynamic A*), crediting speed carried between legs so
         // chained speed jumps and hot corridors route; on by default. Escape hatch: 0 → plain A*.
         ("rtx_bot_bandplan", Bool(true)),
+        // A bot's health weights how willing it is to shortcut through lava/slime: hurt bots detour,
+        // healthy (or armored, or biosuited) ones clip the corner. `0` prices every bot as a bare
+        // spawn — hazards still cost, but the same to everyone. See `bot::bot_hazard_strength`.
+        ("rtx_bot_hazard_health", Bool(true)),
+        // Seconds of detour a bot accepts per unit of "fraction of surviving strength" a hazard eats
+        // (rtx-nav's `HAZARD_TIME_K`). Higher = more timid. The default prices a bare spawn's
+        // waterlevel-1 lava cell at ~1.7s.
+        ("rtx_bot_hazard_k", Float(15.0)),
         // Wall jump (kick off a wall you jump into), on by default (`rtx_walljump 0` to disable).
         ("rtx_walljump", Bool(true)),
         // Elevator jump: a rising lift boosts your jump by `lift_speed * rtx_elevator_jump`. A

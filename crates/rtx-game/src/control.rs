@@ -705,12 +705,17 @@ fn cell_json(game: &GameState, pos: Vec3) -> Result<String, String> {
     for li in 0..g.links.len() as u32 {
         if g.link_source(li) == cell {
             let e = if out.is_empty() { "" } else { "," };
+            // `cost` is the static travel time only. What a hazard link *really* costs the planner is
+            // `hazard_hp` valued against the asking bot's strength, so report the health and let the
+            // caller price it — reporting seconds here would mean picking a bot to price it for.
             out.push_str(&format!(
-                "{e}{{\"link\":{li},\"kind\":{},\"to\":{},\"cost\":{:.2},\"tgt_hazard\":{}}}",
+                "{e}{{\"link\":{li},\"kind\":{},\"to\":{},\"cost\":{:.2},\"tgt_hazard\":{},\"hazard_hp\":{:.2},\"water_extra\":{:.2}}}",
                 jstr(kind_name(g.link_kind(li))),
                 jvec3(g.cell_origin(g.link_target(li))),
                 g.link_cost(li),
-                jstr(&format!("{:?}", g.cell_hazard(g.link_target(li))))
+                jstr(&format!("{:?}", g.cell_hazard(g.link_target(li)))),
+                g.link_hazard_hp(li),
+                g.link_water_extra(li),
             ));
         }
         if g.link_target(li) == cell {

@@ -44,6 +44,10 @@ pub(super) const DOUBLE_JUMP_APEX: f32 = 80.0;
 pub const DOUBLE_ARC_PEAK: f32 = 100.0;
 /// `sv_maxspeed` default — the cost denominator (travel time = distance / speed).
 pub const MAX_SPEED: f32 = 320.0;
+/// Speed a submerged bot makes: pmove drives swimming at 0.7× wishspeed, and there is no bunnyhop
+/// under the surface. The banded planner prices a leg into water at this rather than crediting it the
+/// speed gains a dry corridor of the same length would build.
+pub const SWIM_SPEED: f32 = 0.7 * MAX_SPEED;
 
 // --- speed jumps (bunnyhop-carried leaps across wide gaps) ---
 

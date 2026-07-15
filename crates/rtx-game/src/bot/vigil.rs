@@ -177,14 +177,21 @@ fn pick_scan(eye: Vec3, prev: Vec3, r: f32) -> Vec3 {
 /// A reachable cell in the `[min, max]` XY ring around `item` on roughly its floor, whose route from
 /// `from` is trivial (only `Walk`/`Step` legs, no gate) — so the cruise leg is a short stroll and can
 /// never turn into a gate errand. Cells under a raised lift are barred outright: a post is a spot to
-/// *stand* for seconds at a time, and a body in the shaft holds the lift up. Candidates are tried from
-/// a random offset; `None` if none validate.
+/// *stand* for seconds at a time, and a body in the shaft holds the lift up. Lava/slime footing is
+/// barred for the same reason and harder — standing watch is precisely the thing you cannot do while
+/// burning, and route cost alone never ruled it out (`route_is_trivial` is happy to stroll into a
+/// pool). Mirrors the filter `roam_target` applies to its wander destinations. Candidates are tried
+/// from a random offset; `None` if none validate.
 fn pick_post(g: &NavGraph, from: CellId, item: Vec3, min: f32, max: f32, r: f32) -> Option<(CellId, Vec3)> {
     let ring: Vec<CellId> = (0..g.cells.len() as CellId)
         .filter(|&c| {
             let o = g.cells[c as usize].origin;
             let d = (o.xy() - item.xy()).length();
-            d >= min && d <= max && (o.z - item.z).abs() < POST_DZ && g.cell_under_plat(c).is_none()
+            d >= min
+                && d <= max
+                && (o.z - item.z).abs() < POST_DZ
+                && g.cell_under_plat(c).is_none()
+                && g.cell_hazard(c).is_none()
         })
         .collect();
     if ring.is_empty() {

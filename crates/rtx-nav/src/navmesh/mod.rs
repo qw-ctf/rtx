@@ -219,6 +219,18 @@ pub struct NavGraph {
     /// alongside `water` by [`surcharge_hazard_links`](Self::surcharge_hazard_links); an empty vec
     /// reads as "no cell burns" via [`cell_hazard`](Self::cell_hazard).
     hazard: Vec<Option<crate::hazard::HazardKind>>,
+    /// Health a bot expects to lose *taking* each link (parallel to `links`), `0.0` on the
+    /// overwhelming majority. Filled by [`flag_hazards`](Self::flag_hazards) from the map's real
+    /// damage model — tick size × waterlevel × dwell, plus a risk premium on links onto a pool's
+    /// edge. Kept as **health, not seconds**, because what a point of health is worth depends on who
+    /// is asking: [`link_extra`](Self::link_extra) converts it per query against the bot's own
+    /// strength. An empty vec reads as "nothing hurts".
+    hazard_hp: Vec<f32>,
+    /// Extra seconds each link costs for entering water (parallel to `links`): swimming is slower
+    /// than running and carries no bunnyhop. Filled by [`flag_water`](Self::flag_water); an empty vec
+    /// reads as "no water tax". Unlike `hazard_hp` this is a flat time price, not a health one —
+    /// water doesn't burn, it just slows you down.
+    water_extra: Vec<f32>,
     /// Per-cell "this spot is inside a `func_plat`'s swept volume" (parallel to `cells`), holding the
     /// lift's index in `plats`. A body resting here blocks the lift's descent *and* keeps resetting
     /// its inner trigger's lower-timer, so a raised plat never comes down — hence these cells are
@@ -304,10 +316,38 @@ pub struct LinkCosts<'a> {
     pub jitter_seed: u32,
     /// Nonzero ⇒ charge every [`LinkKind::RocketJump`] link this many extra seconds — the per-bot
     /// capability gate. A bot currently unable to rocket-jump sets it to [`RJ_UNFIT_PENALTY`] so it
-    /// plans around them; `0` (the default) leaves rocket jumps at their solved cost. The only price
-    /// term that depends on *who* is asking (the others are world state), because unlike the grapple
-    /// — a server-wide cvar — a bot's rockets and health vary moment to moment.
+    /// plans around them; `0` (the default) leaves rocket jumps at their solved cost. One of the two
+    /// price terms that depend on *who* is asking (the rest are world state), because unlike the
+    /// grapple — a server-wide cvar — a bot's rockets and health vary moment to moment.
     pub rocket_jump_extra: f32,
+    /// `Some(_)` ⇒ price lava/slime links for this bot, converting each link's `hazard_hp` to seconds
+    /// via [`hazard_cost`]. The weaker the bot, the longer the detour it will accept to stay out of
+    /// the pool; with armor and full health it barely notices a clipped corner.
+    ///
+    /// `None` (the default) ⇒ hazards unpriced, for callers measuring pure traversal time: race-line
+    /// verification and the offline optimizer, whose authored lines deliberately cross lava and whose
+    /// estimates are compared against a timeout. Deliberately not `0.0`-means-inert like the terms
+    /// above: strength zero means *dead*, which has to mean maximum avoidance, not none.
+    pub hazard: Option<HazardPrice>,
+}
+
+/// What a hazard is worth to the bot asking — the whole per-bot half of [`hazard_cost`].
+#[derive(Clone, Copy)]
+pub struct HazardPrice {
+    /// The bot's effective hit points (`total_strength`: health scaled by armor absorption, which
+    /// lava damage really does go through). The denominator of its nerve.
+    pub strength: f32,
+    /// Seconds of detour accepted per unit of fraction-of-strength lost ([`HAZARD_TIME_K`]); higher is
+    /// more timid. Carried per query rather than read as a constant so the tuning harness can sweep it
+    /// live (`rtx_bot_hazard_k`) without a rebuild.
+    pub k: f32,
+}
+
+impl HazardPrice {
+    /// Price hazards for a bot of effective `strength` at the stock timidity.
+    pub fn new(strength: f32) -> Self {
+        Self { strength, k: HAZARD_TIME_K }
+    }
 }
 
 /// A cheap integer hash (variant of the SplitMix/Murmur finalizer) for deterministic route jitter.
@@ -329,10 +369,12 @@ impl NavGraph {
             adjacency: vec![Vec::new(); cells_grid.0.len()],
             cells: cells_grid.0,
             links: Vec::new(),
-            water: Vec::new(),      // filled at graph-swap by surcharge_water_links
-            breathable: Vec::new(), // (needs the engine's liquid-carrying pointcontents)
-            hazard: Vec::new(),     // filled at graph-swap by surcharge_hazard_links (same reason)
-            under_plat: Vec::new(), // filled by add_plats (pure geometry — no engine callback needed)
+            water: Vec::new(),       // filled at graph-swap by flag_water
+            breathable: Vec::new(),  // (needs the engine's liquid-carrying pointcontents)
+            water_extra: Vec::new(), // (same)
+            hazard: Vec::new(),      // filled at graph-swap by flag_hazards (same reason)
+            hazard_hp: Vec::new(),   // (same)
+            under_plat: Vec::new(),  // filled by add_plats (pure geometry — no engine callback needed)
             grid: cells_grid.1,
             gates: SideTable::default(),
             hooks: SideTable::default(),
@@ -343,6 +385,36 @@ impl NavGraph {
         };
         graph.link_cells(bsp);
         graph
+    }
+
+    /// A bare graph for the unit tests: `cells` + `links`, adjacency derived from the links, every
+    /// optional column empty (so it reads as dry, unhazardous and gate-free) and stock bhop physics.
+    /// Exists so that adding a column doesn't mean editing eight field-by-field literals — the friction
+    /// that kept the hazard pricing out of the tests' sight while it silently did nothing in play.
+    #[cfg(test)]
+    pub(super) fn test_graph(cells: Vec<Cell>, links: Vec<Link>) -> NavGraph {
+        let mut adjacency = vec![Vec::new(); cells.len()];
+        for (i, l) in links.iter().enumerate() {
+            adjacency[l.from as usize].push(i as u32);
+        }
+        NavGraph {
+            cells,
+            links,
+            adjacency,
+            water: Vec::new(),
+            breathable: Vec::new(),
+            water_extra: Vec::new(),
+            hazard: Vec::new(),
+            hazard_hp: Vec::new(),
+            under_plat: Vec::new(),
+            grid: GridIndex::default(),
+            gates: SideTable::default(),
+            hooks: SideTable::default(),
+            speed_jumps: SideTable::default(),
+            rocket_jumps: SideTable::default(),
+            plats: SideTable::default(),
+            sj_k: bhop_k(10.0, MAX_SPEED),
+        }
     }
 
     /// Sweep every grid column for floors and emit one [`Cell`] at the bottom of each empty
@@ -531,47 +603,85 @@ impl NavGraph {
         out
     }
 
-    /// Surcharge links that route a bot into or alongside a lava or slime pool, so the planner keeps
-    /// its distance whenever a comparable safe route exists. Two kinds of cell pay:
+    /// Flag every cell's liquid footing and price each link by the **health** crossing it costs, so
+    /// the planner keeps its distance whenever a comparable safe route exists. Two kinds of cell pay:
     ///
     ///  * **standing *in* the liquid** — the cell's own footing (feet+1, the engine's waterlevel-1
     ///    sample) is lava/slime, so the game burns a bot parked there. Persisted in `self.hazard`,
-    ///    priced per link entering by [`LAVA_CELL_EXTRA`] / [`SLIME_CELL_EXTRA`]. This catches shallow
-    ///    films *and* interior cells of a walkable-bottom pool, which the edge probe below cannot see.
+    ///    priced per entering link from the real damage model. This catches shallow films *and*
+    ///    interior cells of a walkable-bottom pool, which the edge probe below cannot see.
     ///  * **on the liquid's *edge*** — an open side a stride out drops onto lava/slime (a bank a bot
-    ///    walks along). Priced by the smaller [`HAZARD_LINK_EXTRA`]. Transient; an in-liquid cell
-    ///    doesn't also pay the edge tax (it's already the worse case).
+    ///    walks along). Priced by the smaller [`HAZARD_EDGE_HP`]. An in-liquid cell doesn't also pay
+    ///    the edge tax (it's already the worse case).
+    ///
+    /// The price lands in `hazard_hp` (health), **not** in `link.cost` (seconds). It used to be baked
+    /// into `link.cost`, and that quietly did nothing: `banded_step`'s Walk/Step arm derives its cost
+    /// from speed and never reads `link.cost`, and the banded planner is the live one — so every bot
+    /// walked into lava priced as bare floor. `link.cost` was the wrong home for risk anyway (it is a
+    /// *distance/speed* quantity), and health can't be converted to seconds here regardless: the
+    /// exchange rate depends on the health of whoever is asking. [`link_extra`](Self::link_extra) —
+    /// which all three searches do honor — does the conversion per query.
     ///
     /// Pits are deliberately not flagged here (every balcony/ledge cell borders a drop — that would
     /// surcharge half the map); the runtime combat guard [`crate::hazard::hazard_ahead`] keeps bots
     /// from stepping off edges in a fight. Only *liquids* get a routing bias, and the pure
     /// worker-thread build can't see them — the clip hull it reads carries no liquid contents — so
     /// this takes the engine's `pointcontents` as `contents` and runs at graph-swap time (from the
-    /// game's navmesh poll) rather than inside [`build_navmesh`]. All surcharges are finite adds, so a
-    /// lava bridge that is the only route stays crossable and the graph is never severed.
-    pub fn surcharge_hazard_links(&mut self, is_solid: &impl Fn(Vec3) -> bool, contents: &impl Fn(Vec3) -> f32) {
-        // A bot's own footing on each cell: feet sit 24u below the origin (player `mins.z`), and the
-        // engine's SV_CheckWater burns from feet+1 — sample there so this matches the damage exactly.
-        self.hazard = self
+    /// game's navmesh poll) rather than inside [`build_navmesh`].
+    pub fn flag_hazards(&mut self, is_solid: &impl Fn(Vec3) -> bool, contents: &impl Fn(Vec3) -> f32) {
+        let liquid = |p: Vec3| match contents(p) {
+            x if x == crate::bsp::CONTENTS_LAVA as f32 => Some(crate::hazard::HazardKind::Lava),
+            x if x == crate::bsp::CONTENTS_SLIME as f32 => Some(crate::hazard::HazardKind::Slime),
+            _ => None,
+        };
+        // Each cell's liquid footing and how deep a bot standing there wades. The engine deals
+        // `tick · waterlevel`, so depth is a 3× damage spread between clipping a corner (wl 1) and
+        // swimming a pit (wl 3) — flattening it would price those the same. These are pmove's own
+        // three sample heights: feet+1 (`mins.z + 1`, which is also SV_CheckWater's burn sample, so
+        // the kind matches the damage exactly), the box mid-point, and the view offset.
+        let depth: Vec<(Option<crate::hazard::HazardKind>, f32)> = self
             .cells
             .iter()
-            .map(|c| match contents(c.origin - Vec3::new(0.0, 0.0, 23.0)) {
-                x if x == crate::bsp::CONTENTS_LAVA as f32 => Some(crate::hazard::HazardKind::Lava),
-                x if x == crate::bsp::CONTENTS_SLIME as f32 => Some(crate::hazard::HazardKind::Slime),
-                _ => None,
+            .map(|c| {
+                let kind = liquid(c.origin - Vec3::new(0.0, 0.0, 23.0));
+                let wl = if kind.is_none() {
+                    0.0
+                } else if liquid(c.origin + Vec3::new(0.0, 0.0, 4.0)).is_none() {
+                    1.0
+                } else if liquid(c.origin + Vec3::new(0.0, 0.0, 22.0)).is_none() {
+                    2.0
+                } else {
+                    3.0
+                };
+                (kind, wl)
             })
             .collect();
+        self.hazard = depth.iter().map(|&(kind, _)| kind).collect();
         let edge: Vec<bool> = (0..self.cells.len() as CellId)
             .map(|id| self.cell_on_liquid_edge(id, is_solid, contents))
             .collect();
-        for link in &mut self.links {
-            match self.hazard[link.to as usize] {
-                Some(crate::hazard::HazardKind::Lava) => link.cost += LAVA_CELL_EXTRA,
-                Some(crate::hazard::HazardKind::Slime) => link.cost += SLIME_CELL_EXTRA,
-                _ if edge[link.to as usize] => link.cost += HAZARD_LINK_EXTRA,
-                _ => {}
-            }
-        }
+        self.hazard_hp = self
+            .links
+            .iter()
+            .map(|link| {
+                let (tick_hp, tick_secs) = match depth[link.to as usize].0 {
+                    Some(crate::hazard::HazardKind::Lava) => (LAVA_TICK_HP, LAVA_TICK_SECS),
+                    Some(crate::hazard::HazardKind::Slime) => (SLIME_TICK_HP, SLIME_TICK_SECS),
+                    // Pit never comes off a footing sample; an edge cell pays the risk premium, and a
+                    // link *leaving* a pool is free — that's the gradient that pulls a bot to shore.
+                    _ => return if edge[link.to as usize] { HAZARD_EDGE_HP } else { 0.0 },
+                };
+                let horiz =
+                    (self.cells[link.to as usize].origin.xy() - self.cells[link.from as usize].origin.xy()).length();
+                // Conservative dwell: walking pace, not the bhop the bot may actually carry.
+                let ticks = (horiz.max(GRID) / MAX_SPEED) / tick_secs;
+                // `dmgtime` starts in the past, so stepping in costs a whole tick before any dwell
+                // accrues — but only on the way *in*. Charging that entry tick per cell would price an
+                // N-cell wade N times over.
+                let ticks = if depth[link.from as usize].0.is_some() { ticks } else { ticks.max(1.0) };
+                tick_hp * depth[link.to as usize].1 * ticks
+            })
+            .collect();
     }
 
     /// Whether cell `id` sits on the edge of a lava or slime pool: for each compass direction with
@@ -602,29 +712,49 @@ impl NavGraph {
     /// Flag every cell whose standing origin is under water, and price swimming above walking. Fills
     /// the parallel `water`/`breathable` vectors — an origin in water means a bot swims here; an eye
     /// point out of the water (`origin + 22`, pmove's waterlevel-3 sample) means a spot it can
-    /// breathe — then multiplies the cost of every link *entering* a water cell by
-    /// [`WATER_COST_MULT`]. Exit links (water → dry) are left untouched, so the surcharge forms a
-    /// cost gradient the planner follows back to shore rather than a uniform pool tax.
+    /// breathe — then charges every link *entering* a water cell the [`WATER_COST_MULT`] premium in
+    /// `water_extra`. Exit links (water → dry) are left free, so the price forms a cost gradient the
+    /// planner follows back to shore rather than a uniform pool tax.
     ///
-    /// Like [`surcharge_hazard_links`](Self::surcharge_hazard_links) this reads liquid contents, which
-    /// only the engine's render-hull `pointcontents` carries (the worker build's clip hull is
-    /// liquid-blind), so it runs at graph-swap from the game's navmesh poll — not inside [`build`].
-    pub fn surcharge_water_links(&mut self, contents: &impl Fn(Vec3) -> f32) {
+    /// Like [`flag_hazards`](Self::flag_hazards) the premium lives in its own column rather than
+    /// baked into `link.cost`, where `banded_step` never read it (see that method for the full story).
+    /// Expressed as the equivalent additive delta, `(mult − 1) · cost`: identical to the old multiply
+    /// for the searches that do read `link.cost`, and conservative for the banded one.
+    ///
+    /// Also like [`flag_hazards`](Self::flag_hazards) this reads liquid contents, which only the
+    /// engine's render-hull `pointcontents` carries (the worker build's clip hull is liquid-blind), so
+    /// it runs at graph-swap from the game's navmesh poll — not inside [`build`].
+    pub fn flag_water(&mut self, contents: &impl Fn(Vec3) -> f32) {
         let is_water = |p: Vec3| contents(p) == crate::bsp::CONTENTS_WATER as f32;
         self.water = self.cells.iter().map(|c| is_water(c.origin)).collect();
         // Eye height for the breathe test: the standing view offset (pmove samples waterlevel 3 here).
         let eye = Vec3::new(0.0, 0.0, 22.0);
         self.breathable = self.cells.iter().map(|c| !is_water(c.origin + eye)).collect();
-        for link in &mut self.links {
-            if self.water[link.to as usize] {
-                link.cost *= WATER_COST_MULT;
-            }
-        }
+        // The extra seconds the slower stroke costs over the same ground, straight from the geometry
+        // — not `(mult − 1) · link.cost`, which would only be the swim time for links whose cost *is*
+        // `horiz / MAX_SPEED`. A `Drop` into a pool pays its fall and then the swim, not a fifth more
+        // falling.
+        self.water_extra = self
+            .links
+            .iter()
+            .map(|l| {
+                if !self.water[l.to as usize] {
+                    return 0.0;
+                }
+                let horiz = (self.cells[l.to as usize].origin.xy() - self.cells[l.from as usize].origin.xy()).length();
+                horiz.max(GRID) / MAX_SPEED * (WATER_COST_MULT - 1.0)
+            })
+            .collect();
     }
 
     /// Extra A* cost for link `li` under `costs`: closed-gate penalty + this caller's per-link
-    /// surcharge + optional deterministic jitter. All non-negative, keeping the A* heuristic
-    /// admissible (see [`LinkCosts`]).
+    /// surcharge + optional deterministic jitter + the water and lava/slime prices. All non-negative,
+    /// keeping the A* heuristic admissible (see [`LinkCosts`]).
+    ///
+    /// This is the one addend every search shares — [`find_path`](Self::find_path),
+    /// [`find_path_banded`](Self::find_path_banded) and [`costs_from`](Self::costs_from) all route
+    /// through here — which is why the liquid prices live here rather than baked into `link.cost`,
+    /// where the banded planner never saw them.
     #[inline]
     fn link_extra(&self, li: u32, costs: &LinkCosts) -> f32 {
         let mut extra = match self.gate_of_link(li) {
@@ -643,6 +773,16 @@ impl NavGraph {
         }
         if costs.rocket_jump_extra > 0.0 && self.links[li as usize].kind == LinkKind::RocketJump {
             extra += costs.rocket_jump_extra;
+        }
+        extra += self.water_extra.get(li as usize).copied().unwrap_or(0.0);
+        // Health is only convertible to seconds against a particular bot's health, so an unpriced
+        // query (`hazard_strength: None`) skips it — and the vast majority of links cost no health at
+        // all, so check that first.
+        if let Some(price) = costs.hazard {
+            let hp = self.hazard_hp.get(li as usize).copied().unwrap_or(0.0);
+            if hp > 0.0 {
+                extra += hazard_cost(hp, price);
+            }
         }
         extra
     }
@@ -675,6 +815,15 @@ impl NavGraph {
         let v_in = BAND_FLOOR[entry as usize].max(MAX_SPEED);
         Some(match link.kind {
             LinkKind::Walk | LinkKind::Step => {
+                // Swimming isn't walking: pmove drives a submerged bot at [`SWIM_SPEED`] and it can't
+                // bunnyhop at all, so a leg into water neither climbs a band nor keeps one. Crediting
+                // it the dry-corridor gain (as this arm did, water being invisible here) plans a
+                // downstream chained jump off speed no bot can carry out of a pool. The *time* the
+                // slower stroke costs isn't added here — `water_extra` charges it, once, for every
+                // search alike.
+                if self.cell_in_water(link.to) {
+                    return Some(((horiz / MAX_SPEED).max(floor_cost), band_of(SWIM_SPEED)));
+                }
                 // Already moving (band ≥ 1): carry speed and climb. From a standstill spend a spin-up
                 // runway before gains begin. But an ascending leg — a stair riser (`dz > WALK_DZ`) —
                 // builds no bhop speed (a human runs up stairs), so it carries the band without gain
@@ -1133,27 +1282,61 @@ pub struct LinkCounts {
 /// Radius out from a cell probed for an adjacent lava/slime surface — a stride (1.5 grid columns)
 /// past the cell, so a bot skirting the edge is caught without flagging cells a safe walkway away.
 const HAZARD_PROBE_R: f32 = 48.0;
-/// Extra travel-time charged to every link *entering* a cell on a lava/slime edge (see
-/// [`NavGraph::surcharge_hazard_links`]). Moderate — a few walk-links' worth — so the planner takes
-/// a parallel safe corridor when one exists within a short detour, yet still crosses a lava bridge
-/// that is the only way; finite, so it never disconnects the graph (like the gate/RJ penalties).
-const HAZARD_LINK_EXTRA: f32 = 0.5;
+/// Health charged to a link *entering* a cell on a lava/slime edge — a risk premium, not certain
+/// damage: the bot means to walk past the pool, and only sometimes clips it. ~15% odds of a stumble
+/// costing a ~20HP dip. Deliberately not stacked on top of the in-pool price below: a cell you're
+/// already burning on doesn't also charge for being *near* the burn.
+const HAZARD_EDGE_HP: f32 = 3.0;
 
-/// Extra travel-time on every link *entering* a cell whose own footing is **lava** (a bot standing
-/// there burns — see [`NavGraph::surcharge_hazard_links`]). A flat add, not a [`WATER_COST_MULT`]-style
-/// multiplier: in-pool links are each roughly one grid pitch (~0.1s), so a multiplier honest about
-/// swim speed would price a lethal wade far below the health it costs; a flat add instead stacks with
-/// pool width exactly as the tick-quantized damage does (10 HP·waterlevel per 0.2s). Magnitude: one
-/// wading cell eats one-to-two 10 HP ticks ⇒ ~0.7–1.4s at the crate's rocket-jump `RJ_HEALTH_SECS_PER_HP`
-/// (0.07 s/HP), doubled for tail risk (waterlevel 2 doubles the tick, a stumble doubles the dwell, and
-/// unlike a rocket jump the spend is uncontrolled). Finite by design — a 4-cell lava bridge that is the
-/// only route costs +8s and is still taken.
-const LAVA_CELL_EXTRA: f32 = 2.0;
-/// Extra travel-time on every link *entering* a cell whose own footing is **slime**. Slime's honest
-/// price is an order under lava's (4 HP·waterlevel per 1.0s tick — the entry tick alone is ~4 HP ≈
-/// 0.28s at 0.07 s/HP, plus a slow drip while wading), so half [`HAZARD_LINK_EXTRA`]'s big brother and
-/// well under lava: bots still shortcut a narrow slime moat when the dry detour is long.
-const SLIME_CELL_EXTRA: f32 = 1.0;
+/// The engine's liquid contact damage, which [`NavGraph::flag_hazards`] prices links against — the
+/// exact numbers `apply_liquid_damage` deals: lava burns `10 · waterlevel` every 0.2s, slime
+/// `4 · waterlevel` every 1.0s. Kept as the raw damage model rather than pre-converted seconds
+/// because what a point of health is *worth* is a per-bot question (see [`hazard_cost`]); this is
+/// just physics.
+const LAVA_TICK_HP: f32 = 10.0;
+const LAVA_TICK_SECS: f32 = 0.2;
+const SLIME_TICK_HP: f32 = 4.0;
+const SLIME_TICK_SECS: f32 = 1.0;
+
+/// Seconds of detour a bot accepts per unit of "fraction of its surviving strength" a hazard eats
+/// (see [`hazard_cost`]). Calibrated so a bare 100-health bot prices a waterlevel-1 lava cell at
+/// ~1.7s — within a hair of the hand-tuned 2.0s this replaced. The median bot therefore behaves as
+/// it always did; only the tails move, which is the whole point of the change.
+pub const HAZARD_TIME_K: f32 = 15.0;
+/// Floor on [`hazard_cost`]'s divisor: the least strength a bot is credited with having left after a
+/// crossing. Small on purpose — the price *should* run away as the damage closes on the health it
+/// would take, because that is the difference between a wound and a death, and a bot one tick from
+/// dying has no business weighing a shortcut at all. It exists only to keep the division finite once
+/// the crossing is fatal (strength ≤ hp), where the true answer is "never".
+const HAZARD_STRENGTH_FLOOR: f32 = 1.0;
+/// Sanity bound on a single hazard link's price, not a policy knob: the runaway above already reaches
+/// ~15× the health at stake, far past any detour a Quake map can offer, so this only stops a
+/// pathologically long in-pool link from swamping A*'s arithmetic. Finite, and orders below
+/// [`CLOSED_GATE_PENALTY`], so a lava-only route is still taken — a bot with no other way through
+/// wades rather than freezing.
+const HAZARD_COST_MAX: f32 = 600.0;
+
+/// What crossing a hazard link costs the bot in `price`, given the `hp` that link is expected to
+/// burn.
+///
+/// The price is the damage as a **fraction of the strength you'd have left**, not a flat rate per
+/// point: a fixed reserve would charge every hazard the same multiple of its size, so a badly hurt
+/// bot would refuse a 4HP slime film (a scratch) as hard as a 20HP lava wade (most of its life). The
+/// ratio separates them — which is the behaviour asked for: at full strength, with armor, clipping a
+/// corner is nearly free; at 30 health it is not worth much of a shortcut.
+///
+/// A gradient the whole way down, and the shape matters at the bottom: the divisor is the strength
+/// the crossing *leaves* you, so as the damage closes on the health it would take, the price runs
+/// away on its own — no threshold to tune, and none to be wrong. Once the wade is fatal
+/// (`strength ≤ hp`) it prices at ~15× the health at stake, hundreds of seconds, which no detour on
+/// any real map beats: refusal, arrived at by arithmetic rather than declared.
+///
+/// | strength (10HP lava cell) | 300 | 100 | 50 | 30 | 20 | 15 | 12 | ≤10 (fatal) |
+/// |---|---|---|---|---|---|---|---|---|
+/// | seconds of detour accepted | 0.5 | 1.7 | 3.8 | 7.5 | 15 | 30 | 75 | 150 |
+pub fn hazard_cost(hp: f32, price: HazardPrice) -> f32 {
+    (price.k * hp / (price.strength - hp).max(HAZARD_STRENGTH_FLOOR)).min(HAZARD_COST_MAX)
+}
 
 /// Extra travel-time on every non-plat link *entering* a cell under a `func_plat`'s swept volume (see
 /// [`NavGraph::surcharge_under_plat_links`]). Standing in a lift's shaft blocks its descent and resets
@@ -1165,14 +1348,20 @@ const SLIME_CELL_EXTRA: f32 = 1.0;
 /// bot never parks there.
 const UNDER_PLAT_EXTRA: f32 = 0.75;
 
-/// Multiplier on the cost of every link *entering* an underwater cell (see
-/// [`NavGraph::surcharge_water_links`]). Water is not lethal like lava, so it's a soft bias, not the
-/// flat [`HAZARD_LINK_EXTRA`] surcharge: a flat add on each of a pool's many short swim links would
-/// stack into an effective ban, whereas a multiplier keeps a crossing *proportional* to its length —
-/// a dry detour up to ~twice as long wins, longer ones don't. `2.0` sits a touch above the honest
-/// physical cost (pmove swims at 0.7× ground wishspeed ⇒ ≥1.43×) to price in the exposure and the
-/// lost bunnyhop, so a bot travels through water only when it's genuinely the shorter way.
-const WATER_COST_MULT: f32 = 2.0;
+/// Multiplier on the cost of every link *entering* an underwater cell — the ratio of swimming to
+/// running the same distance, since pmove drives a submerged bot at [`SWIM_SPEED`] (0.7× wishspeed).
+/// [`NavGraph::flag_water`] charges the difference in `water_extra`, so a crossing stays proportional
+/// to its length and a bot swims exactly when the water really is the shorter way.
+///
+/// This *is* the whole cost of water. It was 2.0 — the honest 1.43 plus a premium for "the exposure
+/// and the lost bunnyhop" — and neither half survives contact:
+///
+///  * the **lost bunnyhop** is now modelled where it belongs, in `banded_step`'s band (a leg into
+///    water exits at swim speed), so charging it here as well would price it twice;
+///  * there is no **exposure** to charge. Water isn't lava: it does no damage, and there is no wet
+///    state to carry out of the pool. Being submerged costs you speed, and it costs you air —
+///    and air is `breathable`'s job, not the route's.
+const WATER_COST_MULT: f32 = MAX_SPEED / SWIM_SPEED;
 
 /// Travel-time cost of a link: horizontal distance / speed, plus risk/effort penalties so A*
 /// prefers grounded routes and avoids damaging falls.
@@ -1894,22 +2083,10 @@ mod tests {
             kind: LinkKind::Walk,
             cost,
         };
-        NavGraph {
-            cells: vec![cell(0.0, 0.0), cell(100.0, 50.0), cell(100.0, -50.0), cell(200.0, 0.0)],
-            links: vec![link(0, 1, 1.0), link(1, 3, 1.0), link(0, 2, 1.1), link(2, 3, 1.1)],
-            adjacency: vec![vec![0, 2], vec![1], vec![3], vec![]],
-            water: Vec::new(),
-            breathable: Vec::new(),
-            hazard: Vec::new(),
-            under_plat: Vec::new(),
-            grid: GridIndex::default(),
-            gates: SideTable::default(),
-            hooks: SideTable::default(),
-            speed_jumps: SideTable::default(),
-            rocket_jumps: SideTable::default(),
-            plats: SideTable::default(),
-            sj_k: bhop_k(10.0, MAX_SPEED),
-        }
+        NavGraph::test_graph(
+            vec![cell(0.0, 0.0), cell(100.0, 50.0), cell(100.0, -50.0), cell(200.0, 0.0)],
+            vec![link(0, 1, 1.0), link(1, 3, 1.0), link(0, 2, 1.1), link(2, 3, 1.1)],
+        )
     }
 
     /// The banded planner credits bhop speed gains on a flat corridor but not up a staircase: an
@@ -1928,22 +2105,10 @@ mod tests {
             kind: LinkKind::Step,
             cost: 1.0,
         };
-        let g = NavGraph {
-            cells: vec![cell(0.0, 0.0, 0.0), cell(1500.0, 0.0, 0.0), cell(0.0, 1500.0, 100.0)],
-            links: vec![step(0, 1), step(0, 2)], // link 0: 1500u flat; link 1: 1500u rising 100u
-            adjacency: vec![vec![0, 1], vec![], vec![]],
-            water: Vec::new(),
-            breathable: Vec::new(),
-            hazard: Vec::new(),
-            under_plat: Vec::new(),
-            grid: GridIndex::default(),
-            gates: SideTable::default(),
-            hooks: SideTable::default(),
-            speed_jumps: SideTable::default(),
-            rocket_jumps: SideTable::default(),
-            plats: SideTable::default(),
-            sj_k: bhop_k(10.0, MAX_SPEED),
-        };
+        let g = NavGraph::test_graph(
+            vec![cell(0.0, 0.0, 0.0), cell(1500.0, 0.0, 0.0), cell(0.0, 1500.0, 100.0)],
+            vec![step(0, 1), step(0, 2)], // link 0: 1500u flat; link 1: 1500u rising 100u
+        );
         let (_, flat_exit) = g.banded_step(0, 0).unwrap();
         let (_, up_exit) = g.banded_step(1, 0).unwrap();
         assert!(flat_exit >= 1, "a long flat corridor should climb a band, got {flat_exit}");
@@ -2048,22 +2213,8 @@ mod tests {
         let mut grid = GridIndex::default();
         grid.insert((0, 0), vec![0]);
         grid.insert((1, 0), vec![1]);
-        let mut g = NavGraph {
-            cells: vec![cell(0.0, 0), cell(32.0, 1)],
-            links: vec![link(0, 1), link(1, 0)],
-            adjacency: vec![vec![0], vec![1]],
-            water: Vec::new(),
-            breathable: Vec::new(),
-            hazard: Vec::new(),
-            under_plat: Vec::new(),
-            grid,
-            gates: SideTable::default(),
-            hooks: SideTable::default(),
-            speed_jumps: SideTable::default(),
-            rocket_jumps: SideTable::default(),
-            plats: SideTable::default(),
-            sj_k: bhop_k(10.0, MAX_SPEED),
-        };
+        let mut g = NavGraph::test_graph(vec![cell(0.0, 0), cell(32.0, 1)], vec![link(0, 1), link(1, 0)]);
+        g.grid = grid;
         // Floor a short step (z ≤ −40) below the cells for x ≤ 60; lava fills x > 60 under z = 0.
         let is_solid = |p: Vec3| p.x <= 60.0 && p.z <= -40.0;
         let contents = |p: Vec3| {
@@ -2073,20 +2224,25 @@ mod tests {
                 crate::bsp::CONTENTS_EMPTY as f32
             }
         };
-        g.surcharge_hazard_links(&is_solid, &contents);
-        // Link 0→1 enters the lava-edge cell 1 → surcharged; link 1→0 enters interior cell 0 → not.
-        assert!(
-            (g.links[0].cost - (1.0 + HAZARD_LINK_EXTRA)).abs() < 1e-6,
-            "into-edge link not surcharged: {}",
-            g.links[0].cost
-        );
-        assert_eq!(g.links[1].cost, 1.0, "interior link must be unchanged");
+        g.flag_hazards(&is_solid, &contents);
+        // Link 0→1 enters the lava-edge cell 1 → charged the edge premium; link 1→0 enters interior
+        // cell 0 → free. Asserted through `link_extra` (what the searches actually pay), not through
+        // `link.cost` — the old bake this replaced looked right there while the live planner, which
+        // never reads it for a walk link, sailed bots straight into the pool.
+        let costs = LinkCosts {
+            hazard: Some(HazardPrice::new(100.0)),
+            ..Default::default()
+        };
+        assert_eq!(g.hazard_hp[0], HAZARD_EDGE_HP, "into-edge link not charged");
+        assert!(g.link_extra(0, &costs) > 0.0, "edge premium must reach the searches");
+        assert_eq!(g.hazard_hp[1], 0.0, "interior link must be free");
+        assert_eq!(g.link_extra(1, &costs), 0.0, "interior link must cost the searches nothing");
     }
 
-    /// `surcharge_water_links` flags the submerged cell, multiplies the cost of links *into* it while
-    /// leaving the exit link alone, and reports the depth via `cell_in_water`/`cell_breathable`.
+    /// `flag_water` flags the submerged cell, charges links *into* it the swim premium while leaving
+    /// the exit link alone, and reports the depth via `cell_in_water`/`cell_breathable`.
     #[test]
-    fn surcharge_flags_water_cells_and_multiplies_into_links() {
+    fn flag_water_flags_cells_and_prices_into_links() {
         let cell = |x: f32, gx: i32| Cell {
             origin: Vec3::new(x, 0.0, 0.0),
             gx,
@@ -2098,22 +2254,7 @@ mod tests {
             kind: LinkKind::Walk,
             cost: 1.0,
         };
-        let mut g = NavGraph {
-            cells: vec![cell(0.0, 0), cell(32.0, 1)],
-            links: vec![link(0, 1), link(1, 0)],
-            adjacency: vec![vec![0], vec![1]],
-            water: Vec::new(),
-            breathable: Vec::new(),
-            hazard: Vec::new(),
-            under_plat: Vec::new(),
-            grid: GridIndex::default(),
-            gates: SideTable::default(),
-            hooks: SideTable::default(),
-            speed_jumps: SideTable::default(),
-            rocket_jumps: SideTable::default(),
-            plats: SideTable::default(),
-            sj_k: bhop_k(10.0, MAX_SPEED),
-        };
+        let mut g = NavGraph::test_graph(vec![cell(0.0, 0), cell(32.0, 1)], vec![link(0, 1), link(1, 0)]);
         // Deep water under and around cell 1 (x = 32), up past its eye point; cell 0 (x = 0) is dry.
         let contents = |p: Vec3| {
             if p.x > 16.0 {
@@ -2122,12 +2263,26 @@ mod tests {
                 crate::bsp::CONTENTS_EMPTY as f32
             }
         };
-        g.surcharge_water_links(&contents);
+        g.flag_water(&contents);
         assert!(!g.cell_in_water(0) && g.cell_breathable(0), "dry cell 0");
         assert!(g.cell_in_water(1) && !g.cell_breathable(1), "deep cell 1 submerged, no air");
-        // Link 0→1 enters the water cell → ×WATER_COST_MULT; link 1→0 exits to dry → unchanged.
-        assert!((g.links[0].cost - WATER_COST_MULT).abs() < 1e-6, "into-water link: {}", g.links[0].cost);
-        assert_eq!(g.links[1].cost, 1.0, "exit link must stay cheap (the gradient toward shore)");
+        // Link 0→1 enters the water cell → charged the swim premium; link 1→0 exits to dry → free.
+        let costs = LinkCosts::default();
+        assert_eq!(g.link_extra(1, &costs), 0.0, "exit link must stay free (the gradient toward shore)");
+        // The premium is exactly what the slower stroke costs over this distance and no more: water
+        // does no damage, and there is no lingering wet state — being under just means 0.7× wishspeed
+        // (and air, which `breathable` above tracks). The banded planner is the one that used to see
+        // none of this, and must now land on the same honest swim time as the plain search.
+        let swim_secs = GRID / SWIM_SPEED;
+        let (banded_step_cost, exit_band) = g.banded_step(0, 0).unwrap();
+        let banded = banded_step_cost + g.link_extra(0, &costs);
+        assert!((banded - swim_secs).abs() < 1e-4, "banded prices the swim at {banded}, not {swim_secs}");
+        assert!(
+            (g.link_extra(0, &costs) - (swim_secs - GRID / MAX_SPEED)).abs() < 1e-6,
+            "the premium must be the swim/run difference, got {}",
+            g.link_extra(0, &costs)
+        );
+        assert_eq!(exit_band, band_of(SWIM_SPEED), "you cannot bunnyhop out of a pool");
     }
 
     /// A shallow cell — origin submerged but the eye point above the surface — is both `in_water`
@@ -2143,22 +2298,17 @@ mod tests {
                 crate::bsp::CONTENTS_EMPTY as f32
             }
         };
-        g.surcharge_water_links(&contents);
+        g.flag_water(&contents);
         assert!(g.cell_in_water(0), "origin under the surface");
         assert!(g.cell_breathable(0), "eye above the surface — can breathe");
     }
 
-    /// The surcharge diverts A* off a lava-edge route the same way a penalty does: flagging the
-    /// cheap branch's middle cell (via a localized lava pool) flips the route onto the safe branch,
-    /// and the graph is never severed. Reuses [`diamond`] (empty grid ⇒ every side is an edge, so
-    /// the oracle alone decides), with `is_solid` false everywhere so non-lava probes read as a
-    /// *pit* — which the surcharge deliberately ignores, leaving only the lava-flagged cell charged.
-    #[test]
-    fn surcharge_diverts_off_lava_route() {
+    /// A lava pool localized on `diamond`'s cheap branch, for the routing tests below. `is_solid` is
+    /// false everywhere so non-lava probes read as a *pit* — which the flagging deliberately ignores,
+    /// leaving only the lava-flagged cell charged. (Empty grid ⇒ every side is an edge, so the oracle
+    /// alone decides.)
+    fn diamond_with_lava_on_branch_1() -> NavGraph {
         let mut g = diamond();
-        // Baseline: cheaper route via cell 1.
-        assert_eq!(g.find_path(0, 3, &LinkCosts::default()).unwrap(), vec![0, 1]);
-        // A lava pool localized around cell 1's origin (100, 50); nothing else is near it.
         let is_solid = |_: Vec3| false;
         let lava_at = |cx: f32, cy: f32| {
             move |p: Vec3| {
@@ -2169,15 +2319,175 @@ mod tests {
                 }
             }
         };
-        g.surcharge_hazard_links(&is_solid, &lava_at(100.0, 50.0));
+        g.flag_hazards(&is_solid, &lava_at(100.0, 50.0));
+        g
+    }
+
+    /// The hazard price diverts A* off a lava route the same way a penalty does: flagging the cheap
+    /// branch's middle cell flips the route onto the safe branch, and the graph is never severed.
+    #[test]
+    fn hazard_price_diverts_off_lava_route() {
+        let g = diamond();
+        let costs = |s: f32| LinkCosts {
+            hazard: Some(HazardPrice::new(s)),
+            ..Default::default()
+        };
+        // Baseline: cheaper route via cell 1.
+        assert_eq!(g.find_path(0, 3, &costs(100.0)).unwrap(), vec![0, 1]);
+        let g = diamond_with_lava_on_branch_1();
         // Cell 1 now sits on lava, so 0→1 costs more → A* takes the (now cheaper) route via cell 2.
-        assert_eq!(g.find_path(0, 3, &LinkCosts::default()).unwrap(), vec![2, 3]);
-        // Flag the other branch too: both first legs charged, but finite — a route still exists.
-        g.surcharge_hazard_links(&is_solid, &lava_at(100.0, -50.0));
+        assert_eq!(g.find_path(0, 3, &costs(100.0)).unwrap(), vec![2, 3]);
+        // With *both* branches lava the price is still finite, so a route survives — a bot walled in
+        // by lava wades rather than freezing.
+        let mut g = diamond();
+        let is_solid = |_: Vec3| false;
+        let lava_everywhere = |p: Vec3| {
+            if p.z < 0.0 {
+                crate::bsp::CONTENTS_LAVA as f32
+            } else {
+                crate::bsp::CONTENTS_EMPTY as f32
+            }
+        };
+        g.flag_hazards(&is_solid, &lava_everywhere);
         assert!(
-            g.find_path(0, 3, &LinkCosts::default()).is_some(),
-            "the moderate surcharge must never sever the graph"
+            g.find_path(0, 3, &costs(1.0)).is_some(),
+            "even at death's door the price must never sever the graph"
         );
+    }
+
+    /// A 200u route straight through a lava pool (cell 1), and an ~820u detour around it (cell 2) —
+    /// so wading is a real temptation, not a formality. Unlike [`diamond`] the branches differ in
+    /// *geometry* rather than stored cost, which is what the banded planner actually reasons about: it
+    /// derives a walk leg's cost from distance and speed and never reads `link.cost`.
+    fn lava_shortcut() -> NavGraph {
+        let cell = |x: f32, y: f32| Cell {
+            origin: Vec3::new(x, y, 0.0),
+            gx: 0,
+            gy: 0,
+        };
+        let origin = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(100.0, 0.0, 0.0),
+            Vec3::new(100.0, 400.0, 0.0),
+            Vec3::new(200.0, 0.0, 0.0),
+        ];
+        let link = |from: CellId, to: CellId| Link {
+            from,
+            to,
+            kind: LinkKind::Walk,
+            cost: link_cost(
+                LinkKind::Walk,
+                (origin[to as usize].xy() - origin[from as usize].xy()).length(),
+                0.0,
+            ),
+        };
+        let mut g = NavGraph::test_graph(
+            vec![cell(0.0, 0.0), cell(100.0, 0.0), cell(100.0, 400.0), cell(200.0, 0.0)],
+            vec![link(0, 1), link(1, 3), link(0, 2), link(2, 3)],
+        );
+        let is_solid = |_: Vec3| false;
+        let lava = |p: Vec3| {
+            if (p.x - 100.0).abs() < 40.0 && p.y.abs() < 40.0 && p.z < 0.0 {
+                crate::bsp::CONTENTS_LAVA as f32
+            } else {
+                crate::bsp::CONTENTS_EMPTY as f32
+            }
+        };
+        g.flag_hazards(&is_solid, &lava);
+        g
+    }
+
+    /// **The regression this whole change exists for.** The *banded* planner is the live one
+    /// (`rtx_bot_bhop` + `rtx_bot_bandplan`, both default on), and its Walk/Step arm derives cost from
+    /// speed and never reads `link.cost` — so the lava surcharge that used to be baked there was
+    /// silently discarded, and every bot walked into lava priced as bare floor. Pricing now lives in
+    /// `link_extra`, which all three searches honor: here lava is the *short* way and the banded
+    /// planner must still walk around.
+    #[test]
+    fn banded_planner_diverts_off_lava_route() {
+        let g = lava_shortcut();
+        let costs = LinkCosts {
+            hazard: Some(HazardPrice::new(100.0)),
+            ..Default::default()
+        };
+        let route = g.find_path_banded(0, 3, 0.0, &costs).expect("a route exists");
+        assert_eq!(route.links, vec![2, 3], "the banded planner must avoid the lava branch too");
+    }
+
+    /// The feature: a bot's health weights how willing it is to shortcut through a hazard. Same map,
+    /// same pool — a bot with armor and full health clips it, a hurt one takes the long way round.
+    #[test]
+    fn health_weights_willingness_to_cross_lava() {
+        let g = lava_shortcut();
+        let route = |s: f32| {
+            g.find_path_banded(
+                0,
+                3,
+                0.0,
+                &LinkCosts {
+                    hazard: Some(HazardPrice::new(s)),
+                    ..Default::default()
+                },
+            )
+            .expect("a route exists")
+            .links
+        };
+        assert_eq!(route(300.0), vec![0, 1], "100 health behind red armor should take the shortcut");
+        assert_eq!(route(30.0), vec![2, 3], "a bot at 30 strength should walk around");
+    }
+
+    /// Race-line verification and the offline optimizer measure pure traversal time over authored
+    /// lines that deliberately cross lava, and compare the estimate against a timeout — so the default
+    /// (`hazard: None`) must leave routing untouched by the flagging. This is why `None` means
+    /// *unpriced* rather than a neutral rate.
+    #[test]
+    fn default_costs_are_hazard_unpriced() {
+        let plain = diamond();
+        let flagged = diamond_with_lava_on_branch_1();
+        let costs = LinkCosts::default();
+        assert_eq!(
+            plain.find_path_banded(0, 3, 0.0, &costs).unwrap().cost,
+            flagged.find_path_banded(0, 3, 0.0, &costs).unwrap().cost,
+            "flagging hazards must not move an unpriced query's cost by a hair"
+        );
+        assert_eq!(flagged.find_path(0, 3, &costs).unwrap(), vec![0, 1], "nor its route");
+    }
+
+    /// The price curve: never rises with strength, always positive, always capped, and finite for
+    /// every strength a dying (or already dead) bot can present — including a hazard bigger than the
+    /// bot itself, where the naive `k·hp/(S−hp)` would divide by zero or go negative.
+    #[test]
+    fn hazard_cost_curve_is_well_behaved() {
+        let hp = 10.0;
+        for s in [f32::MIN, -5.0, 0.0, hp, 25.0, 50.0, 100.0, 300.0, f32::MAX] {
+            let c = hazard_cost(hp, HazardPrice::new(s));
+            assert!(c.is_finite() && c > 0.0 && c <= HAZARD_COST_MAX, "strength {s} → {c}");
+        }
+        let steps = [0.0, 25.0, 50.0, 100.0, 200.0, 300.0];
+        for w in steps.windows(2) {
+            assert!(
+                hazard_cost(hp, HazardPrice::new(w[0])) >= hazard_cost(hp, HazardPrice::new(w[1])),
+                "a stronger bot must never fear a hazard more: {} vs {}",
+                w[0],
+                w[1]
+            );
+        }
+        // A scratch and a near-lethal wade must not price alike for a hurt bot — the whole reason the
+        // price is a ratio rather than a flat rate per point of health.
+        let hurt = HazardPrice::new(30.0);
+        assert!(
+            hazard_cost(20.0, hurt) > 4.0 * hazard_cost(4.0, hurt),
+            "a 20HP wade must cost a hurt bot far more than a 4HP slime film"
+        );
+        // The bottom of the curve is the point of it: a wade that would *kill* has to price past any
+        // detour a map can offer, and get there by running away smoothly rather than by a threshold.
+        // (It stays finite, so a bot walled in by lava still wades rather than freezing.)
+        let fatal = hazard_cost(hp, HazardPrice::new(hp - 1.0));
+        assert!(fatal > 100.0, "a fatal wade priced at only {fatal}s — a long way round would beat it");
+        for w in [(12.0, 15.0), (15.0, 20.0), (20.0, 30.0)] {
+            let (weaker, stronger) = (hazard_cost(hp, HazardPrice::new(w.0)), hazard_cost(hp, HazardPrice::new(w.1)));
+            assert!(weaker > stronger * 1.5, "the price must climb steeply as death nears: {weaker} vs {stronger}");
+        }
     }
 
     /// A cell whose *own footing* is lava (a bot standing on it burns) is flagged in `cell_hazard` and
@@ -2200,22 +2510,8 @@ mod tests {
         let mut grid = GridIndex::default();
         grid.insert((0, 0), vec![0]);
         grid.insert((1, 0), vec![1]);
-        let mut g = NavGraph {
-            cells: vec![cell(0.0, 0), cell(32.0, 1)],
-            links: vec![link(0, 1), link(1, 0)],
-            adjacency: vec![vec![0], vec![1]],
-            water: Vec::new(),
-            breathable: Vec::new(),
-            hazard: Vec::new(),
-            under_plat: Vec::new(),
-            grid,
-            gates: SideTable::default(),
-            hooks: SideTable::default(),
-            speed_jumps: SideTable::default(),
-            rocket_jumps: SideTable::default(),
-            plats: SideTable::default(),
-            sj_k: bhop_k(10.0, MAX_SPEED),
-        };
+        let mut g = NavGraph::test_graph(vec![cell(0.0, 0), cell(32.0, 1)], vec![link(0, 1), link(1, 0)]);
+        g.grid = grid;
         // Floor well below the cells; a tight lava pool sits on it directly under cell 1 (x = 32), so
         // cell 1's feet+1 sample (origin − 23) reads lava while cell 0 (x = 0) keeps dry footing.
         let is_solid = |p: Vec3| p.z <= -40.0;
@@ -2226,17 +2522,23 @@ mod tests {
                 crate::bsp::CONTENTS_EMPTY as f32
             }
         };
-        g.surcharge_hazard_links(&is_solid, &contents);
+        g.flag_hazards(&is_solid, &contents);
         assert_eq!(g.cell_hazard(1), Some(crate::hazard::HazardKind::Lava), "cell 1 stands in lava");
         assert_eq!(g.cell_hazard(0), None, "cell 0 is dry footing");
-        // Entering the burning cell pays the full lava surcharge; leaving it stays cheap.
-        assert!(
-            (g.links[0].cost - (1.0 + LAVA_CELL_EXTRA)).abs() < 1e-6,
-            "into-lava link: {}",
-            g.links[0].cost
-        );
-        assert_eq!(g.links[1].cost, 1.0, "exit link must stay cheap (the gradient back to dry ground)");
-        assert!(g.find_path(0, 1, &LinkCosts::default()).is_some(), "finite surcharge never severs");
+        // Stepping into the pool costs a whole 10HP tick — `dmgtime` starts in the past, so the burn
+        // lands before any dwell accrues — at waterlevel 1, the film being ankle-deep. Leaving is free:
+        // that asymmetry is the gradient back to dry ground.
+        assert_eq!(g.hazard_hp[0], LAVA_TICK_HP, "into-lava link must cost the entry tick");
+        assert_eq!(g.hazard_hp[1], 0.0, "exit link must stay free (the gradient back to dry ground)");
+        let hurt = LinkCosts {
+            hazard: Some(HazardPrice::new(30.0)),
+            ..Default::default()
+        };
+        assert!(g.link_extra(0, &hurt) > g.link_extra(0, &LinkCosts {
+            hazard: Some(HazardPrice::new(300.0)),
+            ..Default::default()
+        }), "a hurt bot must fear the same pool more than a fit one");
+        assert!(g.find_path(0, 1, &hurt).is_some(), "the finite price never severs");
     }
 
     /// The interior cell of a shallow film — every compass neighbour walkable, so the edge probe never
@@ -2259,22 +2561,8 @@ mod tests {
         let mut grid = GridIndex::default();
         grid.insert((0, 0), vec![0]);
         grid.insert((1, 0), vec![1]);
-        let mut g = NavGraph {
-            cells: vec![cell(0.0, 0), cell(32.0, 1)],
-            links: vec![link(0, 1), link(1, 0)],
-            adjacency: vec![vec![0], vec![1]],
-            water: Vec::new(),
-            breathable: Vec::new(),
-            hazard: Vec::new(),
-            under_plat: Vec::new(),
-            grid,
-            gates: SideTable::default(),
-            hooks: SideTable::default(),
-            speed_jumps: SideTable::default(),
-            rocket_jumps: SideTable::default(),
-            plats: SideTable::default(),
-            sj_k: bhop_k(10.0, MAX_SPEED),
-        };
+        let mut g = NavGraph::test_graph(vec![cell(0.0, 0), cell(32.0, 1)], vec![link(0, 1), link(1, 0)]);
+        g.grid = grid;
         // Solid right at the probe height everywhere blinds the edge probe (it reads a wall a stride
         // out, never the liquid below); a thin slime film at the feet+1 sample depth covers both cells.
         let is_solid = |p: Vec3| p.z <= 0.0;
@@ -2285,13 +2573,17 @@ mod tests {
                 crate::bsp::CONTENTS_EMPTY as f32
             }
         };
-        g.surcharge_hazard_links(&is_solid, &contents);
+        g.flag_hazards(&is_solid, &contents);
         assert_eq!(g.cell_hazard(0), Some(crate::hazard::HazardKind::Slime), "interior cell 0 in slime");
         assert_eq!(g.cell_hazard(1), Some(crate::hazard::HazardKind::Slime), "interior cell 1 in slime");
+        // Both cells already stand in the film, so neither link pays the entry tick — only the drip
+        // for the ~0.1s a grid pitch takes. Slime deals 4 HP a *second* against lava's 10 every fifth
+        // of one, so wading it really is nearly free, and the price now says so instead of guessing.
+        let drip = SLIME_TICK_HP * ((GRID / MAX_SPEED) / SLIME_TICK_SECS);
         assert!(
-            (g.links[0].cost - (1.0 + SLIME_CELL_EXTRA)).abs() < 1e-6,
-            "into-slime link priced by SLIME_CELL_EXTRA: {}",
-            g.links[0].cost
+            (g.hazard_hp[0] - drip).abs() < 1e-4,
+            "interior slime link should cost the drip {drip}, got {}",
+            g.hazard_hp[0]
         );
     }
 
@@ -2322,22 +2614,10 @@ mod tests {
             let s = speed_jumps.push(SpeedJumpTraversal { takeoff: origins[links[li].from as usize], v_req, airtime, chained, curl_gain });
             speed_jumps.tag(li, s);
         }
-        NavGraph {
-            cells,
-            links,
-            adjacency,
-            water: Vec::new(),
-            breathable: Vec::new(),
-            hazard: Vec::new(),
-            under_plat: Vec::new(),
-            grid: GridIndex::default(),
-            gates: SideTable::default(),
-            hooks: SideTable::default(),
-            speed_jumps,
-            rocket_jumps: SideTable::default(),
-            plats: SideTable::default(),
-            sj_k: bhop_k(10.0, MAX_SPEED),
-        }
+        let mut g = NavGraph::test_graph(cells, links);
+        g.adjacency = adjacency;
+        g.speed_jumps = speed_jumps;
+        g
     }
 
     /// Every banded step costs at least `horiz / BAND_V_MAX` — the floor that keeps the banded
