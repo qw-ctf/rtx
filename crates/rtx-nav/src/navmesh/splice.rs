@@ -77,6 +77,25 @@ pub struct GateInfo {
     pub shoot: bool,
 }
 
+/// Where a player's **origin** can be while their body touches the box `tmin..tmax`.
+///
+/// A player touches a trigger with their box, not their origin, so the test is box-against-box —
+/// which is the same as testing the origin against the trigger grown by the player's own
+/// half-extents. That's ±[`PLAYER_HALF_WIDTH`] horizontally, and the player box's own -24..+32
+/// vertically, which is where the asymmetric Z comes from.
+fn touch_volume(tmin: Vec3, tmax: Vec3) -> (Vec3, Vec3) {
+    let m = PLAYER_HALF_WIDTH;
+    (
+        Vec3::new(tmin.x - m, tmin.y - m, tmin.z - PLAYER_TOP),
+        Vec3::new(tmax.x + m, tmax.y + m, tmax.z + ORIGIN_TO_FEET),
+    )
+}
+
+/// A standing player's origin sits this far below the top of their head (the QW box is `maxs.z =
+/// 32`). With [`ORIGIN_TO_FEET`], the pair is what grows a box into the volume an origin can touch
+/// it from.
+const PLAYER_TOP: f32 = 32.0;
+
 impl NavGraph {
     /// Splice `func_plat` lifts into the graph. For each plat we add a cell on its surface at
     /// the bottom (the board point), a [`LinkKind::Plat`] ride from there to the floor the plat
@@ -196,16 +215,31 @@ impl NavGraph {
     /// needs no special handling — routing onto an entrance cell walks it into the trigger and
     /// the engine warps it; a separate displacement check then re-paths from the landing spot.
     /// Teleporters whose destination doesn't reach any floor cell are skipped.
-    pub fn add_teleports(&mut self, teles: &[TeleportInfo]) {
+    pub fn add_teleports(&mut self, bsp: &Bsp, teles: &[TeleportInfo]) {
         for t in teles {
             let Some(dest) = self.nearest_within(t.dest, GRID * 3.0, 96.0) else {
                 continue;
             };
-            // Entrance cells: those whose footprint sits within the trigger box (loosened in Z
-            // so a floor cell standing in a doorway-tall trigger still counts).
-            let lo = Vec3::new(t.tmin.x, t.tmin.y, t.tmin.z - 32.0);
-            let hi = Vec3::new(t.tmax.x, t.tmax.y, t.tmax.z + 24.0);
-            for c in self.cells_in_box(lo, hi) {
+
+            let (lo, hi) = touch_volume(t.tmin, t.tmax);
+            let mut entrances = self.cells_in_box(lo, hi);
+
+            // Usually there are none, and that's the interesting case. A teleporter is typically a
+            // paper-thin plane you walk *through* — catalyst's are one unit deep, set into a wall —
+            // while cells are sampled every GRID units of floor. So the grid steps straight over the
+            // sliver of ground you'd stand on to touch it: the last cell centre sits ~34u short, and
+            // the next one along would be inside the wall. The floor is real and a player walks in
+            // without noticing; the navmesh simply has no cell there to hang a link from.
+            //
+            // So carve one, the way plats carve their board point. Without it the map's teleporters
+            // don't exist to the planner at all, and bots take the long way round for ever.
+            if entrances.is_empty() {
+                if let Some(entry) = self.carve_teleport_entry(bsp, lo, hi) {
+                    entrances.push(entry);
+                }
+            }
+
+            for c in entrances {
                 if c != dest {
                     self.push_link(Link {
                         from: c,
@@ -216,6 +250,44 @@ impl NavGraph {
                 }
             }
         }
+    }
+
+    /// Carve a standable cell inside a trigger's touch volume, and walk-link the floor to it.
+    ///
+    /// `lo`/`hi` bound where a player's origin can be while touching. We want the spot in there a
+    /// player would actually reach: take each nearby cell, slide its origin into the volume by the
+    /// shortest move (a clamp), and keep the first that a player can stand in and walk to. Being
+    /// picky matters — a point inside the wall behind the trigger is in the volume too, and linking
+    /// it would send bots to push at masonry.
+    fn carve_teleport_entry(&mut self, bsp: &Bsp, lo: Vec3, hi: Vec3) -> Option<CellId> {
+        let mid = (lo + hi) * 0.5;
+        let mut near = self.cells_near(mid.xy(), GRID * 4.0);
+        near.sort_by(|&a, &b| {
+            let (a, b) = (self.cells[a as usize].origin, self.cells[b as usize].origin);
+            a.distance(mid).total_cmp(&b.distance(mid))
+        });
+
+        for c in near {
+            let from = self.cells[c as usize].origin;
+            // The nearest touching origin to this cell: slide straight in.
+            let entry = from.clamp(lo, hi);
+            if entry.distance(from) > GRID * 1.5 {
+                continue; // further than a step — this cell isn't the one next to the trigger
+            }
+            // Standable, and walkable to from here. `arc_clear` is the same reachability the jump
+            // links are built on, and it's what keeps us off the far side of a wall.
+            if bsp.is_solid(entry) || !arc_clear(bsp, from, entry) {
+                continue;
+            }
+            let id = self.add_cell(entry);
+            let horiz = (entry.xy() - from.xy()).length();
+            let dz = entry.z - from.z;
+            // Two-way: a bot walks in to use it, and the spot is ordinary floor to walk back off.
+            self.push_link(Link { from: c, to: id, kind: LinkKind::Walk, cost: link_cost(LinkKind::Walk, horiz, dz) });
+            self.push_link(Link { from: id, to: c, kind: LinkKind::Walk, cost: link_cost(LinkKind::Walk, horiz, -dz) });
+            return Some(id);
+        }
+        None
     }
 
     /// Cells whose origin lies within the axis-aligned box `[min, max]`.
@@ -392,5 +464,50 @@ mod tests {
         assert_eq!(g.links[0].cost, 1.0);
         assert_eq!(g.cell_under_plat(a), None);
         assert_eq!(g.cell_under_plat(b), None);
+    }
+
+    /// A player touches a trigger with their **body**, not their origin — so the question "which
+    /// cells can enter this teleporter" is box-against-box, and that's the same as testing the
+    /// origin against the trigger grown by the player's own half-extents.
+    ///
+    /// Getting this wrong was worth four teleporters on catalyst: the original asked for a cell
+    /// centre *inside* the trigger, and a teleporter is a plane you walk through — one unit deep —
+    /// so nothing was ever inside one and the map's teleporters didn't exist to the planner.
+    #[test]
+    fn touch_volume_is_the_trigger_grown_by_the_player() {
+        // A paper-thin plane, the shape a real teleporter actually is.
+        let (lo, hi) = touch_volume(Vec3::new(1088.0, -515.0, 26.0), Vec3::new(1216.0, -514.0, 138.0));
+
+        // Horizontally, the player's half-width each way.
+        assert_eq!(lo.x, 1088.0 - 16.0);
+        assert_eq!(hi.x, 1216.0 + 16.0);
+        assert_eq!(lo.y, -515.0 - 16.0);
+        assert_eq!(hi.y, -514.0 + 16.0);
+
+        // Vertically it's asymmetric, because a player is: the origin is 24 above the feet and 32
+        // below the head. An origin *below* the trigger still touches it with their head.
+        assert_eq!(lo.z, 26.0 - 32.0, "head reaches up into it");
+        assert_eq!(hi.z, 138.0 + 24.0, "feet reach down into it");
+
+        // The volume is real however thin the trigger: a plane one unit deep still has 33 units of
+        // standing room in front of it.
+        assert!(hi.y - lo.y > 32.0);
+        assert!((hi - lo).min_element() > 0.0);
+    }
+
+    /// The rule is the player's box, so an origin exactly at the volume's edge is touching and one
+    /// outside it isn't — which is what decides whether a bot walks into a teleporter or past it.
+    #[test]
+    fn touch_volume_edges_match_the_player_box() {
+        let (tmin, tmax) = (Vec3::new(0.0, 0.0, 0.0), Vec3::new(64.0, 1.0, 64.0));
+        let (lo, hi) = touch_volume(tmin, tmax);
+
+        // Standing 16 away in Y: the body's edge just reaches the plane.
+        let touching = Vec3::new(32.0, -16.0, 0.0);
+        assert!(touching.cmpge(lo).all() && touching.cmple(hi).all());
+
+        // A step further back and it doesn't.
+        let clear = Vec3::new(32.0, -17.0, 0.0);
+        assert!(!(clear.cmpge(lo).all() && clear.cmple(hi).all()));
     }
 }

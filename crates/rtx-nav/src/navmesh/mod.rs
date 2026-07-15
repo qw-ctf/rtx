@@ -1461,7 +1461,7 @@ pub fn build_navmesh(
             graph.add_rocket_jumps(&bsp, params, double_jump);
         }
         graph.add_plats(&bsp, &plats);
-        graph.add_teleports(&teleports);
+        graph.add_teleports(&bsp, &teleports);
         graph.add_gates(&gates);
         // Last: prices links entering a lift shaft, so it must see every link the splices above added
         // (a teleport that lands under a plat, a jump-aboard from the shaft floor).
@@ -1685,7 +1685,7 @@ mod tests {
         let near = g.cells[start as usize].origin;
         let tmin = near - Vec3::new(40.0, 40.0, 8.0);
         let tmax = near + Vec3::new(40.0, 40.0, 56.0);
-        g.add_teleports(&[TeleportInfo { tmin, tmax, dest: exit }]);
+        g.add_teleports(&bsp, &[TeleportInfo { tmin, tmax, dest: exit }]);
         let tele = g.summary().teleport;
         assert!(tele >= 1, "no teleport links added");
         eprintln!("teleport splice: {tele} entrance links");
