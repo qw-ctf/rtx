@@ -164,6 +164,40 @@ pub const Z_EXT: u32 = z_ext::PM_TYPE
     | z_ext::VWEP
     | z_ext::PF_SOLID;
 
+/// `STAT_*` — the numbered slots through which a server tells a client about **its own player**.
+///
+/// This is the whole of what a client knows for certain about anyone's condition, and it knows it
+/// only about itself. There is no stat for an *opponent's* health: that isn't withheld by accident,
+/// it's the protocol working as designed, and it's why a bot playing as a client has to estimate
+/// what a bot inside the server could simply read.
+pub mod stat {
+    pub const HEALTH: u8 = 0;
+    pub const FRAGS: u8 = 1;
+    /// Index of the weapon *model* — not the weapon. See [`ACTIVEWEAPON`].
+    pub const WEAPON: u8 = 2;
+    pub const AMMO: u8 = 3;
+    pub const ARMOR: u8 = 4;
+    pub const WEAPONFRAME: u8 = 5;
+    pub const SHELLS: u8 = 6;
+    pub const NAILS: u8 = 7;
+    pub const ROCKETS: u8 = 8;
+    pub const CELLS: u8 = 9;
+    /// The `IT_*` bit of the weapon in hand.
+    pub const ACTIVEWEAPON: u8 = 10;
+    pub const TOTALSECRETS: u8 = 11;
+    pub const TOTALMONSTERS: u8 = 12;
+    pub const SECRETS: u8 = 13;
+    pub const MONSTERS: u8 = 14;
+    /// The `IT_*` bitfield: every weapon, armour and powerup we hold.
+    pub const ITEMS: u8 = 15;
+    pub const VIEWHEIGHT: u8 = 16;
+    /// Server time in milliseconds, under `Z_EXT_SERVERTIME`.
+    pub const TIME: u8 = 17;
+    pub const MATCHSTARTTIME: u8 = 18;
+    /// How many stats there are (`MAX_CL_STATS`).
+    pub const COUNT: usize = 32;
+}
+
 /// The negotiated protocol: which extension bits both ends agreed on, and the coord/angle widths
 /// that follow from them.
 ///

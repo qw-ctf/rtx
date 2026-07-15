@@ -45,6 +45,7 @@
 pub mod config;
 pub(crate) mod frames;
 pub(crate) mod host;
+pub(crate) mod mirror;
 pub(crate) mod session;
 pub(crate) mod world;
 
@@ -54,6 +55,7 @@ use std::time::{Duration, Instant};
 pub use config::{parse as parse_args, Config, USAGE};
 use rtx_proto::info::UserinfoBuilder;
 use rtx_proto::svc::SvcEvent;
+use mirror::Mirror;
 use session::{Session, Signon};
 
 use crate::game::GameState;
@@ -68,11 +70,19 @@ pub struct Client {
     game: GameState,
     host: &'static NetHost,
     sessions: Vec<Session>,
+    /// One mirror per connection: each bot's stats are its own, and each knows which slot it is.
+    /// The *world* they write into is shared — that's the squad, and it's what the bots have inside
+    /// qwprogs too.
+    mirrors: Vec<Mirror>,
     config: Config,
     /// Wall clock at the last tick, for the frame time the game runs on.
     last_tick: Instant,
     /// The map the shadow world was built for, so a level change is noticed.
     world_map: String,
+    /// How far each bot has actually travelled, and where it last was. A bot that connects, spawns
+    /// and then stands still looks identical to a working one in every other line of output — this
+    /// is the number that tells them apart.
+    travelled: Vec<(f32, glam::Vec3)>,
 }
 
 impl Client {
@@ -99,9 +109,11 @@ impl Client {
             game: GameState::new_client(host),
             host,
             sessions: Vec::new(),
+            mirrors: Vec::new(),
             config,
             last_tick: Instant::now(),
             world_map: String::new(),
+            travelled: Vec::new(),
         }
     }
 
@@ -141,6 +153,8 @@ impl Client {
             // clients randomize; deriving them keeps a capture readable.
             let qport = 0x4000u16.wrapping_add(i as u16);
             self.sessions.push(Session::connect(self.config.server, ui, qport)?);
+            self.mirrors.push(Mirror::default());
+            self.travelled.push((0.0, glam::Vec3::ZERO));
         }
         Ok(())
     }
@@ -201,11 +215,12 @@ impl Client {
         let dt = now.duration_since(self.last_tick).as_secs_f32();
         self.last_tick = now;
 
-        // 1. Read.
+        // 1. Read, and write what was said into the world.
         for i in 0..self.sessions.len() {
             let events = self.sessions[i].poll(self.host)?;
             for ev in &events {
                 self.observe(i, ev);
+                self.mirrors[i].apply(&mut self.game, ev);
             }
         }
 
@@ -224,19 +239,32 @@ impl Client {
             self.game.ensure_navmesh();
         }
 
-        // 5. Drive the bots — once there is something to drive. The mirror that fills the world
-        //    with *live* players and projectiles is the next milestone; the shadow world above is
-        //    only the furniture.
+        // 5. Drive the bots. The same `run_bots` the server calls, over the same world — it has no
+        //    idea it isn't one. Needs a navmesh, which it checks for itself.
+        crate::bot::run_bots(&mut self.game);
+        self.measure_travel();
 
         // 6. Send. Once a bot is embodied this carries its usercmd; until then it is the keepalive
         //    that stops the server timing us out, and the carrier the netchan needs to get the
         //    reliable signon messages out.
-        for s in &mut self.sessions {
-            match s.signon() {
-                Signon::Active => s.send_move(glam::Vec3::ZERO, 0, 0, 0, 0, 0)?,
-                Signon::Disconnected => {}
-                _ => s.send_nop()?,
+        //    Whatever the brain emitted for each bot this frame becomes that bot's move. A bot that
+        //    emitted nothing (no navmesh yet, or still connecting) still sends: the server needs a
+        //    packet from us to not time us out, and the netchan needs one to carry signon replies.
+        let cmds = self.host.take_cmds();
+        for (i, s) in self.sessions.iter_mut().enumerate() {
+            if s.signon() == Signon::Disconnected {
+                continue;
             }
+            if s.signon() != Signon::Active {
+                s.send_nop()?;
+                continue;
+            }
+            let client = s.playernum() as i32 + 1;
+            match cmds.iter().find(|c| c.client == client) {
+                Some(c) => s.send_move(c.angles, c.forward, c.side, c.up, c.buttons as u8, c.impulse as u8)?,
+                None => s.send_move(glam::Vec3::ZERO, 0, 0, 0, 0, 0)?,
+            }
+            let _ = i;
         }
         Ok(())
     }
@@ -285,6 +313,29 @@ impl Client {
         );
     }
 
+    /// Track how far each bot has moved.
+    ///
+    /// A teleport isn't travel, and neither is a respawn across the map, so a single frame's jump
+    /// is discarded rather than counted — otherwise a bot that dies repeatedly would look like a
+    /// marathon runner.
+    fn measure_travel(&mut self) {
+        for (i, m) in self.mirrors.iter().enumerate() {
+            let e = m.own();
+            if !self.game.entities[e].in_use {
+                continue;
+            }
+            let origin = self.game.entities[e].v.origin;
+            let (dist, last) = &mut self.travelled[i];
+            if *last != glam::Vec3::ZERO {
+                let step = origin.distance(*last);
+                if step < 200.0 {
+                    *dist += step;
+                }
+            }
+            *last = origin;
+        }
+    }
+
     /// Say the things worth saying while there's no mirror to consume them.
     ///
     /// A squad is N connections to one server, so every bot receives every broadcast — printing
@@ -309,12 +360,24 @@ impl Client {
     /// What the run looked like — the numbers that say whether it went well.
     fn report(&self) {
         for (i, s) in self.sessions.iter().enumerate() {
+            let e = self.mirrors[i].own();
+            let ent = &self.game.entities[e];
             eprintln!(
-                "rtx-client: [{i}] {:?}, map={} rtt={:.0}ms chokes={}",
+                "rtx-client: [{i}] {:?} map={} rtt={:.0}ms chokes={}",
                 s.signon(),
                 s.mapname(),
                 s.rtt() * 1000.0,
                 s.chokes
+            );
+            // Travel is the honest measure of "is it playing": everything else can look right while
+            // the bot stands on its spawn.
+            eprintln!(
+                "rtx-client:      travelled {:.0}u, at {:.0?}, health {} armor {} frags {}",
+                self.travelled[i].0,
+                ent.v.origin,
+                ent.v.health,
+                ent.v.armorvalue,
+                ent.v.frags,
             );
         }
     }

@@ -66,6 +66,17 @@ pub(crate) enum Signon {
 /// How often to retry an unanswered `getchallenge` / `connect`.
 const RESEND_INTERVAL: Duration = Duration::from_secs(5);
 
+/// The CRCs of stock `progs/player.mdl` and `progs/eyes.mdl`.
+///
+/// A server asks a client to prove it hasn't swapped the player model for something easier to see —
+/// an old anti-cheat, and KTX still warns without an answer. The models normally live inside `pak0`,
+/// which this client doesn't read, so these are hardcoded. They're not folklore: both were computed
+/// with [`crc::block`](rtx_proto::crc::block) over the files from two separate id installs, and
+/// qualia hardcodes the same 33168 — it forges the stock value when it loads its MD5 replacement
+/// player model, precisely so the server still sees a vanilla client.
+const STOCK_PMODEL_CRC: u16 = 33168;
+const STOCK_EMODEL_CRC: u16 = 6967;
+
 /// One connection.
 pub(crate) struct Session {
     sock: UdpSocket,
@@ -436,13 +447,18 @@ impl Session {
             .and_then(|bytes| checksum::map_checksum2(&bytes, &self.mapname).ok())
             .unwrap_or(0);
 
-        // The model checksums a real client sends. Cosmetic — they identify the player and eyes
-        // models — but a server that checks them refuses a client that doesn't.
-        for (key, model) in [("pmodel", "progs/player.mdl"), ("emodel", "progs/eyes.mdl")] {
-            if let Some(bytes) = host.read_file(&std::ffi::CString::new(model).unwrap_or_default()) {
-                let crc = rtx_proto::crc::block(&bytes);
-                self.stringcmd(&format!("setinfo {key} {crc}"));
-            }
+        // Prefer a real file when the gamedir has one loose — a mod may ship its own player model,
+        // and then the stock answer is the wrong one — but always send something, because the models
+        // are usually in a pak we don't read and a server that asks will warn without an answer.
+        for (key, model, stock) in [
+            ("pmodel", "progs/player.mdl", STOCK_PMODEL_CRC),
+            ("emodel", "progs/eyes.mdl", STOCK_EMODEL_CRC),
+        ] {
+            let crc = host
+                .read_file(&std::ffi::CString::new(model).unwrap_or_default())
+                .map(|bytes| rtx_proto::crc::block(&bytes))
+                .unwrap_or(stock);
+            self.stringcmd(&format!("setinfo {key} {crc}"));
         }
 
         self.stringcmd(&format!("prespawn {} 0 {checksum}", self.servercount));
