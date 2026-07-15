@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/rtx-nav", "crates/rtx-proto", "crates/rtx-game", "crates/navview", "crates/rjmcp"]
+members = ["crates/rtx-nav", "crates/rtx-proto", "crates/rtx-game", "crates/rtx-client", "crates/navview", "crates/rjmcp"]
 # Plain `cargo build` / `cargo test` build only the game module, its nav core, and the wire codec —
 # the viewer (and its wgpu/winit tree), the rjmcp harness bridge (its rmcp/tokio tree) and the
 # network client stay out of the default build and out of CI. Build them explicitly with

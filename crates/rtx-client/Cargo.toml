@@ -1,0 +1,15 @@
+[package]
+name = "rtx-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rtx-client"
+path = "src/main.rs"
+
+[dependencies]
+# The whole client is `rtx-game`'s `netclient` module — this binary is just the front door. See
+# that module for why it lives there rather than here.
+rtx-game = { path = "../rtx-game", features = ["netclient"] }

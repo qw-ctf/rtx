@@ -149,9 +149,26 @@ pub struct GameState {
 }
 
 impl GameState {
+    /// The game as a server's module: the engine hands us its syscall, and we hand back
+    /// [`game_data`](Self::game_data) so it can write our entity array directly.
     pub fn new(syscall: SyscallFn) -> Self {
+        Self::with_host(|ents| HostApi::new(syscall, ents))
+    }
+
+    /// The game inside a network client: no engine, no syscall — the world arrives over UDP and
+    /// the map is read off disk. See [`crate::netclient`].
+    ///
+    /// The `game_data` handshake and the extended-field table are still built and simply go unused:
+    /// they're how a *server* would reach into our entity array, and here nobody does. Leaving them
+    /// costs a few pointers and keeps one constructor rather than two that drift.
+    #[cfg(feature = "netclient")]
+    pub(crate) fn new_client(host: &'static dyn crate::host::ClientHost) -> Self {
+        Self::with_host(|ents| HostApi::new_client(host, ents))
+    }
+
+    fn with_host(make_host: impl FnOnce(*mut Entity) -> HostApi) -> Self {
         let mut entities = Entities::new(MAX_EDICTS);
-        let host = HostApi::new(syscall, entities.as_mut_ptr());
+        let host = make_host(entities.as_mut_ptr());
         let mut globals = Box::new(GlobalVars::default());
         // Declare the extended `maxspeed` field so the engine can seed each client's move-speed
         // cap from it (required for bots to walk under mvdsv, which never initializes a bot's cap

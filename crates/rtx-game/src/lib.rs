@@ -43,6 +43,8 @@ mod math;
 mod misc;
 mod mode;
 mod nav_build;
+#[cfg(feature = "netclient")]
+pub mod netclient;
 mod obituary;
 mod plats;
 mod player;

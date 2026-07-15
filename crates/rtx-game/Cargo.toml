@@ -12,8 +12,16 @@ name = "rtx"
 # `librtx.so` / `librtx.dylib` variants) to the `qwprogs` module the engine loads.
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Compile the bot brain to run inside a real QuakeWorld *network client* as well as inside a
+# server's game module — see `src/netclient`. Purely additive: it adds a module and one dependency,
+# and changes nothing about the `qwprogs` build, which is why the default build and CI leave it off.
+# The `rtx-client` binary turns it on.
+netclient = ["dep:rtx-proto"]
+
 [dependencies]
 rtx-nav.workspace = true
+rtx-proto = { workspace = true, optional = true }
 binrw.workspace = true
 bitflags.workspace = true
 glam.workspace = true

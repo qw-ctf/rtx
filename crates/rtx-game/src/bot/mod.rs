@@ -253,10 +253,17 @@ pub fn run_bots(game: &mut GameState) {
         return;
     }
     let maxclients = game.host().cvar(c"maxclients") as i32;
+    // A bot embodied as a real network client is a real client: the server runs its trigger touches
+    // for it, exactly as for a human. Running the fake-client pass too would grant every pickup
+    // twice — once here, once on the server — and leave our idea of the world disagreeing with the
+    // only copy that counts.
+    let fake_client = !game.host().is_client();
     for i in 1..=maxclients as u32 {
         let e = EntId(i);
         if game.entities[e].bot.is_bot && game.entities[e].in_use {
-            bot_pickup_items(game, e);
+            if fake_client {
+                bot_pickup_items(game, e);
+            }
             run_bot(game, e);
         }
     }

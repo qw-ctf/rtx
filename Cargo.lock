@@ -2364,6 +2364,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtx-client"
+version = "0.1.0"
+dependencies = [
+ "rtx-game",
+]
+
+[[package]]
 name = "rtx-game"
 version = "0.1.0"
 dependencies = [
@@ -2371,6 +2378,7 @@ dependencies = [
  "bitflags 2.13.0",
  "glam",
  "rtx-nav",
+ "rtx-proto",
 ]
 
 [[package]]
