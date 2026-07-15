@@ -13,10 +13,33 @@
 //! cargo run -p rtx-client -- --server 127.0.0.1:27500 --basedir ~/quake --bots 2
 //! ```
 //!
-//! It is deliberately outside the workspace's default members, so neither `cargo build` nor CI ever
-//! compiles it while building the `qwprogs` module.
+//! It sits outside the workspace's default members, so neither `cargo build` nor the `qwprogs`
+//! release ever compiles it.
 
-fn main() {
-    eprintln!("rtx-client: the session lands in the next milestone");
-    std::process::exit(1);
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.is_empty() {
+        eprint!("{}", rtx::netclient::USAGE);
+        return ExitCode::from(2);
+    }
+
+    let config = match rtx::netclient::parse_args(&argv) {
+        Ok(c) => c,
+        Err(msg) => {
+            // `--help` comes back this way too; both want the text and a non-zero exit, and
+            // neither wants a backtrace.
+            eprint!("{msg}");
+            return ExitCode::from(2);
+        }
+    };
+
+    match rtx::netclient::run(config) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("rtx-client: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }

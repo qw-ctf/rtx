@@ -6,6 +6,22 @@ on:
   workflow_dispatch:
 
 jobs:
+  # The wire protocol and the delta chain are the kind of code where a mistake looks like "the bot
+  # plays badly sometimes" rather than a crash, so the suites that pin them need to actually run.
+  # The netclient is a default-off feature, so its tests need asking for by name — without this line
+  # `cargo test` filters them all out and says ok.
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test (game module, nav core, wire codec)
+        run: cargo test --locked
+      - name: Test (network client)
+        run: cargo test --locked -p rtx-game --features netclient
+
   build:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
