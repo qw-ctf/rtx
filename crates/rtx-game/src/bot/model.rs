@@ -357,6 +357,11 @@ impl GameState {
     /// What `observer`'s pool believes about `target` right now (drift applied to health). `None` when
     /// modeling is off or the observer has no pool (a team-0 human). The returned copy keeps
     /// `last_update` intact so a consumer can age the belief; only `health` is drifted.
+    ///
+    /// Health floors at 1 for a target we still see standing: a belief can over-model damage — a client
+    /// scaling blood off a pellet count, a witness that lost the thread — but a live enemy has at least
+    /// 1 hp by definition, and reading one as already dead (a 0 stack) is just a bad guess that would
+    /// have a bot break off a kill it hasn't made. A genuinely dead target is reset elsewhere, not read.
     pub(crate) fn opponent_est(
         &self,
         observer: EntId,
@@ -369,6 +374,9 @@ impl GameState {
         let pool = self.observer_pool(observer)?;
         let mut est = self.opponents.entry(pool, target);
         est.health = drifted_health(est.health, est.last_update, now);
+        if self.entities[target].is_alive() {
+            est.health = est.health.max(1.0);
+        }
         Some(est)
     }
 

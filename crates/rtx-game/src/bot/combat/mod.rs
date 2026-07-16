@@ -39,6 +39,10 @@ const NAIL_SPEED: f32 = 1000.0;
 const PREFERRED_RANGE: f32 = 400.0;
 /// Below this we're in self-splash territory for the RL — switch to the super shotgun.
 const SPLASH_RANGE: f32 = 140.0;
+/// The lightning gun's beam reaches this far (`w_fire_lightning` traces `v_forward * 600`). The normal
+/// mid-range pick caps LG at a conservative `PREFERRED_RANGE + 150` (550); the *finishing* pick uses
+/// the true reach, so a believed-low enemy in the 550–600 band still draws the bolt over the rocket.
+const LG_RANGE: f32 = 600.0;
 /// KTX's `AvoidQuadBore` treats an enemy inside 250 units as a quad-explosive danger even though
 /// the physical radius is 160: quad turns the normally-small edge splash into a fight-ending hit,
 /// and the projectile strikes the near face of the target rather than its reported origin.
@@ -188,7 +192,14 @@ impl Loadout {
 /// dumps all cells as a self-lethal discharge. The server's auto-pick guard (`w_best_weapon`) can't
 /// help — the bot forces its weapon by impulse, which bypasses it — so the ban lives here (and, as a
 /// belt-and-suspenders fire gate, in [`engage`]).
-fn choose_weapon(inv: Loadout, dist: f32, gl_air: bool, gl_ground: bool, underwater: bool) -> WeaponChoice {
+///
+/// `finishable` — the opponent model believes this enemy is on a finishable stack (set by [`engage`]
+/// from [`est_strength`](crate::bot::model::est_strength) against [`FINISH_STACK`], the same read the
+/// movement `press` uses). When set, a mid/long-range pick that would otherwise be a dodgeable
+/// projectile becomes a hitscan direct hit — the lightning gun in beam range, else the tight
+/// single-barrel shotgun — so the near-kill lands the instant it fires instead of being strafed clear
+/// of a rocket's ~0.4 s flight.
+fn choose_weapon(inv: Loadout, dist: f32, gl_air: bool, gl_ground: bool, underwater: bool, finishable: bool) -> WeaponChoice {
     // A solved airborne grenade intercept takes precedence: it's the shot we came here to take.
     if gl_air {
         return WeaponChoice::grenade();
@@ -205,6 +216,19 @@ fn choose_weapon(inv: Loadout, dist: f32, gl_air: bool, gl_ground: bool, underwa
     // Mid range: the lightning gun (fast, high DPS) when fed — never submerged (it would discharge).
     if dist < PREFERRED_RANGE + 150.0 && inv.fed(Weapon::Lightning) && !underwater {
         return WeaponChoice::of(Weapon::Lightning);
+    }
+    // A finishable enemy past point blank: a hitscan direct hit lands the kill the instant it fires,
+    // where the rocket's flight lets a near-dead target strafe clear. Lightning if fed and in beam
+    // range (its true 600, past the conservative 550 the branch above stops at), else the tight
+    // single-barrel shotgun — not the wide SSG, which patterns worse at this distance. Only reached
+    // when the branches above didn't already pick a hitscan gun, i.e. exactly the RL/projectile case.
+    if finishable && dist >= SPLASH_RANGE {
+        if inv.fed(Weapon::Lightning) && dist < LG_RANGE && !underwater {
+            return WeaponChoice::of(Weapon::Lightning);
+        }
+        if inv.fed(Weapon::Shotgun) {
+            return WeaponChoice::of(Weapon::Shotgun);
+        }
     }
     // Default: the rocket launcher (projectile, lead the target).
     if inv.fed(Weapon::RocketLauncher) {
@@ -1143,10 +1167,18 @@ pub(crate) fn engage(
     // unavailable) — not a clock or geometry threshold — so it can't flip mid-jump and re-slew the
     // aim off the shot; RL/GL share ammo, so the only transition is the pool running dry, grounding
     // both at once. Midair's RL-only loadout never reaches the grenade path.
+    // The opponent model's finish read: is this enemy believed to be on a finishable stack, freshly?
+    // The same belief the movement `press` uses (`combat_move`), minus its own-health gate — a hurt
+    // bot still wants the *reliable* finishing weapon. When set, `choose_weapon` swaps a dodgeable
+    // rocket at range for a hitscan direct hit. `None` (modeling off, or a client with no health
+    // belief yet) ⇒ `false` ⇒ the pick is unchanged.
+    let finishable = game.opponent_est(e, enemy, now).is_some_and(|est| {
+        now - est.last_update < FINISH_FRESH && crate::bot::model::est_strength(&est, now) < FINISH_STACK
+    });
     let mut choice = if discharge {
         WeaponChoice::of(Weapon::Lightning)
     } else {
-        choose_weapon(inv, dist, plan.air_gl.is_some(), plan.gl_ground.is_some(), underwater)
+        choose_weapon(inv, dist, plan.air_gl.is_some(), plan.gl_ground.is_some(), underwater, finishable)
     };
     // Do not even select an explosive weapon when a teammate occupies the target blast or its own
     // projected splash is too costly (especially KTX's enlarged quad caution zone). The fire gate
@@ -1166,6 +1198,18 @@ pub(crate) fn engage(
     // W_ChangeWeapon each frame otherwise).
     if game.entities[e].v.weapon != choice.weapon {
         cmd.impulse = choice.impulse;
+        // Make the finish read observable live (`rtx_bot_debug`): log only when it actually diverts the
+        // pick from what range + inventory alone would choose — the "he's low, hit him with something
+        // that lands" swap. Throttled by the switch itself, and off the hot path unless debugging.
+        if finishable && game.host().cvar_bool(c"rtx_bot_debug") {
+            let plain = choose_weapon(inv, dist, plan.air_gl.is_some(), plan.gl_ground.is_some(), underwater, false);
+            if plain.weapon != choice.weapon {
+                game.host().conprint(&crate::game::cstring(&format!(
+                    "rtx bot{}: finishing with {:?} (range pick was {:?}) at {:.0}u\n",
+                    e.0, choice.weapon, plain.weapon, dist,
+                )));
+            }
+        }
     }
 
     // Aim point and clean firing angles (pure ballistics). `gate_direct` marks a shot that needs a
@@ -2214,14 +2258,14 @@ mod tests {
     #[test]
     fn choose_weapon_falls_back_to_nailguns() {
         // A bot restricted to a nailgun (via rtx_weapons) must fire it, not the axe. Super first.
-        let sng = choose_weapon(armed(Items::SUPER_NAILGUN), 400.0, false, false, false);
+        let sng = choose_weapon(armed(Items::SUPER_NAILGUN), 400.0, false, false, false, false);
         assert_eq!(sng.weapon, Weapon::SuperNailgun);
         assert_eq!(sng.projectile_speed, NAIL_SPEED);
-        let ng = choose_weapon(armed(Items::NAILGUN), 400.0, false, false, false);
+        let ng = choose_weapon(armed(Items::NAILGUN), 400.0, false, false, false, false);
         assert_eq!(ng.weapon, Weapon::Nailgun);
         // Out of nails → nothing else to fire → the axe.
         let dry = Loadout { nails: 0.0, ..armed(Items::SUPER_NAILGUN | Items::NAILGUN) };
-        assert_eq!(choose_weapon(dry, 400.0, false, false, false).weapon, Weapon::Axe);
+        assert_eq!(choose_weapon(dry, 400.0, false, false, false, false).weapon, Weapon::Axe);
     }
 
     #[test]
@@ -2229,19 +2273,19 @@ mod tests {
         // A GL-only bot only fires the GL when engage supplies an arc (gl_ground/gl_air); with no
         // solution there's nothing else to fire, so it holds the axe (never lobs blindly).
         let gl = armed(Items::GRENADE_LAUNCHER);
-        assert_eq!(choose_weapon(gl, 400.0, false, false, false).weapon, Weapon::Axe);
-        assert_eq!(choose_weapon(gl, 400.0, false, true, false).weapon, Weapon::GrenadeLauncher);
-        assert_eq!(choose_weapon(gl, 400.0, true, false, false).weapon, Weapon::GrenadeLauncher);
+        assert_eq!(choose_weapon(gl, 400.0, false, false, false, false).weapon, Weapon::Axe);
+        assert_eq!(choose_weapon(gl, 400.0, false, true, false, false).weapon, Weapon::GrenadeLauncher);
+        assert_eq!(choose_weapon(gl, 400.0, true, false, false, false).weapon, Weapon::GrenadeLauncher);
     }
 
     #[test]
     fn choose_weapon_full_arsenal_unchanged() {
-        // Regression guard: with everything (and dry), the range order is still SSG (point-blank
-        // <140) / LG (mid <550) / RL (beyond) — the nailgun fallbacks never pre-empt it.
+        // Regression guard: with everything (and dry) and no finish read, the range order is still SSG
+        // (point-blank <140) / LG (mid <550) / RL (beyond) — the nailgun fallbacks never pre-empt it.
         let all = armed(Items::all());
-        assert_eq!(choose_weapon(all, 100.0, false, false, false).weapon, Weapon::SuperShotgun);
-        assert_eq!(choose_weapon(all, 400.0, false, false, false).weapon, Weapon::Lightning);
-        assert_eq!(choose_weapon(all, 600.0, false, false, false).weapon, Weapon::RocketLauncher);
+        assert_eq!(choose_weapon(all, 100.0, false, false, false, false).weapon, Weapon::SuperShotgun);
+        assert_eq!(choose_weapon(all, 400.0, false, false, false, false).weapon, Weapon::Lightning);
+        assert_eq!(choose_weapon(all, 600.0, false, false, false, false).weapon, Weapon::RocketLauncher);
     }
 
     #[test]
@@ -2249,12 +2293,34 @@ mod tests {
         // Underwater the lightning gun is barred (it would discharge). With a full arsenal the
         // mid-range pick falls through to the rocket launcher instead of the LG...
         let all = armed(Items::all());
-        assert_eq!(choose_weapon(all, 400.0, false, false, true).weapon, Weapon::RocketLauncher);
+        assert_eq!(choose_weapon(all, 400.0, false, false, true, false).weapon, Weapon::RocketLauncher);
         // ...and a bot whose only fed gun is the LG drops to the axe rather than discharging.
         let lg_only = armed(Items::LIGHTNING);
-        assert_eq!(choose_weapon(lg_only, 400.0, false, false, true).weapon, Weapon::Axe);
+        assert_eq!(choose_weapon(lg_only, 400.0, false, false, true, false).weapon, Weapon::Axe);
         // Dry, that same LG-only bot fires the LG as usual (regression guard on the gate).
-        assert_eq!(choose_weapon(lg_only, 400.0, false, false, false).weapon, Weapon::Lightning);
+        assert_eq!(choose_weapon(lg_only, 400.0, false, false, false, false).weapon, Weapon::Lightning);
+    }
+
+    #[test]
+    fn choose_weapon_finishes_a_low_enemy_with_a_hitscan_hit() {
+        // A believed-low enemy past point blank: the pick swaps the dodgeable rocket for a hitscan
+        // direct hit so the near-kill lands before the target can strafe clear of the flight.
+        let all = armed(Items::all());
+        // In the 550–600 band (past the normal LG cap of PREFERRED_RANGE+150) it's the rocket without
+        // a finish read; with one, the lightning gun's true 600-unit reach takes the guaranteed hit.
+        assert_eq!(choose_weapon(all, 580.0, false, false, false, false).weapon, Weapon::RocketLauncher);
+        assert_eq!(choose_weapon(all, 580.0, false, false, false, true).weapon, Weapon::Lightning);
+        // No lightning gun: the tight single-barrel shotgun — not the rocket, and not the wider SSG,
+        // which patterns worse at this distance. Contrast the no-finish rocket.
+        let no_lg = armed(Items::all() & !Items::LIGHTNING);
+        assert_eq!(choose_weapon(no_lg, 400.0, false, false, false, false).weapon, Weapon::RocketLauncher);
+        assert_eq!(choose_weapon(no_lg, 400.0, false, false, false, true).weapon, Weapon::Shotgun);
+        // Past the lightning gun's reach the shotgun serves even with the LG owned.
+        assert_eq!(choose_weapon(all, 700.0, false, false, false, true).weapon, Weapon::Shotgun);
+        // Point blank is untouched — the super shotgun already one-shots a low enemy up close.
+        assert_eq!(choose_weapon(all, 100.0, false, false, false, true).weapon, Weapon::SuperShotgun);
+        // Underwater bars even the finish lightning gun; the shotgun still serves.
+        assert_eq!(choose_weapon(all, 400.0, false, false, true, true).weapon, Weapon::Shotgun);
     }
 
     #[test]
