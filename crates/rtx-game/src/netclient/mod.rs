@@ -68,6 +68,7 @@
 //! connection has to answer for the squad.
 
 pub mod config;
+pub(crate) mod download;
 pub(crate) mod frames;
 pub(crate) mod host;
 pub(crate) mod mirror;
@@ -250,7 +251,13 @@ impl Client {
             // clients randomize; deriving them keeps a capture readable.
             let qport = 0x4000u16.wrapping_add(i as u16);
             self.bots.push(Bot {
-                session: Session::connect(self.config.server, ui, qport, self.config.wiretap.as_deref())?,
+                session: Session::connect(
+                    self.config.server,
+                    ui,
+                    qport,
+                    self.config.wiretap.as_deref(),
+                    self.config.download,
+                )?,
                 mirror: Mirror::default(),
                 travelled: 0.0,
                 last_at: None,
@@ -465,7 +472,11 @@ impl Client {
         let Some(here) = self.lead().map(|b| (b.session.mapname().to_string(), b.session.servercount())) else {
             return;
         };
-        if here.0.is_empty() || here == self.world_map {
+        // Not just "is the name set" but "is the map actually loaded": the session names the map at
+        // prespawn, which can be *before* the file is on disk when it's still downloading. Spawning
+        // now would build the world against no geometry and then mark it done, so the real map, once
+        // it lands, would be skipped as already-built.
+        if here.0.is_empty() || here == self.world_map || !self.host.has_map() {
             return;
         }
         let map = here.0.clone();

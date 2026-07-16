@@ -21,5 +21,9 @@ glam = "0.32"
 binrw = "0.15"
 bitflags = "2"
 rayon = "1"
+# Map downloads for the network client (behind rtx-game's `netclient` feature). Blocking API — the
+# fetch runs on its own thread — and rustls rather than native-tls, so there's no system OpenSSL to
+# find. `charset`/`http2` off: we GET a static `.bsp` and want the dependency small.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 rtx-nav = { path = "crates/rtx-nav" }
 rtx-proto = { path = "crates/rtx-proto" }

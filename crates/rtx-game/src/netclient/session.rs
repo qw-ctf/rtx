@@ -55,6 +55,9 @@ pub(crate) enum Signon {
     Connecting,
     /// In, and working through the signon exchange.
     Loading,
+    /// Signon is paused while we fetch a map the machine doesn't have. The netchan stays alive on
+    /// the tick loop's nops; when the download lands, signon resumes at `prespawn`.
+    Downloading,
     /// Playing.
     Active,
     /// The map is changing; everything we know is stale until the next `svc_serverdata`.
@@ -156,6 +159,11 @@ pub(crate) struct Session {
     intermission: bool,
     /// Where to record what crosses the wire, if anyone asked (`--wiretap`).
     wiretap: Option<Wiretap>,
+    /// Whether to fetch a missing map rather than give up on it. Off (`--no-download`) restores the
+    /// old behaviour: a map we don't have is a connection we can't make.
+    download_enabled: bool,
+    /// The map download in flight, while [`Signon::Downloading`].
+    download: Option<super::download::Download>,
 }
 
 // A session answers two callers: the tick loop, which drives it, and the world mirror, which asks
@@ -168,6 +176,7 @@ impl Session {
         userinfo: UserinfoBuilder,
         qport: u16,
         wiretap: Option<&std::path::Path>,
+        download_enabled: bool,
     ) -> io::Result<Self> {
         let sock = UdpSocket::bind(if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" })?;
         sock.set_nonblocking(true)?;
@@ -206,6 +215,8 @@ impl Session {
             readied: false,
             intermission: false,
             wiretap,
+            download_enabled,
+            download: None,
         };
         Ok(s)
     }
@@ -278,6 +289,33 @@ impl Session {
         self.chan.queue_reliable(&clc::write_stringcmd(cmd));
     }
 
+    /// If a map download is running, see whether it finished, and resume signon when it did.
+    ///
+    /// The server is still holding at `prespawn`, waiting for us; the nops the tick loop sends while
+    /// we're `Downloading` have kept the connection alive. On success the map is now on disk, so
+    /// `bind_map_then_prespawn` rebinds and sends the `prespawn` we owed. On failure there's no
+    /// playing without the map — drop cleanly rather than send a checksum of nothing.
+    fn poll_download(&mut self, host: &NetHost) {
+        if self.signon != Signon::Downloading {
+            return;
+        }
+        let Some(result) = self.download.as_ref().and_then(|d| d.poll()) else {
+            return;
+        };
+        self.download = None;
+        match result {
+            Ok(path) => {
+                eprintln!("rtx-client: downloaded {}", path.display());
+                self.signon = Signon::Loading;
+                self.bind_map_then_prespawn(host);
+            }
+            Err(e) => {
+                eprintln!("rtx-client: map download failed: {e}");
+                self.signon = Signon::Disconnected;
+            }
+        }
+    }
+
     /// Tell the server we're willing to play, once per level.
     ///
     /// KTX won't start a match until everyone has said so, so a squad that never says it is a squad
@@ -304,6 +342,8 @@ impl Session {
     /// to know that `skins` means "say `begin`". Everything is still passed up, because the world
     /// mirror needs `svc_serverdata` too.
     pub(crate) fn poll(&mut self, host: &NetHost) -> io::Result<Vec<SvcEvent>> {
+        self.poll_download(host);
+
         let mut out = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
@@ -523,13 +563,29 @@ impl Session {
             .and_then(|m| m.strip_suffix(".bsp"))
             .unwrap_or_default()
             .to_string();
+        self.bind_map_then_prespawn(host);
+    }
 
+    /// Load the map and send `prespawn` — or, if we haven't got the map, start fetching it and pause
+    /// the signon at [`Signon::Downloading`]. Called again once the download lands (`poll`), when the
+    /// rebind succeeds and the signon resumes.
+    fn bind_map_then_prespawn(&mut self, host: &NetHost) {
         if !host.rebind(&self.gamedir, &self.mapname) {
-            eprintln!(
-                "rtx-client: can't read maps/{}.bsp — the bot needs the map to see or move",
-                self.mapname
-            );
-            self.signon = Signon::Disconnected;
+            if self.download_enabled {
+                eprintln!("rtx-client: don't have maps/{}.bsp — downloading it", self.mapname);
+                self.download = Some(super::download::Download::start(
+                    host.basedir(),
+                    self.gamedir.clone(),
+                    self.mapname.clone(),
+                ));
+                self.signon = Signon::Downloading;
+            } else {
+                eprintln!(
+                    "rtx-client: can't read maps/{}.bsp — the bot needs the map to see or move (and --no-download is set)",
+                    self.mapname
+                );
+                self.signon = Signon::Disconnected;
+            }
             return;
         }
 
@@ -731,7 +787,7 @@ mod tests {
             name: "rtxbot".to_string(),
             ..Default::default()
         };
-        Session::connect("127.0.0.1:1".parse().unwrap(), ui, 0x1234, None).expect("bind")
+        Session::connect("127.0.0.1:1".parse().unwrap(), ui, 0x1234, None, true).expect("bind")
     }
 
     fn host() -> NetHost {

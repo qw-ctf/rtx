@@ -31,6 +31,9 @@ pub struct Config {
     pub spectate: bool,
     /// Say `ready` on a server that waits to be told, so a match can actually start.
     pub auto_ready: bool,
+    /// Fetch a map we don't have (over HTTP) rather than fail the connection. See
+    /// [`crate::netclient::download`].
+    pub download: bool,
     /// Bind the control channel here, so a harness can drive and inspect the bots. See
     /// [`crate::control`].
     pub control_port: Option<u16>,
@@ -55,6 +58,7 @@ impl Default for Config {
             skill: 3.0,
             spectate: false,
             auto_ready: true,
+            download: true,
             control_port: None,
             soak: None,
             wiretap: None,
@@ -79,6 +83,7 @@ usage: rtx-client --server <host[:port]> --basedir <dir> [options]
   --skill <0..7>          bot skill (default 3)
   --spectate              watch instead of playing
   --no-auto-ready         don't answer KTX ready/join prompts
+  --no-download           don't fetch a missing map — fail the connection instead
   --soak <secs>           exit after this long
   --wiretap <dir>         write every datagram there, as a parser fixture
   +set <cvar> <value>     override an rtx tunable (repeatable)
@@ -105,6 +110,10 @@ pub fn parse(argv: &[String]) -> Result<Config, String> {
             }
             "--no-auto-ready" => {
                 c.auto_ready = false;
+                i += 1;
+            }
+            "--no-download" => {
+                c.download = false;
                 i += 1;
             }
             "--control-port" => {

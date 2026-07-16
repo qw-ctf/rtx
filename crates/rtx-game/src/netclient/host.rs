@@ -195,6 +195,18 @@ impl NetHost {
     ///
     /// Returns whether the map was found and parsed. A client that can't read the map can't play —
     /// there's no navmesh and no `pointcontents` — so the caller must not proceed without it.
+    /// Where the game's files live, for a map download to write beside them.
+    pub(crate) fn basedir(&self) -> PathBuf {
+        self.basedir.clone()
+    }
+
+    /// Whether a map is actually loaded. The session sets a `mapname` at `prespawn` before the map is
+    /// necessarily on disk (it may be downloading), so the world spawn has to check *this*, not the
+    /// name, or it would spawn against no geometry and then believe it had.
+    pub(crate) fn has_map(&self) -> bool {
+        self.bsp.borrow().is_some()
+    }
+
     pub(crate) fn rebind(&self, gamedir: &str, mapname: &str) -> bool {
         *self.gamedir.borrow_mut() = gamedir.to_string();
         *self.mapname.borrow_mut() = mapname.to_string();

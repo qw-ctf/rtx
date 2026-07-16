@@ -17,11 +17,12 @@ crate-type = ["cdylib", "rlib"]
 # server's game module — see `src/netclient`. Purely additive: it adds a module and one dependency,
 # and changes nothing about the `qwprogs` build, which is why the default build and CI leave it off.
 # The `rtx-client` binary turns it on.
-netclient = ["dep:rtx-proto"]
+netclient = ["dep:rtx-proto", "dep:reqwest"]
 
 [dependencies]
 rtx-nav.workspace = true
 rtx-proto = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
 binrw.workspace = true
 bitflags.workspace = true
 glam.workspace = true
