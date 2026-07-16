@@ -347,6 +347,7 @@ and the reason these can play against people without being something other than 
 | `--skill 0..7` | as `rtx_bot_skill` |
 | `--team`, `--name`, `--skin`, `--colors` | userinfo, as any client sends |
 | `--no-download` | fail rather than fetch a missing map |
+| `--config <file>` | a cvar cfg to apply on startup — the client's `server.cfg` (defaults to `<basedir>/rtx.cfg`) |
 | `--control-port <n>` | the same TCP harness the server-side bots expose (`status`, `goto`, `cell`, `links`, …) |
 | `--wiretap <dir>` | record every datagram, as a parser fixture |
 | `+set <cvar> <value>` | override an rtx tunable (e.g. `+set rtx_mode ctf`) |

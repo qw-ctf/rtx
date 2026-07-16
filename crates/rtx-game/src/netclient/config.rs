@@ -34,6 +34,9 @@ pub struct Config {
     /// Fetch a map we don't have (over HTTP) rather than fail the connection. See
     /// [`crate::netclient::download`].
     pub download: bool,
+    /// A cfg file of cvar settings to apply on startup — the client's `server.cfg`. Defaults to
+    /// `<basedir>/rtx.cfg` if that exists; `--config` names another. Empty = none.
+    pub config_file: Option<PathBuf>,
     /// Bind the control channel here, so a harness can drive and inspect the bots. See
     /// [`crate::control`].
     pub control_port: Option<u16>,
@@ -59,6 +62,7 @@ impl Default for Config {
             spectate: false,
             auto_ready: true,
             download: true,
+            config_file: None,
             control_port: None,
             soak: None,
             wiretap: None,
@@ -84,6 +88,7 @@ usage: rtx-client --server <host[:port]> --basedir <dir> [options]
   --spectate              watch instead of playing
   --no-auto-ready         don't answer KTX ready/join prompts
   --no-download           don't fetch a missing map — fail the connection instead
+  --config <file>         cvar cfg to apply on startup (default <basedir>/rtx.cfg if present)
   --soak <secs>           exit after this long
   --wiretap <dir>         write every datagram there, as a parser fixture
   +set <cvar> <value>     override an rtx tunable (repeatable)
@@ -115,6 +120,10 @@ pub fn parse(argv: &[String]) -> Result<Config, String> {
             "--no-download" => {
                 c.download = false;
                 i += 1;
+            }
+            "--config" => {
+                c.config_file = Some(PathBuf::from(need(i, "--config")?));
+                i += 2;
             }
             "--control-port" => {
                 c.control_port = Some(
@@ -190,6 +199,77 @@ pub fn parse(argv: &[String]) -> Result<Config, String> {
     Ok(c)
 }
 
+/// One meaningful line of a Quake console cfg, as far as a headless client is concerned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CfgLine {
+    /// `set NAME VALUE` (or the bare `NAME VALUE`) — a cvar to apply.
+    Set(String, String),
+    /// `exec FILE` — another cfg to read, relative to this one.
+    Exec(String),
+}
+
+/// Read the cvar sets (and `exec`s) out of a Quake console cfg.
+///
+/// A cfg is console commands, one per line. A headless bot has no console to run most of them — a
+/// `bind`, an `alias`, a `map` — so it takes only what it can act on: the cvar sets (`set NAME
+/// VALUE`, `seta NAME VALUE`, and the bare `NAME VALUE` form QuakeWorld also accepts) and `exec`,
+/// which chains to another cfg. Everything else is ignored rather than errored — a real cfg is full
+/// of lines a bot has no use for, and refusing them would make the whole file unusable. `//` starts a
+/// comment; a `"quoted"` value keeps its spaces.
+pub(crate) fn parse_cfg(text: &str) -> Vec<CfgLine> {
+    text.lines().filter_map(parse_cfg_line).collect()
+}
+
+fn parse_cfg_line(line: &str) -> Option<CfgLine> {
+    let line = line.split("//").next().unwrap_or("").trim();
+    if line.is_empty() {
+        return None;
+    }
+    let toks = tokenize(line);
+    match toks.as_slice() {
+        [kw, name, value] if kw == "set" || kw == "seta" => Some(CfgLine::Set(name.clone(), value.clone())),
+        [kw, file] if kw == "exec" => Some(CfgLine::Exec(file.clone())),
+        // The bare `cvar value` form — but not a two-word *command* (a lone `exec x` was caught
+        // above; anything else with two tokens we treat as a cvar, since a spurious one nobody reads
+        // is harmless and the real ones are what the operator meant).
+        [name, value] => Some(CfgLine::Set(name.clone(), value.clone())),
+        _ => None,
+    }
+}
+
+/// Split a cfg line into tokens, treating a `"quoted string"` as one — the only grouping a Quake cfg
+/// has.
+fn tokenize(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = line.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+        } else if c == '"' {
+            chars.next(); // opening quote
+            let mut tok = String::new();
+            for c in chars.by_ref() {
+                if c == '"' {
+                    break;
+                }
+                tok.push(c);
+            }
+            out.push(tok);
+        } else {
+            let mut tok = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_whitespace() {
+                    break;
+                }
+                tok.push(c);
+                chars.next();
+            }
+            out.push(tok);
+        }
+    }
+    out
+}
+
 /// Resolve `host` or `host:port`, defaulting to the QuakeWorld port.
 fn resolve(s: &str) -> Result<SocketAddr, String> {
     // An IPv6 literal is full of colons, so "does it have a colon" isn't the question — "does it
@@ -212,6 +292,34 @@ mod tests {
 
     fn args(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// A cfg is server-style console lines; the client takes the cvar sets and the `exec` chains and
+    /// ignores the commands it has no console for — so a real, cluttered cfg is usable as-is rather
+    /// than all-or-nothing.
+    #[test]
+    fn reads_the_cvars_out_of_a_cfg() {
+        let cfg = r#"
+            // the bot's tuning
+            set rtx_bot_curljump 1
+            seta rtx_bot_skill 7
+            rtx_bot_count 4            // the bare form works too
+            hostname "My Bots"        // a quoted value keeps its spaces
+            bind x "+forward"         // a command we can't run — ignored, not an error
+            exec more.cfg
+        "#;
+        assert_eq!(parse_cfg(cfg), vec![
+            CfgLine::Set("rtx_bot_curljump".into(), "1".into()),
+            CfgLine::Set("rtx_bot_skill".into(), "7".into()),
+            CfgLine::Set("rtx_bot_count".into(), "4".into()),
+            CfgLine::Set("hostname".into(), "My Bots".into()),
+            CfgLine::Exec("more.cfg".into()),
+        ]);
+        // `bind x "+forward"` is three tokens and not a `set`, so it's dropped — a spurious cvar
+        // named `bind` would be harmless, but three-token commands don't even become one.
+        assert!(!parse_cfg("bind x \"+forward\"").iter().any(|l| matches!(l, CfgLine::Set(n, _) if n == "bind")));
+        // A comment-only or blank cfg yields nothing.
+        assert!(parse_cfg("// just a note\n\n   \n").is_empty());
     }
 
     /// The common case, and the defaults that ride along with it.

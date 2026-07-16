@@ -161,6 +161,34 @@ pub(crate) fn live_players(game: &GameState) -> impl Iterator<Item = EntId> + '_
 /// teleport, or a respawn — and counting it would make a bot that dies a lot look well travelled.
 const TELEPORT_STEP: f32 = 200.0;
 
+/// Apply a cvar cfg to the host, following `exec` chains. Silent if the file isn't there — a default
+/// `rtx.cfg` that doesn't exist is not an error, it just means "no cfg".
+///
+/// `depth` bounds the `exec` recursion so a cfg that execs itself (or a cycle of them) can't loop
+/// forever. An `exec` path is resolved relative to the cfg that named it, the way a console does.
+fn exec_cfg(host: &NetHost, path: &std::path::Path, depth: u32) {
+    const MAX_DEPTH: u32 = 8;
+    if depth > MAX_DEPTH {
+        eprintln!("rtx-client: cfg: too many nested exec (cycle?) at {}", path.display());
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return; // absent cfg — fine
+    };
+    if depth == 0 {
+        eprintln!("rtx-client: reading {}", path.display());
+    }
+    for line in config::parse_cfg(&text) {
+        match line {
+            config::CfgLine::Set(name, value) => host.set(&name, &value),
+            config::CfgLine::Exec(file) => {
+                let child = path.parent().unwrap_or(std::path::Path::new(".")).join(file);
+                exec_cfg(host, &child, depth + 1);
+            }
+        }
+    }
+}
+
 /// A bot client: the brain, hosted by [`NetHost`] instead of a server.
 pub struct Client {
     game: GameState,
@@ -199,7 +227,12 @@ impl Client {
         if let Some(port) = config.control_port {
             host.set("rtx_control_port", &port.to_string());
         }
-        // Explicit overrides last, so `+set` always wins.
+        // A cfg of cvar settings — the client's `server.cfg`. `--config` names one; otherwise
+        // `<basedir>/rtx.cfg` if it's there, so a bot can be tuned by dropping a file next to its
+        // maps, the way the server is tuned by its own cfg.
+        let cfg = config.config_file.clone().unwrap_or_else(|| config.basedir.join("rtx.cfg"));
+        exec_cfg(host, &cfg, 0);
+        // Explicit overrides last, so a command-line `+set` always wins — over the cfg and the rest.
         for (name, value) in &config.cvars {
             host.set(name, value);
         }
