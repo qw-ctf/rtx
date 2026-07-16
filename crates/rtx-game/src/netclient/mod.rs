@@ -266,18 +266,22 @@ impl Client {
     /// concerned — QuakeWorld has no notion of a connection carrying two players.
     pub fn connect(&mut self) -> io::Result<()> {
         for i in 0..self.config.bots {
-            let name = if self.config.bots == 1 {
-                self.config.name.clone()
-            } else {
-                format!("{}{}", self.config.name, i + 1)
+            // The label after the `bot•` tag: a name from the list per bot by default, or the
+            // operator's `--name` (a squad appending a number). Then wrap it in the coloured tag so
+            // every rtx bot reads `bot•<label>` on the scoreboard.
+            let label = match &self.config.name {
+                None => crate::bot::bot_name(i as i32).to_string(),
+                Some(base) if self.config.bots == 1 => base.clone(),
+                Some(base) => format!("{base}{}", i + 1),
             };
             let ui = UserinfoBuilder {
-                name,
+                name: crate::bot::bot_display_name(&label),
                 team: self.config.team.clone(),
                 skin: self.config.skin.clone(),
                 topcolor: self.config.colors.0,
                 bottomcolor: self.config.colors.1,
                 spectator: self.config.spectate,
+                bot: true, // announce ourselves — a bot on a human server should say so
                 ..Default::default()
             };
             // The qport identifies us across a NAT rebinding, so a squad needs distinct ones. Real
@@ -737,11 +741,11 @@ impl Client {
             SvcEvent::ServerData(sd) => eprintln!(
                 "rtx-client: [{index}] joined {} on {:?} as slot {}{}",
                 if sd.gamedir.is_empty() { "qw" } else { &sd.gamedir },
-                sd.levelname,
+                crate::text::readable(&sd.levelname),
                 sd.playernum,
                 if sd.spectator { " (spectating)" } else { "" }
             ),
-            SvcEvent::Print { text, .. } if lead == Some(index) => eprint!("{text}"),
+            SvcEvent::Print { text, .. } if lead == Some(index) => eprint!("{}", crate::text::readable(text)),
             SvcEvent::Disconnect => eprintln!("rtx-client: [{index}] dropped by the server"),
             _ => {}
         }
@@ -834,17 +838,28 @@ mod tests {
         assert_eq!(client.game().host().cvar(c"rtx_bot_bhop"), 0.0, "an explicit +set wins");
     }
 
-    /// A squad is N independent clients; the server tells them apart by qport and name, so both
-    /// have to differ. A lone bot keeps the plain name.
+    /// A squad is N independent clients; the server tells them apart by name, so they have to
+    /// differ. Default naming draws a distinct list name per bot, each under the coloured `bot•`
+    /// tag (`\u{e2}\u{ef}\u{f4}\u{85}` = coloured `bot` + the `0x85` dot). An explicit `--name`
+    /// numbers a squad and stays wrapped; a lone bot keeps a single label.
     #[test]
-    fn a_squad_gets_distinct_names_and_qports() {
-        let mut squad = Client::new(Config { bots: 3, name: "bot".into(), ..config() });
-        squad.connect().expect("bind");
-        assert_eq!(squad.bots.len(), 3);
+    fn a_squad_gets_distinct_names() {
+        const TAG: &str = "\u{e2}\u{ef}\u{f4}\u{85}"; // coloured `bot` + dot
 
-        let mut solo = Client::new(Config { bots: 1, name: "bot".into(), ..config() });
+        let mut squad = Client::new(Config { bots: 3, ..config() });
+        squad.connect().expect("bind");
+        let names: Vec<&str> = squad.bots.iter().map(|b| b.session.name()).collect();
+        assert!(names.iter().all(|n| n.starts_with(TAG)), "each carries the bot• tag: {names:?}");
+        assert_eq!(names.iter().collect::<std::collections::HashSet<_>>().len(), 3, "distinct: {names:?}");
+
+        let mut named = Client::new(Config { bots: 2, name: Some("botto".into()), ..config() });
+        named.connect().expect("bind");
+        assert_eq!(named.bots[0].session.name(), format!("{TAG}botto1"));
+        assert_eq!(named.bots[1].session.name(), format!("{TAG}botto2"));
+
+        let mut solo = Client::new(Config { bots: 1, name: Some("botto".into()), ..config() });
         solo.connect().expect("bind");
-        assert_eq!(solo.bots.len(), 1);
+        assert_eq!(solo.bots[0].session.name(), format!("{TAG}botto"));
     }
 
     /// The send rate follows the server, because that's the rate it wants moves at — with a sane

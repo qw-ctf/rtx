@@ -145,6 +145,9 @@ pub struct UserinfoBuilder {
     pub msg: u8,
     /// Connect as a spectator rather than a player.
     pub spectator: bool,
+    /// Declare ourselves a bot via the `*bot` star key, so a server (and its human players) can
+    /// tell. It's the server's own key, so it may drop or override it — but honest to try.
+    pub bot: bool,
     /// The ZQuake extension mask to advertise.
     pub z_ext: u32,
 }
@@ -160,6 +163,7 @@ impl Default for UserinfoBuilder {
             rate: 25000,
             msg: 1,
             spectator: false,
+            bot: false,
             z_ext: crate::protocol::Z_EXT,
         }
     }
@@ -186,6 +190,11 @@ impl UserinfoBuilder {
         info.set("msg", &self.msg.to_string());
         if self.spectator {
             info.set("spectator", "1");
+        }
+        if self.bot {
+            // A star key, settable (like `*z_ext`) only in the connect userinfo; a server that owns
+            // `*bot` may keep, clear, or override it.
+            info.set("*bot", "1");
         }
         info.set("*z_ext", &self.z_ext.to_string());
         info
@@ -277,6 +286,9 @@ mod tests {
         assert_eq!(info.get("pmodel"), None);
         assert_eq!(info.get("emodel"), None);
 
+        // `*bot` is off by default and doesn't appear.
+        assert_eq!(info.get("*bot"), None);
+
         // A spectator says so; colours are clamped to the palette rather than sent raw.
         let spec = UserinfoBuilder {
             spectator: true,
@@ -285,6 +297,10 @@ mod tests {
         };
         assert_eq!(spec.build().get("spectator"), Some("1"));
         assert_eq!(spec.build().get("topcolor"), Some("13"));
+
+        // A bot announces itself with the `*bot` star key.
+        let bot = UserinfoBuilder { bot: true, ..Default::default() };
+        assert_eq!(bot.build().get("*bot"), Some("1"));
     }
 
     /// Userinfo goes inside quotes in the `connect` packet and must fit `MAX_INFO_STRING`.

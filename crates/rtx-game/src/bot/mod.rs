@@ -31,6 +31,10 @@ mod vigil;
 
 pub use population::manage_population;
 pub(crate) use population::{drain_roster, RosterOp};
+// Reused by the netclient to name its own bodies the same way the roster names qwprogs bots; the
+// qwprogs build calls these through their defining module, so the re-export is netclient-only.
+#[cfg(feature = "netclient")]
+pub(crate) use population::{bot_display_name, bot_name};
 #[cfg(test)]
 use population::bot_target;
 

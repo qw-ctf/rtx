@@ -17,8 +17,9 @@ pub struct Config {
     pub basedir: PathBuf,
     /// How many bots to bring.
     pub bots: usize,
-    /// Base name; a squad appends a number.
-    pub name: String,
+    /// The label after the `bot•` tag. `None` draws a name per bot from the built-in list
+    /// (`bot•Grunt`, …); `Some(base)` uses it instead (`bot•base`, a squad appending a number).
+    pub name: Option<String>,
     /// Team string, for teamplay servers.
     pub team: String,
     /// Skin name; empty for the default.
@@ -54,7 +55,7 @@ impl Default for Config {
             server: ([127, 0, 0, 1], rtx_proto::protocol::PORT).into(),
             basedir: PathBuf::from("."),
             bots: 1,
-            name: "rtx".to_string(),
+            name: None,
             team: String::new(),
             skin: String::new(),
             colors: (0, 0),
@@ -80,7 +81,7 @@ usage: rtx-client --server <host[:port]> --basedir <dir> [options]
   --server <host[:port]>  server to join (default port 27500)
   --basedir <dir>         Quake directory holding qw/ and id1/ — the maps must be here
   --bots <n>              how many bots to bring (default 1)
-  --name <s>              base name; a squad appends a number (default \"rtx\")
+  --name <s>              label after the `bot•` tag (default: a random name per bot)
   --team <s>              team, on a teamplay server
   --skin <s>              skin name
   --colors <top> <bottom> shirt and trouser colours, 0-13
@@ -147,7 +148,7 @@ pub fn parse(argv: &[String]) -> Result<Config, String> {
                 i += 2;
             }
             "--name" => {
-                c.name = need(i, "--name")?;
+                c.name = Some(need(i, "--name")?);
                 i += 2;
             }
             "--team" => {
@@ -355,7 +356,7 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(c.bots, 4);
-        assert_eq!(c.name, "botto");
+        assert_eq!(c.name, Some("botto".to_string()));
         assert_eq!(c.team, "red");
         assert_eq!(c.skin, "base");
         assert_eq!(c.colors, (4, 11));

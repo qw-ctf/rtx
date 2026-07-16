@@ -8,7 +8,7 @@ use std::ffi::CString;
 
 use super::state::BotState;
 use crate::entity::EntId;
-use crate::game::{cstring, GameState};
+use crate::game::GameState;
 
 /// Reconcile the live bot count to `rtx_bot_count`, one add/remove per call (called each normal
 /// server frame). No-ops until a navmesh exists for the map, so bots never spawn blind.
@@ -141,13 +141,26 @@ pub(super) fn bot_target(cvar_want: i32, humans: i32, cfg: crate::mode::team::Ma
 /// re-enters the module — is fired later by [`drain_roster`] at the `vmMain` boundary, not here,
 /// so it can't alias the population manager's `&mut GameState`.
 fn queue_add_bot(game: &mut GameState, index: i32) {
-    let name = cstring(&format!("[rtx]{}", bot_name(index)));
+    // Build the name from latin-1 bytes, not `cstring` (which is UTF-8): `bot_display_name` carries
+    // high-half conchars, and the engine stores the `CString`'s bytes verbatim into the netname.
+    let display = bot_display_name(bot_name(index));
+    let name = CString::new(crate::text::latin1_bytes(&display)).unwrap_or_default();
     let (bottom, top) = bot_colors(index);
     game.pending_roster = Some(RosterOp::Add { name, bottom, top });
 }
 
+/// A bot's on-scoreboard name: a coloured `bot` tag, the coloured dot, then `label` in plain white
+/// — e.g. `bot•Grunt`. Shared by both embodiments (the qwprogs roster and the netclient userinfo).
+pub(crate) fn bot_display_name(label: &str) -> String {
+    crate::text::Conchars::default()
+        .coloured("bot")
+        .ch(crate::text::DOT)
+        .plain(label)
+        .build()
+}
+
 /// A rotating set of bot names.
-fn bot_name(index: i32) -> &'static str {
+pub(crate) fn bot_name(index: i32) -> &'static str {
     const NAMES: [&str; 32] = [
         "Grunt",
         "Ranger",

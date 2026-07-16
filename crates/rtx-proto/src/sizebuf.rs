@@ -305,13 +305,9 @@ impl Writer {
     }
 
     /// Append a NUL-terminated string, encoded latin-1 (chars above U+00FF are dropped rather than
-    /// mangled into multi-byte UTF-8, which a QuakeWorld server would misread).
+    /// mangled into multi-byte UTF-8, which a QuakeWorld server would misread). See [`latin1_bytes`].
     pub fn string(&mut self, s: &str) {
-        for c in s.chars() {
-            if (c as u32) < 256 && c != '\0' {
-                self.buf.push(c as u8);
-            }
-        }
+        self.buf.extend(latin1(s));
         self.buf.push(0);
     }
 
@@ -321,6 +317,23 @@ impl Writer {
     pub fn angle16(&mut self, degrees: f32) {
         self.u16(to_angle16(degrees));
     }
+}
+
+/// The latin-1 bytes of a string: each `char` below U+0100 as a single byte, dropping the rest
+/// (and interior NULs).
+///
+/// A QuakeWorld string on the wire is raw bytes, not UTF-8 — a "coloured" conchar is one byte in
+/// the high half, and UTF-8 would split it into two the server misreads. [`Writer::string`] appends
+/// these plus a terminating NUL; a raw context that has no terminator (the `connect` packet) takes
+/// the bytes alone.
+pub fn latin1_bytes(s: &str) -> Vec<u8> {
+    latin1(s).collect()
+}
+
+/// The latin-1 bytes as an iterator, so [`Writer::string`] can `extend` without an intermediate
+/// allocation.
+fn latin1(s: &str) -> impl Iterator<Item = u8> + '_ {
+    s.chars().filter(|&c| (c as u32) < 256 && c != '\0').map(|c| c as u8)
 }
 
 /// Encode an angle in degrees as QuakeWorld's 16-bit fixed-point turn.

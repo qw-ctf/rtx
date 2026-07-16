@@ -260,6 +260,12 @@ impl Session {
         &self.mapname
     }
 
+    /// The name this bot connects under — conchars and all.
+    #[cfg(test)]
+    pub(crate) fn name(&self) -> &str {
+        &self.userinfo.name
+    }
+
     /// Smoothed round-trip time, in seconds.
     pub(crate) fn rtt(&self) -> f32 {
         self.rtt
@@ -436,7 +442,9 @@ impl Session {
                 self.signon = Signon::Loading;
                 self.stringcmd("new");
             }
-            Some(oob::Oob::Print(text)) => eprintln!("rtx-client: server: {}", text.trim_end()),
+            Some(oob::Oob::Print(text)) => {
+                eprintln!("rtx-client: server: {}", crate::text::readable(text.trim_end()))
+            }
             Some(oob::Oob::Ping) => {
                 self.send_oob(&oob::ack());
             }

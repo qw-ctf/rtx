@@ -197,7 +197,9 @@ pub fn connect(qport: u16, challenge: i32, userinfo: &str, n: &Negotiated) -> Ve
             s.push_str(&format!("0x{tag:x} 0x{mask:x}\n"));
         }
     }
-    wrap(s.as_bytes())
+    // Latin-1, not UTF-8: a coloured player name carries high-half conchars (0x80+), and each must
+    // go out as a single byte. The ASCII of the command itself is unchanged by this.
+    wrap(&crate::sizebuf::latin1_bytes(&s))
 }
 
 #[cfg(test)]
@@ -357,5 +359,23 @@ mod tests {
         assert!(text.starts_with("connect 28 4242 31337 \"\\name\\bot\\*z_ext\\511\"\n"));
 
         assert_eq!(parse(&wrap(b"j")), Some(Oob::Accepted));
+    }
+
+    /// A coloured name reaches the wire as single high-half bytes, not the two-byte UTF-8 a Rust
+    /// `String` would otherwise encode them as — the server reads conchars, not Unicode. The name
+    /// here is a coloured `bot`, a `0x85` dot, then plain `Grunt` (`\u{e2}\u{ef}\u{f4}\u{85}Grunt`).
+    #[test]
+    fn connect_encodes_coloured_name_as_latin1() {
+        let name = "\u{e2}\u{ef}\u{f4}\u{85}Grunt";
+        let pkt = connect(1, 2, &format!("\\name\\{name}"), &Negotiated { fte: 0, fte2: 0, mvd1: 0 });
+
+        // The coloured `bot`, the dot, and `Grunt` are each one byte on the wire.
+        let needle = [0xe2, 0xef, 0xf4, 0x85, b'G', b'r', b'u', b'n', b't'];
+        assert!(
+            pkt.windows(needle.len()).any(|w| w == needle),
+            "coloured name not found as latin-1 bytes in {pkt:?}"
+        );
+        // And no UTF-8 lead byte (0xc3) smuggled a two-byte sequence in.
+        assert!(!pkt.contains(&0xc3), "name was UTF-8 encoded, not latin-1");
     }
 }
