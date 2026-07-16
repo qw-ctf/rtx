@@ -425,7 +425,21 @@ impl Session {
                 host.set_movevars(sd.movevars);
                 self.stringcmd(&format!("soundlist {} 0", self.servercount));
             }
-            SvcEvent::SoundList(list) => {
+            // The lists, and the replies that walk through them, belong to the signon — so they're
+            // only answered while we're in one.
+            //
+            // Under loss this is the difference between a bot with ears and one without. A chunk can
+            // arrive after we're already playing, because QuakeWorld duplicates reliables: a lost ack
+            // makes the sender resend, and the receiver's `incoming_reliable_sequence ^= 1` is
+            // unconditional, so the payload is processed twice. Everyone lives with it — it's why
+            // mvdsv answers a second `soundlist` with a shrug ("not valid -- already spawned") rather
+            // than an error, and why you'll see that line in a lossy soak from any client, this one
+            // included.
+            //
+            // What we mustn't do is *absorb* the late copy. `extend` truncates to the chunk's start
+            // before appending, so a late first chunk would cut the finished list back to one entry
+            // and leave the bot resolving every shot it hears against an empty table.
+            SvcEvent::SoundList(list) if self.signon == Signon::Loading => {
                 self.extend(true, list.start as usize, &list.names);
                 if list.next != 0 {
                     let next = self.continuation(self.sounds.len(), list.next);
@@ -434,7 +448,7 @@ impl Session {
                     self.stringcmd(&format!("modellist {} 0", self.servercount));
                 }
             }
-            SvcEvent::ModelList(list) => {
+            SvcEvent::ModelList(list) if self.signon == Signon::Loading => {
                 self.extend(false, list.start as usize, &list.names);
                 if list.next != 0 {
                     let next = self.continuation(self.models.len(), list.next);
@@ -736,6 +750,34 @@ mod tests {
         // A continuation chunk appends where the last left off.
         s.extend(true, 3, &["c.wav".to_string()]);
         assert_eq!(s.sounds, vec!["", "a.wav", "b.wav", "c.wav"]);
+    }
+
+    /// A resource list belongs to the signon, and a late chunk of one is history.
+    ///
+    /// Found by playing through 20% packet loss, where it turns out to be routine: QuakeWorld
+    /// duplicates reliables (a lost ack makes the sender resend, and the receiver toggles its
+    /// reliable bit unconditionally), so a chunk of the list lands again long after the bot is in the
+    /// game. The damage is in absorbing it: `extend` truncates to the chunk's start before appending,
+    /// so a late *first* chunk cuts the finished list back to one entry — and the sound list is the
+    /// bot's ears. It would spend the rest of the map resolving every shot it hears against an empty
+    /// table.
+    #[test]
+    fn a_late_list_chunk_cannot_cost_the_bot_its_ears() {
+        let mut s = session();
+        let host = host();
+        s.signon = Signon::Loading;
+        let list = |start: u16, names: &[&str]| rtx_proto::svc::ResourceList {
+            start,
+            names: names.iter().map(|n| n.to_string()).collect(),
+            next: 0,
+        };
+        s.handle(&SvcEvent::SoundList(list(0, &["a.wav", "b.wav", "c.wav"])), &host);
+        assert_eq!(s.sounds, vec!["", "a.wav", "b.wav", "c.wav"]);
+
+        // In the game now — and the first chunk turns up again, late.
+        s.signon = Signon::Active;
+        s.handle(&SvcEvent::SoundList(list(0, &["a.wav"])), &host);
+        assert_eq!(s.sounds, vec!["", "a.wav", "b.wav", "c.wav"], "the list we spent the signon building");
     }
 
     /// The continuation offset re-attaches the high bits the server's single byte can't carry.
