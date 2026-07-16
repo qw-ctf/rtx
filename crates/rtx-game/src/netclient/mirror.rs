@@ -37,8 +37,7 @@ use crate::items::{ARMOR_GREEN, ARMOR_RED, ARMOR_YELLOW};
 // imported rather than restated, so "the same speed the server fires at" is a fact the compiler
 // keeps rather than a comment that used to be true.
 use crate::weapons::projectiles::{GRENADE_FUSE, NAIL_SPEED, ROCKET_SPEED};
-use crate::entity::MoverPhase;
-use crate::entity::{EntId, Entity, Touch};
+use crate::entity::{EntId, Entity, FlagPhase, MoverPhase, Touch};
 use crate::game::GameState;
 use crate::netclient::frames::EntityState;
 
@@ -591,6 +590,9 @@ enum Kind {
     Projectile(Touch),
     /// A dead player's dropped weapon and ammo.
     Backpack,
+    /// A CTF flag lying in the world (at base or dropped). A *carried* flag is invisible on the wire,
+    /// so this is only ever the not-carried cases; the carrier is found from effects instead.
+    Flag,
     /// Decoration: gibs, blood, the player models we already track through `svc_playerinfo`.
     Ignore,
 }
@@ -606,7 +608,23 @@ fn classify(model: &str) -> Kind {
         "progs/spike.mdl" => Kind::Projectile(Touch::Spike),
         "progs/s_spike.mdl" => Kind::Projectile(Touch::SuperSpike),
         "progs/backpack.mdl" => Kind::Backpack,
+        // The flag models: rtx and KTX-custom use `progs/flag.mdl` (team by skin); KTX stock uses the
+        // id keys, one model per team.
+        "progs/flag.mdl" | "progs/w_g_key.mdl" | "progs/w_s_key.mdl" => Kind::Flag,
         _ => Kind::Ignore,
+    }
+}
+
+/// Which team a networked flag belongs to (`1` red / `2` blue), or `None` if the model isn't a flag.
+///
+/// `progs/flag.mdl` is both teams' flag and tells them apart by skin (0 red / 1 blue, `flags.rs`);
+/// KTX's stock keys are one model per team (`w_g_key` gold = team 1, `w_s_key` silver = team 2).
+fn flag_team(model: &str, skin: u8) -> Option<u8> {
+    match model {
+        "progs/w_g_key.mdl" => Some(1),
+        "progs/w_s_key.mdl" => Some(2),
+        "progs/flag.mdl" => Some(if skin == 0 { 1 } else { 2 }),
+        _ => None,
     }
 }
 
@@ -690,6 +708,11 @@ pub(crate) struct WorldMirror {
     /// server entity number. The previous position is the whole point — nothing sends a velocity, so
     /// a rocket's heading is the difference between two sightings of it.
     tracked: std::collections::HashMap<u16, Vec3>,
+    /// The two CTF flags' shadow entities (empty outside CTF). Their live state — carried by whom,
+    /// lying where — is what the flag brain reads, and none of it is on the wire directly: it's
+    /// inferred from where the flag entity is visible and which player wears its effect. See
+    /// [`Self::write_flags`].
+    flags: Vec<EntId>,
     /// How many projectiles we've ever seen fly, and the most at once. A path that never runs looks
     /// exactly like one with nothing to do — this tells them apart.
     ///
@@ -718,9 +741,11 @@ impl WorldMirror {
                 Kind::Brush(n) => self.write_brush(game, n, e),
                 Kind::Projectile(touch) => self.write_projectile(game, e, touch, now),
                 Kind::Backpack => self.write_backpack(game, e),
-                Kind::Ignore => {}
+                // Flags are a whole-set inference (a carried one is invisible), done in one pass below.
+                Kind::Flag | Kind::Ignore => {}
             }
         }
+        self.write_flags(game, seen, models);
         self.write_item_presence(game, squad, seen, models, now);
         let flying = seen.iter().filter(|e| matches!(classify(name(e.model)), Kind::Projectile(_))).count();
         self.projectiles_peak = self.projectiles_peak.max(flying);
@@ -872,6 +897,83 @@ impl WorldMirror {
         game.entities[slot].v.origin = e.origin;
         game.link_edict(slot);
         self.tracked.insert(e.number, e.origin);
+    }
+
+    /// The live state of the two CTF flags, none of which is on the wire directly.
+    ///
+    /// The flag brain reads four things off each flag — is it carried and by whom, is it home or
+    /// lying in the field, where — and a per-player `carrying` bit. Every one is inferable from
+    /// signals a client already has, which is the whole reason CTF is playable as a client at all:
+    ///
+    /// - **The flag on a player's back is public.** A carrier wears `EF_FLAG1`/`EF_FLAG2` (the flag's
+    ///   own team), which rides in `svc_playerinfo` effects and is already mirrored to `v.effects`. So
+    ///   "who carries which flag" is read straight off the players — and a carried flag entity is
+    ///   *hidden* on the wire (`modelindex 0`), so this is the only way to know, exactly as it is for
+    ///   a human watching the enemy run off with a flag on their shoulder.
+    /// - **A flag lying in the world is just an entity**, sent in packetentities when in view: near
+    ///   its base it's home, anywhere else it's dropped. Its team is the model's skin.
+    /// - **Out of sight with no carrier**, keep the last state — the item-memory rule: absence past
+    ///   the PVS says nothing.
+    fn write_flags(&mut self, game: &mut GameState, seen: &[EntityState], models: &[String]) {
+        if self.flags.is_empty() {
+            return; // not CTF — no flags spawned
+        }
+        let name = |m: u16| models.get(m as usize).map(String::as_str).unwrap_or("");
+
+        // Every player's carried-flag bit, from the effect they wear. `carrying` is the team of the
+        // enemy flag they hold (0 = none), which is exactly what the effect bit names.
+        let maxclients = game.host().cvar(c"maxclients") as u32;
+        for p in (1..=maxclients).map(EntId) {
+            if !game.entities[p].is_player() {
+                continue;
+            }
+            let eff = Effects::from_bits_truncate(game.entities[p].v.effects as u32);
+            game.entities[p].mode_p.ctf.carrying = if eff.contains(Effects::FLAG1) {
+                1
+            } else if eff.contains(Effects::FLAG2) {
+                2
+            } else {
+                0
+            };
+        }
+
+        // Where each team's flag is visibly lying this frame (a carried one isn't sent).
+        let mut lying: [Option<Vec3>; 3] = [None; 3];
+        for e in seen {
+            if let Some(team) = flag_team(name(e.model), e.skin) {
+                lying[team as usize] = Some(e.origin);
+            }
+        }
+
+        for i in 0..self.flags.len() {
+            let flag = self.flags[i];
+            let (team, home) = {
+                let f = &game.entities[flag].flag;
+                (f.team, f.home)
+            };
+            let bit = if team == 1 { Effects::FLAG1 } else { Effects::FLAG2 };
+            let carrier = (1..=maxclients).map(EntId).find(|&p| {
+                game.entities[p].is_player()
+                    && Effects::from_bits_truncate(game.entities[p].v.effects as u32).contains(bit)
+            });
+
+            if let Some(carrier) = carrier {
+                let org = game.entities[carrier].v.origin;
+                let f = &mut game.entities[flag];
+                f.flag.phase = FlagPhase::Carried;
+                f.flag.carrier = carrier;
+                f.v.origin = org; // the brain chases the carrier through the flag's own origin
+                f.v.solid = Solid::Not;
+            } else if let Some(pos) = lying[team as usize] {
+                let at_home = pos.distance(home) < ITEM_MATCH_DIST;
+                let f = &mut game.entities[flag];
+                f.flag.phase = if at_home { FlagPhase::Home } else { FlagPhase::Dropped };
+                f.flag.carrier = EntId::WORLD;
+                f.v.origin = if at_home { home } else { pos };
+                f.v.solid = Solid::Trigger; // a lying flag is grabbable / returnable by touch
+            }
+            // else: not carried and not in view — keep the last state (PVS gap).
+        }
     }
 
     /// Which of the map's items are actually there.
@@ -1035,6 +1137,14 @@ impl WorldMirror {
             .live()
             .filter(|(_, e)| e.classname().is_some_and(crate::bot::goals::is_goal_classname))
             .map(|(i, e)| (i, e.v.origin))
+            .collect();
+        // The CTF flags too — spawned from the map only in CTF, so this is empty in every other mode
+        // and `write_flags` no-ops. Their team and home are already on the shadow entity.
+        self.flags = game
+            .entities
+            .live()
+            .filter(|(_, e)| e.classname() == Some("flag"))
+            .map(|(i, _)| i)
             .collect();
         self.brushes.clear();
         self.tracked.clear();
@@ -1481,6 +1591,73 @@ mod tests {
 
     fn state(number: u16, model: u16, origin: Vec3) -> EntityState {
         EntityState { number, model, origin, ..Default::default() }
+    }
+
+    /// Put a CTF flag into the world the way `spawn_flag` does: team, home, at its base.
+    fn place_flag(g: &mut GameState, slot: u32, team: u8, home: Vec3) -> EntId {
+        let e = EntId(slot);
+        let ent = &mut g.entities[e];
+        *ent = Entity::default();
+        ent.in_use = true;
+        ent.classname = Some("flag".into());
+        ent.flag.team = team;
+        ent.flag.home = home;
+        ent.flag.phase = FlagPhase::Home;
+        ent.v.origin = home;
+        ent.v.solid = Solid::Trigger;
+        e
+    }
+
+    /// A CTF flag's live state is inferred, not sent: a carried flag is invisible and known only by
+    /// the effect its carrier wears; a lying flag is an entity, home or dropped by where it is. This
+    /// is the whole reason a client can play CTF — every signal the brain needs is one a player has.
+    #[test]
+    fn a_flag_is_read_from_its_carrier_and_where_it_lies() {
+        use crate::defs::Effects;
+        let mut g = game();
+        let red_home = Vec3::new(0.0, 0.0, 0.0);
+        let blue_home = Vec3::new(1000.0, 0.0, 0.0);
+        let red = place_flag(&mut g, 20, 1, red_home);
+        let blue = place_flag(&mut g, 21, 2, blue_home);
+
+        // A blue player has run off with the RED flag: they wear FLAG1 (the red flag's effect).
+        let raider = player(&mut g, 3, Vec3::new(400.0, 0.0, 0.0));
+        g.entities[raider].v.effects = Effects::FLAG1.bits() as f32;
+
+        let mut m = Solo::default();
+        m.mirror.set_slot(0, false);
+        m.world.flags = vec![red, blue];
+
+        // The blue flag is visibly home; the red flag isn't sent (it's on the raider's back).
+        let mut models = models();
+        models.push("progs/flag.mdl".to_string()); // index 9
+        let mut blue_state = state(80, 9, blue_home);
+        blue_state.skin = 1; // blue
+        m.world.apply_frame(&mut g, &Squad::default(), &[blue_state], &models);
+
+        // The red flag: carried by the raider, tracking their origin, non-solid.
+        assert_eq!(g.entities[red].flag.phase, FlagPhase::Carried);
+        assert_eq!(g.entities[red].flag.carrier, raider);
+        assert_eq!(g.entities[red].v.origin, g.entities[raider].v.origin);
+        assert_ne!(g.entities[red].v.solid, Solid::Trigger, "a carried flag isn't touchable");
+        // And the raider knows what they carry — the enemy flag's team.
+        assert_eq!(g.entities[raider].mode_p.ctf.carrying, 1, "carrying the red (team 1) flag");
+
+        // The blue flag: home, grabbable, at its base.
+        assert_eq!(g.entities[blue].flag.phase, FlagPhase::Home);
+        assert_eq!(g.entities[blue].flag.carrier, EntId::WORLD);
+        assert_eq!(g.entities[blue].v.solid, Solid::Trigger);
+
+        // The raider is fragged: the red flag drops into the field where they fell. Effect clears
+        // (the mirror stops seeing FLAG1), and the flag entity reappears out in the open.
+        g.entities[raider].v.effects = 0.0;
+        let mut dropped = state(80, 9, Vec3::new(400.0, 0.0, 0.0));
+        dropped.skin = 0; // red
+        m.world.apply_frame(&mut g, &Squad::default(), &[dropped], &models);
+        assert_eq!(g.entities[red].flag.phase, FlagPhase::Dropped);
+        assert_eq!(g.entities[red].v.origin, Vec3::new(400.0, 0.0, 0.0), "lying where it fell");
+        assert_eq!(g.entities[red].v.solid, Solid::Trigger, "a dropped flag can be returned or grabbed");
+        assert_eq!(g.entities[raider].mode_p.ctf.carrying, 0, "no longer carrying");
     }
 
     /// A model list shaped like a real one: index 0 is the placeholder, 1 the map.

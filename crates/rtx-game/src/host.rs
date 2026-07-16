@@ -907,7 +907,16 @@ impl HostApi {
 
     /// Claim the `MapExtFieldPtr`/`SetExtFieldPtr` traps (used for the `alpha` field) at the
     /// numbers ktx uses. Returns whether both are available on this server.
+    ///
+    /// A network client has no engine to claim them from, and no need to: `alpha`/`colormod` are
+    /// cosmetic, and a headless bot renders nothing. Reporting "unsupported" makes every
+    /// [`ExtFields::set`](crate::ext_field::ExtFields::set) a no-op — which is the same best-effort
+    /// path a server that lacks the extension takes — instead of reaching a server-only trap when a
+    /// map (a CTF map, say) carries an `alpha` field on some entity.
     pub fn register_ext_fields(&self) -> bool {
+        if self.is_client() {
+            return false;
+        }
         self.map_extension(c"MapExtFieldPtr", Ext::MapExtFieldPtr as isize) >= 0
             && self.map_extension(c"SetExtFieldPtr", Ext::SetExtFieldPtr as isize) >= 0
     }
