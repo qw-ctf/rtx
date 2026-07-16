@@ -33,14 +33,17 @@ jobs:
             target: linux-x86_64
             built: librtx.so
             artifact: qwprogs.so
+            client: rtx-client
           - os: macos-15
             target: macos-arm64
             built: librtx.dylib
             artifact: qwprogs.dylib
+            client: rtx-client
           - os: windows-latest
             target: windows-x86_64
             built: rtx.dll
             artifact: qwprogs.dll
+            client: rtx-client.exe
     steps:
       - uses: actions/checkout@v5
 
@@ -48,16 +51,28 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build (release)
+      - name: Build qwprogs module (release)
         run: cargo build --release --locked
+
+      # The network client is a default-off feature on its own excluded crate, so it needs building
+      # by name — a separate cargo invocation, which leaves the qwprogs module above untouched.
+      - name: Build network client (release)
+        run: cargo build --release --locked -p rtx-client
 
       - name: Stage qwprogs module
         shell: bash
         run: cp "target/release/${{ matrix.built }}" "${{ matrix.artifact }}"
 
-      - name: Upload artifact
+      - name: Upload qwprogs artifact
         uses: actions/upload-artifact@v6
         with:
           name: qwprogs-${{ matrix.target }}
           path: ${{ matrix.artifact }}
+          if-no-files-found: error
+
+      - name: Upload rtx-client artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: rtx-client-${{ matrix.target }}
+          path: target/release/${{ matrix.client }}
           if-no-files-found: error
