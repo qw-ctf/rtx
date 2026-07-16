@@ -284,7 +284,7 @@ pub struct SpeedJumpTraversal {
 /// planner routes around a closed door whenever any open way exists, but finite so it still
 /// crosses (and the bot then detours to the button) when there's no alternative — matching how a
 /// game engine prices a disabled-but-openable NavMesh link rather than deleting it outright.
-const CLOSED_GATE_PENALTY: f32 = 100_000.0;
+pub const CLOSED_GATE_PENALTY: f32 = 100_000.0;
 
 /// Extra travel-time charged to every [`LinkKind::RocketJump`] link when the querying bot is unfit
 /// to fly one (no rocket launcher, no rocket, too little health, or quad running — see
@@ -307,6 +307,17 @@ pub struct LinkCosts<'a> {
     /// `gate_closed[i]` marks gate `i`'s door currently shut; a link through it is charged
     /// [`CLOSED_GATE_PENALTY`]. Empty slice ⇒ every door treated as open.
     pub gate_closed: &'a [bool],
+    /// `openable_gates[i]` marks closed gate `i` as one this querying bot can open right now — its
+    /// button is reachable without crossing the gate — so a link through it is charged the modest
+    /// [`Self::open_gate_cost`] (a button-detour errand) instead of the full [`CLOSED_GATE_PENALTY`].
+    /// Empty (the default) ⇒ every closed gate keeps the full penalty, which is what *path* planning
+    /// always wants. This is the one term that differs between "how good is this goal" and "how do I
+    /// get there": a prize behind a door the bot knows how to open is a fine goal to *choose*, but the
+    /// route to it should still prefer an open way when one exists. Only goal *valuation* sets it.
+    pub openable_gates: &'a [bool],
+    /// Seconds charged for crossing an [`Self::openable_gates`] gate — the button-detour overhead the
+    /// gate errand actually pays, not the route-around penalty. Unread when `openable_gates` is empty.
+    pub open_gate_cost: f32,
     /// `(link idx, extra seconds)` surcharges — a bot's failed-link penalties. Tiny (≤8 entries),
     /// scanned linearly. Kept far below [`CLOSED_GATE_PENALTY`] so it diverts a route without ever
     /// forcing one through a shut door.
@@ -758,7 +769,16 @@ impl NavGraph {
     #[inline]
     fn link_extra(&self, li: u32, costs: &LinkCosts) -> f32 {
         let mut extra = match self.gate_of_link(li) {
-            Some(g) if costs.gate_closed.get(g).copied().unwrap_or(false) => CLOSED_GATE_PENALTY,
+            Some(g) if costs.gate_closed.get(g).copied().unwrap_or(false) => {
+                // A closed gate this caller flagged openable (its button is reachable on our side) is
+                // an errand, not a wall — price it so, but only for the query that asked. Every other
+                // caller leaves `openable_gates` empty and pays the full route-around penalty.
+                if costs.openable_gates.get(g).copied().unwrap_or(false) {
+                    costs.open_gate_cost
+                } else {
+                    CLOSED_GATE_PENALTY
+                }
+            }
             _ => 0.0,
         };
         for &(l, sec) in costs.penalties {

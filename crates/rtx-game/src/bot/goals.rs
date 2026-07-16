@@ -25,7 +25,7 @@ use crate::defs::{
 };
 use crate::entity::{EntId, Think, Touch};
 use crate::game::GameState;
-use crate::navmesh::CellId;
+use crate::navmesh::{CellId, CLOSED_GATE_PENALTY};
 
 /// Beyond this travel-or-respawn time (seconds) an *ordinary* item isn't worth pursuing.
 pub(crate) const LOOKAHEAD: f32 = 10.0;
@@ -40,6 +40,13 @@ const POWERUP_LOOKAHEAD: f32 = 30.0;
 /// A cross-map quad run legitimately takes longer than that; the progress watchdog still catches a
 /// genuinely stuck bot far sooner. Sized to [`POWERUP_LOOKAHEAD`] plus a margin.
 pub(crate) const POWERUP_GIVEUP: f32 = 35.0;
+
+/// Goal-valuation price (seconds) for crossing a closed gate whose button the bot can reach — the
+/// button-detour errand the bot actually runs, standing in for the full [`CLOSED_GATE_PENALTY`] the
+/// planner keeps. Small enough that a prize behind an openable door still fits inside the item and
+/// powerup horizons, so the bot *chooses* it and heads over to work the button; large enough that an
+/// item on the near side of an open corridor is still preferred to one that needs a door opened.
+const GATE_OPEN_COST: f32 = 8.0;
 
 /// Powerup team-split threshold: a teammate counts as "so much nearer that I should take something
 /// else" once they're within this fraction of the bot's own distance to the powerup. Below 1.0 so a
@@ -1059,7 +1066,26 @@ impl GameState {
         // higher `t` and scores lower, so the bot stops re-choosing an item it can never actually
         // reach. Same pricing `run_bot` routes with (see [`LinkPricing`](super::LinkPricing)).
         let pricing = self.bot_link_pricing(bot_e, now);
-        let costs = graph.costs_from(bot_cell, &pricing.costs(0));
+        let base = pricing.costs(0);
+        let normal = graph.costs_from(bot_cell, &base);
+        // Valuation prices a shut door the bot can *open* as the button-detour errand it is, not the
+        // full route-around wall — otherwise a prize reachable only through a gate (the ultrav quad
+        // behind its teleporter door) floods to ~100k and is never a *choosable* goal, so no bot ever
+        // heads there to work the button, and it sits untaken until the door happens to open for some
+        // other reason. A gate is openable-from-here when its button floods below the route-around
+        // penalty in the plain costs (i.e. its button is reachable without crossing a shut gate); a
+        // sealed one (button on the far side) keeps the full price. Only re-flood when a gate is shut —
+        // most frames there is none, and *path* planning (`run_bot`) still pays the full penalty.
+        let openable: Vec<bool> = base
+            .gate_closed
+            .iter()
+            .enumerate()
+            .map(|(gi, &shut)| shut && normal[graph.gate(gi).button_cell as usize] < CLOSED_GATE_PENALTY)
+            .collect();
+        let mut vcosts = base;
+        vcosts.openable_gates = &openable;
+        vcosts.open_gate_cost = GATE_OPEN_COST;
+        let costs = if openable.iter().any(|&o| o) { graph.costs_from(bot_cell, &vcosts) } else { normal };
         let s = self.bot_stats(bot_e);
         let own_power = s.strength * s.firepower.max(10.0);
         // Only a currently remembered opponent contributes denial/contest information. Position is

@@ -1423,6 +1423,9 @@ impl LinkPricing {
             jitter_seed,
             rocket_jump_extra: self.rj_extra,
             hazard: self.hazard,
+            // Path planning always pays the full route-around penalty for a shut gate; only goal
+            // valuation (see `best_item_plan`) overrides these to price openable gates as errands.
+            ..Default::default()
         }
     }
 
