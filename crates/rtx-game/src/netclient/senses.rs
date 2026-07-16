@@ -144,6 +144,21 @@ impl GameState {
         self.model_note_pickup(picker, kind);
     }
 
+    /// A hit landed on `victim` — we saw the blood spurt. Dock their believed health across the pools
+    /// that could have witnessed it, the same earshot/PVS reach the shot-heard and pickup channels use.
+    ///
+    /// This is the one channel a client can't otherwise fill: no stat carries enemy health, but a spurt
+    /// is a spurt, and it's PVS-gated, so this only ever fires for a hit a squad bot could see — the
+    /// honest evidence, not a wallhack. `note_damage` folds the delivered damage through the victim's
+    /// believed armour exactly as `T_Damage` does inside qwprogs. Unlike the weapon/pickup channels it
+    /// isn't idempotent, so its one caller ([`WorldMirror::note_blood`]) dedups the multicast per tick.
+    pub(crate) fn client_saw_hit(&mut self, victim: EntId, damage: f32, at: Vec3) {
+        let now = self.time();
+        for pool in crate::bot::model::iter_pools(self.witness_pools(at)) {
+            self.opponents.note_damage(pool, victim, damage, now);
+        }
+    }
+
     /// The live player most nearly in the direction a hit came from.
     ///
     /// `svc_damage`'s `from` is where the *damage* came from — the rocket's blast centre, the

@@ -27,7 +27,7 @@
 
 use glam::Vec3;
 use rtx_proto::protocol::stat;
-use rtx_proto::svc::{PlayerInfo, SvcEvent};
+use rtx_proto::svc::{PlayerInfo, SvcEvent, TempEntity, TempEntityKind};
 
 use crate::bot::model::PickupKind;
 use crate::client::movement::AIR_TIME;
@@ -210,6 +210,8 @@ impl Mirror {
                     if is_player_slot(game, e) {
                         game.client_heard_fire(e, weapon, *origin);
                     }
+                    // Remember it: a blood puff a moment later scales by the weapon that caused it.
+                    world.recent_fire = Some((weapon, game.time()));
                 }
                 if name == ITEM_RESPAWN_SOUND {
                     world.heard_item_respawn(game, *origin);
@@ -249,6 +251,11 @@ impl Mirror {
                 game.entities[e].v.angles = *angles;
                 game.entities[e].bot.aim.angles = *angles;
             }
+            // Blood — the honest, PVS-gated "someone got hit" a player reads off a spurt. It's the one
+            // signal that can fill the opponent model's *health* channel on a client (nothing on the
+            // wire carries enemy health), so its bots can tell when an enemy is finishable. Other temp
+            // entities (explosions, gunshots on walls) carry no health news and fall through.
+            SvcEvent::TempEntity(te) => world.note_blood(game, te),
             _ => {}
         }
     }
@@ -678,6 +685,11 @@ fn flag_team(model: &str, skin: u8) -> Option<u8> {
 /// this only has to absorb the difference between where the mapper put it and where it settled.
 const ITEM_MATCH_DIST: f32 = 48.0;
 
+/// How near a blood puff a player must stand to *be* the one it came off — the spurt spawns on the
+/// hull it struck, so within roughly a hull's reach of the body's origin. Beyond it, world blood (a
+/// stray trace against geometry) that names no victim.
+const BLOOD_MATCH_DIST: f32 = 48.0;
+
 /// How near its end a mover has to be to count as resting there. The same eight units
 /// `gate_closed_flags` calls a closed door, and for the same reason: the wire quantizes coordinates,
 /// so "arrived" is a neighbourhood rather than a point.
@@ -802,6 +814,15 @@ pub(crate) struct WorldMirror {
     /// hypothesised loadout (what the opponent model last believed the victim held). See
     /// [`Self::write_backpack`] and [`Self::remember_death_drop`].
     death_drops: Vec<DeathDrop>,
+    /// The most recent weapon-fire sound heard, and when. A blood puff a moment later can then be
+    /// scaled to real damage by the weapon that caused it — a shotgun's `count` is pellets-that-hit
+    /// (4 dmg each), a nail's is the damage itself. See [`Self::note_blood`].
+    recent_fire: Option<(Items, f32)>,
+    /// Blood impacts already credited this tick (origin, tick time). A hit multicast to several of the
+    /// squad's connections reaches each of them, and each runs `apply`; this counts it once, not once
+    /// per bot. Keyed on the tick clock (identical across a tick's connections, so `==` is exact) and
+    /// pruned when it moves on.
+    blood_seen: Vec<(Vec3, f32)>,
 }
 
 /// A player death held just long enough to guess the loadout of the backpack it drops (network client
@@ -1277,6 +1298,55 @@ impl WorldMirror {
         let found = self.items.iter().find(|&&(item, _)| game.entities[item].classname() == Some(class));
         if let Some((item, _)) = found.copied() {
             self.take_item(game, item, now);
+        }
+    }
+
+    /// A blood puff we witnessed: attribute it to the victim and dock their believed health.
+    ///
+    /// The observation-gated way a client learns an enemy is hurt with no health stat on the wire —
+    /// exactly a player reading a spurt. The `count` scales with damage but the scale is weapon-
+    /// dependent: a shotgun's is pellets-that-hit (4 dmg each), a nail's or axe's is the damage itself,
+    /// and the lightning-blood variant carries no count at all (a fixed 30-dmg bolt). We tell them apart
+    /// by the weapon whose fire we heard a moment before ([`Self::recent_fire`]), defaulting to treating
+    /// the count as damage. Only the two blood kinds say anything about health; other temp entities
+    /// (wall gunshots, explosions, teleports) carry none and fall through.
+    ///
+    /// Unlike the weapon/pickup channels this credit is *not* idempotent, so it's deduped per tick
+    /// ([`Self::blood_seen`]): the same hit is multicast to every squad connection whose PVS holds it,
+    /// and each runs `apply` — the belief must fall by the damage dealt, not that times the squad size.
+    pub(crate) fn note_blood(&mut self, game: &mut GameState, te: &TempEntity) {
+        let (kind, count, origin) = match *te {
+            TempEntity::Puff { kind, count, origin } => (kind, count, origin),
+            TempEntity::Point { kind, origin } => (kind, 0u8, origin),
+            _ => return,
+        };
+        let now = game.time();
+        let dmg = match kind {
+            TempEntityKind::LightningBlood => 30.0, // one shaft bolt (w_fire_lightning deals 30)
+            TempEntityKind::Blood => {
+                let recent = self.recent_fire.filter(|&(_, t)| now - t < 0.3).map(|(w, _)| w);
+                let shotgun = recent == Some(Items::SHOTGUN) || recent == Some(Items::SUPER_SHOTGUN);
+                count as f32 * if shotgun { 4.0 } else { 1.0 }
+            }
+            _ => return, // wall gunshots, explosions, teleports — no health news
+        };
+        if dmg <= 0.0 {
+            return;
+        }
+        // Dedup this tick (keyed on the tick clock, identical across a tick's connections).
+        self.blood_seen.retain(|&(_, t)| t == now);
+        if self.blood_seen.iter().any(|&(o, _)| o.distance_squared(origin) < 64.0) {
+            return;
+        }
+        self.blood_seen.push((origin, now));
+        // The victim stands in the spurt — blood spawns on the hull it struck.
+        let victim = crate::netclient::live_players(game).min_by(|&a, &b| {
+            let d = |p: EntId| game.entities[p].v.origin.distance_squared(origin);
+            d(a).total_cmp(&d(b))
+        });
+        let close = |p: EntId| game.entities[p].v.origin.distance_squared(origin) < BLOOD_MATCH_DIST * BLOOD_MATCH_DIST;
+        if let Some(v) = victim.filter(|&p| close(p)) {
+            game.client_saw_hit(v, dmg, origin);
         }
     }
 
@@ -1763,6 +1833,53 @@ mod tests {
         assert!(g.net_shadow_stale(enemy, seen + 0.3), "no update — left PVS, don't fire at the shadow");
         // The guard is client-only; server-side there's no PVS gap and `is_client()` is false.
         assert!(g.host().is_client(), "the test game is a client, so the stale guard is live");
+    }
+
+    /// A client learns an enemy is hurt the one honest way it can — off the blood, PVS-gated — and the
+    /// belief falls by the damage dealt, once, even when the hit reaches several of the squad's bots.
+    #[test]
+    fn witnessed_blood_docks_the_believed_health() {
+        // Build the host directly (like `game()`) so the health belief's gate can be toggled.
+        let host: &'static NetHost = Box::leak(Box::new(NetHost::new(PathBuf::from("/nonexistent"))));
+        host.set("maxclients", "8");
+        host.set("rtx_bot_model", "1");
+        let mut g = GameState::new_client(host);
+        // Our observing bot at slot 0 — embodied and alive, so it counts as a witness near the blood.
+        let mut m = Solo::at(0);
+        m.apply(&mut g, &SvcEvent::PlayerInfo(playerinfo(0, 0)));
+        m.apply(&mut g, &SvcEvent::UpdateStat { stat: stat::HEALTH, value: 100 });
+        g.entities[m.own()].v.origin = Vec3::ZERO;
+        // An enemy a little away — the blood lands on them.
+        let enemy = player(&mut g, slot_to_ent(1).0, Vec3::new(100.0, 0.0, 0.0));
+        let now = g.time();
+        assert_eq!(g.opponent_est(m.own(), enemy, now).unwrap().health, 100.0, "a fresh spawn");
+
+        // A super-shotgun blast: heard the fire, then blood with 10 pellets that hit → 40 damage.
+        m.world.recent_fire = Some((Items::SUPER_SHOTGUN, now));
+        let hit = TempEntity::Puff { kind: TempEntityKind::Blood, count: 10, origin: Vec3::new(100.0, 0.0, 0.0) };
+        m.world.note_blood(&mut g, &hit);
+        assert_eq!(g.opponent_est(m.own(), enemy, now).unwrap().health, 60.0, "40 damage: 10 pellets x 4");
+
+        // The same hit reaches a squadmate's connection this tick too — counted once, not twice.
+        m.world.note_blood(&mut g, &hit);
+        assert_eq!(g.opponent_est(m.own(), enemy, now).unwrap().health, 60.0, "deduped");
+
+        // Blood with nobody standing in it names no victim, so nothing moves.
+        let stray = TempEntity::Puff { kind: TempEntityKind::Blood, count: 10, origin: Vec3::new(5000.0, 0.0, 0.0) };
+        m.world.note_blood(&mut g, &stray);
+        assert_eq!(g.opponent_est(m.own(), enemy, now).unwrap().health, 60.0);
+
+        // A huge over-count while the enemy is still seen alive floors at 1 — a bad guess, not a death.
+        g.globals.time += 1.0; // a fresh tick, so the per-tick dedup doesn't swallow it
+        let now2 = g.time();
+        m.world.recent_fire = Some((Items::SUPER_SHOTGUN, now2));
+        let big = TempEntity::Puff { kind: TempEntityKind::Blood, count: 100, origin: Vec3::new(100.0, 0.0, 0.0) };
+        m.world.note_blood(&mut g, &big);
+        assert_eq!(g.opponent_est(m.own(), enemy, now2).unwrap().health, 1.0, "alive → floored at 1, not dead");
+
+        // Modeling off: no belief exists to move.
+        host.set("rtx_bot_model", "0");
+        assert!(g.opponent_est(m.own(), enemy, now2).is_none());
     }
 
     /// A body with no health that isn't dead is a body the server never spawned — and `run_bot` will
