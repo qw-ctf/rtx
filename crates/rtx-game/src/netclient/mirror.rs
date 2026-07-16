@@ -199,7 +199,7 @@ impl Mirror {
                 }
                 self.write_own_stats(game);
             }
-            SvcEvent::PlayerInfo(pi) => self.write_player(game, squad, pi),
+            SvcEvent::PlayerInfo(pi) => self.write_player(game, world, squad, pi),
             // The bot's ears. Sounds carry by PHS rather than PVS — you hear things through walls,
             // which is the whole point of listening — so this reaches further than sight, and is
             // exactly what a player works from when they say "he's got the rocket launcher".
@@ -213,6 +213,14 @@ impl Mirror {
                 }
                 if name == ITEM_RESPAWN_SOUND {
                     world.heard_item_respawn(game, *origin);
+                } else if let Some(class) = powerup_pickup_class(name) {
+                    // A powerup's pickup sound just played somewhere — that powerup is now held, so it's
+                    // off the floor and on its ~60 s clock, knowable even with the pad out of sight. This
+                    // is one of the ways a bot "knows the quad is gone" without seeing the pad, alongside
+                    // the glow on whoever holds it (see `write_player`) and its own pickup (which plays
+                    // this same sound). Only powerups: their sounds are unique, so position isn't needed.
+                    let now = game.time();
+                    world.note_powerup_taken(game, class, now);
                 }
             }
             // Being shot. Tells us someone's there and roughly where — a bearing, not a position.
@@ -339,7 +347,7 @@ impl Mirror {
     }
 
     /// One player's per-frame state.
-    fn write_player(&mut self, game: &mut GameState, squad: &Squad, pi: &PlayerInfo) {
+    fn write_player(&mut self, game: &mut GameState, world: &mut WorldMirror, squad: &Squad, pi: &PlayerInfo) {
         if pi.player as usize >= MAX_CLIENTS {
             return; // not a slot this server has; everything below indexes by it
         }
@@ -415,6 +423,15 @@ impl Mirror {
                 let lit = glow.contains(bit);
                 if lit && !known.contains(bit) {
                     game.client_saw_pickup(e, kind);
+                    // The glow also dates the *map* item: whoever just lit up is holding that powerup,
+                    // so its pad is empty and on the respawn clock even if it's across the map (ultrav's
+                    // quad). Effect duration bounds the wait tighter than a bare 60s — they picked it up
+                    // within the last ~30s — but the conservative full clock is enough to send a bot to
+                    // arrive and wait rather than believe it's still sitting there.
+                    if let Some(class) = powerup_glow_class(kind) {
+                        let now = game.time();
+                        world.note_powerup_taken(game, class, now);
+                    }
                 }
                 known.set(bit, lit);
             }
@@ -659,6 +676,30 @@ const ITEM_SIGHT_RANGE: f32 = 2000.0;
 /// The noise an item makes coming back (`SUB_regen`) — played on the item itself, so where it comes
 /// from is which item it was. See [`Mirror::heard_item_respawn`].
 const ITEM_RESPAWN_SOUND: &str = "items/itembk2.wav";
+
+/// The powerup a distinctive pickup sound announces, or `None`. Each artifact plays its own sound on
+/// pickup (set in `spawn_powerup`), and a powerup is unique on the map, so — unlike an ammo box or a
+/// dropped weapon, whose shared noises the general item timing rightly ignores — hearing one names the
+/// exact item without any position. The 300 s ring of invulnerability shares the 60 s clock class here;
+/// its longer respawn is applied by `respawn_delay_of` when the timer is set.
+fn powerup_pickup_class(sound: &str) -> Option<&'static str> {
+    match sound {
+        "items/damage.wav" => Some("item_artifact_super_damage"),
+        "items/protect.wav" => Some("item_artifact_invulnerability"),
+        "items/inv1.wav" => Some("item_artifact_invisibility"),
+        _ => None,
+    }
+}
+
+/// The map item a player's powerup glow names. Quad (blue) and pentagram (red) glow; the ring of
+/// shadows carries no effect, so a held ring is unobservable and left `None` — the honesty principle.
+fn powerup_glow_class(kind: PickupKind) -> Option<&'static str> {
+    match kind {
+        PickupKind::Quad => Some("item_artifact_super_damage"),
+        PickupKind::Pent => Some("item_artifact_invulnerability"),
+        _ => None,
+    }
+}
 
 /// What this frame said about one item.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1136,6 +1177,22 @@ impl WorldMirror {
         }
     }
 
+    /// A powerup was just taken — its pickup sound played, or its carrier lit up. Mark the map's item
+    /// of `class` off the floor and on its respawn clock, even with the pad out of sight.
+    ///
+    /// The general item timing deliberately ignores pickup sounds: they play on the *player*, so a
+    /// backpack lying near an armour spot makes the same noise and position can't tell them apart. A
+    /// powerup is the exception — it's unique on the map, so its own distinctive sound (or the glow on
+    /// whoever holds it) names it without any position at all. This is the evidence a player runs on to
+    /// know the quad is gone the instant they hear it across the map, and to be back at the pad ~60 s
+    /// later. `take_item` no-ops if we already believe it gone, so repeated evidence can't double-count.
+    pub(crate) fn note_powerup_taken(&mut self, game: &mut GameState, class: &str, now: f32) {
+        let found = self.items.iter().find(|&&(item, _)| game.entities[item].classname() == Some(class));
+        if let Some((item, _)) = found.copied() {
+            self.take_item(game, item, now);
+        }
+    }
+
     /// Bring an item back on schedule, if its timer has come due.
     fn expect_respawn(&mut self, game: &mut GameState, item: EntId, now: f32) {
         let ent = &mut game.entities[item];
@@ -1216,13 +1273,29 @@ impl WorldMirror {
 
     /// Note the map's items, so their absence can be reasoned about. Called once per map, after the
     /// shadow world is spawned.
-    pub(crate) fn index_items(&mut self, game: &GameState) {
+    ///
+    /// Seeds every one *believed up*. A fresh level — or a mid-game connect — starts with all items on
+    /// the floor, but the client never runs the item's `place_item` think that would make the shadow
+    /// entity solid, so without this a client bot believes *nothing* is up until it has physically
+    /// looked at each pad, and spends the opening minutes ignoring the quad it should be racing for
+    /// (qwprogs bots run the think, so they know at once — this closes that gap). The seed is
+    /// optimistic and self-correcting: the first clear look at a pad that's actually empty (a connect
+    /// mid-respawn) flips it to taken with the right timer, and for the quad "wrong" can never cost
+    /// more than one 60 s respawn cycle. It survives the bot's own death for free — this store is the
+    /// squad's shared world, rebuilt only on a map change, not per life.
+    pub(crate) fn index_items(&mut self, game: &mut GameState) {
         self.items = game
             .entities
             .live()
             .filter(|(_, e)| e.classname().is_some_and(crate::bot::goals::is_goal_classname))
             .map(|(i, e)| (i, e.v.origin))
             .collect();
+        for &(item, _) in &self.items {
+            let ent = &mut game.entities[item];
+            ent.v.solid = Solid::Trigger;
+            ent.think = crate::entity::Think::None;
+            ent.v.nextthink = 0.0;
+        }
         // The CTF flags too — spawned from the map only in CTF, so this is empty in every other mode
         // and `write_flags` no-ops. Their team and home are already on the shadow entity.
         self.flags = game

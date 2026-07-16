@@ -535,7 +535,7 @@ impl Client {
         // The items are what the world reasons about the *absence* of, so it has to know where they
         // all are before the first frame lands. Everything else it remembered — which shadow entity
         // was which door, what was in the air — named slots in a map that no longer exists.
-        self.world.index_items(&self.game);
+        self.world.index_items(&mut self.game);
         // And the nail pools were allocated out of the old map's entity range, which
         // `spawn_shadow_world` has just handed back.
         for b in &mut self.bots {
