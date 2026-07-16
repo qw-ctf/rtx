@@ -317,11 +317,20 @@ cargo build --release -p rtx-client
 It's optional to compile — a cargo feature on `rtx-game` that the default build never enables, so the
 game module is unaffected either way.
 
-**The maps must be on disk**; nothing is downloaded. `--basedir` names the directory holding `qw/`,
-`id1/`, … and each is searched the way the engine searches it: that directory's paks first (highest
-numbered first), then its loose files. Getting that order wrong loads a different copy of the map than
-the server has, and the checksum sent at `prespawn` is then a checksum of the wrong file — which a
-server answers by dropping the connection without a word.
+**It works out what game it joined.** rtx servers publish the mode in serverinfo, in the same
+vocabulary [KTX](https://github.com/QW-Group/ktx) uses (`mode`, `status`), so one parser reads both —
+and the client selects the matching brain (deathmatch, midair, CTF, and so on) before it spawns the
+world. A `+set rtx_mode`/`rtx_match` on the command line overrides the guess; a server that says
+nothing recognisable is played as deathmatch. Teams, when there are any, come through userinfo, so the
+bots fight the right side without needing to be told the format.
+
+**Maps are found or fetched.** `--basedir` names the directory holding `qw/`, `id1/`, … and each is
+searched the way the engine searches it: that directory's paks first (highest numbered first), then
+its loose files — getting that order wrong loads a different copy than the server has, and the
+checksum sent at `prespawn` is then a checksum of the wrong file, which a server answers by dropping
+the connection without a word. A map that's nowhere on disk is **downloaded** over HTTP from the
+community map repository before signon completes (`--no-download` to disable), so the client can join a
+public server running a map you've never seen.
 
 `--bots N` brings a **squad**: N connections in one process, sharing one world. That isn't a shortcut
 — it's what the bots already have inside `qwprogs`, where teammates share item timers and an opponent
@@ -337,9 +346,10 @@ and the reason these can play against people without being something other than 
 | `--spectate` | watch without playing; the parser soak |
 | `--skill 0..7` | as `rtx_bot_skill` |
 | `--team`, `--name`, `--skin`, `--colors` | userinfo, as any client sends |
+| `--no-download` | fail rather than fetch a missing map |
 | `--control-port <n>` | the same TCP harness the server-side bots expose (`status`, `goto`, `cell`, `links`, …) |
 | `--wiretap <dir>` | record every datagram, as a parser fixture |
-| `+set <cvar> <value>` | override an rtx tunable |
+| `+set <cvar> <value>` | override an rtx tunable (e.g. `+set rtx_mode ctf`) |
 
 ## Building
 
