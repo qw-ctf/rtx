@@ -417,11 +417,16 @@ impl Client {
             if auto_ready && !bot.session.at_intermission() {
                 bot.session.ready_up();
             }
-            // At a scoreboard the body is a camera on a pole. The brain doesn't know the game is
-            // over — it can't; nothing it reads says so — and would spend the intermission walking
-            // into a wall and shooting at it.
+            // At a scoreboard, hold +attack and nothing else. The map won't advance without it: the
+            // stock intermission (`server.rs` `intermission_think`) waits for a *held* button once
+            // its own five-second minimum has passed, and a bots-only server with no `rtx_maplist`
+            // will otherwise sit on the scoreboard forever. We still suppress the brain's own cmd —
+            // the bot mustn't try to *play* the scoreboard, it can't see that the game is over — so
+            // this is a fixed press, not the emitted move. KTX advances by its own clock and ignores
+            // the button harmlessly.
             if bot.session.at_intermission() {
-                bot.session.send_idle()?;
+                let attack = rtx_proto::clc::button::ATTACK;
+                bot.session.send_move(glam::Vec3::ZERO, 0, 0, 0, attack, 0)?;
                 continue;
             }
 
