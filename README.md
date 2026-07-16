@@ -1,366 +1,85 @@
 # rtx
 
-A native-Rust **QuakeWorld game module** with **Unreal Tournament-style movement**
-layered on top of faithful QuakeWorld gameplay.
+A **QuakeWorld game module in native Rust** — faithful QuakeWorld gameplay with
+**Unreal Tournament-style movement** on top, and **navmesh bots** that play it anywhere:
+on the server, or connected to any server as real network clients, both QuakeWorld and
+NetQuake servers.
 
-It reimplements the original QuakeWorld `qwprogs.dat` logic (the `qw-qc` QuakeC) as a
-`cdylib` that the server loads as a **pr2 native game module** (`GAME_API_VERSION 16`) in
-place of `qwprogs.dat` — the same host ABI [KTX](https://github.com/QW-Group/ktx) uses. The
-gameplay mirrors stock QuakeWorld; the movement additions are the reason this exists.
+It reimplements the original QuakeWorld `qwprogs.dat` logic as a `cdylib` the server loads as a
+**pr2 native game module** (`GAME_API_VERSION 16`) — the same host ABI
+[KTX](https://github.com/QW-Group/ktx) uses. Drop it in place of `qwprogs.dat` and the gameplay
+mirrors stock QuakeWorld; everything on top is a cvar you can switch off.
 
-## Unreal Tournament 4 influences
+## Highlights
 
-Mechanics inspired by **Unreal Tournament 4**, layered on top of QuakeWorld. Each is a cvar;
-all are server-authoritative. Set any to `0` to disable.
+- **UT-style movement** — double jump, wall dodge, elevator jump, and the shock combo
+  (shootable grenades), layered onto QuakeWorld without breaking bunnyhopping.
+  → [movement & combat](docs/movement.md)
+- **The grappling hook** — the classic Wedge hook, ported from purectf. Bots swing it too.
+  → [movement & combat](docs/movement.md#grappling-hook)
+- **Game modes** — deathmatch, Rocket Arena, midair, CTF, and timed race routes, each
+  composable with an orthogonal match format (FFA, `1on1`, `2on2`, `2on2on2`, …).
+  → [modes & match composition](docs/modes.md)
+- **Bots without waypoint files** — the navmesh is generated from the map's BSP at load time.
+  Bots bunnyhop, speed-jump, double-jump, rocket-jump, and grapple across it.
+  → [the bots](docs/bots.md)
+- **Bots that play like players** — they see, hear, and feel before they fight; value items the
+  way KTX duellers do; model their opponents from observation; and bank grenades around
+  corners. In team modes they spread fire, reserve pickups, and run CTF roles.
+  → [the bots](docs/bots.md)
+- **The same bots as network clients** — `rtx-client` joins any QuakeWorld (or NetQuake) server
+  over UDP with the identical brain, fetching maps it doesn't have.
+  → [the bots as network clients](docs/netclient.md)
+- **Everything is a cvar** — every mechanic, mode, and bot behaviour has a switch.
+  → [cvar reference](docs/cvars.md)
 
-### Movement — air game & wall dodge
+## Quick start
 
-| cvar | default | what it does |
-|------|---------|--------------|
-| `rtx_doublejump` | `1` | A second jump in mid-air, **once per air travel**. Gated so a jump tapped just before landing can't steal it — QuakeWorld **bunny hopping is preserved**. |
-| `rtx_walljump` | `1` | Kick off a wall you jump into: your velocity is mirrored across the wall and you launch out-and-up — UT's wall dodge. Repeatable; geometry-limited. |
-| `rtx_elevator_jump` | `2` | Jumping off a **rising lift** folds the lift's speed into your jump (`lift_speed × cvar + base`), so you launch higher the faster it moves. It's a multiplier: `0` off, `1` = the lift's true speed, `2`+ for more air. |
-
-### Combat — the shock combo
-
-| cvar | default | what it does |
-|------|---------|--------------|
-| `rtx_shootable_grenades` | `1` | Shooting a live grenade in flight detonates it. This is QuakeWorld's take on UT's **Shock Rifle combo** — where the slow energy ball from alt-fire is set off by the fast hitscan beam. Here the grenade is the slow projectile, and any shot that damages it triggers the blast. |
-
-### A note on prediction
-
-These run **server-side** (in `PlayerPreThink`, before the engine's player move). Stock
-QuakeWorld client prediction doesn't know the rules, so each triggers a one-frame correction
-"pop" — the jump itself is authoritative and always happens, but predicting it smoothly would
-need a CSQC client mirroring the same `pmove` logic.
-
-## Grappling hook
-
-Not a UT mechanic but a classic QuakeWorld one — the Wedge (Steve Bond) grappling hook,
-ported from **purectf** (minus its CTF team logic), with
-[KTX](https://github.com/QW-Group/ktx)'s quieter sound: a one-shot throw/impact instead of
-the old looping chain rattle.
-
-| cvar | default | what it does |
-|------|---------|--------------|
-| `rtx_grapple` | `1` | Every player **spawns holding** a grappling hook (no ammo). Fire to throw it; the hook sticks to walls — or players, who get dragged and lightly damaged — and reels you toward it while you hold fire (a moving anchor carries you along). Select it with **impulse 22** or by **double-tapping impulse 1** (toggles axe ↔ hook). `0` disables it. |
-| `rtx_weapons` | `axe hook sg ssg ng sng gl rl lg` | The weapons the server runs with, as a space-separated token list (`axe`, `hook`, `sg`, `ssg`, `ng`, `sng`, `gl`, `rl`, `lg`). A weapon **absent from the list is removed everywhere**: its map pickup (`weapon_*`) never spawns and it's stripped from every spawn kit, so it can't be picked up or fired (bots included). Set e.g. `rtx_weapons "axe sg rl"` for a rockets-first server. Unknown tokens (e.g. `coil`) are ignored; `hook` composes with `rtx_grapple` (both must allow it). Map pickups update on the next **map load**, spawn kits on the next **respawn**. |
-
-Throw and reel speeds are tunable via `rtx_hook_speed` (default `1.25`) and `rtx_hook_pull`
-(default `1.0`) — purectf's `hookspeed`/`hookpull`, each a multiplier on its base speed.
-
-It reels server-side too, so it shows the same one-frame prediction pop as the movement
-features above. The hook's models and viewmodel must be in the gamedir:
-`progs/{star,bit,v_star}.mdl`. Bots use it to navigate — see [Bots](#bots), where the navmesh grows
-hook links a bot swings across.
-
-## Game modes
-
-Gameplay has **two orthogonal axes**. The **game mode** (`rtx_mode`) is the ruleset; the **match
-composition** (`rtx_match`) is how the match is organized. They're independent: deathmatch and CTF
-each run under any composition (open free-for-all, or a locked `2on2`/`4on4`/…), while Rocket Arena
-and midair are inherently duel rulesets. Modes are pluggable: each one overrides only the policy it
-changes — **ruleset** (round/damage/respawn rules), **spawns**, **loadout**, and the **bot brain** —
-behind a small `GameMode` trait (`src/mode/`). Deathmatch is just the baseline mode, so adding a
-mode doesn't touch the generic gameplay or bot code.
-
-| cvar | default | what it does |
-|------|---------|--------------|
-| `rtx_mode` | `dm` | Ruleset: `dm` = deathmatch (stock behaviour). `ra` = Rocket Arena. `midair` = airborne-only rocket DM. `ctf` = Capture the Flag. `race` = timed KTX race routes (bhop/speed-jump harness). |
-| `rtx_match` | *(auto)* | Composition, orthogonal to the mode. Empty = the mode's natural default (dm → open FFA, ctf → open 2-team pickup, midair → 1on1 duel). `ffa` = open free-for-all. A **team format** (`1on1`/`duel`, `2on2`, `2on2on2`, any `NonM…`) = a locked N×M match. Ignored by `ra`; CTF clamps it to 2 teams. |
-| `rtx_ra_countdown` | `3` | Rocket Arena: seconds of spawn-protected countdown before "FIGHT". |
-| `rtx_midair_minheight` | `40` | Midair: minimum height (units) above the floor for a victim to count as airborne. |
-| `rtx_midair_kb_ground` / `rtx_midair_kb_air` | `6` / `3` | Midair: rocket knockback multipliers for grounded vs airborne victims (ground is stronger, to launch players up). |
-| `rtx_match_countdown` | `3` | Team match (`rtx_match` format) / CTF: seconds of spawn-protected countdown after the match-start map reload before "FIGHT". |
-| `rtx_capturelimit` | `8` | CTF: captures a team needs to win (`0` = no limit, ends on `timelimit`). |
-| `rtx_race_route` | `0` | Race: which of the current map's routes to run (0-based, clamped). Read live — changing it moves everyone to the new route's start. |
-| `rtx_runes` | `0` | CTF runes: `0` = on (Haste adds move speed), `1` = off, `2` = on without the speed boost. |
-| `rtx_ctf_tossflag` / `rtx_ctf_tossrune` | `0` / `0` | CTF: allow tossing your carried flag (impulse 26) / held rune (impulse 24). |
-| `rtx_dropitems` | `0` | Outside Race: let players hand items to teammates — a **capped ammo backpack** (impulse 20; up to 20 shells / 20 nails / 10 rockets / 20 cells, deducted from you) and your **current weapon** (impulse 21; drops it as a pickup and switches you to your next-best gun — the axe, single shotgun, and grapple stay). Race never creates dropped items. Ported from purectf. |
-
-**`ra` — Rocket Arena.** Round-based 1v1 duels following the classic arena loop (ported from the
-Frogbot-Rocket-Arena QuakeC, minus its clan-arena team machinery). Two players fight in the arena
-at a time; everyone else waits in the **audience** (the `info_player_deathmatch` spots — the
-stands) and roams there. Each round the fighters spawn with a
-**full loadout** (all weapons, full ammo, red armour) **inside the arena** (the
-`info_teleport_destination` spots), are invulnerable through a short countdown, then fight. During
-the countdown you can move to position but **can't fire yet** (a screen blink if you try); at
-"FIGHT" weapons go hot. Getting killed **drops you to the audience**; the **winner stays** — kept
-in place and topped back up to full — and faces the next challenger pulled from the front of the
-audience queue (losers go to the back), so the arena is always a fresh duel. On a plain deathmatch
-map with no teleport destinations it falls back to DM spawns so the mode still runs. Bots play it
-fully — see below.
-
-**`midair` — airborne-only rocket DM** (modeled on [KTX](https://github.com/QW-Group/ktx)'s
-midair). Everyone spawns with a **rocket launcher** (+ axe), 255 rockets, red armour and 250
-health, at normal gravity. A direct rocket on an **airborne** victim is an **instant kill**; on a
-**grounded** victim it deals no damage but delivers a hard **knockback that launches them skyward**
-— so you rocket someone up, then airshot them out of the air. Non-rocket damage is harmless, and
-your own rockets never hurt you but still fling you (free rocket-jumps). Kills score by **how high
-the victim was** (vertical distance from where you fired): **bronze/silver/gold/platinum** for
-**+1/+2/+4/+8** at `>0/256/512/1024` units, announced as an airshot line. By default midair runs as
-a **1on1 duel** (a structured match — see below); set `rtx_match ffa` for a continuous free-for-all,
-or a team format like `2on2`. Bots play it — they hunt the nearest enemy, launch grounded targets
-and airshot them.
-
-**Match composition — `rtx_match`.** Orthogonal to the mode, this picks how the match is organized.
-Empty (the default) uses the mode's natural composition; `ffa` forces open free-for-all; a **team
-format** (`1on1`/`duel`, `2on2`, `2on2on2`, any `NonM…`) picks **N teams of size M** (`2on2on2` =
-three teams of two) and applies to deathmatch and CTF alike. A team composition gives each team a
-colour (red/blue/green/…) and its `info_player_teamN` spawns (DM spawns as fallback), turns on
-friendly fire (`teamplay`), and — for a plain **team deathmatch** — has teams frag to the
-`fraglimit`. The lifecycle is warmup → **`start`** → live → results: in **warmup** everyone plays and
-is auto-balanced onto the smallest team; typing **`start`** in the console **reloads the map** (fresh
-entities) and runs a countdown, **locking the roster**; play then runs to the limit and returns to
-warmup. A **structured** format (`teams × size`) locks **exactly that many seats** at `start` (humans
-before bots, rebalancing the sides); anyone over the count — and any **late joiner** — is **benched**
-as a harmless spectator (axe only, damage refused, roaming the stands) until the next warmup. Bots
-fill exactly the empty seats and freeze once the match is live. Players who drop and reconnect are
-**reattached to their team**. Bots target only the other side.
-
-**`ctf` — Capture the Flag** (modeled on **purectf**), built on the composition layer above. Two teams
-(red/blue) each own a flag at a base (`item_flag_team1`/`item_flag_team2`). Grab the **enemy** flag,
-carry it to **your** base while **your** flag is home, and it's a **capture** (+1 to your team, +15
-frags to the carrier). Touch your **own** flag where it lies to **return** it (+1); a dropped flag
-also **auto-returns** after 40 s, and a killed carrier **drops** it where they fell. Teams win at
-`rtx_capturelimit`. It uses the same match lifecycle as team DM — warmup → **`start`** (map reload +
-countdown) → live → results — with friendly fire via `teamplay`, the grapple handed out for movement,
-and CTF bots that **split into roles**: most attack (grab the enemy flag and run it home), while a
-minority (about a third, at least one) defend — holding the base, intercepting attackers that close
-on it, chasing down whoever steals the flag, and re-touching a dropped flag to return it. A carrier
-always runs home regardless of role. Full purectf scoring is in:
-capture +15, teammates +10, plus the frag-carrier, carrier-protect, flag-defense, and return/frag
-**assist** bonuses. The four **runes** (Resistance, Strength, Haste, Regeneration — `rtx_runes`) spawn
-at DM points, one per player, dropped on death; the flag and rune can be tossed (`rtx_ctf_tossflag`
-/ `rtx_ctf_tossrune`, impulse 26 / 24). CTF requires the flag model **`progs/flag.mdl`** (and the
-rune models `progs/end1-4.mdl`) in the gamedir.
-
-**`race` — timed KTX race routes.** Run a course from its **start pad** through its **checkpoints**
-to the **finish**, timed per runner — and, first and foremost, a **sanity harness** for the bot
-movement system: most race routes are unfinishable without bunnyhop-accumulated speed, so a bot
-finishing (or **timing out on a named leg**) is a live regression check on the speed-jump / bhop
-machinery. Routes load from two sources, exactly as [KTX](https://github.com/QW-Group/ktx) does:
-`race_route_start` / `race_route_marker` **entities embedded in the map** (race11–20, race32c), and
-external **`race/routes/{mapname}.route`** command files (race1–10, ztricks, ztricks2 — copy KTX's
-examples into the gamedir). Everyone spawns on the active route's start pad (**axe only**, KTX
-`raceWeaponNo`); the clock starts when the runner leaves the start box, checkpoints must be touched
-**in order**, the finish broadcasts the time, and `race_route_timeout` without finishing resets the
-run. Deaths and manual toss commands never leave backpacks or dropped weapons on the course, and a
-bot always keeps the next checkpoint/finish as its hard objective. Because race maps are authored
-for **stock movement + bunnyhop only**, the mode reports
-`stock_movement_only`: double jump, wall jump, elevator jump, grapple and rocket jumps are switched
-**off** — both as live mechanics and as navmesh links — so bots must reach everything by bhop and
-speed jumps, and a failed pathfind is honest. At map load the mode prints a **routability report**,
-one `PASS`/`FAIL` line per route, answering whether every leg is traversable with race-legal
-movement (needs `rtx_bot_bhop 1` for the speed-jump links; it warns if that's off). Switch routes
-live with `rtx_race_route`. **Known gap:** routes that gain height via a **slope launch** (hitting an
-angled ramp at tremendous bhop speed, the engine redirecting horizontal velocity upward) or that
-chain **speed carried between jumps** across a long traverse are not yet modelled in the navmesh —
-the routability report names the exact legs — so those `FAIL` today; that's the next feature, best
-built and tuned against a live server.
-
-## Bots
-
-Navmesh-driven bots that need **no per-map waypoint files** — the navmesh is generated from the
-map's BSP clip hull when the map loads. Bots are real client slots: the engine runs their input
-through the same player-move code as humans, so gravity, stepping, and jumps come for free.
-
-| cvar | default | what it does |
-|------|---------|--------------|
-| `rtx_bot_count` | `0` | How many bots to keep on the server. The population is reconciled to this count (spawning/removing as needed), leaving room for humans. Bots only spawn once the map's navmesh is built. |
-| `rtx_bot_alone` | `0` | Keep bots on the server even when **no humans** are connected (`0` = bots leave an empty server; `1` = they stay and play it out). |
-| `rtx_bot_skill` | `3` | Bot skill (0–7): tightens aim, speeds how fast a bot turns/tracks, widens its view cone, and shortens its reaction time. |
-| `rtx_bot_pacifist` | `0` | Make bots **not fight** outside Race — they just trail the nearest human around the map (for experimenting). Race bots always follow their checkpoint/finish route, which is already non-combat. `0` = bots play the mode normally. |
-| `rtx_bot_greed` | `1` | Let a fighting bot take **optional ordinary item detours** — a missing weapon or worthwhile health/armor swing. Critical local recovery and major objectives (quad/pent/ring and CTF runes) are never disabled by this cvar. |
-| `rtx_bot_fov` | `120` | View cone (full angle, degrees) within which a bot can **see** a target; widened with skill. A nominated enemy outside the cone (or behind cover) isn't engaged until seen, heard firing, or felt as damage. `0` = 360° sight (the old always-aware behavior). |
-| `rtx_bot_reaction` | `0.4` | Base **reaction delay** (seconds) a target must stay in sight before the bot acts on it; shortened with skill (floored so even skill 7 isn't instant). `0` = react instantly. |
-
-In open play each bot **hunts and frags the nearest player** — everyone's an enemy, so a
-bots-only server plays itself — pathing to them and, once in sight, aiming and shooting via the
-shared combat layer (retreating when hurt, grabbing items it passes over). Set `rtx_bot_pacifist 1`
-and, outside Race, they stop fighting and just tail the nearest human instead. With nothing to
-chase and no human to follow, a bot **roams** to a random reachable spot rather than standing on its
-spawn.
-
-A bot doesn't fight a target it hasn't actually **perceived**: an enemy has to be **seen** (inside
-the bot's view cone `rtx_bot_fov`, with line of sight, held for a `rtx_bot_reaction` beat), **heard**
-firing nearby, or **felt** as incoming damage before the bot engages it — so instead of psychically
-beelining an unseen enemy it patrols and collects until real contact, and when it loses sight it
-**hunts the last spot it saw them** for a few seconds before giving up rather than tracking them
-through walls. Aim is loosest on first glimpse and while moving, tightening as it holds a target in
-view. In **team and CTF** modes coordination is always active: a team **spreads its fire** across the
-enemy side, gives each pickup a stable nearest-bot reservation, and sends only the nearest responder
-to a teammate's recent damage call (two for a flag carrier). Bots avoid ally splash and stagger routes
-around occupied teleporter exits. CTF teams split into stable **attack, midfield, and defense** roles;
-attackers can detour for major items, midfielders control powerups/runes and crossings, defenders
-spread around the base, and escorts peel for the carrier.
-
-Navigation is **loop-resistant**: when a bot fails to traverse a link (a jump it keeps undershooting,
-a spot it wedges on, a leg that makes no headway toward the goal) that link gets a temporary per-bot
-cost penalty, so its next path **routes around** the trouble instead of the planner handing back the
-identical dead route to retry until a timeout fires. A dash of per-bot path jitter also keeps two
-bots from treading an identical line. Gap/double/speed-jump traversal is an **indivisible action**:
-it is armed before combat arbitration, freezes route advancement while airborne, and releases only
-after a physical landing, so spotting an enemy at the lip cannot make a bot turn and fall into the gap.
-
-Bots value pickups the way ktx does: each item's **desire** is the marginal effective-HP (health,
-armor), firepower (weapons, ammo), or flat dominance (powerups/runes) it would give *this* bot now,
-weighted by travel and respawn time. The planner evaluates a bounded **two-pickup sequence**, so a
-nearby useful item can become the first stop on the way to armor or quad; the second stop is promoted
-and revalidated after the first touch rather than followed blindly. A perceived opponent's estimated
-need adds denial value, while a weaker bot yields an ordinary contest the enemy reaches first. Bots
-skip health at full, owned weapons, capped ammo, and anything that cannot be collected before a timed
-match ends, while treating **quad, pent, ring, and CTF runes** as completion-critical objectives.
-While timing a hidden quad/pent/ring, the bot may insert a nearby spawned health, armor, or weapon
-only when the complete detour still reaches the powerup on time, turning respawn wait into useful
-preparation instead of walking past yellow armor to idle. When a bot reaches an item that hasn't respawned yet, it
-doesn't stand and twitch on the spot — it **cruises** a short walk around the spawn, panning the view
-to **scan for enemies** (which genuinely widens what it can see), and heads back to stand on the point
-just as the item returns. Dropped **backpacks** (a dead player's weapon + ammo, or a
-teammate's toss) are sought and collected the same way. In combat, a hysteretic
-**Recover / Hold / Press** posture compares effective strength and firepower using observation-gated
-opponent estimates. A weak or critically hurt bot commits movement to reachable health, armor, or a
-needed weapon; combat may keep aiming/firing but cannot strafe it off the final pickup. The same lock
-protects a powerup plan, and a universal fake-client pickup pass covers flags and runes as well as
-ordinary items. `rtx_bot_greed` controls only additional ordinary combat detours. Otherwise (when a
-mode leaves the brain in charge) it pathfinds to the best reachable **item
-pickup**, or **follows the nearest human** (through doors, off ledges, across jumps, recovering after
-a missed jump). On open, roughly-straight stretches they **bunnyhop** (`rtx_bot_bhop`) — chaining jumps
-and **air-strafing** (sweeping the view while holding one strafe key) to exploit QuakeWorld's
-air-acceleration and build speed far past `sv_maxspeed`, weaving the heading toward the waypoint;
-they drop back to a normal gait for corners, ledges, combat, or the final approach to a goal. That
-speed unlocks **speed jumps** — the navmesh links **gaps too wide for any normal or double jump**,
-cleared by arriving at the takeoff with built-up bhop speed (a jump's reach = speed × airtime, and
-airtime is fixed, so faster = farther). Each such link's start is the *runway* itself, so a bot that
-takes it is guaranteed to run the whole accelerating approach before the leap — and it refuses to
-launch if it somehow reaches the edge too slow. These are the only way across a wide gap when the
-double jump is off. When `rtx_doublejump` is on, the navmesh also links the **wider gaps and higher
-ledges
-a double jump reaches** — the bot ground-jumps, then **air-jumps near the apex** to restack the arc
-and clear a gap a single jump can't (it also spends the air jump to recover an undershot ordinary
-jump). When `rtx_grapple` is on, the navmesh also grows **hook links** — edges a bot crosses
-with the **grappling hook**: it throws the hook at an anchor, reels to build speed, then **releases
-mid-reel so the resulting velocity flings it along a parabola** onto a ledge or across a gap a plain
-jump can't reach (a straight pull-up is just the degenerate case). Because the arc is deterministic,
-the links are found and verified when the map's navmesh is built by simulating the swing against the
-BSP, and A* prices them as travel time — so bots take a hook only when it beats the ground route.
-This measurably widens where bots can go on vertical/CTF maps. The mode can redirect the brain
-without touching it: in **Rocket Arena** bots
-**fight** — they path to the nearest enemy and, once they have line of sight, aim (leading the
-target for rockets), pick a weapon by range, strafe/retreat, and fire — and, when eliminated, roam
-the audience like everyone else. The combat layer (`src/bot_combat.rs`) is generic and reused by
-any mode that hands a bot an enemy. A bot's view **lerps** toward its target angle rather than
-snapping, so it turns naturally when spectated; both the turn/track speed and aim tightness scale
-with `rtx_bot_skill` (a low-skill bot visibly swings onto a target more slowly).
-Explosive fire projects the bot's own post-armor health loss using the live quad multiplier (4×, or
-8× in deathmatch 4) and CTF rune scaling. Quad rockets/grenades use KTX's conservative **250-unit
-self-splash caution zone**: the bot switches to a direct gun when possible and the final trigger
-gate withholds a dangerous shot if it cannot, while pent/god mode and Midair self-rockets stay exempt.
-
-Bots also play the **shootable-grenade** game (above). Defensively they shoot down an **incoming**
-grenade — but only from outside its blast, weighed against their own health (the closer it is, the
-more health it takes to justify setting it off) — and a grenade too close to safely pop makes them
-**run and hop clear** instead of detonating it in their own face. Offensively they use splash weapons for
-**position manipulation** — if an enemy stands near **lava, slime, a pit or a ledge**, the bot sets
-off a blast so the outward **knockback shoves them into the hazard**, verifying the shove actually
-carries them across the edge before committing. It's a **generic strategy** — the blast point sits on the ground **behind** the enemy (away from the
-hazard) so the outward splash drives them in — with two deliveries: a **rocket** put straight onto
-that ground spot (no direct hit needed; a static point is easy to hit and works from any angle with a
-clear line to it), or a **grenade lob→shoot combo** when the blast must be **arced over** the enemy
-to reach it — aim a ballistic arc (solved from the launcher's fixed speed/loft against gravity), lob,
-switch to a hitscan gun, and detonate in flight. With no hazard the grenade combo becomes a plain
-airburst. All of it is safety-checked — never self-splash, never a
-teammate, never a shove the wrong way, never a lob into a wall.
-
-Projectile survival does not depend on shootable grenades: bots predict the closest approach of live
-**rockets and nails**, sample the next part of a grenade's gravity arc and fuse, respect intervening
-world collisions, and take a hazard-checked lateral escape when the damage tube intersects them.
-Higher skill notices the same geometry earlier. During a visible duel the normal strafe is also biased
-away from the opponent's current aim line. These evasions cannot interrupt a committed gap jump or
-the final approach to a critical pickup.
-
-They also throw **indirect bank shots** at enemies with **no line of sight**: a solver simulates a
-bouncing grenade against the map's collision hull (a real `SV_RecursiveHullCheck` trace, reflecting
-off surface normals with QuakeWorld's `MOVETYPE_BOUNCE` physics), searching launch angles for one
-whose ricochet path reaches the hidden enemy — then lobs it and lets the **2.5 s fuse** detonate it
-around the corner (a launch-jitter robustness sweep rejects knife-edge angles the throw's spread
-would spoil). It's gated to stay honest and rare — a recently-seen, slow target and higher bot skill
-— with flag carriers worth a blind lob past the throttle.
-
-## Map rotation
-
-Set **`rtx_maplist`** to a whitespace-separated list of maps and the server cycles through them **in
-order** each time a level ends (on `timelimit`/`fraglimit`, or when a team match finishes):
-
-```
-set rtx_maplist "dm2 dm3 dm4 dm6 aerowalk"
-```
-
-The next map is the one after the current map in the list (wrapping around; if the current map isn't
-listed, the rotation starts at the first entry). It takes precedence over a serverinfo `nextmap`.
-When a list is configured the end-of-level intermission scoreboard **auto-advances** after its pause
-instead of waiting for a player to press a button; with no list set, the stock behaviour is
-unchanged. Leave `rtx_maplist` empty (the default) to disable rotation.
-
-## The bots as network clients
-
-The same bots also run **outside** a server, as ordinary QuakeWorld clients. `rtx-client` connects
-over UDP, completes a real handshake and signon, and plays — so the bots can be pitted against humans
-on any server, or against bots hosted by someone else's `qwprogs`. It is the *same brain*: the same
-`run_bots` over the same `GameState`, and it doesn't know which of the two it's under.
-
-```sh
-cargo build --release -p rtx-client
-./target/release/rtx-client --server localhost --basedir ~/Games/Quake --bots 2
-```
-
-It's optional to compile — a cargo feature on `rtx-game` that the default build never enables, so the
-game module is unaffected either way.
-
-**It works out what game it joined.** rtx servers publish the mode in serverinfo, in the same
-vocabulary [KTX](https://github.com/QW-Group/ktx) uses (`mode`, `status`), so one parser reads both —
-and the client selects the matching brain (deathmatch, midair, CTF, and so on) before it spawns the
-world. A `+set rtx_mode`/`rtx_match` on the command line overrides the guess; a server that says
-nothing recognisable is played as deathmatch. Teams, when there are any, come through userinfo, so the
-bots fight the right side without needing to be told the format.
-
-**Maps are found or fetched.** `--basedir` names the directory holding `qw/`, `id1/`, … and each is
-searched the way the engine searches it: that directory's paks first (highest numbered first), then
-its loose files — getting that order wrong loads a different copy than the server has, and the
-checksum sent at `prespawn` is then a checksum of the wrong file, which a server answers by dropping
-the connection without a word. A map that's nowhere on disk is **downloaded** over HTTP from the
-community map repository before signon completes (`--no-download` to disable), so the client can join a
-public server running a map you've never seen.
-
-`--bots N` brings a **squad**: N connections in one process, sharing one world. That isn't a shortcut
-— it's what the bots already have inside `qwprogs`, where teammates share item timers and an opponent
-model because they talk to each other. Each bot's body and stats are its own; what any of them sees,
-all of them know.
-
-What a client cannot know, it doesn't pretend to. An enemy's health isn't on the wire and never will
-be, so a client bot estimates it from what it sees and hears — which is the position a human is in,
-and the reason these can play against people without being something other than a player.
-
-| | |
-|---|---|
-| `--spectate` | watch without playing; the parser soak |
-| `--skill 0..7` | as `rtx_bot_skill` |
-| `--team`, `--name`, `--skin`, `--colors` | userinfo, as any client sends |
-| `--no-download` | fail rather than fetch a missing map |
-| `--config <file>` | a cvar cfg to apply on startup — the client's `server.cfg` (defaults to `<basedir>/rtx.cfg`) |
-| `--control-port <n>` | the same TCP harness the server-side bots expose (`status`, `goto`, `cell`, `links`, …) |
-| `--wiretap <dir>` | record every datagram, as a parser fixture |
-| `+set <cvar> <value>` | override an rtx tunable (e.g. `+set rtx_mode ctf`) |
-
-## Building
+Run a server with it:
 
 ```sh
 cargo build --release
-cp target/release/librtx.so /path/to/server/qw/qwprogs.so   # or .dylib, .dll
+cp target/release/librtx.so /path/to/server/qw/qwprogs.so   # or .dylib / .dll
 ```
 
-The server needs pr2 / API 16 support. Prebuilt `qwprogs.so` / `qwprogs.dylib` artifacts are
-produced by the GitHub Actions `build` workflow.
+The server needs pr2 / API 16 support. Prebuilt `qwprogs` artifacts for Linux, macOS, and
+Windows come out of the GitHub Actions `build` workflow.
+
+Add bots in `server.cfg`:
+
+```
+set rtx_bot_count 4
+set rtx_bot_skill 3
+```
+
+Or point the bots at somebody else's server:
+
+```sh
+cargo build --release -p rtx-client
+./target/release/rtx-client --server quake.example.org --basedir ~/Games/Quake --bots 2
+```
+
+## Documentation
+
+| page | contents |
+|------|----------|
+| [Movement & combat](docs/movement.md) | Double jump, wall jump, elevator jump, the shock combo, the grappling hook, choosing the arsenal. |
+| [Game modes](docs/modes.md) | `dm`, `ra`, `midair`, `ctf`, `race`; match composition and the team-match lifecycle; map rotation. |
+| [The bots](docs/bots.md) | Perception, navigation and the navmesh's jump/hook links, item valuation, combat, teamwork. |
+| [The bots as network clients](docs/netclient.md) | `rtx-client`: joining any QW/NQ server, mode detection, map downloads, squads. |
+| [Cvar reference](docs/cvars.md) | Every `rtx_*` tunable with its default, on one page. |
+| [Development & tooling](docs/development.md) | Building, CI artifacts, tests, the control channel and tuning harness. |
+
+## Workspace
+
+| crate | |
+|-------|---|
+| `rtx-game` | the game module (`qwprogs` replacement) — all game logic |
+| `rtx-nav` | navmesh building and query over the BSP collision hull |
+| `rtx-proto` | the QuakeWorld and NetQuake wire protocols as pure codecs |
+| `rtx-client` | the bots as standalone network clients |
+| `navview` | a 3D viewer for the generated navmesh |
+| `rjmcp` | an MCP bridge for driving live bot-tuning sessions |
 
 ## License
 
