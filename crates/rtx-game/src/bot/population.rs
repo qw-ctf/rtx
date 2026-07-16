@@ -148,7 +148,7 @@ fn queue_add_bot(game: &mut GameState, index: i32) {
 
 /// A rotating set of bot names.
 fn bot_name(index: i32) -> &'static str {
-    const NAMES: [&str; 8] = [
+    const NAMES: [&str; 32] = [
         "Grunt",
         "Ranger",
         "Visor",
@@ -157,6 +157,30 @@ fn bot_name(index: i32) -> &'static str {
         "Hossman",
         "Daemia",
         "Klesk",
+        "Anarki",
+        "Angel",
+        "Biker",
+        "Bones",
+        "Cadaver",
+        "Crash",
+        "Doom",
+        "Gorre",
+        "Hunter",
+        "Keel",
+        "Lucy",
+        "Major",
+        "Mynx",
+        "Orbb",
+        "Patriot",
+        "Phobos",
+        "Razor",
+        "Slash",
+        "Sorlag",
+        "Stripe",
+        "TankJr",
+        "Uriel",
+        "Wrack",
+        "Xaero",
     ];
     NAMES[(index as usize) % NAMES.len()]
 }
