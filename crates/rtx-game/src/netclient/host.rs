@@ -34,7 +34,6 @@ use crate::entity::EntId;
 use crate::host::ClientHost;
 
 /// A usercmd the brain emitted this frame, waiting to be packed into a `clc_move`.
-///
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EmittedCmd {
     /// Which of our connections it belongs to (1-based client number).

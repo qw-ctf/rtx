@@ -18,7 +18,7 @@ use crate::game::GameState;
 use crate::obituary::DeathType;
 use crate::mode::ModePlayer;
 
-mod movement;
+pub(crate) mod movement;
 mod spawn_select;
 
 #[derive(Clone, Copy)]

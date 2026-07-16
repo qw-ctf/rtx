@@ -194,7 +194,39 @@ impl Frames {
         }
     }
 
-    /// The frame to ask the server to delta against, given the sequence of the packet we're about
+/// Remember a baseline that arrived as an entity *delta* rather than a fixed record.
+    ///
+    /// `svc_spawnbaseline2` is the FTE form, and it reuses the entity-delta encoding: it says only
+    /// what differs from nothing. Folding it onto an empty baseline gets the same thing the vanilla
+    /// message states outright — which is the point of the extension, since most baselines differ
+    /// from nothing in three or four fields and paying for all nine per entity is what it exists to
+    /// avoid.
+    pub(crate) fn set_baseline_delta(&mut self, number: u16, delta: &rtx_proto::svc::EntityDelta) {
+        let mut b = Baseline::default();
+        if let Some(v) = delta.model {
+            b.modelindex = v;
+        }
+        if let Some(v) = delta.frame {
+            b.frame = v;
+        }
+        if let Some(v) = delta.colormap {
+            b.colormap = v;
+        }
+        if let Some(v) = delta.skin {
+            b.skinnum = v;
+        }
+        for i in 0..3 {
+            if let Some(v) = delta.origin[i] {
+                b.origin[i] = v;
+            }
+            if let Some(v) = delta.angles[i] {
+                b.angles[i] = v;
+            }
+        }
+        self.set_baseline(number, b);
+    }
+
+        /// The frame to ask the server to delta against, given the sequence of the packet we're about
     /// to send. `None` asks for a full update.
     ///
     /// It takes `outgoing` because a base expires: the server's ring is [`UPDATE_BACKUP`] deep too,
@@ -208,7 +240,7 @@ impl Frames {
     }
 
     /// The current entity set, or empty before the first update lands.
-        pub(crate) fn current(&self) -> &[EntityState] {
+    pub(crate) fn current(&self) -> &[EntityState] {
         self.valid
             .and_then(|s| self.ring[s as usize & UPDATE_MASK].as_ref())
             .map(|s| s.entities.as_slice())

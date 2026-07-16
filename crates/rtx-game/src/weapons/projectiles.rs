@@ -9,6 +9,19 @@ use glam::Vec3;
 use super::*;
 use crate::math::vectoangles;
 
+/// How fast a rocket flies (`W_FireRocket`). Fixed in QuakeWorld — which is what lets a client read
+/// a rocket's heading off its angles the moment it appears, before there are two frames to
+/// difference it from.
+pub(crate) const ROCKET_SPEED: f32 = 1000.0;
+
+/// How fast a nail flies (`W_FireSpikes`). Fixed too, and the whole of what makes a nail's packed
+/// pitch and yaw enough to know where it is going.
+pub(crate) const NAIL_SPEED: f32 = 1000.0;
+
+/// How long a grenade burns before it goes off (`W_FireGrenade`). Never sent — a grenade looks like
+/// any other model on the wire — so a client counts it from when it first saw one, as a player does.
+pub(crate) const GRENADE_FUSE: f32 = 2.5;
+
 impl GameState {
     // --- rockets ---
 
@@ -62,7 +75,7 @@ impl GameState {
             mis.set_owner(e);
             mis.v.movetype = MoveType::FlyMissile;
             mis.v.solid = Solid::BBox;
-            mis.v.velocity = dir * 1000.0;
+            mis.v.velocity = dir * ROCKET_SPEED;
             mis.v.angles = vectoangles(mis.v.velocity);
             mis.set_touch(Touch::Missile);
             mis.combat.voided = 0.0;
@@ -148,7 +161,7 @@ impl GameState {
             mis.v.avelocity = Vec3::new(300.0, 300.0, 300.0);
             mis.v.angles = vectoangles(velocity);
             mis.set_touch(Touch::Grenade);
-            mis.v.nextthink = time + 2.5;
+            mis.v.nextthink = time + GRENADE_FUSE;
             mis.think = Think::GrenadeExplode;
             if shootable {
                 mis.v.takedamage = TakeDamage::Aim;
@@ -182,7 +195,7 @@ impl GameState {
             mis.classname = Some("spike".into());
             mis.think = Think::SubRemove;
             mis.v.nextthink = time + 6.0;
-            mis.v.velocity = dir * 1000.0;
+            mis.v.velocity = dir * NAIL_SPEED;
         }
         self.set_model(m, Model::PROGS_SPIKE);
         self.set_size(m, Vec3::ZERO, Vec3::ZERO);

@@ -15,6 +15,16 @@ use crate::defs::*;
 use crate::entity::{EntId, Think, Touch};
 use crate::game::{self, GameState};
 
+/// How long a powerup lasts. Never on the wire — a client sees only the item *bit* appear in
+/// `STAT_ITEMS`, and the moment it appears is the moment the clock started.
+pub(crate) const POWERUP_TIME: f32 = 30.0;
+
+/// What each armour absorbs. There's no stat for this either: `STAT_ARMOR` says how much is left and
+/// the `IT_ARMOR*` bit says which kind, so the fraction is looked up from the bit at both ends.
+pub(crate) const ARMOR_GREEN: f32 = 0.3;
+pub(crate) const ARMOR_YELLOW: f32 = 0.6;
+pub(crate) const ARMOR_RED: f32 = 0.8;
+
 impl GameState {
     // --- placement & respawn ---
 
@@ -231,9 +241,9 @@ impl GameState {
             return;
         }
         let (type_, value, bit) = match self.entities[e].classname() {
-            Some("item_armor1") => (0.3, 100.0, Items::ARMOR1.as_f32()),
-            Some("item_armor2") => (0.6, 150.0, Items::ARMOR2.as_f32()),
-            _ => (0.8, 200.0, Items::ARMOR3.as_f32()), // item_armorInv
+            Some("item_armor1") => (ARMOR_GREEN, 100.0, Items::ARMOR1.as_f32()),
+            Some("item_armor2") => (ARMOR_YELLOW, 150.0, Items::ARMOR2.as_f32()),
+            _ => (ARMOR_RED, 200.0, Items::ARMOR3.as_f32()), // item_armorInv
         };
         {
             let v = &self.entities[other].v;
@@ -385,17 +395,17 @@ impl GameState {
             Some("item_artifact_envirosuit") => {
                 let o = &mut self.entities[other];
                 o.combat.rad_time = 1.0;
-                o.combat.radsuit_finished = time + 30.0;
+                o.combat.radsuit_finished = time + POWERUP_TIME;
             }
             Some("item_artifact_invulnerability") => {
                 let o = &mut self.entities[other];
                 o.combat.invincible_time = 1.0;
-                o.combat.invincible_finished = time + 30.0;
+                o.combat.invincible_finished = time + POWERUP_TIME;
             }
             Some("item_artifact_invisibility") => {
                 let o = &mut self.entities[other];
                 o.combat.invisible_time = 1.0;
-                o.combat.invisible_finished = time + 30.0;
+                o.combat.invisible_finished = time + POWERUP_TIME;
             }
             Some("item_artifact_super_damage") => {
                 if self.level.deathmatch == 4 {
@@ -406,7 +416,7 @@ impl GameState {
                 }
                 let o = &mut self.entities[other];
                 o.combat.super_time = 1.0;
-                o.combat.super_damage_finished = time + 30.0;
+                o.combat.super_damage_finished = time + POWERUP_TIME;
             }
             _ => {}
         }

@@ -9,6 +9,10 @@ use glam::Vec3;
 
 use super::*;
 
+/// How long a lungful lasts (`WaterMove`). Anything short of fully submerged refills it, because
+/// your head is out and you are breathing.
+pub(crate) const AIR_TIME: f32 = 12.0;
+
 impl GameState {
     /// `PlayerJump`.
     pub(super) fn player_jump(&mut self, e: EntId) {
@@ -249,7 +253,7 @@ impl GameState {
                     .sound(e, Channel::Voice, Sound::PLAYER_GASP1, 1.0, Attenuation::Norm);
             }
             let ent = &mut self.entities[e];
-            ent.combat.air_finished = time + 12.0;
+            ent.combat.air_finished = time + AIR_TIME;
             ent.mover.dmg = 2.0;
         } else if air_finished < time && self.entities[e].combat.pain_finished < time {
             let ent = &mut self.entities[e];
@@ -387,7 +391,7 @@ impl GameState {
 
         // Biosuit — refresh air, expire quietly.
         if self.entities[e].combat.radsuit_finished != 0.0 {
-            self.entities[e].combat.air_finished = time + 12.0;
+            self.entities[e].combat.air_finished = time + AIR_TIME;
             if self.entities[e].combat.radsuit_finished < time + 3.0 {
                 self.powerup_warn(
                     e,

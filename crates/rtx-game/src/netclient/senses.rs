@@ -43,6 +43,7 @@ use crate::bot::perception::{heard_hypothesis, MEMORY};
 use crate::defs::Items;
 use crate::entity::EntId;
 use crate::game::GameState;
+use crate::items::POWERUP_TIME;
 
 /// A weapon-fire sound, and which weapon made it.
 ///
@@ -149,19 +150,12 @@ impl GameState {
     /// shooter's gun — not a player id. Picking the best candidate along that bearing is the same
     /// inference a player makes, and being wrong costs a bot a glance in the wrong direction.
     fn nearest_player_toward(&self, victim: EntId, from: Vec3) -> Option<EntId> {
-        let maxclients = self.host.cvar(c"maxclients") as u32;
-        let mut best: Option<(f32, EntId)> = None;
-        for i in 1..=maxclients {
-            let p = EntId(i);
-            if p == victim || !self.entities[p].in_use || !self.entities[p].is_alive() {
-                continue;
-            }
-            let d = self.entities[p].v.origin.distance(from);
-            if best.is_none_or(|(bd, _)| d < bd) {
-                best = Some((d, p));
-            }
-        }
-        best.map(|(_, p)| p)
+        crate::netclient::live_players(self)
+            .filter(|&p| p != victim)
+            .min_by(|&a, &b| {
+                let d = |p: EntId| self.entities[p].v.origin.distance(from);
+                d(a).total_cmp(&d(b))
+            })
     }
 
     /// Our own weapon re-arm, tracked because there's nothing else to track it with.
@@ -215,9 +209,6 @@ impl GameState {
         }
     }
 }
-
-/// How long a powerup lasts. The server's number; a client only sees the bit appear.
-const POWERUP_TIME: f32 = 30.0;
 
 #[cfg(test)]
 mod tests {

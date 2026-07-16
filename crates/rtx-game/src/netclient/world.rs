@@ -184,10 +184,8 @@ impl GameState {
 
         // Players are the only entities worth blocking a trace here: they're what "can I see you"
         // is about, and a rocket in flight doesn't stop a line of sight.
-        let maxclients = self.host.cvar(c"maxclients") as u32;
-        for i in 1..=maxclients {
-            let p = EntId(i);
-            if p == ignore || !self.entities[p].in_use || !self.entities[p].is_alive() {
+        for p in crate::netclient::live_players(self) {
+            if p == ignore {
                 continue;
             }
             let v = &self.entities[p].v;

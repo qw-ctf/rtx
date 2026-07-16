@@ -20,7 +20,7 @@ use crate::obituary::DeathType;
 mod select;
 mod shootable_grenade;
 mod hitscan;
-mod projectiles;
+pub(crate) mod projectiles;
 
 /// QuakeC `crandom` — a float in `[-1, 1)`.
 fn crandom(game: &mut GameState) -> f32 {

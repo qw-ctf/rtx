@@ -225,6 +225,20 @@ impl Session {
         &self.models
     }
 
+    /// The sound list — `svc_sound` carries an index into this, and the name behind it is what says
+    /// whether the bot just heard a rocket launcher or a footstep.
+    pub(crate) fn sounds(&self) -> &[String] {
+        &self.sounds
+    }
+
+    /// A move that stands still: the keepalive, with a body.
+    ///
+    /// A connected client that stops sending is a client the server times out, so there is no such
+    /// thing as "nothing to send" — only nothing to say.
+    pub(crate) fn send_idle(&mut self) -> io::Result<()> {
+        self.send_move(glam::Vec3::ZERO, 0, 0, 0, 0, 0)
+    }
+
     /// The server's info string.
     pub(crate) fn serverinfo(&self) -> &Info {
         &self.serverinfo
@@ -432,32 +446,7 @@ impl Session {
                 }
             }
             SvcEvent::SpawnBaseline { entity, baseline } => self.frames.set_baseline(*entity, *baseline),
-            SvcEvent::SpawnBaselineDelta { entity, delta } => {
-                // The FTE form arrives as an entity delta rather than a fixed record; fold it onto
-                // an empty baseline to get the same thing.
-                let mut b = rtx_proto::svc::Baseline::default();
-                if let Some(v) = delta.model {
-                    b.modelindex = v;
-                }
-                if let Some(v) = delta.frame {
-                    b.frame = v;
-                }
-                if let Some(v) = delta.colormap {
-                    b.colormap = v;
-                }
-                if let Some(v) = delta.skin {
-                    b.skinnum = v;
-                }
-                for i in 0..3 {
-                    if let Some(v) = delta.origin[i] {
-                        b.origin[i] = v;
-                    }
-                    if let Some(v) = delta.angles[i] {
-                        b.angles[i] = v;
-                    }
-                }
-                self.frames.set_baseline(*entity, b);
-            }
+            SvcEvent::SpawnBaselineDelta { entity, delta } => self.frames.set_baseline_delta(*entity, delta),
             SvcEvent::PacketEntities(pe) => {
                 let (seq, outgoing) = (self.chan.incoming_sequence, self.chan.outgoing_sequence);
                 if self.frames.apply(seq, outgoing, pe.delta_from, &pe.updates) == Applied::Stale {
@@ -711,7 +700,7 @@ impl Session {
     ///
     /// A client acts on a world that is already `rtt/2` old and whose reaction to us is another
     /// `rtt/2` away — so this isn't diagnostics, it's how far ahead a bot must aim.
-    pub(crate) fn note_rtt(&mut self, sample: f32) {
+    fn note_rtt(&mut self, sample: f32) {
         self.rtt = if self.rtt == 0.0 { sample } else { self.rtt * 0.9 + sample * 0.1 };
     }
 }
