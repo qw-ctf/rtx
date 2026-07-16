@@ -72,7 +72,6 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             c.airborne = true;
         }
     }
-    let on_air = bot.air.is_some();
     // Puppet rocket-jump order (test harness, see [`crate::control`]): pin the route to the single
     // ordered link so the repath / leg-advance / errand logic below can't clobber the one-leg route
     // the rocket-jump driver flies. Folded into `route_frozen` below, so every `!route_frozen` guard
@@ -88,20 +87,44 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             bot.goal_cell = Some(graph.link_target(link));
         }
     }
-    // Route committed to a ballistic traversal (hook flight, speed jump, or rocket jump) or pinned by a
-    // puppet order: a goal flip must not replace the route and yank the bot off the leg it's flying.
-    // Gates every route/errand mutation below. Plain jumps used to be a collection of separate
-    // `!on_air` guards, leaving holes such as gate errands; one ownership bit closes those seams.
-    let route_frozen = hooking || on_sj || on_rj || on_air || pinned;
+    // Incoming commitment (reads the route state *before* this frame's displacement handler): a >200u
+    // jump while hooking, on a speed/rocket jump, riding a plain-jump arc, or pinned is that traversal
+    // moving fast on purpose — not a teleport — so the handler below must leave the route alone.
+    let frozen_pre = hooking || on_sj || on_rj || bot.air.is_some() || pinned;
 
-    // A teleport (or any large instant displacement) invalidates the planned route — drop it
-    // and re-path from where we landed. ~200u in one frame is far beyond running/falling. Skipped
-    // mid-hook: the reel and the parabola move fast on purpose and must not clear the hook route.
-    if !route_frozen && bot.watchdog.last_origin != Vec3::ZERO && (origin - bot.watchdog.last_origin).length() > 200.0 {
-        bot.route.clear();
-        bot.repath_time = now;
+    // A teleport (or any large instant displacement) invalidates the planned route — drop it and
+    // re-path from where we landed. ~200u in one frame is far beyond running/falling. Skipped mid-hook:
+    // the reel and the parabola move fast on purpose and must not clear the hook route.
+    //
+    // Exception — a *launch* teleporter: it flings you out airborne carrying the exit velocity, and the
+    // ballistic arc lands on the far ledge the navmesh linked as the leg's target. Re-pathing from
+    // mid-air instead localizes to whatever floor cell sits under the apex and air-steers off the ledge,
+    // so the bot sails past the destination. When the leg we were walking into is a Teleport and we came
+    // out airborne, commit to that target as an air arc (released on landing, like a jump leg) so the
+    // air-strafe below curves us onto it. A teleport that drops you standing (`on_ground`) still clears
+    // and re-paths, exactly as before.
+    if !frozen_pre && bot.watchdog.last_origin != Vec3::ZERO && (origin - bot.watchdog.last_origin).length() > 200.0 {
+        let launch = bot
+            .route
+            .get(bot.route_pos)
+            .filter(|&&l| graph.link_kind(l) == LinkKind::Teleport && !on_ground)
+            .map(|&l| (l, graph.link_target(l)));
+        if let Some((leg, target)) = launch {
+            bot.air = Some(AirCommit { leg, target, since: now, airborne: true });
+        } else {
+            bot.route.clear();
+            bot.repath_time = now;
+        }
     }
     bot.watchdog.last_origin = origin;
+
+    // Settle the commitment view for the rest of the frame. `on_air`/`route_frozen` now include a
+    // launch-teleport arc just latched above, so the repath / gate / leg-advance logic all treat it as a
+    // committed airborne traversal and won't yank the route out from under it. (A goal flip mid-arc must
+    // not replace the route and turn the bot around.) Plain jumps used to be a collection of separate
+    // `!on_air` guards, leaving holes such as gate errands; one ownership bit closes those seams.
+    let on_air = bot.air.is_some();
+    let route_frozen = hooking || on_sj || on_rj || on_air || pinned;
 
     // Gate errand: drop it once the gate's door has opened — or give up if we stop making progress
     // toward its button (stuck at a door whose button we can't actually reach), so we don't camp
@@ -253,12 +276,21 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     }
 
     // Current waypoint + how to traverse to it. Past the route's end, home straight in on the
-    // human (final approach). While riding a plat, steer toward the plat *centre* (the leg's
-    // source cell) to stay aboard as it rises, instead of toward the far exit ledge.
+    // human (final approach). A Plat and a *grounded* Teleport both aim at the leg's *source* cell
+    // rather than its target, for the same reason from opposite ends: you don't walk toward where the
+    // leg *sends* you, you stay in the thing that does the sending. A plat's exit ledge is across a gap
+    // you can't reach until it lifts you; a teleporter's exit is across the map, often through a wall —
+    // steer at it and the bot walks *out* of the trigger it needs to stand in, reaches nothing, and
+    // turns around. Aim at the source and it walks *into* the trigger; touching it teleports.
+    //
+    // Once airborne on a launch teleporter's arc (the displacement handler above latched a teleport
+    // AirCommit), the roles flip: the source is now across the map behind us and the *target* ledge is
+    // where the arc must land, so aim there and let the air-strafe curve us onto it.
     let (waypoint, kind, final_leg, cur_leg) = if bot.route_pos < bot.route.len() {
         let leg = bot.route[bot.route_pos];
         let k = graph.link_kind(leg);
-        let aim = if k == LinkKind::Plat {
+        let aim_source = matches!(k, LinkKind::Plat) || (k == LinkKind::Teleport && on_ground);
+        let aim = if aim_source {
             graph.cell_origin(graph.link_source(leg))
         } else {
             graph.cell_origin(graph.link_target(leg))

@@ -96,6 +96,13 @@ fn touch_volume(tmin: Vec3, tmax: Vec3) -> (Vec3, Vec3) {
 /// it from.
 const PLAYER_TOP: f32 = 32.0;
 
+/// How far horizontally a teleporter's destination may sit from the cell it drops onto (five grid
+/// squares). A dest pad the floor-sampler skipped leaves its nearest cell a few squares off; this is
+/// wide enough to find it (ultrav's quad pad is 128u out) and still tight enough that a genuinely
+/// stranded dest — one with no floor cell anywhere near — is dropped rather than linked to a wrong,
+/// far one. See [`NavGraph::add_teleports`].
+const TELE_DEST_REACH: f32 = GRID * 5.0;
+
 impl NavGraph {
     /// Splice `func_plat` lifts into the graph. For each plat we add a cell on its surface at
     /// the bottom (the board point), a [`LinkKind::Plat`] ride from there to the floor the plat
@@ -217,7 +224,15 @@ impl NavGraph {
     /// Teleporters whose destination doesn't reach any floor cell are skipped.
     pub fn add_teleports(&mut self, bsp: &Bsp, teles: &[TeleportInfo]) {
         for t in teles {
-            let Some(dest) = self.nearest_within(t.dest, GRID * 3.0, 96.0) else {
+            // The cell a teleporter drops you onto. A dest is always a standable pad — players
+            // materialise there — but the grid doesn't always sample a cell right on it: the pad can
+            // be a small shelf the floor-sampler stepped over, leaving the nearest cell a few grid
+            // squares off (ultrav's quad pad is 128u from the ledge cell it belongs to). A generous
+            // horizontal reach finds that cell; the bot lands on the pad and the re-path walks it the
+            // short rest of the way. Too tight and the teleporter is dropped whole, and a prize behind
+            // it — the quad — becomes unreachable. The vertical reach stays snug: a cell one floor
+            // below the pad is a different place, not this one.
+            let Some(dest) = self.nearest_within(t.dest, TELE_DEST_REACH, 96.0) else {
                 continue;
             };
 
