@@ -71,6 +71,7 @@ pub mod config;
 pub(crate) mod frames;
 pub(crate) mod host;
 pub(crate) mod mirror;
+pub(crate) mod modes;
 pub(crate) mod pak;
 pub(crate) mod senses;
 pub(crate) mod session;
@@ -372,11 +373,12 @@ impl Client {
         let squad = self.squad();
         self.mirror_entities(&squad);
 
-        // 6. How far behind the world we're shooting, and then drive the bots. The same `run_bots`
-        //    the server calls, over the same world — it has no idea it isn't one. The control channel
-        //    brackets it exactly as it does on a server, and for the same reason: a `goto` issued
-        //    this frame should take effect this frame.
+        // 6. How far behind the world we're shooting, what phase the match is in (so the RJ gate
+        //    respects a countdown), and then drive the bots. The same `run_bots` the server calls,
+        //    over the same world — it has no idea it isn't one. The control channel brackets it
+        //    exactly as it does on a server: a `goto` issued this frame should take effect this frame.
         self.game.client_lead = self.latency();
+        self.feed_phase();
         crate::control::frame_begin(&mut self.game);
         crate::bot::run_bots(&mut self.game);
         for b in &mut self.bots {
@@ -469,6 +471,12 @@ impl Client {
         let map = here.0.clone();
         self.world_map = here;
 
+        // Work out what game this is *before* the world spawns, because the spawn reads it: the mode
+        // decides which entities exist (CTF's flags, a mode's item set) and `refresh_mode` runs inside
+        // `worldspawn`. The server described itself in serverinfo, which arrived during signon — long
+        // before this point.
+        self.select_mode();
+
         // A new level voids every entity: the shadow furniture belongs to the old map, and the
         // network numbers are about to be reassigned. A server module gets this done for it by the
         // engine's edict clear; here it's ours to do. Note `reset()` marks a slot *spawned* — what's
@@ -544,6 +552,53 @@ impl Client {
         for cmd in queued {
             bot.session.stringcmd(&cmd);
         }
+    }
+
+    /// Select the mode from what the server said about itself, unless the operator pinned it.
+    ///
+    /// Writes the two cvars `refresh_mode` resolves from (`rtx_mode`/`rtx_match`); the shadow-world
+    /// spawn that follows reads them. A `+set rtx_mode`/`rtx_match` on the command line is the last
+    /// word — the operator knows things the wire can't tell us — so a key that appears in
+    /// `config.cvars` is left exactly as they set it.
+    fn select_mode(&self) {
+        let pinned = |key: &str| self.config.cvars.iter().any(|(k, _)| k == key);
+        let Some(info) = self.lead().map(|b| b.session.serverinfo()) else {
+            return;
+        };
+        let choice = modes::select_mode(info);
+        if !pinned("rtx_mode") {
+            self.host.set("rtx_mode", choice.mode);
+        }
+        if !pinned("rtx_match") {
+            self.host.set("rtx_match", &choice.composition);
+        }
+        eprintln!(
+            "rtx-client: mode: {} {} (from serverinfo \"{}\")",
+            choice.mode,
+            choice.composition,
+            info.get("mode").unwrap_or(""),
+        );
+    }
+
+    /// Feed the server's match phase into the game, so the bot's rocket-jump gate respects a
+    /// countdown. Cheap and per-tick: `match_phase` is a serverinfo lookup, and only a change to
+    /// `team_match.phase` matters downstream.
+    fn feed_phase(&mut self) {
+        let Some(phase) = self.lead().map(|b| modes::match_phase(b.session.serverinfo())) else {
+            return;
+        };
+        // Map onto the lifecycle's own phase. The client never *runs* the lifecycle (no
+        // `tick_lifecycle`), so this is the only thing that moves `phase` here, and the only reader
+        // that matters client-side is `match_weapons_hot`.
+        use crate::mode::team::MatchPhase;
+        let now = self.game.time();
+        self.game.team_match.phase = match phase {
+            modes::Phase::Warmup => MatchPhase::Warmup,
+            // The `until` only has to be in the future — nothing client-side counts it down, it just
+            // has to read as "a countdown is running" for the weapons gate.
+            modes::Phase::Countdown => MatchPhase::Countdown { until: now + 1.0 },
+            modes::Phase::Live => MatchPhase::Live,
+        };
     }
 
     /// Which slots are our own bots', and where each of them is looking from.

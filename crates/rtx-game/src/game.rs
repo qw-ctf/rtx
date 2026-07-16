@@ -155,6 +155,10 @@ pub struct GameState {
     /// External bot-control channel (rocket-jump tuning harness). Inert (no socket bound) unless
     /// `rtx_control_port` is set. Persists across maps — the listener binds once. See [`crate::control`].
     pub(crate) control: crate::control::ControlState,
+    /// The serverinfo keys we've published to clients, and their last values — so a per-frame
+    /// `refresh_mode` / lifecycle tick doesn't re-broadcast an unchanged `mode`/`status` every frame.
+    /// See [`Self::publish_serverinfo`]. Persists across maps (serverinfo does too).
+    published_info: std::collections::HashMap<&'static str, String>,
 }
 
 impl GameState {
@@ -232,6 +236,7 @@ impl GameState {
             pending_roster: None,
             dyn_assets: DynAssets::default(),
             control: crate::control::ControlState::default(),
+            published_info: std::collections::HashMap::new(),
         }
     }
 
@@ -612,9 +617,35 @@ impl GameState {
         self.host
             .conprint(c"rtx: QuakeWorld game module loaded (bot-goals build)\n");
 
+        // Announce ourselves the way KTX announces itself (`ktxver`), so a KTX-aware client, HUD or
+        // server browser recognises an rtx server — and so our own network-client bots know they've
+        // joined an rtx server (which decides how one ambiguous mode string, `…-ra`, is read).
+        self.publish_serverinfo("rtxver", env!("CARGO_PKG_VERSION"));
+
         // `self.game_data` lives inside the OnceLock-pinned GameState, so its address is
         // stable for the process — safe to hand to the engine.
         &self.game_data as *const GameData as isize
+    }
+
+    /// Publish a serverinfo key to every connected client, but only when its value changes.
+    ///
+    /// `refresh_mode` and the match lifecycle both run every frame, and re-broadcasting an unchanged
+    /// `mode`/`status` each frame would flood every client with `svc_serverinfo`. The dedup lives
+    /// here so callers can publish unconditionally and let this decide whether the wire needs it.
+    ///
+    /// Server-only: a network client *reads* what the server published to select its mode, it never
+    /// publishes — and its `localcmd` would forward this to the server as a stringcmd the server
+    /// rejects. `is_client` gates it off there. (mvdsv's `serverinfo <key> <value>` takes exactly two
+    /// arguments, so a value with spaces — `"10 min left"` — must be one quoted token.)
+    pub(crate) fn publish_serverinfo(&mut self, key: &'static str, value: &str) {
+        if self.host.is_client() {
+            return;
+        }
+        if self.published_info.get(key).is_some_and(|v| v == value) {
+            return;
+        }
+        self.published_info.insert(key, value.to_string());
+        self.host.localcmd(&format!("serverinfo {key} \"{value}\""));
     }
 
     /// `GAME_LOADENTS` — parse the map's entity string and spawn entities.

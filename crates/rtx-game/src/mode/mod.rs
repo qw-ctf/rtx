@@ -478,6 +478,12 @@ impl GameState {
         if cfg.teams >= 2 && host.cvar(c"teamplay") == 0.0 {
             host.cvar_set(c"teamplay", c"1");
         }
+
+        // Tell connected clients what game this is, in KTX's `mode` vocabulary — so an rtx network
+        // client (or any KTX-aware client/HUD/browser) reads it. Deduped, so a per-frame refresh only
+        // touches the wire when the resolved mode actually changes.
+        let wire = team::mode_serverinfo(self.mode.name(), self.team_match.config);
+        self.publish_serverinfo("mode", &wire);
     }
 }
 

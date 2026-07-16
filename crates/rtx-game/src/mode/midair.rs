@@ -132,10 +132,14 @@ impl GameMode for Midair {
     }
 
     fn bot_intent(&self, g: &mut GameState, bot: EntId) -> Option<BotIntent> {
-        // Hunt the nearest enemy — team-aware under a team composition (a 2on2 midair), else the
-        // nearest living player in a free-for-all. The shared combat overlay leads airborne targets;
-        // a bot rocketing a grounded enemy launches them, then airshots — emergent.
-        if crate::mode::team::lifecycle_active(g) {
+        // Hunt the nearest enemy — team-aware whenever this bot has a side (a 2on2 midair, or a
+        // network client reading its team off the server's userinfo), else the nearest living player
+        // in a free-for-all. The "have I got a side" test, not "is rtx running a match", for the same
+        // reason `dm.rs` uses it: a client gets its team from the server and has no `team_match`
+        // lifecycle of its own, so the lifecycle question comes back false where the team is real. The
+        // shared combat overlay leads airborne targets; a bot rocketing a grounded enemy launches
+        // them, then airshots — emergent.
+        if crate::mode::team::lifecycle_active(g) || g.entities[bot].mode_p.team != 0 {
             return crate::mode::team::help_target(g, bot)
                 .or_else(|| crate::mode::team::nearest_enemy(g, bot))
                 .map(BotIntent::Fight);

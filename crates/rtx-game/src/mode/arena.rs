@@ -90,6 +90,15 @@ impl GameMode for Arena {
         // Queue every waiting player the moment they're in the audience, so the challenger order
         // reflects *when they started waiting* (see `stamp_audience`).
         self.stamp_audience(g);
+        // Publish the round phase in KTX's `status` vocabulary — a round is Rocket Arena's match, so
+        // it drives the same key a team match does, and a KTX-aware HUD shows the arena countdown for
+        // free. Deduped, so this only touches the wire on a phase change.
+        let status = match g.arena.round {
+            RoundState::Countdown { .. } => "Countdown",
+            RoundState::Live => "in progress",
+            _ => "Standby", // Warmup / Forming / Ended
+        };
+        g.publish_serverinfo("status", status);
         match g.arena.round {
             RoundState::Warmup => {
                 if count_players(g) >= 2 {

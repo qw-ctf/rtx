@@ -174,6 +174,47 @@ pub(crate) fn format_label(cfg: MatchConfig) -> String {
     }
 }
 
+/// A KTX-grammar live-clock `status` value: `"N min left"`, N whole minutes rounded up. KTX updates
+/// this once a minute (`match.c:723`) and ezquake reads the integer back out (`atoi(value)*60`), so
+/// the format is load-bearing. A match with no time limit (`until == 0`) reads `"in progress"` —
+/// anything that isn't Standby/Countdown is "live" in ezquake's model, which is what we mean.
+fn minutes_left(until: f32, now: f32) -> String {
+    if until <= 0.0 {
+        return "in progress".to_string();
+    }
+    let mins = (((until - now) / 60.0).ceil() as i32).max(1);
+    format!("{mins} min left")
+}
+
+/// The `mode` serverinfo string for a resolved (ruleset, composition), in **KTX's grammar** —
+/// `<base>[-suffix]` (`SetMode4ServerInfo`, `world.c:1475`). rtx publishes the same vocabulary KTX
+/// does so one client parser, and every KTX-aware HUD and server browser, reads both mods.
+///
+/// The grammar's own conventions, faithfully: open play is `ffa`, a duel is `1on1` (not "duel"), a
+/// team match is `<size>on<size>[on<size>…]`. CTF is its own base with the two teams implied.
+/// Modifiers ride as suffixes — `-midair`, `-race`, `-ra`. Rocket Arena is a 1v1 round queue whatever
+/// its (open) composition resolves to, so it always names the `1on1` base.
+pub(crate) fn mode_serverinfo(mode: &str, cfg: MatchConfig) -> String {
+    if mode == "ctf" {
+        return "ctf".to_string();
+    }
+    let base = if mode == "ra" {
+        "1on1".to_string()
+    } else if cfg.size == 0 {
+        "ffa".to_string()
+    } else if cfg.teams == 2 && cfg.size == 1 {
+        "1on1".to_string()
+    } else {
+        vec![cfg.size.to_string(); cfg.teams].join("on")
+    };
+    match mode {
+        "midair" => format!("{base}-midair"),
+        "race" => format!("{base}-race"),
+        "ra" => format!("{base}-ra"),
+        _ => base,
+    }
+}
+
 /// Whether player `e` is currently **benched** — a structured match is under way (past warmup) and
 /// they aren't on the locked roster (a late joiner, or an overflow beyond teams×size). Benched
 /// players sit out as harmless spectators until the next warmup. Derived from the roster (not a
@@ -235,6 +276,16 @@ pub(crate) fn tick_lifecycle(g: &mut GameState) {
     if !lifecycle_active(g) {
         return;
     }
+    // Publish the match phase in KTX's `status` vocabulary, so a client (and any KTX HUD) tracks the
+    // countdown and the live clock. Deduped, so during Live this touches the wire once a minute (when
+    // the minutes-left string rolls over), and otherwise once per phase change.
+    let status = match g.team_match.phase {
+        MatchPhase::Warmup | MatchPhase::Ended { .. } => "Standby".to_string(),
+        MatchPhase::Countdown { .. } => "Countdown".to_string(),
+        MatchPhase::Live => minutes_left(g.team_match.live_until, g.time()),
+    };
+    g.publish_serverinfo("status", &status);
+
     let now = g.time();
     match g.team_match.phase {
         MatchPhase::Warmup => {} // playable; team assignment happens on spawn (put_client_in_server)
