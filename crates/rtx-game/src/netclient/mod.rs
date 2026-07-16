@@ -53,6 +53,7 @@ pub mod config;
 pub(crate) mod frames;
 pub(crate) mod host;
 pub(crate) mod mirror;
+pub(crate) mod pak;
 pub(crate) mod session;
 pub(crate) mod world;
 
@@ -91,8 +92,9 @@ pub struct Client {
     config: Config,
     /// Wall clock at the last tick, for the frame time the game runs on.
     last_tick: Instant,
-    /// The map the shadow world was built for, so a level change is noticed.
-    world_map: String,
+    /// The map the shadow world was built for, and which incarnation of the server built it — so a
+    /// level change is noticed, and so is a restart onto the same level.
+    world_map: (String, i32),
     /// How far each bot has actually travelled, and where it last was. A bot that connects, spawns
     /// and then stands still looks identical to a working one in every other line of output — this
     /// is the number that tells them apart.
@@ -115,6 +117,11 @@ impl Client {
         // Estimates are the only thing a client *can* know about an enemy's strength, so the
         // opponent model isn't optional here — it's the data source.
         host.set("rtx_bot_model", "1");
+        // The control channel binds off a cvar, so it needs no client-specific plumbing — the same
+        // harness that drives a server's bots drives these.
+        if let Some(port) = config.control_port {
+            host.set("rtx_control_port", &port.to_string());
+        }
         // Explicit overrides last, so `+set` always wins.
         for (name, value) in &config.cvars {
             host.set(name, value);
@@ -126,7 +133,7 @@ impl Client {
             mirrors: Vec::new(),
             config,
             last_tick: Instant::now(),
-            world_map: String::new(),
+            world_map: (String::new(), 0),
             travelled: Vec::new(),
         }
     }
@@ -167,7 +174,7 @@ impl Client {
             // The qport identifies us across a NAT rebinding, so a squad needs distinct ones. Real
             // clients randomize; deriving them keeps a capture readable.
             let qport = 0x4000u16.wrapping_add(i as u16);
-            self.sessions.push(Session::connect(self.config.server, ui, qport)?);
+            self.sessions.push(Session::connect(self.config.server, ui, qport, self.config.wiretap.as_deref())?);
             self.mirrors.push(Mirror::default());
             self.travelled.push((0.0, glam::Vec3::ZERO));
         }
@@ -250,13 +257,21 @@ impl Client {
 
         // 3. Advance the game's clock. The brain's timers — reaction delay, respawn waits, powerup
         //    countdowns — all read this, so it has to move whether or not there's a world yet.
+        //
+        //    It's our own clock, not the server's, and that's deliberate. `STAT_TIME` is on the wire
+        //    (we ask for it in `*z_ext`) and nothing reads it, because nothing needs to: every timer
+        //    here is one we set ourselves, from this clock, and compared against this clock — an item
+        //    is due 20 seconds after *we* saw it go. Adopting the server's would buy no accuracy the
+        //    two clocks don't already share, and would cost the one property all of those timers
+        //    quietly depend on: a level change resets the server's clock to zero, and every deadline
+        //    in the future would land in the distant past at once.
         self.game.globals.frametime = dt;
         self.game.globals.time += dt;
 
         // 4. Build the navmesh, off-thread, as the server does — but only once the world exists.
         //    `ensure_navmesh` gives up permanently if it can't read the map, so calling it before
         //    we know which map that is would disable the bots for the whole connection.
-        if !self.world_map.is_empty() {
+        if !self.world_map.0.is_empty() {
             self.game.ensure_navmesh();
         }
 
@@ -267,10 +282,14 @@ impl Client {
         self.mirror_entities(&squad);
 
         // 6. How far behind the world we're shooting, and then drive the bots. The same `run_bots`
-        //    the server calls, over the same world — it has no idea it isn't one.
+        //    the server calls, over the same world — it has no idea it isn't one. The control channel
+        //    brackets it exactly as it does on a server, and for the same reason: a `goto` issued
+        //    this frame should take effect this frame.
         self.game.client_lead = self.latency();
+        crate::control::frame_begin(&mut self.game);
         crate::bot::run_bots(&mut self.game);
         self.measure_travel();
+        crate::control::frame_end(&mut self.game);
 
         // 7. Send. Once a bot is embodied this carries its usercmd; until then it is the keepalive
         //    that stops the server timing us out, and the carrier the netchan needs to get the
@@ -280,6 +299,7 @@ impl Client {
         //    packet from us to not time us out, and the netchan needs one to carry signon replies.
         self.flush_console();
         let cmds = self.host.take_cmds();
+        let auto_ready = self.config.auto_ready && !self.config.spectate;
         let mut fired: Vec<EntId> = Vec::new();
         for s in self.sessions.iter_mut() {
             if s.signon() == Signon::Disconnected {
@@ -289,8 +309,18 @@ impl Client {
                 s.send_nop()?;
                 continue;
             }
+            // Say we'll play, if the server is the kind that waits to be told. Once per level, and
+            // not while the last one's scoreboard is up — KTX ignores it there, and the reload that
+            // ends the scoreboard re-arms it.
+            if auto_ready && !s.at_intermission() {
+                s.ready_up();
+            }
             let client = s.playernum() as i32 + 1;
             match cmds.iter().find(|c| c.client == client) {
+                // At a scoreboard the body is a camera on a pole: keep the connection alive and
+                // nothing else. The brain doesn't know the game is over — it can't; nothing it reads
+                // says so — and would spend the intermission walking into a wall shooting at it.
+                Some(_) | None if s.at_intermission() => s.send_move(glam::Vec3::ZERO, 0, 0, 0, 0, 0)?,
                 Some(c) => {
                     // Nothing tells a client when its own gun is ready — the server owns
                     // `attack_finished` and never sends it. But we know what we fired and when we
@@ -309,19 +339,27 @@ impl Client {
         Ok(())
     }
 
-    /// Spawn the shadow world when the session binds a map, and again when the map changes.
+    /// Spawn the shadow world when the session binds a map, and again whenever the server starts a
+    /// fresh one — including a restart onto the map we're already on.
     ///
     /// Keyed off the session having read the map, which happens at `prespawn` — by which point the
     /// host has the BSP and the entity string, and the whole of the module's spawn code can run
     /// against them exactly as it would on a server.
+    ///
+    /// The name alone won't do, because the case that matters most doesn't change it: KTX ends a
+    /// match by reloading the same map, and every item on it goes back to being up. Keyed on the name
+    /// we'd keep the finished match's world — items marked taken, timers due, lifts wherever they
+    /// stopped — and hand it to the bots as the state of a game that has just started. `servercount`
+    /// is the server's own incarnation number and changes every time.
     fn rebuild_world_if_map_changed(&mut self) {
-        let Some(map) = self.sessions.first().map(|s| s.mapname().to_string()) else {
+        let Some(here) = self.sessions.first().map(|s| (s.mapname().to_string(), s.servercount())) else {
             return;
         };
-        if map.is_empty() || map == self.world_map {
+        if here.0.is_empty() || here == self.world_map {
             return;
         }
-        self.world_map = map.clone();
+        let map = here.0.clone();
+        self.world_map = here;
 
         // A new level voids every entity: the shadow furniture belongs to the old map, and the
         // network numbers are about to be reassigned. A server module gets this done for it by the

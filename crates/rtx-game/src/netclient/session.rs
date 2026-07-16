@@ -77,6 +77,31 @@ const RESEND_INTERVAL: Duration = Duration::from_secs(5);
 const STOCK_PMODEL_CRC: u16 = 33168;
 const STOCK_EMODEL_CRC: u16 = 6967;
 
+/// A record of every datagram a connection saw, written as it goes.
+///
+/// The point is fixtures. `rtx-proto`'s parser tests replay a capture directory and demand that every
+/// server datagram parses with no unknown opcode, and the captures they've had until now came from a
+/// proxy sat in front of *ezquake* — a real client, but not this one. A bot's own session is the
+/// traffic that actually matters, and the interesting packets (a rocket in flight, a lift moving, a
+/// nail volley) only exist while a bot is playing.
+///
+/// Named to `rtx-proto`'s contract — `NNNNNN-{c2s,s2c}.bin` — so a directory written here is one
+/// `RTX_TEST_QW_CAPTURE` can be pointed straight at.
+struct Wiretap {
+    dir: std::path::PathBuf,
+    n: usize,
+}
+
+impl Wiretap {
+    /// Record one datagram. Failures are dropped on purpose: a full disk is not a reason to break
+    /// off a game, and the capture is a diagnostic, not the point of the run.
+    fn record(&mut self, data: &[u8], to_server: bool) {
+        let name = format!("{:06}-{}.bin", self.n, if to_server { "c2s" } else { "s2c" });
+        self.n += 1;
+        let _ = std::fs::write(self.dir.join(name), data);
+    }
+}
+
 /// One connection.
 pub(crate) struct Session {
     sock: UdpSocket,
@@ -123,6 +148,14 @@ pub(crate) struct Session {
     rtt: f32,
     /// Frames the server withheld to stay inside our rate.
     pub(crate) chokes: u32,
+    /// Whether we've told this level's server we're ready to play. See [`Session::ready_up`].
+    readied: bool,
+    /// Whether the server has us at a scoreboard rather than in the game. Set by `svc_intermission`
+    /// and cleared by the next `svc_serverdata` — which is the whole of its lifecycle, because
+    /// there is no "intermission over" message: the level reload *is* the end of it.
+    intermission: bool,
+    /// Where to record what crosses the wire, if anyone asked (`--wiretap`).
+    wiretap: Option<Wiretap>,
 }
 
 // A session answers two callers: the tick loop, which drives it, and the world mirror, which asks
@@ -130,9 +163,22 @@ pub(crate) struct Session {
 impl Session {
     /// Open a socket and ask for a challenge. Doesn't block: the reply arrives via
     /// [`poll`](Self::poll).
-    pub(crate) fn connect(server: SocketAddr, userinfo: UserinfoBuilder, qport: u16) -> io::Result<Self> {
+    pub(crate) fn connect(
+        server: SocketAddr,
+        userinfo: UserinfoBuilder,
+        qport: u16,
+        wiretap: Option<&std::path::Path>,
+    ) -> io::Result<Self> {
         let sock = UdpSocket::bind(if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" })?;
         sock.set_nonblocking(true)?;
+        // Each connection gets its own directory: a squad's datagrams interleave, and a capture that
+        // mixes two netchans' sequences replays as gibberish.
+        let wiretap = wiretap.map(|dir| dir.join(format!("qport-{qport:04x}"))).and_then(|dir| {
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| eprintln!("rtx-client: can't record to {}: {e}", dir.display()))
+                .ok()
+                .map(|()| Wiretap { dir, n: 0 })
+        });
         let now = Instant::now();
         let s = Session {
             sock,
@@ -157,6 +203,9 @@ impl Session {
             last_move: now,
             rtt: 0.0,
             chokes: 0,
+            readied: false,
+            intermission: false,
+            wiretap,
         };
         Ok(s)
     }
@@ -196,9 +245,43 @@ impl Session {
         self.frames_at
     }
 
-    /// Queue a console command for the server (`say`, `kill`, `join`, …).
+    /// Whether the server has us at a scoreboard rather than in the game.
+    pub(crate) fn at_intermission(&self) -> bool {
+        self.intermission
+    }
+
+    /// The server's incarnation number, bumped every time it (re)starts a level.
+    ///
+    /// It's what distinguishes a *restart* from nothing having happened: KTX ends a match by
+    /// reloading the same map, so the name is no evidence at all and this is the only thing that
+    /// changes.
+    pub(crate) fn servercount(&self) -> i32 {
+        self.servercount
+    }
+
+    /// Queue a console command for the server (`say`, `kill`, `ready`, …).
     pub(crate) fn stringcmd(&mut self, cmd: &str) {
         self.chan.queue_reliable(&clc::write_stringcmd(cmd));
+    }
+
+    /// Tell the server we're willing to play, once per level.
+    ///
+    /// KTX won't start a match until everyone has said so, so a squad that never says it is a squad
+    /// standing in a warmup forever — which is most of what "play on a KTX server" means. There's
+    /// nothing to detect and nothing to parse: `ready` is **idempotent** in KTX (`PlayerReady`
+    /// answers an already-ready player with "type break to unready yourself" and changes nothing),
+    /// and a server that has never heard of it says so and carries on. So the honest implementation
+    /// is to say it once and not be clever.
+    ///
+    /// Once per *level*, though, not once per connection: KTX ignores a `ready` sent during
+    /// intermission, and ends a match by reloading the map — which bumps `servercount` and re-arms
+    /// this, so the next match gets its own.
+    pub(crate) fn ready_up(&mut self) {
+        if self.readied || self.signon != Signon::Active {
+            return;
+        }
+        self.readied = true;
+        self.stringcmd("ready");
     }
 
     /// Drain the socket and hand back everything the server said.
@@ -219,6 +302,9 @@ impl Session {
                 Err(e) => return Err(e),
             };
             let data = &buf[..len];
+            if let Some(w) = self.wiretap.as_mut() {
+                w.record(data, false);
+            }
 
             if oob::is_oob(data) {
                 self.handle_oob(data);
@@ -266,7 +352,7 @@ impl Session {
                 oob::connect(self.chan.qport, self.challenge, &self.userinfo.build().to_string(), &n)
             }
         };
-        let _ = self.sock.send_to(&pkt, self.server);
+        self.send_oob(&pkt);
     }
 
     /// The extension masks we're asking for.
@@ -288,7 +374,7 @@ impl Session {
                 let n = oob::Negotiated::intersect(fte, fte2, mvd1);
                 (self.proto.fte, self.proto.fte2, self.proto.mvd1) = (n.fte, n.fte2, n.mvd1);
                 let pkt = oob::connect(self.chan.qport, challenge, &self.userinfo.build().to_string(), &n);
-                let _ = self.sock.send_to(&pkt, self.server);
+                self.send_oob(&pkt);
                 self.signon = Signon::Connecting;
                 self.last_oob = Instant::now();
             }
@@ -298,7 +384,7 @@ impl Session {
             }
             Some(oob::Oob::Print(text)) => eprintln!("rtx-client: server: {}", text.trim_end()),
             Some(oob::Oob::Ping) => {
-                let _ = self.sock.send_to(&oob::ack(), self.server);
+                self.send_oob(&oob::ack());
             }
             _ => {}
         }
@@ -317,6 +403,10 @@ impl Session {
                 self.models.clear();
                 self.frames.clear();
                 self.signon = Signon::Loading;
+                // A fresh level is a fresh match to say yes to, and the only way out of an
+                // intermission — there is no message that ends one.
+                self.readied = false;
+                self.intermission = false;
 
                 host.set_movevars(sd.movevars);
                 self.stringcmd(&format!("soundlist {} 0", self.servercount));
@@ -388,6 +478,9 @@ impl Session {
                 self.adopt_serverinfo(host);
             }
             SvcEvent::StuffText(text) => self.stufftext(text, host),
+            // The scoreboard. The game is over and our body is a camera on a pole; whatever the
+            // brain thinks it's doing, it isn't playing, and it certainly isn't shooting.
+            SvcEvent::Intermission { .. } | SvcEvent::Finale(_) => self.intermission = true,
             SvcEvent::ChokeCount(n) => self.chokes += *n as u32,
             SvcEvent::Disconnect => self.signon = Signon::Disconnected,
             _ => {}
@@ -576,8 +669,27 @@ impl Session {
         let slot = self.chan.outgoing_sequence as usize % self.sent_at.len();
         let datagram = self.chan.transmit(payload);
         self.sent_at[slot] = Instant::now();
-        self.sock.send_to(&datagram, self.server)?;
+        self.send(&datagram)?;
         Ok(())
+    }
+
+    /// Put a datagram on the wire, and in the record if one is being kept.
+    ///
+    /// Every byte this client sends goes through here, which is the point: a wiretap that missed the
+    /// handshake would record a conversation starting in the middle.
+    fn send(&mut self, datagram: &[u8]) -> io::Result<()> {
+        if let Some(w) = self.wiretap.as_mut() {
+            w.record(datagram, true);
+        }
+        self.sock.send_to(datagram, self.server)?;
+        Ok(())
+    }
+
+    /// Put an out-of-band packet on the wire. The handshake is unreliable by nature — there's no
+    /// netchan yet to carry it — so a failure here is answered by [`retry_handshake`](Self::retry_handshake),
+    /// not by an error.
+    fn send_oob(&mut self, pkt: &[u8]) {
+        let _ = self.send(pkt);
     }
 
     /// Time the round trip from the packet the server just acknowledged.
@@ -616,7 +728,7 @@ mod tests {
             name: "rtxbot".to_string(),
             ..Default::default()
         };
-        Session::connect("127.0.0.1:1".parse().unwrap(), ui, 0x1234).expect("bind")
+        Session::connect("127.0.0.1:1".parse().unwrap(), ui, 0x1234, None).expect("bind")
     }
 
     fn host() -> NetHost {

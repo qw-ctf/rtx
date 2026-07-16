@@ -29,8 +29,11 @@ pub struct Config {
     pub skill: f32,
     /// Connect as a spectator and just watch — the parser soak, and a way to look before playing.
     pub spectate: bool,
-    /// Answer KTX's ready/join prompts by ourselves.
+    /// Say `ready` on a server that waits to be told, so a match can actually start.
     pub auto_ready: bool,
+    /// Bind the control channel here, so a harness can drive and inspect the bots. See
+    /// [`crate::control`].
+    pub control_port: Option<u16>,
     /// Exit after this many seconds; `None` runs until stopped.
     pub soak: Option<u64>,
     /// Write every datagram here, as a parser fixture.
@@ -52,6 +55,7 @@ impl Default for Config {
             skill: 3.0,
             spectate: false,
             auto_ready: true,
+            control_port: None,
             soak: None,
             wiretap: None,
             cvars: Vec::new(),
@@ -102,6 +106,14 @@ pub fn parse(argv: &[String]) -> Result<Config, String> {
             "--no-auto-ready" => {
                 c.auto_ready = false;
                 i += 1;
+            }
+            "--control-port" => {
+                c.control_port = Some(
+                    need(i, "--control-port")?
+                        .parse()
+                        .map_err(|_| "--control-port wants a port number".to_string())?,
+                );
+                i += 2;
             }
             "--server" => {
                 c.server = resolve(&need(i, "--server")?)?;

@@ -302,6 +302,45 @@ When a list is configured the end-of-level intermission scoreboard **auto-advanc
 instead of waiting for a player to press a button; with no list set, the stock behaviour is
 unchanged. Leave `rtx_maplist` empty (the default) to disable rotation.
 
+## The bots as network clients
+
+The same bots also run **outside** a server, as ordinary QuakeWorld clients. `rtx-client` connects
+over UDP, completes a real handshake and signon, and plays — so the bots can be pitted against humans
+on any server, or against bots hosted by someone else's `qwprogs`. It is the *same brain*: the same
+`run_bots` over the same `GameState`, and it doesn't know which of the two it's under.
+
+```sh
+cargo build --release -p rtx-client
+./target/release/rtx-client --server localhost --basedir ~/Games/Quake --bots 2
+```
+
+It's optional to compile — a cargo feature on `rtx-game` that the default build never enables, so the
+game module is unaffected either way.
+
+**The maps must be on disk**; nothing is downloaded. `--basedir` names the directory holding `qw/`,
+`id1/`, … and each is searched the way the engine searches it: that directory's paks first (highest
+numbered first), then its loose files. Getting that order wrong loads a different copy of the map than
+the server has, and the checksum sent at `prespawn` is then a checksum of the wrong file — which a
+server answers by dropping the connection without a word.
+
+`--bots N` brings a **squad**: N connections in one process, sharing one world. That isn't a shortcut
+— it's what the bots already have inside `qwprogs`, where teammates share item timers and an opponent
+model because they talk to each other. Each bot's body and stats are its own; what any of them sees,
+all of them know.
+
+What a client cannot know, it doesn't pretend to. An enemy's health isn't on the wire and never will
+be, so a client bot estimates it from what it sees and hears — which is the position a human is in,
+and the reason these can play against people without being something other than a player.
+
+| | |
+|---|---|
+| `--spectate` | watch without playing; the parser soak |
+| `--skill 0..7` | as `rtx_bot_skill` |
+| `--team`, `--name`, `--skin`, `--colors` | userinfo, as any client sends |
+| `--control-port <n>` | the same TCP harness the server-side bots expose (`status`, `goto`, `cell`, `links`, …) |
+| `--wiretap <dir>` | record every datagram, as a parser fixture |
+| `+set <cvar> <value>` | override an rtx tunable |
+
 ## Building
 
 ```sh

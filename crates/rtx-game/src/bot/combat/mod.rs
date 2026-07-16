@@ -794,15 +794,14 @@ fn aim_solution(
     my_eye: Vec3,
     muzzle_base: Vec3,
     gravity: f32,
-    land: Option<(f32, Vec3)>,
-    grenade_sol: Option<GrenadeSol>,
+    plan: &BallisticPlan,
     lead: f32,
 ) -> (Vec3, Vec3, bool) {
     let s = choice.projectile_speed;
     if choice.grenade_arc {
         // Exactly one of air_gl/gl_ground is set when `grenade_arc` holds, and it aligns with
         // `airborne` (air intercept ⇒ airborne). Fire straight along the solved view.
-        let sol = grenade_sol.expect("grenade_arc ⇒ a grenade solution was validated");
+        let sol = plan.air_gl.or(plan.gl_ground).expect("grenade_arc ⇒ a grenade solution was validated");
         (sol.meet, sol.look, tgt.airborne)
     } else if s > 0.0 {
         if tgt.airborne {
@@ -810,7 +809,7 @@ fn aim_solution(
                 intercept_time(tgt.org - muzzle_base, tgt.vel, s).unwrap_or((tgt.org - muzzle_base).length() / s);
             // The parabola is evaluated `lead` further along than the flight alone: an airborne
             // target keeps falling through our latency, so the meet point drops with it.
-            let pos_at = |t: f32| ballistic_pos(tgt.org, tgt.vel, gravity, land, t + lead);
+            let pos_at = |t: f32| ballistic_pos(tgt.org, tgt.vel, gravity, plan.land, t + lead);
             // Fallback (fixed point didn't settle — a target falling away near projectile speed):
             // the linear-seed flight time evaluated on the *clamped* `pos_at`, so a target that lands
             // mid-flight still resolves to the landing spot rather than a point below the floor.
@@ -1170,10 +1169,8 @@ pub(crate) fn engage(
     // Aim point and clean firing angles (pure ballistics). `gate_direct` marks a shot that needs a
     // direct hull hit vs. one that can lean on splash.
     let muzzle_base = origin + Vec3::new(0.0, 0.0, 16.0); // rocket/grenade spawn height (w_fire_rocket)
-    let grenade_sol = plan.air_gl.or(plan.gl_ground);
     let lead = game.aim_lead(choice.projectile_speed > 0.0);
-    let (aim, clean, gate_direct) =
-        aim_solution(choice, &tgt, my_eye, muzzle_base, gravity, plan.land, grenade_sol, lead);
+    let (aim, clean, gate_direct) = aim_solution(choice, &tgt, my_eye, muzzle_base, gravity, &plan, lead);
 
     // Compose the view: clean angles + feed-forward lead + drifting skill error. `aim_error` also
     // records the "last seen" spot/time for the hold-the-angle behavior.
@@ -1652,16 +1649,9 @@ mod tests {
 
     fn solve(weapon: Weapon, tgt: &Target, lead: f32) -> Vec3 {
         let my_eye = Vec3::new(0.0, 0.0, 22.0);
-        let (aim, _, _) = aim_solution(
-            WeaponChoice::of(weapon),
-            tgt,
-            my_eye,
-            Vec3::new(0.0, 0.0, 16.0),
-            800.0,
-            None,
-            None,
-            lead,
-        );
+        let plan = BallisticPlan { land: None, air_gl: None, gl_ground: None };
+        let (aim, _, _) =
+            aim_solution(WeaponChoice::of(weapon), tgt, my_eye, Vec3::new(0.0, 0.0, 16.0), 800.0, &plan, lead);
         aim
     }
 

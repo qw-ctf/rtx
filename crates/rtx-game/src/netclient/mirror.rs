@@ -198,6 +198,9 @@ impl Mirror {
                         game.client_heard_fire(e, weapon, *origin);
                     }
                 }
+                if name == ITEM_RESPAWN_SOUND {
+                    self.heard_item_respawn(game, *origin);
+                }
             }
             // Being shot. Tells us someone's there and roughly where — a bearing, not a position.
             SvcEvent::Damage { armor, blood, from } => {
@@ -606,6 +609,10 @@ const MOVER_REST: f32 = 8.0;
 /// sent, whether it's there or not.
 const ITEM_SIGHT_RANGE: f32 = 2000.0;
 
+/// The noise an item makes coming back (`SUB_regen`) — played on the item itself, so where it comes
+/// from is which item it was. See [`Mirror::heard_item_respawn`].
+const ITEM_RESPAWN_SOUND: &str = "items/itembk2.wav";
+
 /// What this frame said about one item.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Evidence {
@@ -872,6 +879,26 @@ impl Mirror {
                 // the spot again, what's actually there wins.
                 Evidence::Unknown => self.expect_respawn(game, item, now),
             }
+        }
+    }
+
+    /// An item just came back, and we heard it.
+    ///
+    /// This is item timing done the way a player does it. Sounds carry by PHS — through walls — so
+    /// the armour announcing itself across the map is information you get for free by listening, and
+    /// good players run the whole map on it. The bots already had the ears (`svc_sound`) and the
+    /// timers; they were only ever missing the one sound that says "I'm back".
+    ///
+    /// It's evidence of the safe kind, which is why it's the only item sound taken. `SUB_regen` plays
+    /// this **on the item, at its own origin**, so the position names which item without ambiguity,
+    /// and what it says is *present* — the direction where being wrong costs a walk. The pickup
+    /// sounds are deliberately left alone: those play on the *player*, and a backpack or a dropped
+    /// weapon lying near an item's spot makes the same noise. Believing that would send a bot away
+    /// from an item that's sitting there, which is the mistake this whole module leans against.
+    fn heard_item_respawn(&mut self, game: &mut GameState, at: Vec3) {
+        let found = self.items.iter().find(|(_, home)| home.distance(at) < ITEM_MATCH_DIST);
+        if let Some(&(item, _)) = found {
+            self.restore_item(game, item);
         }
     }
 

@@ -28,6 +28,7 @@ use glam::Vec3;
 use rtx_nav::bsp::Bsp;
 use rtx_proto::svc::MoveVars;
 
+use super::pak;
 use crate::cvars::RTX_CVAR_DEFAULTS;
 use crate::entity::EntId;
 use crate::host::ClientHost;
@@ -215,8 +216,15 @@ impl NetHost {
         ok
     }
 
-    /// Find a game file, searching as a client does: the server's gamedir first (so a mod's
-    /// override wins, as it will have for the server), then `qw`, then `id1`.
+    /// Find a game file, searching as a client does: the server's gamedir first (so a mod's override
+    /// wins, as it will have for the server), then `qw`, then `id1`; and within each, that
+    /// directory's paks before its loose files.
+    ///
+    /// Both halves of that order are the engine's rather than the intuitive one, and both matter for
+    /// the same reason: the map we read is the map we checksum at `prespawn`, and a checksum of a
+    /// different copy is a connection dropped without a word. See [`super::pak`] for why paks come
+    /// first — briefly, `FS_AddPathHandle` prepends a directory and then prepends each of its paks on
+    /// top.
     fn find(&self, rel: &str) -> Option<Vec<u8>> {
         let gamedir = self.gamedir.borrow().clone();
         let mut seen: Vec<&str> = Vec::new();
@@ -225,8 +233,11 @@ impl NetHost {
                 continue;
             }
             seen.push(dir);
-            let p: PathBuf = Path::new(&self.basedir).join(dir).join(rel);
-            if let Ok(bytes) = std::fs::read(&p) {
+            let dir: PathBuf = Path::new(&self.basedir).join(dir);
+            if let Some(bytes) = pak::paks_in(&dir).iter().find_map(|p| p.read(rel)) {
+                return Some(bytes);
+            }
+            if let Ok(bytes) = std::fs::read(dir.join(rel)) {
                 return Some(bytes);
             }
         }
