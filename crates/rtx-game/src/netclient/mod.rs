@@ -520,6 +520,9 @@ impl Client {
         // `worldspawn`. The server described itself in serverinfo, which arrived during signon — long
         // before this point.
         self.select_mode();
+        // And match the rtx movement features the server actually provides, before the navmesh build
+        // reads them — so we don't plan a double-jump the server won't grant.
+        self.sync_movement();
 
         // A new level voids every entity: the shadow furniture belongs to the old map, and the
         // network numbers are about to be reassigned. A server module gets this done for it by the
@@ -622,6 +625,28 @@ impl Client {
             choice.composition,
             info.get("mode").unwrap_or(""),
         );
+    }
+
+    /// Match the rtx-specific movement features to what the server actually provides.
+    ///
+    /// These run *server-side* (a double jump, a wall dodge, the shootable-grenade combo), so they
+    /// exist only on an rtx server — and the sharp one, the double jump, decides whether the navmesh
+    /// plans routes across gaps that need it (`nav_build.rs`'s `djump` links). On a KTX or vanilla
+    /// server that second jump is never granted, so a bot planning around it would leap into a pit.
+    ///
+    /// So: not an rtx server → force every one off, and the navmesh never mints a link the server
+    /// won't honour. An rtx server → mirror exactly what it advertised in serverinfo (it publishes
+    /// each, `mode/mod.rs::publish_movement`), so a server running with, say, double jump off is
+    /// matched rather than assumed on. A key the operator pinned with `+set` is left alone — they know
+    /// something we don't. Run before the world spawns, since the navmesh build reads these.
+    fn sync_movement(&self) {
+        let pinned = |key: &str| self.config.cvars.iter().any(|(k, _)| k == key);
+        let Some(info) = self.lead().map(|b| b.session.serverinfo()) else {
+            return;
+        };
+        for (cv, value) in modes::movement_overrides(info, pinned) {
+            self.host.set(cv, &value);
+        }
     }
 
     /// Feed the server's match phase into the game, so the bot's rocket-jump gate respects a

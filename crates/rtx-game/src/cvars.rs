@@ -27,6 +27,18 @@ impl CvarValue for CvarSeed {
     }
 }
 
+/// The rtx-specific movement and combat features — the ones the *server* applies (in
+/// `PlayerPreThink`, or in the shootable-grenade combat path), so they exist only on an rtx server.
+///
+/// This is the set a network client must not assume. A double jump is the sharp one: the navmesh
+/// plans routes across gaps that only cross with the mid-air second jump (`nav_build.rs`, the `djump`
+/// links), and on a KTX or vanilla server that jump is never granted — the bot would commit to the
+/// leap and fall in. So the server **advertises** these in serverinfo (like KTX's `pm_*` keys) and a
+/// client mirrors them; a client on any other server forces them off. Grapple isn't here — the client
+/// forces it off unconditionally, because the hook's *state* isn't on the wire to mirror at all.
+pub(crate) const RTX_MOVE_CVARS: &[&str] =
+    &["rtx_doublejump", "rtx_walljump", "rtx_elevator_jump", "rtx_shootable_grenades"];
+
 /// The rtx tunables and their first-run defaults, registered in [`GameState::init`](crate::game).
 /// `cvar_default` only seeds a cvar that's unset, so a value from `server.cfg` (or a `set` before
 /// `map`) survives each `GAME_INIT`. Declared as data so the tunables read as one registry.

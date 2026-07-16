@@ -73,4 +73,7 @@ pub fn start_frame(game: &mut GameState) {
     game.level.framecount += 1;
     // Keep the active game mode in sync with `rtx_mode` (read live like the other rtx cvars).
     game.refresh_mode();
+    // Advertise the rtx-specific movement features, so a connecting rtx client mirrors them (and a
+    // KTX-style browser sees them). Deduped, so live cvars only touch the wire when they change.
+    game.publish_movement();
 }

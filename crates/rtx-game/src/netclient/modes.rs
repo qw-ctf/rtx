@@ -96,6 +96,30 @@ fn parse_mode(mode: &str, rtx: bool) -> ModeChoice {
     ModeChoice::new(ruleset, composition)
 }
 
+/// The rtx movement cvars a client should adopt from a server's serverinfo, and the value for each.
+///
+/// The rtx movement features run server-side, so a client must not assume them — the double jump
+/// above all, since the navmesh would otherwise plan routes across gaps that only cross with a second
+/// jump the server won't grant. The rule is one line: **each is the server's advertised value, or off
+/// if the server didn't advertise it.** That's correct in every case at once, because of how QW
+/// serverinfo works — a key at its default is dropped (mvdsv doesn't carry a `"0"`, exactly as it
+/// doesn't carry KTX's `pm_*` defaults):
+///
+/// - a non-rtx server advertises none of them → all off, no double-jump traps;
+/// - an rtx server with a feature *off* drops that key → off, matched;
+/// - an rtx server with a feature *on* publishes it → on, matched.
+///
+/// An older rtx server that predates the advertising publishes nothing, so all read off — safe (the
+/// bot takes longer routes) rather than a trap. A key the operator pinned with `+set` is theirs;
+/// `pinned` filters it out. Pure, so the rule can be tested without a live connection.
+pub(crate) fn movement_overrides(info: &Info, pinned: impl Fn(&str) -> bool) -> Vec<(&'static str, String)> {
+    crate::cvars::RTX_MOVE_CVARS
+        .iter()
+        .filter(|&&cv| !pinned(cv))
+        .map(|&cv| (cv, info.get(cv).unwrap_or("0").to_string()))
+        .collect()
+}
+
 /// The match phase, in the shape the brain reads it — see [`match_phase`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Phase {
@@ -186,6 +210,38 @@ mod tests {
             select_mode(&info(&[("mode", "ctf"), ("ktxver", "1.48")])),
             ModeChoice::new("ctf", "ffa"),
         );
+    }
+
+    /// The rtx movement features run server-side, so a client mustn't assume them. The sharp case is
+    /// the double jump: on a non-rtx server the navmesh must not plan a route across a gap that only
+    /// crosses with a jump the server will never grant. The rule leans on QW dropping a default-valued
+    /// key — an unadvertised movement reads as off, which is the safe direction to be wrong in.
+    #[test]
+    fn movements_are_off_unless_the_server_advertises_them() {
+        let never = |_: &str| false;
+        let get = |o: &[(&'static str, String)], k: &str| o.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
+
+        // A KTX server (ktxver, no rtxver): advertises no rtx moves → every one off.
+        let ktx = movement_overrides(&info(&[("ktxver", "1.48"), ("mode", "ffa")]), never);
+        assert_eq!(get(&ktx, "rtx_doublejump").as_deref(), Some("0"), "no double jump on KTX");
+        assert!(ktx.iter().all(|(_, v)| v == "0"), "every rtx move off on a non-rtx server");
+
+        // A vanilla server (nothing advertised): same — off.
+        assert!(movement_overrides(&info(&[]), never).iter().all(|(_, v)| v == "0"));
+
+        // An rtx server: on-features published (so matched on), off-features dropped by QW (so read
+        // off) — the whole point, since a KTX-style HUD and this client both read a default as absent.
+        let rtx = movement_overrides(
+            &info(&[("rtxver", "0.1.0"), ("rtx_doublejump", "1"), ("rtx_elevator_jump", "2")]),
+            never,
+        );
+        assert_eq!(get(&rtx, "rtx_doublejump").as_deref(), Some("1"), "advertised on → on");
+        assert_eq!(get(&rtx, "rtx_elevator_jump").as_deref(), Some("2"), "the multiplier, verbatim");
+        assert_eq!(get(&rtx, "rtx_walljump").as_deref(), Some("0"), "not advertised (server has it off) → off");
+
+        // The operator's `+set` is the last word — the pinned key doesn't appear.
+        let pinned = |k: &str| k == "rtx_doublejump";
+        assert!(get(&movement_overrides(&info(&[("ktxver", "1")]), pinned), "rtx_doublejump").is_none());
     }
 
     /// The phase feed, ezquake's rules: Standby/Countdown by name, everything else live.

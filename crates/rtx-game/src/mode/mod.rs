@@ -485,6 +485,23 @@ impl GameState {
         let wire = team::mode_serverinfo(self.mode.name(), self.team_match.config);
         self.publish_serverinfo("mode", &wire);
     }
+
+    /// Publish the rtx-specific movement features into serverinfo, so a network client mirrors them
+    /// instead of assuming its own defaults. See [`crate::cvars::RTX_MOVE_CVARS`]. Each key carries
+    /// the live cvar value (`1`/`0`, or the elevator-jump multiplier), deduped by `publish_serverinfo`.
+    pub(crate) fn publish_movement(&mut self) {
+        for &cv in crate::cvars::RTX_MOVE_CVARS {
+            let name = std::ffi::CString::new(cv).unwrap_or_default();
+            let value = self.host.cvar(&name);
+            // Whole numbers as ints (`1`, not `1.0`) so the wire reads like KTX's own `pm_*` keys.
+            let text = if value.fract() == 0.0 {
+                (value as i64).to_string()
+            } else {
+                value.to_string()
+            };
+            self.publish_serverinfo(cv, &text);
+        }
+    }
 }
 
 /// Map (re)load housekeeping for the mode layer, called from `worldspawn` after `refresh_mode`.
