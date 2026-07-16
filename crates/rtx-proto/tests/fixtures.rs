@@ -201,6 +201,16 @@ fn kind(ev: &SvcEvent) -> String {
         SvcEvent::ModelList(_) => "modellist",
         SvcEvent::SoundList(_) => "soundlist",
         SvcEvent::Voice => "voice",
+        // NetQuake-only events; a QuakeWorld capture never produces them.
+        SvcEvent::Time(_) => "time (nq)",
+        SvcEvent::SignonNum(_) => "signonnum (nq)",
+        SvcEvent::NqServerData(_) => "serverinfo (nq)",
+        SvcEvent::ClientData(_) => "clientdata (nq)",
+        SvcEvent::UpdateName { .. } => "updatename (nq)",
+        SvcEvent::UpdateColors { .. } => "updatecolors (nq)",
+        SvcEvent::SetView(_) => "setview (nq)",
+        SvcEvent::EntityUpdate(_) => "entityupdate (nq)",
+        SvcEvent::Particle { .. } => "particle (nq)",
     }
     .to_string()
 }

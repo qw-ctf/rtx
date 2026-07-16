@@ -436,5 +436,15 @@ fn name_of(ev: &SvcEvent) -> &'static str {
         SvcEvent::ModelList(_) => "modellist",
         SvcEvent::SoundList(_) => "soundlist",
         SvcEvent::Voice => "voice",
+        // NetQuake-only events; a QuakeWorld session never produces them.
+        SvcEvent::Time(_) => "time (nq)",
+        SvcEvent::SignonNum(_) => "signonnum (nq)",
+        SvcEvent::NqServerData(_) => "serverinfo (nq)",
+        SvcEvent::ClientData(_) => "clientdata (nq)",
+        SvcEvent::UpdateName { .. } => "updatename (nq)",
+        SvcEvent::UpdateColors { .. } => "updatecolors (nq)",
+        SvcEvent::SetView(_) => "setview (nq)",
+        SvcEvent::EntityUpdate(_) => "entityupdate (nq)",
+        SvcEvent::Particle { .. } => "particle (nq)",
     }
 }

@@ -357,8 +357,9 @@ pub struct EntityDelta {
     pub remove: bool,
     /// Model index.
     pub model: Option<u16>,
-    /// Animation frame.
-    pub frame: Option<u8>,
+    /// Animation frame. 16-bit to carry NetQuake 666's `U_FRAME2` high byte; QuakeWorld only ever
+    /// fills the low 8.
+    pub frame: Option<u16>,
     /// Colormap.
     pub colormap: Option<u8>,
     /// Skin.
@@ -413,8 +414,9 @@ pub struct Nail {
 pub struct Baseline {
     /// Model index.
     pub modelindex: u16,
-    /// Animation frame.
-    pub frame: u8,
+    /// Animation frame. 16-bit for NetQuake 666's `B_LARGEFRAME` baselines; QuakeWorld fills the
+    /// low 8 only.
+    pub frame: u16,
     /// Colormap.
     pub colormap: u8,
     /// Skin.
@@ -443,6 +445,11 @@ pub enum TempEntityKind {
     Teleport = 11,
     Blood = 12,
     LightningBlood = 13,
+    /// NetQuake `TE_EXPLOSION2` (wire byte 12): a colour-mapped explosion. QuakeWorld puts `Blood`
+    /// at 12, so this takes a distinct tag — the wire→kind mapping is each parser's job.
+    Explosion2 = 14,
+    /// NetQuake `TE_BEAM` (wire byte 13): the grapple beam.
+    GrappleBeam = 15,
 }
 
 /// A temp entity — the one-shot visual effects. A bot reads them as evidence: an explosion is a
@@ -538,6 +545,75 @@ impl Default for MoveVars {
     }
 }
 
+/// `svc_serverinfo` — NetQuake's map-change message, the counterpart to QuakeWorld's [`ServerData`].
+///
+/// Unlike QuakeWorld, the precache lists ride *inside* this one message rather than in a separate
+/// `modellist`/`soundlist` exchange, so there is no signon round trip to fetch them. Both lists are
+/// 1-indexed on the wire (index 0 is a reserved empty slot); [`models`](Self::models) and
+/// [`sounds`](Self::sounds) keep that convention with an empty string at index 0, so a wire index
+/// dereferences them directly.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NqServerData {
+    /// Protocol version: 15, 666 or 999.
+    pub protocol: u32,
+    /// `protocolflags` (999 only), for the coord/angle widths.
+    pub flags: u32,
+    /// Maximum player slots — the scoreboard size and the player-entity range `1..=maxclients`.
+    pub maxclients: u8,
+    /// Game type: 0 = coop, 1 = deathmatch (`GAME_*`).
+    pub gametype: u8,
+    /// The map's display name (not its filename — that's `models[1]`).
+    pub levelname: String,
+    /// The model precache list, 1-indexed (index 0 empty). `models[1]` is `maps/<name>.bsp`.
+    pub models: Vec<String>,
+    /// The sound precache list, 1-indexed (index 0 empty).
+    pub sounds: Vec<String>,
+}
+
+/// `svc_clientdata` — the whole of our own player state in one bitfielded message, sent every frame.
+///
+/// QuakeWorld dribbles this out as individual `svc_updatestat`s plus playerinfo; NetQuake packs it
+/// into one message. Fields absent from the bitfield default to zero (or, for viewheight, 22).
+/// `active_weapon` is the `IT_*` weapon bit under standard Quake rules (id1), matching what the
+/// `STAT_ACTIVEWEAPON` consumer expects.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ClientData {
+    /// Eye height above the origin (`STAT_VIEWHEIGHT`, default 22).
+    pub viewheight: i16,
+    /// Server's suggested pitch for auto-aim assist (`STAT_IDEALPITCH`).
+    pub ideal_pitch: i8,
+    /// View punch from recent damage, per axis in degrees.
+    pub punch: Vec3,
+    /// Our velocity, per axis (`char * 16`).
+    pub velocity: Vec3,
+    /// Carried items and powerups (`IT_*` / `STAT_ITEMS`).
+    pub items: u32,
+    /// Standing on the ground this frame.
+    pub on_ground: bool,
+    /// Standing in water this frame.
+    pub in_water: bool,
+    /// Weapon-model animation frame.
+    pub weaponframe: u16,
+    /// Armour points.
+    pub armor: u16,
+    /// The viewmodel's model index (`STAT_WEAPON`).
+    pub weapon_model: u16,
+    /// Health; non-positive means dead.
+    pub health: i16,
+    /// Ammo for the current weapon (`STAT_AMMO`).
+    pub ammo: u16,
+    /// Shells.
+    pub shells: u16,
+    /// Nails.
+    pub nails: u16,
+    /// Rockets.
+    pub rockets: u16,
+    /// Cells.
+    pub cells: u16,
+    /// The active weapon's `IT_*` bit (`STAT_ACTIVEWEAPON`).
+    pub active_weapon: u8,
+}
+
 /// A soundlist or modellist chunk. The list is sent in batches because it won't fit one packet.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResourceList {
@@ -595,8 +671,8 @@ pub enum SvcEvent {
         entity: u16,
         /// Channel 0–7.
         channel: u8,
-        /// Index into the soundlist.
-        sound: u8,
+        /// Index into the soundlist. 16-bit for NetQuake 666's `SND_LARGESOUND`; QuakeWorld fits 8.
+        sound: u16,
         /// Volume 0–255.
         volume: u8,
         /// Attenuation — how fast it fades with distance.
@@ -642,7 +718,8 @@ pub enum SvcEvent {
     /// A looping ambient sound.
     SpawnStaticSound {
         origin: Vec3,
-        sound: u8,
+        /// Index into the soundlist. 16-bit for NetQuake's `svc_spawnstaticsound2`.
+        sound: u16,
         volume: u8,
         attenuation: u8,
     },
@@ -689,6 +766,36 @@ pub enum SvcEvent {
     SoundList(ResourceList),
     /// Voice chat, skipped.
     Voice,
+
+    // ── NetQuake-only messages ──────────────────────────────────────────────────────────────────
+    // QuakeWorld folds these into other messages (own state into stats, frame time into the netchan
+    // sequence); NetQuake sends them explicitly, so they need their own events. The mirror consumes
+    // them through the same match as the shared ones above.
+    /// `svc_time` — the server's frame clock. Delimits an entity frame and is echoed in `clc_move`
+    /// for the server's ping calculation.
+    Time(f32),
+    /// `svc_signonnum` — advance the signon handshake to this step.
+    SignonNum(u8),
+    /// `svc_serverinfo` — NetQuake's map change (the counterpart to [`ServerData`]).
+    NqServerData(Box<NqServerData>),
+    /// `svc_clientdata` — our own player state for this frame.
+    ClientData(Box<ClientData>),
+    /// `svc_updatename` — a player slot's name (NetQuake has no userinfo string).
+    UpdateName { player: u8, name: String },
+    /// `svc_updatecolors` — a player slot's colours, packed `(top << 4) | bottom`.
+    UpdateColors { player: u8, colors: u8 },
+    /// `svc_setview` — the entity we're viewing from; our own player number is this minus one.
+    SetView(u16),
+    /// A NetQuake fast entity update, delta'd from the entity's **baseline** (not the previous
+    /// frame). The store resolves absent fields against the baseline.
+    EntityUpdate(EntityDelta),
+    /// `svc_particle` — a particle burst. Carried for completeness; the bot ignores it.
+    Particle {
+        origin: Vec3,
+        dir: Vec3,
+        count: u8,
+        color: u8,
+    },
 }
 
 /// Parse every message in one packet payload.
@@ -740,7 +847,7 @@ fn parse_one(
                 DEFAULT_SOUND_ATTENUATION
             };
             SvcEvent::Sound {
-                sound: r.u8()?,
+                sound: r.u8()? as u16,
                 origin: r.coord3()?,
                 entity: (channel >> 3) & 1023,
                 channel: (channel & 7) as u8,
@@ -794,7 +901,7 @@ fn parse_one(
         op::FOUNDSECRET => SvcEvent::FoundSecret,
         op::SPAWNSTATICSOUND => SvcEvent::SpawnStaticSound {
             origin: r.coord3()?,
-            sound: r.u8()?,
+            sound: r.u8()? as u16,
             volume: r.u8()?,
             attenuation: r.u8()?,
         },
@@ -921,7 +1028,7 @@ fn parse_serverdata(proto: &mut ProtoState, r: &mut Reader) -> Result<SvcEvent, 
 /// The classic baseline body, shared by `svc_spawnbaseline` and `svc_spawnstatic`.
 fn read_baseline(r: &mut Reader) -> Result<Baseline, Underflow> {
     let modelindex = r.u8()? as u16;
-    let frame = r.u8()?;
+    let frame = r.u8()? as u16;
     let colormap = r.u8()?;
     let skinnum = r.u8()?;
     // Origin and angle interleave, one axis at a time.
@@ -1150,7 +1257,7 @@ fn read_delta_entity_bits(proto: &ProtoState, r: &mut Reader, word: u32) -> Resu
         d.model = Some(r.u16()?);
     }
     if bits & u::FRAME != 0 {
-        d.frame = Some(r.u8()?);
+        d.frame = Some(r.u8()? as u16);
     }
     if bits & u::COLORMAP != 0 {
         d.colormap = Some(r.u8()?);

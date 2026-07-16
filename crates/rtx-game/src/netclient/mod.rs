@@ -73,6 +73,8 @@ pub(crate) mod frames;
 pub(crate) mod host;
 pub(crate) mod mirror;
 pub(crate) mod modes;
+pub(crate) mod nq_frames;
+pub(crate) mod nq_session;
 pub(crate) mod pak;
 pub(crate) mod senses;
 pub(crate) mod session;
@@ -81,11 +83,12 @@ pub(crate) mod world;
 use std::io;
 use std::time::{Duration, Instant};
 
-pub use config::{parse as parse_args, Config, USAGE};
+pub use config::{parse as parse_args, Config, Protocol, USAGE};
 use rtx_proto::info::UserinfoBuilder;
 use rtx_proto::svc::SvcEvent;
 use frames::EntityState;
 use mirror::{Mirror, Squad, WorldMirror};
+use nq_session::NqSession;
 use session::{Session, Signon};
 
 use crate::entity::EntId;
@@ -108,8 +111,111 @@ const MAX_LEAD: f32 = 0.25;
 /// sight — and a [`Mirror`] knows the game and nothing about sockets. This is the seam between them,
 /// and there is exactly one of these per connection because QuakeWorld has no notion of a connection
 /// carrying two players.
+/// A connection, whichever protocol it speaks.
+///
+/// The tick loop drives a connection through this one surface, so it never has to know whether a bot
+/// is on a QuakeWorld or a NetQuake server — the difference is entirely below here. Each arm just
+/// forwards to the session that owns the wire. New per-protocol behaviour goes in the sessions; only
+/// the shared vocabulary the loop needs is delegated.
+enum AnySession {
+    Qw(Session),
+    Nq(NqSession),
+}
+
+/// Forward a `&self` accessor to whichever session backs this connection.
+macro_rules! any_get {
+    ($name:ident -> $ret:ty) => {
+        fn $name(&self) -> $ret {
+            match self {
+                AnySession::Qw(s) => s.$name(),
+                AnySession::Nq(s) => s.$name(),
+            }
+        }
+    };
+}
+
+impl AnySession {
+    any_get!(signon -> Signon);
+    any_get!(playernum -> u8);
+    any_get!(sounds -> &[String]);
+    any_get!(models -> &[String]);
+    any_get!(serverinfo -> &rtx_proto::info::Info);
+    any_get!(mapname -> &str);
+    any_get!(rtt -> f32);
+    any_get!(frames_at -> Instant);
+    any_get!(at_intermission -> bool);
+    any_get!(servercount -> i32);
+    any_get!(frames_current -> &[EntityState]);
+    any_get!(chokes -> u32);
+
+    fn poll(&mut self, host: &NetHost) -> io::Result<Vec<SvcEvent>> {
+        match self {
+            AnySession::Qw(s) => s.poll(host),
+            AnySession::Nq(s) => s.poll(host),
+        }
+    }
+
+    fn send_move(&mut self, angles: glam::Vec3, forward: i32, side: i32, up: i32, buttons: u8, impulse: u8) -> io::Result<()> {
+        match self {
+            AnySession::Qw(s) => s.send_move(angles, forward, side, up, buttons, impulse),
+            AnySession::Nq(s) => s.send_move(angles, forward, side, up, buttons, impulse),
+        }
+    }
+
+    fn send_nop(&mut self) -> io::Result<()> {
+        match self {
+            AnySession::Qw(s) => s.send_nop(),
+            AnySession::Nq(s) => s.send_nop(),
+        }
+    }
+
+    fn send_idle(&mut self) -> io::Result<()> {
+        match self {
+            AnySession::Qw(s) => s.send_idle(),
+            AnySession::Nq(s) => s.send_idle(),
+        }
+    }
+
+    fn stringcmd(&mut self, cmd: &str) {
+        match self {
+            AnySession::Qw(s) => s.stringcmd(cmd),
+            AnySession::Nq(s) => s.stringcmd(cmd),
+        }
+    }
+
+    fn ready_up(&mut self) {
+        match self {
+            AnySession::Qw(s) => s.ready_up(),
+            AnySession::Nq(s) => s.ready_up(),
+        }
+    }
+
+    #[cfg(test)]
+    fn name(&self) -> &str {
+        match self {
+            AnySession::Qw(s) => s.name(),
+            AnySession::Nq(s) => s.name(),
+        }
+    }
+
+    /// The player-slot entities this connection sees, with their estimated velocities — NetQuake
+    /// only, since QuakeWorld delivers players as `svc_playerinfo` events instead. Empty for
+    /// QuakeWorld, so the caller's per-tick player pass is a no-op there.
+    fn nq_players(&self) -> Vec<(EntityState, Option<glam::Vec3>)> {
+        match self {
+            AnySession::Qw(_) => Vec::new(),
+            AnySession::Nq(s) => s
+                .frames_current()
+                .iter()
+                .filter(|e| e.number >= 1 && (e.number as usize) <= mirror::MAX_CLIENTS)
+                .map(|e| (*e, s.velocity_of(e.number)))
+                .collect(),
+        }
+    }
+}
+
 struct Bot {
-    session: Session,
+    session: AnySession,
     mirror: Mirror,
     /// How far it has actually travelled. A bot that connects, spawns and then stands still looks
     /// identical to a working one in every other line of output; this is the number that tells them
@@ -232,6 +338,12 @@ impl Client {
         // maps, the way the server is tuned by its own cfg.
         let cfg = config.config_file.clone().unwrap_or_else(|| config.basedir.join("rtx.cfg"));
         exec_cfg(host, &cfg, 0);
+        // The trick-movement repertoire — rocket jumps, bunnyhop/strafe, curl jumps — is left on for
+        // NetQuake too: these are real NetQuake maneuvers (the whole of Quake Done Quick is built on
+        // them). The one caveat is that the planners *certify* a jump against a QuakeWorld `pmove_sim`,
+        // and NetQuake's server-side physics differ enough in the margins that a certified jump can
+        // occasionally mis-land — a tuning follow-up (re-certify against NetQuake pmove), not a reason
+        // to withhold the capability.
         // Explicit overrides last, so a command-line `+set` always wins — over the cfg and the rest.
         for (name, value) in &config.cvars {
             host.set(name, value);
@@ -284,17 +396,31 @@ impl Client {
                 bot: true, // announce ourselves — a bot on a human server should say so
                 ..Default::default()
             };
-            // The qport identifies us across a NAT rebinding, so a squad needs distinct ones. Real
-            // clients randomize; deriving them keeps a capture readable.
-            let qport = 0x4000u16.wrapping_add(i as u16);
-            self.bots.push(Bot {
-                session: Session::connect(
+            let session = match self.config.proto {
+                Protocol::Qw => {
+                    // The qport identifies us across a NAT rebinding, so a squad needs distinct ones.
+                    // Real clients randomize; deriving them keeps a capture readable.
+                    let qport = 0x4000u16.wrapping_add(i as u16);
+                    AnySession::Qw(Session::connect(
+                        self.config.server,
+                        ui,
+                        qport,
+                        self.config.wiretap.as_deref(),
+                        self.config.download,
+                    )?)
+                }
+                Protocol::Nq => AnySession::Nq(NqSession::connect(
                     self.config.server,
-                    ui,
-                    qport,
+                    ui.name,
+                    self.config.colors,
+                    self.config.spectate,
+                    self.config.game.clone(),
                     self.config.wiretap.as_deref(),
                     self.config.download,
-                )?,
+                )?),
+            };
+            self.bots.push(Bot {
+                session,
                 mirror: Mirror::default(),
                 travelled: 0.0,
                 last_at: None,
@@ -385,6 +511,16 @@ impl Client {
             for ev in events {
                 self.observe(i, ev);
                 self.bots[i].apply(&mut self.game, &mut self.world, &squad, ev);
+            }
+        }
+
+        // 1b. NetQuake carries players as ordinary entity updates rather than per-player messages,
+        //     so a NetQuake bot's own body and the enemies it sees are folded in here, from its
+        //     settled frame store, once the frame is complete. A no-op for QuakeWorld bots.
+        for i in 0..self.bots.len() {
+            let players = self.bots[i].session.nq_players();
+            if !players.is_empty() {
+                self.bots[i].mirror.write_players_nq(&mut self.game, &mut self.world, &squad, &players);
             }
         }
 
@@ -706,7 +842,7 @@ impl Client {
         let playing = || self.bots.iter().filter(|b| b.session.signon() == Signon::Active);
         for b in playing() {
             let at = b.session.frames_at();
-            for e in b.session.frames.current() {
+            for e in b.session.frames_current() {
                 match seen.iter_mut().find(|(x, _)| x.number == e.number) {
                     Some(held) if held.1 < at => *held = (*e, at),
                     Some(_) => {}
@@ -764,7 +900,7 @@ impl Client {
                 s.signon(),
                 s.mapname(),
                 s.rtt() * 1000.0,
-                s.chokes
+                s.chokes()
             );
             // Travel is the honest measure of "is it playing": everything else can look right while
             // the bot stands on its spawn.

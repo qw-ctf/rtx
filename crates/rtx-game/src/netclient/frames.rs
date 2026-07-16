@@ -64,8 +64,8 @@ pub(crate) struct EntityState {
     pub number: u16,
     /// Index into the model list.
     pub model: u16,
-    /// Animation frame.
-    pub frame: u8,
+    /// Animation frame. 16-bit to match [`Baseline`]/[`EntityDelta`] (NetQuake 666 large frames).
+    pub frame: u16,
     /// Colormap.
     pub colormap: u8,
     /// Skin.
@@ -80,7 +80,7 @@ pub(crate) struct EntityState {
 
 impl EntityState {
     /// The state an entity starts from when the server first mentions it.
-    fn from_baseline(number: u16, b: &Baseline) -> Self {
+    pub(crate) fn from_baseline(number: u16, b: &Baseline) -> Self {
         EntityState {
             number,
             model: b.modelindex,
@@ -94,7 +94,7 @@ impl EntityState {
     }
 
     /// Apply the fields an update actually carried, leaving the rest alone.
-    fn apply(&mut self, d: &EntityDelta) {
+    pub(crate) fn apply(&mut self, d: &EntityDelta) {
         self.number = d.number;
         if let Some(v) = d.model {
             self.model = v;

@@ -149,6 +149,14 @@ impl<'a> Reader<'a> {
         Ok(self.i32()? as u32)
     }
 
+    /// A **big-endian** unsigned 32-bit word. QuakeWorld is little-endian everywhere, but NetQuake's
+    /// Datagram transport frames every packet with a big-endian `[flags|len][sequence]` header (id's
+    /// `BigLong`). Only the 8-byte header is big-endian; the payload after it is ordinary LE.
+    pub fn u32_be(&mut self) -> Result<u32> {
+        let b = self.bytes(4)?;
+        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
     /// `MSG_ReadFloat` — a 32-bit IEEE float.
     pub fn f32(&mut self) -> Result<f32> {
         Ok(f32::from_bits(self.i32()? as u32))
@@ -302,6 +310,12 @@ impl Writer {
     /// Append an unsigned 32-bit word.
     pub fn u32(&mut self, v: u32) {
         self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// Append a **big-endian** unsigned 32-bit word — NetQuake's Datagram header longs (see
+    /// [`Reader::u32_be`]).
+    pub fn u32_be(&mut self, v: u32) {
+        self.buf.extend_from_slice(&v.to_be_bytes());
     }
 
     /// Append a NUL-terminated string, encoded latin-1 (chars above U+00FF are dropped rather than
@@ -485,6 +499,21 @@ mod tests {
         assert_eq!(r.i32().unwrap(), 70000);
         assert_eq!(r.string().unwrap(), "hi");
         assert!(r.at_end());
+    }
+
+    /// NetQuake's Datagram header is big-endian while the payload stays little-endian, so the two
+    /// widths must not be confused: `0x8000_0400` is a control packet of length 0x400, and reading
+    /// it little-endian would call it length 0x8000 with the wrong flag bits.
+    #[test]
+    fn u32_be_round_trips_and_differs_from_le() {
+        let mut w = Writer::new();
+        w.u32_be(0x8000_0400);
+        let buf = w.into_vec();
+        assert_eq!(buf, [0x80, 0x00, 0x04, 0x00]);
+        let mut r = Reader::new(&buf);
+        assert_eq!(r.u32_be().unwrap(), 0x8000_0400);
+        // The same bytes read little-endian are a different number entirely.
+        assert_eq!(Reader::new(&buf).u32().unwrap(), 0x0004_0080);
     }
 
     /// Angle quantization must round-trip through the wire encoding and wrap the way the server's

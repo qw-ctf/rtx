@@ -27,7 +27,7 @@
 
 use glam::Vec3;
 use rtx_proto::protocol::stat;
-use rtx_proto::svc::{PlayerInfo, SvcEvent, TempEntity, TempEntityKind};
+use rtx_proto::svc::{ClientData, PlayerInfo, SvcEvent, TempEntity, TempEntityKind};
 
 use crate::bot::model::PickupKind;
 use crate::client::movement::AIR_TIME;
@@ -40,6 +40,12 @@ use crate::weapons::projectiles::{GRENADE_FUSE, NAIL_SPEED, ROCKET_SPEED};
 use crate::entity::{EntId, Entity, FlagPhase, MoverPhase, Touch};
 use crate::game::GameState;
 use crate::netclient::frames::EntityState;
+
+/// `player.mdl`'s death animations — `AXDETH1` (frame 41) through `DEATHE9` (frame 102), fixed by
+/// the model file. NetQuake carries no `PF_DEAD` for other players, so a corpse is told from a live
+/// body by whether its animation frame sits in this range (the same table `player.rs` animates
+/// deaths with). Living poses — stand/run/pain (0–40) and the attacks (103+) — fall outside it.
+const PLAYER_DEATH_FRAMES: std::ops::RangeInclusive<u16> = 41..=102;
 
 /// The wire's player slot as an entity id. Slots are 0-based; entity 0 is the world, so players
 /// start at 1.
@@ -200,6 +206,26 @@ impl Mirror {
                 self.write_own_stats(game);
             }
             SvcEvent::PlayerInfo(pi) => self.write_player(game, world, squad, pi),
+            // NetQuake packs our own state into one message rather than per-stat updates.
+            SvcEvent::ClientData(cd) => self.write_clientdata(game, cd),
+            // NetQuake has no userinfo string — a slot's name and colours arrive on their own.
+            SvcEvent::UpdateName { player, name } => self.write_name_nq(game, *player, name),
+            SvcEvent::UpdateColors { player, colors } => {
+                if (*player as usize) < MAX_CLIENTS {
+                    let e = slot_to_ent(*player);
+                    if is_player_slot(game, e) {
+                        // NetQuake teamplay keys off the trouser (low-nibble) colour.
+                        game.entities[e].mode_p.team = *colors & 0x0f;
+                    }
+                }
+            }
+            // NetQuake tells us our slot via the view entity (one less than its number).
+            SvcEvent::SetView(e) => {
+                let slot = e.saturating_sub(1) as u8;
+                if self.playernum != slot {
+                    self.set_slot(slot, self.spectator);
+                }
+            }
             // The bot's ears. Sounds carry by PHS rather than PVS — you hear things through walls,
             // which is the whole point of listening — so this reaches further than sight, and is
             // exactly what a player works from when they say "he's got the rocket launcher".
@@ -469,6 +495,166 @@ impl Mirror {
 
         // Water is not on the wire either, but it's not a secret: anyone can see where the water is.
         // The map says, and we have the map.
+        self.write_waterlevel(game, e);
+        if own {
+            self.write_air(game, e);
+        }
+        game.link_edict(e);
+    }
+
+    /// Our own state, from NetQuake's monolithic `svc_clientdata`.
+    ///
+    /// The stat fields feed the same [`write_own_stats`](Self::write_own_stats) QuakeWorld drives
+    /// from per-stat updates; velocity and on-ground ride this message too (QuakeWorld gets them from
+    /// playerinfo), while our *origin* comes from the entity update for our own body, applied in
+    /// [`write_player_nq`](Self::write_player_nq).
+    fn write_clientdata(&mut self, game: &mut GameState, cd: &ClientData) {
+        if self.spectator {
+            return;
+        }
+        self.stats[stat::HEALTH as usize] = cd.health as i32;
+        self.stats[stat::ARMOR as usize] = cd.armor as i32;
+        self.stats[stat::ITEMS as usize] = cd.items as i32;
+        self.stats[stat::SHELLS as usize] = cd.shells as i32;
+        self.stats[stat::NAILS as usize] = cd.nails as i32;
+        self.stats[stat::ROCKETS as usize] = cd.rockets as i32;
+        self.stats[stat::CELLS as usize] = cd.cells as i32;
+        self.stats[stat::ACTIVEWEAPON as usize] = cd.active_weapon as i32;
+        self.stats[stat::WEAPON as usize] = cd.weapon_model as i32;
+        self.stats[stat::AMMO as usize] = cd.ammo as i32;
+        self.write_own_stats(game); // embodies us if needed, then writes health/items/ammo/weapon
+
+        let e = self.own();
+        let v = &mut game.entities[e].v;
+        v.velocity = cd.velocity;
+        v.flags = if cd.on_ground {
+            v.flags.with(Flags::ONGROUND)
+        } else {
+            v.flags.without(Flags::ONGROUND)
+        };
+        self.write_waterlevel(game, e);
+        self.write_air(game, e);
+    }
+
+    /// A player slot's name (NetQuake's substitute for a userinfo string). Non-empty makes the slot a
+    /// player the bot reasons about; empty means the slot emptied.
+    fn write_name_nq(&mut self, game: &mut GameState, slot: u8, name: &str) {
+        if slot as usize >= MAX_CLIENTS {
+            return;
+        }
+        let e = slot_to_ent(slot);
+        if name.is_empty() {
+            if slot != self.playernum {
+                game.entities[e] = Entity::default();
+            }
+            return;
+        }
+        let ent = &mut game.entities[e];
+        ent.in_use = true;
+        ent.classname = Some("player".into());
+        ent.netname = Some(Box::from(name));
+    }
+
+    /// Mirror every player-slot entity from this connection's settled frame store.
+    ///
+    /// The QuakeWorld analogue is [`write_player`](Self::write_player), one call per `svc_playerinfo`;
+    /// NetQuake carries players as ordinary entity updates, so they arrive together in the frame and
+    /// are folded in here, per tick, once the frame is complete.
+    pub(crate) fn write_players_nq(
+        &mut self,
+        game: &mut GameState,
+        world: &mut WorldMirror,
+        squad: &Squad,
+        players: &[(EntityState, Option<Vec3>)],
+    ) {
+        if self.spectator {
+            return;
+        }
+        for (state, vel) in players {
+            self.write_player_nq(game, world, squad, state, *vel);
+        }
+    }
+
+    /// One player's per-frame state, from an entity update rather than a playerinfo message.
+    ///
+    /// Our own body takes only its origin from here — health, ammo, velocity and on-ground came from
+    /// [`svc_clientdata`](Self::write_clientdata), and our aim is the brain's, not the model's yaw.
+    /// Everyone else is known exactly as much as a spectator would know: position, facing, and — since
+    /// no `PF_DEAD` is on the wire — life-or-death inferred from the animation frame.
+    fn write_player_nq(
+        &mut self,
+        game: &mut GameState,
+        world: &mut WorldMirror,
+        squad: &Squad,
+        state: &EntityState,
+        vel: Option<Vec3>,
+    ) {
+        let slot = (state.number.saturating_sub(1)) as u8;
+        if slot as usize >= MAX_CLIENTS {
+            return;
+        }
+        let e = slot_to_ent(slot);
+        let own = !self.spectator && slot == self.playernum;
+        if own && !self.embodied {
+            self.embody(game);
+        }
+        // A slot no name has arrived for isn't a player to reason about yet.
+        if !own && !is_player_slot(game, e) {
+            return;
+        }
+
+        // In our PVS this frame — so combat and perception can tell a live sighting from a shadow
+        // frozen where the player was when it left view.
+        game.entities[e].net_seen = game.time();
+        let dead = PLAYER_DEATH_FRAMES.contains(&state.frame);
+
+        {
+            let v = &mut game.entities[e].v;
+            v.origin = state.origin;
+            v.frame = state.frame as f32;
+            v.modelindex = state.model as f32;
+            v.effects = state.effects as f32;
+            v.movetype = MoveType::Walk;
+            v.solid = Solid::SlideBox;
+            v.mins = crate::defs::VEC_HULL_MIN;
+            v.maxs = crate::defs::VEC_HULL_MAX;
+            v.flags = v.flags.with(Flags::CLIENT);
+
+            if !own {
+                v.velocity = vel.unwrap_or(Vec3::ZERO);
+                // NetQuake sends no view angles for others — the model's yaw is the facing a watcher
+                // reads, and there is no pitch on a body.
+                let facing = Vec3::new(0.0, state.angles.y, 0.0);
+                v.angles = facing;
+                v.v_angle = facing;
+                // On-ground isn't on the wire; treat others as grounded, which is the conservative
+                // read for the rocket-at-an-airborne-target heuristic.
+                v.flags = v.flags.with(Flags::ONGROUND);
+
+                // Their health is a guess (the protocol carries none); death, at least, is legible
+                // from the corpse pose. A squadmate has its own mirror that knows both exactly.
+                if !squad.ours(slot) {
+                    v.deadflag = if dead { DeadFlag::Dead } else { DeadFlag::No };
+                    v.health = if dead { 0.0 } else { 100.0 };
+                }
+            }
+        }
+
+        // A death is the moment an estimate stops being a guess — whoever that was is about to
+        // respawn, so the pack they drop inherits what we believed, and the strength model resets.
+        if !own {
+            let now_alive = !dead;
+            if self.alive[slot as usize] && !now_alive {
+                if game.host().cvar_bool(c"rtx_bot_model") {
+                    let (items, ammo) = hypothesized_pack(game.opponents.believed_arsenal(e));
+                    let origin = game.entities[e].v.origin;
+                    world.remember_death_drop(origin, items, ammo, game.time());
+                }
+                game.client_saw_death(e);
+            }
+            self.alive[slot as usize] = now_alive;
+        }
+
         self.write_waterlevel(game, e);
         if own {
             self.write_air(game, e);

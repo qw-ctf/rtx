@@ -42,7 +42,7 @@ use rtx_proto::protocol::{self, magic, ProtoState};
 use rtx_proto::svc::{self, SvcEvent, Usercmd};
 use rtx_proto::{checksum, clc, oob};
 
-use super::frames::{Applied, Frames};
+use super::frames::{Applied, EntityState, Frames};
 use super::host::NetHost;
 use crate::host::ClientHost;
 
@@ -90,15 +90,25 @@ const STOCK_EMODEL_CRC: u16 = 6967;
 ///
 /// Named to `rtx-proto`'s contract — `NNNNNN-{c2s,s2c}.bin` — so a directory written here is one
 /// `RTX_TEST_QW_CAPTURE` can be pointed straight at.
-struct Wiretap {
+pub(crate) struct Wiretap {
     dir: std::path::PathBuf,
     n: usize,
 }
 
 impl Wiretap {
+    /// Open a wiretap on a per-connection subdirectory, so a squad's interleaved datagrams don't
+    /// mix into one unreplayable capture. `None` if the directory can't be made.
+    pub(crate) fn open(base: &std::path::Path, tag: &str) -> Option<Wiretap> {
+        let dir = base.join(tag);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| eprintln!("rtx-client: can't record to {}: {e}", dir.display()))
+            .ok()
+            .map(|()| Wiretap { dir, n: 0 })
+    }
+
     /// Record one datagram. Failures are dropped on purpose: a full disk is not a reason to break
     /// off a game, and the capture is a diagnostic, not the point of the run.
-    fn record(&mut self, data: &[u8], to_server: bool) {
+    pub(crate) fn record(&mut self, data: &[u8], to_server: bool) {
         let name = format!("{:06}-{}.bin", self.n, if to_server { "c2s" } else { "s2c" });
         self.n += 1;
         let _ = std::fs::write(self.dir.join(name), data);
@@ -274,6 +284,17 @@ impl Session {
     /// When this connection's entity snapshot last advanced.
     pub(crate) fn frames_at(&self) -> Instant {
         self.frames_at
+    }
+
+    /// The entities of the current frame — the slice the world mirror consumes. An accessor rather
+    /// than a public field so [`AnySession`](super::AnySession) can front both protocols uniformly.
+    pub(crate) fn frames_current(&self) -> &[EntityState] {
+        self.frames.current()
+    }
+
+    /// Frames the server withheld to stay inside our rate.
+    pub(crate) fn chokes(&self) -> u32 {
+        self.chokes
     }
 
     /// Whether the server has us at a scoreboard rather than in the game.

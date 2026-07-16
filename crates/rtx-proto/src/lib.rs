@@ -8,6 +8,10 @@
 //! the reliable transport ([`netchan`]), the connectionless handshake ([`oob`]), the server→client
 //! parser ([`svc`]) and the client→server builder ([`clc`]).
 //!
+//! The [`nq`] module is the same job for **NetQuake** — the original Quake protocol — reusing the
+//! message buffers and the [`svc::SvcEvent`] vocabulary but with its own transport, handshake and
+//! width rules. A client picks one family per connection.
+//!
 //! No IO, no threads, no world state — the parser hands back typed events and the caller decides
 //! what they mean. That keeps the wire format testable against recorded datagram fixtures (see
 //! `tests/`) independently of the bot that consumes them, and it's why this crate builds and tests
@@ -23,6 +27,7 @@ pub mod crc;
 pub mod info;
 pub mod mdfour;
 pub mod netchan;
+pub mod nq;
 pub mod oob;
 pub mod protocol;
 pub mod sizebuf;
