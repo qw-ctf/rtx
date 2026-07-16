@@ -109,9 +109,11 @@ pub(crate) fn perceive(game: &mut GameState, e: EntId, enemy: EntId, now: f32) -
     let enemy_org = game.entities[enemy].v.origin;
     let enemy_eye = enemy_org + VEC_VIEW_OFS;
 
-    // See: clear line of sight (same test as combat's) AND within the view cone around our view.
+    // See: clear line of sight (same test as combat's) AND within the view cone around our view — and
+    // the shadow we'd be sighting isn't a stale ghost the target left behind on the network client (a
+    // player that teleported or ducked out of PVS, frozen where we last saw it; see `net_shadow_stale`).
     let tr = game.traceline(my_eye, enemy_eye, false, e);
-    let los = tr.ent == enemy || tr.fraction > 0.95;
+    let los = (tr.ent == enemy || tr.fraction > 0.95) && !game.net_shadow_stale(enemy, now);
     let in_fov = fov <= 0.0 || {
         let fwd = angle_vectors(game.entities[e].bot.aim.angles).0;
         let to = (enemy_eye - my_eye).normalize_or_zero();
@@ -172,6 +174,23 @@ pub(crate) fn perceive(game: &mut GameState, e: EntId, enemy: EntId, now: f32) -
             last_seen: b.percept.last_seen,
         },
         _ => Awareness::Unaware,
+    }
+}
+
+/// How long a networked player's shadow may go un-updated before we treat it as a frozen ghost rather
+/// than a live target. A player in our PVS is sent every frame, so a few frames' silence (a dropped
+/// packet) is tolerated, but a fifth of a second means it genuinely left our view.
+const NET_STALE_GRACE: f32 = 0.2;
+
+impl GameState {
+    /// See [`Entity::net_seen`]: on the network client, a player whose shadow the server has stopped
+    /// updating has left our PVS — behind a wall, or through a teleporter — so its shadow is frozen at
+    /// the last spot we saw it, and a live line of sight to *that spot* is a ghost, not a target.
+    /// Perception and combat both AND `!net_shadow_stale` into their line-of-sight test, so the bot
+    /// stops firing the instant the real player is gone instead of emptying its magazine into the
+    /// empty teleporter. Never true server-side: `is_client()` is false and the live edict keeps moving.
+    pub(crate) fn net_shadow_stale(&self, e: EntId, now: f32) -> bool {
+        self.host().is_client() && now - self.entities[e].net_seen > NET_STALE_GRACE
     }
 }
 

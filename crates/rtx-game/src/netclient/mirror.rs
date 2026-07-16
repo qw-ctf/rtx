@@ -362,6 +362,12 @@ impl Mirror {
             return;
         }
 
+        // Stamp the wire-update time: getting this at all means the player is in our PVS this frame,
+        // so combat and perception can tell a live sighting from a shadow frozen where the player was
+        // when it dropped out of view (behind a wall, or through a teleporter). Without it a stale
+        // shadow reads as a live target and the bot empties its ammo into the empty spot.
+        game.entities[e].net_seen = game.time();
+
         {
             let v = &mut game.entities[e].v;
             v.origin = pi.origin;
@@ -1642,6 +1648,30 @@ mod tests {
         // placeholder is the honest thing to write.
         tell(&mut g, 2);
         assert_eq!(g.entities[slot_to_ent(2)].v.health, 100.0, "alive, and that's all we can say");
+    }
+
+    /// A player that walks out of our PVS — behind a wall, or through a teleporter — stops arriving on
+    /// the wire, and its shadow freezes where we last saw it. A live line of sight to that frozen spot
+    /// is a ghost, not a target, so `net_shadow_stale` flags it and combat/perception stop firing at
+    /// it. Without this the bot empties its magazine into an empty teleporter.
+    #[test]
+    fn a_player_gone_from_pvs_reads_as_a_stale_ghost() {
+        let mut g = game();
+        let enemy = player(&mut g, slot_to_ent(1).0, Vec3::new(100.0, 0.0, 0.0));
+        let mut m = Solo::at(0);
+        let squad = Squad::new([false; MAX_CLIENTS], Vec::new());
+        let apply = |g: &mut GameState, m: &mut Solo| {
+            m.mirror.apply(g, &mut m.world, &squad, &SvcEvent::PlayerInfo(playerinfo(1, 0)), &[]);
+        };
+
+        // A playerinfo arrived, so it's in our PVS this frame: fresh, and a real target.
+        apply(&mut g, &mut m);
+        let seen = g.entities[enemy].net_seen;
+        assert!(!g.net_shadow_stale(enemy, seen + 0.1), "in PVS this frame — a live target");
+        // A fifth of a second on with no new update: it left our view, and the shadow is a ghost.
+        assert!(g.net_shadow_stale(enemy, seen + 0.3), "no update — left PVS, don't fire at the shadow");
+        // The guard is client-only; server-side there's no PVS gap and `is_client()` is false.
+        assert!(g.host().is_client(), "the test game is a client, so the stale guard is live");
     }
 
     /// A body with no health that isn't dead is a body the server never spawned — and `run_bot` will

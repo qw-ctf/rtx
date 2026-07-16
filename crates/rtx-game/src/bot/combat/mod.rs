@@ -1084,9 +1084,11 @@ pub(crate) fn engage(
     let enemy_vel = game.entities[enemy].v.velocity;
 
     // Line of sight? Trace to the enemy's eyes, ignoring ourselves. Clear if we hit the enemy or
-    // nothing at all.
+    // nothing at all — unless the enemy is a stale network shadow (teleported or ducked out of PVS,
+    // frozen where we last saw it), in which case that clear line is to a ghost, not a target, and we
+    // must not fire down it. Same guard perception uses, so aim and trigger agree on who's really there.
     let tr = game.traceline(my_eye, enemy_eye, false, e);
-    let los = tr.ent == enemy || tr.fraction > 0.95;
+    let los = (tr.ent == enemy || tr.fraction > 0.95) && !game.net_shadow_stale(enemy, now);
     if !los {
         // No shooting through walls; navigation keeps driving the movement. But if we saw the
         // enemy moments ago, hold the angle where they disappeared instead of snapping the view
