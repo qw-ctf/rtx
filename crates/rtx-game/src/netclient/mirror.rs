@@ -615,6 +615,21 @@ fn classify(model: &str) -> Kind {
     }
 }
 
+/// The item classname for a powerup lying on the floor, by its model — or `None` if the model isn't
+/// a powerup.
+///
+/// A powerup a killed carrier dropped looks like any other model on the wire: a position and
+/// `progs/quaddama.mdl`. Mapping it back to the item classname is what lets it become a goal the bots
+/// value — `category` reads the classname, and a quad is worth `200 + strength` to a bot.
+fn dropped_powerup_classname(model: &str) -> Option<&'static str> {
+    match model {
+        "progs/quaddama.mdl" => Some("item_artifact_super_damage"),
+        "progs/invulner.mdl" => Some("item_artifact_invulnerability"),
+        "progs/invisibl.mdl" => Some("item_artifact_invisibility"),
+        _ => None,
+    }
+}
+
 /// Which team a networked flag belongs to (`1` red / `2` blue), or `None` if the model isn't a flag.
 ///
 /// `progs/flag.mdl` is both teams' flag and tells them apart by skin (0 red / 1 blue, `flags.rs`);
@@ -713,6 +728,12 @@ pub(crate) struct WorldMirror {
     /// inferred from where the flag entity is visible and which player wears its effect. See
     /// [`Self::write_flags`].
     flags: Vec<EntId>,
+    /// Powerups lying in the field that the map didn't put there — a quad (or pent, or ring) a killed
+    /// carrier dropped, on a server that drops them (KTX's `dropquad`). Server number → the shadow
+    /// goal we spawned for it. These aren't in the map's static goal catalog, so the bots would walk
+    /// past a quad on the floor; this makes each a live goal for as long as it's there. See
+    /// [`Self::write_dropped_powerups`].
+    dropped_powerups: std::collections::HashMap<u16, EntId>,
     /// How many projectiles we've ever seen fly, and the most at once. A path that never runs looks
     /// exactly like one with nothing to do — this tells them apart.
     ///
@@ -746,6 +767,7 @@ impl WorldMirror {
             }
         }
         self.write_flags(game, seen, models);
+        self.write_dropped_powerups(game, seen, models);
         self.write_item_presence(game, squad, seen, models, now);
         let flying = seen.iter().filter(|e| matches!(classify(name(e.model)), Kind::Projectile(_))).count();
         self.projectiles_peak = self.projectiles_peak.max(flying);
@@ -976,6 +998,69 @@ impl WorldMirror {
         }
     }
 
+    /// A powerup lying on the floor that the map didn't place — a dropped quad, pent, or ring.
+    ///
+    /// A server that drops a powerup when its carrier dies (KTX's `dropquad`) leaves a quad on the
+    /// ground, worth crossing the map for — but the bots' goal catalogue is the map's *static* items,
+    /// so a dropped one isn't in it and they'd walk straight past. This makes each dropped powerup a
+    /// live goal: a shadow item at its position, appended to `nav.goals`, retired when it's gone.
+    ///
+    /// It needs no server that *has* dropquad to be detected as such — if no powerup ever drops, no
+    /// powerup-model entity appears off its spawn, and this does nothing. A powerup at its map home is
+    /// left to [`write_item_presence`]; only one lying *elsewhere* is a drop.
+    fn write_dropped_powerups(&mut self, game: &mut GameState, seen: &[EntityState], models: &[String]) {
+        // No graph yet ⇒ no cell to hang a goal on, and nothing can path to it anyway.
+        if game.nav.graph.is_none() {
+            return;
+        }
+        let name = |m: u16| models.get(m as usize).map(String::as_str).unwrap_or("");
+
+        for e in seen {
+            let Some(classname) = dropped_powerup_classname(name(e.model)) else {
+                continue;
+            };
+            // A powerup sitting at a map spawn is that map item, tracked by `write_item_presence` —
+            // not a drop. Only one lying away from every spawn is a drop worth adding.
+            if self.items.iter().any(|(_, home)| home.distance(e.origin) < ITEM_MATCH_DIST) {
+                continue;
+            }
+            let slot = EntId(e.number as u32);
+            if let std::collections::hash_map::Entry::Vacant(entry) = self.dropped_powerups.entry(e.number) {
+                let Some(cell) = game.nav.graph.as_ref().and_then(|g| g.nearest(e.origin)) else {
+                    continue; // nowhere reachable to stand — not a goal we can offer
+                };
+                let ent = &mut game.entities[slot];
+                *ent = Entity::default();
+                ent.in_use = true;
+                ent.classname = Some(classname.into());
+                ent.v.solid = Solid::Trigger; // the goal loop takes only `Trigger` items
+                ent.v.mins = Vec3::new(-16.0, -16.0, 0.0);
+                ent.v.maxs = Vec3::new(16.0, 16.0, 56.0);
+                game.nav.goals.push((slot.0, cell));
+                entry.insert(slot);
+                eprintln!("rtx-client: a {classname} is on the floor — now a goal");
+            }
+            game.entities[slot].v.origin = e.origin;
+            game.link_edict(slot);
+        }
+
+        // Retire any we're no longer shown — grabbed, or expired. A dropped powerup is transient, so
+        // "out of sight" is treated as gone (it re-adds if it comes back); the goal must leave
+        // `nav.goals` with it, or bots would path to a quad that isn't there.
+        let live: std::collections::HashSet<u16> = seen.iter().map(|e| e.number).collect();
+        let gone: Vec<(u16, EntId)> = self
+            .dropped_powerups
+            .iter()
+            .filter(|(num, _)| !live.contains(num))
+            .map(|(&num, &slot)| (num, slot))
+            .collect();
+        for (num, slot) in gone {
+            self.dropped_powerups.remove(&num);
+            game.nav.goals.retain(|&(idx, _)| idx != slot.0);
+            game.entities[slot] = Entity::default();
+        }
+    }
+
     /// Which of the map's items are actually there.
     ///
     /// The shadow world spawns every item the map has, all of them available, because that's the
@@ -1148,6 +1233,9 @@ impl WorldMirror {
             .collect();
         self.brushes.clear();
         self.tracked.clear();
+        // The new map's `nav.goals` is rebuilt fresh from its own items; any dropped-powerup goals
+        // belonged to the old one.
+        self.dropped_powerups.clear();
     }
 }
 
@@ -1684,6 +1772,27 @@ mod tests {
         assert!(matches!(classify("maps/b_bh25.bsp"), Kind::Ignore));
         assert!(matches!(classify("maps/b_rock0.bsp"), Kind::Ignore));
         assert!(matches!(classify(""), Kind::Ignore));
+    }
+
+    /// A rocket in flight becomes something the dodge logic can reason about — and its velocity is
+    /// A powerup on the floor is worth crossing the map for, and its model is how a client knows
+    /// which one — the classname it maps to is what makes it a high-value goal. The three are exactly
+    /// KTX's own `dropped_powerup_names`, so a dropped quad on a KTX server is read the way KTX's own
+    /// bots read it, and each classname is a goal the bot brain already knows how to want.
+    #[test]
+    fn a_dropped_powerups_model_names_its_goal() {
+        for (model, classname) in [
+            ("progs/quaddama.mdl", "item_artifact_super_damage"),
+            ("progs/invulner.mdl", "item_artifact_invulnerability"),
+            ("progs/invisibl.mdl", "item_artifact_invisibility"),
+        ] {
+            assert_eq!(dropped_powerup_classname(model), Some(classname));
+            assert!(crate::bot::goals::is_goal_classname(classname), "{classname} must be a goal the brain wants");
+        }
+        // Not every model on the floor is a powerup.
+        assert_eq!(dropped_powerup_classname("progs/backpack.mdl"), None);
+        assert_eq!(dropped_powerup_classname("progs/armor.mdl"), None);
+        assert_eq!(dropped_powerup_classname(""), None);
     }
 
     /// A rocket in flight becomes something the dodge logic can reason about — and its velocity is
