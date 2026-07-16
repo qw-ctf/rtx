@@ -17,7 +17,7 @@
 //! once with the navmesh (see `GameState::collect_goals`); the live availability and the bot's
 //! own stats are read fresh each time a goal is chosen.
 
-use glam::Vec3;
+use glam::{Vec3, Vec3Swizzles};
 
 use crate::arsenal::AmmoKind;
 use crate::defs::{
@@ -40,6 +40,25 @@ const POWERUP_LOOKAHEAD: f32 = 30.0;
 /// A cross-map quad run legitimately takes longer than that; the progress watchdog still catches a
 /// genuinely stuck bot far sooner. Sized to [`POWERUP_LOOKAHEAD`] plus a margin.
 pub(crate) const POWERUP_GIVEUP: f32 = 35.0;
+
+/// Red armour and megahealth — the "holy grail" pickups — are planned farther out than a shard but
+/// not as far as a powerup: worth a real trek and worth cycling, since holding them is half of QW map
+/// control. 20 s covers a cross-room run plus the tail of a 20 s armour respawn, staying under the
+/// powerup's 30 so a quad still wins a straight contest. Only when [`Stats::stack`] discipline is on.
+const MAJOR_LOOKAHEAD: f32 = 20.0;
+/// Give-up leash for a *major* (RA/mega) goal: longer than an ordinary item's 10 s (a cross-room run
+/// is legitimate), shorter than a powerup's, sized to [`MAJOR_LOOKAHEAD`] plus a margin.
+pub(crate) const MAJOR_GIVEUP: f32 = 25.0;
+
+/// How far out a goal is worth planning, by tier. A quad is worth crossing the map for and waiting at;
+/// red armour/mega are worth a trek and a cycle; an ordinary shard only a short detour. The score
+/// curve ([`item_score`]) decays each to zero at its own horizon.
+#[derive(Clone, Copy, PartialEq)]
+enum Horizon {
+    Ordinary,
+    Major,
+    Powerup,
+}
 
 /// Goal-valuation price (seconds) for crossing a closed gate whose button the bot can reach — the
 /// button-detour errand the bot actually runs, standing in for the full [`CLOSED_GATE_PENALTY`] the
@@ -77,6 +96,50 @@ const POWERUP_BRIDGE_TRAVEL: f32 = 1.5;
 const POWERUP_BRIDGE_SLACK: f32 = 0.5;
 /// Strategic recovery may break contact for an item reachable inside this many seconds.
 const RECOVERY_TRAVEL: f32 = 4.0;
+
+/// Waypoint magnetism (Phase 1). A desirable, up item within this Euclidean XY radius of the bot is a
+/// candidate to bend the walk through — a side-step, not a detour, so it's kept short (the corridor
+/// test in `steer` bounds the actual bend far tighter, to [`super::MAGNET_LATERAL`]).
+const MAGNET_RADIUS: f32 = 160.0;
+/// Only bend toward a magnet on roughly the bot's own floor: a pickup this many units above or below
+/// is across a ledge/stair the walk doesn't cross, and steering at it would drag the bot off its path.
+const MAGNET_DZ: f32 = 32.0;
+
+/// Resource discipline (`rtx_bot_stack`). The bare-spawn effective-HP line: 50 health + 50 armour
+/// absorb is exactly this, the >50/>50 stack the bot strives to keep. Below it, health/armour desire
+/// scales up so the bot values topping its stack the way a human does — and reliably clears the
+/// combat-detour bar mid-fight instead of walking thin-stacked into the next duel.
+const STACK_NEUTRAL: f32 = 100.0;
+/// Ceiling on the stack-pressure multiplier, reached at ≈ a third of the neutral stack. Capped so a
+/// hurt bot raises health/armour up its priority list without becoming an item-obsessed coward.
+const STACK_PRESSURE_MAX: f32 = 2.5;
+
+/// Combat-posture stack thresholds (stack-aware, `rtx_bot_stack`). Enter Recover when health is one
+/// rocket from death (30) *or* the whole stack is thin (60 EHP) — so 40hp+yellow (100 EHP) fights on
+/// while 40hp naked (40 EHP) pulls back. Exit needs both a real health cushion and a rebuilt stack,
+/// each with margin over its entry point so posture doesn't oscillate on a single pickup.
+const RECOVER_ENTER_HEALTH: f32 = 30.0;
+const RECOVER_ENTER_STRENGTH: f32 = 60.0;
+const RECOVER_EXIT_HEALTH: f32 = 50.0;
+const RECOVER_EXIT_STRENGTH: f32 = 90.0;
+
+/// Escape-gated disengage (stack discipline). Breaking off to heal hands the feet to navigation, which
+/// can turn the bot's back on the enemy. In mutual line of sight it only does so past this separation
+/// — a lead long enough to reach cover/the pickup before a rocket lands; closer, the bot stays and
+/// fights with combat's facing backpedal instead of getting shot in the back. A touch beyond the 400 u
+/// preferred fighting range so a bot already backing off clears the bar as the gap opens. Live-tunable.
+const DISENGAGE_SAFE_RANGE: f32 = 550.0;
+
+/// Dry-primary ammo urgency (stack discipline). Below this firepower a bot armed with a primary is
+/// about to be reduced to its shotgun/axe — a stack loss as real as low armour, so ammo for that
+/// primary spikes in desire. 50 ≈ a fed super-nailgun, the best fallback worth staying above.
+const AMMO_DRY_FIREPOWER: f32 = 50.0;
+/// Base desire for a dry primary's ammo, deliberately equal to [`COMBAT_GREED_MIN_DESIRE`]: running a
+/// primary dry is worth breaking off a fight to refill, so it clears the combat-detour bar exactly.
+const AMMO_DRY_BASE: f32 = COMBAT_GREED_MIN_DESIRE;
+/// How much the dry-ammo desire rises per point of firepower below the threshold — the emptier the
+/// primary, the more urgent the refill (fp 0 → 75, fp 49 → ~41).
+const AMMO_DRY_SLOPE: f32 = 0.7;
 
 /// Bounded two-leg planning: only the strongest one-step candidates receive a second nav flood.
 /// This makes the worst-case query count explicit (one origin flood + this many continuation floods).
@@ -169,6 +232,10 @@ pub(crate) struct ItemPlan {
     pub second: Option<(EntId, CellId)>,
     pub first_desire: f32,
     pub contains_powerup: bool,
+    /// The plan reaches a genuinely-wanted major pickup (RA/mega whose post-contest desire clears the
+    /// combat-detour bar), so a greed-off fighting bot may break off for it — but a bare denial floor
+    /// (below the bar) can't, keeping [`select_major_item`] from yanking a bot out of every fight.
+    pub contains_major: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -178,7 +245,7 @@ struct ItemCandidate {
     desire: f32,
     time: f32,
     mult: f32,
-    powerup: bool,
+    horizon: Horizon,
     one_score: f32,
 }
 
@@ -235,6 +302,24 @@ pub(crate) fn total_strength(health: f32, armor_value: f32, armor_type: f32) -> 
     (health / (1.0 - armor_type)).min(health + armor_value).max(0.0)
 }
 
+/// How much more a bot values a health/armour pickup given its current effective HP: `1.0` at or
+/// above the bare-spawn stack, rising to [`STACK_PRESSURE_MAX`] as the stack thins toward death — the
+/// >50/>50 discipline as a smooth curve rather than a cliff. `1.0` when stack discipline is off.
+fn stack_pressure(strength: f32) -> f32 {
+    (STACK_NEUTRAL / strength.max(1.0)).clamp(1.0, STACK_PRESSURE_MAX)
+}
+
+/// The health/armour desire multiplier for a bot: [`stack_pressure`] of its current stack when
+/// resource discipline is on, else `1.0`. Applied to the marginal-EHP desire so a thin stack raises
+/// health/armour up the priority list; a full one leaves it at ktx-parity value.
+fn stack_mult(s: &Stats) -> f32 {
+    if s.stack {
+        stack_pressure(s.strength)
+    } else {
+        1.0
+    }
+}
+
 /// The denial desire floor for a weapon pickup: [`DENIAL_DESIRE`] for a rocket launcher or lightning
 /// gun the enemy side provably lacks in a no-weapons-stay game, else `0` (nothing to deny). Only the
 /// two big weapons are worth denying — the lesser guns don't swing a fight enough to camp a spawn.
@@ -246,6 +331,13 @@ fn denial_floor(kind: WeaponKind, weapons_stay: bool, enemy_side_has_bit: bool) 
         WeaponKind::Rl | WeaponKind::Lg => DENIAL_DESIRE,
         _ => 0.0,
     }
+}
+
+/// Whether `other_team` is an enemy of `my_team`. In FFA (`my_team == 0`) every other player is their
+/// own one-person team, so *everyone else* is an enemy to deny; in a team composition it's the players
+/// on a different team. Denies to a shared function so weapon/item denial reads the same in both.
+fn enemy_of(my_team: u8, other_team: u8) -> bool {
+    my_team == 0 || other_team != my_team
 }
 
 /// How long a bot will hold a weapon for a powerup carrier before taking it itself. Under a third of
@@ -343,6 +435,10 @@ struct Stats {
     /// "Weapons stay" mode (deathmatch 2/3/5): a picked-up weapon's entity lingers and re-touching
     /// it does nothing, so an owned weapon is worthless. Otherwise re-grabbing one refills its ammo.
     weapons_stay: bool,
+    /// Resource discipline on (`rtx_bot_stack`): scale health/armour desire up below the bare-spawn
+    /// stack and panic for a dry primary. An enemy's estimated `Stats` carries the *bot's own* flag so
+    /// its denial desire scales the same way ("he's weak and needs that armour" is worth more).
+    stack: bool,
 }
 
 /// A 0–100 estimate of the bot's offensive capability — its best weapon fed by its ammo. Higher
@@ -374,7 +470,7 @@ fn firepower(items: f32, shells: f32, nails: f32, rockets: f32, cells: f32) -> f
 /// Convert an observation-gated opponent estimate into the same scoring currency as the bot. Ammo
 /// is not observable after a pickup, so assume a modest fed loadout for weapons known to be owned;
 /// this is used only for relative risk and denial, never aiming or exact damage prediction.
-fn estimated_stats(est: crate::bot::model::OpponentEstimate, weapons_stay: bool) -> Stats {
+fn estimated_stats(est: crate::bot::model::OpponentEstimate, weapons_stay: bool, stack: bool) -> Stats {
     let has = |bit: Items| est.items.has(bit);
     let shells = if has(Items::SUPER_SHOTGUN) { 20.0 } else { 10.0 };
     let nails = if has(Items::NAILGUN) || has(Items::SUPER_NAILGUN) { 50.0 } else { 0.0 };
@@ -394,6 +490,7 @@ fn estimated_stats(est: crate::bot::model::OpponentEstimate, weapons_stay: bool)
         armor: est.armor_type * est.armor_value,
         firepower: firepower(est.items, shells, nails, rockets, cells),
         weapons_stay,
+        stack,
     }
 }
 
@@ -418,20 +515,46 @@ fn contest_adjust(
     (desire, mult)
 }
 
+/// Whether disengaging to heal is survivable: safe when the enemy can't currently see the bot (no
+/// mutual line of sight → a free break for cover), or when far enough to reach the pickup/cover before
+/// being punished. In the enemy's face it returns false — running only turns the back into the shot,
+/// so the bot is better off fighting on with combat's facing backpedal.
+fn disengage_safe(has_los: bool, enemy_dist: f32) -> bool {
+    !has_los || enemy_dist >= DISENGAGE_SAFE_RANGE
+}
+
 fn posture_step(
     previous: super::state::CombatPosture,
     health: f32,
+    strength: f32,
     own_power: f32,
     enemy_power: Option<f32>,
+    stack: bool,
 ) -> super::state::CombatPosture {
     use super::state::CombatPosture::*;
     let ratio = enemy_power.filter(|&p| p > 0.0).map_or(1.0, |p| own_power / p);
     if previous == Recover {
-        if health < 60.0 || ratio < 0.85 {
+        // Exit only when back on our feet: a health cushion *and* (stack-aware) a rebuilt stack, plus
+        // a fair power ratio. Each threshold clears its entry point so one pickup doesn't oscillate us.
+        let recovered = if stack {
+            health >= RECOVER_EXIT_HEALTH && strength >= RECOVER_EXIT_STRENGTH && ratio >= 0.85
+        } else {
+            health >= 60.0 && ratio >= 0.85
+        };
+        if !recovered {
             return Recover;
         }
-    } else if health <= 40.0 || ratio < 0.6 {
-        return Recover;
+    } else {
+        // Enter Recover on a health that's one rocket from death, a thin whole stack (stack-aware), or
+        // a clearly losing power ratio. Without discipline it's the leaner health-only entry.
+        let critical = if stack {
+            health <= RECOVER_ENTER_HEALTH || strength <= RECOVER_ENTER_STRENGTH || ratio < 0.6
+        } else {
+            health <= 40.0 || ratio < 0.6
+        };
+        if critical {
+            return Recover;
+        }
     }
     if ratio > 1.35 {
         Press
@@ -464,21 +587,36 @@ fn weapon_desire(s: &Stats, w: WeaponKind) -> f32 {
     }
 }
 
+/// The dry-primary ammo urgency at a given firepower: `0` once the bot is adequately armed
+/// ([`AMMO_DRY_FIREPOWER`] or above), else a desire that rises as the primary empties out — high
+/// enough to clear the combat-detour bar, because going dry mid-fight is a stack loss.
+fn dry_urgency(firepower: f32) -> f32 {
+    if firepower >= AMMO_DRY_FIREPOWER {
+        0.0
+    } else {
+        AMMO_DRY_BASE + (AMMO_DRY_FIREPOWER - firepower) * AMMO_DRY_SLOPE
+    }
+}
+
 /// Desire for an ammo pickup — scales with how empty the bot is, zero once it's near the cap or
-/// already well-armed (for the secondary ammo types).
+/// already well-armed (for the secondary ammo types). Under stack discipline the ammo of a *dry
+/// primary* the bot actually owns spikes via [`dry_urgency`]: the firepower gate self-solves the
+/// multi-gun case (a fed LG makes rockets non-urgent), so it keys on overall firepower, not per-gun.
 fn ammo_desire(s: &Stats, a: AmmoKind) -> f32 {
     let fp = s.firepower;
+    let dry = |owns: bool| if s.stack && owns { dry_urgency(fp) } else { 0.0 };
     match a {
         AmmoKind::Rockets => {
             if s.rockets < 100.0 {
-                (20.0 - s.rockets).max(5.0)
+                let owns = s.items.has(Items::ROCKET_LAUNCHER) || s.items.has(Items::GRENADE_LAUNCHER);
+                (20.0 - s.rockets).max(5.0).max(dry(owns))
             } else {
                 0.0
             }
         }
         AmmoKind::Cells => {
             if s.cells < 100.0 {
-                ((50.0 - s.cells) * 0.2).max(2.5)
+                ((50.0 - s.cells) * 0.2).max(2.5).max(dry(s.items.has(Items::LIGHTNING)))
             } else {
                 0.0
             }
@@ -517,6 +655,19 @@ impl GameState {
             armor: v.armortype * v.armorvalue,
             firepower: firepower(v.items, v.ammo_shells, v.ammo_nails, v.ammo_rockets, v.ammo_cells),
             weapons_stay: matches!(self.level.deathmatch, 2 | 3 | 5),
+            stack: self.host().cvar_bool(c"rtx_bot_stack"),
+        }
+    }
+
+    /// Which planning horizon `item` gets. Quad/pent/ring are always powerups; red armour and mega are
+    /// "major" (worth a trek and a cycle) but only once resource discipline is on — off, they score as
+    /// the ordinary armour/health they were, preserving ktx-parity valuation. Everything else ordinary.
+    fn horizon_of(&self, item: EntId, cat: Category, stack: bool) -> Horizon {
+        match cat {
+            Category::Powerup => Horizon::Powerup,
+            Category::Health if stack && self.entities[item].item.healtype == 2.0 => Horizon::Major,
+            Category::Armor { gate, .. } if stack && gate >= 160.0 => Horizon::Major,
+            _ => Horizon::Ordinary,
         }
     }
 
@@ -530,7 +681,7 @@ impl GameState {
                     let it = &self.entities[item].item;
                     (it.healamount, it.healtype == 2.0)
                 };
-                if mega {
+                let raw = if mega {
                     if s.health < 250.0 {
                         let new = (s.health + amount).min(250.0);
                         (total_strength(new, s.armor_value, s.armor_type) - s.strength).max(0.0)
@@ -542,7 +693,10 @@ impl GameState {
                     (2.0 * (total_strength(new, s.armor_value, s.armor_type) - s.strength)).max(0.0)
                 } else {
                     0.0
-                }
+                };
+                // Below the bare-spawn stack, value the top-up more (>50/>50 discipline). Zero stays
+                // zero and the caps still zero out — only a genuine gain is scaled.
+                raw * stack_mult(s)
             }
             Category::Armor {
                 value,
@@ -550,7 +704,7 @@ impl GameState {
                 gate,
                 double,
             } => {
-                if s.armor < gate {
+                let raw = if s.armor < gate {
                     let gain = (total_strength(s.health, value, at) - s.strength).max(0.0);
                     if double {
                         gain * 2.0
@@ -559,7 +713,8 @@ impl GameState {
                     }
                 } else {
                     0.0
-                }
+                };
+                raw * stack_mult(s)
             }
             Category::Weapon(w) => {
                 if !s.items.has(weapon_bit(w)) {
@@ -637,19 +792,22 @@ impl GameState {
         let Some(cat) = ent.classname().and_then(category) else {
             return false;
         };
-        // A powerup respawning within the wider powerup horizon is a valid standing goal (arrive
-        // early and wait); ordinary items use the tight LOOKAHEAD.
-        let horizon = if matches!(cat, Category::Powerup) {
-            POWERUP_LOOKAHEAD
-        } else {
-            LOOKAHEAD
+        let s = self.bot_stats(bot_e);
+        // A goal respawning within its own tier's horizon is still a valid standing goal (arrive early
+        // and wait): a powerup out to 30 s, a major (RA/mega) to 20, an ordinary item the tight 10.
+        let horizon = match self.horizon_of(item, cat, s.stack) {
+            Horizon::Powerup => POWERUP_LOOKAHEAD,
+            Horizon::Major => MAJOR_LOOKAHEAD,
+            Horizon::Ordinary => LOOKAHEAD,
         };
         let reachable_soon = ent.v.solid == Solid::Trigger
             || (matches!(ent.think, Think::SubRegen) && ent.v.nextthink - now < horizon);
         if !reachable_soon {
             return false;
         }
-        self.item_desire(&self.bot_stats(bot_e), item, cat) > 0.0
+        // Include denial floors — a bot standing on a denial-worthy RL/mega has a *valid* goal even at
+        // zero ordinary desire, or the next-frame re-pick (mod.rs) would drop it the instant it's chosen.
+        self.desire_with_floors(bot_e, &s, item, cat, self.deny_active(bot_e), now) > 0.0
     }
 
     /// Pick the highest-scoring reachable item goal for a bot, or `None` to fall back to following
@@ -667,11 +825,12 @@ impl GameState {
             .filter(|p| p.first_desire >= COMBAT_GREED_MIN_DESIRE || p.contains_powerup)
     }
 
-    /// Major pickup planning while optional combat greed is disabled. A timed powerup or CTF rune
-    /// is a match objective, not a personality detour; an ordinary first leg is allowed only when
-    /// the bounded plan proves it bridges to that major pickup.
+    /// Major pickup planning while optional combat greed is disabled. A timed powerup or CTF rune is a
+    /// match objective, not a personality detour; red armour/mega count too once they're genuinely
+    /// wanted (`contains_major`) — holding them is map control, worth breaking a fight for. An ordinary
+    /// first leg is allowed only when the bounded plan proves it bridges to one of those.
     pub(crate) fn select_major_item(&self, bot_e: EntId) -> Option<ItemPlan> {
-        self.best_item_plan(bot_e).filter(|p| p.contains_powerup)
+        self.best_item_plan(bot_e).filter(|p| p.contains_powerup || p.contains_major)
     }
 
     /// Pick a spawned, nearby health/armor recovery or timed powerup that must be completed before
@@ -726,6 +885,46 @@ impl GameState {
             })
             .max_by(|a, b| a.3.total_cmp(&b.3).then_with(|| b.0.0.cmp(&a.0.0)))
             .map(|(item, cell, commit, _)| (item, cell, commit))
+    }
+
+    /// Pick a desirable, up item near the bot that's worth a small side-step onto while it travels —
+    /// waypoint magnetism (`rtx_bot_magnet`). This is *not* a goal: the bot never changes course to
+    /// fetch it; `steer` only bends the immediate waypoint through it when it actually lies on the
+    /// route corridor (see [`super::steer::magnet_on_corridor`]). So the bar is only "would touching
+    /// it help, is it near, on my floor" — the corridor test in `steer` does the rest.
+    ///
+    /// Excludes the item the bot is already chasing (steering leads there anyway) and any weapon held
+    /// for a teammate (a handoff must not be stepped on — the server would grant the touch).
+    pub(crate) fn select_route_magnet(&self, bot_e: EntId) -> Option<EntId> {
+        let origin = self.entities[bot_e].v.origin;
+        let now = self.time();
+        let s = self.bot_stats(bot_e);
+        let goal = self.entities[bot_e].bot.goal.item;
+        let hold = self.entities[bot_e].bot.goal.hold_item;
+        let deny = self.deny_active(bot_e);
+        let mut candidates = Vec::new();
+        for &(idx, _cell) in &self.nav.goals {
+            if idx == goal || idx == hold || self.entities[bot_e].bot.is_avoided(idx, now) {
+                continue;
+            }
+            let ent = &self.entities[EntId(idx)];
+            if ent.v.solid != Solid::Trigger {
+                continue;
+            }
+            let d = ent.v.origin - origin;
+            if d.z.abs() > MAGNET_DZ || d.xy().length() > MAGNET_RADIUS {
+                continue;
+            }
+            let Some(cat) = ent.classname().and_then(category) else {
+                continue;
+            };
+            // Include denial floors, so a stacked bot still bends onto an enemy's RL/mega in passing.
+            let desire = self.desire_with_floors(bot_e, &s, EntId(idx), cat, deny, now);
+            if desire > 0.0 {
+                candidates.push((idx, desire, d.xy().length()));
+            }
+        }
+        best_magnet(&candidates).map(EntId)
     }
 
     /// Find a useful ordinary pickup that can be collected without arriving late for a powerup the
@@ -822,16 +1021,27 @@ impl GameState {
         let s = self.bot_stats(bot_e);
         let own_power = s.strength * s.firepower.max(10.0);
         let enemy_power = self.opponent_est(bot_e, enemy, now).map(|est| {
-            let es = estimated_stats(est, s.weapons_stay);
+            let es = estimated_stats(est, s.weapons_stay, s.stack);
             es.strength * es.firepower.max(10.0)
         });
-        let posture = posture_step(previous, s.health, own_power, enemy_power);
+        let posture = posture_step(previous, s.health, s.strength, own_power, enemy_power, s.stack);
         if posture != Recover {
             return (posture, None);
         }
         let Some(item) = self.select_recovery_item(bot_e, &s, now) else {
             return (Hold, None);
         };
+        // Escape gate (stack discipline): committing to this pickup hands the feet to navigation, which
+        // may turn the bot's back on the enemy. Only do so when a disengage is survivable — otherwise
+        // stay in Recover with no goal so combat_move fights on with its facing backpedal, and break the
+        // instant a gap opens. Without discipline, keep the old unconditional break-off.
+        if s.stack {
+            let has_los = self.entities[bot_e].bot.percept.vis_since != 0.0;
+            let enemy_dist = (self.entities[enemy].v.origin - self.entities[bot_e].v.origin).length();
+            if !disengage_safe(has_los, enemy_dist) {
+                return (Recover, None);
+            }
+        }
         (Recover, Some(item))
     }
 
@@ -910,11 +1120,60 @@ impl GameState {
             let e = &self.entities[t];
             e.is_player()
                 && e.v.health > 0.0
-                && e.mode_p.team != my_team
+                && enemy_of(my_team, e.mode_p.team)
                 && self
                     .opponent_est(bot_e, t, now)
                     .is_some_and(|est| est.items.has(bit))
         })
+    }
+
+    /// Whether any living enemy player exists (FFA: anyone else; team: an opposing player). Denial is
+    /// pointless with the field cleared, so the deny gate requires it — and it's what lets FFA denial
+    /// mean "keep it from everyone" rather than the vacuous "keep it from my (empty) team".
+    fn any_living_enemy(&self, bot_e: EntId) -> bool {
+        let my_team = self.entities[bot_e].mode_p.team;
+        let maxclients = self.host().cvar(c"maxclients") as u32;
+        (1..=maxclients).map(EntId).any(|t| {
+            t != bot_e && {
+                let e = &self.entities[t];
+                e.is_player() && e.v.health > 0.0 && enemy_of(my_team, e.mode_p.team)
+            }
+        })
+    }
+
+    /// Whether item denial is active for this bot: opponent modeling on and a living enemy to deny.
+    /// Both `best_item_plan` (once per frame) and the one-shot callers price denial through this so
+    /// selection and validation can't disagree on whether a floor applies.
+    fn deny_active(&self, bot_e: EntId) -> bool {
+        self.host().cvar_bool(c"rtx_bot_model") && self.any_living_enemy(bot_e)
+    }
+
+    /// This bot's desire for `item`, raised to a denial floor where one applies: a big weapon (RL/LG)
+    /// the enemy side lacks, or — because taking mega at 200 hp is correct QW play — a megahealth or red
+    /// armour, regardless of the bot's own stack. `deny` is the [`deny_active`] gate, passed in so the
+    /// per-frame catalog scan computes it once. Selection *and* [`item_goal_valid`] must both price
+    /// through here, or a denial goal would be invalidated the frame after it's chosen (mod.rs re-pick).
+    fn desire_with_floors(&self, bot_e: EntId, s: &Stats, item: EntId, cat: Category, deny: bool, now: f32) -> f32 {
+        let mut desire = self.item_desire(s, item, cat);
+        if !deny {
+            return desire;
+        }
+        let my_team = self.entities[bot_e].mode_p.team;
+        match cat {
+            Category::Weapon(w) => {
+                let enemy_has = self.enemy_side_has_weapon(bot_e, my_team, weapon_bit(w), now);
+                desire = desire.max(denial_floor(w, s.weapons_stay, enemy_has));
+            }
+            // Mega/RA detected independent of the stack cvar (`true`): denial is a modeling feature, not
+            // resource discipline, so it holds even when the leaner valuation is selected.
+            Category::Health | Category::Armor { .. }
+                if self.horizon_of(item, cat, true) == Horizon::Major =>
+            {
+                desire = desire.max(DENIAL_DESIRE);
+            }
+            _ => {}
+        }
+        desire
     }
 
     /// Maintain or begin a **handoff hold**: an idle bot may reserve a spawned RL/LG for a
@@ -1097,7 +1356,7 @@ impl GameState {
             if enemy.0 != 0 && now < p.known_until && self.entities[enemy].v.health > 0.0 {
                 self.opponent_est(bot_e, enemy, now).and_then(|est| {
                     let cell = graph.nearest(p.last_seen)?;
-                    let stats = estimated_stats(est, s.weapons_stay);
+                    let stats = estimated_stats(est, s.weapons_stay, s.stack);
                     let power = stats.strength * stats.firepower.max(10.0);
                     // Flood from *their* position priced by *their* strength: how far the enemy can
                     // get is no business of our health. Our own pricing was near enough while it only
@@ -1118,9 +1377,11 @@ impl GameState {
         let my_team = self.entities[bot_e].mode_p.team;
         let teamwork = my_team != 0;
         // Item denial (opponent modeling): raise the desire to hold a big weapon the enemy side is
-        // believed to lack, so a team secures/guards the RL and LG spawns. Team play only, and only
-        // when modeling is on (else "no belief" would masquerade as "enemy lacks it").
-        let deny = teamwork && self.host().cvar_bool(c"rtx_bot_model");
+        // believed to lack (and mega/RA outright), so bots secure/guard those spawns. On whenever
+        // modeling is on and a living enemy exists — FFA included, where everyone else is the enemy
+        // side ([`enemy_of`]) — not just team play. Modeling gates it so "no belief" can't masquerade
+        // as "enemy lacks it".
+        let deny = self.deny_active(bot_e);
         let claim_mult = |idx: u32| {
             if teamwork && self.item_claimed_by_teammate(bot_e, my_team, idx) {
                 CLAIM_DISCOUNT
@@ -1131,13 +1392,13 @@ impl GameState {
         let skip = |idx: u32| self.entities[bot_e].bot.is_avoided(idx, now);
 
         let mut candidates = Vec::new();
-        let mut consider = |item: EntId, cell: CellId, desire: f32, t: f32, mult: f32, powerup: bool| {
+        let mut consider = |item: EntId, cell: CellId, desire: f32, t: f32, mult: f32, horizon: Horizon| {
             if t >= PLAN_LOOKAHEAD {
                 return;
             }
             // Beyond the tight first-goal horizon an ordinary item has no one-step score, but it
             // remains eligible as a second leg from one of the six useful nearby primaries.
-            let mut score = item_score(desire, t, powerup).unwrap_or(0.0) * mult;
+            let mut score = item_score(desire, t, horizon).unwrap_or(0.0) * mult;
             if score > 0.0 && item.0 == current_goal {
                 score *= GOAL_HYSTERESIS; // stick with the current goal against a near-tie
             }
@@ -1147,7 +1408,7 @@ impl GameState {
                 desire,
                 time: t,
                 mult,
-                powerup,
+                horizon,
                 one_score: score,
             });
         };
@@ -1161,16 +1422,13 @@ impl GameState {
                 continue;
             };
             let powerup = matches!(cat, Category::Powerup);
-            let mut desire = self.item_desire(&s, item, cat);
-            // Denial floor: an owned RL/LG normally scores ~0 desire, but if the enemy side lacks it
-            // and it won't stay on the map, holding it still has value. Applied before the >0 gate so
-            // an already-owned weapon isn't skipped.
-            if deny {
-                if let Category::Weapon(w) = cat {
-                    let enemy_has = self.enemy_side_has_weapon(bot_e, my_team, weapon_bit(w), now);
-                    desire = desire.max(denial_floor(w, s.weapons_stay, enemy_has));
-                }
-            }
+            // The scoring tier (RA/mega reach farther than a shard). Only a true powerup keeps contest
+            // immunity and the team split below — a major is contested and yielded like an ordinary
+            // item (a weaker bot losing a mega race shouldn't feed a fight over it).
+            let horizon = self.horizon_of(item, cat, s.stack);
+            // Desire including any denial floor (weapon the enemy lacks, or mega/RA). Priced through the
+            // shared helper so `item_goal_valid` agrees the goal is still worth holding.
+            let desire = self.desire_with_floors(bot_e, &s, item, cat, deny, now);
             let travel = costs[cell as usize];
             if !travel.is_finite() {
                 continue; // unreachable from here
@@ -1208,7 +1466,7 @@ impl GameState {
             if desire <= 0.0 {
                 continue;
             }
-            consider(item, cell, desire, t, claim_mult(idx) * contest_mult, powerup);
+            consider(item, cell, desire, t, claim_mult(idx) * contest_mult, horizon);
         }
 
         // CTF runes spawn and relocate dynamically, so they cannot live in the map-start static
@@ -1243,7 +1501,7 @@ impl GameState {
                     continue;
                 }
             }
-            consider(EntId(i as u32), cell, desire, travel, claim_mult(i as u32), true);
+            consider(EntId(i as u32), cell, desire, travel, claim_mult(i as u32), Horizon::Powerup);
         }
 
         // Live backpacks aren't in the static catalog (they spawn on death / a teammate's toss and
@@ -1264,7 +1522,7 @@ impl GameState {
             if !travel.is_finite() {
                 continue;
             }
-            consider(item, cell, desire, travel, claim_mult(i as u32), false);
+            consider(item, cell, desire, travel, claim_mult(i as u32), Horizon::Ordinary);
         }
 
         // KTX-style two-goal evaluation, bounded to six continuation floods. A second goal changes
@@ -1297,7 +1555,7 @@ impl GameState {
                 if self.team_match.live_until > now && now + total >= self.team_match.live_until {
                     continue;
                 }
-                let Some(score) = secondary_item_score(second.desire, total, second.powerup) else {
+                let Some(score) = secondary_item_score(second.desire, total, second.horizon) else {
                     continue;
                 };
                 let score = score * second.mult * SECONDARY_WEIGHT;
@@ -1316,7 +1574,10 @@ impl GameState {
             first: (first.item, first.cell),
             second: second.map(|s| (s.item, s.cell)),
             first_desire: first.desire,
-            contains_powerup: first.powerup || second.is_some_and(|s| s.powerup),
+            contains_powerup: first.horizon == Horizon::Powerup
+                || second.is_some_and(|s| s.horizon == Horizon::Powerup),
+            contains_major: major_wanted(first.horizon, first.desire)
+                || second.is_some_and(|s| major_wanted(s.horizon, s.desire)),
         })
     }
 
@@ -1346,6 +1607,16 @@ impl GameState {
                 .and_then(category)
                 .is_some_and(|c| matches!(c, Category::Powerup))
     }
+
+    /// Whether an item is a *major* pickup (red armour or megahealth) under resource discipline — the
+    /// goal watchdog gives these a middle leash ([`MAJOR_GIVEUP`]), between a shard and a powerup.
+    pub(crate) fn is_major_item(&self, item: EntId) -> bool {
+        let stack = self.host().cvar_bool(c"rtx_bot_stack");
+        self.entities[item]
+            .classname()
+            .and_then(category)
+            .is_some_and(|c| self.horizon_of(item, c, stack) == Horizon::Major)
+    }
 }
 
 /// Stable owner of an item reservation: shortest distance, then lowest edict id. Callers include
@@ -1356,6 +1627,29 @@ fn reservation_owner(candidates: &[(EntId, f32)]) -> Option<EntId> {
         .iter()
         .min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.0.cmp(&b.0.0)))
         .map(|&(e, _)| e)
+}
+
+/// Whether a plan leg is a *genuinely wanted* major pickup — a major-tier item (RA/mega) whose
+/// post-contest desire clears the combat-detour bar. [`GameState::select_major_item`] breaks a
+/// greed-off fight for one of these, but never for a bare denial floor (which sits below the bar), so
+/// denial can't yank a bot out of every fight.
+fn major_wanted(horizon: Horizon, desire: f32) -> bool {
+    horizon == Horizon::Major && desire >= COMBAT_GREED_MIN_DESIRE
+}
+
+/// Pure core of magnet selection over `(entid, desire, dist)`: the item maximizing desire per unit
+/// distance, so a near wanted item beats a far slightly-more-wanted one (a side-step, not a detour).
+/// The `+ 32` smooths the point-blank divide and stops a touching item dominating everything. Lower
+/// entity id breaks ties so sequential bot frames agree, like [`reservation_owner`].
+fn best_magnet(candidates: &[(u32, f32, f32)]) -> Option<u32> {
+    candidates
+        .iter()
+        .max_by(|a, b| {
+            (a.1 / (a.2 + 32.0))
+                .total_cmp(&(b.1 / (b.2 + 32.0)))
+                .then_with(|| b.0.cmp(&a.0))
+        })
+        .map(|&(idx, _, _)| idx)
 }
 
 /// Pure core of the powerup team-split: defer (skip the powerup as a goal) when a teammate has
@@ -1369,22 +1663,23 @@ fn defer_powerup_to_teammate(claimed: bool, my_dist: f32, best_mate_dist: Option
 /// [`LOOKAHEAD`]; a powerup is scored out to the wider [`POWERUP_LOOKAHEAD`] with a dominant,
 /// gently-decaying numerator so it stays positive and outranks every ordinary item at any reachable
 /// collect time `t` (with desire ≈ 200+). Higher is better; callers multiply claim/hysteresis factors.
-fn item_score(desire: f32, t: f32, powerup: bool) -> Option<f32> {
-    if powerup {
-        (t < POWERUP_LOOKAHEAD).then(|| desire * POWERUP_LOOKAHEAD / (t + 5.0))
-    } else {
-        (t < LOOKAHEAD).then(|| desire * (LOOKAHEAD - t) / (t + 5.0))
+fn item_score(desire: f32, t: f32, horizon: Horizon) -> Option<f32> {
+    match horizon {
+        Horizon::Powerup => (t < POWERUP_LOOKAHEAD).then(|| desire * POWERUP_LOOKAHEAD / (t + 5.0)),
+        // Same decaying shape as an ordinary item but reaching twice as far, so an equal-desire major
+        // at the same distance scores well above a shard — the "holy grail" bias as arithmetic.
+        Horizon::Major => (t < MAJOR_LOOKAHEAD).then(|| desire * (MAJOR_LOOKAHEAD - t) / (t + 5.0)),
+        Horizon::Ordinary => (t < LOOKAHEAD).then(|| desire * (LOOKAHEAD - t) / (t + 5.0)),
     }
 }
 
-/// Continuation score: timed powerups keep their dominant powerup curve; ordinary second legs use
-/// the wider total-plan horizon because the first pickup is already useful and makes the route a
-/// deliberate sequence rather than a long single-item detour.
-fn secondary_item_score(desire: f32, total_t: f32, powerup: bool) -> Option<f32> {
-    if powerup {
-        item_score(desire, total_t, true)
-    } else {
-        (total_t < PLAN_LOOKAHEAD).then(|| desire * (PLAN_LOOKAHEAD - total_t) / (total_t + 5.0))
+/// Continuation score: timed powerups keep their dominant powerup curve; major and ordinary second
+/// legs both use the wider total-plan horizon because the first pickup is already useful and makes the
+/// route a deliberate sequence rather than a long single-item detour.
+fn secondary_item_score(desire: f32, total_t: f32, horizon: Horizon) -> Option<f32> {
+    match horizon {
+        Horizon::Powerup => item_score(desire, total_t, Horizon::Powerup),
+        _ => (total_t < PLAN_LOOKAHEAD).then(|| desire * (PLAN_LOOKAHEAD - total_t) / (total_t + 5.0)),
     }
 }
 
@@ -1426,6 +1721,16 @@ mod tests {
     }
 
     #[test]
+    fn ffa_treats_everyone_as_the_enemy_side() {
+        // FFA (my team 0): every other player is their own team, so all are the enemy side to deny.
+        assert!(enemy_of(0, 0));
+        assert!(enemy_of(0, 3));
+        // A team composition: only a different team is an enemy; a teammate is not.
+        assert!(enemy_of(1, 2));
+        assert!(!enemy_of(1, 1));
+    }
+
+    #[test]
     fn hold_continues_until_an_abort() {
         // The happy path: before the deadline, weapon down, carrier alive/powered/lacking it, no
         // contest → keep holding.
@@ -1443,25 +1748,93 @@ mod tests {
     fn powerup_score_dominates_and_reaches_far() {
         // A quad (desire ~207) at t=20 must outrank a nearby health pack (desire ~50 at t=1) and a
         // nearby armor (desire ~80 at t=3) — the "MUST get" directive as arithmetic.
-        let quad = item_score(207.0, 20.0, true).unwrap();
-        let health = item_score(50.0, 1.0, false).unwrap();
-        let armor = item_score(80.0, 3.0, false).unwrap();
+        let quad = item_score(207.0, 20.0, Horizon::Powerup).unwrap();
+        let health = item_score(50.0, 1.0, Horizon::Ordinary).unwrap();
+        let armor = item_score(80.0, 3.0, Horizon::Ordinary).unwrap();
         assert!(quad > health && quad > armor, "quad {quad} vs health {health}, armor {armor}");
         // An ordinary item past LOOKAHEAD is dropped; a powerup at the same t is still a candidate.
-        assert!(item_score(200.0, 12.0, false).is_none());
-        assert!(item_score(200.0, 12.0, true).is_some());
+        assert!(item_score(200.0, 12.0, Horizon::Ordinary).is_none());
+        assert!(item_score(200.0, 12.0, Horizon::Powerup).is_some());
         // A powerup past its own (wider) horizon is dropped.
-        assert!(item_score(200.0, POWERUP_LOOKAHEAD, true).is_none());
+        assert!(item_score(200.0, POWERUP_LOOKAHEAD, Horizon::Powerup).is_none());
+        // A quad far out (t=20) still beats a near red armour (t=5) — the powerup tier stays on top.
+        let far_quad = item_score(207.0, 20.0, Horizon::Powerup).unwrap();
+        let near_ra = item_score(100.0, 5.0, Horizon::Major).unwrap();
+        assert!(far_quad > near_ra, "far quad {far_quad} vs near RA {near_ra}");
+    }
+
+    #[test]
+    fn major_items_reach_past_the_ordinary_horizon() {
+        // At t=15 a major (RA/mega) is still worth heading for; an equal-desire shard is long gone.
+        assert!(item_score(100.0, 15.0, Horizon::Major).is_some());
+        assert!(item_score(100.0, 15.0, Horizon::Ordinary).is_none());
+        // A major decays to nothing at its own 20 s horizon.
+        assert!(item_score(100.0, MAJOR_LOOKAHEAD, Horizon::Major).is_none());
+        // Same distance, same desire: a major outweighs a shard (twice the reach → higher numerator).
+        let major = item_score(100.0, 5.0, Horizon::Major).unwrap();
+        let shard = item_score(100.0, 5.0, Horizon::Ordinary).unwrap();
+        assert!(major > shard, "major {major} vs shard {shard}");
+    }
+
+    #[test]
+    fn major_plans_break_greedless_fights_only_when_genuinely_wanted() {
+        // A greed-off bot breaks off for a major only when its desire clears the combat-detour bar.
+        assert!(major_wanted(Horizon::Major, COMBAT_GREED_MIN_DESIRE));
+        assert!(major_wanted(Horizon::Major, 80.0));
+        // A bare denial floor (30, below the bar) on a major must not yank the bot out of a fight.
+        assert!(!major_wanted(Horizon::Major, DENIAL_DESIRE));
+        // Ordinary and powerup legs are never "major-wanted" (powerups gate on contains_powerup).
+        assert!(!major_wanted(Horizon::Ordinary, 100.0));
+        assert!(!major_wanted(Horizon::Powerup, 100.0));
+    }
+
+    #[test]
+    fn dry_primary_ammo_clears_the_combat_bar() {
+        // Zero once adequately armed; rising as firepower collapses, past the combat-detour bar.
+        assert_eq!(dry_urgency(AMMO_DRY_FIREPOWER), 0.0);
+        assert_eq!(dry_urgency(60.0), 0.0);
+        assert!(dry_urgency(24.0) >= COMBAT_GREED_MIN_DESIRE); // RL + 3 rockets (fp 24) ≈ 58
+        assert!(dry_urgency(0.0) > dry_urgency(30.0)); // emptier = more urgent
+
+        let stats = |items: Items, rockets: f32, cells: f32, fp: f32, stack: bool| Stats {
+            health: 100.0,
+            armor_value: 0.0,
+            armor_type: 0.0,
+            items: items.as_f32(),
+            shells: 0.0,
+            nails: 0.0,
+            rockets,
+            cells,
+            strength: 100.0,
+            armor: 0.0,
+            firepower: fp,
+            weapons_stay: false,
+            stack,
+        };
+        let bar = COMBAT_GREED_MIN_DESIRE;
+        // RL nearly dry (fp 16): rocket boxes clear the combat bar.
+        assert!(ammo_desire(&stats(Items::ROCKET_LAUNCHER, 2.0, 0.0, 16.0, true), AmmoKind::Rockets) >= bar);
+        // RL well-fed (fp 100): only the ordinary top-off, no panic.
+        assert!(ammo_desire(&stats(Items::ROCKET_LAUNCHER, 15.0, 0.0, 100.0, true), AmmoKind::Rockets) < bar);
+        // Owns RL but LG-fed (fp 100 from cells): low rockets don't panic — the firepower gate self-solves.
+        let lg_fed = stats(Items::LIGHTNING | Items::ROCKET_LAUNCHER, 2.0, 100.0, 100.0, true);
+        assert!(ammo_desire(&lg_fed, AmmoKind::Rockets) < bar);
+        // No launcher at all → no dry panic, just the base top-off.
+        assert!(ammo_desire(&stats(Items::SUPER_SHOTGUN, 2.0, 0.0, 10.0, true), AmmoKind::Rockets) < bar);
+        // Stack discipline off → base only, even bone-dry.
+        assert!(ammo_desire(&stats(Items::ROCKET_LAUNCHER, 2.0, 0.0, 16.0, false), AmmoKind::Rockets) < bar);
     }
 
     #[test]
     fn secondary_item_extends_only_the_continuation_horizon() {
         // An ordinary item is too far away to begin a plan, but remains useful as the second stop
         // after a worthwhile nearby pickup has already put the bot on that route.
-        assert!(item_score(60.0, LOOKAHEAD + 1.0, false).is_none());
-        assert!(secondary_item_score(60.0, LOOKAHEAD + 1.0, false).is_some());
-        assert!(secondary_item_score(60.0, PLAN_LOOKAHEAD - 0.1, false).is_some());
-        assert!(secondary_item_score(60.0, PLAN_LOOKAHEAD, false).is_none());
+        assert!(item_score(60.0, LOOKAHEAD + 1.0, Horizon::Ordinary).is_none());
+        assert!(secondary_item_score(60.0, LOOKAHEAD + 1.0, Horizon::Ordinary).is_some());
+        assert!(secondary_item_score(60.0, PLAN_LOOKAHEAD - 0.1, Horizon::Ordinary).is_some());
+        assert!(secondary_item_score(60.0, PLAN_LOOKAHEAD, Horizon::Ordinary).is_none());
+        // A major second leg uses the continuation horizon too (not its own tighter 20 s bound).
+        assert!(secondary_item_score(60.0, MAJOR_LOOKAHEAD + 1.0, Horizon::Major).is_some());
     }
 
     #[test]
@@ -1482,13 +1855,51 @@ mod tests {
     fn recovery_posture_has_stable_entry_and_exit_thresholds() {
         use super::super::state::CombatPosture::{Hold, Press, Recover};
 
-        assert_eq!(posture_step(Hold, 40.0, 100.0, Some(100.0)), Recover);
-        assert_eq!(posture_step(Hold, 100.0, 50.0, Some(100.0)), Recover);
+        // Legacy health-only path (stack discipline off); strength is ignored, passed as 100.
+        assert_eq!(posture_step(Hold, 40.0, 100.0, 100.0, Some(100.0), false), Recover);
+        assert_eq!(posture_step(Hold, 100.0, 100.0, 50.0, Some(100.0), false), Recover);
         // Once recovering, crossing only one exit threshold is not enough to oscillate back.
-        assert_eq!(posture_step(Recover, 59.0, 100.0, Some(100.0)), Recover);
-        assert_eq!(posture_step(Recover, 100.0, 84.0, Some(100.0)), Recover);
-        assert_eq!(posture_step(Recover, 60.0, 85.0, Some(100.0)), Hold);
-        assert_eq!(posture_step(Hold, 100.0, 136.0, Some(100.0)), Press);
+        assert_eq!(posture_step(Recover, 59.0, 100.0, 100.0, Some(100.0), false), Recover);
+        assert_eq!(posture_step(Recover, 100.0, 100.0, 84.0, Some(100.0), false), Recover);
+        assert_eq!(posture_step(Recover, 60.0, 100.0, 85.0, Some(100.0), false), Hold);
+        assert_eq!(posture_step(Hold, 100.0, 100.0, 136.0, Some(100.0), false), Press);
+    }
+
+    #[test]
+    fn recovery_posture_is_stack_aware() {
+        use super::super::state::CombatPosture::{Hold, Recover};
+        // 40 hp behind yellow armour is 100 EHP — a real stack, so fight on rather than flee.
+        let yellow = total_strength(40.0, 150.0, 0.6);
+        assert!((yellow - 100.0).abs() < 0.01, "40hp+yellow is ~100 EHP, got {yellow}");
+        assert_eq!(posture_step(Hold, 40.0, yellow, 100.0, None, true), Hold);
+        // 40 hp naked is 40 EHP — a thin stack trips the strength floor even though health > 30.
+        assert_eq!(posture_step(Hold, 40.0, 40.0, 100.0, None, true), Recover);
+        // 30 hp behind red armour is a big stack, but one rocket from death — the health floor recovers.
+        let red = total_strength(30.0, 200.0, 0.8);
+        assert!(red > RECOVER_ENTER_STRENGTH);
+        assert_eq!(posture_step(Hold, 30.0, red, 100.0, None, true), Recover);
+    }
+
+    #[test]
+    fn disengage_only_when_the_break_is_survivable() {
+        // Out of the enemy's sight → always safe to turn and go for cover/health.
+        assert!(disengage_safe(false, 0.0));
+        assert!(disengage_safe(false, 10_000.0));
+        // In mutual sight → only with enough separation to reach cover before being shot in the back.
+        assert!(!disengage_safe(true, DISENGAGE_SAFE_RANGE - 1.0));
+        assert!(disengage_safe(true, DISENGAGE_SAFE_RANGE));
+    }
+
+    #[test]
+    fn stack_pressure_ramps_below_the_5050_line() {
+        // At or above the bare-spawn stack, no urgency; below it, up to the cap at ≈ a third.
+        assert_eq!(stack_pressure(100.0), 1.0);
+        assert_eq!(stack_pressure(200.0), 1.0);
+        assert_eq!(stack_pressure(80.0), 1.25);
+        assert_eq!(stack_pressure(40.0), STACK_PRESSURE_MAX); // 100/40 = 2.5, at the cap
+        assert_eq!(stack_pressure(10.0), STACK_PRESSURE_MAX); // clamped, not runaway
+        // Monotonic: a thinner stack is never valued less.
+        assert!(stack_pressure(70.0) > stack_pressure(90.0));
     }
 
     #[test]
@@ -1507,6 +1918,17 @@ mod tests {
         let id_tie = [(EntId(7), 25.0), (EntId(3), 25.0)];
         assert_eq!(reservation_owner(&id_tie), Some(EntId(3)));
         assert_eq!(reservation_owner(&[]), None);
+    }
+
+    #[test]
+    fn best_magnet_prefers_desire_per_distance_and_tie_breaks_on_id() {
+        // A near, wanted item beats a far, slightly-more-wanted one (a side-step, not a detour).
+        let near = (5u32, 60.0, 20.0); // 60/52 ≈ 1.15
+        let far = (9u32, 100.0, 140.0); // 100/172 ≈ 0.58
+        assert_eq!(best_magnet(&[near, far]), Some(5));
+        // Exact tie on desire and distance → the lower entity id, so sequential frames agree.
+        assert_eq!(best_magnet(&[(7, 40.0, 30.0), (3, 40.0, 30.0)]), Some(3));
+        assert_eq!(best_magnet(&[]), None);
     }
 
     #[test]

@@ -138,6 +138,16 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // Greedy bots: let a fighting bot break off to grab a compelling nearby pickup (powerup, a
         // weapon it lacks, big health/armor) instead of only chasing the enemy — ktx-style item play.
         ("rtx_bot_greed", Bool(true)),
+        // Waypoint magnetism: bend the immediate steering waypoint through a desirable, up item lying
+        // just off the route corridor so the bot actually steps onto it. The fake-client pickup net
+        // grabs incidental items via a generous touch box; a real network client only gets the tight
+        // server-side trigger overlap, so steering has to put the hull on the trigger. On by default.
+        ("rtx_bot_magnet", Bool(true)),
+        // Resource discipline: value health/armor more steeply below the bare-spawn stack, enter the
+        // Recover posture on a thin stack (not just low health), treat red armor and megahealth as
+        // major "must-cycle" pickups, and panic for ammo when a bot's firepower is about to collapse.
+        // Off = the leaner ktx-parity valuation (a topped-up bot ignores items until a true need). On.
+        ("rtx_bot_stack", Bool(true)),
         // Per-bot goal/pickup diagnostics to the server console (off by default).
         ("rtx_bot_debug", Bool(false)),
         // Bots rocket-jump to ledges that would otherwise need a long detour (or are unreachable).

@@ -101,6 +101,11 @@ pub(crate) const RJ_BALLISTIC_SLACK: f32 = 1.0;
 /// Advance to the next route leg once within this of the current waypoint (≈ ¾ of a grid).
 const ARRIVE_RADIUS: f32 = 24.0;
 
+/// Waypoint magnetism (see [`steer::magnet_on_corridor`]): the greatest lateral offset from the leg
+/// corridor at which an item is still worth bending the walk onto. ≈ the fake-client pickup box
+/// (`PICKUP_XY` 40) plus slack; small enough that a same-floor magnet always sits on walkable mesh.
+const MAGNET_LATERAL: f32 = 48.0;
+
 /// Edge-safety (see the ledge brake / turn slowdown in [`steer`]). Below this speed a single frame
 /// of wish can't carry a grounded bot over an edge, so the brake stays off (avoids a stand-still lock).
 const LEDGE_MIN_SPEED: f32 = 60.0;
@@ -394,6 +399,11 @@ struct Objective {
     target_origin: Vec3,
     /// The navmesh cell of the item goal, when chasing one (skips a `nearest` lookup).
     item_cell: Option<CellId>,
+    /// Waypoint magnetism (`rtx_bot_magnet`): a desirable item lying just off the route the bot
+    /// should bend its immediate steering waypoint through — grabbed *in passing*, without changing
+    /// its goal. `None` = nothing worth the side-step. `steer` applies the bend only when the item is
+    /// genuinely on the current leg's corridor (see [`steer::magnet_on_corridor`]).
+    magnet: Option<Vec3>,
     /// Fighter eye point an arena audience bot holds its eyes on (a `Spectate` intent); `None`
     /// otherwise, leaving the eyes on the walk corridor.
     watch_point: Option<Vec3>,
@@ -601,6 +611,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
             vigil: false,
             target_origin,
             item_cell,
+            magnet: None, // a puppet-ordered leg is flown as issued — no incidental side-steps
             watch_point: None,
             surfacing: false,
             swim_up: false,
@@ -870,8 +881,9 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         let wat = if let Some(BotIntent::Spectate { watch, .. }) = intent { watch.0 } else { 0 };
         let commit = b.goal.commit;
         let posture = b.posture;
+        let mag = b.goal.magnet_item;
         let msg = cstring(&format!(
-            "rtx bot{client}: want={goal} dist={dist:.0} on_item={overlap} ownLG={own_lg} cells={:.0} pen={pen} aware={aware} est={est} hold={hold} commit={commit:?} posture={posture:?} vig={vig} watch={wat}\n",
+            "rtx bot{client}: want={goal} dist={dist:.0} on_item={overlap} ownLG={own_lg} cells={:.0} pen={pen} aware={aware} est={est} hold={hold} mag={mag} commit={commit:?} posture={posture:?} vig={vig} watch={wat}\n",
             game.entities[e].v.ammo_cells,
         ));
         host.conprint(&msg); // conprint always shows; dprint needs `developer 1`
@@ -927,6 +939,8 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // ordinary give-up time (the progress watchdog still catches a genuinely stuck bot sooner).
     let giveup = if game.is_powerup_item(EntId(game.entities[e].bot.goal.item)) {
         goals::POWERUP_GIVEUP
+    } else if game.is_major_item(EntId(game.entities[e].bot.goal.item)) {
+        goals::MAJOR_GIVEUP // RA/mega: a cross-room run is legitimate, between a shard and a powerup
     } else {
         GOAL_GIVEUP_TIME
     };
@@ -940,6 +954,32 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         b.goal.next_pick = now; // re-pick (skipping the abandoned item) next frame
     }
 
+    // Waypoint magnetism: a desirable up item just off the route corridor is worth stepping onto in
+    // passing. The fake-client pickup net grabs incidental items by a generous touch box; a network
+    // client only gets the tight server-side trigger overlap, so steering has to put the hull on the
+    // trigger. Only while free to wander the route — idle, fight, or advance, and no ballistic leg: a
+    // hard Move (a race checkpoint is a hull-sized box) or a frozen traversal must never bend. Picked
+    // on the same 0.2s throttle as the urgent pass (the classname scan isn't per-frame cheap); the
+    // actual bend, gated on the item lying on the leg corridor, is `steer`'s (see `magnet_on_corridor`).
+    let magnet = if host.cvar_bool(c"rtx_bot_magnet")
+        && matches!(intent, None | Some(BotIntent::Fight(_) | BotIntent::Advance(_)))
+        && !traversal_committed
+    {
+        if now >= game.entities[e].bot.goal.magnet_pick {
+            let pick = game.select_route_magnet(e);
+            let b = &mut game.entities[e].bot;
+            b.goal.magnet_pick = now + 0.2;
+            b.goal.magnet_item = pick.map_or(0, |i| i.0);
+        }
+        let mi = game.entities[e].bot.goal.magnet_item;
+        // Revalidate cheaply each frame: a magnet is good only while it's still on the floor.
+        (mi != 0 && game.entities[EntId(mi)].v.solid == Solid::Trigger)
+            .then(|| game.entities[EntId(mi)].v.origin)
+    } else {
+        game.entities[e].bot.goal.magnet_item = 0;
+        None
+    };
+
     // Audience watch (arena Spectate): snapshot the chosen fighter's eye point so the look override
     // in `run_bot` — deep inside the `&mut bot` / `&nav` borrow — can point the eyes there without
     // re-reading another entity. `None` for every other intent leaves the eyes on the corridor.
@@ -951,8 +991,8 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // `surfacing`/`swim_up` are decided in `run_bot` (they need the borrowed graph + bot cell), so
     // the normal objective leaves them off — the anti-drown override flips them on when it fires.
     Objective {
-        hooking, on_sj, on_rj, enemy, chasing, item_committed, polite, target_origin, item_cell, watch_point,
-        vigil: vigil.is_some(), surfacing: false, swim_up: false, order_link: None,
+        hooking, on_sj, on_rj, enemy, chasing, item_committed, polite, target_origin, item_cell, magnet,
+        watch_point, vigil: vigil.is_some(), surfacing: false, swim_up: false, order_link: None,
     }
 }
 
@@ -1563,6 +1603,26 @@ fn plat_standoff(origin: Vec3, fp_min: Vec2, fp_max: Vec2) -> Vec3 {
     Vec3::new(x, y, origin.z)
 }
 
+/// Whether a magnet item lies on the current leg's corridor — close enough to the straight line from
+/// the bot to its waypoint to be worth bending the walk onto (waypoint magnetism, see [`steer`]). The
+/// item must be *ahead* (a positive projection — never step backward for it), no farther along than
+/// the waypoint plus one arrival radius (an item past the waypoint belongs to a later leg), and within
+/// [`MAGNET_LATERAL`] of the corridor. A degenerate zero-length leg has no corridor, so no magnet.
+fn magnet_on_corridor(origin_xy: Vec2, waypoint_xy: Vec2, item_xy: Vec2) -> bool {
+    let leg = waypoint_xy - origin_xy;
+    let leg_len = leg.length();
+    if leg_len < 1.0 {
+        return false;
+    }
+    let dir = leg / leg_len;
+    let rel = item_xy - origin_xy;
+    let along = rel.dot(dir);
+    if along <= 0.0 || along > leg_len + ARRIVE_RADIUS {
+        return false;
+    }
+    (rel - dir * along).length() <= MAGNET_LATERAL
+}
+
 /// Record that this bot just failed to traverse `link`, so its next A* diverts around it. `Plat`
 /// and `Teleport` legs are exempt: waiting on a lift or standing in a teleport trigger reads as
 /// "stuck" to the watchdogs but is not a routing mistake. Bumps an existing live entry's strike
@@ -2157,6 +2217,25 @@ mod tests {
         // Dead centre is degenerate (all faces equal) but must still resolve to a point outside.
         let centre = plat_standoff(Vec3::new(0.0, 0.0, 24.0), lo, hi);
         assert!(!in_footprint(centre.xy(), lo, hi, PLAT_STANDOFF - 0.01), "centre still escapes");
+    }
+
+    #[test]
+    fn magnet_bends_only_onto_the_corridor() {
+        // Corridor runs +X from the origin to a waypoint 100u out.
+        let origin = Vec2::ZERO;
+        let waypoint = Vec2::new(100.0, 0.0);
+        // An item ahead and near the line (40u to the side) is on the corridor.
+        assert!(magnet_on_corridor(origin, waypoint, Vec2::new(50.0, 40.0)));
+        // 49u to the side is past MAGNET_LATERAL (48) — off the corridor.
+        assert!(!magnet_on_corridor(origin, waypoint, Vec2::new(50.0, 49.0)));
+        // Behind the bot (negative projection) — never step backward for it.
+        assert!(!magnet_on_corridor(origin, waypoint, Vec2::new(-10.0, 0.0)));
+        // Beyond the waypoint plus one arrival radius — it belongs to a later leg.
+        assert!(!magnet_on_corridor(origin, waypoint, Vec2::new(100.0 + ARRIVE_RADIUS + 1.0, 0.0)));
+        // Right up to the waypoint-plus-slack it still counts.
+        assert!(magnet_on_corridor(origin, waypoint, Vec2::new(100.0 + ARRIVE_RADIUS - 1.0, 0.0)));
+        // A degenerate zero-length leg has no corridor.
+        assert!(!magnet_on_corridor(origin, origin, Vec2::new(1.0, 0.0)));
     }
 
     #[test]

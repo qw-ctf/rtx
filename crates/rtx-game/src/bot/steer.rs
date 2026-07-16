@@ -337,6 +337,29 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         }
         None => (waypoint, kind),
     };
+
+    // Waypoint magnetism: `resolve_objective` picked a desirable up item near the route; if it lies on
+    // this leg's corridor, bend the immediate waypoint through it so the hull actually crosses the
+    // trigger (a network-client bot has no generous pickup box — only the tight server-side overlap).
+    // Only on a plain walk/step leg or the final approach (`None`) and never while airborne, bhopping,
+    // holding off a plat, or running a gate errand — those own the feet and a side-step would wreck the
+    // traversal. The bend is a lateral nudge of at most `MAGNET_LATERAL`; leg advancement still keys on
+    // cell centers (untouched above), so this can't trip the progress watchdog. Left active under a
+    // powerup commit on purpose: a ≤48u step costs far under the bridge slack, and grabbing armour on
+    // the quad walk is the whole point.
+    let waypoint = match o.magnet {
+        Some(item)
+            if matches!(kind, Some(LinkKind::Walk | LinkKind::Step) | None)
+                && !on_air
+                && plat_hold.is_none()
+                && bot.gate.errand.is_none()
+                && bot.bhop.phase == bhop::Phase::Off
+                && magnet_on_corridor(origin.xy(), waypoint.xy(), item.xy()) =>
+        {
+            item
+        }
+        _ => waypoint,
+    };
     // Plat-wait timeout: keyed on the plat index (not the leg, which the 0.4s repath churn rebuilds),
     // give up on a lift that never descends — a camped one, or a targeted plat only its own trigger
     // lowers — by striking its ride link so this bot's A* diverts, then re-path.

@@ -448,6 +448,14 @@ impl Mirror {
         // *transition* is what makes it an event rather than a state.
         let now_alive = !pi.dead();
         if self.alive[pi.player as usize] && !now_alive {
+            // Snapshot what they were holding *before* `client_saw_death` wipes the estimate, so the
+            // backpack they're about to drop can inherit the hypothesis. Their origin now is the death
+            // spot the pack will land near. Modeling-gated: no belief, no guess.
+            if game.host().cvar_bool(c"rtx_bot_model") {
+                let (items, ammo) = hypothesized_pack(game.opponents.believed_arsenal(e));
+                let origin = game.entities[e].v.origin;
+                world.remember_death_drop(origin, items, ammo, game.time());
+            }
             game.client_saw_death(e);
         }
         self.alive[pi.player as usize] = now_alive;
@@ -789,6 +797,40 @@ pub(crate) struct WorldMirror {
     /// entirely with shotguns.
     pub(crate) projectiles_seen: u32,
     pub(crate) projectiles_peak: usize,
+    /// Recent player deaths, remembered just long enough to attribute the backpack they drop. A pack's
+    /// contents are on the wire nowhere, so a pack appearing near a remembered death inherits its
+    /// hypothesised loadout (what the opponent model last believed the victim held). See
+    /// [`Self::write_backpack`] and [`Self::remember_death_drop`].
+    death_drops: Vec<DeathDrop>,
+}
+
+/// A player death held just long enough to guess the loadout of the backpack it drops (network client
+/// only — on the server the pack carries its real contents). `until` is the memory's expiry.
+#[derive(Clone, Copy)]
+struct DeathDrop {
+    origin: Vec3,
+    items: f32,
+    ammo: [f32; 4],
+    until: f32,
+}
+
+/// A dropped pack appears within a frame or two of the death; keep the memory a few seconds so the
+/// packet carrying the pack (and the small position drift from the server's random toss) still matches.
+const DEATH_DROP_WINDOW: f32 = 4.0;
+/// How far a pack may have bounced from the death origin and still be attributed to it — generous,
+/// because the server tosses the pack with a random horizontal velocity off the death spot.
+const DEATH_DROP_RADIUS: f32 = 200.0;
+
+/// A plausible dropped-pack loadout for a believed arsenal: the witnessed weapons (carried straight
+/// through, so `backpack_desire`'s `weapon_kind_of` reads them) plus a modest ammo guess per weapon.
+/// The wire carries neither, so the weapon is the honest evidence-based signal and the ammo a
+/// conservative default — a fresh corpse isn't assumed full. Same shape as goals' `estimated_stats`.
+fn hypothesized_pack(items: f32) -> (f32, [f32; 4]) {
+    let shells = if items.has(Items::SUPER_SHOTGUN) { 10.0 } else { 5.0 };
+    let nails = if items.has(Items::NAILGUN) || items.has(Items::SUPER_NAILGUN) { 40.0 } else { 0.0 };
+    let rockets = if items.has(Items::GRENADE_LAUNCHER) || items.has(Items::ROCKET_LAUNCHER) { 5.0 } else { 0.0 };
+    let cells = if items.has(Items::LIGHTNING) { 15.0 } else { 0.0 };
+    (items, [shells, nails, rockets, cells])
 }
 
 impl WorldMirror {
@@ -948,24 +990,63 @@ impl WorldMirror {
 
     /// A dead player's dropped kit.
     ///
-    /// It's mirrored as a real entity so it exists to be seen and walked over, but deliberately not
-    /// made a *goal*: what's inside is not on the wire, and a bot that pathed to a pack knowing what
-    /// it held would know something it has no way of knowing. Reasoning about that from evidence —
-    /// who died there, and what we last saw them holding — is the opponent model's business.
+    /// It's mirrored as a real entity so it exists to be seen and walked over. What's inside isn't on
+    /// the wire, so a bot may not path to one knowing its contents for free — but reasoning about that
+    /// from evidence (who died here, and what we last saw them holding) is exactly the opponent model's
+    /// business. So a pack that lands near a remembered death inherits that death's hypothesised loadout
+    /// and becomes a real goal (`Solid::Trigger`); an unattributable pack stays present-but-not-a-goal.
     fn write_backpack(&mut self, game: &mut GameState, e: &EntityState) {
         let slot = EntId(e.number as u32);
         if !self.tracked.contains_key(&e.number) {
+            let hypothesis = self.take_matching_death_drop(e.origin, game.time());
             let ent = &mut game.entities[slot];
             *ent = Entity::default();
             ent.in_use = true;
             ent.set_touch(Touch::Backpack);
-            ent.v.solid = Solid::Not; // present, but not a goal — see above
             ent.v.mins = Vec3::new(-16.0, -16.0, 0.0);
             ent.v.maxs = Vec3::new(16.0, 16.0, 56.0);
+            match hypothesis {
+                // A guess from a nearby death: fill the fields `backpack_desire` reads and make it a
+                // goal. This is the shadow the *brain* routes by; the real touch is still the server's,
+                // so believing the wrong contents only mis-values the walk, it never grants a pickup.
+                Some(d) => {
+                    ent.v.items = d.items;
+                    ent.v.ammo_shells = d.ammo[0];
+                    ent.v.ammo_nails = d.ammo[1];
+                    ent.v.ammo_rockets = d.ammo[2];
+                    ent.v.ammo_cells = d.ammo[3];
+                    ent.v.solid = Solid::Trigger;
+                }
+                None => ent.v.solid = Solid::Not, // contents unknown → present, but not a goal
+            }
         }
         game.entities[slot].v.origin = e.origin;
         game.link_edict(slot);
         self.tracked.insert(e.number, e.origin);
+    }
+
+    /// Remember a player death so a backpack landing nearby can inherit its loadout. Prunes expired
+    /// memories on the way in, so the list stays as short as recent deaths.
+    fn remember_death_drop(&mut self, origin: Vec3, items: f32, ammo: [f32; 4], now: f32) {
+        self.death_drops.retain(|d| d.until > now);
+        self.death_drops.push(DeathDrop { origin, items, ammo, until: now + DEATH_DROP_WINDOW });
+    }
+
+    /// The nearest live remembered death within [`DEATH_DROP_RADIUS`] of a pack's spawn, removed so a
+    /// second pack can't claim the same death. `None` — no attributable death — leaves the pack a
+    /// contents-unknown non-goal, exactly as before this feature.
+    fn take_matching_death_drop(&mut self, origin: Vec3, now: f32) -> Option<DeathDrop> {
+        self.death_drops.retain(|d| d.until > now);
+        let idx = self
+            .death_drops
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| (d.origin - origin).length() <= DEATH_DROP_RADIUS)
+            .min_by(|(_, a), (_, b)| {
+                (a.origin - origin).length().total_cmp(&(b.origin - origin).length())
+            })
+            .map(|(i, _)| i)?;
+        Some(self.death_drops.remove(idx))
     }
 
     /// The live state of the two CTF flags, none of which is on the wire directly.
@@ -1219,11 +1300,21 @@ impl WorldMirror {
         if game.entities[item].v.solid != Solid::Trigger {
             return; // already known gone
         }
-        // The same rule the server's own pickup uses (`items.rs`), asked rather than copied.
-        let delay = game.entities[item]
-            .classname()
-            .map(str::to_owned)
-            .and_then(|cn| game.respawn_delay_of(&cn));
+        // The same rule the server's own pickup uses (`items.rs`), asked rather than copied. A
+        // megahealth is the exception the classname can't express: `item_health` with `healtype == 2`
+        // rots back at an unknowable time (items.rs says so), so don't fake a 20 s timer for it — leave
+        // it un-scheduled and let the evidence pass (heard respawn / seen present) restore it, or the
+        // bot would cycle to an empty pad. A priority target now (Phases 3/5), so getting this right matters.
+        let is_mega = game.entities[item].classname() == Some("item_health")
+            && game.entities[item].item.healtype == 2.0;
+        let delay = if is_mega {
+            None
+        } else {
+            game.entities[item]
+                .classname()
+                .map(str::to_owned)
+                .and_then(|cn| game.respawn_delay_of(&cn))
+        };
         let ent = &mut game.entities[item];
         ent.v.solid = Solid::Not;
         ent.v.modelindex = 0.0;
@@ -2159,6 +2250,56 @@ mod tests {
         assert_ne!(ent.v.solid, Solid::Trigger, "the goal scan requires Trigger — it must not qualify");
     }
 
+    /// A pack that lands near a remembered death inherits that death's hypothesised loadout and becomes
+    /// a real goal — the whole point of tracking who died where.
+    #[test]
+    fn a_backpack_near_a_death_inherits_the_hypothesised_loadout() {
+        let mut g = game();
+        g.globals.time = 50.0;
+        let mut m = Solo::at(0);
+
+        // We believed the player who just died here was carrying an RL.
+        let death = Vec3::new(100.0, 100.0, 0.0);
+        let (items, ammo) = hypothesized_pack((Items::ROCKET_LAUNCHER | Items::SHOTGUN | Items::AXE).as_f32());
+        m.world.remember_death_drop(death, items, ammo, 50.0);
+
+        // A pack appears a short bounce away: it takes the loadout and turns into a goal.
+        let near = death + Vec3::new(40.0, 0.0, 0.0);
+        m.apply_frame(&mut g, &[state(70, 4, near)], &models());
+        let ent = &g.entities[EntId(70)];
+        assert_eq!(ent.v.solid, Solid::Trigger, "a hypothesised pack is a valued goal");
+        assert!(ent.v.items.has(Items::ROCKET_LAUNCHER), "it carries the believed weapon");
+        assert!(ent.v.ammo_rockets > 0.0, "and a plausible rocket refill");
+    }
+
+    /// Death-drop attribution is by proximity and recency, and each death feeds at most one pack.
+    #[test]
+    fn death_drops_match_by_proximity_and_expire() {
+        let mut w = WorldMirror::default();
+        w.remember_death_drop(Vec3::new(100.0, 0.0, 0.0), 1.0, [0.0; 4], 50.0);
+        // Too far → no match, and the memory is left for a closer pack.
+        let far = Vec3::new(100.0 + DEATH_DROP_RADIUS + 1.0, 0.0, 0.0);
+        assert!(w.take_matching_death_drop(far, 51.0).is_none());
+        // Within reach → matched and consumed, so a second pack can't claim the same death.
+        assert!(w.take_matching_death_drop(Vec3::new(140.0, 0.0, 0.0), 51.0).is_some());
+        assert!(w.take_matching_death_drop(Vec3::new(100.0, 0.0, 0.0), 51.0).is_none(), "consumed");
+        // A memory past its window is gone.
+        w.remember_death_drop(Vec3::ZERO, 1.0, [0.0; 4], 50.0);
+        assert!(w.take_matching_death_drop(Vec3::ZERO, 50.0 + DEATH_DROP_WINDOW + 0.1).is_none());
+    }
+
+    /// The content hypothesis carries the witnessed weapon and a modest, weapon-appropriate refill.
+    #[test]
+    fn a_pack_hypothesis_carries_the_weapon_and_a_modest_refill() {
+        let (items, ammo) = hypothesized_pack((Items::ROCKET_LAUNCHER | Items::SHOTGUN).as_f32());
+        assert!(items.has(Items::ROCKET_LAUNCHER));
+        assert!(ammo[2] > 0.0, "rockets for the RL");
+        assert_eq!(ammo[3], 0.0, "no cells without an LG");
+        // A shotgun-only victim: a token of shells, nothing heavier.
+        let (_, ammo) = hypothesized_pack((Items::SHOTGUN | Items::AXE).as_f32());
+        assert!(ammo[0] > 0.0 && ammo[1] == 0.0 && ammo[2] == 0.0 && ammo[3] == 0.0);
+    }
+
     /// Put a real item into the world at `home`, the way the shadow world would.
     fn place_item(g: &mut GameState, at: Vec3, classname: &'static str) -> EntId {
         let e = EntId(1500);
@@ -2291,6 +2432,32 @@ mod tests {
 
         m.world.expect_respawn(&mut g, item, 100_000.0);
         assert_eq!(g.entities[item].v.solid, Solid::Not, "and it never comes back");
+    }
+
+    /// A megahealth (`item_health`, `healtype == 2`) rots back at an unknowable time, so — unlike an
+    /// ordinary `item_health` — taking it must not schedule a 20 s respawn the bot would queue for.
+    /// The evidence pass restores it when it's actually seen/heard back.
+    #[test]
+    fn mega_health_is_not_expected_back_on_a_timer() {
+        let mut g = game();
+        g.level.deathmatch = 1; // items respawn here — but a mega still doesn't tick
+        let mut m = Solo::at(0);
+
+        let mega = place_item(&mut g, Vec3::ZERO, "item_health");
+        g.entities[mega].item.healtype = 2.0; // the megahealth marker
+        m.world.take_item(&mut g, mega, 100.0);
+        assert_eq!(g.entities[mega].v.solid, Solid::Not);
+        assert_eq!(
+            g.entities[mega].think,
+            crate::entity::Think::None,
+            "a mega rots back unpredictably — no faked timer to cycle on"
+        );
+
+        // An ordinary +25 health box in the same mode is timed normally.
+        let box25 = place_item(&mut g, Vec3::new(64.0, 0.0, 0.0), "item_health");
+        m.world.take_item(&mut g, box25, 100.0);
+        assert_eq!(g.entities[box25].think, crate::entity::Think::SubRegen);
+        assert_eq!(g.entities[box25].v.nextthink, 120.0, "a normal health box is a 20-second item");
     }
 
     /// The respawn rule is the server's, and it's asked rather than copied — including the modes

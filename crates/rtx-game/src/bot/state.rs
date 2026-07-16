@@ -305,6 +305,12 @@ pub struct GoalState {
     /// Earliest time to run the cheap nearby lifesaving-pickup pre-pass. This is much faster than
     /// normal goal selection but need not flood the navmesh every server frame.
     pub next_urgent: f32,
+    /// Waypoint magnetism (see [`crate::bot::goals::GameState::select_route_magnet`]): a desirable
+    /// item lying just off the current route the bot bends its immediate waypoint through so it steps
+    /// onto the trigger. `0` = none. Distinct from `item` — this is grabbed *in passing*, never
+    /// chased — and re-picked on `magnet_pick`'s throttle (the classname scan isn't per-frame cheap).
+    pub magnet_item: u32,
+    pub magnet_pick: f32,
     /// When the bot began chasing its current item goal. If it's *still* chasing the same item long
     /// after (one it can't actually reach — e.g. behind an elevator/button/movewall/teleporter chain
     /// the router can't thread), it abandons that goal rather than circling forever. Uses time-on-

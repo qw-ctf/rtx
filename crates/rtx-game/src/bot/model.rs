@@ -144,6 +144,18 @@ impl OpponentModel {
         self.pools[pool][slot]
     }
 
+    /// The union across every pool of what's believed about `target`'s arsenal — the most complete
+    /// "what were they holding" hypothesis. Used on the network client to guess a dropped backpack's
+    /// contents (the wire carries none): a weapon *any* bot witnessed counts. ORed as bitfields.
+    #[cfg_attr(not(feature = "netclient"), allow(dead_code))] // only the netclient backpack path calls it
+    pub(crate) fn believed_arsenal(&self, target: EntId) -> f32 {
+        let slot = target.0 as usize;
+        if slot == 0 || slot >= MAX_SLOTS {
+            return 0.0;
+        }
+        self.pools.iter().fold(0.0_f32, |acc, pool| acc.with(pool[slot].items))
+    }
+
     /// Mutable access, bounds-guarded — a hook can never panic on an exotic `maxclients`.
     fn entry_mut(&mut self, pool: usize, target: EntId) -> Option<&mut OpponentEstimate> {
         let slot = target.0 as usize;
@@ -600,5 +612,19 @@ mod tests {
         // resets the kit); under weapons-stay there's nothing to deny, so no nudge.
         assert_eq!(target_bias(100.0, true, false), 0.8);
         assert_eq!(target_bias(100.0, true, true), 1.0);
+    }
+
+    #[test]
+    fn believed_arsenal_unions_across_pools() {
+        let mut m = OpponentModel::default();
+        // Two different pools each witnessed a different weapon on the same victim.
+        m.note_weapon(0, EntId(3), Items::ROCKET_LAUNCHER, 0.0);
+        m.note_weapon(2, EntId(3), Items::LIGHTNING, 0.0);
+        let a = m.believed_arsenal(EntId(3));
+        assert!(a.has(Items::ROCKET_LAUNCHER) && a.has(Items::LIGHTNING), "union of both pools");
+        // A player nobody saw with a big gun stays at the baseline kit (no RL/LG believed).
+        assert!(!m.believed_arsenal(EntId(4)).has(Items::ROCKET_LAUNCHER));
+        // The world slot is never a target.
+        assert_eq!(m.believed_arsenal(EntId(0)), 0.0);
     }
 }
