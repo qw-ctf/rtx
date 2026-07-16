@@ -52,9 +52,12 @@ One workflow, `.github/workflows/build.yml`:
 
 - **test** — `cargo test --locked` across the workspace, then
   `cargo test --locked -p rtx-game --features netclient` for the client suite.
-- **build** — a release matrix producing the drop-in server artifacts:
+- **build** — a release matrix producing two artifacts per platform. The drop-in server module,
   `qwprogs-linux-x86_64` (`.so`), `qwprogs-macos-arm64` (`.dylib`), and
-  `qwprogs-windows-x86_64` (`.dll`), each staged under the `qwprogs.*` name a server expects.
+  `qwprogs-windows-x86_64` (`.dll`), each staged under the `qwprogs.*` name a server expects; and
+  the standalone [network client](netclient.md), `rtx-client-<target>` (`rtx-client.exe` on
+  Windows), built by its own `cargo build -p rtx-client` step so its `netclient` feature stays
+  out of the game module.
 
 ## Tests
 
