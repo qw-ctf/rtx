@@ -187,6 +187,12 @@ const SURFACE_CACHE_TTL: f32 = 0.5;
 const ESCAPE_FLOOD_MAX: f32 = 4.0;
 /// Minimum seconds between A* re-paths (the human keeps moving).
 const REPATH_INTERVAL: f32 = 0.4;
+/// How far ahead (travel seconds) the LOD steer corridor plants its interim target: far enough that
+/// the fine banded route covers several repaths of committed movement (the bot re-plans every
+/// `REPATH_INTERVAL`), near enough that the search stays a bounded local neighbourhood rather than the
+/// whole map. A nearer interim also commits the bot less to an approximate coarse corridor. See
+/// [`steer::steer`].
+const STEER_LOD_HORIZON: f32 = 3.0;
 /// Stuck detector: if we move less than this over `STUCK_TIME`, jump and re-path.
 const STUCK_MOVE: f32 = 16.0;
 const STUCK_TIME: f32 = 0.7;

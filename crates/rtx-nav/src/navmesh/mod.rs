@@ -3014,4 +3014,28 @@ mod tests {
             }
         }
     }
+
+    /// The LOD steer corridor plants its interim target short of a far goal (bounding the fine search)
+    /// but steers a near goal directly.
+    #[test]
+    fn corridor_interim_bounds_a_far_goal() {
+        let cell = |gx: i32| Cell { origin: Vec3::new(gx as f32 * 32.0, 0.0, 0.0), gx, gy: 0 };
+        let cells: Vec<Cell> = (0..25).map(|i| cell(i)).collect();
+        let mut links = Vec::new();
+        for i in 0..24u32 {
+            links.push(reach_link(i, i + 1));
+            links.push(reach_link(i + 1, i));
+        }
+        let mut g = NavGraph::test_graph(cells, links);
+        g.build_lod();
+        let costs = LinkCosts::default();
+
+        // Far goal (cell 24): the interim is a portal short of it, at/past the horizon.
+        let interim = g.corridor_interim(0, 24, &costs, 4.0).expect("a far goal has an interim");
+        assert!(interim < 24, "interim {interim} should fall short of the far goal");
+        assert!(g.coarse_costs(0, &costs, false).cost_to(interim) >= 4.0, "interim should be at/past the horizon");
+        // Same-cluster goal, and a goal within the horizon: steer directly (no interim).
+        assert_eq!(g.corridor_interim(0, 5, &costs, 4.0), None, "a same-cluster goal steers directly");
+        assert_eq!(g.corridor_interim(0, 10, &costs, 100.0), None, "a goal within the horizon steers directly");
+    }
 }

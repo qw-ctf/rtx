@@ -366,6 +366,76 @@ impl NavGraph {
         CoarseCosts { graph: self, costs, sever_chained, full: None, home, abs_cost }
     }
 
+    /// An interim steer target on the coarse corridor toward a far `goal`: the first portal cell whose
+    /// coarse cost from `from` reaches `horizon` along the abstract shortest path. Steering the fine
+    /// banded A* at this nearer portal instead of the far goal bounds the search to a `horizon`-sized
+    /// neighbourhood (A* explores less the nearer its target); the next repath advances the interim as
+    /// the bot moves. `None` when the goal is within `horizon` (steer it directly) or unreachable, or
+    /// on a bare graph. `sever_chained` is `false` here — a corridor may lead through a chained speed
+    /// jump the fine window then gates for feasibility.
+    pub fn corridor_interim(&self, from: CellId, goal: CellId, costs: &LinkCosts, horizon: f32) -> Option<CellId> {
+        let lod = self.lod.as_ref()?;
+        let (from_cl, goal_cl) = (lod.cluster_of[from as usize], lod.cluster_of[goal as usize]);
+        if from_cl == goal_cl {
+            return None; // same cluster — the goal is near, steer straight at it
+        }
+        // Abstract Dijkstra from the home portals, tracking the predecessor of each portal.
+        let home = self.home_flood(from, from_cl, lod, costs, false);
+        let np = lod.portals.len();
+        let mut abs_cost = vec![f32::INFINITY; np];
+        let mut parent = vec![u32::MAX; np];
+        let mut heap = BinaryHeap::new();
+        for (&cell, &seed) in &home {
+            let p = lod.portal_of_cell[cell as usize];
+            if p >= 0 && seed < abs_cost[p as usize] {
+                abs_cost[p as usize] = seed;
+                heap.push(MinNode { key: seed, id: p as u32 });
+            }
+        }
+        while let Some(MinNode { key: g, id: p }) = heap.pop() {
+            if g > abs_cost[p as usize] {
+                continue;
+            }
+            for e in &lod.abs_adj[p as usize] {
+                let ng = g + e.base + self.price_meta(e.gates, e.rj, e.chained, costs, false);
+                if ng < abs_cost[e.to as usize] {
+                    abs_cost[e.to as usize] = ng;
+                    parent[e.to as usize] = p;
+                    heap.push(MinNode { key: ng, id: e.to });
+                }
+            }
+        }
+        // The cheapest entry portal of the goal's cluster (coarse cost into the cluster + the in-cluster
+        // hop to the goal). If the whole thing is within `horizon` the goal is near — steer it directly.
+        let mut goal_portal = None;
+        let mut goal_cost = f32::INFINITY;
+        for r in &lod.cell_reach[goal as usize] {
+            let via = abs_cost[r.portal as usize];
+            if via.is_finite() && via + r.dist < goal_cost {
+                goal_cost = via + r.dist;
+                goal_portal = Some(r.portal);
+            }
+        }
+        let goal_portal = goal_portal?;
+        if goal_cost <= horizon {
+            return None;
+        }
+        // Walk the abstract path from the home side to the goal portal; the interim is the first portal
+        // at or past `horizon`.
+        let mut chain = Vec::new();
+        let mut p = goal_portal;
+        while p != u32::MAX {
+            chain.push(p);
+            p = parent[p as usize];
+        }
+        for &p in chain.iter().rev() {
+            if abs_cost[p as usize] >= horizon {
+                return Some(lod.portals[p as usize].cell);
+            }
+        }
+        Some(lod.portals[goal_portal as usize].cell)
+    }
+
     /// Priced Dijkstra from `from` restricted to cluster `cl`, returning the exact priced cost to every
     /// cell of the home cluster. Uses the full `link_extra` pricing (gates, hazard, …) so the home
     /// region matches the fine flood exactly; its portals seed [`coarse_costs`]'s abstract search and

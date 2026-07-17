@@ -186,12 +186,22 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         } else {
             graph.nearest_reachable_to(bot_cell, goal).unwrap_or(goal)
         };
-        let (route, mut bands) = match banded(bot_cell, target) {
+        // LOD steer corridor: for a far target, aim the fine banded A* at an interim portal ~a few
+        // seconds along the coarse route instead of the far goal, so the search stays bounded to a
+        // local neighbourhood (A* explores less the nearer its target). The next repath advances the
+        // interim as the bot moves; `bot.goal_cell` stays the true `goal`, so change detection and the
+        // gate/give-up logic are untouched. Off → today's exact whole-graph banded A* to the target.
+        let search_target = if host.cvar_bool(c"rtx_bot_lod") {
+            graph.corridor_interim(bot_cell, target, &costs, STEER_LOD_HORIZON).unwrap_or(target)
+        } else {
+            target
+        };
+        let (route, mut bands) = match banded(bot_cell, search_target) {
             Some(r) => (r.links, r.bands),
             // Banded came back empty on a *reachable* target ⇒ band-infeasible (a route that exists
             // only through a speed-jump chain the carried speed can't satisfy), or bands are off. The
             // plain cell A* ignores bands and is guaranteed to find the reachable target.
-            None => (graph.find_path(bot_cell, target, &costs).unwrap_or_default(), Vec::new()),
+            None => (graph.find_path(bot_cell, search_target, &costs).unwrap_or_default(), Vec::new()),
         };
         // Keep `route_bands` parallel to `route`: zero-fill when unbanded (or on any length mismatch).
         if bands.len() != route.len() {
@@ -226,7 +236,15 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 let button_cell = graph.gate(gi).button_cell;
                 // first frame records the starting distance (best_dist starts at +inf)
                 bot.gate.errand = Some(GateErrand { index: gi, best_dist: f32::INFINITY, since: now });
-                bot.route = graph.find_path(bot_cell, button_cell, &costs).unwrap_or_default();
+                // Bound this one-shot errand route the same way the main repath does (subsequent
+                // repaths target the button as `goal` and corridor-bound it); a far button on a big
+                // map would otherwise be one unbounded whole-graph A*.
+                let btarget = if host.cvar_bool(c"rtx_bot_lod") {
+                    graph.corridor_interim(bot_cell, button_cell, &costs, STEER_LOD_HORIZON).unwrap_or(button_cell)
+                } else {
+                    button_cell
+                };
+                bot.route = graph.find_path(bot_cell, btarget, &costs).unwrap_or_default();
                 bot.route_bands = vec![0u8; bot.route.len()]; // a walking errand, no carried speed
                 bot.route_pos = 0;
                 bot.goal_cell = Some(button_cell);
