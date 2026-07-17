@@ -55,6 +55,13 @@ const EXPLOSIVE_IMPACT_MARGIN: f32 = 24.0;
 /// self-splash; blast radius is 160 and attacker self-damage is only halved). Matches the slack in
 /// [`crate::bot::grenade::rocket_shove`].
 const LINE_OF_FIRE_SLACK: f32 = 48.0;
+/// How long *before* an airborne enemy touches down a rocket may still arrive and be better put into
+/// the ground under them than into the body ([`aim_solution`]). The blast reaches 160 units, so a
+/// target this close to landing — tens of units up, and dropping into it — eats the floor splash
+/// anyway; and eating it airborne is the point, since the blast throws them further up, where the
+/// next rocket has a body on a clean parabola to solve. Past this they're properly in the air, with
+/// room to be anywhere by the time the shot lands, and the hull is the better target.
+const FLOOR_SPLASH_LEEWAY: f32 = 0.15;
 /// Retreat when hurt below this.
 const LOW_HEALTH: f32 = 40.0;
 /// Upper range on the single-barrel *shotgun* finish (the lightning finish keeps its full
@@ -721,7 +728,8 @@ struct GrenadeSol {
 /// Projectile planning computed inside one immutable BSP borrow, handed back as plain data.
 struct BallisticPlan {
     /// Where an airborne enemy would touch down (time, point), so the rocket lead clamps at the
-    /// floor instead of aiming through it.
+    /// floor instead of aiming through it — and, once they're down by the time a rocket could reach
+    /// them, the floor the shot is put into rather than the body (see [`aim_solution`]).
     land: Option<(f32, Vec3)>,
     /// A *validated* airborne grenade intercept: still airborne at the meet, far enough that the
     /// blast doesn't catch us, and a real bounce sim confirms the arc reaches them.
@@ -814,9 +822,11 @@ fn plan_ballistics(
 /// projectiles solve the true intercept — where the enemy *will be* when the shot arrives; airborne
 /// targets ride the gravity-displaced, floor-clamped parabola from the muzzle (falling back to a
 /// linear lead if the fixed point can't settle), aimed at the hull centre (+4) for the most
-/// direct-hit margin; grounded/swimming targets get a linear lead from the eye (a grounded RL
-/// strafer gets the shin-drop so a near miss becomes floor splash, but nailguns need a direct hit).
-/// Hitscan aims straight at the eye, led only by `lead`.
+/// direct-hit margin — *unless* a rocket's target is down, or all but down, by the time it could get
+/// there, in which case it aims at the floor under them and leans on the splash. Grounded/swimming
+/// targets get a linear lead from the eye (a grounded RL strafer gets the same shin-drop so a near
+/// miss becomes floor splash, but nailguns need a direct hit). Hitscan aims straight at the eye, led
+/// only by `lead`.
 ///
 /// `lead` is the latency the shot is fired across — zero inside a server, and a network client's
 /// round trip otherwise (see [`GameState::aim_lead`]). It's simply added to the flight time, because
@@ -847,9 +857,23 @@ fn aim_solution(
             // Fallback (fixed point didn't settle — a target falling away near projectile speed):
             // the linear-seed flight time evaluated on the *clamped* `pos_at`, so a target that lands
             // mid-flight still resolves to the landing spot rather than a point below the floor.
-            let (_t, meet) = ballistic_intercept(muzzle_base, &pos_at, s, seed).unwrap_or((seed, pos_at(seed)));
-            let aim = meet + Vec3::new(0.0, 0.0, 4.0);
-            (aim, angles_to(muzzle_base, aim), true)
+            let (t, meet) = ballistic_intercept(muzzle_base, &pos_at, s, seed).unwrap_or((seed, pos_at(seed)));
+            // Down, or as good as, before the rocket can get there ([`FLOOR_SPLASH_LEEWAY`]): put the
+            // shot in the floor under them rather than into the body. Against an enemy who dodges what
+            // is aimed *at* them, the ground is the better target — stand on it and eat the splash, or
+            // jump off it and get catapulted, which only hands us the shot we want next. The blast is
+            // instantaneous, so it goes under where they'll *be* when it arrives (`meet`, which past
+            // touchdown is the landing spot with the run-on already in it), at the landing floor:
+            // `land_pos` is the resting *origin*, so −16 is the shin — the grounded strafer's
+            // floor-splash convention below, keeping 8u of clearance so a shallow shot doesn't graze
+            // the ground short of the spot. Rocket only: a nail in the floor is a wasted shot.
+            let floor_splash = plan
+                .land
+                .filter(|_| choice.weapon == Weapon::RocketLauncher)
+                .filter(|&(t_land, _)| t + lead >= t_land - FLOOR_SPLASH_LEEWAY)
+                .map(|(_, land_pos)| Vec3::new(meet.x, meet.y, land_pos.z - 16.0));
+            let aim = floor_splash.unwrap_or(meet + Vec3::new(0.0, 0.0, 4.0));
+            (aim, angles_to(muzzle_base, aim), floor_splash.is_none())
         } else {
             // A swimmer is led in full 3D with no gravity term (water isn't free-fall).
             let pred_vel = if tgt.swimming {
@@ -2145,6 +2169,113 @@ mod tests {
         assert!((after.x - (100.0 + 200.0 * 0.5)).abs() < 1e-3, "x {}", after.x);
         // Never predicted below the floor — the whole point of the clamp.
         assert!(ballistic_pos(p0, v0, g, land, 5.0).z >= 0.0);
+    }
+
+    /// An airborne target 600u downrange, solved from a bot at the origin — a rocket's flight over
+    /// that range is ~0.6s, which is what the touchdown times below are placed either side of.
+    /// The floor is at z = 0 throughout, so a landed player's origin rests at z = 24 and the shin
+    /// the floor-splash aims at is z = 8.
+    fn solve_air(weapon: Weapon, tgt: &Target, land: Option<(f32, Vec3)>, lead: f32) -> (Vec3, bool) {
+        let plan = BallisticPlan { land, air_gl: None, gl_ground: None };
+        let (aim, _, gate_direct) = aim_solution(
+            WeaponChoice::of(weapon),
+            tgt,
+            Vec3::new(0.0, 0.0, 22.0),
+            Vec3::new(0.0, 0.0, 16.0),
+            800.0,
+            &plan,
+            lead,
+        );
+        (aim, gate_direct)
+    }
+
+    /// A target 600u downrange at height `z`, in the air. `land` times below are the real solution of
+    /// this parabola against the floor, as `fall_land` would trace them.
+    fn falling_target(z: f32, vel: Vec3) -> Target {
+        let org = Vec3::new(600.0, 0.0, z);
+        Target {
+            org,
+            eye: org + Vec3::new(0.0, 0.0, 22.0),
+            vel,
+            dist: (org - Vec3::new(0.0, 0.0, 22.0)).length(),
+            swimming: false,
+            airborne: true,
+        }
+    }
+
+    /// The dodge answer: an enemy who'll be standing when the rocket gets there is shot at the ground
+    /// they'll be standing on, not at the body — so the splash lands whether they hold or jump.
+    #[test]
+    fn rocket_floor_splashes_a_target_that_lands_first() {
+        // Dropping from 60 at 200ups: down at t = 0.14, long before a ~0.6s rocket arrives.
+        let tgt = falling_target(60.0, Vec3::new(0.0, 0.0, -200.0));
+        let land = Some((0.14, Vec3::new(600.0, 0.0, 24.0)));
+        let (aim, gate_direct) = solve_air(Weapon::RocketLauncher, &tgt, land, 0.0);
+        assert_eq!(aim, Vec3::new(600.0, 0.0, 8.0), "the shin of the spot they're standing on");
+        assert!(!gate_direct, "a floor shot rides the splash tolerance, not the hull");
+    }
+
+    /// The leeway: they're still airborne when it arrives, but only just — the floor blast reaches
+    /// them anyway, and catches them off the ground, which is where we want them.
+    #[test]
+    fn rocket_floor_splashes_a_target_about_to_land() {
+        // Falling from an apex at 200: down at t = 0.66, a shade after the ~0.60s flight — so the
+        // rocket meets them ~30u up, inside the leeway and well inside the blast.
+        let tgt = falling_target(200.0, Vec3::ZERO);
+        let land = Some((0.66, Vec3::new(600.0, 0.0, 24.0)));
+        let (aim, gate_direct) = solve_air(Weapon::RocketLauncher, &tgt, land, 0.0);
+        assert_eq!(aim, Vec3::new(600.0, 0.0, 8.0), "the floor under where they'll be");
+        assert!(!gate_direct);
+    }
+
+    /// The mid-air intercept is still the right answer while they're a body on a parabola.
+    #[test]
+    fn rocket_keeps_midair_intercept_when_it_arrives_first() {
+        // Rising at 100ups from 300: not down until t = 0.97, and the rocket is there at ~0.63.
+        let tgt = falling_target(300.0, Vec3::new(0.0, 0.0, 100.0));
+        let land = Some((0.97, Vec3::new(600.0, 0.0, 24.0)));
+        let (aim, gate_direct) = solve_air(Weapon::RocketLauncher, &tgt, land, 0.0);
+        assert!(aim.z > 100.0, "hull centre up on the parabola, nowhere near the floor: {aim:?}");
+        assert!(gate_direct, "a body shot needs the hull");
+    }
+
+    /// Nails don't splash, so the floor is never a target for them — the aim still rides the clamp to
+    /// the landing spot, but at the hull it has to hit.
+    #[test]
+    fn nailgun_never_aims_at_the_floor() {
+        let tgt = falling_target(60.0, Vec3::new(0.0, 0.0, -200.0));
+        let land = Some((0.14, Vec3::new(600.0, 0.0, 24.0)));
+        let (aim, gate_direct) = solve_air(Weapon::SuperNailgun, &tgt, land, 0.0);
+        assert_eq!(aim, Vec3::new(600.0, 0.0, 28.0), "hull centre at the landing spot (24 + 4)");
+        assert!(gate_direct);
+    }
+
+    /// The blast goes under where they'll *be*, not where they touched down: a target that lands
+    /// running keeps running, and the shot follows.
+    #[test]
+    fn floor_splash_follows_the_post_landing_run() {
+        // Same 0.14s drop, running +y at 320ups: they touch down 45u along and keep going.
+        let tgt = falling_target(60.0, Vec3::new(0.0, 320.0, -200.0));
+        let land = Some((0.14, Vec3::new(600.0, 44.8, 24.0)));
+        let (aim, gate_direct) = solve_air(Weapon::RocketLauncher, &tgt, land, 0.0);
+        assert_eq!(aim.z, 8.0, "still the shin of the floor");
+        assert!(aim.y > 44.8, "and past the touchdown point at their ground speed: {aim:?}");
+        assert!(!gate_direct);
+    }
+
+    /// Latency is time the target keeps falling before our shot even exists, so it counts toward
+    /// their landing exactly as it counts toward the flight.
+    #[test]
+    fn latency_counts_toward_the_landing() {
+        // Falling from an apex at 300: down at t = 0.83, with the rocket there at ~0.61.
+        let tgt = falling_target(300.0, Vec3::ZERO);
+        let land = Some((0.83, Vec3::new(600.0, 0.0, 24.0)));
+        let (_, direct_now) = solve_air(Weapon::RocketLauncher, &tgt, land, 0.0);
+        // A client 150ms behind: they've had that long to keep falling before the shot even exists.
+        let (aim_late, direct_late) = solve_air(Weapon::RocketLauncher, &tgt, land, 0.15);
+        assert!(direct_now, "in the server's present they're still well up when it arrives");
+        assert!(!direct_late, "seen 150ms late, they're on the floor by then — shoot the floor");
+        assert_eq!(aim_late.z, 8.0, "{aim_late:?}");
     }
 
     /// A shot solved 400u downrange along +x, clean angles dead ahead — the geometry the on-target
