@@ -299,7 +299,7 @@ impl GameState {
                 continue;
             }
             goals.extend(
-                collect_touch_terminals(cells(), ent.v.origin)
+                collect_touch_terminals(cells(), ent)
                     .into_iter()
                     .map(|cell| (i as u32, cell)),
             );
@@ -432,11 +432,11 @@ impl GameState {
 /// nearby geometry to the entity origin.
 fn collect_touch_terminals(
     cells: impl IntoIterator<Item = (navmesh::CellId, Vec3)>,
-    item_origin: Vec3,
+    item: &crate::entity::Entity,
 ) -> Vec<navmesh::CellId> {
     cells
         .into_iter()
-        .filter_map(|(cell, origin)| crate::bot::on_item(origin, item_origin).then_some(cell))
+        .filter_map(|(cell, origin)| crate::bot::item_terminal_touches(origin, item).then_some(cell))
         .collect()
 }
 
@@ -445,10 +445,20 @@ mod tests {
     use super::*;
     use crate::bsp::Bsp;
     use crate::defs::{Bits, Items, Solid};
-    use crate::entity::Touch;
+    use crate::entity::{Entity, Touch};
     use crate::netclient::host::NetHost;
     use crate::navmesh::NavGraph;
     use std::path::PathBuf;
+
+    fn armor_entity(classname: &str, origin: Vec3) -> Entity {
+        let mut armor = Entity::default();
+        armor.in_use = true;
+        armor.classname = Some(classname.into());
+        armor.v.origin = origin;
+        armor.v.mins = Vec3::new(-16.0, -16.0, 0.0);
+        armor.v.maxs = Vec3::new(16.0, 16.0, 56.0);
+        armor
+    }
 
     fn assert_armor_take(classname: &str, item_origin: Vec3, terminal: Vec3) {
         let host: &'static NetHost = Box::leak(Box::new(NetHost::new(PathBuf::from("/nonexistent"))));
@@ -467,6 +477,8 @@ mod tests {
             ent.in_use = true;
             ent.classname = Some(classname.into());
             ent.v.origin = item_origin;
+            ent.v.mins = Vec3::new(-16.0, -16.0, 0.0);
+            ent.v.maxs = Vec3::new(16.0, 16.0, 56.0);
             ent.v.solid = Solid::Trigger;
             ent.set_touch(Touch::ItemArmor);
         }
@@ -484,7 +496,8 @@ mod tests {
     fn armor_take_from_terminal(classname: &str, item_origin: Vec3, bad_endpoint: Vec3) {
         let valid_endpoint = item_origin + Vec3::new(0.0, 0.0, 24.0);
         let cells = [(7, bad_endpoint), (8, valid_endpoint)];
-        let terminals = collect_touch_terminals(cells, item_origin);
+        let armor = armor_entity(classname, item_origin);
+        let terminals = collect_touch_terminals(cells, &armor);
 
         assert_eq!(terminals, vec![8], "the observed stall cell must not catalogue as a pickup terminal");
         assert_armor_take(classname, item_origin, valid_endpoint);
@@ -536,18 +549,22 @@ mod tests {
                 Vec3::new(1239.0, -887.0, 88.0),
             ),
         ] {
-            assert!(!crate::bot::on_item(bad_endpoint, item_origin), "observed endpoint is not a take");
+            let armor = armor_entity(classname, item_origin);
+            assert!(
+                !crate::bot::item_terminal_touches(bad_endpoint, &armor),
+                "observed endpoint is not a take"
+            );
             let terminals = collect_touch_terminals(
                 graph
                     .cells
                     .iter()
                     .enumerate()
                     .map(|(cell, c)| (cell as navmesh::CellId, c.origin)),
-                item_origin,
+                &armor,
             );
             assert!(!terminals.is_empty(), "{classname} has no touch-valid DM3 terminal");
             let terminal = graph.cell_origin(terminals[0]);
-            assert!(crate::bot::on_item(terminal, item_origin));
+            assert!(crate::bot::item_terminal_touches(terminal, &armor));
             assert_armor_take(classname, item_origin, terminal);
         }
     }

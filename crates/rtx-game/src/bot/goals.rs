@@ -108,8 +108,8 @@ fn local_pickup_in_budget(current_goal: bool, distance: f32, travel: f32) -> boo
 /// Whether standing at `cell` is itself sufficient to overlap the item's pickup trigger. Catalog
 /// construction guarantees this for static items; selectors check it again so a live/dynamic entry
 /// can never acquire completion ownership through an invalid endpoint.
-fn touch_valid_terminal(graph: &crate::navmesh::NavGraph, cell: CellId, item_origin: Vec3) -> bool {
-    super::on_item(graph.cell_origin(cell), item_origin)
+fn touch_valid_terminal(graph: &crate::navmesh::NavGraph, cell: CellId, item: &crate::entity::Entity) -> bool {
+    super::item_terminal_touches(graph.cell_origin(cell), item)
 }
 
 /// A high stack pickup may beat a slightly nearer low one during a fresh-spawn exit. One second is
@@ -948,7 +948,7 @@ impl GameState {
         choose_spawn_stack(self.nav.goals.iter().filter_map(|&(idx, cell)| {
             let item = EntId(idx);
             let ent = &self.entities[item];
-            if !touch_valid_terminal(graph, cell, ent.v.origin) {
+            if !touch_valid_terminal(graph, cell, ent) {
                 return None;
             }
             if self.entities[bot_e].bot.is_avoided(idx, now) {
@@ -1000,7 +1000,7 @@ impl GameState {
         for &(idx, cell) in &self.nav.goals {
             let item = EntId(idx);
             let ent = &self.entities[item];
-            if !touch_valid_terminal(graph, cell, ent.v.origin)
+            if !touch_valid_terminal(graph, cell, ent)
                 || ent.v.solid != Solid::Trigger
                 || self.entities[bot_e].bot.is_avoided(idx, now)
                 || (ent.v.origin - origin).length() > LOCAL_PICKUP_RADIUS
@@ -1128,7 +1128,7 @@ impl GameState {
             }
             let item = EntId(idx);
             let ent = &self.entities[item];
-            if !touch_valid_terminal(graph, cell, ent.v.origin)
+            if !touch_valid_terminal(graph, cell, ent)
                 || ent.v.solid != Solid::Trigger
                 || (ent.v.origin - origin).length() > LOCAL_PICKUP_RADIUS
             {
@@ -1222,7 +1222,7 @@ impl GameState {
             .filter_map(|&(idx, cell)| {
                 let item = EntId(idx);
                 let ent = &self.entities[item];
-                if !touch_valid_terminal(graph, cell, ent.v.origin)
+                if !touch_valid_terminal(graph, cell, ent)
                     || ent.v.solid != Solid::Trigger
                     || self.entities[bot_e].bot.is_avoided(idx, now)
                 {
@@ -1266,14 +1266,13 @@ impl GameState {
         let from = graph.nearest(self.entities[bot_e].v.origin)?;
         let pricing = self.bot_link_pricing(bot_e, self.time());
         let travel = graph.costs_from(from, &pricing.costs(0));
-        let item_origin = self.entities[item].v.origin;
         self.nav
             .goals
             .iter()
             .filter_map(|&(idx, cell)| {
                 (idx == item.0
                     && cell != current
-                    && touch_valid_terminal(graph, cell, item_origin)
+                    && touch_valid_terminal(graph, cell, &self.entities[item])
                     && travel[cell as usize].is_finite())
                 .then_some((cell, travel[cell as usize]))
             })
@@ -1647,7 +1646,7 @@ impl GameState {
                 continue;
             }
             let item = EntId(idx);
-            if !touch_valid_terminal(graph, cell, self.entities[item].v.origin) {
+            if !touch_valid_terminal(graph, cell, &self.entities[item]) {
                 continue;
             }
             let Some(cat) = self.entities[item].classname().and_then(category) else {

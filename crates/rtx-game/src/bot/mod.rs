@@ -44,7 +44,8 @@ use crate::bot::state::{
     AirCommit, BotState, CombatPosture, Commit, GoalCommit, GrenadePhase, HookPhase, RjPhase, Wander,
 };
 use crate::defs::{
-    Bits, DeadFlag, Flags, Items, Solid, TakeDamage, Weapon, BUTTON_ATTACK, BUTTON_JUMP, VEC_VIEW_OFS,
+    Bits, DeadFlag, Flags, Items, Solid, TakeDamage, Weapon, BUTTON_ATTACK, BUTTON_JUMP, VEC_HULL_MAX,
+    VEC_HULL_MIN, VEC_VIEW_OFS,
 };
 use crate::entity::{EntId, Entity, Touch};
 use crate::game::{cstring, GameState};
@@ -635,6 +636,19 @@ fn sense(game: &GameState, e: EntId) -> Sense {
 /// pickup from surviving a restart and replacing the course objective.
 fn hard_mode_objective(intent: Option<BotIntent>) -> bool {
     matches!(intent, Some(BotIntent::Move(_) | BotIntent::Spectate { .. }))
+}
+
+/// Whether a player standing at `player_origin` physically overlaps the server's linked pickup
+/// trigger. Unlike [`on_item`] (the deliberately generous fake-client compatibility predicate),
+/// this uses the real asymmetric player/item hulls and the engine's 15u horizontal item-link grow.
+/// It is therefore suitable for proving that a nav terminal itself can execute a real-client take.
+pub(crate) fn item_terminal_touches(player_origin: Vec3, item: &Entity) -> bool {
+    const ITEM_LINK_GRAB: f32 = 15.0;
+    let player_min = player_origin + VEC_HULL_MIN;
+    let player_max = player_origin + VEC_HULL_MAX;
+    let item_min = item.v.origin + item.v.mins - Vec3::new(ITEM_LINK_GRAB, ITEM_LINK_GRAB, 0.0);
+    let item_max = item.v.origin + item.v.maxs + Vec3::new(ITEM_LINK_GRAB, ITEM_LINK_GRAB, 0.0);
+    (0..3).all(|axis| player_max[axis] >= item_min[axis] && player_min[axis] <= item_max[axis])
 }
 
 /// Completion ownership carried by a bounded item plan. Kept pure so the objective arbiter's
