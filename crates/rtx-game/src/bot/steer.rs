@@ -233,6 +233,9 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         bot.route_bands = bands;
         bot.route_pos = 0;
         bot.goal_cell = Some(goal);
+        // Remember the gates the corridor crosses beyond the interim window, so the gate-errand block
+        // can pre-arm for a far shut door the truncated route won't reveal (see [`GateState`]).
+        bot.gate.corridor_gates = corridor.as_ref().map_or(0, |c| c.crossed_gates);
         bot.repath_time = now + REPATH_INTERVAL;
         // Restart the progress watchdog against the new route (INFINITY ⇒ the first frame records the
         // real starting distance rather than reading as an instant stall on an old baseline).
@@ -251,8 +254,16 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     if !route_frozen && !on_air && bot.gate.errand.is_none() {
         // Skip a gate we recently gave up on, while its avoid window is still open.
         let avoid = bot.gate.avoid.filter(|&(_, until)| now < until).map(|(gi, _)| gi);
-        let block =
-            route_blocking_gate(graph, &bot.route, bot.route_pos, gate_closed).filter(|&gi| Some(gi) != avoid);
+        // A shut gate on the current route, or — under LOD, where the route stops at the interim — a
+        // shut gate the corridor crosses further along (the far pre-arm, matching exact mode's
+        // full-route detection). `route_blocking_gate` takes priority (it's the more precise near case).
+        let corridor_gates = bot.gate.corridor_gates;
+        let far = (0..32u32).find(|&gi| {
+            corridor_gates & (1 << gi) != 0 && gate_closed.get(gi as usize).copied().unwrap_or(false) && Some(gi as usize) != avoid
+        });
+        let block = route_blocking_gate(graph, &bot.route, bot.route_pos, gate_closed)
+            .filter(|&gi| Some(gi) != avoid)
+            .or(far.map(|gi| gi as usize));
         if let Some(gi) = block {
             if button_reachable(graph, bot_cell, gi, &costs) {
                 let button_cell = graph.gate(gi).button_cell;
