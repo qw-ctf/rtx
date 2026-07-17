@@ -352,6 +352,13 @@ pub struct GoalState {
     /// `Powerup` is a selected timed powerup. The lock ends only on touch, invalidation, route
     /// failure, or its watchdog.
     pub commit: GoalCommit,
+    /// The selected pickup terminal has been reached but the item is still present. Steering gives
+    /// the server a short touch-confirmation grace, then retries one alternate terminal before
+    /// abandoning the item. `(item, cell, arrived_at)` keeps stale state from old goals inert.
+    pub terminal_arrival: Option<(u32, CellId, f32)>,
+    /// Item for which the one alternate-terminal retry has already been spent. Cleared once there is
+    /// no active goal, so a later fresh attempt at the same pickup starts cleanly.
+    pub terminal_retried_item: u32,
     /// Handoff hold (team opponent modeling): a spawned RL/LG this bot stands on but deliberately
     /// does **not** pick up (`bot_pickup_items` skips it), reserving it for a powerup-carrying
     /// teammate that lacks it. `0` = not holding. `hold_for` is that teammate; `hold_until` the hard

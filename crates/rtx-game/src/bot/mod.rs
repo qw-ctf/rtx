@@ -449,7 +449,7 @@ fn bot_pickup_items(game: &mut GameState, e: EntId) {
 }
 
 /// Whether a bot at `bot_origin` is close enough to an item at `item_origin` to collect it.
-fn on_item(bot_origin: Vec3, item_origin: Vec3) -> bool {
+pub(crate) fn on_item(bot_origin: Vec3, item_origin: Vec3) -> bool {
     let d = item_origin - bot_origin;
     d.x.abs() <= PICKUP_XY && d.y.abs() <= PICKUP_XY && d.z.abs() <= PICKUP_Z
 }
@@ -483,6 +483,9 @@ struct Objective {
     target_origin: Vec3,
     /// The navmesh cell of the item goal, when chasing one (skips a `nearest` lookup).
     item_cell: Option<CellId>,
+    /// A second touch-valid terminal for the same pickup, priced from the bot's current cell. Filled
+    /// only after steering reaches the first terminal and its short confirmation grace elapses.
+    alternate_item_cell: Option<CellId>,
     /// Waypoint magnetism (`rtx_bot_magnet`): a desirable item lying just off the route the bot
     /// should bend its immediate steering waypoint through — grabbed *in passing*, without changing
     /// its goal. `None` = nothing worth the side-step. `steer` applies the bend only when the item is
@@ -761,6 +764,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
             vigil: false,
             target_origin,
             item_cell,
+            alternate_item_cell: None,
             magnet: None, // a puppet-ordered leg is flown as issued — no incidental side-steps
             watch_point: None,
             surfacing: false,
@@ -1135,23 +1139,30 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // would otherwise just beeline the enemy. This is ktx's "the enemy is one more goal" in effect.
     let chasing = game.entities[e].bot.goal.item != 0;
     let item_committed = game.entities[e].bot.goal.commit != GoalCommit::None;
-    let goal_item_org = {
+    let goal_item_terminal = {
         let it = EntId(game.entities[e].bot.goal.item);
-        (game.entities[it].v.origin, Some(game.entities[e].bot.goal.item_cell))
+        let cell = game.entities[e].bot.goal.item_cell;
+        let target = game
+            .nav
+            .graph
+            .as_ref()
+            .map(|g| g.cell_origin(cell))
+            .unwrap_or(game.entities[it].v.origin);
+        (target, Some(cell))
     };
     // Where we're headed: the vigil post (waiting on an uncollectable item), the detour item, the
     // mode's target, the chosen item, or the nearest human.
     let (target_origin, item_cell) = match intent {
-        Some(BotIntent::Fight(_)) if chasing => vigil.unwrap_or(goal_item_org),
+        Some(BotIntent::Fight(_)) if chasing => vigil.unwrap_or(goal_item_terminal),
         // Visible → the enemy's live origin (combat owns aim on sight); aware-but-unseen → the
         // last-seen spot, so the bot searches where they went instead of tracking through walls.
         Some(BotIntent::Fight(en)) => (combat_last_seen.unwrap_or(game.entities[en].v.origin), None),
-        Some(BotIntent::Advance(_)) if chasing => vigil.unwrap_or(goal_item_org),
+        Some(BotIntent::Advance(_)) if chasing => vigil.unwrap_or(goal_item_terminal),
         Some(BotIntent::Advance(pos)) => (pos, None),
         Some(BotIntent::Move(pos)) => (pos, None),
         // Spectate navigates exactly like Move; the watched fighter only redirects the eyes (below).
         Some(BotIntent::Spectate { goal, .. }) => (goal, None),
-        None if chasing => vigil.unwrap_or(goal_item_org),
+        None if chasing => vigil.unwrap_or(goal_item_terminal),
         // No armor/weapon is currently reachable (all may be deeper in their respawn clocks): hold
         // this spawn instead of falling into the ordinary human-follow/roam path. The 1.5-second
         // selector cadence will commit as soon as a respawning stack item enters its lookahead.
@@ -1196,6 +1207,27 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         b.goal.next_pick = now; // re-pick (skipping the abandoned item) next frame
     }
 
+    // A reached item terminal gets a brief window for the server's touch/stat update. If it is
+    // still active after that, pre-price one other touch-valid terminal. Steering consumes that
+    // retry immediately; a second miss fails/avoids instead of burning the 10/25 s goal watchdog.
+    let active_item = game.entities[e].bot.goal.item;
+    let alternate_item_cell = if active_item != 0 {
+        let b = &game.entities[e].bot;
+        let due = b.goal.terminal_arrival.is_some_and(|(item, cell, at)| {
+            item == active_item
+                && cell == b.goal.item_cell
+                && now - at >= steer::TERMINAL_TAKE_GRACE
+        });
+        (due && b.goal.terminal_retried_item != active_item)
+            .then(|| game.select_alternate_item_terminal(e, EntId(active_item), b.goal.item_cell))
+            .flatten()
+    } else {
+        let b = &mut game.entities[e].bot;
+        b.goal.terminal_arrival = None;
+        b.goal.terminal_retried_item = 0;
+        None
+    };
+
     // Waypoint magnetism: a desirable up item just off the route corridor is worth stepping onto in
     // passing. The fake-client pickup net grabs incidental items by a generous touch box; a network
     // client only gets the tight server-side trigger overlap, so steering has to put the hull on the
@@ -1233,8 +1265,9 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // `surfacing`/`swim_up` are decided in `run_bot` (they need the borrowed graph + bot cell), so
     // the normal objective leaves them off — the anti-drown override flips them on when it fires.
     Objective {
-        hooking, on_sj, on_rj, enemy, chasing, item_committed, polite, target_origin, item_cell, magnet,
-        watch_point, vigil: vigil.is_some(), surfacing: false, swim_up: false, order_link: None,
+        hooking, on_sj, on_rj, enemy, chasing, item_committed, polite, target_origin, item_cell,
+        alternate_item_cell, magnet, watch_point, vigil: vigil.is_some(), surfacing: false,
+        swim_up: false, order_link: None,
     }
 }
 

@@ -105,6 +105,13 @@ fn local_pickup_in_budget(current_goal: bool, distance: f32, travel: f32) -> boo
                 && travel <= TERMINAL_PICKUP_TRAVEL))
 }
 
+/// Whether standing at `cell` is itself sufficient to overlap the item's pickup trigger. Catalog
+/// construction guarantees this for static items; selectors check it again so a live/dynamic entry
+/// can never acquire completion ownership through an invalid endpoint.
+fn touch_valid_terminal(graph: &crate::navmesh::NavGraph, cell: CellId, item_origin: Vec3) -> bool {
+    super::on_item(graph.cell_origin(cell), item_origin)
+}
+
 /// A high stack pickup may beat a slightly nearer low one during a fresh-spawn exit. One second is
 /// enough to choose a bridge/window-level destination when it is genuinely nearby, but too small to
 /// turn an across-map RA into the answer to every spawn.
@@ -941,6 +948,9 @@ impl GameState {
         choose_spawn_stack(self.nav.goals.iter().filter_map(|&(idx, cell)| {
             let item = EntId(idx);
             let ent = &self.entities[item];
+            if !touch_valid_terminal(graph, cell, ent.v.origin) {
+                return None;
+            }
             if self.entities[bot_e].bot.is_avoided(idx, now) {
                 return None;
             }
@@ -990,7 +1000,8 @@ impl GameState {
         for &(idx, cell) in &self.nav.goals {
             let item = EntId(idx);
             let ent = &self.entities[item];
-            if ent.v.solid != Solid::Trigger
+            if !touch_valid_terminal(graph, cell, ent.v.origin)
+                || ent.v.solid != Solid::Trigger
                 || self.entities[bot_e].bot.is_avoided(idx, now)
                 || (ent.v.origin - origin).length() > LOCAL_PICKUP_RADIUS
             {
@@ -1117,7 +1128,8 @@ impl GameState {
             }
             let item = EntId(idx);
             let ent = &self.entities[item];
-            if ent.v.solid != Solid::Trigger
+            if !touch_valid_terminal(graph, cell, ent.v.origin)
+                || ent.v.solid != Solid::Trigger
                 || (ent.v.origin - origin).length() > LOCAL_PICKUP_RADIUS
             {
                 continue;
@@ -1210,7 +1222,10 @@ impl GameState {
             .filter_map(|&(idx, cell)| {
                 let item = EntId(idx);
                 let ent = &self.entities[item];
-                if ent.v.solid != Solid::Trigger || self.entities[bot_e].bot.is_avoided(idx, now) {
+                if !touch_valid_terminal(graph, cell, ent.v.origin)
+                    || ent.v.solid != Solid::Trigger
+                    || self.entities[bot_e].bot.is_avoided(idx, now)
+                {
                     return None;
                 }
                 let cat = ent.classname().and_then(category)?;
@@ -1236,6 +1251,34 @@ impl GameState {
             })
             .max_by(|a, b| a.2.total_cmp(&b.2).then_with(|| b.0.0.cmp(&a.0.0)))
             .map(|(item, cell, _)| (item, cell))
+    }
+
+    /// Price a second terminal for the same item after steering reached the selected one without a
+    /// take. This preserves pickup ownership while changing only the physical endpoint and uses the
+    /// same live link pricing as normal item planning.
+    pub(crate) fn select_alternate_item_terminal(
+        &self,
+        bot_e: EntId,
+        item: EntId,
+        current: CellId,
+    ) -> Option<CellId> {
+        let graph = self.nav.graph.as_ref()?;
+        let from = graph.nearest(self.entities[bot_e].v.origin)?;
+        let pricing = self.bot_link_pricing(bot_e, self.time());
+        let travel = graph.costs_from(from, &pricing.costs(0));
+        let item_origin = self.entities[item].v.origin;
+        self.nav
+            .goals
+            .iter()
+            .filter_map(|&(idx, cell)| {
+                (idx == item.0
+                    && cell != current
+                    && touch_valid_terminal(graph, cell, item_origin)
+                    && travel[cell as usize].is_finite())
+                .then_some((cell, travel[cell as usize]))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
+            .map(|(cell, _)| cell)
     }
 
     /// The best `(item, cell, desire)` for a bot by `desire × (LOOKAHEAD − t) / (t + 5)`, over both
@@ -1604,6 +1647,9 @@ impl GameState {
                 continue;
             }
             let item = EntId(idx);
+            if !touch_valid_terminal(graph, cell, self.entities[item].v.origin) {
+                continue;
+            }
             let Some(cat) = self.entities[item].classname().and_then(category) else {
                 continue;
             };
@@ -1719,13 +1765,24 @@ impl GameState {
             b.one_score
                 .total_cmp(&a.one_score)
                 .then_with(|| a.item.0.cmp(&b.item.0))
+                .then_with(|| a.cell.cmp(&b.cell))
         });
         // The up-to-six continuation costs (one per primary), all under the same pricing the base costs
         // used (`base` == `pricing.costs(0)`, still valid — `LinkCosts` is `Copy`). Coarse: a cheap
         // abstract Dijkstra each. Exact: the mutually-independent floods, fanned out in one ordered
         // batch across the worker pool. `leg_costs[pi]` is primary `pi`'s costs.
-        let primaries: Vec<ItemCandidate> =
-            candidates.iter().filter(|c| c.one_score > 0.0).take(PLAN_PRIMARY_LIMIT).copied().collect();
+        // One item may expose several touch-valid terminals. Keep all of them available as second
+        // legs, but do not let six cells for one armor consume the bounded primary-plan budget.
+        let mut primaries: Vec<ItemCandidate> = Vec::new();
+        for &candidate in candidates.iter().filter(|c| c.one_score > 0.0) {
+            if primaries.iter().any(|c: &ItemCandidate| c.item == candidate.item) {
+                continue;
+            }
+            primaries.push(candidate);
+            if primaries.len() == PLAN_PRIMARY_LIMIT {
+                break;
+            }
+        }
         let leg_costs: Vec<PlanCosts> = if lod {
             primaries.iter().map(|c| PlanCosts::Coarse(graph.coarse_costs(c.cell, &base, true))).collect()
         } else {

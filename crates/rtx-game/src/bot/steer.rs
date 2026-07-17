@@ -23,6 +23,10 @@ use crate::nav_build::PlatStatus;
 use crate::navmesh::{CellId, Corridor, LinkCosts, LinkKind, NavGraph};
 use crate::nearfield;
 
+/// How long a real network client waits at a reached pickup terminal for the authoritative server
+/// touch/stat update before trying another terminal or abandoning the item.
+pub(super) const TERMINAL_TAKE_GRACE: f32 = 0.35;
+
 /// The all-`Copy` frame snapshot `steer` reads: the [`Sense`] and [`Objective`] this frame, the
 /// per-bot A* costs, and the live gate/plat state gathered before the borrow (see `run_bot`).
 pub(super) struct SteerCtx<'a> {
@@ -109,6 +113,19 @@ fn jump_runup_ok(v_xy: Vec2, to_wp: Vec2, dist: f32, frac: f32, maxspeed: f32) -
     v_xy.dot(to_wp.normalize_or_zero()) >= frac * maxspeed
 }
 
+fn abandon_terminal_item(bot: &mut BotState, item: u32, now: f32) {
+    bot.mark_avoid(item, now + GOAL_AVOID_TIME);
+    bot.goal.item = 0;
+    bot.goal.next_item = 0;
+    bot.goal.commit = GoalCommit::None;
+    bot.goal.next_commit = GoalCommit::None;
+    bot.goal.next_pick = now;
+    bot.goal.terminal_arrival = None;
+    bot.route.clear();
+    bot.goal_cell = None;
+    bot.repath_time = now;
+}
+
 pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> SteerOut {
     let SteerCtx { s, o, costs, plat_status, gate_ready, bot_cell, goal_cell, race_line_ahead, weapons_hot, bsp } =
         ctx;
@@ -117,7 +134,20 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         enemy_seen_time, v_xy, speed, grapple_hook, has_grapple, hook_out, on_hook, anchor, reel_half_step,
         attack_finished, has_rl, ammo_rockets, health, armortype, armorvalue, quad, ..
     } = s;
-    let Objective { hooking, on_sj, on_rj, enemy, chasing, polite, vigil, target_origin, watch_point, .. } = o;
+    let Objective {
+        hooking,
+        on_sj,
+        on_rj,
+        enemy,
+        chasing,
+        polite,
+        vigil,
+        target_origin,
+        item_cell,
+        alternate_item_cell,
+        watch_point,
+        ..
+    } = o;
     let gate_closed = costs.gate_closed;
 
     // Plain-jump commitment is normally pre-armed before objective resolution. Remember the first
@@ -430,6 +460,48 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         (target_origin, None, true, None)
     };
 
+    // Reaching a catalogued pickup terminal while the item remains active means the authoritative
+    // touch has not arrived. Give a network update a short grace, then immediately retry one other
+    // touch-valid terminal. A second miss (or no alternate) avoids the item now — never spend the
+    // ordinary/major goal watchdog pushing into nearby geometry.
+    let at_item_terminal = chasing
+        && item_cell == Some(goal_cell)
+        && final_leg
+        && bot_cell == goal_cell
+        && (target_origin - origin).length() <= ARRIVE_RADIUS;
+    let mut terminal_changed = false;
+    if at_item_terminal {
+        let item = bot.goal.item;
+        let arrived_at = match bot.goal.terminal_arrival {
+            Some((old_item, old_cell, at)) if old_item == item && old_cell == goal_cell => at,
+            _ => {
+                bot.goal.terminal_arrival = Some((item, goal_cell, now));
+                now
+            }
+        };
+        if now - arrived_at >= TERMINAL_TAKE_GRACE {
+            if bot.goal.terminal_retried_item != item {
+                if let Some(alternate) = alternate_item_cell {
+                    bot.goal.item_cell = alternate;
+                    bot.goal.terminal_retried_item = item;
+                    bot.goal.terminal_arrival = None;
+                    bot.route.clear();
+                    bot.goal_cell = None;
+                    bot.repath_time = now;
+                    terminal_changed = true;
+                } else {
+                    abandon_terminal_item(bot, item, now);
+                    terminal_changed = true;
+                }
+            } else {
+                abandon_terminal_item(bot, item, now);
+                terminal_changed = true;
+            }
+        }
+    } else {
+        bot.goal.terminal_arrival = None;
+    }
+
     // Plat standoff. If an upcoming leg boards/rides a func_plat that isn't at its bottom, and we're
     // not already aboard it, walking to the board point would put us inside the lift's inner trigger
     // (the footprint shrunk 25u, spanning the full travel height) — and `plat_center_touch` resets
@@ -460,12 +532,16 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // over by a grace period that would, by construction, still stand under the lift for its duration.
     // While holding, steer to the standoff point and borrow the Plat leg's driver treatment (no
     // jump-press, no bhop entry, no air-latch, progress-watchdog exempt) by presenting `kind` as Plat.
-    let (waypoint, kind) = match plat_hold {
+    let (waypoint, kind) = if terminal_changed {
+        (origin, None)
+    } else {
+        match plat_hold {
         Some(pi) => {
             let p = graph.plat(pi);
             (plat_standoff(origin, p.fp_min, p.fp_max), Some(LinkKind::Plat))
         }
         None => (waypoint, kind),
+        }
     };
 
     // Waypoint magnetism: `resolve_objective` picked a desirable up item near the route; if it lies on

@@ -276,29 +276,35 @@ impl GameState {
     }
 
     /// Build the static item-goal catalog: every spawned pickup (weapons, health, armor, ammo,
-    /// powerups) paired with the navmesh cell nearest it. Items don't move, so this is computed
-    /// once with the navmesh; [`GameState::select_item_goal`] reads live availability per query.
+    /// powerups) paired with every navmesh cell whose standing player origin overlaps its pickup
+    /// trigger. Items don't move, so this is computed once with the navmesh;
+    /// [`GameState::select_item_goal`] reads live availability per query.
     fn collect_goals(&self, graph: &navmesh::NavGraph) -> Vec<(u32, navmesh::CellId)> {
-        self.entities
-            .iter()
-            .enumerate()
-            .filter_map(|(i, ent)| {
-                let cn = ent.classname()?;
-                // `in_use` matters: a freed slot keeps its classname until something reuses it, and
-                // an item that failed `droptofloor` at load was deleted for having fallen out of the
-                // level. Cataloguing it anyway would send bots to stand forever where an item isn't.
-                if i == 0 || !ent.in_use || !bot_goals::is_goal_classname(cn) {
-                    return None;
-                }
-                // Resolve to a cell the item is collectable *from* (Z-aware), not merely the nearest
-                // floor — a ledge/pedestal item must not alias to the ground under it, or a bot parks
-                // beneath it forever. Fall back to the plain nearest when no cell is close enough
-                // (better an imperfect goal than a silently dropped item; the runtime `gdz` telemetry
-                // surfaces any residual aliasing).
-                let cell = graph.nearest_collectable(ent.v.origin).or_else(|| graph.nearest(ent.v.origin))?;
-                Some((i as u32, cell))
-            })
-            .collect()
+        let cells = || {
+            graph
+                .cells
+                .iter()
+                .enumerate()
+                .map(|(cell, c)| (cell as navmesh::CellId, c.origin))
+        };
+        let mut goals = Vec::new();
+        for (i, ent) in self.entities.iter().enumerate() {
+            let Some(cn) = ent.classname() else {
+                continue;
+            };
+            // `in_use` matters: a freed slot keeps its classname until something reuses it, and an
+            // item that failed `droptofloor` at load was deleted for having fallen out of the level.
+            // Cataloguing it anyway would send bots to stand forever where an item isn't.
+            if i == 0 || !ent.in_use || !bot_goals::is_goal_classname(cn) {
+                continue;
+            }
+            goals.extend(
+                collect_touch_terminals(cells(), ent.v.origin)
+                    .into_iter()
+                    .map(|cell| (i as u32, cell)),
+            );
+        }
+        goals
     }
 
     /// Gather the [`PlatInfo`](crate::navmesh::PlatInfo) for every spawned `func_plat`: the
@@ -418,5 +424,82 @@ impl GameState {
             }
         }
         None
+    }
+}
+
+/// Player-origin nav cells that already overlap an item's pickup trigger. A route ending on one of
+/// these cells completes the pickup by standing there; it never relies on a final beeline through
+/// nearby geometry to the entity origin.
+fn collect_touch_terminals(
+    cells: impl IntoIterator<Item = (navmesh::CellId, Vec3)>,
+    item_origin: Vec3,
+) -> Vec<navmesh::CellId> {
+    cells
+        .into_iter()
+        .filter_map(|(cell, origin)| crate::bot::on_item(origin, item_origin).then_some(cell))
+        .collect()
+}
+
+#[cfg(all(test, feature = "netclient"))]
+mod tests {
+    use super::*;
+    use crate::defs::{Items, Solid};
+    use crate::entity::Touch;
+    use crate::netclient::host::NetHost;
+    use std::path::PathBuf;
+
+    fn armor_take_from_terminal(classname: &str, item_origin: Vec3, bad_endpoint: Vec3) {
+        let valid_endpoint = item_origin + Vec3::new(0.0, 0.0, 24.0);
+        let cells = [(7, bad_endpoint), (8, valid_endpoint)];
+        let terminals = collect_touch_terminals(cells, item_origin);
+
+        assert_eq!(terminals, vec![8], "the observed stall cell must not catalogue as a pickup terminal");
+
+        let host: &'static NetHost = Box::leak(Box::new(NetHost::new(PathBuf::from("/nonexistent"))));
+        host.set("maxclients", "8");
+        let mut game = GameState::new_client(host);
+        let (player, armor) = (EntId(1), EntId(32));
+        {
+            let ent = &mut game.entities[player];
+            ent.in_use = true;
+            ent.classname = Some("player".into());
+            ent.v.health = 100.0;
+            ent.v.origin = valid_endpoint;
+        }
+        {
+            let ent = &mut game.entities[armor];
+            ent.in_use = true;
+            ent.classname = Some(classname.into());
+            ent.v.origin = item_origin;
+            ent.v.solid = Solid::Trigger;
+            ent.set_touch(Touch::ItemArmor);
+        }
+
+        game.run_touch(armor, player);
+
+        assert!(game.entities[player].v.armorvalue > 0.0, "terminal arrival must execute an armor take");
+        assert!(
+            game.entities[player].v.items.has(Items::ARMOR2 | Items::ARMOR3),
+            "the take must change armor inventory, not merely satisfy a selector"
+        );
+        assert_eq!(game.entities[armor].v.solid, Solid::Not, "the server-side pickup handler consumed it");
+    }
+
+    #[test]
+    fn dm3_ra_wrong_side_endpoint_rebinds_to_a_real_take() {
+        armor_take_from_terminal(
+            "item_armorInv",
+            Vec3::new(256.0, -704.0, 304.0),
+            Vec3::new(360.0, -677.0, 264.0),
+        );
+    }
+
+    #[test]
+    fn dm3_ya_upper_floor_endpoint_rebinds_to_a_real_take() {
+        armor_take_from_terminal(
+            "item_armor2",
+            Vec3::new(1232.0, -904.0, -48.0),
+            Vec3::new(1239.0, -887.0, 88.0),
+        );
     }
 }
