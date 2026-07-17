@@ -25,7 +25,7 @@ use crate::defs::{
 };
 use crate::entity::{EntId, Think, Touch};
 use crate::game::GameState;
-use crate::navmesh::{CellId, LinkCosts, NavGraph, CLOSED_GATE_PENALTY};
+use crate::navmesh::{CellId, LinkCosts, LinkKind, NavGraph, CLOSED_GATE_PENALTY};
 
 /// Beyond this travel-or-respawn time (seconds) an *ordinary* item isn't worth pursuing.
 pub(crate) const LOOKAHEAD: f32 = 10.0;
@@ -89,6 +89,9 @@ const LOCAL_PICKUP_RADIUS: f32 = 384.0;
 /// is inflated by a turn or stair. This covers the analysed 116-209 qu armor stalls while remaining
 /// a terminal approach, not a new cross-room combat detour.
 const TERMINAL_PICKUP_RADIUS: f32 = 256.0;
+/// A Euclidean-near goal across a wall or floor can still have a long route. Keep the terminal
+/// override bounded to a short completion run rather than locking onto a multi-room detour.
+const TERMINAL_PICKUP_TRAVEL: f32 = 3.0;
 
 /// Whether a local pickup's cell-level route is short enough to take movement ownership. The
 /// current-goal bit is deliberately explicit: terminal completion may need a different rule from
@@ -96,7 +99,10 @@ const TERMINAL_PICKUP_RADIUS: f32 = 256.0;
 fn local_pickup_in_budget(current_goal: bool, distance: f32, travel: f32) -> bool {
     distance <= LOCAL_PICKUP_RADIUS
         && travel.is_finite()
-        && (travel <= LOCAL_PICKUP_TRAVEL || (current_goal && distance <= TERMINAL_PICKUP_RADIUS))
+        && (travel <= LOCAL_PICKUP_TRAVEL
+            || (current_goal
+                && distance <= TERMINAL_PICKUP_RADIUS
+                && travel <= TERMINAL_PICKUP_TRAVEL))
 }
 
 /// A high stack pickup may beat a slightly nearer low one during a fresh-spawn exit. One second is
@@ -104,24 +110,30 @@ fn local_pickup_in_budget(current_goal: bool, distance: f32, travel: f32) -> boo
 /// turn an across-map RA into the answer to every spawn.
 const SPAWN_HEIGHT_BONUS_MAX: f32 = 1.0;
 const SPAWN_HEIGHT_BONUS_RISE: f32 = 128.0;
-const SPAWN_STACK_TRAVEL_MAX: f32 = 10.0;
-
 #[derive(Clone, Copy, Debug)]
 struct SpawnStackCandidate {
     item: EntId,
     cell: CellId,
     travel: f32,
     rise: f32,
+    uses_lift: bool,
 }
 
 /// Choose the nearest reachable spawn-stack pickup, with a bounded preference for gaining height.
-fn choose_spawn_stack(candidates: impl IntoIterator<Item = SpawnStackCandidate>) -> Option<SpawnStackCandidate> {
+fn choose_spawn_stack(
+    candidates: impl IntoIterator<Item = SpawnStackCandidate>,
+) -> Option<SpawnStackCandidate> {
     candidates
         .into_iter()
-        .filter(|c| c.travel.is_finite() && c.travel <= SPAWN_STACK_TRAVEL_MAX)
+        .filter(|c| c.travel.is_finite())
         .min_by(|a, b| {
             let score = |c: &SpawnStackCandidate| {
-                c.travel - (c.rise.max(0.0) / SPAWN_HEIGHT_BONUS_RISE).min(SPAWN_HEIGHT_BONUS_MAX)
+                let height_bonus = if c.uses_lift {
+                    0.0
+                } else {
+                    (c.rise.max(0.0) / SPAWN_HEIGHT_BONUS_RISE).min(SPAWN_HEIGHT_BONUS_MAX)
+                };
+                c.travel - height_bonus
             };
             score(a)
                 .total_cmp(&score(b))
@@ -919,13 +931,14 @@ impl GameState {
         let from = graph.nearest(origin)?;
         let now = self.time();
         let pricing = self.bot_link_pricing(bot_e, now);
-        let travel = graph.costs_from(from, &pricing.costs(0));
+        let costs = pricing.costs(0);
+        let travel = graph.costs_from(from, &costs);
         let stats = self.bot_stats(bot_e);
 
         choose_spawn_stack(self.nav.goals.iter().filter_map(|&(idx, cell)| {
             let item = EntId(idx);
             let ent = &self.entities[item];
-            if ent.v.solid != Solid::Trigger || self.entities[bot_e].bot.is_avoided(idx, now) {
+            if self.entities[bot_e].bot.is_avoided(idx, now) {
                 return None;
             }
             let cat = ent.classname().and_then(category)?;
@@ -934,11 +947,26 @@ impl GameState {
             {
                 return None;
             }
+            let route = graph.find_path(from, cell, &costs)?;
+            let path_rise = route
+                .iter()
+                .map(|&link| graph.cell_origin(graph.link_target(link)).z - origin.z)
+                .fold(ent.v.origin.z - origin.z, f32::max);
+            let uses_lift = route.iter().any(|&link| graph.link_kind(link) == LinkKind::Plat);
+            let route_time = travel[cell as usize];
+            let collect_time = if ent.v.solid == Solid::Trigger {
+                route_time
+            } else if matches!(ent.think, Think::SubRegen) && ent.v.nextthink - now < LOOKAHEAD {
+                route_time.max(ent.v.nextthink - now)
+            } else {
+                return None;
+            };
             Some(SpawnStackCandidate {
                 item,
                 cell,
-                travel: travel[cell as usize],
-                rise: ent.v.origin.z - origin.z,
+                travel: collect_time,
+                rise: path_rise,
+                uses_lift,
             })
         }))
         .map(|c| (c.item, c.cell))
@@ -1872,9 +1900,12 @@ mod tests {
     fn chased_armor_enters_terminal_completion_before_touch_range() {
         // The analysed DM3 stalls were 116-209 qu from armor. Cell-level travel can exceed the
         // opportunistic one-second budget around stairs/turns, but a goal already selected and
-        // physically this close must keep closing until its hull reaches the trigger (roughly 80 qu).
+        // physically this close must keep closing until its hull reaches the trigger (roughly
+        // 80 qu).
         assert!(local_pickup_in_budget(true, 209.0, 1.5));
-        // A different item at the same cost remains merely opportunistic and must not hijack combat.
+        assert!(!local_pickup_in_budget(true, 209.0, 8.0));
+        // A different item at the same cost remains merely opportunistic and must not hijack
+        // combat.
         assert!(!local_pickup_in_budget(false, 209.0, 1.5));
     }
 
@@ -1885,12 +1916,14 @@ mod tests {
             cell: 1,
             travel: 2.0,
             rise: 0.0,
+            uses_lift: false,
         };
         let nearby_high = SpawnStackCandidate {
             item: EntId(11),
             cell: 2,
             travel: 2.6,
             rise: 128.0,
+            uses_lift: false,
         };
         assert_eq!(choose_spawn_stack([low, nearby_high]).unwrap().item, nearby_high.item);
 
@@ -1899,6 +1932,7 @@ mod tests {
             cell: 3,
             travel: 4.0,
             rise: 256.0,
+            uses_lift: false,
         };
         assert_eq!(choose_spawn_stack([low, distant_high]).unwrap().item, low.item);
 
@@ -1907,8 +1941,27 @@ mod tests {
             cell: 4,
             travel: f32::INFINITY,
             rise: 512.0,
+            uses_lift: false,
         };
         assert_eq!(choose_spawn_stack([low, unreachable]).unwrap().item, low.item);
+
+        let lift_high = SpawnStackCandidate {
+            item: EntId(14),
+            cell: 5,
+            travel: 2.6,
+            rise: 256.0,
+            uses_lift: true,
+        };
+        assert_eq!(choose_spawn_stack([low, lift_high]).unwrap().item, low.item);
+
+        let only_far = SpawnStackCandidate {
+            item: EntId(15),
+            cell: 6,
+            travel: 30.0,
+            rise: 0.0,
+            uses_lift: false,
+        };
+        assert_eq!(choose_spawn_stack([only_far]).unwrap().item, only_far.item);
     }
 
     #[test]

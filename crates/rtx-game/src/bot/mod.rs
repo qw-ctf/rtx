@@ -1043,7 +1043,13 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
             crate::mode::ArenaRole::Audience => 'A',
         };
         let msg = cstring(&format!(
-            "rtx bot{client}: role={role} want={goal} dist={dist:.0} gcell={gcell} gdz={gdz:.0} on_item={overlap} ownLG={own_lg} cells={:.0} pen={pen} aware={aware} est={est} hold={hold} mag={mag} commit={commit:?} posture={posture:?} spawnexit={} vig={vig} watch={wat}\n",
+            concat!(
+                "rtx bot{client}: role={role} want={goal} dist={dist:.0} ",
+                "gcell={gcell} gdz={gdz:.0} on_item={overlap} ",
+                "ownLG={own_lg} cells={:.0} pen={pen} aware={aware} est={est} ",
+                "hold={hold} mag={mag} commit={commit:?} posture={posture:?} ",
+                "spawnexit={} vig={vig} watch={wat}\n",
+            ),
             game.entities[e].v.ammo_cells,
             stack_exit as i32,
         ));
@@ -1080,6 +1086,10 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         // Spectate navigates exactly like Move; the watched fighter only redirects the eyes (below).
         Some(BotIntent::Spectate { goal, .. }) => (goal, None),
         None if chasing => vigil.unwrap_or(goal_item_org),
+        // No armor/weapon is currently reachable (all may be deeper in their respawn clocks): hold
+        // this spawn instead of falling into the ordinary human-follow/roam path. The one-second
+        // selector cadence will commit as soon as a respawning stack item enters its lookahead.
+        None if stack_exit => (origin, None),
         None => {
             polite = true; // following / roaming: no need to stand on the exact spot
             if let Some(spot) = mode.bot_idle_roam(game, e) {
@@ -1369,7 +1379,8 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // Detect the living edge rather than a server-only spawn callback: a network-client body is
     // spawned by the remote server, but its mirrored health produces the same false→true edge. In
     // ordinary DM with stack discipline, reserve the first life objective for one armor/weapon.
-    let spawn_exit_done = spawn_exit_complete(game.entities[e].v.armorvalue, game.entities[e].v.items);
+    let spawn_exit_done =
+        spawn_exit_complete(game.entities[e].v.armorvalue, game.entities[e].v.items);
     let fresh_spawn = alive && !game.entities[e].bot.was_alive;
     {
         let enable = game.mode.name() == "dm" && host.cvar_bool(c"rtx_bot_stack");

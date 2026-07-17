@@ -32,6 +32,14 @@ shared combat layer (retreating when hurt, grabbing items it passes over). Set
 instead. With nothing to chase and no human to follow, a bot **roams** to a random reachable
 spot rather than standing on its spawn.
 
+With resource discipline enabled, a **fresh deathmatch spawn stacks first**: it commits to one
+reachable armor or upgraded weapon before nominating an opponent. Travel time leads the choice,
+with a bounded preference for a route that gains height without using a lift (a bridge/window-style
+exit) when it is only slightly farther away. The item run owns movement through physical touch;
+acquiring armor or any weapon beyond the spawn axe/shotgun ends the exit and normal hunting resumes.
+If every candidate is deeper in its respawn clock, the bot holds its spawn until one becomes a
+waitable goal instead of drifting into its ordinary follow/roam fallback.
+
 When a mode leaves the brain in charge, it pathfinds to the best reachable **item pickup**, or
 **follows the nearest human** — through doors, off ledges, across jumps, recovering after a
 missed jump.
@@ -157,8 +165,8 @@ and collected the same way.
 **Resource discipline** (`rtx_bot_stack`, on by default) values health/armor more steeply below
 the bare-spawn stack, enters the Recover posture on a thin stack (not just low health), treats
 red armor and megahealth as major "must-cycle" pickups, and panics for ammo when a bot's
-firepower is about to collapse. Off = the leaner ktx-parity valuation, where a topped-up bot
-ignores items until a true need.
+firepower is about to collapse. It also enables the one-pickup fresh-spawn exit described above.
+Off = the leaner ktx-parity valuation, where a topped-up bot ignores items until a true need.
 
 **Waypoint magnetism** (`rtx_bot_magnet`, on by default) bends the immediate steering waypoint
 through a desirable item lying just off the route corridor, so the bot actually steps onto it.
