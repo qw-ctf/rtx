@@ -473,6 +473,13 @@ impl GameState {
                 config: cfg,
                 ..Default::default()
             };
+            // Re-seed the opponent hypotheses on the new ruleset's spawn kit, exactly as a map load
+            // does ([`on_worldspawn`]). The baseline is what *every* belief reset copies — spawn,
+            // death, the Arena winner-stays — so leaving the old mode's kit here would model each
+            // fighter with the wrong stack for the rest of the map: switching into `ra` live, the
+            // dm baseline's bare 100hp/no-armor makes one rocket read as a finishable 20 EHP while
+            // the real fighter still has 220 behind red armor, and the bots shotgun-rush a full stack.
+            self.opponents = crate::bot::model::OpponentModel::new(crate::bot::model::baseline_for_mode(next.name()));
             host.conprint(&cstring(&format!("rtx: game mode = {}\n", next.name())));
         } else if cfg != self.team_match.config {
             self.team_match = MatchState {

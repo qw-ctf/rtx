@@ -1235,12 +1235,24 @@ pub(crate) fn engage(
         // Make the finish read observable live (`rtx_bot_debug`): log only when it actually diverts the
         // pick from what range + inventory alone would choose — the "he's low, hit him with something
         // that lands" swap. Throttled by the switch itself, and off the hot path unless debugging.
+        //
+        // The belief prints *beside the truth it is a guess at*: the failure this catches is never the
+        // gate arithmetic, it's the model quietly disagreeing with the world (a stale baseline, a missed
+        // reset, over-modelled damage), and a believed-strength number alone cannot show that. Both
+        // sides come from the frame that took the decision, so they're directly comparable.
         if finishable && game.host().cvar_bool(c"rtx_bot_debug") {
             let plain = choose_weapon(inv, dist, plan.air_gl.is_some(), plan.gl_ground.is_some(), underwater, false);
             if plain.weapon != choice.weapon {
+                let (bh, ba, be, age) = game.opponent_est(e, enemy, now).map_or((-1.0, -1.0, -1.0, -1.0), |est| {
+                    (est.health, est.armor_value, crate::bot::model::est_strength(&est, now), now - est.last_update)
+                });
+                let v = &game.entities[enemy].v;
+                let (rh, ra, rt) = (v.health, v.armorvalue, v.armortype);
+                let real = crate::bot::goals::total_strength(rh, ra, rt);
                 game.host().conprint(&crate::game::cstring(&format!(
-                    "rtx bot{}: finishing with {:?} (range pick was {:?}) at {:.0}u\n",
-                    e.0, choice.weapon, plain.weapon, dist,
+                    "rtx bot{}: finishing with {:?} (range pick was {:?}) at {dist:.0}u — \
+                     belief H{bh:.0}/A{ba:.0} E{be:.0} age {age:.1}s | real H{rh:.0}/A{ra:.0}@{rt:.1} E{real:.0}\n",
+                    e.0, choice.weapon, plain.weapon,
                 )));
             }
         }

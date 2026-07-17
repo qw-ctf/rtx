@@ -350,8 +350,21 @@ macro_rules! field_enum {
     ($(#[$meta:meta])* $name:ident { $($variant:ident = $val:expr,)* }) => {
         $(#[$meta])*
         #[repr(transparent)]
-        #[derive(Clone, Copy, PartialEq, PartialOrd, Debug, Default)]
+        #[derive(Clone, Copy, PartialEq, PartialOrd, Default)]
         pub struct $name(f32);
+        /// Print the variant's *name*, not the float behind it — these reach humans through debug
+        /// telemetry (`rtx bot3: finishing with Shotgun`), where a bare `Weapon(1.0)` is a lookup
+        /// the reader shouldn't have to do. Hand-written because the field is an `f32`: it can hold
+        /// a value no variant names, so the numeric form stays as the fallback, and `f32` isn't
+        /// structural-match, so the arms can't be a `match`.
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                $(if *self == $name::$variant {
+                    return f.write_str(stringify!($variant));
+                })*
+                write!(f, "{}({})", stringify!($name), self.0)
+            }
+        }
         #[allow(non_upper_case_globals, dead_code)]
         impl $name {
             $(pub const $variant: $name = $name($val as f32);)*
