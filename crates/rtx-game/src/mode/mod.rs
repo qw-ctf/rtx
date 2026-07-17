@@ -32,7 +32,7 @@
 
 use glam::Vec3;
 
-use crate::defs::{Items, Weapon};
+use crate::defs::{Items, TakeDamage, Weapon};
 use crate::entity::EntId;
 use crate::game::{cstring, GameState};
 
@@ -291,6 +291,15 @@ pub(crate) trait GameMode: Sync {
     /// adapts bot behavior. `Some` overrides the generic item/human brain (fight an enemy, or roam
     /// to a spot); `None` leaves the default behavior in charge. Default: `None`.
     fn bot_intent(&self, _g: &mut GameState, _bot: EntId) -> Option<BotIntent> {
+        None
+    }
+
+    /// Where a bot with *no* live objective (no visible enemy, no item to fetch, no human to tail)
+    /// should idle-roam this frame — the mode's chance to keep it in its own space instead of the
+    /// generic whole-map [`roam_target`](crate::bot). Rocket Arena confines a fighter to the arena and
+    /// the audience to the stands, so a fighter never sets off toward — and jams itself against the
+    /// wall beneath — the untouchable spectators. `None` (the default) falls back to the generic roam.
+    fn bot_idle_roam(&self, _g: &mut GameState, _bot: EntId) -> Option<Vec3> {
         None
     }
 
@@ -588,6 +597,7 @@ pub(crate) fn countdown_announce(until: f32, now: f32, last: i32) -> (i32, Optio
 /// Arena's audience and a structured match's benched late-joiners; damage to (and from) these
 /// players is refused by the bench/audience damage gates. Health/armor must stay positive — a
 /// client (and the bot AI) treats 0 health as dead and locks movement, freezing the spectator.
+/// [`audience_loadout`] also clears `takedamage` so the whole world reads these as non-participants.
 /// A fixed spawn kit — the arena fighter, midair, race and audience kits each hand-wrote these
 /// fields. `apply` *assigns* `items` (not `.with`), which drops the grapple bit
 /// `put_client_in_server` hands out first (the intended no-hook-in-the-arena behavior). `max_health:
@@ -637,6 +647,13 @@ pub(crate) fn audience_loadout(g: &mut GameState, e: EntId) {
         weapon: Weapon::Axe,
     }
     .apply(g, e);
+    // Mark a spectator as a non-participant the way FBRA's `becomeinvisible` does (arena.qc): a
+    // `takedamage == No` body is refused damage at the top of `t_damage`, ignored by the teleporter /
+    // jump-pad touch gates (so a solid, roaming audience member can't ride a teleporter into the live
+    // arena), and skipped by bot enemy selection. The mode damage hook still protects a fighter during
+    // the countdown, which keeps its `Aim`; a promotion re-spawns through `configure_fresh_player_body`
+    // and regains `Aim` there.
+    g.entities[e].v.takedamage = TakeDamage::No;
 }
 
 /// A roaming destination among `classname` spawns for a bot with nothing to fight — re-picked on a

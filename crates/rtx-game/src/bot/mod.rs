@@ -882,8 +882,13 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         let commit = b.goal.commit;
         let posture = b.posture;
         let mag = b.goal.magnet_item;
+        // Arena role (F=fighter, A=audience), so a live read shows who's dueling vs spectating.
+        let role = match game.entities[e].mode_p.arena.role {
+            crate::mode::ArenaRole::Fighter => 'F',
+            crate::mode::ArenaRole::Audience => 'A',
+        };
         let msg = cstring(&format!(
-            "rtx bot{client}: want={goal} dist={dist:.0} on_item={overlap} ownLG={own_lg} cells={:.0} pen={pen} aware={aware} est={est} hold={hold} mag={mag} commit={commit:?} posture={posture:?} vig={vig} watch={wat}\n",
+            "rtx bot{client}: role={role} want={goal} dist={dist:.0} on_item={overlap} ownLG={own_lg} cells={:.0} pen={pen} aware={aware} est={est} hold={hold} mag={mag} commit={commit:?} posture={posture:?} vig={vig} watch={wat}\n",
             game.entities[e].v.ammo_cells,
         ));
         host.conprint(&msg); // conprint always shows; dprint needs `developer 1`
@@ -921,7 +926,12 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         None if chasing => vigil.unwrap_or(goal_item_org),
         None => {
             polite = true; // following / roaming: no need to stand on the exact spot
-            if let Some(h) = nearest_human(game, e) {
+            if let Some(spot) = mode.bot_idle_roam(game, e) {
+                // The mode keeps an idle bot in its own space (Rocket Arena confines a fighter to the
+                // arena, the audience to the stands) rather than letting the whole-map roam send it
+                // toward — and into the wall beneath — the untouchable spectators.
+                (spot, None)
+            } else if let Some(h) = nearest_human(game, e) {
                 (game.entities[h].v.origin, None)
             } else {
                 // Nothing to chase and no human to follow: **roam** to a random reachable spot
@@ -1853,7 +1863,9 @@ fn escape_target(cache: &mut Wander, graph: &NavGraph, bot_cell: CellId, costs: 
     picked
 }
 
-/// The nearest living human player to bot `bot_e` (skips bots, spectators, and the dead).
+/// The nearest living human *participant* to bot `bot_e` (skips bots, spectators, the dead, and —
+/// via the `takedamage` gate — a non-participant like a Rocket Arena audience member or a benched
+/// human, so a pacifist bot doesn't leave the duel to trail someone watching from the stands).
 fn nearest_human(game: &GameState, bot_e: EntId) -> Option<EntId> {
     let maxclients = game.host().cvar(c"maxclients") as i32;
     let origin = game.entities[bot_e].v.origin;
@@ -1867,7 +1879,7 @@ fn nearest_human(game: &GameState, bot_e: EntId) -> Option<EntId> {
         if !ent.in_use || ent.bot.is_bot || !ent.is_player() {
             continue;
         }
-        if !ent.is_alive() {
+        if !ent.is_alive() || ent.v.takedamage == TakeDamage::No {
             continue;
         }
         let d = (ent.v.origin - origin).length_squared();

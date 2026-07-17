@@ -297,7 +297,12 @@ impl GameState {
         }
         {
             let v = &self.entities[other].v;
-            if v.health <= 0.0 || v.solid != Solid::SlideBox {
+            // A non-participant (`takedamage == No`: a corpse, a Rocket Arena audience member, a
+            // benched spectator) is inert to the teleporter, mirroring FBRA's `if (other.takedamage)`
+            // gate (arena.qc/triggers.qc). rtx's audience are *solid* walking players — FBRA's are
+            // `SOLID_NOT` and never even touch a trigger — so without this gate a spectator rides the
+            // arena teleporter into the live duel.
+            if v.health <= 0.0 || v.solid != Solid::SlideBox || v.takedamage == TakeDamage::No {
                 return;
             }
         }
@@ -427,7 +432,11 @@ impl GameState {
         let is_grenade = self.entities[other].classname() == Some("grenade");
         if is_grenade {
             self.entities[other].v.velocity = push;
-        } else if self.entities[other].v.health > 0.0 {
+        } else if self.entities[other].v.health > 0.0 && self.entities[other].v.takedamage != TakeDamage::No {
+            // A jump pad, like the teleporter above, ignores a non-participant (`takedamage == No`) —
+            // FBRA gates `trigger_push` the same way (triggers.qc), so a Rocket Arena spectator can't be
+            // launched into the live arena. (`hurt`/telefrag need no gate: they route through `t_damage`,
+            // which already refuses a `takedamage == No` target.)
             self.entities[other].v.velocity = push;
             if self.entities[other].is_player() {
                 let time = self.time();

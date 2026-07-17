@@ -23,7 +23,7 @@
 use glam::Vec3;
 
 use super::{centerprint_all, countdown_announce, nearest_player_where, players};
-use crate::defs::PrintLevel;
+use crate::defs::{PrintLevel, TakeDamage};
 use crate::entity::EntId;
 use crate::game::{cstring, GameState};
 
@@ -644,7 +644,11 @@ pub(crate) fn nearest_enemy(g: &GameState, bot: EntId) -> Option<EntId> {
         .into_iter()
         .filter(|&en| {
             let e = &g.entities[en];
-            e.is_alive() && e.mode_p.team != my_team
+            // A non-participant (`takedamage == No`: a Rocket Arena audience member, a benched
+            // spectator) is never a target, even though it's a living player on another "team" — the
+            // same non-participant marker the teleporter gate keys off. Keeps a fighter from swinging
+            // its aim onto the harmless bodies watching the duel.
+            e.is_alive() && e.v.takedamage != TakeDamage::No && e.mode_p.team != my_team
         })
         .map(|en| {
             let d = (g.entities[en].v.origin - origin).length_squared()
@@ -677,7 +681,10 @@ fn assign_target(candidates: &[(EntId, f32, u32)]) -> Option<EntId> {
 /// The nearest living player not on `my_team` to an arbitrary `point` — used to pick a target near a
 /// base to defend, not just near the bot itself.
 pub(crate) fn nearest_enemy_to(g: &GameState, my_team: u8, point: Vec3) -> Option<EntId> {
-    nearest_player_where(g, point, EntId::WORLD, |g, e| g.entities[e].mode_p.team != my_team)
+    nearest_player_where(g, point, EntId::WORLD, |g, e| {
+        // Skip non-participants (audience / benched spectators), as `nearest_enemy` does.
+        g.entities[e].v.takedamage != TakeDamage::No && g.entities[e].mode_p.team != my_team
+    })
 }
 
 #[cfg(test)]

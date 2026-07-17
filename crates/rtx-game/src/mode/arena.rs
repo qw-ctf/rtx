@@ -330,6 +330,17 @@ impl GameMode for Arena {
             }
         }
     }
+
+    fn bot_idle_roam(&self, g: &mut GameState, bot: EntId) -> Option<Vec3> {
+        // No opponent in sight and no goal to fetch: roam our *own* space, never the whole map.
+        // `spawn_pool` already splits by role — a fighter's arena (its teleport-destination ring), an
+        // audience member's deathmatch stands — so a fighter picked to duel never sets a roam target
+        // among the unreachable stands cells and jams itself into the wall below the audience trying
+        // to reach it, and the audience keep to the stands. Mirrors the Fighter arm's own no-enemy
+        // fallback (`bot_intent` above), which is why they read the same pool.
+        let pool = spawn_pool(g, bot).unwrap_or("info_player_deathmatch");
+        Some(super::wander_point(g, bot, pool, |_| None))
+    }
 }
 
 impl Arena {
