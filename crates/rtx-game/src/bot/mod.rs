@@ -1052,6 +1052,20 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
             ),
             game.entities[e].v.ammo_cells,
             stack_exit as i32,
+            client = client,
+            goal = goal,
+            dist = dist,
+            overlap = overlap,
+            own_lg = own_lg,
+            pen = pen,
+            aware = aware,
+            est = est,
+            hold = hold,
+            mag = mag,
+            commit = commit,
+            posture = posture,
+            vig = vig,
+            wat = wat,
         ));
         host.conprint(&msg); // conprint always shows; dprint needs `developer 1`
     }
