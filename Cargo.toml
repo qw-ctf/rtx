@@ -14,6 +14,15 @@ edition = "2021"
 license = "AGPL-3.0-or-later"
 authors = ["Daniel Svensson <dsvensson@gmail.com>"]
 
+# The shipped module lives or dies on the bot brain's frame budget, and its hot loops (the navmesh
+# A*/Dijkstra in rtx-nav) are called from rtx-game across a crate boundary that cargo's defaults —
+# no cross-crate LTO, 16 codegen units — leave un-inlined. Thin LTO plus a single codegen unit costs
+# a slower release build and buys back the inlining. Deliberately *not* `panic = "abort"`: the engine
+# hosts this as a dylib, and turning a panic into an instant process death takes the server with it.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 [workspace.dependencies]
 # `glam` crosses the rtx-nav public API boundary (Vec3 in Bsp/NavGraph), so every crate must
 # resolve the same version — single-source it here.
