@@ -235,9 +235,11 @@ impl GameState {
         }
         let counts = graph.summary();
         let goals = self.collect_goals(&graph);
+        let (lclusters, lportals, ledges, lreach) = graph.lod_stats();
         let msg = cstring(&format!(
             "rtx: navmesh: {} planes, {} clipnodes -> {} cells, {} links \
-             (walk {} step {} drop {} jump {} djump {} sjump {} plat {} tele {} hook {} rjump {}), {} gates, {} item goals\n",
+             (walk {} step {} drop {} jump {} djump {} sjump {} plat {} tele {} hook {} rjump {}), {} gates, {} item goals; \
+             lod {} clusters {} portals {} edges {} reach\n",
             bsp.planes.len(),
             bsp.clipnodes.len(),
             graph.cells.len(),
@@ -254,6 +256,10 @@ impl GameState {
             counts.rocket_jump,
             graph.gate_count(),
             goals.len(),
+            lclusters,
+            lportals,
+            ledges,
+            lreach,
         ));
         self.host.dprint(&msg);
         self.nav.bsp = Some(bsp);

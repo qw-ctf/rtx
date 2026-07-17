@@ -21,11 +21,6 @@ use super::{CellId, LinkCosts, LinkKind, NavGraph, CLOSED_GATE_PENALTY};
 /// blocks. Bigger blocks mean fewer, coarser clusters (cheaper abstract graph, blunter estimates).
 const LOD_SHIFT: i32 = 3;
 
-/// The near field the coarse query answers *exactly* (via a bounded fine flood) before falling back to
-/// the abstract graph — travel seconds. Comfortably wider than any single cluster's internal traverse,
-/// so cluster-local goals and the immediate steer window never pay for approximation.
-const COARSE_FINE_CAP: f32 = 3.0;
-
 /// A min-heap entry with a NaN-free f32 key (mirrors `query::MinCost`): `BinaryHeap` is a max-heap, so
 /// `Ord` reverses the key and the smallest pops first. `id` is a cell or an abstract-portal index.
 struct MinNode {
@@ -171,14 +166,32 @@ impl NavGraph {
         }
         let (cluster_of, cluster_count) = self.cluster_cells();
 
-        // A cell is a portal iff it is an endpoint of a link crossing a cluster boundary. Assign
-        // abstract-node indices in cell order (deterministic).
-        let mut is_portal = vec![false; n];
-        for link in &self.links {
-            if cluster_of[link.from as usize] != cluster_of[link.to as usize] {
-                is_portal[link.from as usize] = true;
-                is_portal[link.to as usize] = true;
+        // Collapse each directed cluster pair's border to a single representative crossing — the
+        // cheapest link between those clusters (lowest index on a tie, so the build is deterministic).
+        // Without this a wide border becomes dozens of parallel portals and the intra-cluster all-pairs
+        // transit explodes to a graph larger than the fine one; one portal per neighbour keeps it small.
+        let mut rep: HashMap<(u32, u32), u32> = HashMap::new();
+        for li in 0..self.links.len() as u32 {
+            let link = self.links[li as usize];
+            let key = (cluster_of[link.from as usize], cluster_of[link.to as usize]);
+            if key.0 == key.1 {
+                continue;
             }
+            match rep.get(&key) {
+                Some(&best) if self.links[best as usize].cost <= link.cost => {}
+                _ => {
+                    rep.insert(key, li);
+                }
+            }
+        }
+
+        // Portal cells: the endpoints of the representative crossings, assigned abstract-node indices
+        // in cell order (deterministic).
+        let mut is_portal = vec![false; n];
+        for &li in rep.values() {
+            let link = self.links[li as usize];
+            is_portal[link.from as usize] = true;
+            is_portal[link.to as usize] = true;
         }
         let mut portal_of_cell = vec![-1i32; n];
         let mut portals = Vec::new();
@@ -190,10 +203,11 @@ impl NavGraph {
         }
         let mut abs_adj: Vec<Vec<AbsEdge>> = (0..portals.len()).map(|_| Vec::new()).collect();
 
-        // Crossing edges: one per cross-cluster link, at its own cost + metadata.
+        // Crossing edges: one per representative, built in link order (deterministic).
         for li in 0..self.links.len() as u32 {
             let link = self.links[li as usize];
-            if cluster_of[link.from as usize] == cluster_of[link.to as usize] {
+            let key = (cluster_of[link.from as usize], cluster_of[link.to as usize]);
+            if key.0 == key.1 || rep.get(&key) != Some(&li) {
                 continue;
             }
             let (gates, rj, chained) = link_meta(self, li);
@@ -288,6 +302,20 @@ impl NavGraph {
         self.lod.as_ref().map_or(0, |l| l.cluster_count as usize)
     }
 
+    /// `(clusters, portal nodes, abstract edges, cell-reach entries)` — for the build summary log, to
+    /// watch the abstract graph's size against the fine graph's.
+    pub fn lod_stats(&self) -> (usize, usize, usize, usize) {
+        match &self.lod {
+            Some(l) => (
+                l.cluster_count as usize,
+                l.portals.len(),
+                l.abs_adj.iter().map(Vec::len).sum(),
+                l.cell_reach.iter().map(Vec::len).sum(),
+            ),
+            None => (0, 0, 0, 0),
+        }
+    }
+
     /// Iterate `(cell, cluster_id)` for every cell — for the navview overlay. Empty when unbuilt.
     pub fn cluster_assignment(&self) -> impl Iterator<Item = (CellId, u32)> + '_ {
         self.lod
@@ -304,22 +332,14 @@ impl NavGraph {
     /// an exact full flood on a bare graph (no LOD tables).
     pub fn coarse_costs<'a>(&'a self, from: CellId, costs: &'a LinkCosts, sever_chained: bool) -> CoarseCosts<'a> {
         let Some(lod) = self.lod.as_ref() else {
-            let fine = self.costs_from(from, costs);
-            return CoarseCosts {
-                graph: self,
-                costs,
-                sever_chained,
-                fine,
-                cap: f32::INFINITY,
-                abs_cost: Vec::new(),
-                home: HashMap::new(),
-            };
+            // No hierarchy (bare test graph): an exact full flood, read directly.
+            let full = Some(self.costs_from(from, costs));
+            return CoarseCosts { graph: self, costs, sever_chained, full, home: HashMap::new(), abs_cost: Vec::new() };
         };
-        // Near field: exact fine flood out to the cap.
-        let (fine, _) = self.costs_from_within(from, costs, COARSE_FINE_CAP);
-        // The whole home cluster, priced exactly by an in-cluster flood — complete regardless of the
-        // fine cap, so a home cell past the cap (a wide cluster) is still answered exactly, and every
-        // home portal seeds the abstract search.
+        // Exact home cluster, priced by an in-cluster flood; its cells answer `cost_to` directly and
+        // its portals seed the abstract search. There is deliberately no separate near-field flood —
+        // running one per `coarse_costs` call (up to nine a pick) was the very cost the hierarchy
+        // exists to avoid. The abstract graph answers everything past the home cluster.
         let home = self.home_flood(from, lod.cluster_of[from as usize], lod, costs, sever_chained);
         let mut abs_cost = vec![f32::INFINITY; lod.portals.len()];
         let mut heap = BinaryHeap::new();
@@ -343,7 +363,7 @@ impl NavGraph {
                 }
             }
         }
-        CoarseCosts { graph: self, costs, sever_chained, fine, cap: COARSE_FINE_CAP, abs_cost, home }
+        CoarseCosts { graph: self, costs, sever_chained, full: None, home, abs_cost }
     }
 
     /// Priced Dijkstra from `from` restricted to cluster `cl`, returning the exact priced cost to every
@@ -401,36 +421,35 @@ impl NavGraph {
     }
 }
 
-/// The result of [`NavGraph::coarse_costs`]: exact fine costs near `from`, an abstract-graph estimate
-/// beyond. Borrows the graph and the pricing so [`cost_to`](Self::cost_to) can finish the last coarse
-/// hop into the target's cluster.
+/// The result of [`NavGraph::coarse_costs`]: exact costs in the home cluster, an abstract-graph
+/// estimate beyond. Borrows the graph and the pricing so [`cost_to`](Self::cost_to) can finish the
+/// last coarse hop into the target's cluster.
 pub struct CoarseCosts<'a> {
     graph: &'a NavGraph,
     costs: &'a LinkCosts<'a>,
     sever_chained: bool,
-    fine: Vec<f32>,
-    cap: f32,
-    abs_cost: Vec<f32>,
-    /// Exact priced costs to every cell of the home cluster — answers home cells past the fine cap.
+    /// Present only for a bare graph (no LOD): the exact full flood, read directly for every cell.
+    full: Option<Vec<f32>>,
+    /// Exact priced costs to every cell of the home cluster.
     home: HashMap<CellId, f32>,
+    abs_cost: Vec<f32>,
 }
 
 impl CoarseCosts<'_> {
-    /// Coarse travel cost from the source to `cell`: exact when the fine flood settled it (`≤ cap`) or
-    /// it is in the home cluster, otherwise the cheapest way into its cluster through the abstract
-    /// graph plus the in-cluster hop to it. `INFINITY` if unreachable. A bounded overestimate beyond
-    /// the near field — never an underestimate, so goal scoring can trust it not to call an item closer
-    /// than it is.
+    /// Coarse travel cost from the source to `cell`: exact when `cell` is in the home cluster,
+    /// otherwise the cheapest way into its cluster through the abstract graph plus the in-cluster hop
+    /// to it. `INFINITY` if unreachable. A bounded overestimate beyond the home cluster — never an
+    /// underestimate, so goal scoring can trust it not to call an item closer than it is.
     pub fn cost_to(&self, cell: CellId) -> f32 {
-        if self.fine[cell as usize] <= self.cap {
-            return self.fine[cell as usize];
+        if let Some(full) = &self.full {
+            return full[cell as usize]; // bare graph: exact full flood
+        }
+        if let Some(&d) = self.home.get(&cell) {
+            return d; // home cluster: exact
         }
         let Some(lod) = self.graph.lod.as_ref() else {
-            return self.fine[cell as usize]; // bare graph: `fine` is the full flood
+            return f32::INFINITY;
         };
-        if let Some(&d) = self.home.get(&cell) {
-            return d; // a home-cluster cell past the cap — exact from the home flood
-        }
         let mut best = f32::INFINITY;
         for r in &lod.cell_reach[cell as usize] {
             let via = self.abs_cost[r.portal as usize];

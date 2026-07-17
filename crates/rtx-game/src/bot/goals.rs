@@ -249,6 +249,23 @@ struct ItemCandidate {
     one_score: f32,
 }
 
+/// Travel costs for goal scoring: either the exact whole-graph flood or the LOD coarse estimate. Both
+/// answer `cost_to(cell)`, so `best_item_plan`'s scoring is written once; `rtx_bot_lod` picks which
+/// `best_item_plan` builds. An unreachable cell reads `INFINITY` from either.
+enum PlanCosts<'a> {
+    Exact(Vec<f32>),
+    Coarse(crate::navmesh::CoarseCosts<'a>),
+}
+impl PlanCosts<'_> {
+    #[inline]
+    fn cost_to(&self, cell: CellId) -> f32 {
+        match self {
+            PlanCosts::Exact(v) => v[cell as usize],
+            PlanCosts::Coarse(c) => c.cost_to(cell),
+        }
+    }
+}
+
 /// Classify a pickup by its classname (the enviro suit and anything unlisted return `None`, so
 /// bots ignore them).
 fn category(classname: &str) -> Option<Category> {
@@ -1357,39 +1374,60 @@ impl GameState {
                 (None, None)
             }
         };
-        // The base flood (from us) and the enemy-contest flood (from them) are independent pure
-        // functions of `(graph, source, costs)`, so fan them out across the worker pool; the ordered
-        // return keeps this bit-identical to running them serially (`rtx_bot_par 0`).
+        // Base costs (travel from us) and enemy-contest costs (travel from them). With `rtx_bot_lod`
+        // these are coarse LOD estimates — near-exact and cheap; otherwise the exact whole-graph floods,
+        // still fanned out across the worker pool (bit-identical to serial). Scoring below reads either
+        // through `PlanCosts::cost_to`. Both floods use jitter 0, so item scoring stays stable.
+        let lod = self.host().cvar_bool(c"rtx_bot_lod");
         let their_costs = enemy_theirs.as_ref().map(|t| t.costs(0));
-        let (normal, enemy_flood) = self.bot_pool.join(
-            || graph.costs_from(bot_cell, &base),
-            || match (&enemy_prep, &their_costs) {
-                (Some((_, cell, _)), Some(tc)) => Some(graph.costs_from(*cell, tc)),
+        let (base_costs, enemy_context) = if lod {
+            let enemy_c = match (enemy_prep, &their_costs) {
+                (Some((stats, cell, weaker)), Some(tc)) => {
+                    Some((stats, PlanCosts::Coarse(graph.coarse_costs(cell, tc, true)), weaker))
+                }
                 _ => None,
-            },
-        );
-        let enemy_context = match (enemy_prep, enemy_flood) {
-            (Some((stats, _, weaker)), Some(costs)) => Some((stats, costs, weaker)),
-            _ => None,
+            };
+            (PlanCosts::Coarse(graph.coarse_costs(bot_cell, &base, true)), enemy_c)
+        } else {
+            let (normal, enemy_flood) = self.bot_pool.join(
+                || graph.costs_from(bot_cell, &base),
+                || match (&enemy_prep, &their_costs) {
+                    (Some((_, cell, _)), Some(tc)) => Some(graph.costs_from(*cell, tc)),
+                    _ => None,
+                },
+            );
+            let enemy_c = match (enemy_prep, enemy_flood) {
+                (Some((stats, _, weaker)), Some(f)) => Some((stats, PlanCosts::Exact(f), weaker)),
+                _ => None,
+            };
+            (PlanCosts::Exact(normal), enemy_c)
         };
         // Valuation prices a shut door the bot can *open* as the button-detour errand it is, not the
         // full route-around wall — otherwise a prize reachable only through a gate (the ultrav quad
-        // behind its teleporter door) floods to ~100k and is never a *choosable* goal, so no bot ever
+        // behind its teleporter door) costs ~100k and is never a *choosable* goal, so no bot ever
         // heads there to work the button, and it sits untaken until the door happens to open for some
-        // other reason. A gate is openable-from-here when its button floods below the route-around
+        // other reason. A gate is openable-from-here when its button costs below the route-around
         // penalty in the plain costs (i.e. its button is reachable without crossing a shut gate); a
-        // sealed one (button on the far side) keeps the full price. Only re-flood when a gate is shut —
+        // sealed one (button on the far side) keeps the full price. Only re-cost when a gate is shut —
         // most frames there is none, and *path* planning (`run_bot`) still pays the full penalty.
         let openable: Vec<bool> = base
             .gate_closed
             .iter()
             .enumerate()
-            .map(|(gi, &shut)| shut && normal[graph.gate(gi).button_cell as usize] < CLOSED_GATE_PENALTY)
+            .map(|(gi, &shut)| shut && base_costs.cost_to(graph.gate(gi).button_cell) < CLOSED_GATE_PENALTY)
             .collect();
         let mut vcosts = base;
         vcosts.openable_gates = &openable;
         vcosts.open_gate_cost = GATE_OPEN_COST;
-        let costs = if openable.iter().any(|&o| o) { graph.costs_from(bot_cell, &vcosts) } else { normal };
+        let costs = if openable.iter().any(|&o| o) {
+            if lod {
+                PlanCosts::Coarse(graph.coarse_costs(bot_cell, &vcosts, true))
+            } else {
+                PlanCosts::Exact(graph.costs_from(bot_cell, &vcosts))
+            }
+        } else {
+            base_costs
+        };
         // The item we're already chasing, for the hysteresis bonus below.
         let current_goal = self.entities[bot_e].bot.goal.item;
         // Item claims (teamwork): an item a living teammate bot is already fetching is discounted, so
@@ -1450,7 +1488,7 @@ impl GameState {
             // Desire including any denial floor (weapon the enemy lacks, or mega/RA). Priced through the
             // shared helper so `item_goal_valid` agrees the goal is still worth holding.
             let desire = self.desire_with_floors(bot_e, &s, item, cat, deny, now);
-            let travel = costs[cell as usize];
+            let travel = costs.cost_to(cell);
             if !travel.is_finite() {
                 continue; // unreachable from here
             }
@@ -1461,7 +1499,7 @@ impl GameState {
                 continue; // it cannot be collected before the structured match ends
             }
             let enemy_eta = enemy_context.as_ref().and_then(|(_, enemy_costs, _)| {
-                let eta = enemy_costs[cell as usize];
+                let eta = enemy_costs.cost_to(cell);
                 eta.is_finite()
                     .then(|| self.item_collect_time(item, eta, now))
                     .flatten()
@@ -1504,14 +1542,14 @@ impl GameState {
             let Some(cell) = graph.nearest(ent.v.origin) else {
                 continue;
             };
-            let travel = costs[cell as usize];
+            let travel = costs.cost_to(cell);
             if !travel.is_finite()
                 || (self.team_match.live_until > now && now + travel >= self.team_match.live_until)
             {
                 continue;
             }
             let enemy_eta = enemy_context.as_ref().and_then(|(_, enemy_costs, _)| {
-                let eta = enemy_costs[cell as usize];
+                let eta = enemy_costs.cost_to(cell);
                 eta.is_finite().then_some(eta)
             });
             if teamwork && !enemy_eta.is_some_and(|eta| eta <= travel + 1.5) {
@@ -1539,7 +1577,7 @@ impl GameState {
             let Some(cell) = graph.nearest(ent.v.origin) else {
                 continue;
             };
-            let travel = costs[cell as usize];
+            let travel = costs.cost_to(cell);
             if !travel.is_finite() {
                 continue;
             }
@@ -1555,22 +1593,27 @@ impl GameState {
                 .total_cmp(&a.one_score)
                 .then_with(|| a.item.0.cmp(&b.item.0))
         });
-        // The up-to-six continuation floods (one per primary) are mutually independent, and all use
-        // the same pricing the base flood did (`base` == `pricing.costs(0)`, still valid — `LinkCosts`
-        // is `Copy`), so fan them out in one ordered batch. `leg_floods[pi]` is primary `pi`'s flood.
+        // The up-to-six continuation costs (one per primary), all under the same pricing the base costs
+        // used (`base` == `pricing.costs(0)`, still valid — `LinkCosts` is `Copy`). Coarse: a cheap
+        // abstract Dijkstra each. Exact: the mutually-independent floods, fanned out in one ordered
+        // batch across the worker pool. `leg_costs[pi]` is primary `pi`'s costs.
         let primaries: Vec<ItemCandidate> =
             candidates.iter().filter(|c| c.one_score > 0.0).take(PLAN_PRIMARY_LIMIT).copied().collect();
-        let source_cells: Vec<CellId> = primaries.iter().map(|c| c.cell).collect();
-        let leg_floods = self.bot_pool.flood_batch(graph, &source_cells, &base);
+        let leg_costs: Vec<PlanCosts> = if lod {
+            primaries.iter().map(|c| PlanCosts::Coarse(graph.coarse_costs(c.cell, &base, true))).collect()
+        } else {
+            let source_cells: Vec<CellId> = primaries.iter().map(|c| c.cell).collect();
+            self.bot_pool.flood_batch(graph, &source_cells, &base).into_iter().map(PlanCosts::Exact).collect()
+        };
         let mut best: Option<(ItemCandidate, Option<ItemCandidate>, f32)> = None;
         for (pi, &first) in primaries.iter().enumerate() {
-            let from_first = &leg_floods[pi];
+            let from_first = &leg_costs[pi];
             let mut best_second: Option<(ItemCandidate, f32)> = None;
             for &second in &candidates {
                 if second.item == first.item {
                     continue;
                 }
-                let leg = from_first[second.cell as usize];
+                let leg = from_first.cost_to(second.cell);
                 if !leg.is_finite() {
                     continue;
                 }
