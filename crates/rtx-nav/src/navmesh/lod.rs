@@ -456,24 +456,28 @@ impl NavGraph {
         CoarseCosts { graph: self, costs, sever_chained, full: None, home, abs_cost }
     }
 
-    /// An interim steer target on the coarse corridor toward a far `goal`: the first portal cell whose
-    /// coarse cost from `from` reaches `horizon` along the abstract shortest path. Steering the fine
-    /// banded A* at this nearer portal instead of the far goal bounds the search to a `horizon`-sized
-    /// neighbourhood (A* explores less the nearer its target); the next repath advances the interim as
-    /// the bot moves. `None` when the goal is within `horizon` (steer it directly) or unreachable, or
-    /// on a bare graph. `sever_chained` is `false` here — a corridor may lead through a chained speed
-    /// jump the fine window then gates for feasibility.
-    pub fn corridor_interim(&self, from: CellId, goal: CellId, costs: &LinkCosts, horizon: f32) -> Option<CellId> {
+    /// The coarse corridor toward a far `goal`: an interim steer target plus the cluster window the fine
+    /// search may stay inside and the gates the corridor crosses. The interim is the first portal at/past
+    /// `horizon` along the abstract shortest path; steering the fine banded A* at it (restricted to the
+    /// window) instead of the far goal bounds the search to a local neighbourhood — the abstract path is
+    /// a real fine path through the window clusters, so a route always exists there. The next repath
+    /// advances it as the bot moves. `None` when the goal is within `horizon` (steer it directly) or
+    /// unreachable, or on a bare graph. `sever_chained` is `false` — a corridor may lead through a
+    /// chained speed jump the fine window then gates for feasibility.
+    pub fn corridor(&self, from: CellId, goal: CellId, costs: &LinkCosts, horizon: f32) -> Option<Corridor> {
         let lod = self.lod.as_ref()?;
-        let (from_cl, goal_cl) = (lod.cluster_of[from as usize], lod.cluster_of[goal as usize]);
-        if from_cl == goal_cl {
+        let from_cl = lod.cluster_of[from as usize];
+        if from_cl == lod.cluster_of[goal as usize] {
             return None; // same cluster — the goal is near, steer straight at it
         }
-        // Abstract Dijkstra from the home portals, tracking the predecessor of each portal.
+        // Abstract Dijkstra from the home portals, tracking each portal's predecessor and the gate bits
+        // accumulated along its min-cost path (home-cluster gates aren't tracked — they sit on the fine
+        // route, so `route_blocking_gate` still catches them; the abstract edges carry the far ones).
         let home = self.home_flood(from, from_cl, lod, costs, false);
         let np = lod.portals.len();
         let mut abs_cost = vec![f32::INFINITY; np];
         let mut parent = vec![u32::MAX; np];
+        let mut pgate = vec![0u32; np];
         let mut heap = BinaryHeap::new();
         for (&cell, &seed) in &home {
             let p = lod.portal_of_cell[cell as usize];
@@ -491,6 +495,7 @@ impl NavGraph {
                 if ng < abs_cost[e.to as usize] {
                     abs_cost[e.to as usize] = ng;
                     parent[e.to as usize] = p;
+                    pgate[e.to as usize] = pgate[p as usize] | e.gates;
                     heap.push(MinNode { key: ng, id: e.to });
                 }
             }
@@ -510,20 +515,25 @@ impl NavGraph {
         if goal_cost <= horizon {
             return None;
         }
-        // Walk the abstract path from the home side to the goal portal; the interim is the first portal
-        // at or past `horizon`.
+        // Walk the abstract path home→goal, flagging every cluster it passes through (the fine search's
+        // window) and stopping the interim at the first portal at/past the horizon.
         let mut chain = Vec::new();
         let mut p = goal_portal;
         while p != u32::MAX {
             chain.push(p);
             p = parent[p as usize];
         }
+        let mut allowed = vec![false; lod.cluster_count as usize];
+        allowed[from_cl as usize] = true;
+        let mut interim = goal_portal;
         for &p in chain.iter().rev() {
+            allowed[lod.portals[p as usize].cluster as usize] = true;
             if abs_cost[p as usize] >= horizon {
-                return Some(lod.portals[p as usize].cell);
+                interim = p;
+                break;
             }
         }
-        Some(lod.portals[goal_portal as usize].cell)
+        Some(Corridor { interim: lod.portals[interim as usize].cell, allowed, crossed_gates: pgate[goal_portal as usize] })
     }
 
     /// Priced Dijkstra from `from` restricted to cluster `cl`, returning the exact priced cost to every
@@ -587,6 +597,18 @@ impl NavGraph {
         }
         extra
     }
+}
+
+/// The result of [`NavGraph::corridor`]: where to steer next toward a far goal, and the bound.
+pub struct Corridor {
+    /// The interim steer target — the first corridor portal cell at/past the horizon.
+    pub interim: CellId,
+    /// Clusters the fine search may enter (home + the corridor up to the interim), indexed by cluster
+    /// id. A route to the interim exists inside this window, so the restricted search always succeeds.
+    pub allowed: Vec<bool>,
+    /// Gate-id bits the corridor crosses reaching the true goal — for the far button-errand pre-arm
+    /// (near/home gates already sit on the fine route, caught by `route_blocking_gate`).
+    pub crossed_gates: u32,
 }
 
 /// The result of [`NavGraph::coarse_costs`]: exact costs in the home cluster, an abstract-graph

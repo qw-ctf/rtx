@@ -39,7 +39,7 @@ pub use physics::{
     attainable_speed, band_of, bhop_k, prestrafe_delivered_from, BAND_EDGES, BAND_FLOOR, BAND_V_MAX, BHOP_EFF,
     CURL_V_HOLD_TOL, DOUBLE_ARC_PEAK, JUMP_APEX, MAX_SPEED, NBANDS,
 };
-pub use lod::CoarseCosts;
+pub use lod::{CoarseCosts, Corridor};
 use lod::Lod;
 use physics::*;
 use reach::Reach;
@@ -3042,10 +3042,10 @@ mod tests {
         }
     }
 
-    /// The LOD steer corridor plants its interim target short of a far goal (bounding the fine search)
-    /// but steers a near goal directly.
+    /// The LOD steer corridor plants its interim short of a far goal (bounding the fine search) but
+    /// steers a near goal directly; its window contains a route the restricted search actually finds.
     #[test]
-    fn corridor_interim_bounds_a_far_goal() {
+    fn corridor_bounds_a_far_goal() {
         let cell = |gx: i32| Cell { origin: Vec3::new(gx as f32 * 32.0, 0.0, 0.0), gx, gy: 0 };
         let cells: Vec<Cell> = (0..25).map(|i| cell(i)).collect();
         let mut links = Vec::new();
@@ -3057,13 +3057,26 @@ mod tests {
         g.build_lod();
         let costs = LinkCosts::default();
 
-        // Far goal (cell 24): the interim is a portal short of it, at/past the horizon.
-        let interim = g.corridor_interim(0, 24, &costs, 4.0).expect("a far goal has an interim");
-        assert!(interim < 24, "interim {interim} should fall short of the far goal");
-        assert!(g.coarse_costs(0, &costs, false).cost_to(interim) >= 4.0, "interim should be at/past the horizon");
-        // Same-cluster goal, and a goal within the horizon: steer directly (no interim).
-        assert_eq!(g.corridor_interim(0, 5, &costs, 4.0), None, "a same-cluster goal steers directly");
-        assert_eq!(g.corridor_interim(0, 10, &costs, 100.0), None, "a goal within the horizon steers directly");
+        // Far goal (cell 24): the interim is short of it, at/past the horizon, in the window.
+        let c = g.corridor(0, 24, &costs, 4.0).expect("a far goal has a corridor");
+        assert!(c.interim < 24, "interim {} should fall short of the far goal", c.interim);
+        assert!(g.coarse_costs(0, &costs, false).cost_to(c.interim) >= 4.0, "interim at/past the horizon");
+        assert!(c.allowed[g.cluster_of(0).unwrap() as usize], "the home cluster is in the window");
+        assert!(c.allowed[g.cluster_of(c.interim).unwrap() as usize], "the interim's cluster is in the window");
+        // The restricted search finds a route to the interim (the corridor is a real in-window path)…
+        assert!(
+            !g.find_path_within(0, c.interim, &costs, &c.allowed).unwrap_or_default().is_empty(),
+            "restricted search must find the corridor route"
+        );
+        // …and it truly bounds: a cell outside the window is unreachable to the restricted search.
+        let outside = (0..g.cluster_count() as u32).find(|&cl| !c.allowed[cl as usize]);
+        if let Some(cl) = outside {
+            let far = (0..25u32).find(|&x| g.cluster_of(x) == Some(cl)).unwrap();
+            assert!(g.find_path_within(0, far, &costs, &c.allowed).is_none(), "window must exclude cell {far}");
+        }
+        // Same-cluster goal, and a goal within the horizon: steer directly (no corridor).
+        assert!(g.corridor(0, 5, &costs, 4.0).is_none(), "a same-cluster goal steers directly");
+        assert!(g.corridor(0, 10, &costs, 100.0).is_none(), "a goal within the horizon steers directly");
     }
 
     /// The graph-swap liquid patch folds the water tax (bot-independent) and hazard hp (priced per bot)

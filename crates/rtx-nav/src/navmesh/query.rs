@@ -77,6 +77,27 @@ impl NavGraph {
     /// so the route bends around closed doors when it can and only crosses one (leaving the bot to
     /// open it) when there's no other way. Pass [`LinkCosts::gated`] (or `default`) for gates-only.
     pub fn find_path(&self, start: CellId, goal: CellId, costs: &LinkCosts) -> Option<Vec<u32>> {
+        self.find_path_filtered(start, goal, costs, None)
+    }
+
+    /// [`find_path`](Self::find_path) restricted to a cluster window: expansion rejects any cell whose
+    /// LOD cluster isn't flagged in `allowed` (indexed by cluster id). Steer bounds a far-goal route to
+    /// the coarse corridor's clusters with this, so the search stays a local neighbourhood.
+    pub fn find_path_within(&self, start: CellId, goal: CellId, costs: &LinkCosts, allowed: &[bool]) -> Option<Vec<u32>> {
+        self.find_path_filtered(start, goal, costs, Some(allowed))
+    }
+
+    /// Whether `cell` may be expanded under an optional cluster window (`None` ⇒ unrestricted; a cell
+    /// with no LOD cluster, or a cluster past the slice, defaults to allowed).
+    #[inline]
+    fn in_window(&self, cell: CellId, allowed: Option<&[bool]>) -> bool {
+        match allowed {
+            None => true,
+            Some(a) => self.cluster_of(cell).is_none_or(|cl| a.get(cl as usize).copied().unwrap_or(true)),
+        }
+    }
+
+    fn find_path_filtered(&self, start: CellId, goal: CellId, costs: &LinkCosts, allowed: Option<&[bool]>) -> Option<Vec<u32>> {
         use std::collections::BinaryHeap;
 
         if start == goal {
@@ -101,6 +122,9 @@ impl NavGraph {
             }
             for &li in &self.adjacency[cell as usize] {
                 let link = self.links[li as usize];
+                if !self.in_window(link.to, allowed) {
+                    continue;
+                }
                 let ng = g_cost[cell as usize] + link.cost + self.link_extra(li, costs) + self.chained_block(li);
                 if ng < g_cost[link.to as usize] {
                     g_cost[link.to as usize] = ng;
@@ -135,6 +159,31 @@ impl NavGraph {
         start_speed: f32,
         costs: &LinkCosts,
     ) -> Option<BandedRoute> {
+        self.find_path_banded_filtered(start, goal, start_speed, costs, None)
+    }
+
+    /// [`find_path_banded`](Self::find_path_banded) restricted to a cluster window (see
+    /// [`find_path_within`](Self::find_path_within)) — the bounded search steer runs to a corridor
+    /// interim, so band-infeasible exhaustion stays inside the window instead of draining the whole map.
+    pub fn find_path_banded_within(
+        &self,
+        start: CellId,
+        goal: CellId,
+        start_speed: f32,
+        costs: &LinkCosts,
+        allowed: &[bool],
+    ) -> Option<BandedRoute> {
+        self.find_path_banded_filtered(start, goal, start_speed, costs, Some(allowed))
+    }
+
+    fn find_path_banded_filtered(
+        &self,
+        start: CellId,
+        goal: CellId,
+        start_speed: f32,
+        costs: &LinkCosts,
+        allowed: Option<&[bool]>,
+    ) -> Option<BandedRoute> {
         use std::collections::BinaryHeap;
 
         if start == goal {
@@ -167,6 +216,9 @@ impl NavGraph {
             let in_link = came_link[state as usize];
             let in_dir = (in_link != u32::MAX).then(|| self.link_dir(in_link));
             for &li in &self.adjacency[cell as usize] {
+                if !self.in_window(self.links[li as usize].to, allowed) {
+                    continue;
+                }
                 // Carried speed only counts if the corridor continues within the cone.
                 let entry = match in_dir {
                     Some(d) if d.length_squared() > 0.01 => {
