@@ -2052,6 +2052,10 @@ mod tests {
                 mix(&mut h, t.airtime.to_bits() as u64);
                 mix(&mut h, t.self_damage.to_bits() as u64);
             }
+            // Reachability (SCC + closure) and the LOD tables (clusters, portals, edges, reach) —
+            // a nondeterministic cluster/portal build would otherwise slip past the fingerprint.
+            mix(&mut h, g.reach_fingerprint());
+            mix(&mut h, g.lod_fingerprint());
             h
         }
 

@@ -10,8 +10,11 @@
 //! same slot and lifetime as [`super::reach`]. `lod: Option<Lod>` on `NavGraph`; `None` on a bare
 //! (unbuilt) graph, where the public accessors fall back conservatively.
 //!
-//! This module is grown in steps: clustering first, the abstract portal graph and the coarse-cost
-//! query on top of it.
+//! Clustering (`cluster_cells`) groups cells; the abstract graph (`build_lod_tables` + a coverage
+//! pass) keeps one representative crossing per cluster pair plus any landing a rep misses; queries
+//! layer on top — [`coarse_costs`](NavGraph::coarse_costs) for scoring, [`corridor`](NavGraph::corridor)
+//! for the bounded steer window. Liquid link costs are folded in at the graph-swap
+//! ([`patch_lod_liquids`](NavGraph::patch_lod_liquids)) since they don't exist on the worker build.
 
 use std::collections::{BinaryHeap, HashMap};
 
@@ -434,6 +437,47 @@ impl NavGraph {
             .flat_map(|l| l.cluster_of.iter().enumerate().map(|(c, &id)| (c as CellId, id)))
     }
 
+    /// A stable FNV-1a hash of the LOD tables (clusters, portals, edges, reach), for the
+    /// build-determinism fingerprint test — a nondeterministic cluster/portal build would be caught.
+    #[cfg(test)]
+    pub(super) fn lod_fingerprint(&self) -> u64 {
+        fn mix(h: &mut u64, v: u64) {
+            *h ^= v;
+            *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        match &self.lod {
+            None => mix(&mut h, 0),
+            Some(l) => {
+                mix(&mut h, l.cluster_count as u64);
+                for &c in &l.cluster_of {
+                    mix(&mut h, c as u64);
+                }
+                for p in &l.portals {
+                    mix(&mut h, p.cell as u64);
+                    mix(&mut h, p.cluster as u64);
+                }
+                for edges in &l.abs_adj {
+                    mix(&mut h, edges.len() as u64);
+                    for e in edges {
+                        mix(&mut h, e.to as u64);
+                        mix(&mut h, e.base.to_bits() as u64);
+                        mix(&mut h, e.gates as u64);
+                        mix(&mut h, e.link as u64);
+                    }
+                }
+                for reach in &l.cell_reach {
+                    mix(&mut h, reach.len() as u64);
+                    for r in reach {
+                        mix(&mut h, r.portal as u64);
+                        mix(&mut h, r.dist.to_bits() as u64);
+                    }
+                }
+            }
+        }
+        h
+    }
+
     /// Coarse travel costs from `from` under `costs`: exact within [`COARSE_FINE_CAP`] via a bounded
     /// fine flood, and an abstract-graph estimate (a bounded overestimate) beyond it. `sever_chained`
     /// mirrors `chained_block` — `true` for goal scoring (a chained speed jump is impassable to a
@@ -446,8 +490,9 @@ impl NavGraph {
             let full = Some(self.costs_from(from, costs));
             return CoarseCosts { graph: self, costs, sever_chained, full, home: HashMap::new(), abs_cost: Vec::new() };
         };
-        // Exact home cluster, priced by an in-cluster flood; its cells answer `cost_to` directly and
-        // its portals seed the abstract search. There is deliberately no separate near-field flood —
+        // Home cluster, priced by an in-cluster flood (exact for cells the shortest path reaches
+        // without leaving the cluster; overestimate-safe for the rest); its cells answer `cost_to`
+        // directly and its portals seed the abstract search. There is deliberately no near-field flood —
         // running one per `coarse_costs` call (up to nine a pick) was the very cost the hierarchy
         // exists to avoid. The abstract graph answers everything past the home cluster.
         let home = self.home_flood(from, lod.cluster_of[from as usize], lod, costs, sever_chained);
@@ -650,10 +695,13 @@ pub struct CoarseCosts<'a> {
 }
 
 impl CoarseCosts<'_> {
-    /// Coarse travel cost from the source to `cell`: exact when `cell` is in the home cluster,
-    /// otherwise the cheapest way into its cluster through the abstract graph plus the in-cluster hop
-    /// to it. `INFINITY` if unreachable. A bounded overestimate beyond the home cluster — never an
-    /// underestimate, so goal scoring can trust it not to call an item closer than it is.
+    /// Coarse travel cost from the source to `cell`: home-cluster cells come from the in-cluster flood
+    /// (overestimate-safe — a cell whose true shortest path leaves and re-enters the home cluster is
+    /// priced high, not exact), everything else is the cheapest way into its cluster through the
+    /// abstract graph plus the in-cluster hop. `INFINITY` if unreachable (the coverage pass in
+    /// `build_lod` guarantees reachable ⟺ finite). A bounded overestimate — never an underestimate (an
+    /// abstract path is a real path; ≥31-gate crossings are sealed shut, not dropped) — so goal scoring
+    /// can trust it not to call an item closer than it is.
     pub fn cost_to(&self, cell: CellId) -> f32 {
         if let Some(full) = &self.full {
             return full[cell as usize]; // bare graph: exact full flood

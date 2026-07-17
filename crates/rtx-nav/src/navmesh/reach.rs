@@ -170,4 +170,27 @@ impl NavGraph {
             None => (to as usize) < self.cells.len() && (from as usize) < self.cells.len(),
         }
     }
+
+    /// A stable FNV-1a hash of the reachability tables (SCC ids + closure bitset), for the
+    /// build-determinism fingerprint test.
+    #[cfg(test)]
+    pub(super) fn reach_fingerprint(&self) -> u64 {
+        fn mix(h: &mut u64, v: u64) {
+            *h ^= v;
+            *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        match &self.reach {
+            None => mix(&mut h, 0),
+            Some(r) => {
+                for &s in &r.scc {
+                    mix(&mut h, s as u64);
+                }
+                for &w in &r.closure {
+                    mix(&mut h, w);
+                }
+            }
+        }
+        h
+    }
 }
