@@ -1419,7 +1419,7 @@ impl GameState {
             .as_ref()
             .and_then(|g| g.nearest(self.entities[item].v.origin));
         let b = &mut self.entities[e].bot;
-        b.goal.item = item.0;
+        b.goal.set_item(item.0);
         if let Some(c) = cell {
             b.goal.item_cell = c;
         }

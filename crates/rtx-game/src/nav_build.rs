@@ -298,11 +298,14 @@ impl GameState {
             if i == 0 || !ent.in_use || !bot_goals::is_goal_classname(cn) {
                 continue;
             }
-            goals.extend(
-                collect_touch_terminals(cells(), ent)
-                    .into_iter()
-                    .map(|cell| (i as u32, cell)),
-            );
+            let terminals = collect_touch_terminals(cells(), ent);
+            if terminals.is_empty() {
+                eprintln!(
+                    "rtx: navmesh: no touch-valid terminal for {cn} edict {i} at {:?}",
+                    ent.v.origin
+                );
+            }
+            goals.extend(terminals.into_iter().map(|cell| (i as u32, cell)));
         }
         goals
     }

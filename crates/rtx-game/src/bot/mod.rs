@@ -105,8 +105,8 @@ pub(crate) const RJ_BALLISTIC_SLACK: f32 = 1.0;
 const ARRIVE_RADIUS: f32 = 24.0;
 
 /// Waypoint magnetism (see [`steer::magnet_on_corridor`]): the greatest lateral offset from the leg
-/// corridor at which an item is still worth bending the walk onto. ≈ the fake-client pickup box
-/// (`PICKUP_XY` 40) plus slack; small enough that a same-floor magnet always sits on walkable mesh.
+/// corridor at which an item is still worth bending the walk onto. Small enough that a same-floor
+/// magnet always sits on walkable mesh; the final take is still gated by exact hull overlap.
 const MAGNET_LATERAL: f32 = 48.0;
 
 /// Edge-safety (see the ledge brake / turn slowdown in [`steer`]). Below this speed a single frame
@@ -363,12 +363,6 @@ pub fn run_bots(game: &mut GameState) {
     }
 }
 
-/// Generous fixed pickup half-extents (the player hull ±16 plus the item trigger ±16, with a
-/// little slack). We use a fixed box rather than the item's engine-side `mins`/`maxs` because
-/// `set_size` may not sync those to our shadow `EntVars`, which would make the test a degenerate
-/// point and almost never fire.
-const PICKUP_XY: f32 = 40.0;
-const PICKUP_Z: f32 = 48.0;
 /// How long a just-collected goal item stays on the avoid ring, so the bot re-picks a fresh goal
 /// instead of re-fixating on a pickup that respawns (or lingers solid) the same second.
 const PICKUP_AVOID_TIME: f32 = 3.0;
@@ -409,7 +403,7 @@ fn bot_pickup_items(game: &mut GameState, e: EntId) {
         .iter()
         .enumerate()
         .filter_map(|(i, it)| {
-            (it.v.solid == Solid::Trigger && bot_pickup_touch(it.touch) && on_item(origin, it.v.origin))
+            (it.v.solid == Solid::Trigger && bot_pickup_touch(it.touch) && item_terminal_touches(origin, it))
                 .then_some(EntId(i as u32))
         })
         .collect();
@@ -435,11 +429,12 @@ fn bot_pickup_items(game: &mut GameState, e: EntId) {
                 let b = &mut game.entities[e].bot;
                 b.mark_avoid(item.0, now + PICKUP_AVOID_TIME);
                 if next_item != 0 {
-                    (b.goal.item, b.goal.item_cell, b.goal.commit) = (next_item, next_cell, next_commit);
+                    b.goal.set_item(next_item);
+                    (b.goal.item_cell, b.goal.commit) = (next_cell, next_commit);
                     b.goal.since = now;
                     b.goal.next_pick = now + GOAL_SELECT_INTERVAL;
                 } else {
-                    b.goal.item = 0;
+                    b.goal.set_item(0);
                     b.goal.commit = GoalCommit::None;
                     b.goal.next_pick = now;
                 }
@@ -447,12 +442,6 @@ fn bot_pickup_items(game: &mut GameState, e: EntId) {
             }
         }
     }
-}
-
-/// Whether a bot at `bot_origin` is close enough to an item at `item_origin` to collect it.
-pub(crate) fn on_item(bot_origin: Vec3, item_origin: Vec3) -> bool {
-    let d = item_origin - bot_origin;
-    d.x.abs() <= PICKUP_XY && d.y.abs() <= PICKUP_XY && d.z.abs() <= PICKUP_Z
 }
 
 /// What the bot is trying to do this frame — the output of [`resolve_objective`]. All-Copy so the
@@ -639,9 +628,9 @@ fn hard_mode_objective(intent: Option<BotIntent>) -> bool {
 }
 
 /// Whether a player standing at `player_origin` physically overlaps the server's linked pickup
-/// trigger. Unlike [`on_item`] (the deliberately generous fake-client compatibility predicate),
-/// this uses the real asymmetric player/item hulls and the engine's 15u horizontal item-link grow.
-/// It is therefore suitable for proving that a nav terminal itself can execute a real-client take.
+/// trigger. This uses the real asymmetric player/item hulls and the engine's 15u horizontal
+/// item-link grow, and is shared by terminal cataloging and fake-client pickup dispatch so every
+/// selectable endpoint can take in both execution modes.
 pub(crate) fn item_terminal_touches(player_origin: Vec3, item: &Entity) -> bool {
     const ITEM_LINK_GRAB: f32 = 15.0;
     let player_min = player_origin + VEC_HULL_MIN;
@@ -710,7 +699,7 @@ fn spawn_exit_should_abort(
 fn end_spawn_exit(b: &mut BotState, now: f32) {
     b.spawn_exit = false;
     b.spawn_exit_until = 0.0;
-    b.goal.item = 0;
+    b.goal.set_item(0);
     b.goal.next_item = 0;
     b.goal.commit = GoalCommit::None;
     b.goal.next_commit = GoalCommit::None;
@@ -753,7 +742,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // additionally sets `order_link`, which `steer` uses to pin the route to that one link.
     if let Some(order) = game.entities[e].bot.puppet.order {
         use crate::bot::state::ControlOrder;
-        game.entities[e].bot.goal.item = 0; // no item chase under a puppet order
+        game.entities[e].bot.goal.set_item(0); // no item chase under a puppet order
         game.entities[e].bot.goal.next_item = 0;
         game.entities[e].bot.goal.commit = GoalCommit::None;
         game.entities[e].bot.goal.next_commit = GoalCommit::None;
@@ -865,7 +854,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // audience). It supersedes an old item completion inherited from a previous Fight/idle frame.
     if hard_mode_objective(intent) {
         let b = &mut game.entities[e].bot;
-        b.goal.item = 0;
+        b.goal.set_item(0);
         b.goal.next_item = 0;
         b.goal.commit = GoalCommit::None;
         b.goal.next_commit = GoalCommit::None;
@@ -878,7 +867,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     let committed = game.entities[e].bot.goal.commit != GoalCommit::None;
     if committed && (committed_item == 0 || !game.item_goal_valid(e, EntId(committed_item), now)) {
         let b = &mut game.entities[e].bot;
-        b.goal.item = 0;
+        b.goal.set_item(0);
         b.goal.next_item = 0;
         b.goal.commit = GoalCommit::None;
         b.goal.next_commit = GoalCommit::None;
@@ -906,10 +895,10 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
                     let b = &mut game.entities[e].bot;
                     let preserve = (b.goal.commit == GoalCommit::Powerup && b.goal.item != 0)
                         .then_some((b.goal.item, b.goal.item_cell, GoalCommit::Powerup));
-                    if item.0 != b.goal.item {
+                    if b.goal.set_item(item.0) {
                         b.goal.since = now;
                     }
-                    (b.goal.item, b.goal.item_cell, b.goal.commit) = (item.0, cell, GoalCommit::Pickup);
+                    (b.goal.item_cell, b.goal.commit) = (cell, GoalCommit::Pickup);
                     (b.goal.next_item, b.goal.next_cell, b.goal.next_commit) =
                         preserve.unwrap_or((0, 0, GoalCommit::None));
                     b.goal.next_pick = now + GOAL_SELECT_INTERVAL;
@@ -940,8 +929,8 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         b.goal.next_urgent = now + 0.2;
         if let Some((item, cell)) = pick {
             b.goal.since = now;
-            (b.goal.item, b.goal.item_cell, b.goal.commit) =
-                (item.0, cell, GoalCommit::Pickup);
+            b.goal.set_item(item.0);
+            (b.goal.item_cell, b.goal.commit) = (cell, GoalCommit::Pickup);
             (b.goal.next_item, b.goal.next_cell, b.goal.next_commit) =
                 (powerup.0, powerup_cell, GoalCommit::Powerup);
             b.goal.next_pick = now + GOAL_SELECT_INTERVAL;
@@ -955,10 +944,10 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         let b = &mut game.entities[e].bot;
         b.goal.next_urgent = now + 0.2;
         if let Some((item, cell, commit)) = pick {
-            if item.0 != b.goal.item {
+            if b.goal.set_item(item.0) {
                 b.goal.since = now;
             }
-            (b.goal.item, b.goal.item_cell, b.goal.commit) = (item.0, cell, commit);
+            (b.goal.item_cell, b.goal.commit) = (cell, commit);
             (b.goal.next_item, b.goal.next_cell, b.goal.next_commit) = (0, 0, GoalCommit::None);
             b.goal.next_pick = now + GOAL_SELECT_INTERVAL;
         }
@@ -1024,17 +1013,17 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
             // only the phase moves. The other `next_pick = now` sites are deliberate re-picks: exact.
             let spread = GOAL_SELECT_INTERVAL * (1.0 + GOAL_SELECT_SPREAD * (game.random() - 0.5));
             let b = &mut game.entities[e].bot;
-            if new_item != b.goal.item {
+            if b.goal.set_item(new_item) {
                 b.goal.since = now; // restart the watchdog for a new goal
             }
-            (b.goal.item, b.goal.item_cell) = (new_item, new_cell);
+            b.goal.item_cell = new_cell;
             (b.goal.next_item, b.goal.next_cell, b.goal.next_commit) = (next_item, next_cell, next_commit);
             b.goal.next_pick = now + spread;
             b.goal.commit = commit;
         }
         if game.entities[e].bot.goal.item != 0 && !game.item_goal_valid(e, EntId(game.entities[e].bot.goal.item), now) {
             let b = &mut game.entities[e].bot;
-            b.goal.item = 0;
+            b.goal.set_item(0);
             b.goal.next_item = 0;
             b.goal.commit = GoalCommit::None;
             b.goal.next_commit = GoalCommit::None;
@@ -1042,7 +1031,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         }
     } else {
         let b = &mut game.entities[e].bot;
-        b.goal.item = 0; // a Move objective supersedes any item chase
+        b.goal.set_item(0); // a Move objective supersedes any item chase
         b.goal.next_item = 0;
         b.goal.commit = GoalCommit::None;
         b.goal.next_commit = GoalCommit::None;
@@ -1063,7 +1052,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         let gi = game.entities[e].bot.goal.item;
         let (goal, dist, overlap) = if gi != 0 {
             let it = &game.entities[EntId(gi)];
-            let on = it.v.solid == Solid::Trigger && on_item(origin, it.v.origin);
+            let on = it.v.solid == Solid::Trigger && item_terminal_touches(origin, it);
             let name = it
                 .classname()
                 .unwrap_or(if it.touch == Touch::Backpack { "backpack" } else { "?" });
@@ -1502,7 +1491,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
         if fresh_spawn {
             b.spawn_exit = enable && !spawn_exit_done;
             b.spawn_exit_until = if b.spawn_exit { now + SPAWN_EXIT_TIME } else { 0.0 };
-            b.goal.item = 0;
+            b.goal.set_item(0);
             b.goal.next_item = 0;
             b.goal.commit = GoalCommit::None;
             b.goal.next_commit = GoalCommit::None;
@@ -2602,6 +2591,50 @@ mod tests {
         for touch in [Touch::Teleport, Touch::Hurt, Touch::ButtonTouch, Touch::Multi, Touch::PlatCenter] {
             assert!(!bot_pickup_touch(touch), "{touch:?} must remain engine/map-owned");
         }
+    }
+
+    #[test]
+    fn fake_client_pickup_accepts_every_catalogued_terminal_overlap() {
+        let mut item = Entity::default();
+        item.v.solid = Solid::Trigger;
+        item.v.mins = Vec3::new(-16.0, -16.0, 0.0);
+        item.v.maxs = Vec3::new(16.0, 16.0, 56.0);
+        item.set_touch(Touch::ItemArmor);
+
+        // The outer catalog band rejected by the old ±40/±48 origin-distance predicate:
+        // 47u horizontal and 80u above the item origin still overlap at the linked hull faces.
+        let terminal = Vec3::new(47.0, 0.0, 80.0);
+        assert!(bot_pickup_touch(item.touch));
+        assert!(item_terminal_touches(terminal, &item));
+        assert!(!item_terminal_touches(Vec3::new(47.01, 0.0, 80.0), &item));
+        assert!(!item_terminal_touches(Vec3::new(47.0, 0.0, 80.01), &item));
+    }
+
+    #[test]
+    fn changing_item_goal_clears_terminal_state_even_across_a_chain() {
+        use super::state::{GoalState, TerminalArrival};
+
+        let mut goal = GoalState::default();
+        goal.set_item(10);
+        goal.item_cell = 3;
+        goal.terminal_arrival = Some(TerminalArrival {
+            item: EntId(10),
+            cell: 3,
+            at: 1.0,
+        });
+        goal.terminal_retried_item = Some(EntId(10));
+
+        assert!(!goal.set_item(10), "same goal retains its in-flight retry state");
+        assert!(goal.terminal_arrival.is_some());
+        assert_eq!(goal.terminal_retried_item, Some(EntId(10)));
+
+        assert!(goal.set_item(11), "pickup continuation is a new goal chain link");
+        assert!(goal.terminal_arrival.is_none());
+        assert_eq!(goal.terminal_retried_item, None);
+
+        goal.terminal_retried_item = Some(EntId(11));
+        assert!(goal.set_item(10), "a later fresh chase of the original item is new again");
+        assert_eq!(goal.terminal_retried_item, None);
     }
 
     #[test]

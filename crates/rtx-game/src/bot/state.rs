@@ -147,13 +147,11 @@ impl BotState {
     /// continuation/commitment, and permit selection again immediately.
     pub(crate) fn abandon_item_goal(&mut self, now: f32, avoid_until: f32) {
         self.mark_avoid(self.goal.item, avoid_until);
-        self.goal.item = 0;
+        self.goal.set_item(0);
         self.goal.next_item = 0;
         self.goal.commit = GoalCommit::None;
         self.goal.next_commit = GoalCommit::None;
         self.goal.next_pick = now;
-        self.goal.terminal_arrival = None;
-        self.goal.terminal_retried_item = None;
     }
 
     /// Shared failure tail for the hook / rocket-jump leg drivers (see [`Driver`]): bump the driver's
@@ -380,6 +378,20 @@ pub struct GoalState {
     /// weapons-stay trigger can't re-capture the goal slot the same second). A small ring: a fresh
     /// entry evicts the soonest-to-expire slot. `(item entid, until)`; a `0` item marks an empty slot.
     pub avoid_items: [(u32, f32); 4],
+}
+
+impl GoalState {
+    /// Replace the active item and invalidate terminal state that belongs to the previous goal.
+    /// Returns whether the item changed so callers can restart their goal watchdog at the same seam.
+    pub(crate) fn set_item(&mut self, item: u32) -> bool {
+        let changed = self.item != item;
+        if changed {
+            self.terminal_arrival = None;
+            self.terminal_retried_item = None;
+        }
+        self.item = item;
+        changed
+    }
 }
 
 /// A pickup terminal that steering has physically reached and is waiting for the authoritative

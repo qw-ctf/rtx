@@ -121,6 +121,17 @@ fn abandon_terminal_item(bot: &mut BotState, item: u32, now: f32) {
     bot.repath_time = now;
 }
 
+fn consume_terminal_retry(bot: &mut BotState, item: u32, alternate: CellId, now: f32) {
+    bot.goal.item_cell = alternate;
+    bot.goal.terminal_retried_item = Some(EntId(item));
+    bot.goal.terminal_arrival = None;
+    // The ordinary 1.5 s selector must not immediately rebind the just-failed primary terminal.
+    bot.goal.next_pick = now + GOAL_SELECT_INTERVAL;
+    bot.route.clear();
+    bot.goal_cell = None;
+    bot.repath_time = now;
+}
+
 pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> SteerOut {
     let SteerCtx { s, o, costs, plat_status, gate_ready, bot_cell, goal_cell, race_line_ahead, weapons_hot, bsp } =
         ctx;
@@ -481,12 +492,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         if now - arrived_at >= TERMINAL_TAKE_GRACE {
             if bot.goal.terminal_retried_item != Some(EntId(item)) {
                 if let Some(alternate) = alternate_item_cell {
-                    bot.goal.item_cell = alternate;
-                    bot.goal.terminal_retried_item = Some(EntId(item));
-                    bot.goal.terminal_arrival = None;
-                    bot.route.clear();
-                    bot.goal_cell = None;
-                    bot.repath_time = now;
+                    consume_terminal_retry(bot, item, alternate, now);
                     terminal_changed = true;
                 } else {
                     abandon_terminal_item(bot, item, now);
@@ -1514,5 +1520,30 @@ mod tests {
         assert!(!jump_runup_ok(Vec2::new(0.0, 300.0), fwd, 200.0, 0.5, 320.0));
         // Gate disabled → always allowed (today's behavior).
         assert!(jump_runup_ok(Vec2::ZERO, fwd, 200.0, 0.0, 320.0));
+    }
+
+    #[test]
+    fn terminal_retry_blocks_periodic_repick_until_the_alternate_leg_starts() {
+        let mut bot = BotState::default();
+        bot.goal.set_item(17);
+        bot.goal.item_cell = 4;
+        bot.goal.next_pick = 1.0;
+        bot.goal.terminal_arrival = Some(TerminalArrival {
+            item: EntId(17),
+            cell: 4,
+            at: 2.0,
+        });
+        bot.route = vec![1, 2];
+        bot.goal_cell = Some(4);
+
+        consume_terminal_retry(&mut bot, 17, 9, 10.0);
+
+        assert_eq!(bot.goal.item_cell, 9);
+        assert_eq!(bot.goal.terminal_retried_item, Some(EntId(17)));
+        assert!(bot.goal.terminal_arrival.is_none());
+        assert_eq!(bot.goal.next_pick, 10.0 + GOAL_SELECT_INTERVAL);
+        assert!(bot.route.is_empty());
+        assert_eq!(bot.goal_cell, None);
+        assert_eq!(bot.repath_time, 10.0);
     }
 }

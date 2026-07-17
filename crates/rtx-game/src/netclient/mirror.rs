@@ -859,6 +859,18 @@ fn dropped_powerup_classname(model: &str) -> Option<&'static str> {
     }
 }
 
+fn dropped_powerup_shadow(classname: &str, origin: Vec3) -> Entity {
+    let mut ent = Entity::default();
+    ent.in_use = true;
+    ent.classname = Some(classname.into());
+    ent.v.solid = Solid::Trigger;
+    // Exact server entity box from `items::spawn_powerup`; terminal hull math depends on it.
+    ent.v.mins = Vec3::new(-16.0, -16.0, -24.0);
+    ent.v.maxs = Vec3::new(16.0, 16.0, 32.0);
+    ent.v.origin = origin;
+    ent
+}
+
 /// Which team a networked flag belongs to (`1` red / `2` blue), or `None` if the model isn't a flag.
 ///
 /// `progs/flag.mdl` is both teams' flag and tells them apart by skin (0 red / 1 blue, `flags.rs`);
@@ -990,8 +1002,9 @@ pub(crate) struct WorldMirror {
     /// carrier dropped, on a server that drops them (KTX's `dropquad`). Server number → the shadow
     /// goal we spawned for it. These aren't in the map's static goal catalog, so the bots would walk
     /// past a quad on the floor; this makes each a live goal for as long as it's there. See
-    /// [`Self::write_dropped_powerups`].
-    dropped_powerups: std::collections::HashMap<u16, EntId>,
+    /// [`Self::write_dropped_powerups`]. `None` is a visible drop that exposed no touch-valid nav
+    /// terminal: a tombstone prevents rebuilding the full catalog every frame until it disappears.
+    dropped_powerups: std::collections::HashMap<u16, Option<EntId>>,
     /// How many projectiles we've ever seen fly, and the most at once. A path that never runs looks
     /// exactly like one with nothing to do — this tells them apart.
     ///
@@ -1366,14 +1379,9 @@ impl WorldMirror {
             }
             let slot = EntId(e.number as u32);
             if let std::collections::hash_map::Entry::Vacant(entry) = self.dropped_powerups.entry(e.number) {
-                let ent = &mut game.entities[slot];
-                *ent = Entity::default();
-                ent.in_use = true;
-                ent.classname = Some(classname.into());
-                ent.v.solid = Solid::Trigger; // the goal loop takes only `Trigger` items
-                ent.v.mins = Vec3::new(-16.0, -16.0, 0.0);
-                ent.v.maxs = Vec3::new(16.0, 16.0, 56.0);
-                ent.v.origin = e.origin;
+                // Build off-slot first: the server-numbered slot may already carry useful mirrored
+                // state, and a failed catalog attempt must not erase it.
+                let ent = dropped_powerup_shadow(classname, e.origin);
                 let terminals = crate::nav_build::collect_touch_terminals(
                     game.nav
                         .graph
@@ -1381,25 +1389,29 @@ impl WorldMirror {
                         .into_iter()
                         .flat_map(|g| g.cells.iter().enumerate())
                         .map(|(cell, c)| (cell as crate::navmesh::CellId, c.origin)),
-                    ent,
+                    &ent,
                 );
                 if terminals.is_empty() {
-                    game.entities[slot] = Entity::default();
-                    continue; // nowhere the player hull can touch it — not a goal we can offer
+                    entry.insert(None);
+                    eprintln!("rtx-client: a dropped {classname} has no touch-valid nav terminal");
+                } else {
+                    game.entities[slot] = ent;
+                    game.nav.goals.extend(terminals.into_iter().map(|cell| (slot.0, cell)));
+                    entry.insert(Some(slot));
+                    eprintln!("rtx-client: a {classname} is on the floor — now a goal");
                 }
-                game.nav.goals.extend(terminals.into_iter().map(|cell| (slot.0, cell)));
-                entry.insert(slot);
-                eprintln!("rtx-client: a {classname} is on the floor — now a goal");
             }
-            game.entities[slot].v.origin = e.origin;
-            game.link_edict(slot);
+            if let Some(Some(slot)) = self.dropped_powerups.get(&e.number).copied() {
+                game.entities[slot].v.origin = e.origin;
+                game.link_edict(slot);
+            }
         }
 
         // Retire any we're no longer shown — grabbed, or expired. A dropped powerup is transient, so
         // "out of sight" is treated as gone (it re-adds if it comes back); the goal must leave
         // `nav.goals` with it, or bots would path to a quad that isn't there.
         let live: std::collections::HashSet<u16> = seen.iter().map(|e| e.number).collect();
-        let gone: Vec<(u16, EntId)> = self
+        let gone: Vec<(u16, Option<EntId>)> = self
             .dropped_powerups
             .iter()
             .filter(|(num, _)| !live.contains(num))
@@ -1407,8 +1419,10 @@ impl WorldMirror {
             .collect();
         for (num, slot) in gone {
             self.dropped_powerups.remove(&num);
-            game.nav.goals.retain(|&(idx, _)| idx != slot.0);
-            game.entities[slot] = Entity::default();
+            if let Some(slot) = slot {
+                game.nav.goals.retain(|&(idx, _)| idx != slot.0);
+                game.entities[slot] = Entity::default();
+            }
         }
     }
 
@@ -2305,6 +2319,16 @@ mod tests {
         assert_eq!(dropped_powerup_classname("progs/backpack.mdl"), None);
         assert_eq!(dropped_powerup_classname("progs/armor.mdl"), None);
         assert_eq!(dropped_powerup_classname(""), None);
+    }
+
+    #[test]
+    fn dropped_powerup_shadow_uses_the_server_powerup_box() {
+        let origin = Vec3::new(10.0, 20.0, 30.0);
+        let ent = dropped_powerup_shadow("item_artifact_super_damage", origin);
+        assert_eq!(ent.v.origin, origin);
+        assert_eq!(ent.v.mins, Vec3::new(-16.0, -16.0, -24.0));
+        assert_eq!(ent.v.maxs, Vec3::new(16.0, 16.0, 32.0));
+        assert_eq!(ent.v.solid, Solid::Trigger);
     }
 
     /// A rocket in flight becomes something the dodge logic can reason about — and its velocity is
