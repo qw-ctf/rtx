@@ -149,12 +149,20 @@ impl UnionFind {
     }
 }
 
+/// Top bit of the gate bitmask, reserved to mean "crosses a gate whose id ≥ 31 that the 31 tracked
+/// bits can't represent". Priced as an always-shut door (a safe overestimate) rather than dropped —
+/// dropping it (the old `gi < 32` check) priced a 32nd gate at 0, a real underestimate that could make
+/// a bot value an item actually sealed behind it. Real maps have single-digit gate counts, so this
+/// never fires; it's the correctness backstop.
+const SEALED_GATE: u32 = 1 << 31;
+
 /// The static (build-time) metadata a link contributes to an abstract edge: its gate bit, whether it
 /// is a rocket jump, whether it is a chained speed jump.
 fn link_meta(graph: &NavGraph, li: u32) -> (u32, u8, bool) {
     let gates = match graph.gate_of_link(li) {
-        Some(gi) if gi < 32 => 1u32 << gi,
-        _ => 0,
+        Some(gi) if gi < 31 => 1u32 << gi,
+        Some(_) => SEALED_GATE,
+        None => 0,
     };
     let rj = (graph.link_kind(li) == LinkKind::RocketJump) as u8;
     let chained = graph.speed_jump_of_link(li).is_some_and(|s| s.chained);
@@ -173,10 +181,12 @@ impl NavGraph {
         }
         let (cluster_of, cluster_count) = self.cluster_cells();
 
-        // Kept crossings — the cross-cluster links promoted to abstract edges. Start with the cheapest
-        // one per directed cluster pair (lowest index on a tie → deterministic): a wide border must not
-        // become dozens of parallel portals, or the intra-cluster all-pairs transit explodes to a graph
-        // larger than the fine one. The coverage pass below adds back any crossing a rep fails to cover.
+        // Kept crossings — the cross-cluster links promoted to abstract edges. One representative per
+        // directed cluster pair (a wide border must not become dozens of parallel portals, or the
+        // intra-cluster all-pairs transit explodes to a graph larger than the fine one; the coverage
+        // pass below adds back any crossing a rep fails to cover). Chosen by cheapest, then *gate-free*
+        // (so the abstract graph carries an open route between clusters where one exists, and a shut
+        // door doesn't wrongly seal the pair), then lowest index (deterministic).
         let mut rep: HashMap<(u32, u32), u32> = HashMap::new();
         for li in 0..self.links.len() as u32 {
             let link = self.links[li as usize];
@@ -184,11 +194,21 @@ impl NavGraph {
             if key.0 == key.1 {
                 continue;
             }
-            match rep.get(&key) {
-                Some(&best) if self.links[best as usize].cost <= link.cost => {}
-                _ => {
-                    rep.insert(key, li);
+            let better = match rep.get(&key) {
+                None => true,
+                Some(&best) => {
+                    let best_cost = self.links[best as usize].cost;
+                    if link.cost != best_cost {
+                        link.cost < best_cost
+                    } else if self.gate_of_link(li).is_some() != self.gate_of_link(best).is_some() {
+                        self.gate_of_link(li).is_none() // prefer the gate-free crossing at equal cost
+                    } else {
+                        li < best
+                    }
                 }
+            };
+            if better {
+                rep.insert(key, li);
             }
         }
         let mut kept: Vec<u32> = rep.values().copied().collect();
@@ -571,7 +591,7 @@ impl NavGraph {
     fn price_meta(&self, gates: u32, rj: u8, chained: bool, hazard_hp: f32, costs: &LinkCosts, sever_chained: bool) -> f32 {
         let mut extra = 0.0;
         if gates != 0 {
-            for gi in 0..self.gate_count().min(32) {
+            for gi in 0..self.gate_count().min(31) {
                 if gates & (1 << gi) != 0 && costs.gate_closed.get(gi).copied().unwrap_or(false) {
                     extra += if costs.openable_gates.get(gi).copied().unwrap_or(false) {
                         costs.open_gate_cost
@@ -579,6 +599,10 @@ impl NavGraph {
                         CLOSED_GATE_PENALTY
                     };
                 }
+            }
+            // An untracked (≥31) gate is priced as always shut — never underestimate (see SEALED_GATE).
+            if gates & SEALED_GATE != 0 {
+                extra += CLOSED_GATE_PENALTY;
             }
         }
         if rj > 0 && costs.rocket_jump_extra > 0.0 {
