@@ -2932,4 +2932,85 @@ mod tests {
         one_way.build_lod();
         assert_eq!(one_way.cluster_of(0), one_way.cluster_of(1), "a one-way drop still clusters together");
     }
+
+    /// On a straight corridor spanning several cluster blocks the abstract portal path *is* the only
+    /// path, so the coarse estimate equals the exact flood at every cell — near cells from the fine
+    /// flood, far cells reconstructed through portals and intra-cluster transit.
+    #[test]
+    fn coarse_costs_match_exact_on_a_chain() {
+        let cell = |gx: i32| Cell { origin: Vec3::new(gx as f32 * 32.0, 0.0, 0.0), gx, gy: 0 };
+        let cells: Vec<Cell> = (0..25).map(|i| cell(i)).collect();
+        let mut links = Vec::new();
+        for i in 0..24u32 {
+            links.push(reach_link(i, i + 1));
+            links.push(reach_link(i + 1, i));
+        }
+        let mut g = NavGraph::test_graph(cells, links);
+        g.build_lod();
+        assert!(g.cluster_count() >= 4, "a 25-cell chain spans four 8-column blocks, got {}", g.cluster_count());
+
+        let costs = LinkCosts::default();
+        let exact = g.costs_from(0, &costs);
+        let coarse = g.coarse_costs(0, &costs, true);
+        for c in 0..25u32 {
+            assert_eq!(
+                coarse.cost_to(c).to_bits(),
+                exact[c as usize].to_bits(),
+                "cell {c}: coarse {} must equal exact {} on a linear chain",
+                coarse.cost_to(c),
+                exact[c as usize],
+            );
+        }
+
+        // Bare graph (no LOD built): coarse falls back to the exact full flood.
+        let bare = NavGraph::test_graph((0..3).map(cell).collect(), vec![reach_link(0, 1), reach_link(1, 2)]);
+        let bare_exact = bare.costs_from(0, &costs);
+        let bare_coarse = bare.coarse_costs(0, &costs, true);
+        for c in 0..3u32 {
+            assert_eq!(bare_coarse.cost_to(c).to_bits(), bare_exact[c as usize].to_bits(), "bare-graph fallback cell {c}");
+        }
+    }
+
+    /// The safety property goal scoring relies on: over a 2-D grid spanning several clusters, the
+    /// coarse estimate never *underestimates* the exact cost (an abstract path is a real path, so its
+    /// cost ≥ the shortest) and agrees on reachability. Underestimating would let a bot think an item
+    /// is closer than it is.
+    #[test]
+    fn coarse_never_underestimates_on_a_grid() {
+        let (w, h) = (18i32, 6i32);
+        let idx = |gx: i32, gy: i32| (gy * w + gx) as u32;
+        let mut cells = Vec::new();
+        for gy in 0..h {
+            for gx in 0..w {
+                cells.push(Cell { origin: Vec3::new(gx as f32 * 32.0, gy as f32 * 32.0, 0.0), gx, gy });
+            }
+        }
+        let mut links = Vec::new();
+        for gy in 0..h {
+            for gx in 0..w {
+                if gx + 1 < w {
+                    links.push(reach_link(idx(gx, gy), idx(gx + 1, gy)));
+                    links.push(reach_link(idx(gx + 1, gy), idx(gx, gy)));
+                }
+                if gy + 1 < h {
+                    links.push(reach_link(idx(gx, gy), idx(gx, gy + 1)));
+                    links.push(reach_link(idx(gx, gy + 1), idx(gx, gy)));
+                }
+            }
+        }
+        let mut g = NavGraph::test_graph(cells, links);
+        g.build_lod();
+        assert!(g.cluster_count() >= 3, "18-wide grid spans three gx-blocks, got {}", g.cluster_count());
+
+        let costs = LinkCosts::default();
+        let exact = g.costs_from(0, &costs);
+        let coarse = g.coarse_costs(0, &costs, true);
+        for c in 0..(w * h) as u32 {
+            let (e, co) = (exact[c as usize], coarse.cost_to(c));
+            assert_eq!(e.is_finite(), co.is_finite(), "cell {c}: reachability must agree");
+            if e.is_finite() {
+                assert!(co >= e - 1e-3, "cell {c}: coarse {co} underestimates exact {e}");
+            }
+        }
+    }
 }
