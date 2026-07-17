@@ -443,7 +443,7 @@ fn collect_touch_terminals(
 #[cfg(all(test, feature = "netclient"))]
 mod tests {
     use super::*;
-    use crate::defs::{Items, Solid};
+    use crate::defs::{Bits, Items, Solid};
     use crate::entity::Touch;
     use crate::netclient::host::NetHost;
     use std::path::PathBuf;
