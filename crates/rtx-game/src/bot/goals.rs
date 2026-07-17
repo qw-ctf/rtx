@@ -974,8 +974,16 @@ impl GameState {
         let stats = self.bot_stats(bot_e);
         let pricing = self.bot_link_pricing(bot_e, now);
         let link_costs = pricing.costs(0);
-        let from_costs = graph.costs_from(from, &link_costs);
-        let direct = from_costs.get(powerup_cell as usize).copied()?;
+        // Coarse when `rtx_bot_lod` is on (the bridge otherwise runs an exact whole-graph flood — plus
+        // one per candidate below — the last such path in goal selection). `direct` reaches the
+        // powerup, which can be far, so this genuinely needs the far field, not just a bounded flood.
+        let lod = self.host().cvar_bool(c"rtx_bot_lod");
+        let from_costs = if lod {
+            PlanCosts::Coarse(graph.coarse_costs(from, &link_costs, true))
+        } else {
+            PlanCosts::Exact(graph.costs_from(from, &link_costs))
+        };
+        let direct = from_costs.cost_to(powerup_cell);
         if !direct.is_finite() {
             return None;
         }
@@ -1000,7 +1008,7 @@ impl GameState {
                 continue;
             }
             let desire = self.item_desire(&stats, item, cat);
-            let first_leg = from_costs[cell as usize];
+            let first_leg = from_costs.cost_to(cell);
             if desire <= 0.0 || !first_leg.is_finite() || first_leg > POWERUP_BRIDGE_TRAVEL {
                 continue;
             }
@@ -1010,7 +1018,11 @@ impl GameState {
         candidates
             .into_iter()
             .filter_map(|(item, cell, desire, first_leg)| {
-                let second_leg = graph.costs_from(cell, &link_costs)[powerup_cell as usize];
+                let second_leg = if lod {
+                    graph.coarse_costs(cell, &link_costs, true).cost_to(powerup_cell)
+                } else {
+                    graph.costs_from(cell, &link_costs)[powerup_cell as usize]
+                };
                 if !second_leg.is_finite()
                     || !powerup_bridge_arrives_in_time(
                         direct,
