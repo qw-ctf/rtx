@@ -219,9 +219,11 @@ pub(crate) fn mode_serverinfo(mode: &str, cfg: MatchConfig) -> String {
 /// they aren't on the locked roster (a late joiner, or an overflow beyond teams×size). Benched
 /// players sit out as harmless spectators until the next warmup. Derived from the roster (not a
 /// stored flag), so it survives the match-start reload for free. Cheap in open/warmup play (the
-/// `structured` gate short-circuits before the netname lookup allocates).
+/// `structured` gate short-circuits before the netname lookup allocates). Server-side only: a
+/// network client mirrors the remote server's phase but does not own its roster or bench.
 pub(crate) fn benched(g: &GameState, e: EntId) -> bool {
-    structured(g)
+    !g.host().is_client()
+        && structured(g)
         && !matches!(g.team_match.phase, MatchPhase::Warmup)
         && {
             let name = g.netname_of(e);
@@ -802,5 +804,30 @@ mod tests {
         let candidates = vec![(EntId(8), 25.0), (EntId(3), 9.0), (EntId(2), 9.0)];
         assert_eq!(selected_responders(candidates.clone(), 1), vec![EntId(2)]);
         assert_eq!(selected_responders(candidates, 2), vec![EntId(2), EntId(3)]);
+    }
+
+    /// A network client mirrors a remote server's phase, but never owns that server's locked roster.
+    /// Treating its deliberately empty local roster as authoritative benches every bot before the
+    /// mode can nominate an enemy.
+    #[cfg(feature = "netclient")]
+    #[test]
+    fn a_network_client_does_not_bench_remote_server_players() {
+        use super::{benched, MatchConfig, MatchPhase, MatchState};
+        use crate::entity::EntId;
+        use crate::game::GameState;
+        use crate::netclient::host::NetHost;
+        use std::path::PathBuf;
+
+        let host: &'static NetHost = Box::leak(Box::new(NetHost::new(PathBuf::from("/nonexistent"))));
+        let mut game = GameState::new_client(host);
+        let bot = EntId(1);
+        game.entities[bot].netname = Some("bot".into());
+        game.team_match = MatchState {
+            config: MatchConfig { teams: 2, size: 4 },
+            phase: MatchPhase::Live,
+            ..Default::default()
+        };
+
+        assert!(!benched(&game, bot), "the remote server, not its client-side mirror, owns the roster");
     }
 }
