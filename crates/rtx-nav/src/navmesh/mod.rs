@@ -2814,6 +2814,38 @@ mod tests {
         assert!(g.reachable(2, 2) && g.reachable(3, 3));
     }
 
+    /// The goal-selection fan-out (`bot::par::flood_batch`) runs `costs_from` for many sources on a
+    /// worker pool. That is only sound if `costs_from` is a pure function of `(graph, source, costs)` —
+    /// no shared mutable state — so a batch computed on a rayon pool is **bit-identical** to the serial
+    /// one. Guard that here (the pool-side determinism proof for Step 5), comparing raw f32 bits.
+    #[test]
+    fn costs_from_batch_is_thread_invariant() {
+        use rayon::prelude::*;
+        // A ring plus spokes: several distinct sources, each with a non-trivial flood.
+        let cells: Vec<Cell> = (0..12).map(|i| reach_cell(i as f32 * 40.0)).collect();
+        let mut links = Vec::new();
+        for i in 0..12u32 {
+            let j = (i + 1) % 12;
+            links.push(reach_link(i, j));
+            links.push(reach_link(j, i));
+        }
+        let g = NavGraph::test_graph(cells, links);
+        let sources: Vec<CellId> = (0..12).collect();
+        let costs = LinkCosts::default();
+
+        let serial: Vec<Vec<f32>> = sources.iter().map(|&s| g.costs_from(s, &costs)).collect();
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let parallel: Vec<Vec<f32>> =
+            pool.install(|| sources.par_iter().map(|&s| g.costs_from(s, &costs)).collect());
+
+        assert_eq!(serial.len(), parallel.len());
+        for (s, (a, b)) in sources.iter().zip(serial.iter().zip(&parallel)) {
+            let ab: Vec<u32> = a.iter().map(|x| x.to_bits()).collect();
+            let bb: Vec<u32> = b.iter().map(|x| x.to_bits()).collect();
+            assert_eq!(ab, bb, "source {s}: parallel flood differs from serial bit-for-bit");
+        }
+    }
+
     /// `nearest_reachable_to` picks the reachable cell physically closest to an unreachable goal, and
     /// the O(1)-table path agrees cell-for-cell with the Dijkstra-flood fallback (bare graph).
     #[test]

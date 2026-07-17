@@ -22,6 +22,7 @@ pub(crate) mod goals;
 mod grenade;
 mod hook;
 pub(crate) mod model;
+pub(crate) mod par;
 pub(crate) mod perception;
 mod population;
 pub(crate) mod prof;
@@ -278,6 +279,9 @@ pub fn run_bots(game: &mut GameState) {
     // per bot (mvdsv's `SV_RunBots` runs `SV_ProgStartFrame(true)` before its client loop), so this
     // one bracket is already the whole squad's think time — see `prof`.
     let host = *game.host();
+    // Reconcile the goal-selection worker pool to `rtx_bot_par` (builds it on first enable). Cheap
+    // when already in the wanted state; the floods themselves are dispatched from `best_item_plan`.
+    game.bot_pool.ensure(&host);
     let interval = host.cvar(c"rtx_bot_prof");
     let profiling = interval > 0.0;
     let budget = prof::budget_ms(&host);

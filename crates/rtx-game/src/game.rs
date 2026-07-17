@@ -144,6 +144,11 @@ pub struct GameState {
     /// the cvar is set. Lives here rather than in `bot` so both embodiments get it: the netclient owns
     /// a `GameState` too, and drives the same `run_bots`. See [`bot::prof`].
     pub(crate) bot_prof: bot::prof::BotProf,
+    /// The bot brain's persistent worker pool, for fanning a goal pick's independent floods across
+    /// cores (see [`bot::par`]). Lazily built (gated on `rtx_bot_par`), and torn down at
+    /// `GAME_SHUTDOWN` so its workers are joined before the engine unloads us. Both embodiments share
+    /// it — the netclient owns a `GameState` too and drives the same `run_bots`.
+    pub(crate) bot_pool: bot::par::BotPool,
     /// A population change the bot manager wants applied this frame (add or remove one bot),
     /// deferred out of the frame. `add_bot`/`remove_bot` make the engine run our
     /// `ClientConnect`/`PutClientInServer`/`ClientDisconnect` *synchronously and re-entrantly*; if
@@ -238,6 +243,7 @@ impl GameState {
             map_spawned: false,
             normal_bot_drive_logged: false,
             bot_prof: bot::prof::BotProf::default(),
+            bot_pool: bot::par::BotPool::default(),
             pending_roster: None,
             dyn_assets: DynAssets::default(),
             control: crate::control::ControlState::default(),
@@ -254,7 +260,12 @@ impl GameState {
             GameCommand::Init => self.init(arg0, arg1),
             GameCommand::LoadEntities => self.load_entities(),
             GameCommand::StartFrame => self.start_frame(arg0, arg1),
-            GameCommand::Shutdown => 0,
+            GameCommand::Shutdown => {
+                // Join the bot pool's workers before the engine unloads us — dropping the pool only
+                // signals them (see `bot::par`). Idempotent and a no-op when the pool was never built.
+                self.bot_pool.shutdown();
+                0
+            }
             GameCommand::ClientConnect if !is_spectator => {
                 self.client_connect(player);
                 1

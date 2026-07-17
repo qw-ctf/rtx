@@ -58,6 +58,10 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // Bots plan over speed bands (kinodynamic A*), crediting speed carried between legs so
         // chained speed jumps and hot corridors route; on by default. Escape hatch: 0 → plain A*.
         ("rtx_bot_bandplan", Bool(true)),
+        // Fan a goal pick's independent navmesh floods out across a persistent worker pool (see
+        // `bot::par`) — on by default; the result is bit-identical to serial. 0 → run them inline on
+        // the main thread (the live A/B switch, and the fallback if the pool can't be built).
+        ("rtx_bot_par", Bool(true)),
         // A bot's health weights how willing it is to shortcut through lava/slime: hurt bots detour,
         // healthy (or armored, or biosuited) ones clip the corner. `0` prices every bot as a bare
         // spawn — hazards still cost, but the same to everyone. See `bot::bot_hazard_strength`.

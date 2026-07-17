@@ -26,3 +26,6 @@ reqwest = { workspace = true, optional = true }
 binrw.workspace = true
 bitflags.workspace = true
 glam.workspace = true
+# The bot brain's goal-selection floods run on a persistent worker pool (see `bot::par`). Already in
+# this dylib's tree via rtx-nav's navmesh build, so it adds no new link weight.
+rayon.workspace = true

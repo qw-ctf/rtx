@@ -2659,6 +2659,7 @@ dependencies = [
  "binrw",
  "bitflags 2.13.0",
  "glam",
+ "rayon",
  "reqwest",
  "rtx-nav",
  "rtx-proto",

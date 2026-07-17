@@ -1326,7 +1326,48 @@ impl GameState {
         // reach. Same pricing `run_bot` routes with (see [`LinkPricing`](super::LinkPricing)).
         let pricing = self.bot_link_pricing(bot_e, now);
         let base = pricing.costs(0);
-        let normal = graph.costs_from(bot_cell, &base);
+        let s = self.bot_stats(bot_e);
+        let own_power = s.strength * s.firepower.max(10.0);
+        // Only a currently remembered opponent contributes denial/contest information. Position is
+        // the perception hypothesis (exact only when seen), and inventory/stack comes exclusively
+        // from the observation-gated model — never from the live enemy edict. The *flood* from their
+        // position is deferred into the fan-out below (it's independent of our own base flood); only
+        // the serial prep — their cell, their estimated stats, their pricing — happens here.
+        let (enemy_prep, enemy_theirs): (Option<(Stats, CellId, bool)>, Option<super::LinkPricing>) = {
+            let p = &self.entities[bot_e].bot.percept;
+            let enemy = EntId(p.known_enemy);
+            if enemy.0 != 0 && now < p.known_until && self.entities[enemy].v.health > 0.0 {
+                match self.opponent_est(bot_e, enemy, now).and_then(|est| {
+                    let cell = graph.nearest(p.last_seen)?;
+                    let stats = estimated_stats(est, s.weapons_stay, s.stack);
+                    let power = stats.strength * stats.firepower.max(10.0);
+                    // Price the enemy's flood by *their* strength: how far they can get is no business
+                    // of our health (hazards are valued by whoever is wading).
+                    let theirs = pricing.for_strength(stats.strength);
+                    Some(((stats, cell, own_power < 0.6 * power), theirs))
+                }) {
+                    Some((prep, theirs)) => (Some(prep), Some(theirs)),
+                    None => (None, None),
+                }
+            } else {
+                (None, None)
+            }
+        };
+        // The base flood (from us) and the enemy-contest flood (from them) are independent pure
+        // functions of `(graph, source, costs)`, so fan them out across the worker pool; the ordered
+        // return keeps this bit-identical to running them serially (`rtx_bot_par 0`).
+        let their_costs = enemy_theirs.as_ref().map(|t| t.costs(0));
+        let (normal, enemy_flood) = self.bot_pool.join(
+            || graph.costs_from(bot_cell, &base),
+            || match (&enemy_prep, &their_costs) {
+                (Some((_, cell, _)), Some(tc)) => Some(graph.costs_from(*cell, tc)),
+                _ => None,
+            },
+        );
+        let enemy_context = match (enemy_prep, enemy_flood) {
+            (Some((stats, _, weaker)), Some(costs)) => Some((stats, costs, weaker)),
+            _ => None,
+        };
         // Valuation prices a shut door the bot can *open* as the button-detour errand it is, not the
         // full route-around wall — otherwise a prize reachable only through a gate (the ultrav quad
         // behind its teleporter door) floods to ~100k and is never a *choosable* goal, so no bot ever
@@ -1345,30 +1386,6 @@ impl GameState {
         vcosts.openable_gates = &openable;
         vcosts.open_gate_cost = GATE_OPEN_COST;
         let costs = if openable.iter().any(|&o| o) { graph.costs_from(bot_cell, &vcosts) } else { normal };
-        let s = self.bot_stats(bot_e);
-        let own_power = s.strength * s.firepower.max(10.0);
-        // Only a currently remembered opponent contributes denial/contest information. Position is
-        // the perception hypothesis (exact only when seen), and inventory/stack comes exclusively
-        // from the observation-gated model — never from the live enemy edict.
-        let enemy_context = {
-            let p = &self.entities[bot_e].bot.percept;
-            let enemy = EntId(p.known_enemy);
-            if enemy.0 != 0 && now < p.known_until && self.entities[enemy].v.health > 0.0 {
-                self.opponent_est(bot_e, enemy, now).and_then(|est| {
-                    let cell = graph.nearest(p.last_seen)?;
-                    let stats = estimated_stats(est, s.weapons_stay, s.stack);
-                    let power = stats.strength * stats.firepower.max(10.0);
-                    // Flood from *their* position priced by *their* strength: how far the enemy can
-                    // get is no business of our health. Our own pricing was near enough while it only
-                    // carried our failed links, but hazards are valued by the health of whoever is
-                    // wading — reading our own here would model their nerve as ours.
-                    let theirs = pricing.for_strength(stats.strength);
-                    Some((stats, graph.costs_from(cell, &theirs.costs(0)), own_power < 0.6 * power))
-                })
-            } else {
-                None
-            }
-        };
         // The item we're already chasing, for the hysteresis bonus below.
         let current_goal = self.entities[bot_e].bot.goal.item;
         // Item claims (teamwork): an item a living teammate bot is already fetching is discounted, so
@@ -1534,11 +1551,16 @@ impl GameState {
                 .total_cmp(&a.one_score)
                 .then_with(|| a.item.0.cmp(&b.item.0))
         });
-        let pricing = self.bot_link_pricing(bot_e, now);
-        let link_costs = pricing.costs(0);
+        // The up-to-six continuation floods (one per primary) are mutually independent, and all use
+        // the same pricing the base flood did (`base` == `pricing.costs(0)`, still valid — `LinkCosts`
+        // is `Copy`), so fan them out in one ordered batch. `leg_floods[pi]` is primary `pi`'s flood.
+        let primaries: Vec<ItemCandidate> =
+            candidates.iter().filter(|c| c.one_score > 0.0).take(PLAN_PRIMARY_LIMIT).copied().collect();
+        let source_cells: Vec<CellId> = primaries.iter().map(|c| c.cell).collect();
+        let leg_floods = self.bot_pool.flood_batch(graph, &source_cells, &base);
         let mut best: Option<(ItemCandidate, Option<ItemCandidate>, f32)> = None;
-        for &first in candidates.iter().filter(|c| c.one_score > 0.0).take(PLAN_PRIMARY_LIMIT) {
-            let from_first = graph.costs_from(first.cell, &link_costs);
+        for (pi, &first) in primaries.iter().enumerate() {
+            let from_first = &leg_floods[pi];
             let mut best_second: Option<(ItemCandidate, f32)> = None;
             for &second in &candidates {
                 if second.item == first.item {
