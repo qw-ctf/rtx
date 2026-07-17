@@ -21,6 +21,7 @@ use rayon::prelude::*;
 mod geom;
 mod hook;
 mod jumps;
+mod lod;
 mod physics;
 mod query;
 mod reach;
@@ -38,6 +39,7 @@ pub use physics::{
     attainable_speed, band_of, bhop_k, prestrafe_delivered_from, BAND_EDGES, BAND_FLOOR, BAND_V_MAX, BHOP_EFF,
     CURL_V_HOLD_TOL, DOUBLE_ARC_PEAK, JUMP_APEX, MAX_SPEED, NBANDS,
 };
+use lod::Lod;
 use physics::*;
 use reach::Reach;
 pub use rocketjump::RJ_CERT_AIM_DEG;
@@ -264,6 +266,10 @@ pub struct NavGraph {
     /// at the end of the build so [`reachable`](Self::reachable) answers "can A ever get to B?" in O(1)
     /// instead of a failed whole-graph search. `None` on a bare (unbuilt) graph — see [`reach`].
     reach: Option<Reach>,
+    /// Level-of-detail hierarchy (cluster assignment + abstract portal graph), filled by
+    /// [`build_lod`](Self::build_lod) at the end of the build. Coarse far-field navigation reads it;
+    /// `None` on a bare (unbuilt) graph — see [`lod`].
+    lod: Option<Lod>,
 }
 
 /// A solved speed jump: where the takeoff ledge is and the horizontal speed needed there, so the
@@ -400,6 +406,7 @@ impl NavGraph {
             plats: SideTable::default(),
             sj_k: bhop_k(10.0, MAX_SPEED), // stock default until add_speed_jumps captures live cvars
             reach: None,                   // filled by build_reachability once all links are spliced
+            lod: None,                     // filled by build_lod once all links are spliced
         };
         graph.link_cells(bsp);
         graph
@@ -433,6 +440,7 @@ impl NavGraph {
             plats: SideTable::default(),
             sj_k: bhop_k(10.0, MAX_SPEED),
             reach: None,
+            lod: None,
         }
     }
 
@@ -1494,10 +1502,12 @@ pub fn build_navmesh(
         // Last: prices links entering a lift shaft, so it must see every link the splices above added
         // (a teleport that lands under a plat, a jump-aboard from the shaft floor).
         graph.surcharge_under_plat_links();
-        // Now that every link is in place, precompute static reachability. The graph-swap steps
-        // (`flag_hazards`/`flag_water`) only add *cost* to existing links, never new links, so this
-        // stays valid across the swap.
+        // Now that every link is in place, precompute static reachability and the LOD hierarchy. The
+        // graph-swap steps (`flag_hazards`/`flag_water`) only add *cost* to existing links, never new
+        // links, so the structure these bake stays valid across the swap (liquid costs are patched
+        // into the LOD tables at the swap — see `patch_lod_liquids`).
         graph.build_reachability();
+        graph.build_lod();
         Some((bsp, graph))
     };
     // Run the (rayon-parallel) build on a transient pool sized to leave one core for the caller.
@@ -2895,5 +2905,31 @@ mod tests {
         let mut built = NavGraph::test_graph(cells, links);
         built.build_reachability();
         assert_eq!(built.nearest_reachable_to(0, 3), Some(2), "table path must agree with the flood");
+    }
+
+    // --- LOD hierarchy (see `lod`) ---
+
+    /// Clustering groups cells that share a spatial block *and* a link path inside it; an unconnected
+    /// same-block cell and a cell in another block each get their own cluster. `LOD_SHIFT=3` → blocks
+    /// are 8 grid columns wide, so gx 0..7 share a block and gx 8 starts the next.
+    #[test]
+    fn clusters_split_disconnected_blocks() {
+        let cell = |gx: i32| Cell { origin: Vec3::new(gx as f32 * 32.0, 0.0, 0.0), gx, gy: 0 };
+        // cells 0,1,2 in block 0 (gx 0/1/2); cell 3 in block 1 (gx 8). 0↔1 linked; 2 isolated.
+        let mut g = NavGraph::test_graph(
+            vec![cell(0), cell(1), cell(2), cell(8)],
+            vec![reach_link(0, 1), reach_link(1, 0)],
+        );
+        g.build_lod();
+        let cl = |c: u32| g.cluster_of(c).unwrap();
+        assert_eq!(cl(0), cl(1), "connected same-block cells share a cluster");
+        assert_ne!(cl(0), cl(2), "an unconnected same-block cell is its own cluster");
+        assert_ne!(cl(0), cl(3), "a cell in another block is a different cluster");
+        assert_ne!(cl(2), cl(3), "distinct singletons stay distinct");
+        assert_eq!(g.cluster_count(), 3, "0/1, 2, and 3 → three clusters");
+        // A one-way link still groups its endpoints (undirected clustering).
+        let mut one_way = NavGraph::test_graph(vec![cell(0), cell(1)], vec![reach_link(0, 1)]);
+        one_way.build_lod();
+        assert_eq!(one_way.cluster_of(0), one_way.cluster_of(1), "a one-way drop still clusters together");
     }
 }
