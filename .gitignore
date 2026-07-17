@@ -3,3 +3,4 @@
 *.txt
 *.pem
 /playground
+.DS_Store
