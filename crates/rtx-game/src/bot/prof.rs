@@ -101,6 +101,16 @@ pub(crate) struct BotProf {
     over: u32,
     /// Most bots seen in any one frame this window.
     peak_bots: usize,
+    /// This frame's per-bot times and phase totals, rebuilt every frame. Only interesting for the one
+    /// frame that turns out to be the worst — but which frame that is isn't known until it's over.
+    cur_bots: Vec<f32>,
+    cur_phase: [f32; 3],
+    /// An autopsy of the window's worst frame: what it cost, how it split across the bots that ran in
+    /// it, and across the phases. `avg`/`p95`/`max` say a spike happened; only this says *what* it was
+    /// — one bot doing something dear, or every bot's cadence landing on the same frame.
+    worst: f32,
+    worst_bots: Vec<f32>,
+    worst_phase: [f32; 3],
     /// Window anchor. `None` until the first sample, so the window measures collected time rather
     /// than counting an idle map load against us.
     started: Option<Instant>,
@@ -132,8 +142,19 @@ impl BotProf {
         self.combat = PhaseStat::default();
         self.over = 0;
         self.peak_bots = 0;
+        self.cur_bots.clear();
+        self.cur_phase = [0.0; 3];
+        self.worst = 0.0;
+        self.worst_bots.clear();
+        self.worst_phase = [0.0; 3];
         self.started = None;
         self.budget = 0.0;
+    }
+
+    /// Open a frame: whatever the last one accumulated is banked or discarded by now.
+    pub(crate) fn begin_frame(&mut self) {
+        self.cur_bots.clear();
+        self.cur_phase = [0.0; 3];
     }
 
     /// Record one phase of one bot. Called the instant a phase is measured rather than batched at the
@@ -148,11 +169,13 @@ impl BotProf {
             Phase::Steer => self.steer.add(ms),
             Phase::Combat => self.combat.add(ms),
         }
+        self.cur_phase[phase as usize] += ms;
     }
 
     /// Record one bot's total think time.
     pub(crate) fn add_bot(&mut self, ms: f32) {
         self.bots.push(ms);
+        self.cur_bots.push(ms);
     }
 
     /// Record the squad total for one bot frame, and open the window if this is its first sample.
@@ -165,6 +188,12 @@ impl BotProf {
         self.peak_bots = self.peak_bots.max(bots);
         if ms > budget {
             self.over += 1;
+        }
+        if ms > self.worst {
+            self.worst = ms;
+            self.worst_bots.clear();
+            self.worst_bots.extend_from_slice(&self.cur_bots);
+            self.worst_phase = self.cur_phase;
         }
     }
 
@@ -234,6 +263,15 @@ impl BotProf {
                 self.steer.max,
                 self.combat.avg(),
                 self.combat.max,
+            ),
+            // The autopsy: read across it to tell one dear bot from every bot at once.
+            format!(
+                "rtx bots: worst frame {:.2}ms | objective {:.2} steer {:.2} combat {:.2} | per-bot [{}]\n",
+                self.worst,
+                self.worst_phase[Phase::Objective as usize],
+                self.worst_phase[Phase::Steer as usize],
+                self.worst_phase[Phase::Combat as usize],
+                self.worst_bots.iter().map(|b| format!("{b:.2}")).collect::<Vec<_>>().join(" "),
             ),
         ]
     }
@@ -325,6 +363,35 @@ mod tests {
         assert!(out.contains("1.79ms under"), "{out}");
         assert!(out.contains("maxfps 77"), "{out}");
         assert!(out.contains("objective 9.80/9.80"), "{out}");
+    }
+
+    /// The autopsy exists to tell the two spike shapes apart, so pin that it can.
+    #[test]
+    fn worst_frame_autopsy_separates_one_dear_bot_from_a_whole_herd() {
+        let mut p = BotProf::default();
+        p.set_profiling(true);
+
+        // A herd frame: every bot elevated at once.
+        p.begin_frame();
+        for _ in 0..4 {
+            p.add_bot(5.0);
+            p.add_phase(Phase::Objective, 4.5);
+        }
+        p.add_frame(20.0, 4, 12.99);
+
+        // A dearer frame, but one bot's doing: the autopsy must now describe *this* one.
+        p.begin_frame();
+        p.add_bot(24.0);
+        p.add_phase(Phase::Steer, 23.0);
+        p.add_bot(0.1);
+        p.add_frame(24.1, 2, 12.99);
+
+        let out = p.render(10.0).join("");
+        assert!(out.contains("worst frame 24.10ms"), "{out}");
+        assert!(out.contains("per-bot [24.00 0.10]"), "{out}");
+        assert!(out.contains("steer 23.00"), "{out}");
+        // The herd frame's numbers must not bleed into the autopsy of a later, worse frame.
+        assert!(!out.contains("per-bot [5.00"), "{out}");
     }
 
     #[test]

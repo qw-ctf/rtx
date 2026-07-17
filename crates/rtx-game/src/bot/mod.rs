@@ -201,6 +201,11 @@ const PLAT_LOOKAHEAD: usize = 4;
 /// Minimum seconds between item-goal re-selections (so a bot commits to a pickup rather than
 /// flip-flopping between two of similar worth each frame).
 const GOAL_SELECT_INTERVAL: f32 = 1.5;
+/// Fraction of [`GOAL_SELECT_INTERVAL`] the re-selection period is spread over, per bot per pick, to
+/// keep the squad's floods off the same frame (see the re-arm in `resolve_objective`). `0.5` = each
+/// period lands in ±25% of 1.5s, i.e. 1.125–1.875s. Wide enough that a whole squad de-phases within a
+/// cycle or two, narrow enough that "a bot reconsiders about every 1.5s" is still true of each bot.
+const GOAL_SELECT_SPREAD: f32 = 0.5;
 /// How long after the last line-of-sight frame the nav view may still point at a Fight enemy's
 /// live origin. Set equal to combat's `HOLD_ANGLE_TIME` (the 2s corner-hold in `combat::engage`):
 /// while that hold owns the view it overrides `look` anyway, so the handoff is seamless — hold the
@@ -280,6 +285,7 @@ pub fn run_bots(game: &mut GameState) {
     if !profiling || game.bot_prof.budget_changed(budget) {
         game.bot_prof.reset();
     }
+    game.bot_prof.begin_frame();
     let frame = prof::Timer::start(profiling);
     let mut bots = 0usize;
 
@@ -835,13 +841,23 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
                 }
                 None => (0, 0, 0, 0, GoalCommit::None, GoalCommit::None),
             };
+            // Re-arm off-phase from the rest of the squad. A pick is the dearest thing a bot does —
+            // whole-navmesh floods, ~4ms on dm3 — and a flat `now + INTERVAL` would make firing on the
+            // same frame an *absorbing state*: every bot in a frame reads the same `now`, so two bots
+            // that ever coincide re-arm to a bit-identical deadline and coincide forever after. Deaths
+            // and goal invalidation keep shuffling bots into each other, each collision locks, and the
+            // squad ratchets into one herd — 6 bots × 4ms on a single 12.99ms frame, while 115 of every
+            // 116 frames do nothing. Drawing a fresh period per pick means colliding bots draw
+            // different ones and separate again, so alignment stays transient. Same work, same mean,
+            // only the phase moves. The other `next_pick = now` sites are deliberate re-picks: exact.
+            let spread = GOAL_SELECT_INTERVAL * (1.0 + GOAL_SELECT_SPREAD * (game.random() - 0.5));
             let b = &mut game.entities[e].bot;
             if new_item != b.goal.item {
                 b.goal.since = now; // restart the watchdog for a new goal
             }
             (b.goal.item, b.goal.item_cell) = (new_item, new_cell);
             (b.goal.next_item, b.goal.next_cell, b.goal.next_commit) = (next_item, next_cell, next_commit);
-            b.goal.next_pick = now + GOAL_SELECT_INTERVAL;
+            b.goal.next_pick = now + spread;
             b.goal.commit = commit;
         }
         if game.entities[e].bot.goal.item != 0 && !game.item_goal_valid(e, EntId(game.entities[e].bot.goal.item), now) {

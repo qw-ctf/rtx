@@ -83,13 +83,26 @@ The rocket-jump tuning loop built on top of it — an MCP server that Claude Cod
 ## Profiling the bot brain
 
 `rtx_bot_prof <seconds>` prints a periodic profile of what the bots cost, to the server console
-only — never to clients or the MVD/QTV stream. `0` (the default) times nothing at all.
+only — never to clients or the MVD/QTV stream. It defaults to `10`, on the view that a server
+that has started missing its frames should say so without being asked; `0` turns it off and
+times nothing at all.
 
 ```
-rtx bots: 10.0s 770 frames 6 bots | avg 2.14 p95 5.90 max 11.20 ms
-rtx bots: budget 12.99ms (maxfps 77) | worst 86% (1.79ms under) | 0/770 over | per-bot avg 0.36 max 3.10 ms
-rtx bots: phases avg/max ms | objective 1.30/9.80 | steer 0.51/1.40 | combat 0.28/0.90
+rtx bots: 10.0s 772 frames 6 bots | avg 0.47 p95 1.71 max 10.72 ms
+rtx bots: budget 12.99ms (maxfps 77) | worst 83% (2.27ms under) | 0/772 over | per-bot avg 0.08 max 4.55 ms
+rtx bots: phases avg/max ms | objective 0.03/4.49 | steer 0.01/3.26 | combat 0.01/0.47
+rtx bots: worst frame 10.72ms | objective 10.32 steer 0.15 combat 0.10 | per-bot [0.12 0.02 3.14 2.55 2.63 2.26]
 ```
+
+The last line is an autopsy of the single worst frame in the window, and it's the one that
+answers *why*: `avg`/`p95`/`max` tell you a spike happened, but only the per-bot split tells one
+dear bot (`[0.06 0.02 7.51 0.03 0.01 0.01]`) from the whole squad landing on one frame
+(`[4.98 4.09 3.92 3.77 3.74 4.04]`) — a distinction that decides whether you optimise the work
+or spread it. This is how the goal-selection lockstep was found; see `GOAL_SELECT_SPREAD`.
+
+One spike is expected and harmless: a batch of bots is added within a single bot frame, so a
+freshly spawned squad takes its first (dearest) pick together, once. They scatter within a cycle
+or two and stay scattered.
 
 Read it with three facts from mvdsv's `SV_RunBots` (`src/sv_phys.c`) in mind:
 
