@@ -84,6 +84,8 @@ struct App {
     nav: Option<(Bsp, NavGraph)>,
     /// Per-`LinkKind` visibility (indexed by `geom::kind_index`); `Walk` gates the filled surface.
     visible: [bool; NUM_LINK_KINDS],
+    /// Tint the walkable surface by LOD cluster instead of the flat walk color — the hierarchy overlay.
+    clusters: bool,
     egui_ctx: egui::Context,
     /// egui's winit input translator; created with the window in `resumed`.
     egui_state: Option<egui_winit::State>,
@@ -110,6 +112,7 @@ impl App {
             pending_path,
             nav: None,
             visible: [true; NUM_LINK_KINDS],
+            clusters: false,
             egui_ctx: egui::Context::default(),
             egui_state: None,
         }
@@ -119,10 +122,12 @@ impl App {
     /// the current graph and path-type visibility. Cheap enough to redo on every toggle change.
     fn rebuild_overlay(&mut self) {
         let (Some(gpu), Some((bsp, graph))) = (self.gpu.as_mut(), self.nav.as_ref()) else { return };
-        if self.visible[geom::kind_index(rtx_nav::navmesh::LinkKind::Walk)] {
-            gpu.set_surface(&geom::nav_surface(graph, bsp));
-        } else {
+        if !self.visible[geom::kind_index(rtx_nav::navmesh::LinkKind::Walk)] {
             gpu.set_surface(&[]);
+        } else if self.clusters {
+            gpu.set_surface(&geom::nav_clusters(graph, bsp));
+        } else {
+            gpu.set_surface(&geom::nav_surface(graph, bsp));
         }
         gpu.set_lines(&geom::nav_lines(graph, &self.visible));
         if let Some(w) = &self.window {
@@ -141,11 +146,13 @@ impl App {
         let raw_input = self.egui_state.as_mut().unwrap().take_egui_input(&window);
         let ctx = self.egui_ctx.clone();
         let mut visible = self.visible;
-        let full = ctx.run_ui(raw_input, |ui| build_panel(ui, &mut visible));
+        let mut clusters = self.clusters;
+        let full = ctx.run_ui(raw_input, |ui| build_panel(ui, &mut visible, &mut clusters));
         self.egui_state.as_mut().unwrap().handle_platform_output(&window, full.platform_output);
 
-        if visible != self.visible {
+        if visible != self.visible || clusters != self.clusters {
             self.visible = visible;
+            self.clusters = clusters;
             self.rebuild_overlay();
         }
 
@@ -371,7 +378,7 @@ impl ApplicationHandler<UserEvent> for App {
 
 /// The path-type toggle panel: a checkbox per `LinkKind`, labelled and swatched in that kind's
 /// overlay color. `Walk` toggles the filled walkable surface; the rest toggle their colored lines.
-fn build_panel(ui: &mut egui::Ui, visible: &mut [bool; NUM_LINK_KINDS]) {
+fn build_panel(ui: &mut egui::Ui, visible: &mut [bool; NUM_LINK_KINDS], clusters: &mut bool) {
     egui::Window::new("Path types")
         .default_pos([12.0, 12.0])
         .resizable(false)
@@ -384,6 +391,8 @@ fn build_panel(ui: &mut egui::Ui, visible: &mut [bool; NUM_LINK_KINDS]) {
                     ui.colored_label(swatch, geom::kind_label(kind));
                 });
             }
+            ui.separator();
+            ui.checkbox(clusters, "LOD clusters");
         });
 }
 
