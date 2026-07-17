@@ -16,6 +16,12 @@ pub struct BotState {
     pub is_bot: bool,
     /// 1-based engine client number, for `set_bot_cmd`/`remove_bot`.
     pub client: i32,
+    /// Whether this body was alive on the previous bot frame. The false→true edge is the one spawn
+    /// signal shared by server bots and network-client mirrors.
+    pub was_alive: bool,
+    /// Fresh-DM-spawn stack run: suppress initiating a fight and keep one reachable armor/weapon
+    /// pickup completion-critical. Ends as soon as that pickup changes armor or weapon inventory.
+    pub spawn_exit: bool,
     /// Current A* route as link indices into the navmesh, and our leg within it.
     pub route: Vec<u32>,
     pub route_pos: usize,
@@ -335,8 +341,9 @@ pub struct GoalState {
     /// for being stuck.
     pub since: f32,
     /// Completion lock for a pickup that must not lose movement ownership to combat or a periodic
-    /// goal re-pick. `Pickup` is a nearby lifesaving health/armor item; `Powerup` is a selected timed
-    /// powerup. The lock ends only on touch, invalidation, route failure, or its watchdog.
+    /// goal re-pick. `Pickup` covers local recovery, a selected major, or a fresh-spawn stack item;
+    /// `Powerup` is a selected timed powerup. The lock ends only on touch, invalidation, route
+    /// failure, or its watchdog.
     pub commit: GoalCommit,
     /// Handoff hold (team opponent modeling): a spawned RL/LG this bot stands on but deliberately
     /// does **not** pick up (`bot_pickup_items` skips it), reserving it for a powerup-carrying
@@ -353,7 +360,7 @@ pub struct GoalState {
 }
 
 /// How strongly the current item goal is committed. Ordinary goals remain freely re-scored;
-/// lifesaving local pickups and timed powerups own movement until completion.
+/// completion-critical stack pickups and timed powerups own movement until completion.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GoalCommit {
     #[default]

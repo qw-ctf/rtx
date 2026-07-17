@@ -85,13 +85,51 @@ const LOCAL_PICKUP_TRAVEL: f32 = 1.0;
 /// Euclidean pre-filter before the local Dijkstra. It is deliberately looser than one second of
 /// stock running to admit a short stair/turn while avoiding a flood when no relevant item is nearby.
 const LOCAL_PICKUP_RADIUS: f32 = 384.0;
+/// Once an already-selected health/armor goal is this close, finish it even when cell-level travel
+/// is inflated by a turn or stair. This covers the analysed 116-209 qu armor stalls while remaining
+/// a terminal approach, not a new cross-room combat detour.
+const TERMINAL_PICKUP_RADIUS: f32 = 256.0;
 
 /// Whether a local pickup's cell-level route is short enough to take movement ownership. The
 /// current-goal bit is deliberately explicit: terminal completion may need a different rule from
 /// opportunistically choosing a new nearby pickup.
-fn local_pickup_in_budget(_current_goal: bool, distance: f32, travel: f32) -> bool {
-    distance <= LOCAL_PICKUP_RADIUS && travel.is_finite() && travel <= LOCAL_PICKUP_TRAVEL
+fn local_pickup_in_budget(current_goal: bool, distance: f32, travel: f32) -> bool {
+    distance <= LOCAL_PICKUP_RADIUS
+        && travel.is_finite()
+        && (travel <= LOCAL_PICKUP_TRAVEL || (current_goal && distance <= TERMINAL_PICKUP_RADIUS))
 }
+
+/// A high stack pickup may beat a slightly nearer low one during a fresh-spawn exit. One second is
+/// enough to choose a bridge/window-level destination when it is genuinely nearby, but too small to
+/// turn an across-map RA into the answer to every spawn.
+const SPAWN_HEIGHT_BONUS_MAX: f32 = 1.0;
+const SPAWN_HEIGHT_BONUS_RISE: f32 = 128.0;
+const SPAWN_STACK_TRAVEL_MAX: f32 = 10.0;
+
+#[derive(Clone, Copy, Debug)]
+struct SpawnStackCandidate {
+    item: EntId,
+    cell: CellId,
+    travel: f32,
+    rise: f32,
+}
+
+/// Choose the nearest reachable spawn-stack pickup, with a bounded preference for gaining height.
+fn choose_spawn_stack(candidates: impl IntoIterator<Item = SpawnStackCandidate>) -> Option<SpawnStackCandidate> {
+    candidates
+        .into_iter()
+        .filter(|c| c.travel.is_finite() && c.travel <= SPAWN_STACK_TRAVEL_MAX)
+        .min_by(|a, b| {
+            let score = |c: &SpawnStackCandidate| {
+                c.travel - (c.rise.max(0.0) / SPAWN_HEIGHT_BONUS_RISE).min(SPAWN_HEIGHT_BONUS_MAX)
+            };
+            score(a)
+                .total_cmp(&score(b))
+                .then_with(|| a.travel.total_cmp(&b.travel))
+                .then_with(|| a.item.0.cmp(&b.item.0))
+        })
+}
+
 /// While committed to a respawning powerup, only consider ordinary pickups this close and this
 /// quick to reach. The second leg is checked against the powerup timer below, so this is a cost
 /// bound as well as a guard against scanning/flooding unrelated items across the room.
@@ -870,6 +908,40 @@ impl GameState {
     /// first leg is allowed only when the bounded plan proves it bridges to one of those.
     pub(crate) fn select_major_item(&self, bot_e: EntId) -> Option<ItemPlan> {
         self.best_item_plan(bot_e).filter(|p| p.contains_powerup || p.contains_major)
+    }
+
+    /// Fresh-spawn exit: take one available armor or weapon before initiating combat. Unlike the
+    /// general value planner this is deliberately one leg and travel-led; the bounded height bonus
+    /// favors bridge/window-level exits without making a distant high item universally win.
+    pub(crate) fn select_spawn_stack_item(&self, bot_e: EntId) -> Option<(EntId, CellId)> {
+        let graph = self.nav.graph.as_ref()?;
+        let origin = self.entities[bot_e].v.origin;
+        let from = graph.nearest(origin)?;
+        let now = self.time();
+        let pricing = self.bot_link_pricing(bot_e, now);
+        let travel = graph.costs_from(from, &pricing.costs(0));
+        let stats = self.bot_stats(bot_e);
+
+        choose_spawn_stack(self.nav.goals.iter().filter_map(|&(idx, cell)| {
+            let item = EntId(idx);
+            let ent = &self.entities[item];
+            if ent.v.solid != Solid::Trigger || self.entities[bot_e].bot.is_avoided(idx, now) {
+                return None;
+            }
+            let cat = ent.classname().and_then(category)?;
+            if !matches!(cat, Category::Armor { .. } | Category::Weapon(_))
+                || self.item_desire(&stats, item, cat) <= 0.0
+            {
+                return None;
+            }
+            Some(SpawnStackCandidate {
+                item,
+                cell,
+                travel: travel[cell as usize],
+                rise: ent.v.origin.z - origin.z,
+            })
+        }))
+        .map(|c| (c.item, c.cell))
     }
 
     /// Pick a spawned, nearby health/armor recovery or timed powerup that must be completed before
@@ -1804,6 +1876,39 @@ mod tests {
         assert!(local_pickup_in_budget(true, 209.0, 1.5));
         // A different item at the same cost remains merely opportunistic and must not hijack combat.
         assert!(!local_pickup_in_budget(false, 209.0, 1.5));
+    }
+
+    #[test]
+    fn spawn_stack_choice_is_nearest_with_a_bounded_height_preference() {
+        let low = SpawnStackCandidate {
+            item: EntId(10),
+            cell: 1,
+            travel: 2.0,
+            rise: 0.0,
+        };
+        let nearby_high = SpawnStackCandidate {
+            item: EntId(11),
+            cell: 2,
+            travel: 2.6,
+            rise: 128.0,
+        };
+        assert_eq!(choose_spawn_stack([low, nearby_high]).unwrap().item, nearby_high.item);
+
+        let distant_high = SpawnStackCandidate {
+            item: EntId(12),
+            cell: 3,
+            travel: 4.0,
+            rise: 256.0,
+        };
+        assert_eq!(choose_spawn_stack([low, distant_high]).unwrap().item, low.item);
+
+        let unreachable = SpawnStackCandidate {
+            item: EntId(13),
+            cell: 4,
+            travel: f32::INFINITY,
+            rise: 512.0,
+        };
+        assert_eq!(choose_spawn_stack([low, unreachable]).unwrap().item, low.item);
     }
 
     #[test]

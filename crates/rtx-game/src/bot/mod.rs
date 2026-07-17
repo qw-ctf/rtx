@@ -631,21 +631,41 @@ fn hard_mode_objective(intent: Option<BotIntent>) -> bool {
 /// first/continuation mapping cannot silently diverge as new strategic item tiers are added.
 fn planned_goal_commits(
     contains_powerup: bool,
-    _contains_major: bool,
+    contains_major: bool,
     next_powerup: bool,
-    _next_major: bool,
+    next_major: bool,
 ) -> (GoalCommit, GoalCommit) {
     let first = if contains_powerup {
         GoalCommit::Powerup
+    } else if contains_major {
+        GoalCommit::Pickup
     } else {
         GoalCommit::None
     };
     let next = if next_powerup {
         GoalCommit::Powerup
+    } else if next_major {
+        GoalCommit::Pickup
     } else {
         GoalCommit::None
     };
     (first, next)
+}
+
+/// A fresh DM spawn has completed its one-item exit as soon as it owns armor or any weapon beyond
+/// the stock axe/shotgun (the optional grapple is also part of the spawn kit, not an exit pickup).
+fn spawn_exit_complete(armor_value: f32, items: f32) -> bool {
+    armor_value > 0.0
+        || [
+            Items::SUPER_SHOTGUN,
+            Items::NAILGUN,
+            Items::SUPER_NAILGUN,
+            Items::GRENADE_LAUNCHER,
+            Items::ROCKET_LAUNCHER,
+            Items::LIGHTNING,
+        ]
+        .into_iter()
+        .any(|weapon| items.has(weapon))
 }
 
 fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, client: i32) -> Objective {
@@ -724,9 +744,14 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // Whether to stop politely short of the destination (see `Objective::polite`) — flagged at
     // the arms that tail a human or roam, never for a mode-issued intent.
     let mut polite = false;
+    let stack_exit = game.entities[e].bot.spawn_exit;
     let intent = if crate::mode::team::benched(game, e) {
         // Benched spectator (structured match, off the locked roster): stroll the stands, no fighting.
         Some(BotIntent::Move(crate::mode::wander_point(game, e, "info_player_deathmatch", |_| None)))
+    } else if stack_exit {
+        // A fresh DM spawn takes one armor/weapon before initiating. `None` keeps combat from
+        // nominating a target; the dedicated one-leg item selector below owns the exit instead.
+        None
     } else if host.cvar_bool(c"rtx_bot_pacifist") && mode.allows_bot_pacifist_override() {
         // Global override where the mode permits it: don't fight — just tail the nearest human.
         // Race refuses this because its hard Move intent is the ordered checkpoint/finish route.
@@ -827,7 +852,8 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
 
     // Fast local survival pass. It is independent of greed and runs while idle or fighting, but not
     // during a ballistic traversal whose route/view already have an indivisible owner.
-    let urgent_allowed = matches!(intent, None | Some(BotIntent::Fight(_) | BotIntent::Advance(_)))
+    let urgent_allowed = !stack_exit
+        && matches!(intent, None | Some(BotIntent::Fight(_) | BotIntent::Advance(_)))
         && !traversal_committed;
     // A timed powerup commitment normally freezes item selection, but a known respawn wait is spare
     // route time: use it to collect a nearby health/armor/weapon only when the complete two-leg path
@@ -874,7 +900,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     let holding = game.update_handoff_hold(
         e,
         now,
-        intent.is_none() && game.entities[e].bot.goal.commit == GoalCommit::None,
+        intent.is_none() && !stack_exit && game.entities[e].bot.goal.commit == GoalCommit::None,
     );
     if holding {
         // `update_handoff_hold` set `goal_item` to the held weapon — nothing else to pick this frame.
@@ -882,10 +908,20 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         // Nearby recovery / timed powerup completion owns the slot until its terminal condition.
     } else if intent.is_none() || matches!(intent, Some(BotIntent::Fight(_) | BotIntent::Advance(_))) {
         if now >= game.entities[e].bot.goal.next_pick {
-            let pick = match intent {
-                Some(BotIntent::Fight(_)) if greedy => game.select_combat_item(e),
-                Some(BotIntent::Fight(_)) => game.select_major_item(e),
-                _ => game.select_item_goal(e),
+            let pick = if stack_exit {
+                game.select_spawn_stack_item(e).map(|first| goals::ItemPlan {
+                    first,
+                    second: None,
+                    first_desire: 0.0,
+                    contains_powerup: false,
+                    contains_major: false,
+                })
+            } else {
+                match intent {
+                    Some(BotIntent::Fight(_)) if greedy => game.select_combat_item(e),
+                    Some(BotIntent::Fight(_)) => game.select_major_item(e),
+                    _ => game.select_item_goal(e),
+                }
             };
             let (new_item, new_cell, next_item, next_cell, commit, next_commit) = match pick {
                 Some(plan) => {
@@ -893,12 +929,16 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
                     let (next, next_cell) = plan.second.map_or((0, 0), |(it, cell)| (it.0, cell));
                     let next_powerup = next != 0 && game.is_powerup_item(EntId(next));
                     let next_major = next != 0 && game.is_major_item(EntId(next));
-                    let (commit, next_commit) = planned_goal_commits(
-                        plan.contains_powerup,
-                        plan.contains_major,
-                        next_powerup,
-                        next_major,
-                    );
+                    let (commit, next_commit) = if stack_exit {
+                        (GoalCommit::Pickup, GoalCommit::None)
+                    } else {
+                        planned_goal_commits(
+                            plan.contains_powerup,
+                            plan.contains_major,
+                            next_powerup,
+                            next_major,
+                        )
+                    };
                     (first.0, first_cell, next, next_cell, commit, next_commit)
                 }
                 None => (0, 0, 0, 0, GoalCommit::None, GoalCommit::None),
@@ -1003,8 +1043,9 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
             crate::mode::ArenaRole::Audience => 'A',
         };
         let msg = cstring(&format!(
-            "rtx bot{client}: role={role} want={goal} dist={dist:.0} gcell={gcell} gdz={gdz:.0} on_item={overlap} ownLG={own_lg} cells={:.0} pen={pen} aware={aware} est={est} hold={hold} mag={mag} commit={commit:?} posture={posture:?} vig={vig} watch={wat}\n",
+            "rtx bot{client}: role={role} want={goal} dist={dist:.0} gcell={gcell} gdz={gdz:.0} on_item={overlap} ownLG={own_lg} cells={:.0} pen={pen} aware={aware} est={est} hold={hold} mag={mag} commit={commit:?} posture={posture:?} spawnexit={} vig={vig} watch={wat}\n",
             game.entities[e].v.ammo_cells,
+            stack_exit as i32,
         ));
         host.conprint(&msg); // conprint always shows; dprint needs `developer 1`
     }
@@ -1325,6 +1366,27 @@ fn run_bot(game: &mut GameState, e: EntId) {
         b.pulse
     };
 
+    // Detect the living edge rather than a server-only spawn callback: a network-client body is
+    // spawned by the remote server, but its mirrored health produces the same false→true edge. In
+    // ordinary DM with stack discipline, reserve the first life objective for one armor/weapon.
+    let spawn_exit_done = spawn_exit_complete(game.entities[e].v.armorvalue, game.entities[e].v.items);
+    let fresh_spawn = alive && !game.entities[e].bot.was_alive;
+    {
+        let enable = game.mode.name() == "dm" && host.cvar_bool(c"rtx_bot_stack");
+        let b = &mut game.entities[e].bot;
+        b.was_alive = alive;
+        if fresh_spawn {
+            b.spawn_exit = enable && !spawn_exit_done;
+            b.goal.item = 0;
+            b.goal.next_item = 0;
+            b.goal.commit = GoalCommit::None;
+            b.goal.next_commit = GoalCommit::None;
+            b.goal.next_pick = now;
+        } else if b.spawn_exit && spawn_exit_done {
+            b.spawn_exit = false;
+        }
+    }
+
     // A dead bot holds nothing and isn't mid-jump — drop the handoff reservation and any airborne
     // commitment so neither resumes after respawn.
     if !alive {
@@ -1336,6 +1398,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
         b.sj = None;
         b.goal.commit = GoalCommit::None;
         b.posture = CombatPosture::Hold;
+        b.spawn_exit = false;
     }
 
     // Connected but never spawned (health 0, not dead): the engine defers `PutClientInServer` — the
@@ -2148,6 +2211,15 @@ mod tests {
             (GoalCommit::Pickup, GoalCommit::Pickup),
             "an ordinary bridge and its major continuation must both retain pickup ownership",
         );
+    }
+
+    #[test]
+    fn spawn_exit_ends_only_after_armor_or_an_upgraded_weapon() {
+        let stock = (Items::AXE | Items::SHOTGUN | Items::GRAPPLE).as_f32();
+        assert!(!spawn_exit_complete(0.0, stock));
+        assert!(spawn_exit_complete(1.0, stock));
+        assert!(spawn_exit_complete(0.0, stock.with(Items::SUPER_NAILGUN)));
+        assert!(spawn_exit_complete(0.0, stock.with(Items::ROCKET_LAUNCHER)));
     }
 
     /// The corridor scan (used pure, no NavGraph): a straight level corridor is all runway; a sharp
