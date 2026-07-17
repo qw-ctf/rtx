@@ -443,18 +443,14 @@ fn collect_touch_terminals(
 #[cfg(all(test, feature = "netclient"))]
 mod tests {
     use super::*;
+    use crate::bsp::Bsp;
     use crate::defs::{Bits, Items, Solid};
     use crate::entity::Touch;
     use crate::netclient::host::NetHost;
+    use crate::navmesh::NavGraph;
     use std::path::PathBuf;
 
-    fn armor_take_from_terminal(classname: &str, item_origin: Vec3, bad_endpoint: Vec3) {
-        let valid_endpoint = item_origin + Vec3::new(0.0, 0.0, 24.0);
-        let cells = [(7, bad_endpoint), (8, valid_endpoint)];
-        let terminals = collect_touch_terminals(cells, item_origin);
-
-        assert_eq!(terminals, vec![8], "the observed stall cell must not catalogue as a pickup terminal");
-
+    fn assert_armor_take(classname: &str, item_origin: Vec3, terminal: Vec3) {
         let host: &'static NetHost = Box::leak(Box::new(NetHost::new(PathBuf::from("/nonexistent"))));
         host.set("maxclients", "8");
         let mut game = GameState::new_client(host);
@@ -464,7 +460,7 @@ mod tests {
             ent.in_use = true;
             ent.classname = Some("player".into());
             ent.v.health = 100.0;
-            ent.v.origin = valid_endpoint;
+            ent.v.origin = terminal;
         }
         {
             let ent = &mut game.entities[armor];
@@ -485,6 +481,15 @@ mod tests {
         assert_eq!(game.entities[armor].v.solid, Solid::Not, "the server-side pickup handler consumed it");
     }
 
+    fn armor_take_from_terminal(classname: &str, item_origin: Vec3, bad_endpoint: Vec3) {
+        let valid_endpoint = item_origin + Vec3::new(0.0, 0.0, 24.0);
+        let cells = [(7, bad_endpoint), (8, valid_endpoint)];
+        let terminals = collect_touch_terminals(cells, item_origin);
+
+        assert_eq!(terminals, vec![8], "the observed stall cell must not catalogue as a pickup terminal");
+        assert_armor_take(classname, item_origin, valid_endpoint);
+    }
+
     #[test]
     fn dm3_ra_wrong_side_endpoint_rebinds_to_a_real_take() {
         armor_take_from_terminal(
@@ -501,5 +506,49 @@ mod tests {
             Vec3::new(1232.0, -904.0, -48.0),
             Vec3::new(1239.0, -887.0, 88.0),
         );
+    }
+
+    /// Optional real-map check used by the DM3 bench/ref loop. The always-on endpoint tests above
+    /// exercise catalog filtering plus the real armor handler without shipping id's BSP in-tree;
+    /// setting `RTX_TEST_BSP=.../dm3.bsp` additionally proves the generated DM3 graph exposes
+    /// touch-valid terminals for both armor entities and that those exact cell origins take armor.
+    #[test]
+    fn dm3_real_navmesh_exposes_takeable_ra_and_ya_terminals() {
+        let Ok(path) = std::env::var("RTX_TEST_BSP") else {
+            return;
+        };
+        if !path.to_ascii_lowercase().contains("dm3") {
+            return;
+        }
+        let bytes = std::fs::read(path).expect("read dm3 bsp");
+        let bsp = Bsp::parse(&bytes).expect("parse dm3 bsp");
+        let graph = NavGraph::build(&bsp);
+
+        for (classname, item_origin, bad_endpoint) in [
+            (
+                "item_armorInv",
+                Vec3::new(256.0, -704.0, 304.0),
+                Vec3::new(360.0, -677.0, 264.0),
+            ),
+            (
+                "item_armor2",
+                Vec3::new(1232.0, -904.0, -48.0),
+                Vec3::new(1239.0, -887.0, 88.0),
+            ),
+        ] {
+            assert!(!crate::bot::on_item(bad_endpoint, item_origin), "observed endpoint is not a take");
+            let terminals = collect_touch_terminals(
+                graph
+                    .cells
+                    .iter()
+                    .enumerate()
+                    .map(|(cell, c)| (cell as navmesh::CellId, c.origin)),
+                item_origin,
+            );
+            assert!(!terminals.is_empty(), "{classname} has no touch-valid DM3 terminal");
+            let terminal = graph.cell_origin(terminals[0]);
+            assert!(crate::bot::on_item(terminal, item_origin));
+            assert_armor_take(classname, item_origin, terminal);
+        }
     }
 }
