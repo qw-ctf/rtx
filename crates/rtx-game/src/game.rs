@@ -140,6 +140,10 @@ pub struct GameState {
     map_spawned: bool,
     /// One-shot: whether we've logged that the normal frame is driving the bots (diagnostic).
     normal_bot_drive_logged: bool,
+    /// Opt-in wall-clock profile of the bot brain (`rtx_bot_prof <seconds>`). Inert — and free — until
+    /// the cvar is set. Lives here rather than in `bot` so both embodiments get it: the netclient owns
+    /// a `GameState` too, and drives the same `run_bots`. See [`bot::prof`].
+    pub(crate) bot_prof: bot::prof::BotProf,
     /// A population change the bot manager wants applied this frame (add or remove one bot),
     /// deferred out of the frame. `add_bot`/`remove_bot` make the engine run our
     /// `ClientConnect`/`PutClientInServer`/`ClientDisconnect` *synchronously and re-entrantly*; if
@@ -233,6 +237,7 @@ impl GameState {
             bot_frame_seen: false,
             map_spawned: false,
             normal_bot_drive_logged: false,
+            bot_prof: bot::prof::BotProf::default(),
             pending_roster: None,
             dyn_assets: DynAssets::default(),
             control: crate::control::ControlState::default(),
@@ -613,6 +618,10 @@ impl GameState {
         for &(name, seed) in crate::cvars::RTX_CVAR_DEFAULTS {
             self.host.cvar_default(name, seed);
         }
+
+        // A map load is not bot time. Drop any half-collected profile window so the first report on
+        // the new map doesn't bill it for the changeover.
+        self.bot_prof.reset();
 
         // conprint (not dprint) so it shows without `developer 1` — lets you confirm at a glance
         // that the freshly built module is the one actually loaded.

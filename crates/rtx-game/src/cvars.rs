@@ -150,6 +150,10 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         ("rtx_bot_stack", Bool(true)),
         // Per-bot goal/pickup diagnostics to the server console (off by default).
         ("rtx_bot_debug", Bool(false)),
+        // Bot evaluation profiler: seconds between server-console reports of what the bot brain costs
+        // per bot frame (p95, worst, and the head-room left against the `maxfps` slice the engine
+        // allots it). `0` (default) = off, and nothing is timed. See [`crate::bot::prof`].
+        ("rtx_bot_prof", Float(0.0)),
         // Bots rocket-jump to ledges that would otherwise need a long detour (or are unreachable).
         // Costs health, so a bot only plans one when it clearly beats the walk and it's fit to fly it
         // (has the RL, a rocket, and the health). On by default.

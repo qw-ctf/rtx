@@ -80,6 +80,34 @@ binds nothing. Implementation: `crates/rtx-game/src/control.rs`.
 The rocket-jump tuning loop built on top of it — an MCP server that Claude Code drives, plus the
 `rtx_rj_*` knobs it turns — is documented in [`crates/rjmcp/README.md`](../crates/rjmcp/README.md).
 
+## Profiling the bot brain
+
+`rtx_bot_prof <seconds>` prints a periodic profile of what the bots cost, to the server console
+only — never to clients or the MVD/QTV stream. `0` (the default) times nothing at all.
+
+```
+rtx bots: 10.0s 770 frames 6 bots | avg 2.14 p95 5.90 max 11.20 ms
+rtx bots: budget 12.99ms (maxfps 77) | worst 86% (1.79ms under) | 0/770 over | per-bot avg 0.36 max 3.10 ms
+rtx bots: phases avg/max ms | objective 1.30/9.80 | steer 0.51/1.40 | combat 0.28/0.90
+```
+
+Read it with three facts from mvdsv's `SV_RunBots` (`src/sv_phys.c`) in mind:
+
+- **A frame is the whole squad.** The engine calls the module *once per bot frame, not once per
+  bot* — `SV_ProgStartFrame(true)` runs before its client loop — so one frame sample is every
+  bot's thinking, and `bots` is how many were in it.
+- **The budget is `maxfps`.** `SV_RunBots` reads that cvar (`{"maxfps", "77", CVAR_SERVERINFO}`),
+  substitutes 77 outside `[20, 1000]`, and won't run a bot frame until `1/maxfps` has elapsed.
+  Since `SV_Frame` runs `SV_Physics()` *then* `SV_RunBots()`, time spent here is added to the
+  server's own frame — an overrun makes the *server* late, not just the bots.
+- **It measures deciding, not moving.** Per-bot physics (`SV_RunCmd`, trigger touches) happens
+  outside our call and isn't counted.
+
+Watch `p95` and `max` rather than `avg`: the costly work is spiky, not steady — goal selection
+floods the whole navmesh but only every 1.5s, and A* re-paths every 0.4s. The `phases` line
+attributes a spike (`objective` is goal selection, `steer` is A*, `combat` is traces and grenade
+rollouts); they sum to less than the frame total, the remainder being sensing and command emit.
+
 ## Contributing notes
 
 The source is hand-wrapped narrower than rustfmt's `max_width` — please don't run `cargo fmt`;

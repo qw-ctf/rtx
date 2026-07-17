@@ -90,6 +90,7 @@ Debug and harness knobs — safe to ignore on a play server. See
 | cvar | default | effect |
 |------|---------|--------|
 | `rtx_bot_debug` | `0` | Per-bot goal/pickup diagnostics to the server console. |
+| `rtx_bot_prof` | `0` | Seconds between bot-evaluation profile reports on the server console (p95, worst frame, head-room against the engine's `maxfps` slice). `0` = off, and nothing is timed. |
 | `rtx_control_port` | `0` | TCP control channel (localhost) for scripted bot puppetry — teleport, goto, fly a link, read telemetry. `0` = no socket bound. |
 | `rtx_rj_stance` | `16` | Rocket-jump driver: stance offset. |
 | `rtx_rj_aim_tol` | `0.5` | Rocket-jump driver: aim tolerance (degrees). |

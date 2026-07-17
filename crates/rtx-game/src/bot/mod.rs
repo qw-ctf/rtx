@@ -24,6 +24,7 @@ mod hook;
 pub(crate) mod model;
 pub(crate) mod perception;
 mod population;
+pub(crate) mod prof;
 mod rj;
 pub(crate) mod state;
 mod steer;
@@ -267,14 +268,39 @@ pub fn run_bots(game: &mut GameState) {
     // twice — once here, once on the server — and leave our idea of the world disagreeing with the
     // only copy that counts.
     let fake_client = !game.host().is_client();
+
+    // Opt-in profiling (`rtx_bot_prof <seconds>`). The engine calls us once per bot *frame*, not once
+    // per bot (mvdsv's `SV_RunBots` runs `SV_ProgStartFrame(true)` before its client loop), so this
+    // one bracket is already the whole squad's think time — see `prof`.
+    let host = *game.host();
+    let interval = host.cvar(c"rtx_bot_prof");
+    let profiling = interval > 0.0;
+    let budget = prof::budget_ms(&host);
+    game.bot_prof.set_profiling(profiling);
+    if !profiling || game.bot_prof.budget_changed(budget) {
+        game.bot_prof.reset();
+    }
+    let frame = prof::Timer::start(profiling);
+    let mut bots = 0usize;
+
     for i in 1..=maxclients as u32 {
         let e = EntId(i);
         if game.entities[e].bot.is_bot && game.entities[e].in_use {
+            let one = prof::Timer::start(profiling);
             if fake_client {
                 bot_pickup_items(game, e);
             }
             run_bot(game, e);
+            if profiling {
+                bots += 1;
+                game.bot_prof.add_bot(one.stop());
+            }
         }
+    }
+
+    if profiling {
+        game.bot_prof.add_frame(frame.stop(), bots, budget);
+        game.bot_prof.maybe_report(&host, interval);
     }
 }
 
@@ -1256,7 +1282,13 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // lip. `steer` owns the physical lifecycle and fallback latch.
     prearm_traversal(game, e, now, s.on_ground);
 
+    // Profiling brackets (see `prof`): each phase is banked the moment it's measured, not batched to
+    // the end of this function — the early returns below sit *after* this call, and a write-back would
+    // silently drop a goal flood we'd already paid for.
+    let profiling = game.bot_prof.profiling();
+    let t = prof::Timer::start(profiling);
     let mut o = resolve_objective(game, e, now, origin, client);
+    game.bot_prof.add_phase(prof::Phase::Objective, t.stop());
     // The spine and prologue read a few fields; `steer` re-destructures the rest from `o` via `SteerCtx`.
     let Objective { enemy, item_cell, target_origin, .. } = o;
 
@@ -1355,6 +1387,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
         })
         .collect();
 
+    let t = prof::Timer::start(profiling);
     let bot = &mut game.entities[e].bot;
     let steer::SteerOut { mut cmd, bhop_cmd, hook, rj, traversal_lock, overlays_ok } = steer::steer(
         graph,
@@ -1374,6 +1407,8 @@ fn run_bot(game: &mut GameState, e: EntId) {
     );
 
     // The `&nav` / `&mut bot` steering borrows have ended; the spine resumes with `&mut game`.
+    game.bot_prof.add_phase(prof::Phase::Steer, t.stop());
+
     // Navigation's world-move, kept so combat can't strand the bot in water: a swimmer isn't
     // ONGROUND, so `combat_move`'s hazard filter never runs and it would strafe in place until it
     // drowns. In water we restore this route move (which the water surcharge aims at shore).
@@ -1382,6 +1417,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
 
     // Combat overlay: with an enemy in sight, `engage` picks the look (live aim with drifting error)
     // and its own movement; traversal-critical legs are locked out (see `SteerOut::traversal_lock`).
+    let t = prof::Timer::start(profiling);
     if let Some(en) = enemy.filter(|_| !traversal_lock) {
         combat::engage(game, e, en, origin, now, &mut cmd);
     }
@@ -1422,6 +1458,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
             }
         }
     }
+    game.bot_prof.add_phase(prof::Phase::Combat, t.stop());
     emit(game, e, s, cmd, bhop_cmd, &hook, &rj, enemy);
 }
 
