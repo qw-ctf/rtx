@@ -1366,9 +1366,6 @@ impl WorldMirror {
             }
             let slot = EntId(e.number as u32);
             if let std::collections::hash_map::Entry::Vacant(entry) = self.dropped_powerups.entry(e.number) {
-                let Some(cell) = game.nav.graph.as_ref().and_then(|g| g.nearest(e.origin)) else {
-                    continue; // nowhere reachable to stand — not a goal we can offer
-                };
                 let ent = &mut game.entities[slot];
                 *ent = Entity::default();
                 ent.in_use = true;
@@ -1376,7 +1373,21 @@ impl WorldMirror {
                 ent.v.solid = Solid::Trigger; // the goal loop takes only `Trigger` items
                 ent.v.mins = Vec3::new(-16.0, -16.0, 0.0);
                 ent.v.maxs = Vec3::new(16.0, 16.0, 56.0);
-                game.nav.goals.push((slot.0, cell));
+                ent.v.origin = e.origin;
+                let terminals = crate::nav_build::collect_touch_terminals(
+                    game.nav
+                        .graph
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|g| g.cells.iter().enumerate())
+                        .map(|(cell, c)| (cell as crate::navmesh::CellId, c.origin)),
+                    ent,
+                );
+                if terminals.is_empty() {
+                    game.entities[slot] = Entity::default();
+                    continue; // nowhere the player hull can touch it — not a goal we can offer
+                }
+                game.nav.goals.extend(terminals.into_iter().map(|cell| (slot.0, cell)));
                 entry.insert(slot);
                 eprintln!("rtx-client: a {classname} is on the floor — now a goal");
             }

@@ -15,7 +15,7 @@ use glam::{Vec2, Vec3, Vec3Swizzles};
 use super::*;
 use crate::bsp::Bsp;
 use rtx_nav::qphys::ORIGIN_TO_FEET;
-use crate::bot::state::{AirCommit, Commit, GateErrand, PlatWait};
+use crate::bot::state::{AirCommit, Commit, GateErrand, PlatWait, TerminalArrival};
 use crate::math::{angle_vectors, angles_to, yaw_of};
 use crate::defs::{Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP};
 use crate::game::cstring;
@@ -114,13 +114,8 @@ fn jump_runup_ok(v_xy: Vec2, to_wp: Vec2, dist: f32, frac: f32, maxspeed: f32) -
 }
 
 fn abandon_terminal_item(bot: &mut BotState, item: u32, now: f32) {
-    bot.mark_avoid(item, now + GOAL_AVOID_TIME);
-    bot.goal.item = 0;
-    bot.goal.next_item = 0;
-    bot.goal.commit = GoalCommit::None;
-    bot.goal.next_commit = GoalCommit::None;
-    bot.goal.next_pick = now;
-    bot.goal.terminal_arrival = None;
+    debug_assert_eq!(bot.goal.item, item);
+    bot.abandon_item_goal(now, now + GOAL_AVOID_TIME);
     bot.route.clear();
     bot.goal_cell = None;
     bot.repath_time = now;
@@ -473,17 +468,21 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     if at_item_terminal {
         let item = bot.goal.item;
         let arrived_at = match bot.goal.terminal_arrival {
-            Some((old_item, old_cell, at)) if old_item == item && old_cell == goal_cell => at,
+            Some(arrival) if arrival.item == EntId(item) && arrival.cell == goal_cell => arrival.at,
             _ => {
-                bot.goal.terminal_arrival = Some((item, goal_cell, now));
+                bot.goal.terminal_arrival = Some(TerminalArrival {
+                    item: EntId(item),
+                    cell: goal_cell,
+                    at: now,
+                });
                 now
             }
         };
         if now - arrived_at >= TERMINAL_TAKE_GRACE {
-            if bot.goal.terminal_retried_item != item {
+            if bot.goal.terminal_retried_item != Some(EntId(item)) {
                 if let Some(alternate) = alternate_item_cell {
                     bot.goal.item_cell = alternate;
-                    bot.goal.terminal_retried_item = item;
+                    bot.goal.terminal_retried_item = Some(EntId(item));
                     bot.goal.terminal_arrival = None;
                     bot.route.clear();
                     bot.goal_cell = None;

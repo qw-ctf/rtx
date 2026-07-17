@@ -6,6 +6,7 @@
 
 use glam::Vec3;
 
+use crate::entity::EntId;
 use crate::navmesh::CellId;
 
 /// Per-bot navigation/AI state, on the bot's client edict (`1..=maxclients`). Non-bot edicts
@@ -142,6 +143,19 @@ impl BotState {
         self.goal.avoid_items.iter().any(|&(it, until)| it == item && now < until)
     }
 
+    /// Abandon the active item goal through the shared failure tail: avoid it, discard any bounded
+    /// continuation/commitment, and permit selection again immediately.
+    pub(crate) fn abandon_item_goal(&mut self, now: f32, avoid_until: f32) {
+        self.mark_avoid(self.goal.item, avoid_until);
+        self.goal.item = 0;
+        self.goal.next_item = 0;
+        self.goal.commit = GoalCommit::None;
+        self.goal.next_commit = GoalCommit::None;
+        self.goal.next_pick = now;
+        self.goal.terminal_arrival = None;
+        self.goal.terminal_retried_item = None;
+    }
+
     /// Shared failure tail for the hook / rocket-jump leg drivers (see [`Driver`]): bump the driver's
     /// consecutive-fail count and force a repath; after two failures in a row, abandon a chased goal
     /// item — drop the route, briefly avoid-list the item, and re-select next frame. The
@@ -165,12 +179,7 @@ impl BotState {
             }
             self.route.clear();
             if chasing {
-                self.mark_avoid(self.goal.item, now + super::GOAL_AVOID_TIME);
-                self.goal.item = 0;
-                self.goal.next_item = 0;
-                self.goal.commit = GoalCommit::None;
-                self.goal.next_commit = GoalCommit::None;
-                self.goal.next_pick = now;
+                self.abandon_item_goal(now, now + super::GOAL_AVOID_TIME);
             }
         }
     }
@@ -355,10 +364,10 @@ pub struct GoalState {
     /// The selected pickup terminal has been reached but the item is still present. Steering gives
     /// the server a short touch-confirmation grace, then retries one alternate terminal before
     /// abandoning the item. `(item, cell, arrived_at)` keeps stale state from old goals inert.
-    pub terminal_arrival: Option<(u32, CellId, f32)>,
+    pub terminal_arrival: Option<TerminalArrival>,
     /// Item for which the one alternate-terminal retry has already been spent. Cleared once there is
     /// no active goal, so a later fresh attempt at the same pickup starts cleanly.
-    pub terminal_retried_item: u32,
+    pub terminal_retried_item: Option<EntId>,
     /// Handoff hold (team opponent modeling): a spawned RL/LG this bot stands on but deliberately
     /// does **not** pick up (`bot_pickup_items` skips it), reserving it for a powerup-carrying
     /// teammate that lacks it. `0` = not holding. `hold_for` is that teammate; `hold_until` the hard
@@ -371,6 +380,15 @@ pub struct GoalState {
     /// weapons-stay trigger can't re-capture the goal slot the same second). A small ring: a fresh
     /// entry evicts the soonest-to-expire slot. `(item entid, until)`; a `0` item marks an empty slot.
     pub avoid_items: [(u32, f32); 4],
+}
+
+/// A pickup terminal that steering has physically reached and is waiting for the authoritative
+/// take to confirm.
+#[derive(Clone, Copy)]
+pub struct TerminalArrival {
+    pub item: EntId,
+    pub cell: CellId,
+    pub at: f32,
 }
 
 /// How strongly the current item goal is committed. Ordinary goals remain freely re-scored;

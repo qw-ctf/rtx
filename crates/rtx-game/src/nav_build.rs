@@ -430,7 +430,7 @@ impl GameState {
 /// Player-origin nav cells that already overlap an item's pickup trigger. A route ending on one of
 /// these cells completes the pickup by standing there; it never relies on a final beeline through
 /// nearby geometry to the entity origin.
-fn collect_touch_terminals(
+pub(crate) fn collect_touch_terminals(
     cells: impl IntoIterator<Item = (navmesh::CellId, Vec3)>,
     item: &crate::entity::Entity,
 ) -> Vec<navmesh::CellId> {
@@ -472,17 +472,14 @@ mod tests {
             ent.v.health = 100.0;
             ent.v.origin = terminal;
         }
-        {
-            let ent = &mut game.entities[armor];
-            ent.in_use = true;
-            ent.classname = Some(classname.into());
-            ent.v.origin = item_origin;
-            ent.v.mins = Vec3::new(-16.0, -16.0, 0.0);
-            ent.v.maxs = Vec3::new(16.0, 16.0, 56.0);
-            ent.v.solid = Solid::Trigger;
-            ent.set_touch(Touch::ItemArmor);
-        }
+        let mut armor_ent = armor_entity(classname, item_origin);
+        armor_ent.v.solid = Solid::Trigger;
+        armor_ent.set_touch(Touch::ItemArmor);
+        game.entities[armor] = armor_ent;
 
+        // This is the engine's touch-dispatch gate: only overlapping linked trigger/player hulls
+        // dispatch GAME_EDICT_TOUCH. The dispatch itself is the production server-side armor path.
+        assert!(crate::bot::item_terminal_touches(terminal, &game.entities[armor]));
         game.run_touch(armor, player);
 
         assert!(game.entities[player].v.armorvalue > 0.0, "terminal arrival must execute an armor take");
@@ -500,6 +497,10 @@ mod tests {
         let terminals = collect_touch_terminals(cells, &armor);
 
         assert_eq!(terminals, vec![8], "the observed stall cell must not catalogue as a pickup terminal");
+        assert!(
+            !crate::bot::item_terminal_touches(bad_endpoint, &armor),
+            "the observed endpoint must fail the same hull-overlap gate that dispatches server touch"
+        );
         assert_armor_take(classname, item_origin, valid_endpoint);
     }
 

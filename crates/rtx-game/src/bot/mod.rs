@@ -1213,12 +1213,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     };
     if chasing && game.entities[e].bot.gate.errand.is_none() && now - game.entities[e].bot.goal.since > giveup {
         let b = &mut game.entities[e].bot;
-        b.mark_avoid(b.goal.item, now + GOAL_AVOID_TIME);
-        b.goal.item = 0;
-        b.goal.next_item = 0;
-        b.goal.commit = GoalCommit::None;
-        b.goal.next_commit = GoalCommit::None;
-        b.goal.next_pick = now; // re-pick (skipping the abandoned item) next frame
+        b.abandon_item_goal(now, now + GOAL_AVOID_TIME);
     }
 
     // A reached item terminal gets a brief window for the server's touch/stat update. If it is
@@ -1227,18 +1222,18 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     let active_item = game.entities[e].bot.goal.item;
     let alternate_item_cell = if active_item != 0 {
         let b = &game.entities[e].bot;
-        let due = b.goal.terminal_arrival.is_some_and(|(item, cell, at)| {
-            item == active_item
-                && cell == b.goal.item_cell
-                && now - at >= steer::TERMINAL_TAKE_GRACE
+        let due = b.goal.terminal_arrival.is_some_and(|arrival| {
+            arrival.item == EntId(active_item)
+                && arrival.cell == b.goal.item_cell
+                && now - arrival.at >= steer::TERMINAL_TAKE_GRACE
         });
-        (due && b.goal.terminal_retried_item != active_item)
+        (due && b.goal.terminal_retried_item != Some(EntId(active_item)))
             .then(|| game.select_alternate_item_terminal(e, EntId(active_item), b.goal.item_cell))
             .flatten()
     } else {
         let b = &mut game.entities[e].bot;
         b.goal.terminal_arrival = None;
-        b.goal.terminal_retried_item = 0;
+        b.goal.terminal_retried_item = None;
         None
     };
 
