@@ -85,6 +85,13 @@ const LOCAL_PICKUP_TRAVEL: f32 = 1.0;
 /// Euclidean pre-filter before the local Dijkstra. It is deliberately looser than one second of
 /// stock running to admit a short stair/turn while avoiding a flood when no relevant item is nearby.
 const LOCAL_PICKUP_RADIUS: f32 = 384.0;
+
+/// Whether a local pickup's cell-level route is short enough to take movement ownership. The
+/// current-goal bit is deliberately explicit: terminal completion may need a different rule from
+/// opportunistically choosing a new nearby pickup.
+fn local_pickup_in_budget(_current_goal: bool, distance: f32, travel: f32) -> bool {
+    distance <= LOCAL_PICKUP_RADIUS && travel.is_finite() && travel <= LOCAL_PICKUP_TRAVEL
+}
 /// While committed to a respawning powerup, only consider ordinary pickups this close and this
 /// quick to reach. The second leg is checked against the powerup timer below, so this is a cost
 /// bound as well as a guard against scanning/flooding unrelated items across the room.
@@ -899,7 +906,7 @@ impl GameState {
                 }
                 _ => continue,
             };
-            nearby.push((item, cell, desire, commit));
+            nearby.push((item, cell, desire, commit, (ent.v.origin - origin).length()));
         }
         if nearby.is_empty() {
             return None;
@@ -912,9 +919,9 @@ impl GameState {
         let (travel, _) = graph.costs_from_within(from, &pricing.costs(0), LOCAL_PICKUP_TRAVEL);
         nearby
             .into_iter()
-            .filter_map(|(item, cell, desire, commit)| {
+            .filter_map(|(item, cell, desire, commit, distance)| {
                 let t = travel[cell as usize];
-                (t.is_finite() && t <= LOCAL_PICKUP_TRAVEL)
+                local_pickup_in_budget(item.0 == self.entities[bot_e].bot.goal.item, distance, t)
                     .then_some((item, cell, commit, desire / (t + 0.25)))
             })
             .max_by(|a, b| a.3.total_cmp(&b.3).then_with(|| b.0.0.cmp(&a.0.0)))
@@ -1787,6 +1794,16 @@ mod tests {
         // Cell-level path noise on a pickup lying along the route gets the documented tolerance.
         assert!(powerup_bridge_arrives_in_time(2.0, 2.5, 0.0));
         assert!(!powerup_bridge_arrives_in_time(2.0, 2.51, 0.0));
+    }
+
+    #[test]
+    fn chased_armor_enters_terminal_completion_before_touch_range() {
+        // The analysed DM3 stalls were 116-209 qu from armor. Cell-level travel can exceed the
+        // opportunistic one-second budget around stairs/turns, but a goal already selected and
+        // physically this close must keep closing until its hull reaches the trigger (roughly 80 qu).
+        assert!(local_pickup_in_budget(true, 209.0, 1.5));
+        // A different item at the same cost remains merely opportunistic and must not hijack combat.
+        assert!(!local_pickup_in_budget(false, 209.0, 1.5));
     }
 
     #[test]

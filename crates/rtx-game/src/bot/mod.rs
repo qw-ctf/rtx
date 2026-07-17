@@ -627,6 +627,27 @@ fn hard_mode_objective(intent: Option<BotIntent>) -> bool {
     matches!(intent, Some(BotIntent::Move(_) | BotIntent::Spectate { .. }))
 }
 
+/// Completion ownership carried by a bounded item plan. Kept pure so the objective arbiter's
+/// first/continuation mapping cannot silently diverge as new strategic item tiers are added.
+fn planned_goal_commits(
+    contains_powerup: bool,
+    _contains_major: bool,
+    next_powerup: bool,
+    _next_major: bool,
+) -> (GoalCommit, GoalCommit) {
+    let first = if contains_powerup {
+        GoalCommit::Powerup
+    } else {
+        GoalCommit::None
+    };
+    let next = if next_powerup {
+        GoalCommit::Powerup
+    } else {
+        GoalCommit::None
+    };
+    (first, next)
+}
+
 fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, client: i32) -> Objective {
     let host = *game.host();
     // Hook invariant net: if we're mid-hook but no longer hold the grapple (a mode loadout stripped
@@ -870,18 +891,14 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
                 Some(plan) => {
                     let (first, first_cell) = plan.first;
                     let (next, next_cell) = plan.second.map_or((0, 0), |(it, cell)| (it.0, cell));
-                    let first_powerup = game.is_powerup_item(first);
                     let next_powerup = next != 0 && game.is_powerup_item(EntId(next));
-                    let commit = if first_powerup || plan.contains_powerup {
-                        GoalCommit::Powerup
-                    } else {
-                        GoalCommit::None
-                    };
-                    let next_commit = if next_powerup {
-                        GoalCommit::Powerup
-                    } else {
-                        GoalCommit::None
-                    };
+                    let next_major = next != 0 && game.is_major_item(EntId(next));
+                    let (commit, next_commit) = planned_goal_commits(
+                        plan.contains_powerup,
+                        plan.contains_major,
+                        next_powerup,
+                        next_major,
+                    );
                     (first.0, first_cell, next, next_cell, commit, next_commit)
                 }
                 None => (0, 0, 0, 0, GoalCommit::None, GoalCommit::None),
@@ -2117,6 +2134,20 @@ mod tests {
         assert!(!hard_mode_objective(Some(BotIntent::Advance(Vec3::ZERO))));
         assert!(!hard_mode_objective(Some(BotIntent::Fight(EntId(1)))));
         assert!(!hard_mode_objective(None));
+    }
+
+    #[test]
+    fn major_item_plans_own_movement_until_touch() {
+        assert_eq!(
+            planned_goal_commits(false, true, false, false),
+            (GoalCommit::Pickup, GoalCommit::None),
+            "a selected RA/mega plan must not hand its terminal approach back to combat",
+        );
+        assert_eq!(
+            planned_goal_commits(false, true, false, true),
+            (GoalCommit::Pickup, GoalCommit::Pickup),
+            "an ordinary bridge and its major continuation must both retain pickup ownership",
+        );
     }
 
     /// The corridor scan (used pure, no NavGraph): a straight level corridor is all runway; a sharp
