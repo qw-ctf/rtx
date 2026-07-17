@@ -3038,4 +3038,37 @@ mod tests {
         assert_eq!(g.corridor_interim(0, 5, &costs, 4.0), None, "a same-cluster goal steers directly");
         assert_eq!(g.corridor_interim(0, 10, &costs, 100.0), None, "a goal within the horizon steers directly");
     }
+
+    /// The graph-swap liquid patch folds the water tax (bot-independent) and hazard hp (priced per bot)
+    /// of a far intra-cluster liquid link into the coarse estimate.
+    #[test]
+    fn lod_liquid_patch_prices_water_and_hazard() {
+        let cell = |gx: i32| Cell { origin: Vec3::new(gx as f32 * 32.0, 0.0, 0.0), gx, gy: 0 };
+        let cells: Vec<Cell> = (0..15).map(|i| cell(i)).collect();
+        let mut links = Vec::new();
+        for i in 0..14u32 {
+            links.push(reach_link(i, i + 1)); // link 2i = (i,i+1)
+            links.push(reach_link(i + 1, i));
+        }
+        let mut g = NavGraph::test_graph(cells, links);
+        g.build_lod();
+        let costs = LinkCosts::default();
+        let dry = g.coarse_costs(0, &costs, false).cost_to(12);
+
+        // Flag link 10→11 (index 20) as a water + lava crossing, then patch as the graph-swap does.
+        let nlinks = g.links.len();
+        g.water_extra = vec![0.0; nlinks];
+        g.hazard_hp = vec![0.0; nlinks];
+        g.water_extra[20] = 3.0;
+        g.hazard_hp[20] = 25.0;
+        g.patch_lod_liquids();
+
+        // Cell 12 is reached across 10→11, so its coarse cost grows by exactly the water tax.
+        let wet = g.coarse_costs(0, &costs, false).cost_to(12);
+        assert!((wet - (dry + 3.0)).abs() < 1e-3, "water tax: wet {wet} != dry+3 {}", dry + 3.0);
+        // With a hazard price set, the lava hp adds cost on top, scaled to the bot's nerve.
+        let hazcosts = LinkCosts { hazard: Some(HazardPrice::new(100.0)), ..LinkCosts::default() };
+        let hurt = g.coarse_costs(0, &hazcosts, false).cost_to(12);
+        assert!(hurt > wet, "hazard pricing should add cost: hurt {hurt} !> wet {wet}");
+    }
 }

@@ -233,6 +233,9 @@ impl GameState {
             // swimming above walking, so bots cross water but never loiter in it.
             graph.flag_water(&contents);
         }
+        // Fold the now-known water/hazard link costs into the LOD abstract graph (the worker built it
+        // liquid-blind). Cheap — only clusters touching a liquid link are recomputed.
+        graph.patch_lod_liquids();
         let counts = graph.summary();
         let goals = self.collect_goals(&graph);
         let (lclusters, lportals, ledges, lreach) = graph.lod_stats();

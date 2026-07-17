@@ -15,7 +15,7 @@
 
 use std::collections::{BinaryHeap, HashMap};
 
-use super::{CellId, LinkCosts, LinkKind, NavGraph, CLOSED_GATE_PENALTY};
+use super::{hazard_cost, CellId, LinkCosts, LinkKind, NavGraph, CLOSED_GATE_PENALTY};
 
 /// Grid columns per cluster-block edge, as a shift. `3` → `1<<3 = 8` columns → `8 · GRID = 256u`
 /// blocks. Bigger blocks mean fewer, coarser clusters (cheaper abstract graph, blunter estimates).
@@ -52,9 +52,10 @@ struct Portal {
 }
 
 /// A directed abstract edge: a boundary crossing (one cross-cluster link) or intra-cluster transit
-/// (the shortest in-cluster hop between two of its portals). `base` is the static travel cost; the
-/// dynamic terms are folded in per query from the metadata (never baked, so live door state stays
-/// honest). Water/hazard costs are added at the graph-swap patch (they don't exist on the worker).
+/// (the shortest in-cluster hop between two of its portals). `base` is the static travel cost
+/// *including* the water tax (baked at the graph-swap patch, since the liquid columns don't exist on
+/// the worker); the rest of the dynamic terms are priced per query from the metadata, never baked, so
+/// live door state and per-bot hazard nerve stay honest.
 struct AbsEdge {
     to: u32,
     base: f32,
@@ -66,6 +67,11 @@ struct AbsEdge {
     /// Crosses a chained speed jump: severed in scoring mode (parity with `chained_block`), allowed in
     /// corridor mode so a route can still lead through a chain the fine window then gates for feasibility.
     chained: bool,
+    /// Health lost to lava/slime along this edge — priced per bot via `hazard_cost` in [`price_meta`].
+    hazard_hp: f32,
+    /// For a crossing edge, the representative fine link, so the swap patch can re-read its liquid
+    /// costs; `u32::MAX` for a transit edge (rebuilt wholesale at the patch instead).
+    link: u32,
 }
 
 /// Reaching a cell from one of the entry portals of its cluster: the final coarse hop. Same metadata
@@ -76,6 +82,7 @@ struct PortalReach {
     gates: u32,
     rj: u8,
     chained: bool,
+    hazard_hp: f32,
 }
 
 /// The level-of-detail tables: cluster assignment plus the abstract portal graph over it.
@@ -213,7 +220,9 @@ impl NavGraph {
             let (gates, rj, chained) = link_meta(self, li);
             let pf = portal_of_cell[link.from as usize] as u32;
             let pt = portal_of_cell[link.to as usize] as u32;
-            abs_adj[pf as usize].push(AbsEdge { to: pt, base: link.cost, gates, rj, chained });
+            let base = link.cost + self.link_water_extra(li);
+            let hazard_hp = self.link_hazard_hp(li);
+            abs_adj[pf as usize].push(AbsEdge { to: pt, base, gates, rj, chained, hazard_hp, link: li });
         }
 
         // Intra-cluster tables: from each portal, a Dijkstra restricted to its cluster gives the
@@ -221,12 +230,12 @@ impl NavGraph {
         let mut cell_reach: Vec<Vec<PortalReach>> = (0..n).map(|_| Vec::new()).collect();
         for pi in 0..portals.len() as u32 {
             let Portal { cell: src, cluster: cl } = portals[pi as usize];
-            for (cell, dist, gates, rj, chained) in self.intra_reach(src, cl, &cluster_of) {
+            for (cell, dist, gates, rj, chained, hazard_hp) in self.intra_reach(src, cl, &cluster_of) {
                 let pc = portal_of_cell[cell as usize];
                 if pc >= 0 && cell != src {
-                    abs_adj[pi as usize].push(AbsEdge { to: pc as u32, base: dist, gates, rj, chained });
+                    abs_adj[pi as usize].push(AbsEdge { to: pc as u32, base: dist, gates, rj, chained, hazard_hp, link: u32::MAX });
                 }
-                cell_reach[cell as usize].push(PortalReach { portal: pi, dist, gates, rj, chained });
+                cell_reach[cell as usize].push(PortalReach { portal: pi, dist, gates, rj, chained, hazard_hp });
             }
         }
 
@@ -261,35 +270,96 @@ impl NavGraph {
         (cluster_of, count)
     }
 
-    /// Dijkstra from `src` restricted to the cells of cluster `cl`, over static link cost only, with a
-    /// metadata accumulator (gates OR'd, rocket jumps counted, chained flag OR'd) along each cell's
-    /// min-cost in-cluster path. One per portal at build time.
-    fn intra_reach(&self, src: CellId, cl: u32, cluster_of: &[u32]) -> Vec<(CellId, f32, u32, u8, bool)> {
-        let mut dist: HashMap<CellId, (f32, u32, u8, bool)> = HashMap::new();
+    /// Dijkstra from `src` restricted to the cells of cluster `cl`, with a metadata accumulator (gates
+    /// OR'd, rocket jumps counted, chained flag OR'd, hazard-hp summed) along each cell's min-cost
+    /// in-cluster path. Cost includes the water tax (`link_water_extra`), so the min-cost path is the
+    /// wettest-aware one. On the worker build the liquid columns are empty (both read 0); the swap
+    /// patch re-runs this once they are filled — see [`patch_lod_liquids`](Self::patch_lod_liquids).
+    fn intra_reach(&self, src: CellId, cl: u32, cluster_of: &[u32]) -> Vec<(CellId, f32, u32, u8, bool, f32)> {
+        let mut dist: HashMap<CellId, (f32, u32, u8, bool, f32)> = HashMap::new();
         let mut heap = BinaryHeap::new();
-        dist.insert(src, (0.0, 0, 0, false));
+        dist.insert(src, (0.0, 0, 0, false, 0.0));
         heap.push(MinNode { key: 0.0, id: src });
         let mut out = Vec::new();
         while let Some(MinNode { key: g, id: cell }) = heap.pop() {
-            let (d, gates, rj, chained) = dist[&cell];
+            let (d, gates, rj, chained, haz) = dist[&cell];
             if g > d {
                 continue;
             }
-            out.push((cell, d, gates, rj, chained));
+            out.push((cell, d, gates, rj, chained, haz));
             for &li in &self.adjacency[cell as usize] {
                 let link = self.links[li as usize];
                 if cluster_of[link.to as usize] != cl {
                     continue; // stay inside the cluster
                 }
                 let (lg, lrj, lch) = link_meta(self, li);
-                let ng = d + link.cost;
+                let ng = d + link.cost + self.link_water_extra(li);
                 if dist.get(&link.to).is_none_or(|&(od, ..)| ng < od) {
-                    dist.insert(link.to, (ng, gates | lg, rj.saturating_add(lrj), chained || lch));
+                    let nh = haz + self.link_hazard_hp(li);
+                    dist.insert(link.to, (ng, gates | lg, rj.saturating_add(lrj), chained || lch, nh));
                     heap.push(MinNode { key: ng, id: link.to });
                 }
             }
         }
         out
+    }
+
+    /// Fold water and hazard costs into the abstract graph, once the graph-swap has filled the liquid
+    /// columns (they don't exist on the worker build — see `nav_build::poll_navmesh_build`). Re-reads
+    /// each crossing's own water/hazard, and re-runs the intra-cluster tables for the clusters that
+    /// contain a liquid link. Cheap: dry clusters — the overwhelming majority — keep their build-time
+    /// costs untouched. A no-op on a bare or liquid-free graph.
+    pub fn patch_lod_liquids(&mut self) {
+        let Some(mut lod) = self.lod.take() else {
+            return;
+        };
+        // Crossing edges: re-read each representative crossing's own liquid costs (idempotent for a
+        // dry crossing, where both read 0).
+        for edges in &mut lod.abs_adj {
+            for e in edges.iter_mut() {
+                if e.link != u32::MAX {
+                    e.base = self.links[e.link as usize].cost + self.link_water_extra(e.link);
+                    e.hazard_hp = self.link_hazard_hp(e.link);
+                }
+            }
+        }
+        // Clusters holding an intra liquid link need their transit + reach recomputed with liquids.
+        let mut liquid = vec![false; lod.cluster_count as usize];
+        for li in 0..self.links.len() as u32 {
+            if self.link_water_extra(li) <= 0.0 && self.link_hazard_hp(li) <= 0.0 {
+                continue;
+            }
+            let link = self.links[li as usize];
+            let (cf, ct) = (lod.cluster_of[link.from as usize], lod.cluster_of[link.to as usize]);
+            if cf == ct {
+                liquid[cf as usize] = true;
+            }
+        }
+        if liquid.iter().any(|&x| x) {
+            for c in 0..self.cells.len() {
+                if liquid[lod.cluster_of[c] as usize] {
+                    lod.cell_reach[c].clear();
+                }
+            }
+            let cluster_of = lod.cluster_of.clone();
+            for pi in 0..lod.portals.len() as u32 {
+                let (src, cl) = (lod.portals[pi as usize].cell, lod.portals[pi as usize].cluster);
+                if !liquid[cl as usize] {
+                    continue;
+                }
+                // Drop this portal's stale transit edges (identified by the sentinel link), keeping the
+                // crossings, then re-add the liquid-aware transit + reach from a fresh intra flood.
+                lod.abs_adj[pi as usize].retain(|e| e.link != u32::MAX);
+                for (cell, dist, gates, rj, chained, hazard_hp) in self.intra_reach(src, cl, &cluster_of) {
+                    let pc = lod.portal_of_cell[cell as usize];
+                    if pc >= 0 && cell != src {
+                        lod.abs_adj[pi as usize].push(AbsEdge { to: pc as u32, base: dist, gates, rj, chained, hazard_hp, link: u32::MAX });
+                    }
+                    lod.cell_reach[cell as usize].push(PortalReach { portal: pi, dist, gates, rj, chained, hazard_hp });
+                }
+            }
+        }
+        self.lod = Some(lod);
     }
 
     /// The cluster id of cell `c`, or `None` when the LOD layer isn't built (bare test graphs).
@@ -356,7 +426,7 @@ impl NavGraph {
                 continue;
             }
             for e in &lod.abs_adj[p as usize] {
-                let ng = g + e.base + self.price_meta(e.gates, e.rj, e.chained, costs, sever_chained);
+                let ng = g + e.base + self.price_meta(e.gates, e.rj, e.chained, e.hazard_hp, costs, sever_chained);
                 if ng < abs_cost[e.to as usize] {
                     abs_cost[e.to as usize] = ng;
                     heap.push(MinNode { key: ng, id: e.to });
@@ -397,7 +467,7 @@ impl NavGraph {
                 continue;
             }
             for e in &lod.abs_adj[p as usize] {
-                let ng = g + e.base + self.price_meta(e.gates, e.rj, e.chained, costs, false);
+                let ng = g + e.base + self.price_meta(e.gates, e.rj, e.chained, e.hazard_hp, costs, false);
                 if ng < abs_cost[e.to as usize] {
                     abs_cost[e.to as usize] = ng;
                     parent[e.to as usize] = p;
@@ -468,7 +538,7 @@ impl NavGraph {
     /// Price the dynamic terms an abstract edge carries: closed gates (openable ones at the errand
     /// price), the per-bot rocket-jump-unfit surcharge, and — in scoring mode — a chained speed jump.
     /// Mirrors the terms `link_extra`/`chained_block` add per fine link.
-    fn price_meta(&self, gates: u32, rj: u8, chained: bool, costs: &LinkCosts, sever_chained: bool) -> f32 {
+    fn price_meta(&self, gates: u32, rj: u8, chained: bool, hazard_hp: f32, costs: &LinkCosts, sever_chained: bool) -> f32 {
         let mut extra = 0.0;
         if gates != 0 {
             for gi in 0..self.gate_count().min(32) {
@@ -486,6 +556,14 @@ impl NavGraph {
         }
         if sever_chained && chained {
             extra += CLOSED_GATE_PENALTY;
+        }
+        // Lava/slime crossed along this edge, priced against the querying bot's nerve — the lump
+        // equivalent of the fine graph's per-link `hazard_cost` (`link_extra`). Only home-cluster
+        // hazards are per-bot-exact (the fine home flood); this covers the far field.
+        if hazard_hp > 0.0 {
+            if let Some(price) = costs.hazard {
+                extra += hazard_cost(hazard_hp, price);
+            }
         }
         extra
     }
@@ -524,7 +602,7 @@ impl CoarseCosts<'_> {
         for r in &lod.cell_reach[cell as usize] {
             let via = self.abs_cost[r.portal as usize];
             if via.is_finite() {
-                let c = via + r.dist + self.graph.price_meta(r.gates, r.rj, r.chained, self.costs, self.sever_chained);
+                let c = via + r.dist + self.graph.price_meta(r.gates, r.rj, r.chained, r.hazard_hp, self.costs, self.sever_chained);
                 if c < best {
                     best = c;
                 }
