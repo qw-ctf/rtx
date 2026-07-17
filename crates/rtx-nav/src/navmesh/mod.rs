@@ -2846,6 +2846,38 @@ mod tests {
         }
     }
 
+    /// `costs_from_within(t_max)` is the whole-graph flood restricted to the ≤ `t_max` ball: every
+    /// cell within the bound reads its exact full-flood cost, and `settled` is exactly those cells in
+    /// nondecreasing-cost order. This is the exactness guarantee the local escape/pickup floods lean on.
+    #[test]
+    fn costs_from_within_matches_bounded_full_flood() {
+        // Chain 0↔1↔…↔9, unit walk links, so cell k settles at cost k from cell 0.
+        let cells: Vec<Cell> = (0..10).map(|i| reach_cell(i as f32 * 40.0)).collect();
+        let mut links = Vec::new();
+        for i in 0..9u32 {
+            links.push(reach_link(i, i + 1));
+            links.push(reach_link(i + 1, i));
+        }
+        let g = NavGraph::test_graph(cells, links);
+        let costs = LinkCosts::default();
+        let full = g.costs_from(0, &costs);
+        for &t_max in &[0.0_f32, 2.5, 4.0, 100.0] {
+            let (bounded, settled) = g.costs_from_within(0, &costs, t_max);
+            for c in 0..10usize {
+                if full[c] <= t_max {
+                    assert_eq!(bounded[c].to_bits(), full[c].to_bits(), "cell {c} within {t_max} must be exact");
+                }
+            }
+            let expected: Vec<u32> = (0..10u32).filter(|&c| full[c as usize] <= t_max).collect();
+            let mut got = settled.clone();
+            got.sort_unstable();
+            assert_eq!(got, expected, "settled set at t_max={t_max}");
+            for w in settled.windows(2) {
+                assert!(bounded[w[0] as usize] <= bounded[w[1] as usize], "settled out of cost order at {t_max}");
+            }
+        }
+    }
+
     /// `nearest_reachable_to` picks the reachable cell physically closest to an unreachable goal, and
     /// the O(1)-table path agrees cell-for-cell with the Dijkstra-flood fallback (bare graph).
     #[test]

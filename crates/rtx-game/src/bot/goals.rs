@@ -875,7 +875,9 @@ impl GameState {
 
         let from = graph.nearest(origin)?;
         let pricing = self.bot_link_pricing(bot_e, now);
-        let travel = graph.costs_from(from, &pricing.costs(0));
+        // Every candidate is rejected past `LOCAL_PICKUP_TRAVEL`, so a bounded flood to exactly that
+        // horizon is identical to the whole-graph one here — and stops at the local neighbourhood.
+        let (travel, _) = graph.costs_from_within(from, &pricing.costs(0), LOCAL_PICKUP_TRAVEL);
         nearby
             .into_iter()
             .filter_map(|(item, cell, desire, commit)| {
@@ -1049,7 +1051,9 @@ impl GameState {
         let graph = self.nav.graph.as_ref()?;
         let from = graph.nearest(self.entities[bot_e].v.origin)?;
         let pricing = self.bot_link_pricing(bot_e, now);
-        let costs = graph.costs_from(from, &pricing.costs(0));
+        // Recovery items past `RECOVERY_TRAVEL` are dropped below, so bound the flood there — exact for
+        // every cell it keeps, and it never floods the far half of a big map for a hurt bot.
+        let (costs, _) = graph.costs_from_within(from, &pricing.costs(0), RECOVERY_TRAVEL);
         let my_team = self.entities[bot_e].mode_p.team;
         let teamwork = my_team != 0;
         self.nav

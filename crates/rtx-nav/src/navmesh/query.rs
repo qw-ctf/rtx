@@ -271,6 +271,46 @@ impl NavGraph {
         cost
     }
 
+    /// Bounded [`costs_from`](Self::costs_from): a Dijkstra flood that stops the moment it settles a
+    /// cell costing more than `t_max`, returning the (partial) cost table plus the cells it settled —
+    /// those with cost ≤ `t_max` — in nondecreasing-cost order.
+    ///
+    /// **Exact within the bound.** Dijkstra settles in cost order, so every cell whose true cost is
+    /// ≤ `t_max` is final in the table, and no cell reads a finite value ≤ `t_max` unless its true
+    /// cost really is ≤ `t_max` (a written cost is an upper bound on the truth). A caller that only
+    /// cares about cells within a travel-time threshold — pass `t_max` = that threshold — gets exactly
+    /// what the full flood would give it, without touching the rest of the map. The returned `settled`
+    /// list lets a "nearest cell with property X" scan (nearest air, nearest safe footing) walk only
+    /// the local neighbourhood; the first qualifying cell in it is the globally nearest such cell *iff*
+    /// one settled at all (else the property's nearest cell, if any, lies beyond `t_max`).
+    pub fn costs_from_within(&self, start: CellId, costs: &LinkCosts, t_max: f32) -> (Vec<f32>, Vec<CellId>) {
+        use std::collections::BinaryHeap;
+
+        let mut cost = vec![f32::INFINITY; self.cells.len()];
+        let mut settled = Vec::new();
+        let mut heap = BinaryHeap::new();
+        cost[start as usize] = 0.0;
+        heap.push(MinCost { key: 0.0, payload: start });
+        while let Some(MinCost { key: g, payload: cell }) = heap.pop() {
+            if g > cost[cell as usize] {
+                continue; // a cheaper path already settled this cell
+            }
+            if g > t_max {
+                break; // everything still queued costs more than the bound
+            }
+            settled.push(cell);
+            for &li in &self.adjacency[cell as usize] {
+                let link = self.links[li as usize];
+                let ng = g + link.cost + self.link_extra(li, costs) + self.chained_block(li);
+                if ng < cost[link.to as usize] {
+                    cost[link.to as usize] = ng;
+                    heap.push(MinCost { key: ng, payload: link.to });
+                }
+            }
+        }
+        (cost, settled)
+    }
+
     /// Walk `came_from` link indices back from `goal` to `start` into a forward link route.
     fn reconstruct(&self, came_from: &[u32], start: CellId, goal: CellId) -> Vec<u32> {
         let mut route = Vec::new();

@@ -180,6 +180,11 @@ const RADSUIT_NERVE: f32 = 5.0;
 /// a drowning bot doesn't run a full Dijkstra every frame while it swims out. Shared by the burn
 /// escape reflex, which floods the same way.
 const SURFACE_CACHE_TTL: f32 = 0.5;
+/// How far (travel-time) the escape reflexes flood before falling back to a whole-graph search: air
+/// and safe footing are always close (a submerged bot is inside a pool; a burning one is on its
+/// edge), so a bounded flood over the local neighbourhood answers both. Generous enough that the
+/// full-flood fallback essentially never fires, so the answer stays the exact whole-graph nearest.
+const ESCAPE_FLOOD_MAX: f32 = 4.0;
 /// Minimum seconds between A* re-paths (the human keeps moving).
 const REPATH_INTERVAL: f32 = 0.4;
 /// Stuck detector: if we move less than this over `STUCK_TIME`, jump and re-path.
@@ -1881,11 +1886,23 @@ fn roam_target(game: &mut GameState, e: EntId, origin: Vec3, now: f32) -> Vec3 {
 /// already breaks the surface). `None` if every reachable cell is underwater (a sealed flooded
 /// pocket), leaving the caller to just swim up toward any open surface.
 fn nearest_air(graph: &NavGraph, bot_cell: CellId, costs: &LinkCosts) -> Option<CellId> {
+    nearest_settled(graph, bot_cell, costs, |c| graph.cell_breathable(c))
+}
+
+/// The nearest cell (by travel cost) for which `ok` holds, found over the local neighbourhood via a
+/// bounded flood — the escape targets are always close. `settled` is in nondecreasing-cost order, so
+/// the first qualifying cell is the nearest one within [`ESCAPE_FLOOD_MAX`]. Only if nothing within
+/// the bound qualifies does it pay for a whole-graph flood, so the result equals the global nearest.
+fn nearest_settled(graph: &NavGraph, bot_cell: CellId, costs: &LinkCosts, ok: impl Fn(CellId) -> bool) -> Option<CellId> {
+    let (_, settled) = graph.costs_from_within(bot_cell, costs, ESCAPE_FLOOD_MAX);
+    if let Some(&c) = settled.iter().find(|&&c| ok(c)) {
+        return Some(c);
+    }
     let flood = graph.costs_from(bot_cell, costs);
     flood
         .iter()
         .enumerate()
-        .filter(|&(c, &d)| d.is_finite() && graph.cell_breathable(c as CellId))
+        .filter(|&(c, &d)| d.is_finite() && ok(c as CellId))
         .min_by(|&(_, &a), &(_, &b)| a.total_cmp(&b))
         .map(|(c, _)| c as CellId)
 }
@@ -1907,13 +1924,7 @@ fn surface_target(cache: &mut Wander, graph: &NavGraph, bot_cell: CellId, costs:
 /// link costs once and takes the cheapest cell that isn't lava/slime (water counts as safe here:
 /// diving into a pool to escape lava is right). `None` only if every reachable cell burns.
 fn nearest_safe_ground(graph: &NavGraph, bot_cell: CellId, costs: &LinkCosts) -> Option<CellId> {
-    let flood = graph.costs_from(bot_cell, costs);
-    flood
-        .iter()
-        .enumerate()
-        .filter(|&(c, &d)| d.is_finite() && graph.cell_hazard(c as CellId).is_none())
-        .min_by(|&(_, &a), &(_, &b)| a.total_cmp(&b))
-        .map(|(c, _)| c as CellId)
+    nearest_settled(graph, bot_cell, costs, |c| graph.cell_hazard(c).is_none())
 }
 
 /// The origin of the nearest safe-footing spot for a burning bot, cached in `cache` for
