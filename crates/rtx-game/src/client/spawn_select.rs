@@ -89,9 +89,15 @@ impl GameState {
     // --- small helpers ---
 
     /// Read the player's `name` userinfo key.
+    ///
+    /// Userinfo names are latin-1 conchar bytes (a coloured `bot•Grunt`, a high-bit player name),
+    /// not UTF-8. Fill the buffer via `infokey` but ignore its strict-UTF-8 view — that would drop
+    /// any high-bit name to `""` — and decode the raw bytes as latin-1 so the name survives.
     pub(crate) fn read_netname(&self, player: EntId) -> String {
         let mut buf = [0u8; 64];
-        self.host.infokey(player, c"name", &mut buf).to_owned()
+        self.host.infokey(player, c"name", &mut buf);
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        crate::text::from_latin1(&buf[..end])
     }
 }
 

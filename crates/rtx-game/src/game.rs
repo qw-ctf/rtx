@@ -375,7 +375,9 @@ impl GameState {
     /// raw pointer the engine keeps stays valid for the client's lifetime.
     pub(crate) fn set_netname(&mut self, e: EntId, name: &str) {
         let ent = &mut self.entities[e];
-        ent.netname_cs = Some(cstring(name));
+        // A conchar name (a coloured `bot•Grunt`) goes to the engine as latin-1 bytes, so the
+        // FTEQW-synced scoreboard draws one glyph per conchar rather than UTF-8's two.
+        ent.netname_cs = Some(crate::text::conchar_cstring(name));
         let ptr = ent.netname_cs.as_deref().map_or(0, |c| c.as_ptr() as u64);
         ent.string_refs[STRING_REF_NETNAME] = ptr;
     }

@@ -13,7 +13,7 @@ use crate::assets::{Model, Sound};
 use crate::bot::model::PickupKind;
 use crate::defs::*;
 use crate::entity::{EntId, Think, Touch};
-use crate::game::{self, GameState};
+use crate::game::GameState;
 
 /// How long a powerup lasts. Never on the wire — a client sees only the item *bit* appear in
 /// `STAT_ITEMS`, and the moment it appears is the moment the clock started.
@@ -653,7 +653,7 @@ impl GameState {
         if self.entities[e].bot.is_bot {
             return;
         }
-        let c = game::cstring(msg);
+        let c = crate::text::conchar_cstring(msg);
         self.host.sprint(e, PrintLevel::Low, &c);
     }
 

@@ -14,6 +14,8 @@
 //! Both paths need this because [`rtx_proto`](rtx_proto) is an optional dependency, absent from the
 //! default (qwprogs) build.
 
+use std::ffi::CString;
+
 /// The high-half offset: OR an ASCII byte with this to get its coloured conchar.
 const COLOURED: u8 = 0x80;
 
@@ -34,6 +36,22 @@ pub(crate) fn coloured(s: &str) -> String {
 /// `CString` carries to the engine.
 pub(crate) fn latin1_bytes(s: &str) -> Vec<u8> {
     s.chars().filter(|&c| (c as u32) < 256 && c != '\0').map(|c| c as u8).collect()
+}
+
+/// Decode raw QW text bytes as latin-1 — each byte becomes one `char` in U+0000..=U+00FF. The exact
+/// inverse of [`latin1_bytes`]. Used to read a userinfo name back into a `String`: those bytes are
+/// conchar/high-bit (a coloured `bot•Grunt`, a high-bit player name), not UTF-8, so a strict
+/// `str::from_utf8` would reject them and drop the name to `""`.
+pub(crate) fn from_latin1(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| b as char).collect()
+}
+
+/// A `CString` of a string's latin-1 bytes — the encoding the QW engine and wire use for
+/// player-facing conchar text (names, frag messages). ASCII is unchanged; a coloured conchar stays
+/// one byte, not the two a UTF-8 encode would emit (which the client draws as two garbled glyphs).
+/// [`latin1_bytes`] already drops interior NULs and anything past the code page, so this can't fail.
+pub(crate) fn conchar_cstring(s: &str) -> CString {
+    CString::new(latin1_bytes(s)).unwrap_or_default()
 }
 
 /// The readable-ASCII copy of a conchar string, for logging.
@@ -135,6 +153,26 @@ mod tests {
         assert_eq!(latin1_bytes(&name), vec![0xe2, 0xef, 0xf4, 0x85, b'G', b'r', b'u', b'n', b't']);
         // A char past the Latin-1 range is dropped, not mangled into UTF-8 bytes.
         assert_eq!(latin1_bytes("a\u{2022}b\0c"), vec![b'a', b'b', b'c']);
+    }
+
+    /// `from_latin1` is the exact inverse of `latin1_bytes`: a coloured name survives the round-trip
+    /// through the engine's userinfo, and the high-bit bytes a strict UTF-8 decode would drop to ""
+    /// decode losslessly instead.
+    #[test]
+    fn from_latin1_inverts_latin1_bytes() {
+        let name = Conchars::default().coloured("bot").ch(DOT).plain("Grunt").build();
+        assert_eq!(from_latin1(&latin1_bytes(&name)), name);
+        // The raw conchar bytes of `bot•G` are not valid UTF-8 (`0xe2` starts a 3-byte sequence that
+        // `0xef` doesn't continue), so a strict decode would drop them to ""; latin-1 keeps each byte.
+        assert_eq!(from_latin1(&[0xe2, 0xef, 0xf4, 0x85, b'G']), "\u{e2}\u{ef}\u{f4}\u{85}G");
+    }
+
+    /// `conchar_cstring` single-bytes the high half (so the wire carries one glyph per conchar),
+    /// where a UTF-8 `CString` would emit two bytes for `0x85`.
+    #[test]
+    fn conchar_cstring_is_latin1_not_utf8() {
+        let name = Conchars::default().coloured("bot").ch(DOT).plain("Grunt").build();
+        assert_eq!(conchar_cstring(&name).as_bytes(), &[0xe2, 0xef, 0xf4, 0x85, b'G', b'r', b'u', b'n', b't']);
     }
 
     /// Logging normalizes conchars for readability: colour is stripped, the separator dot reads as

@@ -569,7 +569,7 @@ pub(crate) fn nearest_player_where(
 /// one makes the engine warn "msg_entity: not a client").
 pub(crate) fn centerprint_all(g: &GameState, msg: &str) {
     let host = *g.host();
-    let cmsg = cstring(msg);
+    let cmsg = crate::text::conchar_cstring(msg);
     for e in players(g) {
         if g.entities[e].bot.is_bot {
             continue;

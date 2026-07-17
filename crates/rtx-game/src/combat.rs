@@ -11,7 +11,7 @@ use glam::Vec3;
 use crate::assets::Sound;
 use crate::defs::*;
 use crate::entity::{EntId, Touch};
-use crate::game::{self, GameState};
+use crate::game::GameState;
 use crate::obituary::DeathType;
 
 impl GameState {
@@ -344,7 +344,8 @@ impl GameState {
 impl GameState {
     /// `bprint` of a dynamic message to every client (shared by combat/items/etc).
     pub(crate) fn broadcast(&self, level: PrintLevel, message: &str) {
-        let c = game::cstring(message);
+        // Player-facing text is conchar/latin-1 on the wire (frag messages carry coloured names).
+        let c = crate::text::conchar_cstring(message);
         self.host.bprint(level, &c);
     }
 }
