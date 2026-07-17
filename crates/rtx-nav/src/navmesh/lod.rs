@@ -173,10 +173,10 @@ impl NavGraph {
         }
         let (cluster_of, cluster_count) = self.cluster_cells();
 
-        // Collapse each directed cluster pair's border to a single representative crossing — the
-        // cheapest link between those clusters (lowest index on a tie, so the build is deterministic).
-        // Without this a wide border becomes dozens of parallel portals and the intra-cluster all-pairs
-        // transit explodes to a graph larger than the fine one; one portal per neighbour keeps it small.
+        // Kept crossings — the cross-cluster links promoted to abstract edges. Start with the cheapest
+        // one per directed cluster pair (lowest index on a tie → deterministic): a wide border must not
+        // become dozens of parallel portals, or the intra-cluster all-pairs transit explodes to a graph
+        // larger than the fine one. The coverage pass below adds back any crossing a rep fails to cover.
         let mut rep: HashMap<(u32, u32), u32> = HashMap::new();
         for li in 0..self.links.len() as u32 {
             let link = self.links[li as usize];
@@ -191,11 +191,41 @@ impl NavGraph {
                 }
             }
         }
+        let mut kept: Vec<u32> = rep.values().copied().collect();
+        kept.sort_unstable();
 
-        // Portal cells: the endpoints of the representative crossings, assigned abstract-node indices
-        // in cell order (deterministic).
+        let mut lod = self.build_lod_tables(&cluster_of, cluster_count, &kept);
+
+        // Coverage: a cell reachable only through a *dropped* crossing's landing (two teleporter exits
+        // into directed-disjoint pockets, a ledge only jumpable from the neighbour) would have an empty
+        // `cell_reach` and read `cost_to = INFINITY` while the exact flood reaches it — a silent goal
+        // drop. Promote every cross-cluster landing a rep didn't cover (its `cell_reach` is empty) and
+        // rebuild once: those landings become portals, so `intra_reach` floods from them. One rebuild
+        // suffices — adding crossings only adds coverage, and a promoted landing covers at least itself.
+        let extra: Vec<u32> = (0..self.links.len() as u32)
+            .filter(|&li| {
+                let link = self.links[li as usize];
+                cluster_of[link.from as usize] != cluster_of[link.to as usize] && lod.cell_reach[link.to as usize].is_empty()
+            })
+            .collect();
+        if !extra.is_empty() {
+            kept.extend(extra);
+            kept.sort_unstable();
+            kept.dedup();
+            lod = self.build_lod_tables(&cluster_of, cluster_count, &kept);
+        }
+        self.lod = Some(lod);
+    }
+
+    /// Build the portal graph + intra-cluster tables from a fixed set of `kept` cross-cluster links
+    /// (the abstract edges). Portal cells = the kept crossings' endpoints, in cell order; each kept
+    /// crossing is a crossing edge; one intra-cluster Dijkstra per portal gives the transit edges
+    /// (portal→portal) and the reach table (portal→every in-cluster cell). Callable twice — the second
+    /// pass rebuilds with the coverage promotions folded in.
+    fn build_lod_tables(&self, cluster_of: &[u32], cluster_count: u32, kept: &[u32]) -> Lod {
+        let n = self.cells.len();
         let mut is_portal = vec![false; n];
-        for &li in rep.values() {
+        for &li in kept {
             let link = self.links[li as usize];
             is_portal[link.from as usize] = true;
             is_portal[link.to as usize] = true;
@@ -209,14 +239,8 @@ impl NavGraph {
             }
         }
         let mut abs_adj: Vec<Vec<AbsEdge>> = (0..portals.len()).map(|_| Vec::new()).collect();
-
-        // Crossing edges: one per representative, built in link order (deterministic).
-        for li in 0..self.links.len() as u32 {
+        for &li in kept {
             let link = self.links[li as usize];
-            let key = (cluster_of[link.from as usize], cluster_of[link.to as usize]);
-            if key.0 == key.1 || rep.get(&key) != Some(&li) {
-                continue;
-            }
             let (gates, rj, chained) = link_meta(self, li);
             let pf = portal_of_cell[link.from as usize] as u32;
             let pt = portal_of_cell[link.to as usize] as u32;
@@ -224,13 +248,10 @@ impl NavGraph {
             let hazard_hp = self.link_hazard_hp(li);
             abs_adj[pf as usize].push(AbsEdge { to: pt, base, gates, rj, chained, hazard_hp, link: li });
         }
-
-        // Intra-cluster tables: from each portal, a Dijkstra restricted to its cluster gives the
-        // transit edges (portal→portal) and the final-hop reach (portal→every cell in the cluster).
         let mut cell_reach: Vec<Vec<PortalReach>> = (0..n).map(|_| Vec::new()).collect();
         for pi in 0..portals.len() as u32 {
-            let Portal { cell: src, cluster: cl } = portals[pi as usize];
-            for (cell, dist, gates, rj, chained, hazard_hp) in self.intra_reach(src, cl, &cluster_of) {
+            let (src, cl) = (portals[pi as usize].cell, portals[pi as usize].cluster);
+            for (cell, dist, gates, rj, chained, hazard_hp) in self.intra_reach(src, cl, cluster_of) {
                 let pc = portal_of_cell[cell as usize];
                 if pc >= 0 && cell != src {
                     abs_adj[pi as usize].push(AbsEdge { to: pc as u32, base: dist, gates, rj, chained, hazard_hp, link: u32::MAX });
@@ -238,8 +259,7 @@ impl NavGraph {
                 cell_reach[cell as usize].push(PortalReach { portal: pi, dist, gates, rj, chained, hazard_hp });
             }
         }
-
-        self.lod = Some(Lod { cluster_of, cluster_count, portal_of_cell, portals, abs_adj, cell_reach });
+        Lod { cluster_of: cluster_of.to_vec(), cluster_count, portal_of_cell, portals, abs_adj, cell_reach }
     }
 
     /// Weakly connect cells joined by a link that stays inside one block (grouping is undirected — a

@@ -3015,6 +3015,33 @@ mod tests {
         }
     }
 
+    /// The coverage-pass guardrail: a cell reachable only through a crossing that the cheapest-per-pair
+    /// rep dropped must still get a finite coarse cost (it silently read INFINITY before). Cluster A =
+    /// {0,1}, cluster B = {2,3}; two A→B crossings (cheap Walk 1→2 = rep, pricier Drop 1→3), and inside
+    /// B only one-way 3→2 — so the rep's landing (2) can't reach 3.
+    #[test]
+    fn coarse_covers_cells_reachable_only_via_a_dropped_crossing() {
+        let cell = |gx: i32| Cell { origin: Vec3::new(gx as f32 * 32.0, 0.0, 0.0), gx, gy: 0 };
+        let cells = vec![cell(0), cell(1), cell(8), cell(9)];
+        let links = vec![
+            reach_link(0, 1),
+            reach_link(1, 0),
+            reach_link(1, 2), // cheap Walk cross → rep
+            Link { from: 1, to: 3, kind: LinkKind::Drop, cost: 2.0 }, // pricier cross to cell 3
+            reach_link(3, 2), // one-way inside B
+        ];
+        let mut g = NavGraph::test_graph(cells, links);
+        g.build_reachability();
+        g.build_lod();
+        let costs = LinkCosts::default();
+        let coarse = g.coarse_costs(0, &costs, false);
+        assert!(g.reachable(0, 3), "cell 3 is reachable via the drop");
+        assert!(coarse.cost_to(3).is_finite(), "coverage pass must give reachable cell 3 a finite coarse cost");
+        for c in 0..4u32 {
+            assert_eq!(g.reachable(0, c), coarse.cost_to(c).is_finite(), "reachability/finiteness must agree at cell {c}");
+        }
+    }
+
     /// The LOD steer corridor plants its interim target short of a far goal (bounding the fine search)
     /// but steers a near goal directly.
     #[test]
