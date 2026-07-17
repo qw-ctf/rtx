@@ -132,6 +132,45 @@ fn consume_terminal_retry(bot: &mut BotState, item: u32, alternate: CellId, now:
     bot.repath_time = now;
 }
 
+fn update_item_terminal(
+    bot: &mut BotState,
+    at_item_terminal: bool,
+    item_solid: Solid,
+    goal_cell: CellId,
+    alternate_item_cell: Option<CellId>,
+    now: f32,
+) -> bool {
+    if at_item_terminal && item_solid == Solid::Trigger {
+        let item = bot.goal.item;
+        let arrived_at = match bot.goal.terminal_arrival {
+            Some(arrival) if arrival.item == EntId(item) && arrival.cell == goal_cell => arrival.at,
+            _ => {
+                bot.goal.terminal_arrival = Some(TerminalArrival {
+                    item: EntId(item),
+                    cell: goal_cell,
+                    at: now,
+                });
+                now
+            }
+        };
+        if now - arrived_at >= TERMINAL_TAKE_GRACE {
+            if bot.goal.terminal_retried_item != Some(EntId(item)) {
+                if let Some(alternate) = alternate_item_cell {
+                    consume_terminal_retry(bot, item, alternate, now);
+                    return true;
+                }
+                abandon_terminal_item(bot, item, now);
+                return true;
+            }
+            abandon_terminal_item(bot, item, now);
+            return true;
+        }
+    } else {
+        bot.goal.terminal_arrival = None;
+    }
+    false
+}
+
 pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> SteerOut {
     let SteerCtx { s, o, costs, plat_status, gate_ready, bot_cell, goal_cell, race_line_ahead, weapons_hot, bsp } =
         ctx;
@@ -148,6 +187,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         chasing,
         polite,
         vigil,
+        item_solid,
         target_origin,
         item_cell,
         alternate_item_cell,
@@ -475,37 +515,8 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         && final_leg
         && bot_cell == goal_cell
         && (target_origin - origin).length() <= ARRIVE_RADIUS;
-    let mut terminal_changed = false;
-    if at_item_terminal {
-        let item = bot.goal.item;
-        let arrived_at = match bot.goal.terminal_arrival {
-            Some(arrival) if arrival.item == EntId(item) && arrival.cell == goal_cell => arrival.at,
-            _ => {
-                bot.goal.terminal_arrival = Some(TerminalArrival {
-                    item: EntId(item),
-                    cell: goal_cell,
-                    at: now,
-                });
-                now
-            }
-        };
-        if now - arrived_at >= TERMINAL_TAKE_GRACE {
-            if bot.goal.terminal_retried_item != Some(EntId(item)) {
-                if let Some(alternate) = alternate_item_cell {
-                    consume_terminal_retry(bot, item, alternate, now);
-                    terminal_changed = true;
-                } else {
-                    abandon_terminal_item(bot, item, now);
-                    terminal_changed = true;
-                }
-            } else {
-                abandon_terminal_item(bot, item, now);
-                terminal_changed = true;
-            }
-        }
-    } else {
-        bot.goal.terminal_arrival = None;
-    }
+    let terminal_changed =
+        update_item_terminal(bot, at_item_terminal, item_solid, goal_cell, alternate_item_cell, now);
 
     // Plat standoff. If an upcoming leg boards/rides a func_plat that isn't at its bottom, and we're
     // not already aboard it, walking to the board point would put us inside the lift's inner trigger
@@ -1545,5 +1556,24 @@ mod tests {
         assert!(bot.route.is_empty());
         assert_eq!(bot.goal_cell, None);
         assert_eq!(bot.repath_time, 10.0);
+    }
+
+    #[test]
+    fn timed_return_arrival_preserves_unspawned_item_goal_after_grace() {
+        let mut bot = BotState::default();
+        let item = EntId(17);
+        let terminal = 4;
+        bot.goal.set_item(item.0);
+        bot.goal.item_cell = terminal;
+        bot.goal.terminal_arrival = Some(TerminalArrival { item, cell: terminal, at: 1.0 });
+
+        let now = 1.0 + TERMINAL_TAKE_GRACE;
+        let changed = update_item_terminal(&mut bot, true, Solid::Not, terminal, Some(9), now);
+
+        assert!(!changed, "an unspawned item is a wait, not a failed take");
+        assert_eq!(bot.goal.item, item.0);
+        assert_eq!(bot.goal.item_cell, terminal);
+        assert_eq!(bot.goal.terminal_retried_item, None);
+        assert!(!bot.is_avoided(item.0, now));
     }
 }

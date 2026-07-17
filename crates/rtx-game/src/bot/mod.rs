@@ -469,6 +469,9 @@ struct Objective {
     /// Standing vigil over an uncollectable goal item (cruising/scanning near it) — exempts the
     /// stuck/progress watchdogs and drives the eyes with the scan sweep.
     vigil: bool,
+    /// Current solidity of the goal item; terminal take confirmation is meaningful only for a live
+    /// pickup trigger.
+    item_solid: Solid,
     /// Where to navigate toward this frame.
     target_origin: Vec3,
     /// The navmesh cell of the item goal, when chasing one (skips a `nearest` lookup).
@@ -765,6 +768,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
             item_committed: false,
             polite: false,
             vigil: false,
+            item_solid: Solid::Not,
             target_origin,
             item_cell,
             alternate_item_cell: None,
@@ -1142,6 +1146,11 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // would otherwise just beeline the enemy. This is ktx's "the enemy is one more goal" in effect.
     let chasing = game.entities[e].bot.goal.item != 0;
     let item_committed = game.entities[e].bot.goal.commit != GoalCommit::None;
+    let item_solid = if chasing {
+        game.entities[EntId(game.entities[e].bot.goal.item)].v.solid
+    } else {
+        Solid::Not
+    };
     let goal_item_terminal = {
         let it = EntId(game.entities[e].bot.goal.item);
         let cell = game.entities[e].bot.goal.item_cell;
@@ -1264,7 +1273,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // the normal objective leaves them off — the anti-drown override flips them on when it fires.
     Objective {
         hooking, on_sj, on_rj, enemy, chasing, item_committed, polite, target_origin, item_cell,
-        alternate_item_cell, magnet, watch_point, vigil: vigil.is_some(), surfacing: false,
+        alternate_item_cell, magnet, watch_point, vigil: vigil.is_some(), item_solid, surfacing: false,
         swim_up: false, order_link: None,
     }
 }
