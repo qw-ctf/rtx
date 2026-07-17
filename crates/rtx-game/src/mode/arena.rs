@@ -402,6 +402,12 @@ impl Arena {
                 // leak back into the carried-over arsenal each round.
                 g.filter_disabled_weapons(e);
                 g.w_set_current_ammo(e);
+                // Same reason the opponent model must be reset by hand: the winner never crosses the
+                // respawn path (`grant_spawn_loadout`) that resets every other spawn, so without this
+                // the shared belief keeps last round's low health — and the next challenger reads a
+                // full-stack survivor as "nearly dead" and shotgun-rushes them. Restore the RA
+                // spawn baseline (100 hp / 200 red), matching the loadout just applied.
+                g.model_reset_target(e);
             } else {
                 g.entities[e].mode_p.arena.pending_spawn = true;
             }

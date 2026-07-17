@@ -57,6 +57,13 @@ const EXPLOSIVE_IMPACT_MARGIN: f32 = 24.0;
 const LINE_OF_FIRE_SLACK: f32 = 48.0;
 /// Retreat when hurt below this.
 const LOW_HEALTH: f32 = 40.0;
+/// Upper range on the single-barrel *shotgun* finish (the lightning finish keeps its full
+/// [`LG_RANGE`] beam). The pattern holds its full ~24-dmg six pellets only while its cone half-width
+/// (`dist · 0.04`, the [`w_fire_shotgun`](crate::weapons) spread) stays under the ~16u target
+/// half-width — about 400 units; two shots then close out a [`FINISH_STACK`] enemy. Past this the
+/// cone opens up and it needs 3+ hits, so a believed-low enemy is better finished with the rocket's
+/// splash than a switch to a shotgun that can't reach — the "swapped too early" the user saw.
+const FINISH_SHOTGUN_RANGE: f32 = 450.0;
 
 /// Opponent-model "press the advantage" thresholds. When the current enemy is believed to be on a
 /// finishable stack (below [`FINISH_STACK`] — under one rocket even through green armor), the belief
@@ -195,10 +202,11 @@ impl Loadout {
 ///
 /// `finishable` — the opponent model believes this enemy is on a finishable stack (set by [`engage`]
 /// from [`est_strength`](crate::bot::model::est_strength) against [`FINISH_STACK`], the same read the
-/// movement `press` uses). When set, a mid/long-range pick that would otherwise be a dodgeable
-/// projectile becomes a hitscan direct hit — the lightning gun in beam range, else the tight
-/// single-barrel shotgun — so the near-kill lands the instant it fires instead of being strafed clear
-/// of a rocket's ~0.4 s flight.
+/// movement `press` uses). When set, a mid-range pick that would otherwise be a dodgeable projectile
+/// becomes a hitscan direct hit — the lightning gun in beam range, else the tight single-barrel
+/// shotgun within [`FINISH_SHOTGUN_RANGE`] — so the near-kill lands the instant it fires instead of
+/// being strafed clear of a rocket's ~0.4 s flight. Past the shotgun's finishing range (and out of
+/// beam range) the rocket's splash is the better closer, so the finish leaves the pick alone.
 fn choose_weapon(inv: Loadout, dist: f32, gl_air: bool, gl_ground: bool, underwater: bool, finishable: bool) -> WeaponChoice {
     // A solved airborne grenade intercept takes precedence: it's the shot we came here to take.
     if gl_air {
@@ -220,13 +228,15 @@ fn choose_weapon(inv: Loadout, dist: f32, gl_air: bool, gl_ground: bool, underwa
     // A finishable enemy past point blank: a hitscan direct hit lands the kill the instant it fires,
     // where the rocket's flight lets a near-dead target strafe clear. Lightning if fed and in beam
     // range (its true 600, past the conservative 550 the branch above stops at), else the tight
-    // single-barrel shotgun — not the wide SSG, which patterns worse at this distance. Only reached
-    // when the branches above didn't already pick a hitscan gun, i.e. exactly the RL/projectile case.
+    // single-barrel shotgun — not the wide SSG, which patterns worse at this distance — but only
+    // within FINISH_SHOTGUN_RANGE, where two barrels still close the enemy out; beyond it the pattern
+    // can't finish and we keep the rocket's splash. Only reached when the branches above didn't
+    // already pick a hitscan gun, i.e. exactly the RL/projectile case.
     if finishable && dist >= SPLASH_RANGE {
         if inv.fed(Weapon::Lightning) && dist < LG_RANGE && !underwater {
             return WeaponChoice::of(Weapon::Lightning);
         }
-        if inv.fed(Weapon::Shotgun) {
+        if inv.fed(Weapon::Shotgun) && dist < FINISH_SHOTGUN_RANGE {
             return WeaponChoice::of(Weapon::Shotgun);
         }
     }
@@ -2310,13 +2320,17 @@ mod tests {
         // a finish read; with one, the lightning gun's true 600-unit reach takes the guaranteed hit.
         assert_eq!(choose_weapon(all, 580.0, false, false, false, false).weapon, Weapon::RocketLauncher);
         assert_eq!(choose_weapon(all, 580.0, false, false, false, true).weapon, Weapon::Lightning);
-        // No lightning gun: the tight single-barrel shotgun — not the rocket, and not the wider SSG,
-        // which patterns worse at this distance. Contrast the no-finish rocket.
+        // No lightning gun, inside the shotgun's finishing range: the tight single-barrel shotgun —
+        // not the rocket, and not the wider SSG, which patterns worse at this distance. Contrast the
+        // no-finish rocket.
         let no_lg = armed(Items::all() & !Items::LIGHTNING);
         assert_eq!(choose_weapon(no_lg, 400.0, false, false, false, false).weapon, Weapon::RocketLauncher);
         assert_eq!(choose_weapon(no_lg, 400.0, false, false, false, true).weapon, Weapon::Shotgun);
-        // Past the lightning gun's reach the shotgun serves even with the LG owned.
-        assert_eq!(choose_weapon(all, 700.0, false, false, false, true).weapon, Weapon::Shotgun);
+        // Past FINISH_SHOTGUN_RANGE the single-barrel can't close the kill out, so the finish keeps
+        // the rocket's splash rather than swapping too early — even without a lightning gun.
+        assert_eq!(choose_weapon(no_lg, 500.0, false, false, false, true).weapon, Weapon::RocketLauncher);
+        // And past the lightning gun's reach the shotgun no longer serves either — the rocket stays.
+        assert_eq!(choose_weapon(all, 700.0, false, false, false, true).weapon, Weapon::RocketLauncher);
         // Point blank is untouched — the super shotgun already one-shots a low enemy up close.
         assert_eq!(choose_weapon(all, 100.0, false, false, false, true).weapon, Weapon::SuperShotgun);
         // Underwater bars even the finish lightning gun; the shotgun still serves.
