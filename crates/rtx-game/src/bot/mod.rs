@@ -1742,7 +1742,15 @@ fn penalize_link(bot: &mut BotState, link: u32, now: f32) {
 /// pillars but sits behind them): a bot outside can't reach it, so committing to that gate is
 /// futile — it should route around the pillar instead. A `None` path counts as unreachable.
 fn button_reachable(graph: &NavGraph, from: CellId, gi: usize, costs: &LinkCosts) -> bool {
-    match graph.find_path(from, graph.gate(gi).button_cell, costs) {
+    let button = graph.gate(gi).button_cell;
+    // Topologically severed from here (a different component entirely)? Then no route exists even
+    // through the gate — skip the search. A button reachable only *by* crossing the gate still passes
+    // this O(1) test (the gate link is finitely priced, not deleted), so the find_path below is what
+    // actually rules out the chicken-and-egg case.
+    if !graph.reachable(from, button) {
+        return false;
+    }
+    match graph.find_path(from, button, costs) {
         Some(route) => !route.iter().any(|&leg| graph.gate_of_link(leg) == Some(gi)),
         None => false,
     }

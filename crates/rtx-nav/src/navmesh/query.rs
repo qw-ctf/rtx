@@ -219,19 +219,30 @@ impl NavGraph {
         (self.cells[l.to as usize].origin.xy() - self.cells[l.from as usize].origin.xy()).normalize_or_zero()
     }
 
-    /// The reachable cell (per current door states) whose origin is closest to `goal`'s, when
-    /// `goal` itself can't be reached. Lets a bot head as far toward an unreachable target as the
-    /// graph allows — approaching a wall/door/connection to get line of sight — instead of homing
-    /// straight into geometry. `None` only if nothing but `start` is reachable.
-    pub fn nearest_reachable_to(&self, start: CellId, goal: CellId, costs: &LinkCosts) -> Option<CellId> {
-        let flood = self.costs_from(start, costs);
+    /// The reachable cell whose origin is closest to `goal`'s, when `goal` itself can't be reached.
+    /// Lets a bot head as far toward an unreachable target as the graph allows — approaching a
+    /// wall/door/connection to get line of sight — instead of homing straight into geometry. `None`
+    /// only if nothing but `start` is reachable.
+    ///
+    /// Reachability is static topology (every dynamic cost is finite — see [`super::reach`]), so on a
+    /// built graph this is an O(cells) scan against the precomputed table with no search at all. A bare
+    /// graph (no table) falls back to a Dijkstra flood, the original behavior.
+    pub fn nearest_reachable_to(&self, start: CellId, goal: CellId) -> Option<CellId> {
         let goal_pos = self.cells[goal as usize].origin;
-        (0..self.cells.len() as CellId)
-            .filter(|&c| c != start && flood[c as usize].is_finite())
-            .min_by(|&a, &b| {
-                let d = |c: CellId| (self.cells[c as usize].origin - goal_pos).length_squared();
-                d(a).total_cmp(&d(b))
-            })
+        let nearest = |reachable: &dyn Fn(CellId) -> bool| {
+            (0..self.cells.len() as CellId)
+                .filter(|&c| c != start && reachable(c))
+                .min_by(|&a, &b| {
+                    let d = |c: CellId| (self.cells[c as usize].origin - goal_pos).length_squared();
+                    d(a).total_cmp(&d(b))
+                })
+        };
+        if self.reach.is_some() {
+            nearest(&|c| self.reachable(start, c))
+        } else {
+            let flood = self.costs_from(start, &LinkCosts::default());
+            nearest(&|c| flood[c as usize].is_finite())
+        }
     }
 
     /// Dijkstra cost-flood from `start`: the travel-time cost to reach every cell (`INFINITY`

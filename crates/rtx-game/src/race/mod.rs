@@ -801,7 +801,7 @@ race_set_teleport_flags_by_name odd RACEFLAG_BOGUS
                         // Diagnose the break: how close does reachability get to the goal, and
                         // what does the remaining hop look like (distance and height delta)?
                         let frontier = graph
-                            .nearest_reachable_to(a, b, &costs)
+                            .nearest_reachable_to(a, b)
                             .map(|c| {
                                 let (fo, go) = (graph.cell_origin(c), graph.cell_origin(b));
                                 let dxy = glam::Vec2::new(go.x - fo.x, go.y - fo.y).length();

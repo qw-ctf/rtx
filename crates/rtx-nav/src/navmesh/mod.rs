@@ -23,6 +23,7 @@ mod hook;
 mod jumps;
 mod physics;
 mod query;
+mod reach;
 mod rocketjump;
 mod sidetable;
 mod splice;
@@ -38,6 +39,7 @@ pub use physics::{
     CURL_V_HOLD_TOL, DOUBLE_ARC_PEAK, JUMP_APEX, MAX_SPEED, NBANDS,
 };
 use physics::*;
+use reach::Reach;
 pub use rocketjump::RJ_CERT_AIM_DEG;
 use rocketjump::{rj_perturb_ok, rocket_jump_cost, simulate_rocket_jump, RJ_DELAYS, RJ_PITCHES};
 use sidetable::SideTable;
@@ -258,6 +260,10 @@ pub struct NavGraph {
     /// speed jumps are spliced (or left at the stock default). The banded planner reads it to price
     /// speed carried between links; keeping it here avoids re-reading cvars at query time.
     sj_k: f32,
+    /// Static reachability (SCCs + forward closure), filled by [`build_reachability`](Self::build_reachability)
+    /// at the end of the build so [`reachable`](Self::reachable) answers "can A ever get to B?" in O(1)
+    /// instead of a failed whole-graph search. `None` on a bare (unbuilt) graph — see [`reach`].
+    reach: Option<Reach>,
 }
 
 /// A solved speed jump: where the takeoff ledge is and the horizontal speed needed there, so the
@@ -393,6 +399,7 @@ impl NavGraph {
             rocket_jumps: SideTable::default(),
             plats: SideTable::default(),
             sj_k: bhop_k(10.0, MAX_SPEED), // stock default until add_speed_jumps captures live cvars
+            reach: None,                   // filled by build_reachability once all links are spliced
         };
         graph.link_cells(bsp);
         graph
@@ -425,6 +432,7 @@ impl NavGraph {
             rocket_jumps: SideTable::default(),
             plats: SideTable::default(),
             sj_k: bhop_k(10.0, MAX_SPEED),
+            reach: None,
         }
     }
 
@@ -1486,6 +1494,10 @@ pub fn build_navmesh(
         // Last: prices links entering a lift shaft, so it must see every link the splices above added
         // (a teleport that lands under a plat, a jump-aboard from the shaft floor).
         graph.surcharge_under_plat_links();
+        // Now that every link is in place, precompute static reachability. The graph-swap steps
+        // (`flag_hazards`/`flag_water`) only add *cost* to existing links, never new links, so this
+        // stays valid across the swap.
+        graph.build_reachability();
         Some((bsp, graph))
     };
     // Run the (rayon-parallel) build on a transient pool sized to leave one core for the caller.
@@ -2770,5 +2782,54 @@ mod tests {
             corner.find_path_banded(0, 2, 0.0, &LinkCosts::default()).is_none(),
             "a sharp corner should demote the carried band below the jump's requirement"
         );
+    }
+
+    // --- static reachability (see `reach`) ---
+
+    fn reach_cell(x: f32) -> Cell {
+        Cell { origin: Vec3::new(x, 0.0, 0.0), gx: 0, gy: 0 }
+    }
+    fn reach_link(from: CellId, to: CellId) -> Link {
+        Link { from, to, kind: LinkKind::Walk, cost: 1.0 }
+    }
+
+    /// A one-way drop severs backward reachability but not forward: after a two-way pair a bot drops
+    /// into a pocket it can't climb back out of. The SCC closure must reflect that asymmetry.
+    #[test]
+    fn reachability_respects_one_way_links() {
+        // 0 <-> 1 (two-way), then a one-way chain 1 → 2 → 3 (a drop into a pocket, no way back up).
+        let mut g = NavGraph::test_graph(
+            vec![reach_cell(0.0), reach_cell(32.0), reach_cell(64.0), reach_cell(96.0)],
+            vec![reach_link(0, 1), reach_link(1, 0), reach_link(1, 2), reach_link(2, 3)],
+        );
+        g.build_reachability();
+        // Forward across the drop: everything downstream is reachable.
+        assert!(g.reachable(0, 3), "0 should reach the pocket bottom");
+        assert!(g.reachable(1, 2));
+        // Backward across the drop: severed.
+        assert!(!g.reachable(2, 1), "no way back up the drop");
+        assert!(!g.reachable(3, 0), "the pocket bottom can't return");
+        // The two-way pair is mutually reachable, and every cell reaches itself.
+        assert!(g.reachable(0, 1) && g.reachable(1, 0));
+        assert!(g.reachable(2, 2) && g.reachable(3, 3));
+    }
+
+    /// `nearest_reachable_to` picks the reachable cell physically closest to an unreachable goal, and
+    /// the O(1)-table path agrees cell-for-cell with the Dijkstra-flood fallback (bare graph).
+    #[test]
+    fn nearest_reachable_matches_flood() {
+        // A connected run 0→1→2 (x = 0, 100, 200) plus an isolated goal cell 3 at x = 250 with no
+        // links. From 0 the reachable set is {0,1,2}; the closest of those to the goal is cell 2.
+        let cells = vec![reach_cell(0.0), reach_cell(100.0), reach_cell(200.0), reach_cell(250.0)];
+        let links = vec![reach_link(0, 1), reach_link(1, 0), reach_link(1, 2), reach_link(2, 1)];
+
+        // Flood path: no reachability table built (reach == None), so it falls back to costs_from.
+        let bare = NavGraph::test_graph(cells.clone(), links.clone());
+        assert_eq!(bare.nearest_reachable_to(0, 3), Some(2), "flood fallback picks the closest reachable cell");
+
+        // Table path: identical graph with the table built — must give the same answer.
+        let mut built = NavGraph::test_graph(cells, links);
+        built.build_reachability();
+        assert_eq!(built.nearest_reachable_to(0, 3), Some(2), "table path must agree with the flood");
     }
 }

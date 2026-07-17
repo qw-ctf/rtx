@@ -174,23 +174,25 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         // chain alive. Falls back to the plain cell A* (bands all-zero) when off.
         let use_bands = host.cvar_bool(c"rtx_bot_bhop") && host.cvar_bool(c"rtx_bot_bandplan");
         let banded = |from, to| use_bands.then(|| graph.find_path_banded(from, to, speed, &costs)).flatten();
-        let (mut route, mut bands) = match banded(bot_cell, goal) {
-            Some(r) => (r.links, r.bands),
-            None if use_bands => (Vec::new(), Vec::new()),
-            None => (graph.find_path(bot_cell, goal, &costs).unwrap_or_default(), Vec::new()),
+        // Where can we actually head? Unreachability is pure topology (every dynamic cost term is
+        // finite — see `navmesh::reach`), so resolve the target *before* searching instead of
+        // discovering a dead goal by watching a whole-graph search exhaust and then flooding to find
+        // the nearest reachable cell. A goal behind a shut door with no way around, or in a
+        // disconnected pocket, redirects to the reachable cell nearest it — the bot heads as far
+        // toward the target as the graph allows (often enough for line of sight) rather than homing
+        // into a wall.
+        let target = if graph.reachable(bot_cell, goal) {
+            goal
+        } else {
+            graph.nearest_reachable_to(bot_cell, goal).unwrap_or(goal)
         };
-        // Goal unreachable from here (behind a shut door with no way around from this spot, or a
-        // disconnected pocket)? Don't home straight into a wall — head to the reachable cell
-        // nearest the goal, approaching as far as the graph allows (often enough for line of sight
-        // or to find a connection). Better than freezing until the target wanders into view.
-        if route.is_empty() && bot_cell != goal {
-            if let Some(near) = graph.nearest_reachable_to(bot_cell, goal, &costs) {
-                match banded(bot_cell, near) {
-                    Some(r) => (route, bands) = (r.links, r.bands),
-                    None => route = graph.find_path(bot_cell, near, &costs).unwrap_or_default(),
-                }
-            }
-        }
+        let (route, mut bands) = match banded(bot_cell, target) {
+            Some(r) => (r.links, r.bands),
+            // Banded came back empty on a *reachable* target ⇒ band-infeasible (a route that exists
+            // only through a speed-jump chain the carried speed can't satisfy), or bands are off. The
+            // plain cell A* ignores bands and is guaranteed to find the reachable target.
+            None => (graph.find_path(bot_cell, target, &costs).unwrap_or_default(), Vec::new()),
+        };
         // Keep `route_bands` parallel to `route`: zero-fill when unbanded (or on any length mismatch).
         if bands.len() != route.len() {
             bands = vec![0u8; route.len()];
