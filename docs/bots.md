@@ -37,8 +37,10 @@ reachable armor or upgraded weapon before nominating an opponent. Travel time le
 with a bounded preference for a route that gains height without using a lift (a bridge/window-style
 exit) when it is only slightly farther away. The item run owns movement through physical touch;
 acquiring armor or any weapon beyond the spawn axe/shotgun ends the exit and normal hunting resumes.
-If every candidate is deeper in its respawn clock, the bot holds its spawn until one becomes a
-waitable goal instead of drifting into its ordinary follow/roam fallback.
+The 1.5-second selector cadence considers only candidates reachable within the exit's eight-second
+budget. If none qualifies, the bot holds briefly rather than drifting into its ordinary follow/roam
+fallback, but taking damage, perceiving an enemy within combat range, or reaching the hard
+eight-second deadline immediately restores normal hunting.
 
 When a mode leaves the brain in charge, it pathfinds to the best reachable **item pickup**, or
 **follows the nearest human** — through doors, off ledges, across jumps, recovering after a

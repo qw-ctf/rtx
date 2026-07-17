@@ -110,6 +110,9 @@ fn local_pickup_in_budget(current_goal: bool, distance: f32, travel: f32) -> boo
 /// turn an across-map RA into the answer to every spawn.
 const SPAWN_HEIGHT_BONUS_MAX: f32 = 1.0;
 const SPAWN_HEIGHT_BONUS_RISE: f32 = 128.0;
+/// A spawn-stack candidate must fit inside the exit's hard combat-suppression budget and therefore
+/// also stays below the ordinary item goal watchdog's 10-second give-up leash.
+const SPAWN_STACK_TRAVEL_MAX: f32 = super::SPAWN_EXIT_TIME;
 #[derive(Clone, Copy, Debug)]
 struct SpawnStackCandidate {
     item: EntId,
@@ -125,7 +128,7 @@ fn choose_spawn_stack(
 ) -> Option<SpawnStackCandidate> {
     candidates
         .into_iter()
-        .filter(|c| c.travel.is_finite())
+        .filter(|c| c.travel.is_finite() && c.travel <= SPAWN_STACK_TRAVEL_MAX)
         .min_by(|a, b| {
             let score = |c: &SpawnStackCandidate| {
                 let height_bonus = if c.uses_lift {
@@ -1961,7 +1964,13 @@ mod tests {
             rise: 0.0,
             uses_lift: false,
         };
-        assert_eq!(choose_spawn_stack([only_far]).unwrap().item, only_far.item);
+        assert!(choose_spawn_stack([only_far]).is_none());
+
+        let at_limit = SpawnStackCandidate {
+            travel: SPAWN_STACK_TRAVEL_MAX,
+            ..only_far
+        };
+        assert_eq!(choose_spawn_stack([at_limit]).unwrap().item, at_limit.item);
     }
 
     #[test]

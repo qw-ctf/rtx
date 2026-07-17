@@ -248,6 +248,13 @@ const GOAL_SELECT_INTERVAL: f32 = 1.5;
 /// period lands in ±25% of 1.5s, i.e. 1.125–1.875s. Wide enough that a whole squad de-phases within a
 /// cycle or two, narrow enough that "a bot reconsiders about every 1.5s" is still true of each bot.
 const GOAL_SELECT_SPREAD: f32 = 0.5;
+/// A fresh-spawn stack run may suppress combat for at most this long. The spawn selector uses the
+/// same bound for candidate travel/respawn time, keeping every chosen exit inside both this deadline
+/// and the ordinary item watchdog's 10-second leash.
+const SPAWN_EXIT_TIME: f32 = 8.0;
+/// Close perceived contact immediately ends stack-first behavior. This covers the useful combat
+/// envelope through lightning-gun range without treating a distant sound as a reason to abandon it.
+const SPAWN_EXIT_COMBAT_RANGE: f32 = 600.0;
 /// How long after the last line-of-sight frame the nav view may still point at a Fight enemy's
 /// live origin. Set equal to combat's `HOLD_ANGLE_TIME` (the 2s corner-hold in `combat::engage`):
 /// while that hold owns the view it overrides `look` anyway, so the handoff is seamless — hold the
@@ -668,6 +675,31 @@ fn spawn_exit_complete(armor_value: f32, items: f32) -> bool {
         .any(|weapon| items.has(weapon))
 }
 
+/// Whether safety must release a fresh-spawn item lock. Kept pure so the deadline, mirrored damage
+/// signal, and perceived-contact threshold stay deterministic and directly testable.
+fn spawn_exit_should_abort(
+    now: f32,
+    until: f32,
+    took_damage: bool,
+    perceived_enemy_distance: Option<f32>,
+) -> bool {
+    took_damage
+        || now >= until
+        || perceived_enemy_distance.is_some_and(|distance| distance <= SPAWN_EXIT_COMBAT_RANGE)
+}
+
+/// Release every part of the spawn-exit completion lock so ordinary intent and combat movement can
+/// take ownership in the same frame as a timeout, hit, or close perceived contact.
+fn end_spawn_exit(b: &mut BotState, now: f32) {
+    b.spawn_exit = false;
+    b.spawn_exit_until = 0.0;
+    b.goal.item = 0;
+    b.goal.next_item = 0;
+    b.goal.commit = GoalCommit::None;
+    b.goal.next_commit = GoalCommit::None;
+    b.goal.next_pick = now;
+}
+
 fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, client: i32) -> Objective {
     let host = *game.host();
     // Hook invariant net: if we're mid-hook but no longer hold the grapple (a mode loadout stripped
@@ -744,14 +776,11 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // Whether to stop politely short of the destination (see `Objective::polite`) — flagged at
     // the arms that tail a human or roam, never for a mode-issued intent.
     let mut polite = false;
-    let stack_exit = game.entities[e].bot.spawn_exit;
-    let intent = if crate::mode::team::benched(game, e) {
+    let mut stack_exit = game.entities[e].bot.spawn_exit;
+    let benched = crate::mode::team::benched(game, e);
+    let nominated_intent = if benched {
         // Benched spectator (structured match, off the locked roster): stroll the stands, no fighting.
         Some(BotIntent::Move(crate::mode::wander_point(game, e, "info_player_deathmatch", |_| None)))
-    } else if stack_exit {
-        // A fresh DM spawn takes one armor/weapon before initiating. `None` keeps combat from
-        // nominating a target; the dedicated one-leg item selector below owns the exit instead.
-        None
     } else if host.cvar_bool(c"rtx_bot_pacifist") && mode.allows_bot_pacifist_override() {
         // Global override where the mode permits it: don't fight — just tail the nearest human.
         // Race refuses this because its hard Move intent is the ordered checkpoint/finish route.
@@ -775,7 +804,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // collects until real contact — the biggest believability change); keep an *aware but unseen*
     // target as Fight but hunt where it was last seen (`combat_last_seen`) rather than its live
     // origin; leave a *visible* target as-is. Non-Fight intents (Move/None) aren't perceived.
-    let (intent, combat_last_seen) = match intent {
+    let (mut intent, mut combat_last_seen) = match nominated_intent {
         Some(BotIntent::Fight(en)) => match perception::perceive(game, e, en, now) {
             perception::Awareness::Unaware => (None, None),
             perception::Awareness::Known { last_seen } => (Some(BotIntent::Fight(en)), Some(last_seen)),
@@ -788,6 +817,29 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
             (other, None)
         }
     };
+
+    // A spawn exit still runs normal perception so close contact can break the no-combat lock. A
+    // perceived but distant enemy leaves the one-item run alone; a close one releases the goal and
+    // falls through to this frame's Fight intent. Benched movement keeps its existing precedence.
+    if stack_exit && !benched {
+        let perceived_enemy_distance = match intent {
+            Some(BotIntent::Fight(en)) => Some((game.entities[en].v.origin - origin).length()),
+            _ => None,
+        };
+        if spawn_exit_should_abort(
+            now,
+            game.entities[e].bot.spawn_exit_until,
+            false,
+            perceived_enemy_distance,
+        ) {
+            end_spawn_exit(&mut game.entities[e].bot, now);
+            stack_exit = false;
+        } else {
+            // The dedicated one-leg item selector owns this bounded exit until safety releases it.
+            intent = None;
+            combat_last_seen = None;
+        }
+    }
 
     let greedy = matches!(intent, Some(BotIntent::Fight(_))) && host.cvar_bool(c"rtx_bot_greed");
 
@@ -1101,7 +1153,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         Some(BotIntent::Spectate { goal, .. }) => (goal, None),
         None if chasing => vigil.unwrap_or(goal_item_org),
         // No armor/weapon is currently reachable (all may be deeper in their respawn clocks): hold
-        // this spawn instead of falling into the ordinary human-follow/roam path. The one-second
+        // this spawn instead of falling into the ordinary human-follow/roam path. The 1.5-second
         // selector cadence will commit as soon as a respawning stack item enters its lookahead.
         None if stack_exit => (origin, None),
         None => {
@@ -1396,20 +1448,31 @@ fn run_bot(game: &mut GameState, e: EntId) {
     let spawn_exit_done =
         spawn_exit_complete(game.entities[e].v.armorvalue, game.entities[e].v.items);
     let fresh_spawn = alive && !game.entities[e].bot.was_alive;
+    let health = game.entities[e].v.health;
+    let armor_value = game.entities[e].v.armorvalue;
     {
         let enable = game.mode.name() == "dm" && host.cvar_bool(c"rtx_bot_stack");
         let b = &mut game.entities[e].bot;
+        let took_damage = b.spawn_exit
+            && !fresh_spawn
+            && (health < b.last_health || armor_value < b.last_armor_value);
         b.was_alive = alive;
         if fresh_spawn {
             b.spawn_exit = enable && !spawn_exit_done;
+            b.spawn_exit_until = if b.spawn_exit { now + SPAWN_EXIT_TIME } else { 0.0 };
             b.goal.item = 0;
             b.goal.next_item = 0;
             b.goal.commit = GoalCommit::None;
             b.goal.next_commit = GoalCommit::None;
             b.goal.next_pick = now;
-        } else if b.spawn_exit && spawn_exit_done {
-            b.spawn_exit = false;
+        } else if b.spawn_exit
+            && (spawn_exit_done
+                || spawn_exit_should_abort(now, b.spawn_exit_until, took_damage, None))
+        {
+            end_spawn_exit(b, now);
         }
+        b.last_health = health;
+        b.last_armor_value = armor_value;
     }
 
     // A dead bot holds nothing and isn't mid-jump — drop the handoff reservation and any airborne
@@ -1424,6 +1487,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
         b.goal.commit = GoalCommit::None;
         b.posture = CombatPosture::Hold;
         b.spawn_exit = false;
+        b.spawn_exit_until = 0.0;
     }
 
     // Connected but never spawned (health 0, not dead): the engine defers `PutClientInServer` — the
@@ -2245,6 +2309,25 @@ mod tests {
         assert!(spawn_exit_complete(1.0, stock));
         assert!(spawn_exit_complete(0.0, stock.with(Items::SUPER_NAILGUN)));
         assert!(spawn_exit_complete(0.0, stock.with(Items::ROCKET_LAUNCHER)));
+    }
+
+    #[test]
+    fn spawn_exit_safety_aborts_on_deadline_damage_or_close_contact() {
+        assert!(!spawn_exit_should_abort(7.99, 8.0, false, None));
+        assert!(spawn_exit_should_abort(8.0, 8.0, false, None));
+        assert!(spawn_exit_should_abort(1.0, 8.0, true, None));
+        assert!(spawn_exit_should_abort(
+            1.0,
+            8.0,
+            false,
+            Some(SPAWN_EXIT_COMBAT_RANGE),
+        ));
+        assert!(!spawn_exit_should_abort(
+            1.0,
+            8.0,
+            false,
+            Some(SPAWN_EXIT_COMBAT_RANGE + 1.0),
+        ));
     }
 
     /// The corridor scan (used pure, no NavGraph): a straight level corridor is all runway; a sharp

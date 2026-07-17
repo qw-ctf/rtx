@@ -22,6 +22,13 @@ pub struct BotState {
     /// Fresh-DM-spawn stack run: suppress initiating a fight and keep one reachable armor/weapon
     /// pickup completion-critical. Ends as soon as that pickup changes armor or weapon inventory.
     pub spawn_exit: bool,
+    /// Hard deadline for [`spawn_exit`](Self::spawn_exit). The exit also aborts sooner on damage or
+    /// close enemy contact, so a failed/contested pickup can never suppress combat indefinitely.
+    pub spawn_exit_until: f32,
+    /// Previous bot-frame health/armor, used to detect damage from both server-side combat and a
+    /// network client's mirrored player state while a fresh-spawn exit is active.
+    pub last_health: f32,
+    pub last_armor_value: f32,
     /// Current A* route as link indices into the navmesh, and our leg within it.
     pub route: Vec<u32>,
     pub route_pos: usize,
