@@ -62,10 +62,12 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // `bot::par`) — on by default; the result is bit-identical to serial. 0 → run them inline on
         // the main thread (the live A/B switch, and the fallback if the pool can't be built).
         ("rtx_bot_par", Bool(true)),
-        // Score goals over the coarse LOD hierarchy (clusters + portals — see `navmesh::lod`) instead
-        // of whole-graph floods: near cells stay exact, the far field is a bounded overestimate. Off
-        // for now (opt-in A/B while it's validated); 0 → the exact whole-graph floods.
-        ("rtx_bot_lod", Bool(false)),
+        // Navigate over the coarse LOD hierarchy (clusters + portals — see `navmesh::lod`) instead of
+        // whole-graph floods: goal scoring and long-range steering read a near-exact/bounded-overestimate
+        // coarse cost, and the steer search is bounded to the corridor window. On by default (validated:
+        // stronghold/rocka/ultrav 6 bots stay under the frame budget, behaviour parity incl. the ultrav
+        // gated quad). Escape hatch: 0 → the exact whole-graph floods + unwindowed steer.
+        ("rtx_bot_lod", Bool(true)),
         // A bot's health weights how willing it is to shortcut through lava/slime: hurt bots detour,
         // healthy (or armored, or biosuited) ones clip the corner. `0` prices every bot as a bare
         // spawn — hazards still cost, but the same to everyone. See `bot::bot_hazard_strength`.
