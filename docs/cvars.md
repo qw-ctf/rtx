@@ -67,6 +67,7 @@ Covered in depth in [the bots](bots.md).
 | `rtx_bot_model` | `1` | Opponent modeling: shared observation-gated hypotheses of enemy stack/arsenal. `0` = estimate-free. |
 | `rtx_bot_stack` | `1` | Resource discipline: steeper valuation below the bare-spawn stack, RA/mega cycling, ammo panic. |
 | `rtx_bot_magnet` | `1` | Waypoint magnetism: bend the steering waypoint through a desirable item just off the route. |
+| `rtx_bot_turnrate` | `0` | Ceiling on how fast a bot's view turns (deg/s) — the aim spring's angular-speed clamp, so a big look-flip pans like a human. `0` = skill-scaled default; `>0` overrides for tuning. |
 
 ## Bots — movement
 
@@ -81,6 +82,10 @@ Covered in depth in [bot navigation](bots.md#navigation).
 | `rtx_bot_rocketjump` | `1` | Rocket-jump to ledges when it clearly beats the walk and the bot is fit to fly it. |
 | `rtx_bot_hazard_health` | `1` | A bot's health weights its willingness to shortcut through lava/slime. `0` = price every bot as a bare spawn. |
 | `rtx_bot_hazard_k` | `15` | Seconds of detour accepted per unit of survival strength a hazard eats (higher = more timid). |
+| `rtx_bot_lod` | `1` | Navigate over the coarse LOD cluster/portal hierarchy — goal scoring and long steering read a bounded-overestimate coarse cost. `0` = exact whole-graph floods. |
+| `rtx_bot_nearfield` | `1` | Steer the last metre off a fine 8u clearance grid: nudge off walls and drop-edges, centre through doorways. `0` = the drop-only edge probe. |
+| `rtx_bot_glide` | `1` | When the near-field certifies a straight look-ahead chord is clear, glide toward it instead of the next cell centre (smooths the grid zigzag). Sub-toggle of nearfield. |
+| `rtx_bot_ledgecap` | `210` | Careful-ledge walk-speed cap (u/s) on cells flagged beside a fatal drop (an open-cored spiral's inner edge). `0` = full maxspeed. |
 
 ## Development & tuning
 
@@ -90,6 +95,7 @@ Debug and harness knobs — safe to ignore on a play server. See
 | cvar | default | effect |
 |------|---------|--------|
 | `rtx_bot_debug` | `0` | Per-bot goal/pickup diagnostics to the server console. |
+| `rtx_bot_par` | `1` | Fan a goal pick's independent navmesh floods across a persistent worker pool (bit-identical to serial). `0` = run them inline on the main thread. |
 | `rtx_bot_prof` | `10` | Seconds between bot-evaluation profile reports on the server console (p95, worst frame, head-room against the engine's `maxfps` slice). `0` = off, and nothing is timed. |
 | `rtx_control_port` | `0` | TCP control channel (localhost) for scripted bot puppetry — teleport, goto, fly a link, read telemetry. `0` = no socket bound. |
 | `rtx_rj_stance` | `16` | Rocket-jump driver: stance offset. |
@@ -101,7 +107,7 @@ Debug and harness knobs — safe to ignore on a play server. See
 | `rtx_rj_pitch_bias` | `0` | Degrees *added* to every solved rocket-jump fire pitch (QW positive-down; may be negative). |
 | `rtx_jump_curl_hold` | `0` | Fraction of a gap flown on the takeoff heading before the air-curl engages ("curl later"). |
 | `rtx_jump_curl_gain` | `0` | Air-curl proportional gain override (°/s per °). `0` = each link's own baked gain. |
-| `rtx_jump_runup` | `0` | Minimum ground speed (fraction of `sv_maxspeed`) before a takeoff jump fires ("more speed"). |
+| `rtx_jump_runup` | `0.5` | Minimum run-up speed toward the waypoint (fraction of `sv_maxspeed`) before a plain jump leg fires — `0.5` (~160 ups) kills the standstill pogo; a jump close to the lip fires regardless. `0` = off. |
 | `rtx_wedge_debug` | *(unset)* | Dev-only: log the animation-wedge catch. Read directly, never seeded. |
 
 The `rtx_rj_*` and `rtx_jump_*` knobs are read live each frame and default to the constants they

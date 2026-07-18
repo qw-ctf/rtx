@@ -128,4 +128,5 @@ it would churn the whole crate. Match the surrounding style instead.
 
 ---
 
-*See also: [cvar reference](cvars.md) · [network client](netclient.md)*
+*See also: [cvar reference](cvars.md) · [network client](netclient.md) ·
+[bot architecture](bot-architecture.md)*

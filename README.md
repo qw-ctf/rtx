@@ -66,6 +66,7 @@ cargo build --release -p rtx-client
 | [Movement & combat](docs/movement.md) | Double jump, wall jump, elevator jump, the shock combo, the grappling hook, choosing the arsenal. |
 | [Game modes](docs/modes.md) | `dm`, `ra`, `midair`, `ctf`, `race`; match composition and the team-match lifecycle; map rotation. |
 | [The bots](docs/bots.md) | Perception, navigation and the navmesh's jump/hook links, item valuation, combat, teamwork. |
+| [Bot architecture](docs/bot-architecture.md) | How the brain is built: the navmesh core, the per-frame decision loop, movement drivers, the opponent model, the two embodiments. |
 | [The bots as network clients](docs/netclient.md) | `rtx-client`: joining any QW/NQ server, mode detection, map downloads, squads. |
 | [Cvar reference](docs/cvars.md) | Every `rtx_*` tunable with its default, on one page. |
 | [Development & tooling](docs/development.md) | Building, CI artifacts, tests, the control channel and tuning harness. |

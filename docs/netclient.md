@@ -90,5 +90,5 @@ server it forces them off — so the navmesh never plans a double-jump gap the s
 
 ---
 
-*See also: [the bots](bots.md) · [cvar reference](cvars.md) ·
-[development & tooling](development.md)*
+*See also: [the bots](bots.md) · [bot architecture](bot-architecture.md) ·
+[cvar reference](cvars.md) · [development & tooling](development.md)*

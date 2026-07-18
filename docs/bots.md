@@ -4,7 +4,8 @@ Navmesh-driven bots that need **no per-map waypoint files** — the navmesh is g
 map's BSP clip hull when the map loads. Bots are real client slots: the engine runs their input
 through the same player-move code as humans, so gravity, stepping, and jumps come for free.
 
-Part of the [rtx manual](../README.md) · every tunable on one page: [cvar reference](cvars.md)
+Part of the [rtx manual](../README.md) · how the brain is built inside:
+[bot architecture](bot-architecture.md) · every tunable on one page: [cvar reference](cvars.md)
 
 ## At a glance
 
@@ -175,7 +176,7 @@ a powerup plan, and a universal fake-client pickup pass covers flags and runes a
 ordinary items.
 
 Once a bot has line of sight it aims (leading the target for rockets), picks a weapon by range,
-strafes/retreats, and fires. The combat layer (`crates/rtx-game/src/bot_combat.rs`) is generic
+strafes/retreats, and fires. The combat layer (`crates/rtx-game/src/bot/combat/`) is generic
 and reused by any mode that hands a bot an enemy.
 
 ### Splash self-care
@@ -259,5 +260,5 @@ hard objective. See [game modes](modes.md) for what each mode asks of them.
 
 ---
 
-*See also: [movement & combat](movement.md) · [game modes](modes.md) ·
-[the bots as network clients](netclient.md) · [cvar reference](cvars.md)*
+*See also: [bot architecture](bot-architecture.md) · [movement & combat](movement.md) ·
+[game modes](modes.md) · [the bots as network clients](netclient.md) · [cvar reference](cvars.md)*
