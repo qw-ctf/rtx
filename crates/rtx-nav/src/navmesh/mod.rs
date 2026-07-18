@@ -1163,6 +1163,19 @@ impl NavGraph {
         (self.links.len() - 1) as u32
     }
 
+    /// Rebuild the derived tables — the reachability closure and the LOD hierarchy — after a post-build
+    /// topology mutation such as [`plant_speed_jump`](Self::plant_speed_jump). The automatic build runs
+    /// these once at the end over the final link set; a hand-planted link (harness bring-up) must
+    /// refresh them, or the O(1) [`reachable`](Self::reachable) gate and the coarse router keep
+    /// answering for the *pre-plant* graph — e.g. a `goto` to a ledge reachable only across the planted
+    /// jump would see `reachable` return false and redirect to the nearest old-reachable cell instead
+    /// of pathing over it. The live graph's liquid columns are already filled, so `build_lod` folds
+    /// them in directly (no separate liquid patch needed).
+    pub fn rebuild_derived(&mut self) {
+        self.build_reachability();
+        self.build_lod();
+    }
+
     /// Push a speed-jump link with its traversal, tagging the new link in the side table.
     fn push_speed_jump(&mut self, link: Link, traversal: SpeedJumpTraversal) {
         let s = self.speed_jumps.push(traversal);

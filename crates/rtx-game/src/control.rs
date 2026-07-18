@@ -864,6 +864,10 @@ fn plant_link_json(game: &mut GameState, from: Vec3, takeoff: Vec3, tgt: Vec3, v
     let cost = runup / 400.0 + airtime + 0.3;
     let tr = SpeedJumpTraversal { takeoff, v_req, airtime, chained: false, curl_gain };
     let li = g.plant_speed_jump(from_cell, to_cell, cost, tr);
+    // Refresh the reachability + LOD tables so the new link is visible to steer's O(1) reachable()
+    // gate and the coarse router — otherwise a `goto` across the plant redirects to the nearest cell
+    // reachable on the pre-plant graph instead of pathing over it.
+    g.rebuild_derived();
     let (fo, to) = (g.cell_origin(from_cell), g.cell_origin(to_cell));
     Ok(format!(
         "{{\"link\":{li},\"from_cell\":{from_cell},\"to_cell\":{to_cell},\"from\":{},\"tgt\":{},\"takeoff\":{},\"v_req\":{},\"airtime\":{},\"cost\":{}}}",
