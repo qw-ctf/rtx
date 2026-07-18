@@ -40,6 +40,16 @@ pub(crate) fn aim_omega(skill: f32) -> f32 {
     6.0 + skill * 2.0
 }
 
+/// Ceiling on the aim spring's angular speed (deg/s), skill-scaled. It sits *above* the spring's own
+/// natural peak for an ordinary ≤90° correction (`omega·90/e` ≈ 200 at skill 0, 660 at skill 7), so
+/// combat flicks are untouched — but it turns a ≥150° look-target reversal (a vigil-scan flip, a
+/// goal re-pick, a flickering enemy) from an instant snap / unbounded spin into a fast *human* pan
+/// (~360 deg/s at skill 0, ~990 at skill 7, in the range of a real fast flick). This is the missing
+/// view turn-rate dial; `rtx_bot_turnrate > 0` overrides it for live tuning.
+pub(crate) fn aim_rate_cap(skill: f32) -> f32 {
+    360.0 + skill * 90.0
+}
+
 /// Multiplier on the base aim spread from three human tracking factors, all ≥ 1 so they only ever
 /// *widen* the error: **convergence** (loose on first sight at `visible_for = 0`, tightening below 1
 /// over ~1.5s of continuous line of sight), **own motion** (worse while running, up to +40% at

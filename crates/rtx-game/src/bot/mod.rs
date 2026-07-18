@@ -1093,6 +1093,16 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
 /// world move is projected onto it. The hook fire is decided here, *after* the spring, so the
 /// throw waits for the smoothed view to settle on the anchor.
 #[allow(clippy::too_many_arguments)] // the frame's decision bundle; grouping it would just relocate
+/// One critically-damped spring step of the view toward `target` (degrees), with the resulting angular
+/// speed clamped to `±vmax` deg/s. The clamp only bites on a large error — where the spring would snap
+/// or, driven by an oscillating look target, spin — turning it into a bounded human pan; a small
+/// correction is untouched (its natural speed is well under the cap). Returns the new `(angle, vel)`.
+fn spring_step(a: f32, v: f32, target: f32, omega: f32, dt: f32, vmax: f32) -> (f32, f32) {
+    let d = wrap180(target - a);
+    let v = (v + (omega * omega * d - 2.0 * omega * v) * dt).clamp(-vmax, vmax);
+    (wrap180(a + v * dt), v)
+}
+
 fn emit(
     game: &mut GameState,
     e: EntId,
@@ -1126,17 +1136,19 @@ fn emit(
         // Spring stiffness (1/s): sluggish → pro-snappy. Shared with the combat feed-forward,
         // whose lag compensation assumes exactly this spring.
         let omega = combat::aim_omega(skill);
+        // Angular-speed ceiling so a large look-target flip (a vigil scan, a goal re-pick, a flickering
+        // enemy) reads as a fast human pan, not an instant snap or an unbounded spin. `rtx_bot_turnrate`
+        // overrides the skill-scaled default when > 0.
+        let cap = {
+            let c = game.host().cvar(c"rtx_bot_turnrate");
+            if c > 0.0 { c } else { combat::aim_rate_cap(skill) }
+        };
         let b = &mut game.entities[e].bot;
         if b.aim.angles == Vec3::ZERO {
             b.aim.angles = v_angle; // seed from the real view so the first frame doesn't snap from zero
         }
-        let spring = |a: f32, v: f32, target: f32| {
-            let d = wrap180(target - a);
-            let v = v + (omega * omega * d - 2.0 * omega * v) * dt;
-            (wrap180(a + v * dt), v)
-        };
-        let (pitch, pv) = spring(b.aim.angles.x, b.aim.vel.x, look.x);
-        let (yaw, yv) = spring(b.aim.angles.y, b.aim.vel.y, look.y);
+        let (pitch, pv) = spring_step(b.aim.angles.x, b.aim.vel.x, look.x, omega, dt, cap);
+        let (yaw, yv) = spring_step(b.aim.angles.y, b.aim.vel.y, look.y, omega, dt, cap);
         b.aim.angles = Vec3::new(pitch, yaw, 0.0);
         b.aim.vel = Vec3::new(pv, yv, 0.0);
         let view = b.aim.angles;
@@ -2331,6 +2343,26 @@ mod tests {
         // The cap must stay far below the navmesh's closed-gate penalty (100_000s) so a failed-link
         // surcharge only reshapes a route, never forces one through a shut door.
         const { assert!(PENALTY_CAP < 1_000.0) };
+    }
+
+    #[test]
+    fn aim_spring_clamps_the_turn_rate_but_not_small_corrections() {
+        let (omega, dt) = (combat::aim_omega(3.0), 1.0 / 77.0);
+        let cap = combat::aim_rate_cap(3.0);
+        // A 170° reversal: the first step's speed is bounded to the cap (no snap/spin).
+        let (a1, v1) = spring_step(0.0, 0.0, 170.0, omega, dt, cap);
+        assert!(v1.abs() <= cap + 1e-3, "turn rate {v1} exceeds cap {cap}");
+        assert!((a1 - v1 * dt).abs() < 1e-3, "angle advances by the clamped velocity");
+        // A small 5° correction is under the cap — identical to the unclamped spring.
+        let (_, vs) = spring_step(0.0, 0.0, 5.0, omega, dt, cap);
+        let unclamped = 0.0 + (omega * omega * 5.0 - 2.0 * omega * 0.0) * dt;
+        assert!((vs - unclamped).abs() < 1e-3, "small correction must not be clamped");
+        // Repeatedly stepping a fixed target converges (no limit cycle at the clamp).
+        let (mut a, mut v) = (0.0f32, 0.0f32);
+        for _ in 0..400 {
+            (a, v) = spring_step(a, v, 170.0, omega, dt, cap);
+        }
+        assert!((a - 170.0).abs() < 1.0 && v.abs() < 5.0, "converges to target: a={a} v={v}");
     }
 
     #[test]

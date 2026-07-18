@@ -218,6 +218,11 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // before the bot reacts, shortened with skill; 0 = instant. Both 0 ≈ pre-perception bots.
         ("rtx_bot_fov", Float(120.0)),
         ("rtx_bot_reaction", Float(0.4)),
+        // Ceiling on how fast a bot's view turns (deg/s) — the aim spring's angular-speed clamp, so a
+        // large look-target flip (a spawn-wait scan, a goal re-pick, a flickering enemy) is a fast human
+        // pan, not an instant snap or a spin. 0 = the skill-scaled default (`combat::aim_rate_cap`);
+        // > 0 overrides it for tuning. Small combat corrections sit well under it, so aim is unaffected.
+        ("rtx_bot_turnrate", Float(0.0)),
         // Opponent modeling: bots keep a shared, observation-gated hypothesis of each opponent's
         // health/armor stack and arsenal (per-team blackboards; the FFA bots share one), reset on
         // death, updated only from events a bot could witness (pickups/gunfire in earshot, damage it
