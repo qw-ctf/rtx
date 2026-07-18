@@ -143,7 +143,13 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 bot.gate.errand = None; // door opened — done
                 bot.route.clear();
                 bot.repath_time = now;
-            } else if !button_reachable(graph, bot_cell, gi, &costs) {
+            } else if now >= bot.repath_time && !button_reachable(graph, bot_cell, gi, &costs) {
+                // Re-verify the button is reachable without crossing this very gate (the arenazap
+                // chicken-and-egg case) only at the repath cadence, not every frame: `button_reachable`
+                // runs a whole-graph search, and the far pre-arm now routinely aims errands at distant
+                // buttons. A door that opens is caught above every frame, and a bot that stops making
+                // progress toward a now-unreachable button is caught by the give-up clock below, so a
+                // ≤`REPATH_INTERVAL` lag on the topology-flip case is harmless.
                 give_up(bot); // button is walled off behind this very gate — route around instead
             } else {
                 let d = (graph.cell_origin(graph.gate(gi).button_cell).xy() - origin.xy()).length();
@@ -163,6 +169,9 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         Some(errand) => graph.gate(errand.index).button_cell,
         None => goal_cell,
     };
+    // Read the LOD toggle once for the whole steer pass (repath corridor, far gate pre-arm, errand
+    // route) — one engine cvar lookup instead of three, and one consistent value across the frame.
+    let lod = host.cvar_bool(c"rtx_bot_lod");
 
     // Re-path when the route is empty, the goal changed, or the timer elapsed. Frozen mid-hook, on a
     // speed/rocket jump, or committed to a plain jump arc, so the traversal keeps the route that put
@@ -192,8 +201,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         // route to the interim always exists in the window. The next repath advances it; `bot.goal_cell`
         // stays the true `goal`, so change detection and the gate/give-up logic are untouched. Off →
         // today's exact whole-graph search to the target.
-        let corridor = host
-            .cvar_bool(c"rtx_bot_lod")
+        let corridor = lod
             .then(|| graph.corridor(bot_cell, target, &costs, STEER_LOD_HORIZON))
             .flatten();
         let (search_target, window) = match &corridor {
@@ -233,9 +241,10 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         bot.route_bands = bands;
         bot.route_pos = 0;
         bot.goal_cell = Some(goal);
-        // Remember the gates the corridor crosses beyond the interim window, so the gate-errand block
-        // can pre-arm for a far shut door the truncated route won't reveal (see [`GateState`]).
-        bot.gate.corridor_gates = corridor.as_ref().map_or(0, |c| c.crossed_gates);
+        // Remember the gates the corridor crosses beyond the interim window (nearest first), so the
+        // gate-errand block can pre-arm for a far shut door the truncated route won't reveal (see
+        // [`GateState`]). Empty when there's no corridor, which also clears any previous list.
+        bot.gate.corridor_gates = corridor.as_ref().map_or_else(Vec::new, |c| c.far_gates.clone());
         bot.repath_time = now + REPATH_INTERVAL;
         // Restart the progress watchdog against the new route (INFINITY ⇒ the first frame records the
         // real starting distance rather than reading as an instant stall on an old baseline).
@@ -254,16 +263,22 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     if !route_frozen && !on_air && bot.gate.errand.is_none() {
         // Skip a gate we recently gave up on, while its avoid window is still open.
         let avoid = bot.gate.avoid.filter(|&(_, until)| now < until).map(|(gi, _)| gi);
-        // A shut gate on the current route, or — under LOD, where the route stops at the interim — a
-        // shut gate the corridor crosses further along (the far pre-arm, matching exact mode's
-        // full-route detection). `route_blocking_gate` takes priority (it's the more precise near case).
-        let corridor_gates = bot.gate.corridor_gates;
-        let far = (0..32u32).find(|&gi| {
-            corridor_gates & (1 << gi) != 0 && gate_closed.get(gi as usize).copied().unwrap_or(false) && Some(gi as usize) != avoid
-        });
+        // A shut gate on the current route, or — under LOD, where the route stops at the interim — the
+        // first still-shut gate the corridor crosses further along, in route order (the far pre-arm,
+        // matching exact mode's full-route detection). `route_blocking_gate` takes priority (the more
+        // precise near case). The far list is consulted only while lod is on, so a mid-game
+        // `rtx_bot_lod 0` can't act on a stale corridor.
+        let far = lod
+            .then(|| {
+                bot.gate.corridor_gates.iter().copied().find(|&gi| {
+                    gate_closed.get(gi as usize).copied().unwrap_or(false) && Some(gi as usize) != avoid
+                })
+            })
+            .flatten()
+            .map(|gi| gi as usize);
         let block = route_blocking_gate(graph, &bot.route, bot.route_pos, gate_closed)
             .filter(|&gi| Some(gi) != avoid)
-            .or(far.map(|gi| gi as usize));
+            .or(far);
         if let Some(gi) = block {
             if button_reachable(graph, bot_cell, gi, &costs) {
                 let button_cell = graph.gate(gi).button_cell;
@@ -272,8 +287,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 // Bound this one-shot errand route the same way the main repath does (subsequent
                 // repaths target the button as `goal` and corridor-bound it); a far button on a big
                 // map would otherwise be one unbounded whole-graph A*.
-                let corridor = host
-                    .cvar_bool(c"rtx_bot_lod")
+                let corridor = lod
                     .then(|| graph.corridor(bot_cell, button_cell, &costs, STEER_LOD_HORIZON))
                     .flatten();
                 bot.route = match &corridor {

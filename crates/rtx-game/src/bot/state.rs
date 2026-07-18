@@ -286,10 +286,11 @@ pub struct GateState {
     pub errand: Option<GateErrand>,
     /// A gate to skip when picking the next errand, until the paired expiry (`None` = none avoided).
     pub avoid: Option<(usize, f32)>,
-    /// Gate-id bits the last repath's LOD corridor crosses beyond the interim window. The route stops
-    /// at the interim, so `route_blocking_gate` can't see a far shut door; this stands in, restoring
-    /// exact mode's far button-errand pre-arm. `0` when lod is off or the corridor crosses no gate.
-    pub corridor_gates: u32,
+    /// Gate ids the last repath's LOD corridor crosses beyond the interim window, **nearest first**.
+    /// The route stops at the interim, so `route_blocking_gate` can't see a far shut door; this stands
+    /// in, restoring exact mode's far button-errand pre-arm — the far block works the first *shut* one
+    /// in route order (not the lowest id). Empty when lod is off or the corridor crosses no far gate.
+    pub corridor_gates: Vec<u32>,
 }
 
 /// A bot's item-fetch goal (see [`crate::bot::goals`]) and the bookkeeping around it.

@@ -614,8 +614,11 @@ impl NavGraph {
         if goal_cost <= horizon {
             return None;
         }
-        // Walk the abstract path home→goal, flagging every cluster it passes through (the fine search's
-        // window) and stopping the interim at the first portal at/past the horizon.
+        // Walk the abstract path home→goal: flag every cluster up to the interim (the fine search's
+        // window), put the interim at the first portal at/past the horizon, and collect — in route
+        // order, nearest first — the gate ids crossed *beyond* the interim. The truncated route can't
+        // reveal those, so the far pre-arm works the first shut one; gates within the window sit on the
+        // fine route and `route_blocking_gate` catches them. A sealed (≥31) gate is no specific gate.
         let mut chain = Vec::new();
         let mut p = goal_portal;
         while p != u32::MAX {
@@ -625,18 +628,32 @@ impl NavGraph {
         let mut allowed = vec![false; lod.cluster_count as usize];
         allowed[from_cl as usize] = true;
         let mut interim = goal_portal;
+        let mut far_gates: Vec<u32> = Vec::new();
+        let mut past_interim = false;
+        let mut prev_pgate = 0u32;
         for &p in chain.iter().rev() {
-            allowed[lod.portals[p as usize].cluster as usize] = true;
-            if abs_cost[p as usize] >= horizon {
-                interim = p;
-                break;
+            if past_interim {
+                let mut bits = (pgate[p as usize] & !prev_pgate) & !SEALED_GATE;
+                while bits != 0 {
+                    far_gates.push(bits.trailing_zeros());
+                    bits &= bits - 1;
+                }
+            } else {
+                allowed[lod.portals[p as usize].cluster as usize] = true;
+                if abs_cost[p as usize] >= horizon {
+                    interim = p;
+                    past_interim = true;
+                }
             }
+            prev_pgate = pgate[p as usize];
         }
-        Some(Corridor {
-            interim: lod.portals[interim as usize].cell,
-            allowed,
-            crossed_gates: pgate[goal_portal as usize] | goal_gates,
-        })
+        // The final in-cluster hop into the goal cell is beyond whatever portal the route stops at.
+        let mut bits = goal_gates & !SEALED_GATE;
+        while bits != 0 {
+            far_gates.push(bits.trailing_zeros());
+            bits &= bits - 1;
+        }
+        Some(Corridor { interim: lod.portals[interim as usize].cell, allowed, far_gates })
     }
 
     /// Priced Dijkstra from `from` restricted to cluster `cl`, returning the exact priced cost to every
@@ -732,9 +749,10 @@ pub struct Corridor {
     /// Clusters the fine search may enter (home + the corridor up to the interim), indexed by cluster
     /// id. A route to the interim exists inside this window, so the restricted search always succeeds.
     pub allowed: Vec<bool>,
-    /// Gate-id bits the corridor crosses reaching the true goal — for the far button-errand pre-arm
-    /// (near/home gates already sit on the fine route, caught by `route_blocking_gate`).
-    pub crossed_gates: u32,
+    /// Gate ids the corridor crosses **beyond** the interim, nearest first — for the far button-errand
+    /// pre-arm (near/home gates already sit on the fine route, caught by `route_blocking_gate`). The
+    /// far block works the first currently-shut one, matching exact mode's route-order detection.
+    pub far_gates: Vec<u32>,
 }
 
 /// The result of [`NavGraph::coarse_costs`]: exact costs in the home cluster, an abstract-graph
