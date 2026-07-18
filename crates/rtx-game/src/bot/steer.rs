@@ -617,6 +617,14 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // and a long window suppresses hopping almost everywhere.
     const BHOP_COMBAT_GRACE: f32 = 0.5;
     let combat_view = enemy.is_some() && enemy_seen_time > 0.0 && now - enemy_seen_time < BHOP_COMBAT_GRACE;
+    // On a navmesh cell flagged beside a fatal drop (a wall-hugging walkway over an open pit — a spiral
+    // staircase's inner edge) drop to the walk: a fast bot carries off the inner edge at the corners,
+    // where no bend holds it. The flag is precomputed per cell, so unlike the near-field it stays valid
+    // while the bot is airborne mid-hop. Exempt a jump run-up (the leg at hand, or the next, is a jump)
+    // — those need bhop speed to clear the gap; the drop there is the jump's landing, not a fall.
+    let is_jump = |l: u32| matches!(graph.link_kind(l), LinkKind::JumpGap | LinkKind::DoubleJump | LinkKind::SpeedJump);
+    let jump_at_hand = cur_leg.is_some_and(&is_jump) || bot.route.get(bot.route_pos + 1).is_some_and(|&l| is_jump(l));
+    let on_ledge = graph.is_ledge(bot_cell) && !jump_at_hand;
     let bhop_veto = !host.cvar_bool(c"rtx_bot_bhop")
         || combat_view
         || in_water // can't hop while swimming — the engine's pmove turns jumps into swim strokes
@@ -626,7 +634,8 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         // and a spectator strolling the stands shouldn't be bunnyhopping anyway.
         || watch_point.is_some()
         || bot.gate.errand.is_some()
-        || bot.grenade.phase != GrenadePhase::Idle;
+        || bot.grenade.phase != GrenadePhase::Idle
+        || on_ledge;
     // The banded planner's intent for this run: a band ≥ 1 on the current or next leg means the
     // route was planned to carry speed here, so admit bhop even on a short leg (the goal-distance
     // gates below exist to avoid hopping on trivial approaches — the plan overrides that judgment)
@@ -666,7 +675,8 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         && matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
         && !final_leg
         && goal_dist > 150.0
-        && runway_dist >= bhop::ZIGZAG_ENGAGE;
+        && runway_dist >= bhop::ZIGZAG_ENGAGE
+        && !on_ledge;
     // A speed-jump leg is a *committed* bhop run-up + leap: engage bhop unconditionally (the link is a
     // pre-verified runway) and track it so the route stays frozen. Latch/clear `sj_leg` on the leg.
     let mut sj_active =
@@ -1097,11 +1107,19 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 let feet = waypoint - Vec3::new(0.0, 0.0, ORIGIN_TO_FEET);
                 crate::hazard::ledge_ahead(&|p| bsp.is_solid(p), feet, Vec3::new(cur_dir.x, cur_dir.y, 0.0))
             });
-        if over_ledge {
-            (dist / TURN_SLOW_RADIUS).clamp(TURN_SLOW_MIN, 1.0)
+        let turn = if over_ledge { (dist / TURN_SLOW_RADIUS).clamp(TURN_SLOW_MIN, 1.0) } else { 1.0 };
+        // Careful-ledge cap: on a flagged ledge cell (an open-cored spiral's inner edge) hold the walk
+        // to `rtx_bot_ledgecap` for the *whole* run — the turn slowdown above only bites inside the 96u
+        // approach, too late to bleed a full-speed straight's momentum before the corner's lip. `on_ledge`
+        // already excludes jump run-ups. The wish is `MOVE_SPEED` (800, 2.5× maxspeed) so a scale of
+        // cap/800 caps the post-clamp ground speed at `cap` u/s. `min` so a sharp ledge corner slows further.
+        let ledge = if on_ledge {
+            let cap = host.cvar(c"rtx_bot_ledgecap");
+            if cap > 0.0 { (cap / MOVE_SPEED).min(1.0) } else { 1.0 }
         } else {
             1.0
-        }
+        };
+        turn.min(ledge)
     };
     // Edge margin: on a grounded walk/step (or final-approach) leg while NOT bhopping, steer the
     // slow-walk wish away from a wall or drop beside the line of travel — the inner edge of an

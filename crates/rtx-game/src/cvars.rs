@@ -77,6 +77,13 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // is clear, glide toward it instead of the next 32u cell centre (smooths the residual grid
         // zigzag on plain walk legs). On by default; inert when `rtx_bot_nearfield` is 0.
         ("rtx_bot_glide", Bool(true)),
+        // Careful-ledge walk speed (u/s): on a navmesh cell flagged beside a fatal drop (a wall-hugging
+        // walkway over an open pit — an open-cored spiral staircase's inner edge) the walk is held to
+        // this speed for the whole run, not just at the corners. A full-speed walk builds momentum on
+        // the straights that carries off the inner edge at the bends, faster than the 40u `ledge_ahead`
+        // brake or the edge nudge can bleed it. Jump run-ups are exempt (they keep bhop speed to clear
+        // the gap). 0 disables the cap (full maxspeed on ledges). See the ledge flag in `navmesh`.
+        ("rtx_bot_ledgecap", Float(210.0)),
         // A bot's health weights how willing it is to shortcut through lava/slime: hurt bots detour,
         // healthy (or armored, or biosuited) ones clip the corner. `0` prices every bot as a bare
         // spawn — hazards still cost, but the same to everyone. See `bot::bot_hazard_strength`.

@@ -244,6 +244,13 @@ pub struct NavGraph {
     /// [`add_plats`](Self::add_plats) fills it on the worker build; an empty vec reads as "no cell is
     /// under a lift" via [`cell_under_plat`](Self::cell_under_plat).
     under_plat: Vec<Option<u16>>,
+    /// Per-cell "beside a fatal drop" flag (parallel to `cells`): the ground falls away by more than a
+    /// survivable step within a stride of the cell — a wall-hugging walkway over an open pit, a spiral
+    /// staircase's inner edge. Pure build-side geometry (no engine callback), filled by
+    /// [`flag_ledges`](Self::flag_ledges); lets the runtime bhop policy drop to a walk there (a fast bot
+    /// carries off the inner edge at a corner) without the near-field's airborne staleness. An empty vec
+    /// reads as "no ledge" via [`is_ledge`](Self::is_ledge) — the safe default for a bare graph.
+    ledge: Vec<bool>,
     grid: GridIndex,
     /// The closed door/movewall each link's segment passes through — the "navmesh aware of dynamic
     /// geometry" core, so pathfinding can price a link by its door's live state (see
@@ -385,6 +392,45 @@ fn hash32(mut x: u32) -> u32 {
     x
 }
 
+/// Ledge probe ([`ledge_beside`]): how far off a cell centre to sample, how far the ground must fall
+/// there to count as a fatal edge, and the vertical sweep step. `REACH` catches a cell on a
+/// one-to-two-grid-cell walkway beside a pit; a step-down whose floor sits within `FATAL_DROP`, or a
+/// wall, leaves the cell unflagged. `√½` gives the diagonal samples a unit stride.
+const LEDGE_REACH: f32 = 44.0;
+const LEDGE_FATAL_DROP: f32 = 64.0;
+const LEDGE_SCAN_DZ: f32 = 8.0;
+const SQRT_HALF: f32 = 0.707_106_77;
+
+/// Whether a fatal drop sits within [`LEDGE_REACH`] of `origin` in any of eight directions — a
+/// wall-hugging walkway over an open pit, a spiral staircase's inner edge. In each direction the sampled
+/// column must be open air from a step above the floor down past [`LEDGE_FATAL_DROP`]: solid anywhere
+/// between is a wall (pillar / step-up) or a catch-floor (a mere step-down, survivable), so that
+/// direction is not an edge. Pure over `is_solid` (the hull-1 point test), so it is unit-testable and
+/// runs on the worker build; see [`NavGraph::flag_ledges`].
+fn ledge_beside(is_solid: &impl Fn(Vec3) -> bool, origin: Vec3) -> bool {
+    const DIRS: [(f32, f32); 8] = [
+        (1.0, 0.0),
+        (-1.0, 0.0),
+        (0.0, 1.0),
+        (0.0, -1.0),
+        (SQRT_HALF, SQRT_HALF),
+        (SQRT_HALF, -SQRT_HALF),
+        (-SQRT_HALF, SQRT_HALF),
+        (-SQRT_HALF, -SQRT_HALF),
+    ];
+    DIRS.iter().any(|&(dx, dy)| {
+        let (x, y) = (origin.x + dx * LEDGE_REACH, origin.y + dy * LEDGE_REACH);
+        let mut z = origin.z + STEP_HEIGHT;
+        while z > origin.z - LEDGE_FATAL_DROP {
+            if is_solid(Vec3::new(x, y, z)) {
+                return false;
+            }
+            z -= LEDGE_SCAN_DZ;
+        }
+        true
+    })
+}
+
 impl NavGraph {
     /// Build the graph from a parsed BSP's player hull. Pure; safe to run at load time.
     pub fn build(bsp: &Bsp) -> NavGraph {
@@ -399,6 +445,7 @@ impl NavGraph {
             hazard: Vec::new(),      // filled at graph-swap by flag_hazards (same reason)
             hazard_hp: Vec::new(),   // (same)
             under_plat: Vec::new(),  // filled by add_plats (pure geometry — no engine callback needed)
+            ledge: Vec::new(),       // filled by flag_ledges below (pure geometry too)
             grid: cells_grid.1,
             gates: SideTable::default(),
             hooks: SideTable::default(),
@@ -410,6 +457,7 @@ impl NavGraph {
             lod: None,                     // filled by build_lod once all links are spliced
         };
         graph.link_cells(bsp);
+        graph.flag_ledges(bsp);
         graph
     }
 
@@ -433,6 +481,7 @@ impl NavGraph {
             hazard: Vec::new(),
             hazard_hp: Vec::new(),
             under_plat: Vec::new(),
+            ledge: Vec::new(),
             grid: GridIndex::default(),
             gates: SideTable::default(),
             hooks: SideTable::default(),
@@ -443,6 +492,21 @@ impl NavGraph {
             reach: None,
             lod: None,
         }
+    }
+
+    /// Flag every cell beside a fatal drop (see [`ledge_beside`]) — a wall-hugging walkway over an open
+    /// pit, a spiral staircase's inner edge. Pure geometry over the hull-1 point test, so it runs on the
+    /// worker build; a lava/slime-flanked cell is left to the `hazard` flag instead. The runtime bhop
+    /// policy reads [`is_ledge`](Self::is_ledge) to walk here rather than carry speed off the inner edge
+    /// at a corner (the near-field can't — it goes stale while the bot is airborne mid-hop).
+    fn flag_ledges(&mut self, bsp: &Bsp) {
+        self.ledge = self.cells.par_iter().map(|cell| ledge_beside(&|p| bsp.is_solid(p), cell.origin)).collect();
+    }
+
+    /// Whether a cell sits beside a fatal drop (see [`flag_ledges`](Self::flag_ledges)). Empty flags —
+    /// a bare graph, or one built without the pass — read as `false` (no ledge).
+    pub fn is_ledge(&self, c: CellId) -> bool {
+        self.ledge.get(c as usize).copied().unwrap_or(false)
     }
 
     /// Sweep every grid column for floors and emit one [`Cell`] at the bottom of each empty
@@ -1571,6 +1635,31 @@ impl NavState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ledge_beside` flags a cell only when the floor genuinely falls away past a survivable step
+    /// within a stride — an open pit, not flat ground, a wall, or a small step-down.
+    #[test]
+    fn ledge_beside_flags_a_pit_edge_not_flat_ground_or_a_step() {
+        // Flat floor everywhere (solid below z=0): nowhere is a ledge.
+        let flat = |p: Vec3| p.z < 0.0;
+        assert!(!ledge_beside(&flat, Vec3::ZERO), "flat ground must not flag");
+
+        // A walkway that ends at x=20 with open air (a deep pit) beyond it.
+        let cliff = |p: Vec3| p.x < 20.0 && p.z < 0.0;
+        // A cell on the lip (its +x probe at x=44 lands in the pit) is a ledge.
+        assert!(ledge_beside(&cliff, Vec3::ZERO), "cell beside the pit must flag");
+        // A cell well back from the lip (every probe still over floor) is not.
+        assert!(!ledge_beside(&cliff, Vec3::new(-100.0, 0.0, 0.0)), "cell away from the pit must not flag");
+
+        // A mere step-down (a catch-floor within FATAL_DROP past the lip) is survivable, not a ledge:
+        // floor at z=0 for x<20, a lower floor at z=-40 beyond it.
+        let step_down = |p: Vec3| if p.x < 20.0 { p.z < 0.0 } else { p.z < -40.0 };
+        assert!(!ledge_beside(&step_down, Vec3::ZERO), "a survivable step-down must not flag");
+
+        // But a drop past FATAL_DROP with no catch-floor within reach is a ledge (catch-floor at -100).
+        let deep = |p: Vec3| if p.x < 20.0 { p.z < 0.0 } else { p.z < -100.0 };
+        assert!(ledge_beside(&deep, Vec3::ZERO), "a drop past the fatal threshold must flag");
+    }
 
     /// The parabola integrator matches the closed-form ballistic solution over a flat floor.
     #[test]
