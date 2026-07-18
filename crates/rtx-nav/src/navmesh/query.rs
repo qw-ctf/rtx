@@ -433,6 +433,12 @@ impl NavGraph {
         self.hazard.get(cell as usize).copied().flatten()
     }
 
+    /// Whether the map has *any* lava/slime cell — a cheap gate so the near-field's per-column liquid
+    /// oracle (an engine `pointcontents` call) is skipped entirely on the dry maps that are the norm.
+    pub fn has_hazards(&self) -> bool {
+        self.hazard.iter().any(Option::is_some)
+    }
+
     /// The lift whose swept volume covers this cell, as an index into `plats` — the same index space as
     /// [`plat`](Self::plat) and [`plat_of_link`](Self::plat_of_link), so the game's `plat_statuses()`
     /// (built over `0..plat_count()`) indexes straight with it. `None` is open ground. A body resting on

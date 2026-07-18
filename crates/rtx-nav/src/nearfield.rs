@@ -14,11 +14,13 @@
 //! (doorway centring, thin-beam balance). [`NearField::chord_clear`] certifies a straight short-cut
 //! stays on clear floor, for a look-ahead glide.
 //!
-//! Everything is **pure** over one oracle — `is_solid` (the clip-hull point test,
+//! Everything is **pure** over two oracles — `is_solid` (the clip-hull point test,
 //! [`crate::bsp::Bsp::is_solid`], already inflated by the ±16 player box so "not solid at an origin"
-//! means the standing hull fits there) — plus a caller-supplied list of blocked boxes (closed
-//! button-gated doors, which the world hull can't see). Keeping it a closure lets the same logic run
-//! against a live map, the engine, or a synthetic test fixture, exactly like [`crate::hazard`].
+//! means the standing hull fits there) and `is_hazard` (whether a floor point sits in lava/slime,
+//! which the liquid-blind clip hull can't tell, so flush lava would otherwise read as plain floor) —
+//! plus a caller-supplied list of blocked boxes (closed button-gated doors, which the world hull can't
+//! see). Keeping them closures lets the same logic run against a live map, the engine, or a synthetic
+//! test fixture, exactly like [`crate::hazard`].
 
 use std::collections::VecDeque;
 
@@ -79,12 +81,16 @@ enum Col {
     Wall,
     /// A ledge: the floor falls away by more than a step. Repels (harder than a wall).
     Drop,
+    /// Walkable footing whose floor is lava/slime — the clip hull can't see it (liquid-blind), so it
+    /// is classified from a caller-supplied contents oracle. Repels like a drop (falling in is fatal)
+    /// and, like a drop/wall, does not extend the walkable frontier — the field ends at the shore.
+    Hazard,
     /// Walkable, at this resting-origin floor height (reachable from the bot within step-sized moves).
     Walk(f32),
 }
 
 impl Col {
-    /// Whether a sample lands on walkable floor (not a wall/drop/unexamined column).
+    /// Whether a sample lands on walkable floor (not a wall/drop/hazard/unexamined column).
     fn walkable(self) -> bool {
         matches!(self, Col::Walk(_))
     }
@@ -116,8 +122,17 @@ impl NearField {
 
     /// Build the field around `origin` (the bot's standing origin). `blocked` are closed-gate world
     /// AABBs the world hull can't see — their volume is stamped unwalkable so the field doesn't route
-    /// a bot through a shut door. `gate_key` is stored for [`valid_for`](Self::valid_for).
-    pub fn build(is_solid: &impl Fn(Vec3) -> bool, origin: Vec3, blocked: &[(Vec3, Vec3)], gate_key: u32) -> NearField {
+    /// a bot through a shut door. `is_hazard` reports whether a floor point sits in lava/slime — the
+    /// clip hull is liquid-blind, so a flush lava pool would otherwise read as ordinary walkable floor;
+    /// a walkable column whose floor is a hazard becomes [`Col::Hazard`] and repels. `gate_key` is
+    /// stored for [`valid_for`](Self::valid_for).
+    pub fn build(
+        is_solid: &impl Fn(Vec3) -> bool,
+        is_hazard: &impl Fn(Vec3) -> bool,
+        origin: Vec3,
+        blocked: &[(Vec3, Vec3)],
+        gate_key: u32,
+    ) -> NearField {
         let snap = |v: f32| (v / NEAR_RES).round() * NEAR_RES;
         let center = Vec3::new(snap(origin.x), snap(origin.y), origin.z);
         // Place the corner so the bot's column (`N/2`) is *centred* on the bot — a half-cell shift, so
@@ -150,7 +165,12 @@ impl NearField {
                 let col = if blocks(c, cz, blocked) {
                     Col::Wall // a shut gate's volume — invisible to the world hull, stamped here
                 } else {
-                    probe_column(is_solid, c.x, c.y, cz)
+                    // Walkable footing over lava/slime (the liquid-blind clip hull can't tell) becomes
+                    // a repelling Hazard, tested only on the columns geometry already calls walkable.
+                    match probe_column(is_solid, c.x, c.y, cz) {
+                        Col::Walk(f) if is_hazard(Vec3::new(c.x, c.y, f)) => Col::Hazard,
+                        other => other,
+                    }
                 };
                 grid[idx] = col;
                 if col.walkable() {
@@ -191,7 +211,8 @@ impl NearField {
             while r <= REACH {
                 match self.col_at(p + dir * r) {
                     Some(Col::Walk(_)) => {} // clear here — keep looking outward
-                    Some(Col::Drop) => {
+                    Some(Col::Drop) | Some(Col::Hazard) => {
+                        // A ledge or a lava edge — both fatal to walk off; push off at full weight.
                         push -= dir * DROP_WEIGHT * ramp(r, REACH);
                         break;
                     }
@@ -320,7 +341,7 @@ mod tests {
     const EYE: Vec3 = Vec3::new(0.0, 0.0, 1.0); // the bot's standing origin, just above a z ≤ 0 floor
 
     fn build(is_solid: &impl Fn(Vec3) -> bool) -> NearField {
-        NearField::build(is_solid, EYE, &[], 0)
+        NearField::build(is_solid, &|_| false, EYE, &[], 0)
     }
 
     #[test]
@@ -415,14 +436,40 @@ mod tests {
         // hull can't see it (floor is clear), so only the overlay makes the chord through it fail.
         let solid = |p: Vec3| p.z <= 0.0;
         let door = [(Vec3::new(32.0, -64.0, -8.0), Vec3::new(48.0, 64.0, 64.0))];
-        let nf = NearField::build(&solid, EYE, &door, 1);
+        let nf = NearField::build(&solid, &|_| false, EYE, &door, 1);
         assert!(
             !nf.chord_clear(EYE, Vec3::new(80.0, 0.0, 1.0), 0.0),
             "a shut gate's volume must block the chord the world hull can't see"
         );
         // Without the overlay the same geometry is wide open.
-        let open = NearField::build(&solid, EYE, &[], 0);
+        let open = NearField::build(&solid, &|_| false, EYE, &[], 0);
         assert!(open.chord_clear(EYE, Vec3::new(80.0, 0.0, 1.0), 0.0));
+    }
+
+    #[test]
+    fn pushes_off_a_one_sided_lava_edge() {
+        // Flat floor everywhere (the clip hull sees no drop), but lava fills y < -16 — invisible to
+        // is_solid, caught by is_hazard. Walking the band, the lava is on the −y side → push +y off it,
+        // exactly like a geometric drop (`pushes_off_a_one_sided_drop`).
+        let solid = |p: Vec3| p.z <= 0.0;
+        let lava = |p: Vec3| p.y < -16.0;
+        let nf = NearField::build(&solid, &lava, EYE, &[], 0);
+        let push = nf.steer_push(EYE).expect("walkable");
+        assert!(push.y > 0.3, "should steer +y off the −y lava: {push:?}");
+    }
+
+    #[test]
+    fn thin_walkway_between_lava_holds_the_line() {
+        // A one-body walkway |y| ≤ 16 with lava both sides on otherwise-flat floor: the two hazard
+        // pushes cancel → hold the centre (don't drift into either pool).
+        let solid = |p: Vec3| p.z <= 0.0;
+        let lava = |p: Vec3| p.y.abs() > 16.0;
+        let nf = NearField::build(&solid, &lava, EYE, &[], 0);
+        let push = nf.steer_push(EYE).expect("walkable");
+        assert!(push.y.abs() < 0.2, "lava both sides should balance: {push:?}");
+        // And a chord straight out along the walkway stays clear, but one angling into the lava fails.
+        assert!(nf.chord_clear(EYE, Vec3::new(64.0, 0.0, 1.0), 0.0), "walkway centre is clear");
+        assert!(!nf.chord_clear(EYE, Vec3::new(48.0, 48.0, 1.0), 0.0), "a chord into the lava is blocked");
     }
 
     #[test]
@@ -436,7 +483,7 @@ mod tests {
     #[test]
     fn valid_for_tracks_movement_and_gates() {
         let solid = |p: Vec3| p.z <= 0.0;
-        let nf = NearField::build(&solid, EYE, &[], 0b10);
+        let nf = NearField::build(&solid, &|_| false, EYE, &[], 0b10);
         assert!(nf.valid_for(EYE, 0b10), "fresh field is valid");
         assert!(nf.valid_for(Vec3::new(40.0, 0.0, 1.0), 0b10), "small move stays valid");
         assert!(!nf.valid_for(Vec3::new(200.0, 0.0, 1.0), 0b10), "past the recenter radius");
