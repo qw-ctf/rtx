@@ -1537,6 +1537,53 @@ fn link_penalty_secs(strikes: u8) -> f32 {
 const TELEPORT_EXIT_CLEAR: f32 = 96.0;
 const TELEPORT_TEAM_SURCHARGE: f32 = 2.0;
 
+/// Surcharge (seconds) and lifetime of a just-ridden teleport, so a re-entry shuttle re-prices itself
+/// (see [`GameState::bot_link_pricing`] / [`stamp_tele_reuse`]). `4.0` is 2× the team surcharge — your
+/// own immediate re-entry is stronger evidence of a bad plan than a teammate on the exit pad — and
+/// orders below the `CLOSED_GATE_PENALTY`/`RJ_UNFIT_PENALTY` walls, so a teleport that is the *only*
+/// route is still taken. The `8.0s` TTL spans several `GOAL_SELECT_INTERVAL`s (1.5s) and most of
+/// `GOAL_GIVEUP_TIME` (10s), so the plan progresses by foot or gives up before the price fades.
+const TELEPORT_REUSE_SURCHARGE: f32 = 4.0;
+const TELEPORT_REUSE_TTL: f32 = 8.0;
+/// How near the exit a teleporter's *entrance* cell must sit to count as the reverse pad — the
+/// worst-case `TELE_DEST_REACH = 5·GRID` destination snap plus a cell of slack.
+const TELE_REVERSE_NEAR: f32 = 192.0;
+
+/// The live surcharge for a `recent_tele` entry: the full [`TELEPORT_REUSE_SURCHARGE`] at the moment of
+/// use, ramping linearly to zero at `until`; `0` once expired (or for an empty `(0, 0.0)` slot).
+fn tele_reuse_penalty(until: f32, now: f32) -> f32 {
+    let remaining = until - now;
+    if remaining <= 0.0 {
+        0.0
+    } else {
+        TELEPORT_REUSE_SURCHARGE * (remaining / TELEPORT_REUSE_TTL).min(1.0)
+    }
+}
+
+/// Stamp the just-ridden teleport `used` and the reverse pad — teleport links whose *entrance* cell
+/// sits within [`TELE_REVERSE_NEAR`] of the `landing` — into the bot's `recent_tele` ring (evict the
+/// soonest-to-expire slot, mirroring [`penalize_link`]). Called from `steer` on a grounded teleport
+/// exit; priced by [`bot_link_pricing`](GameState::bot_link_pricing).
+fn stamp_tele_reuse(bot: &mut BotState, graph: &NavGraph, used: u32, landing: Vec3, now: f32) {
+    let until = now + TELEPORT_REUSE_TTL;
+    let mut stamp = |link: u32| {
+        if let Some(slot) = bot.recent_tele.iter_mut().find(|(l, u)| *l == link && *u > now) {
+            slot.1 = until;
+        } else if let Some(slot) = bot.recent_tele.iter_mut().min_by(|a, b| a.1.total_cmp(&b.1)) {
+            *slot = (link, until);
+        }
+    };
+    stamp(used);
+    for li in 0..graph.links.len() as u32 {
+        if li != used
+            && graph.link_kind(li) == LinkKind::Teleport
+            && (graph.cell_origin(graph.link_source(li)).xy() - landing.xy()).length() <= TELE_REVERSE_NEAR
+        {
+            stamp(li);
+        }
+    }
+}
+
 /// Add or merge a transient per-link surcharge. Failed-link and team-occupancy penalties can target
 /// the same link; merging matters because the nav query intentionally stores one extra per link.
 fn merge_link_penalty(penalties: &mut Vec<(u32, f32)>, link: u32, extra: f32) {
@@ -1599,6 +1646,15 @@ impl GameState {
             .filter(|&&(_, until, _)| until > now)
             .map(|&(li, _, strikes)| (li, link_penalty_secs(strikes)))
             .collect();
+        // Recently-ridden teleports (this bot, all modes) cost extra, decaying to nothing over the TTL,
+        // so a re-entry shuttle re-prices itself and the bot routes by foot (or gives up) instead of
+        // bouncing back through the near-free link. Cost-shaping, not a ban.
+        for &(li, until) in &self.entities[e].bot.recent_tele {
+            let extra = tele_reuse_penalty(until, now);
+            if extra > 0.0 {
+                merge_link_penalty(&mut penalties, li, extra);
+            }
+        }
         let my_team = self.entities[e].mode_p.team;
         if my_team != 0 {
             if let Some(graph) = &self.nav.graph {
@@ -2275,6 +2331,20 @@ mod tests {
         // The cap must stay far below the navmesh's closed-gate penalty (100_000s) so a failed-link
         // surcharge only reshapes a route, never forces one through a shut door.
         const { assert!(PENALTY_CAP < 1_000.0) };
+    }
+
+    #[test]
+    fn tele_reuse_penalty_decays_linearly_to_zero() {
+        let now = 100.0;
+        let until = now + TELEPORT_REUSE_TTL;
+        // Full surcharge at the moment of use, half at half the TTL, nothing at/after expiry.
+        assert!((tele_reuse_penalty(until, now) - TELEPORT_REUSE_SURCHARGE).abs() < 1e-3);
+        let half = tele_reuse_penalty(until, now + TELEPORT_REUSE_TTL / 2.0);
+        assert!((half - TELEPORT_REUSE_SURCHARGE / 2.0).abs() < 1e-3, "half-life surcharge: {half}");
+        assert_eq!(tele_reuse_penalty(until, until), 0.0, "expired");
+        assert_eq!(tele_reuse_penalty(0.0, now), 0.0, "empty slot");
+        // Orders below the closed-gate wall, so a sole-route teleport is still taken.
+        assert!(TELEPORT_REUSE_SURCHARGE < 100.0);
     }
 
     #[test]

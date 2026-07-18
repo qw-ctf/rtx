@@ -36,6 +36,13 @@ pub struct BotState {
     /// planner *divert* around a dead leg instead of re-issuing the identical route to retry forever.
     /// A fixed ring; a fresh failure bumps a matching entry or evicts the soonest-to-expire slot.
     pub failed_links: [(u32, f32, u8); 8],
+    /// Teleport links this bot recently rode, each `(link idx, until)` — a per-bot decaying surcharge
+    /// ring (mirrors [`Self::failed_links`], evict-soonest) priced in `bot_link_pricing`. Damps the
+    /// re-entry shuttle: after teleporting, the just-used pad *and* the reverse pad by the exit cost
+    /// extra for a few seconds, so a stable far-side goal re-routes by foot (or gives up) instead of
+    /// bouncing back through the free 0.2 link. Cost-shaping, not a ban — a sole-route teleport is still
+    /// taken.
+    pub recent_tele: [(u32, f32); 8],
     /// Earliest time we may recompute the route (throttles A*).
     pub repath_time: f32,
     /// The route-progress watchdogs — three ways a bot notices it isn't getting anywhere.

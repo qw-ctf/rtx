@@ -151,11 +151,13 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         if let Some((leg, target)) = launch {
             bot.air = Some(AirCommit { leg, target, since: now, airborne: true });
         } else {
-            // Teleport telemetry (C1): a grounded teleport exit clears the route here. Two of these from
-            // one bot within a few seconds is a re-entry round-trip.
-            if host.cvar_bool(c"rtx_bot_debug") {
-                if let Some(&leg) = bot.route.get(bot.route_pos) {
-                    if graph.link_kind(leg) == LinkKind::Teleport {
+            // A grounded teleport exit clears the route here. Stamp the just-ridden pad (and the reverse
+            // pad by the exit) into the re-entry surcharge ring so a shuttle re-prices itself, and — under
+            // debug — log it (two `tele` lines from one bot within a few seconds is a round-trip).
+            if let Some(&leg) = bot.route.get(bot.route_pos) {
+                if graph.link_kind(leg) == LinkKind::Teleport {
+                    stamp_tele_reuse(bot, graph, leg, origin, now);
+                    if host.cvar_bool(c"rtx_bot_debug") {
                         host.conprint(&cstring(&format!("rtx bot{client}: tele leg={leg}\n")));
                     }
                 }
