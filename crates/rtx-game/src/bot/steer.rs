@@ -652,8 +652,12 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         && speed >= bhop::RUN_UP_SPEED;
     // Lenient continuation gate for taking *another* hop from a landing: leg kinds churn as the
     // route advances, and a run in progress shouldn't be dumped by the stricter entry conditions.
-    let bhop_sustain =
-        matches!(kind, Some(LinkKind::Walk | LinkKind::Step)) && (goal_dist > 150.0 || planned_band >= 1);
+    // But never sustain the chain up an ascending stair run — `runway`'s climb stop keeps *entry* off
+    // stairs, yet a chain carried onto a stairway (a wall-hugging spiral, say) would otherwise keep
+    // hopping and weave off the treads. Drop to the walk, whose near-field glide tracks the steps.
+    let bhop_sustain = matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
+        && (goal_dist > 150.0 || planned_band >= 1)
+        && !ascent_ahead;
     // Ground zigzag: a corridor too short for a hop ([`bhop::RUNWAY_ENGAGE`]) but straight and long
     // enough ([`bhop::ZIGZAG_ENGAGE`]) to gain speed from the circle-strafe alone. The controller
     // hands off to the hop cycle if `bhop_entry` opens up mid-run, and `bhop_veto` (which includes
@@ -889,7 +893,13 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             Some(bsp) if speed > 1.0 && (bot.bhop.phase != bhop::Phase::Off || bhop_entry) => {
                 let d = (speed * bhop::T_HOP).max(64.0);
                 let end = origin + (v_xy.normalize_or_zero() * d).extend(0.0);
-                bsp.hull1_trace(origin, end).fraction * d
+                let wall = bsp.hull1_trace(origin, end).fraction * d;
+                // The hull trace sees only walls: a bot flying at the open centre of a wall-hugging
+                // walkway (a spiral staircase's inner edge) traces clear and hops over the void. The
+                // near-field sees the drop — cap `clear` at the lip so the controller carves/brakes on
+                // the ground at the edge (turning far faster than in the air) instead of leaping off it.
+                let edge = bot.near.as_ref().filter(|_| nf_active).map_or(d, |nf| nf.edge_ahead(origin, v_xy.extend(0.0), d));
+                wall.min(edge)
             }
             _ => f32::INFINITY,
         };

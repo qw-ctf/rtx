@@ -272,6 +272,29 @@ impl NearField {
         true
     }
 
+    /// Distance from `p` to the first drop/hazard edge heading along `dir`, capped at `max` (and at the
+    /// flood frontier — an `Unknown`/off-grid column, or a wall, ends the scan and returns `max`). The
+    /// drop-aware companion to a wall hull-trace for the bhop controller's leap gate: a bot flying at
+    /// the open centre of a wall-hugging walkway (a spiral's inner edge) traces clear of any wall and
+    /// leaps over the void — this caps its "clear ahead" at the lip so it carves on the ground instead.
+    /// Walls are left to the caller's hull trace; only the drop it can't see is reported here.
+    pub fn edge_ahead(&self, p: Vec3, dir: Vec3, max: f32) -> f32 {
+        let dir = dir.normalize_or_zero();
+        if dir.length_squared() < 0.5 {
+            return max;
+        }
+        let mut r = NEAR_RES;
+        while r <= max {
+            match self.col_at(p + dir * r) {
+                Some(Col::Walk(_)) => {}                          // on floor — keep scanning ahead
+                Some(Col::Drop) | Some(Col::Hazard) => return r,  // an edge not to hop over
+                _ => return max,                                  // wall (the trace's job) / frontier
+            }
+            r += NEAR_RES;
+        }
+        max
+    }
+
     /// Whether no wall/drop column lies within `margin` of `p` (a small box scan around `p`).
     fn clear_by(&self, p: Vec3, margin: f32) -> bool {
         let cells = (margin / NEAR_RES).ceil() as i32;
@@ -423,6 +446,17 @@ mod tests {
         assert!(nf.chord_open(EYE, Vec3::new(400.0, 0.0, 1.0)), "an open chord past the flood frontier passes");
         // Contrast: `chord_clear` rejects that same long chord for leaving the certified footprint.
         assert!(!nf.chord_clear(EYE, Vec3::new(400.0, 0.0, 1.0), 8.0), "chord_clear needs the whole chord in-footprint");
+    }
+
+    #[test]
+    fn edge_ahead_stops_at_a_drop_not_on_open_floor() {
+        // Floor for y ≥ -16, an open drop beyond it (a spiral flight's inner edge).
+        let solid = |p: Vec3| p.y >= -16.0 && p.z <= 0.0;
+        let nf = build(&solid);
+        // Heading −y at the drop: reports the edge close ahead, so the bhop leap gate carves at the lip.
+        assert!(nf.edge_ahead(EYE, Vec3::new(0.0, -1.0, 0.0), 100.0) < 40.0, "reports the −y drop edge close ahead");
+        // Heading +x along the floor: no drop, returns the cap — open ground keeps its leap distance.
+        assert!((nf.edge_ahead(EYE, Vec3::new(1.0, 0.0, 0.0), 100.0) - 100.0).abs() < 1e-3, "open floor ahead → the cap");
     }
 
     #[test]
