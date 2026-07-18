@@ -572,7 +572,15 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         bot.watchdog.stuck_origin = origin;
         bot.watchdog.stuck_since = now;
     } else if now - bot.watchdog.stuck_since > STUCK_TIME {
-        force_jump = true;
+        // Force a jump to unwedge — but NOT toward a fatal edge. A bot stuck at a lava/pit lip (e.g.
+        // wedged against a surcharged jump the router refuses to take) would otherwise force-jump
+        // straight off it and burn. When the near-field sees a drop/hazard within a hop toward the
+        // waypoint, hold the jump and let the penalize+repath below divert the route instead.
+        let toward_edge = bot.near.as_ref().is_some_and(|nf| {
+            let d = (waypoint.xy() - origin.xy()).normalize_or_zero();
+            d.length_squared() > 0.5 && nf.edge_ahead(origin, Vec3::new(d.x, d.y, 0.0), STUCK_JUMP_LOOK) < STUCK_JUMP_LOOK
+        });
+        force_jump = !toward_edge;
         // Penalize the leg we're wedged on so the forced re-path actually *diverts* — without this
         // the deterministic A* hands back the identical route and the bot re-wedges every 0.7s.
         penalize_leg(bot, cur_leg, kind, now);
@@ -824,8 +832,9 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // Drive the hop-cycle controller (see `bhop::Bhop`). On a speed jump the runway is the
     // run-up to the takeoff edge and the bearing aims straight at the landing so the leap goes
     // across the gap; otherwise steer toward the look-ahead corridor point (smoother than the 32u
-    // next cell) with as much straight-ish corridor as the route offers.
-    let bhop_cmd = {
+    // next cell) with as much straight-ish corridor as the route offers. `mut` so the hazard-edge
+    // brake below can null the hop and drive a reverse wish through `emit` instead.
+    let mut bhop_cmd = {
         let dt = frametime.clamp(0.001, 0.05);
         let accel = host.cvar(c"sv_accelerate");
         let maxspeed = host.cvar(c"sv_maxspeed");
@@ -1311,6 +1320,28 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         };
         if let Some(w) = wish {
             move_world = w;
+        }
+    }
+
+    // Hazard-edge brake: if the near-field sees a fatal drop or lava edge close ahead along the
+    // *velocity* — nearer than the bot can bleed its speed before the lip — hard-brake to a stop rather
+    // than sliding or hopping into it. Unlike the geometric ledge brake below this is hazard-aware
+    // (catches flush lava the clip hull can't see) and fires while *bhopping* too: a fast bot's
+    // momentum, not its wish direction, is what carries it off, so the near-field bearing bend and the
+    // leap-suppression above don't stop it — the speed itself must go. The hop is nulled for the frame
+    // so the reverse wish actually drives (`emit` ignores `move_world` while a hop is). Off during a
+    // jump run-up (`jump_at_hand`) — the bot needs that speed to clear the gap — and inert on open
+    // ground, where `edge_ahead` finds no edge. `nf_active` already limits it to grounded walk/step/
+    // approach legs (a Drop leg descends; a jump leg leaps), and the near-field grid is built there.
+    if nf_active && on_ground && !jump_at_hand && speed > LEDGE_MIN_SPEED {
+        if let Some(nf) = bot.near.as_ref() {
+            let vdir = v_xy.normalize_or_zero();
+            let stop = (speed * BRAKE_REACT + speed * speed / (2.0 * BRAKE_DECEL)).clamp(nearfield::NEAR_RES, BRAKE_MAX_LOOK);
+            let dir3 = Vec3::new(vdir.x, vdir.y, 0.0);
+            if nf.edge_ahead(origin, dir3, stop + nearfield::NEAR_RES) <= stop {
+                move_world = -dir3 * MOVE_SPEED;
+                bhop_cmd = None;
+            }
         }
     }
 

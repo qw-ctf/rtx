@@ -786,6 +786,41 @@ impl NavGraph {
                 tick_hp * depth[link.to as usize].1 * ticks
             })
             .collect();
+
+        // Jump-over-lava surcharge. The pricing above reads only the *target* cell's footing — for a
+        // jump that's the safe far platform, so a leap over a lava pool reads as free and the router
+        // sends bots sailing over the coals. But an undershoot (arriving a hair slow at the takeoff)
+        // drops into the pool, not onto the platform — a near-certain kill. Price the span itself: if
+        // any point of the fall-short zone between the two footings sits over lava/slime, charge the
+        // fatal [`JUMP_LAVA_HP`] so the router prefers the walk-around. A sole-route lava jump still
+        // costs finite (the [`HAZARD_COST_MAX`] cap), so a bot with no other way across still attempts
+        // it. Computed as a separate pass (a fresh immutable borrow of the links/cells) after the map.
+        let over_lava: Vec<bool> = self
+            .links
+            .iter()
+            .map(|link| {
+                matches!(
+                    link.kind,
+                    LinkKind::JumpGap | LinkKind::DoubleJump | LinkKind::SpeedJump | LinkKind::RocketJump
+                ) && {
+                    let a = self.cells[link.from as usize].origin;
+                    let b = self.cells[link.to as usize].origin;
+                    // Sample the interior of the platform-to-platform span (endpoints are safe footing).
+                    (1..=3).any(|i| {
+                        let p = a.lerp(b, i as f32 / 4.0);
+                        matches!(
+                            crate::hazard::hazard_below(is_solid, contents, p),
+                            Some(crate::hazard::HazardKind::Lava | crate::hazard::HazardKind::Slime)
+                        )
+                    })
+                }
+            })
+            .collect();
+        for (hp, &over) in self.hazard_hp.iter_mut().zip(over_lava.iter()) {
+            if over {
+                *hp = hp.max(JUMP_LAVA_HP);
+            }
+        }
     }
 
     /// Whether cell `id` sits on the edge of a lava or slime pool: for each compass direction with
@@ -1433,6 +1468,13 @@ const LAVA_TICK_HP: f32 = 10.0;
 const LAVA_TICK_SECS: f32 = 0.2;
 const SLIME_TICK_HP: f32 = 4.0;
 const SLIME_TICK_SECS: f32 = 1.0;
+
+/// Health charged to a jump link whose fall-short zone is a lava/slime pool (see [`flag_hazards`]).
+/// A jump/speed-jump over lava lands on a *safe* platform — so the per-cell pricing reads it free —
+/// but an undershoot (the bot arriving a hair slow at the takeoff) drops into the pool, and that is a
+/// near-certain kill. Priced past a bare bot's health so [`hazard_cost`] treats it as fatal (~the cost
+/// cap): the router takes any walk-around, and only a sole-route lava jump is still attempted.
+const JUMP_LAVA_HP: f32 = 200.0;
 
 /// Seconds of detour a bot accepts per unit of "fraction of its surviving strength" a hazard eats
 /// (see [`hazard_cost`]). Calibrated so a bare 100-health bot prices a waterlevel-1 lava cell at

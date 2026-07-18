@@ -142,6 +142,23 @@ const NEAR_GLIDE_MARGIN: f32 = 16.0;
 /// toward the raw xy goal. Inert on open ground, where the near-field push is zero.
 const NEARFIELD_BHOP_WEIGHT: f32 = 1.0;
 
+/// Hazard-edge brake (see [`steer`]): the deceleration a hard ground brake (full-reverse wish plus
+/// friction) is *conservatively* assumed to bleed. The bot looks its stopping distance at the current
+/// speed ahead for a fatal drop / lava edge and brakes if one is nearer. Real QW ground friction +
+/// reverse accel bleeds several times faster than this, so the bot halts with margin to spare at the
+/// lip rather than skidding over it.
+const BRAKE_DECEL: f32 = 2000.0;
+/// Reaction slack folded into the brake lookahead: the couple of frames it takes to null the hop and
+/// reverse the wish before the deceleration bites.
+const BRAKE_REACT: f32 = 0.12;
+/// The brake never looks past this — the near-field only floods ~130u out, and a bot too fast to stop
+/// within it on a hazard approach is a pathological case the routing hazard cost should have avoided.
+const BRAKE_MAX_LOOK: f32 = 128.0;
+/// How far toward the waypoint the stuck-detector looks for a fatal drop/lava edge before force-jumping
+/// to unwedge (see [`steer`]): inside this, the jump is held so a bot wedged at a pit lip diverts by
+/// repath rather than leaping to its death. About a hop's reach.
+const STUCK_JUMP_LOOK: f32 = 96.0;
+
 /// Outcome of a ballistic-phase landing check, shared by the hook and rocket-jump drivers: both fly
 /// a frictionless arc that matches their solve, so the only questions are whether we've touched down
 /// and whether we overran the predicted airtime without a clean landing.
