@@ -211,7 +211,10 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // All default to today's behavior.
         ("rtx_jump_curl_hold", Float(0.0)),
         ("rtx_jump_curl_gain", Float(0.0)),
-        ("rtx_jump_runup", Float(0.0)),
+        // Minimum run-up speed toward the waypoint (fraction of sv_maxspeed) before a plain jump leg
+        // fires — 0.5 (160 ups, ~4 ticks of ground accel) kills the useless standstill pogo without
+        // stalling short approaches (a jump within JUMP_NOW_DIST of the lip fires regardless). 0 = off.
+        ("rtx_jump_runup", Float(0.5)),
         // Perception (human-like targeting). `rtx_bot_fov` is the view cone (full angle, degrees)
         // within which a bot can *see* a target, widened with skill; 0 = 360° (see everywhere, the
         // old behavior). `rtx_bot_reaction` is the base delay (seconds) a target must stay seen

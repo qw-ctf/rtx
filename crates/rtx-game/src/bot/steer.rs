@@ -93,6 +93,22 @@ fn nearfield_gates<'a>(graph: &'a NavGraph, gate_closed: &'a [bool], origin: Vec
     })
 }
 
+/// The lip is "right here" — inside this distance the takeoff jump must fire *now* or the bot wedges
+/// against the step face; beyond it the run-up gate applies.
+const JUMP_NOW_DIST: f32 = 40.0;
+
+/// Whether a plain jump leg (`JumpGap`/`DoubleJump`) may fire its takeoff jump this frame. Applying
+/// forward *after* the leap barely helps in QW air physics, so the speed must already be carried
+/// *toward the waypoint* before jumping — gate on the velocity component along `to_wp` reaching
+/// `frac · maxspeed`. Two escapes keep a bot from wedging: the lip is within [`JUMP_NOW_DIST`] (jump
+/// now), or the gate is off (`frac <= 0`). `frac` is `rtx_jump_runup`.
+fn jump_runup_ok(v_xy: Vec2, to_wp: Vec2, dist: f32, frac: f32, maxspeed: f32) -> bool {
+    if frac <= 0.0 || dist < JUMP_NOW_DIST {
+        return true;
+    }
+    v_xy.dot(to_wp.normalize_or_zero()) >= frac * maxspeed
+}
+
 pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> SteerOut {
     let SteerCtx { s, o, costs, plat_status, gate_ready, bot_cell, goal_cell, race_line_ahead, weapons_hot, bsp } =
         ctx;
@@ -1141,10 +1157,11 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         let g = host.cvar(c"rtx_jump_curl_gain");
         if g > 0.0 { g } else { bhop::AIR_CORRECT_GAIN_DEFAULT }
     };
-    // Run-up gate: on a plain jump leg, hold the takeoff jump until the bot is running at
-    // `jump_runup · maxspeed`, so it leaves the lip with speed instead of hopping slow. `force_jump`
-    // (the stuck detector) and the bhop controller bypass it, so a genuinely wedged bot still jumps.
-    let runup_ok = jump_runup <= 0.0 || speed >= jump_runup * jump_maxspeed;
+    // Run-up gate: on a plain jump leg, hold the takeoff jump until the bot carries speed *toward the
+    // waypoint* (`jump_runup · maxspeed`), so it leaves the lip moving instead of jumping from a
+    // standstill and air-accelerating into a stub arc. Escapes at the lip and when disabled keep it from
+    // wedging; `force_jump` (the stuck detector) and the bhop controller bypass it too.
+    let runup_ok = jump_runup_ok(v_xy, to_wp, dist, jump_runup, jump_maxspeed);
     if on_ground
         && (force_jump
             || bhop_cmd.is_some_and(|c| c.jump)
@@ -1330,4 +1347,24 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         || matches!(kind, Some(LinkKind::JumpGap | LinkKind::DoubleJump | LinkKind::SpeedJump));
     let overlays_ok = !hook_engaged && !rj_engaged && !bhop_active && !traversal_lock;
     SteerOut { cmd, bhop_cmd, hook, rj, traversal_lock, overlays_ok }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jump_runup_gate_wants_speed_toward_the_waypoint() {
+        let fwd = Vec2::new(1.0, 0.0);
+        // Standstill, far from the lip → blocked (no useless pogo).
+        assert!(!jump_runup_ok(Vec2::ZERO, fwd, 200.0, 0.5, 320.0));
+        // At the lip (< JUMP_NOW_DIST) → must jump now, whatever the speed.
+        assert!(jump_runup_ok(Vec2::ZERO, fwd, 39.0, 0.5, 320.0));
+        // Running toward the waypoint at 200 ups (> 0.5·320 = 160) → allowed.
+        assert!(jump_runup_ok(Vec2::new(200.0, 0.0), fwd, 200.0, 0.5, 320.0));
+        // Fast but perpendicular (no toward-component) → blocked.
+        assert!(!jump_runup_ok(Vec2::new(0.0, 300.0), fwd, 200.0, 0.5, 320.0));
+        // Gate disabled → always allowed (today's behavior).
+        assert!(jump_runup_ok(Vec2::ZERO, fwd, 200.0, 0.0, 320.0));
+    }
 }
