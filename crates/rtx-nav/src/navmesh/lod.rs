@@ -327,6 +327,18 @@ impl NavGraph {
     /// in-cluster path. Cost includes the water tax (`link_water_extra`), so the min-cost path is the
     /// wettest-aware one. On the worker build the liquid columns are empty (both read 0); the swap
     /// patch re-runs this once they are filled — see [`patch_lod_liquids`](Self::patch_lod_liquids).
+    ///
+    /// The metadata rides the min-*cost* path, chosen gate-blind (gates are metadata, not a cost term
+    /// here). So a cell whose cheapest in-cluster path clips a gate carries that gate's bit even if a
+    /// pricier *gate-free* in-cluster path also exists; when the gate is shut, `cost_to`/`price_meta`
+    /// then charge it the closed-gate penalty — a bounded **overestimate**, never an underestimate, so
+    /// the never-call-an-item-closer contract holds. A per-cell gate-free alternate distance (the
+    /// `d_nogate` of the plan) would tighten it, but it is deliberately not built: a gate wholly inside
+    /// one 256u cluster *with* a gate-free intra detour is rare (doors sit at chokepoints, i.e. cluster
+    /// boundaries — handled by the gate-free crossing rep in `build_lod`), the error is safe-direction,
+    /// and a second intra flood + parallel metadata on every edge is disproportionate for it. The one
+    /// live symptom — a far pre-arm for such an intra gate the fine route would skirt — self-corrects
+    /// via `button_reachable` + the errand give-up clock.
     fn intra_reach(&self, src: CellId, cl: u32, cluster_of: &[u32]) -> Vec<(CellId, f32, u32, u8, bool, f32)> {
         let mut dist: HashMap<CellId, (f32, u32, u8, bool, f32)> = HashMap::new();
         let mut heap = BinaryHeap::new();
