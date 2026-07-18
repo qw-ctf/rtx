@@ -93,7 +93,7 @@ pub const RUN_UP_SPEED: f32 = 280.0;
 /// keeps circle-strafing on the ground until it's at full run speed rather than leaping slow. Below
 /// ~maxspeed, ground accel (~40 ups/tick toward the wish) far outgains the 30-ups air cap, so a slow
 /// leap is strictly worse than one more ground stride.
-const LAUNCH_MIN_FRAC: f32 = 0.95;
+const LAUNCH_MIN_FRAC: f32 = 1.0;
 /// Don't leap unless a hop's flight (`speed·T_HOP`) fits this fraction of the forward clear distance
 /// (`Input.clear`): a bot flying at a wall is better off carving on the ground (which turns far
 /// faster than air) and re-launching once it's aimed down open corridor — the land-carve-rejump a
@@ -870,10 +870,11 @@ mod sim {
     #[test]
     fn never_leaps_below_full_run() {
         // A human runs up before leaping. From a near-standstill, no takeoff may happen below the
-        // launch floor (0.95·maxspeed) on *either* a long runway (goes via Prestrafe) or a short one
-        // (the 256–512u direct-to-Hop hole) — the bot builds speed on the ground first.
-        let floor = 0.95 * ENV.maxspeed;
-        for &(runway, min_takeoff) in &[(4096.0f32, 420.0f32), (400.0, 304.0)] {
+        // launch floor (full maxspeed) on a long runway (via Prestrafe), a medium one, or a short one
+        // (the 256–512u direct-to-Hop band Daniel saw hopping slow) — the bot builds speed on the
+        // ground to ≥ maxspeed first, then leaps.
+        let floor = LAUNCH_MIN_FRAC * ENV.maxspeed;
+        for &(runway, min_takeoff) in &[(4096.0f32, 420.0f32), (400.0, 319.0), (300.0, 319.0)] {
             let mut w = World::grounded(100.0);
             let mut b = Bhop::default();
             let mut first_jump = None;
