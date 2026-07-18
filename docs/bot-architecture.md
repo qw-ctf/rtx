@@ -268,17 +268,21 @@ Two consumers share it: **offence** (`find_hazard` scans the ring around an enem
 shove them into) and **self-preservation** (`hazard_ahead` / `ledge_ahead` ask "does stepping this
 way walk me into lava or off a ledge?"). At graph-swap the flags are baked in: `flag_hazards`
 stamps a per-cell hazard kind and a per-link `hazard_hp` from the *real* damage model (lava ticks
-10 hp / 0.2 s, slime 4 hp / 1.0 s), plus a risk premium on links onto a pool edge.
+10 hp / 0.2 s, slime 4 hp / 1.0 s), a risk premium on links onto a pool edge, and a near-fatal
+surcharge on jump arcs over a lava or slime pool (below).
 
 Two design choices are worth stating. First, **risk lives in health, not seconds**: a link's cost
 holds no risk premium; the damage is priced per query via a per-bot `HazardPrice { strength, k }`,
 so a hurt bot detours around lava while a healthy or armored one clips the corner
-(`rtx_bot_hazard_health`, `rtx_bot_hazard_k`). Second, **water is transit-only, never a no-go** —
-it carries a swim-speed tax, not a wall — and **pits are deliberately not flagged as routing
-hazards at all**; the runtime edge guards own them, because a pit is a fall the bot chooses at the
-lip, not a region to route around. Under-plat shaft cells are similarly *transit-only*: stamped and
-surcharged so a bot passes through but never parks under a raised lift — and pointedly with **no
-timers**, only a standing cost.
+(`rtx_bot_hazard_health`, `rtx_bot_hazard_k`). Second, **falls are split by what lies below**: water
+is transit-only (a swim-speed tax, not a wall), and a **dry pit is not flagged as a routing
+hazard** — the runtime edge guards own it, since a fall onto solid is a choice made at the lip, not a
+region to route around — but a **jump whose fall-short span crosses lava *is* priced fatal**, because
+an undershot leap lands in the pool rather than on the far platform, and the per-cell pricing misses
+it since both footings are safe. Routing then prefers the walk-around; a sole-route lava jump stays
+finite (the cost is capped) and is still attempted. Under-plat shaft cells are similarly
+*transit-only*: stamped and surcharged so a bot passes through but never parks under a raised lift —
+and pointedly with **no timers**, only a standing cost.
 
 ## The decision loop
 
@@ -530,8 +534,12 @@ and abandon the chased goal, so the planner diverts instead of re-issuing the de
 - **Plats** — a bot holds a standoff 40 units outside a raised lift's footprint (standing under it
   resets its descent timer), boards when it lowers, and gives up after 8 seconds.
 - **Ledges** — on a navmesh cell flagged as an open-cored inner edge (the `ledge` flag), bhop is
-  vetoed, ground speed is capped (`rtx_bot_ledgecap`, 210 u/s), and a ledge brake thrusts backward
-  when velocity drifts off-corridor toward the drop.
+  vetoed, ground speed is capped (`rtx_bot_ledgecap`, 210 u/s), and a geometric ledge brake thrusts
+  backward when velocity drifts off-corridor toward the drop. A second, hazard-aware brake keys off
+  the near-field's `edge_ahead`: when a drop *or lava* edge lies within the bot's stopping distance
+  along its velocity, it reverses the wish and cancels the hop — killing the momentum that would
+  carry a fast bot over a lip even mid-bhop — and the stuck detector likewise holds its unwedge-jump
+  rather than launch a wedged bot off a lava lip.
 - **Stairs** — risers drop the hop chain to a walk (a human runs *up* stairs), while the near-field
   glide tracks the treads.
 - **Water** — two reflexes override navigation entirely. When submerged with under five seconds of
