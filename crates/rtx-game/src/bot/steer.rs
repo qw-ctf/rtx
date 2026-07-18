@@ -151,6 +151,15 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         if let Some((leg, target)) = launch {
             bot.air = Some(AirCommit { leg, target, since: now, airborne: true });
         } else {
+            // Teleport telemetry (C1): a grounded teleport exit clears the route here. Two of these from
+            // one bot within a few seconds is a re-entry round-trip.
+            if host.cvar_bool(c"rtx_bot_debug") {
+                if let Some(&leg) = bot.route.get(bot.route_pos) {
+                    if graph.link_kind(leg) == LinkKind::Teleport {
+                        host.conprint(&cstring(&format!("rtx bot{client}: tele leg={leg}\n")));
+                    }
+                }
+            }
             bot.route.clear();
             bot.repath_time = now;
         }
@@ -261,6 +270,16 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         // Keep `route_bands` parallel to `route`: zero-fill when unbanded (or on any length mismatch).
         if bands.len() != route.len() {
             bands = vec![0u8; route.len()];
+        }
+        // Empty-route telemetry (C6): a resolved repath that came back with no legs while the bot isn't
+        // already at its goal — the "parked in place" signature. `corr` shows whether a corridor was in
+        // play (a same-cluster/near None vs a windowed search that found nothing).
+        if host.cvar_bool(c"rtx_bot_debug") && route.is_empty() && bot_cell != target {
+            host.conprint(&cstring(&format!(
+                "rtx bot{client}: route=0 corr={} tgt_eq_goal={}\n",
+                corridor.is_some(),
+                target == goal
+            )));
         }
         bot.route = route;
         bot.route_bands = bands;

@@ -947,6 +947,17 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
             |o| format!("H{:.0}/A{:.0} ars={:03x}", o.health, o.armor_value, o.items as u32),
         );
         let vig = vigil.is_some() as i32;
+        // Goal-cell aliasing telemetry: the resolved nav cell of the goal item and its height under the
+        // item origin. A large negative `gdz` means the goal resolved to a floor cell *below* the item
+        // (a ledge/pedestal item aliased to the ground under it) — the item is uncollectable from there
+        // (`on_item` gates |dz| ≤ 48), so the bot parks/waits for something it can't reach.
+        let (gcell, gdz) = if gi != 0 {
+            let ic = b.goal.item_cell;
+            let dz = game.nav.graph.as_ref().map_or(0.0, |g| g.cell_origin(ic).z - game.entities[EntId(gi)].v.origin.z);
+            (ic as i64, dz)
+        } else {
+            (-1, 0.0)
+        };
         // Arena spectating: which fighter (edict) this bot is watching, `0` = none.
         let wat = if let Some(BotIntent::Spectate { watch, .. }) = intent { watch.0 } else { 0 };
         let commit = b.goal.commit;
@@ -958,7 +969,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
             crate::mode::ArenaRole::Audience => 'A',
         };
         let msg = cstring(&format!(
-            "rtx bot{client}: role={role} want={goal} dist={dist:.0} on_item={overlap} ownLG={own_lg} cells={:.0} pen={pen} aware={aware} est={est} hold={hold} mag={mag} commit={commit:?} posture={posture:?} vig={vig} watch={wat}\n",
+            "rtx bot{client}: role={role} want={goal} dist={dist:.0} gcell={gcell} gdz={gdz:.0} on_item={overlap} ownLG={own_lg} cells={:.0} pen={pen} aware={aware} est={est} hold={hold} mag={mag} commit={commit:?} posture={posture:?} vig={vig} watch={wat}\n",
             game.entities[e].v.ammo_cells,
         ));
         host.conprint(&msg); // conprint always shows; dprint needs `developer 1`
