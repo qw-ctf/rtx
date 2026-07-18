@@ -11,9 +11,10 @@
 //! (unbuilt) graph, where the public accessors fall back conservatively.
 //!
 //! Clustering (`cluster_cells`) groups cells; the abstract graph (`build_lod_tables` + a coverage
-//! pass) keeps one representative crossing per cluster pair plus any landing a rep misses; queries
-//! layer on top — [`coarse_costs`](NavGraph::coarse_costs) for scoring, [`corridor`](NavGraph::corridor)
-//! for the bounded steer window. Liquid link costs are folded in at the graph-swap
+//! pass) keeps a few representative crossings per cluster pair (one per border level and gatedness —
+//! see [`rep_band`] and `build_lod`) plus any landing a rep misses; queries layer on top —
+//! [`coarse_costs`](NavGraph::coarse_costs) for scoring, [`corridor`](NavGraph::corridor) for the
+//! bounded steer window. Liquid link costs are folded in at the graph-swap
 //! ([`patch_lod_liquids`](NavGraph::patch_lod_liquids)) since they don't exist on the worker build.
 
 use std::collections::{BinaryHeap, HashMap};
@@ -128,6 +129,24 @@ fn block_of(gx: i32, gy: i32, z: f32) -> (i32, i32, i32) {
     (gx >> LOD_SHIFT, gy >> LOD_SHIFT, (z / LOD_STOREY).round() as i32)
 }
 
+/// Half-storey height band of a crossing endpoint — the vertical resolution at which `build_lod`
+/// keeps crossing representatives between a cluster pair. One rep per pair is the classic HPA*
+/// entrance-placement trap when the shared border spans height: a 128u storey holds two walkable
+/// floors (dm3's base at z-16 and the red-armour spiral's first flight at z56 both round to band 0),
+/// so a cluster pair can touch along *both*, and the single cheapest crossing — picked by cost, all
+/// flat Walks tie — lands on whichever floor a tie-break favours. Every coarse route into the other
+/// floor then detours through that entrance and pays the full intra-cluster climb (or, where the
+/// floors don't connect inside the block at all, a many-cluster loop the fine graph never takes),
+/// inflating the estimate ~9× and flipping route decisions against the exact flood. Banding the rep
+/// slots by the endpoints' heights keeps one entrance per level the border actually touches, which
+/// is bounded — a cluster spans at most one storey, so at most three half-storey bands per side —
+/// unlike keying on XY extent, where a long flat seam would mint a portal per column for a detour
+/// the block circumference already caps at a fraction of a second.
+#[inline]
+fn rep_band(z: f32) -> i32 {
+    (z / (LOD_STOREY * 0.5)).round() as i32
+}
+
 /// Union-find with path-halving + union-by-rank, for the intra-block connected-components pass.
 struct UnionFind {
     parent: Vec<u32>,
@@ -202,24 +221,30 @@ impl NavGraph {
         let (cluster_of, cluster_count) = self.cluster_cells();
 
         // Kept crossings — the cross-cluster links promoted to abstract edges. Up to two representatives
-        // per directed cluster pair: the cheapest crossing, and — when that one is gated — the cheapest
-        // *gate-free* crossing, if the pair has one. A wide border must not become dozens of parallel
-        // portals (the intra-cluster all-pairs transit would explode to a graph larger than the fine
-        // one), but keeping the gate-free alternate is what lets the abstract graph express "there is an
-        // open way between these clusters" even when the single cheapest crossing is a shut door:
-        // `cost_to` then routes around a closed gate wherever a fine gate-free route exists, so the
-        // openable-gate valuation (a prize behind an openable door) matches the exact flood instead of
-        // pricing the prize as a sealed ~100k wall. Just preferring gate-free *at equal cost* wouldn't
-        // do it — a strictly-cheaper gated crossing would still evict the gate-free one and seal the
-        // pair. The coverage pass below adds back any landing neither rep covers.
-        let mut rep: HashMap<(u32, u32), u32> = HashMap::new();
-        let mut rep_free: HashMap<(u32, u32), u32> = HashMap::new();
+        // per directed cluster pair *per height band of the crossing's endpoints* ([`rep_band`]): the
+        // cheapest crossing, and — when that one is gated — the cheapest *gate-free* crossing, if the
+        // pair has one. A wide border must not become dozens of parallel portals (the intra-cluster
+        // all-pairs transit would explode to a graph larger than the fine one), but each of these two
+        // alternates earns its slot by expressing a way between the clusters the plain cheapest crossing
+        // can't: the gate-free rep keeps an *open* way when the cheapest crossing is a shut door, so
+        // `cost_to` routes around a closed gate wherever a fine gate-free route exists and an openable
+        // prize prices as an errand, not a sealed ~100k wall (preferring gate-free only *at equal cost*
+        // wouldn't do it — a strictly-cheaper gated crossing would still seal the pair); the height
+        // banding keeps an entrance *per level* when the border spans storeys stacked inside one band,
+        // so a route to the border's upper floor crosses there instead of entering at the ground-floor
+        // rep and paying a huge intra-cluster climb the exact flood never pays (dm3's red-armour
+        // spiral: base and first flight share band 0, and the one kept crossing sat on the base, so the
+        // coarse climb read ~18 against an exact ~1 and the bot routed the wrong way off the landing).
+        // The coverage pass below adds back any landing no rep covers.
+        let mut rep: HashMap<(u32, u32, i32, i32), u32> = HashMap::new();
+        let mut rep_free: HashMap<(u32, u32, i32, i32), u32> = HashMap::new();
         for li in 0..self.links.len() as u32 {
             let link = self.links[li as usize];
-            let key = (cluster_of[link.from as usize], cluster_of[link.to as usize]);
-            if key.0 == key.1 {
+            let (cf, ct) = (cluster_of[link.from as usize], cluster_of[link.to as usize]);
+            if cf == ct {
                 continue;
             }
+            let key = (cf, ct, rep_band(self.cells[link.from as usize].origin.z), rep_band(self.cells[link.to as usize].origin.z));
             // Cheapest, then lowest index (deterministic).
             let cheaper = |cur: Option<&u32>| match cur {
                 None => true,
@@ -232,7 +257,7 @@ impl NavGraph {
                 rep.insert(key, li);
             }
             if self.gate_of_link(li).is_none() && cheaper(rep_free.get(&key)) {
-                rep_free.insert(key, li); // cheapest gate-free crossing of this pair (may equal `rep`)
+                rep_free.insert(key, li); // cheapest gate-free crossing of this slot (may equal `rep`)
             }
         }
         let mut kept: Vec<u32> = rep.values().chain(rep_free.values()).copied().collect();
