@@ -25,7 +25,7 @@ use crate::defs::{
 };
 use crate::entity::{EntId, Think, Touch};
 use crate::game::GameState;
-use crate::navmesh::{CellId, CLOSED_GATE_PENALTY};
+use crate::navmesh::{CellId, LinkCosts, NavGraph, CLOSED_GATE_PENALTY};
 
 /// Beyond this travel-or-respawn time (seconds) an *ordinary* item isn't worth pursuing.
 pub(crate) const LOOKAHEAD: f32 = 10.0;
@@ -256,11 +256,26 @@ enum PlanCosts<'a> {
     Exact(Vec<f32>),
     Coarse(crate::navmesh::CoarseCosts<'a>),
 }
-impl PlanCosts<'_> {
+impl<'a> PlanCosts<'a> {
+    /// The goal-scoring costs from `from` under `costs`: the coarse LOD estimate when `lod`, else an
+    /// exact whole-graph flood. The single place the exact/coarse choice is written for a lone source —
+    /// the batched exact floods (`bot_pool.join`/`flood_batch`) stay explicit at their call sites, since
+    /// they fan out and have no coarse equivalent.
+    fn single(graph: &'a NavGraph, from: CellId, costs: &'a LinkCosts<'a>, lod: bool) -> PlanCosts<'a> {
+        if lod {
+            PlanCosts::Coarse(graph.coarse_costs(from, costs, true))
+        } else {
+            PlanCosts::Exact(graph.costs_from(from, costs))
+        }
+    }
+
     #[inline]
     fn cost_to(&self, cell: CellId) -> f32 {
         match self {
-            PlanCosts::Exact(v) => v[cell as usize],
+            // An out-of-range cell (a goal cell held stale across a navmesh rebuild) reads as
+            // unreachable rather than panicking the game module — the graceful skip the pre-refactor
+            // `costs.get(cell)?` gave, now at the single chokepoint every reader passes through.
+            PlanCosts::Exact(v) => v.get(cell as usize).copied().unwrap_or(f32::INFINITY),
             PlanCosts::Coarse(c) => c.cost_to(cell),
         }
     }
@@ -978,11 +993,7 @@ impl GameState {
         // one per candidate below — the last such path in goal selection). `direct` reaches the
         // powerup, which can be far, so this genuinely needs the far field, not just a bounded flood.
         let lod = self.host().cvar_bool(c"rtx_bot_lod");
-        let from_costs = if lod {
-            PlanCosts::Coarse(graph.coarse_costs(from, &link_costs, true))
-        } else {
-            PlanCosts::Exact(graph.costs_from(from, &link_costs))
-        };
+        let from_costs = PlanCosts::single(graph, from, &link_costs, lod);
         let direct = from_costs.cost_to(powerup_cell);
         if !direct.is_finite() {
             return None;
@@ -1018,11 +1029,7 @@ impl GameState {
         candidates
             .into_iter()
             .filter_map(|(item, cell, desire, first_leg)| {
-                let second_leg = if lod {
-                    graph.coarse_costs(cell, &link_costs, true).cost_to(powerup_cell)
-                } else {
-                    graph.costs_from(cell, &link_costs)[powerup_cell as usize]
-                };
+                let second_leg = PlanCosts::single(graph, cell, &link_costs, lod).cost_to(powerup_cell);
                 if !second_leg.is_finite()
                     || !powerup_bridge_arrives_in_time(
                         direct,
@@ -1432,11 +1439,7 @@ impl GameState {
         vcosts.openable_gates = &openable;
         vcosts.open_gate_cost = GATE_OPEN_COST;
         let costs = if openable.iter().any(|&o| o) {
-            if lod {
-                PlanCosts::Coarse(graph.coarse_costs(bot_cell, &vcosts, true))
-            } else {
-                PlanCosts::Exact(graph.costs_from(bot_cell, &vcosts))
-            }
+            PlanCosts::single(graph, bot_cell, &vcosts, lod)
         } else {
             base_costs
         };

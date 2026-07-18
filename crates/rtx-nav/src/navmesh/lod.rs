@@ -779,16 +779,19 @@ impl CoarseCosts<'_> {
     /// can trust it not to call an item closer than it is.
     pub fn cost_to(&self, cell: CellId) -> f32 {
         if let Some(full) = &self.full {
-            return full[cell as usize]; // bare graph: exact full flood
+            return full.get(cell as usize).copied().unwrap_or(f32::INFINITY); // bare graph: exact flood
         }
         if let Some(&d) = self.home.get(&cell) {
             return d; // home cluster: exact
         }
-        let Some(lod) = self.graph.lod.as_ref() else {
-            return f32::INFINITY;
+        // Out of range (a goal cell held stale across a navmesh rebuild) reads as unreachable, never a
+        // panic; `None` LOD tables likewise.
+        let reach = match self.graph.lod.as_ref().and_then(|lod| lod.cell_reach.get(cell as usize)) {
+            Some(r) => r,
+            None => return f32::INFINITY,
         };
         let mut best = f32::INFINITY;
-        for r in &lod.cell_reach[cell as usize] {
+        for r in reach {
             let via = self.abs_cost[r.portal as usize];
             if via.is_finite() {
                 let c = via + r.dist + self.graph.price_meta(r.gates, r.rj, r.chained, r.hazard_hp, self.costs, self.sever_chained, u32::MAX);

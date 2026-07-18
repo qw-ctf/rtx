@@ -37,10 +37,13 @@ pub(crate) struct BotPool {
 }
 
 impl BotPool {
-    /// Reconcile the pool to the `rtx_bot_par` cvar: build it on first enable, tear it down on
-    /// disable. Called once per frame from `run_bots`; cheap when already in the wanted state.
+    /// Reconcile the pool to whether it's actually wanted — `rtx_bot_par` on **and** `rtx_bot_lod`
+    /// off: the pool exists only to fan out the exact-mode goal floods, and under LOD those run coarse
+    /// and serial, so holding idle workers (and their shutdown-join cost) buys nothing. Builds on first
+    /// enable, tears down otherwise; rebuilds if lod is toggled back off. Called once per frame from
+    /// `run_bots`; cheap when already in the wanted state.
     pub(crate) fn ensure(&mut self, host: &HostApi) {
-        let want = host.cvar_bool(c"rtx_bot_par");
+        let want = host.cvar_bool(c"rtx_bot_par") && !host.cvar_bool(c"rtx_bot_lod");
         if want && self.pool.is_none() && !self.failed {
             // Leave one core for the engine/main thread, and cap at the fan-out width — a goal pick
             // never has more than nine independent floods, so more workers would just idle.
