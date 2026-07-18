@@ -7,7 +7,7 @@
 
 use glam::{Vec3, Vec3Swizzles};
 
-use super::physics::{jump_airtime, DOUBLE_JUMP_REACH, JUMP_APEX, JUMP_REACH, MAX_DROP};
+use super::physics::{jump_airtime, DOUBLE_JUMP_REACH, JUMP_APEX, JUMP_REACH, MAX_DROP, WALK_DZ};
 use super::{GRID, GROUND_SAMPLE, GROUND_SLACK};
 use crate::bsp::Bsp;
 use crate::qphys::{JUMP_VZ, STEP_HEIGHT};
@@ -66,10 +66,123 @@ pub(super) fn ground_along(is_solid: &impl Fn(Vec3) -> bool, a: Vec3, b: Vec3) -
     })
 }
 
+/// Whether a rise from `a` to `b` (a `dz` already in the JumpGap band, `STEP_HEIGHT..=JUMP_APEX`) is
+/// actually a **walkable staircase** — a sequence of treads each within a [`STEP_HEIGHT`] rise — rather
+/// than a single wall the bot must jump. On the 32u carve grid, two shallow risers (a ~10-16u tread
+/// pair) fall inside one grid span, so their cell-centre `dz` lands in the jump band even though pmove
+/// steps each riser while walking. Probe the floor under a few interior points; true iff the tread
+/// heights climb monotonically from `a` to `b` with no single riser taller than a step and no gap.
+/// Pure over `is_solid` (the hull-inflated clip test), like [`ground_along`] — so it unit-tests against
+/// a synthetic oracle. Conservative: any probe that finds no tread within a step (a wall) or a floor
+/// below the current tread (a drop) fails, keeping a genuine ledge a `JumpGap`.
+pub(super) fn steppable_rise(is_solid: &impl Fn(Vec3) -> bool, a: Vec3, b: Vec3) -> bool {
+    // A jump-band span (`dz <= JUMP_APEX = 45` over ~32-45u) holds at most ~3 risers; three interior
+    // probes resolve each tread.
+    const PROBES: usize = 3;
+    // The next tread up from height `from` at `(x, y)`: the floor within a step above it, bisected.
+    // `None` when solid fills the up-window (a wall / too-tall riser) or no floor sits within reach.
+    let step_floor = |x: f32, y: f32, from: f32| -> Option<f32> {
+        let (lo, hi) = (from - (WALK_DZ + 4.0), from + STEP_HEIGHT + 4.0);
+        let mut z = lo;
+        let mut prev = is_solid(Vec3::new(x, y, z));
+        let mut best: Option<f32> = None;
+        while z < hi {
+            z += 4.0;
+            let solid = is_solid(Vec3::new(x, y, z));
+            if prev && !solid {
+                // Bisect the resting-origin height in this 4u transition band (six halvings < 0.1u).
+                let (mut blo, mut bhi) = (z - 4.0, z);
+                for _ in 0..6 {
+                    let mid = (blo + bhi) * 0.5;
+                    if is_solid(Vec3::new(x, y, mid)) {
+                        blo = mid;
+                    } else {
+                        bhi = mid;
+                    }
+                }
+                if best.is_none_or(|c| (bhi - from).abs() < (c - from).abs()) {
+                    best = Some(bhi);
+                }
+            }
+            prev = solid;
+        }
+        best
+    };
+    let mut prev = a.z;
+    for k in 1..=PROBES {
+        let p = a.lerp(b, k as f32 / (PROBES + 1) as f32);
+        let Some(floor) = step_floor(p.x, p.y, prev) else {
+            return false; // no floor within reach under this probe — a wall / gap to jump
+        };
+        if floor > prev + STEP_HEIGHT || floor < prev - WALK_DZ {
+            return false; // a riser taller than a step, or a drop — not a monotone staircase
+        }
+        prev = floor;
+    }
+    // The final riser from the last tread up to the target must also be a single step.
+    b.z <= prev + STEP_HEIGHT && b.z >= prev - WALK_DZ
+}
+
 /// Whether a jump arc from `a` to `b` clears geometry: sample a parabola peaking `JUMP_APEX`
 /// above the higher endpoint and require every point to be open.
 pub(super) fn arc_clear(bsp: &Bsp, a: Vec3, b: Vec3) -> bool {
     arc_clear_peak(bsp, a, b, JUMP_APEX, 8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The oracle models the already-hull-inflated clip test (like the `nearfield`/`hazard` tests):
+    // `is_solid(p)` is true where a standing origin is blocked, i.e. at or below the local floor.
+    fn at(x: f32, z: f32) -> Vec3 {
+        Vec3::new(x, 0.0, z)
+    }
+
+    #[test]
+    fn two_shallow_risers_are_steppable() {
+        // Two 12u risers across a 32u span: floors 0 / 12 / 24. dz = 24 sits in the JumpGap band but
+        // pmove walks it — must read steppable.
+        let solid = |p: Vec3| p.z <= if p.x < 10.67 { 0.0 } else if p.x < 21.33 { 12.0 } else { 24.0 };
+        assert!(steppable_rise(&solid, at(0.0, 0.0), at(32.0, 24.0)));
+    }
+
+    #[test]
+    fn single_tall_riser_is_not_steppable() {
+        // One 24u riser (> STEP_HEIGHT) at mid-span: a knee-high ledge the bot must jump.
+        let solid = |p: Vec3| p.z <= if p.x < 16.0 { 0.0 } else { 24.0 };
+        assert!(!steppable_rise(&solid, at(0.0, 0.0), at(32.0, 24.0)));
+    }
+
+    #[test]
+    fn a_gap_mid_span_is_not_steppable() {
+        // A bottomless slot across the middle — never solid there — is a gap to jump, not a stair.
+        let solid = |p: Vec3| {
+            if (12.0..20.0).contains(&p.x) {
+                false
+            } else {
+                p.z <= if p.x < 16.0 { 0.0 } else { 24.0 }
+            }
+        };
+        assert!(!steppable_rise(&solid, at(0.0, 0.0), at(32.0, 24.0)));
+    }
+
+    #[test]
+    fn three_risers_over_a_diagonal_span_are_steppable() {
+        // Three 15u risers up to the apex band (dz = 45): floors 0 / 15 / 30 / 45.
+        let solid = |p: Vec3| {
+            p.z <= if p.x < 11.25 {
+                0.0
+            } else if p.x < 22.5 {
+                15.0
+            } else if p.x < 33.75 {
+                30.0
+            } else {
+                45.0
+            }
+        };
+        assert!(steppable_rise(&solid, at(0.0, 0.0), at(45.0, 45.0)));
+    }
 }
 
 /// Clearance along the **true ballistic path** of a run-jump onto a target far below. The

@@ -542,6 +542,18 @@ impl NavGraph {
         let (a, b) = (self.cells[from as usize], self.cells[to as usize]);
         let dz = b.origin.z - a.origin.z;
         if dz > STEP_HEIGHT && dz <= JUMP_APEX {
+            // A rise in the jump band that is really a **walkable staircase** — two shallow risers
+            // caught inside one 32u grid span — climbs by stepping, not jumping. Emit a `Step` (the same
+            // path the ≤STEP_HEIGHT case takes) so the bot walks it instead of pogoing each riser, and
+            // so a bhop/glide can treat the flight as a runway. A genuine knee-high ledge (one tall
+            // riser) fails `steppable_rise` and stays a JumpGap below.
+            if steppable_rise(&|p| bsp.is_solid(p), a.origin, b.origin)
+                && path_clear(bsp, a.origin, b.origin)
+                && ground_along(&|p| bsp.is_solid(p), a.origin, b.origin)
+            {
+                let horiz = (b.origin.xy() - a.origin.xy()).length();
+                return Some(Link { from, to, kind: LinkKind::Step, cost: link_cost(LinkKind::Step, horiz, dz) });
+            }
             // Hop up onto the adjacent higher footing; clear the standing-jump arc to it. Not from a
             // submerged cell, though — you can't jump when submerged (the jump input swims up).
             if bsp.is_liquid_at(a.origin) {
