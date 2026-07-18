@@ -24,6 +24,17 @@ use super::{hazard_cost, CellId, LinkCosts, LinkKind, NavGraph, CLOSED_GATE_PENA
 /// blocks. Bigger blocks mean fewer, coarser clusters (cheaper abstract graph, blunter estimates).
 const LOD_SHIFT: i32 = 3;
 
+/// Vertical extent of one cluster storey, in world units: cells more than half this apart in Z never
+/// share a cluster, even inside one XY block. Without it the block union is Z-blind, so a one-way drop
+/// welds a platform to the pit beneath it into one cluster spanning both heights — and then the single
+/// cheapest crossing kept per cluster pair is a low walk that *evicts* the climb link onto the
+/// platform, so the coarse route into the platform's cluster lands below it and the steer corridor
+/// never enters the plateau (the bravado quad, unreachable under LOD). Banded by `round`, not `floor`,
+/// exactly as [`super::geom::jump_elev_band`] bands a jump target: a storey is centred on its band, so
+/// a floor plane sits mid-band and a full-storey drop lands a band away. A floor straddling a band edge
+/// merely splits into two clusters (fewer cells each) — never a wrong weld.
+const LOD_STOREY: f32 = 128.0;
+
 /// A min-heap entry with a NaN-free f32 key (mirrors `query::MinCost`): `BinaryHeap` is a max-heap, so
 /// `Ord` reverses the key and the smallest pops first. `id` is a cell or an abstract-portal index, and
 /// it also breaks key ties so the settle order is deterministic — otherwise two abstract paths of equal
@@ -108,11 +119,13 @@ pub(super) struct Lod {
     cell_reach: Vec<Vec<PortalReach>>,
 }
 
-/// The block a cell sits in — its grid column shifted down by [`LOD_SHIFT`]. Two cells cluster
-/// together only if they share a block *and* a link path within it.
+/// The block a cell sits in — its grid column shifted down by [`LOD_SHIFT`], plus a storey band from
+/// its height ([`LOD_STOREY`]). Two cells cluster together only if they share a block *and* a storey
+/// *and* a link path between them: the storey term keeps a plateau and the pit beneath it (same XY
+/// block, joined by a one-way drop) in separate clusters.
 #[inline]
-fn block_of(gx: i32, gy: i32) -> (i32, i32) {
-    (gx >> LOD_SHIFT, gy >> LOD_SHIFT)
+fn block_of(gx: i32, gy: i32, z: f32) -> (i32, i32, i32) {
+    (gx >> LOD_SHIFT, gy >> LOD_SHIFT, (z / LOD_STOREY).round() as i32)
 }
 
 /// Union-find with path-halving + union-by-rank, for the intra-block connected-components pass.
@@ -294,16 +307,18 @@ impl NavGraph {
         Lod { cluster_of: cluster_of.to_vec(), cluster_count, portal_of_cell, portals, abs_adj, cell_reach }
     }
 
-    /// Weakly connect cells joined by a link that stays inside one block (grouping is undirected — a
-    /// one-way drop still groups its endpoints; the directed intra distances carry the asymmetry).
-    /// Returns the dense per-cell cluster id (first-appearance order → deterministic) and the count.
+    /// Weakly connect cells joined by a link that stays inside one block *and one storey* (grouping is
+    /// undirected — a one-way drop within a storey still groups its endpoints; the directed intra
+    /// distances carry the asymmetry). A link spanning storeys (a drop off a plateau, a jump up a wall)
+    /// is a cluster *crossing*, not an intra-cluster weld. Returns the dense per-cell cluster id
+    /// (first-appearance order → deterministic) and the count.
     fn cluster_cells(&self) -> (Vec<u32>, u32) {
         let n = self.cells.len();
         let mut uf = UnionFind::new(n);
         for link in &self.links {
             let a = &self.cells[link.from as usize];
             let b = &self.cells[link.to as usize];
-            if block_of(a.gx, a.gy) == block_of(b.gx, b.gy) {
+            if block_of(a.gx, a.gy, a.origin.z) == block_of(b.gx, b.gy, b.origin.z) {
                 uf.union(link.from, link.to);
             }
         }
@@ -499,12 +514,12 @@ impl NavGraph {
         h
     }
 
-    /// Coarse travel costs from `from` under `costs`: exact within [`COARSE_FINE_CAP`] via a bounded
-    /// fine flood, and an abstract-graph estimate (a bounded overestimate) beyond it. `sever_chained`
+    /// Coarse travel costs from `from` under `costs`: exact within the home cluster (an in-cluster
+    /// flood), and an abstract-graph estimate (a bounded overestimate) beyond it. `sever_chained`
     /// mirrors `chained_block` — `true` for goal scoring (a chained speed jump is impassable to a
-    /// speed-unaware estimate), `false` for the steer corridor (it may lead through one). Cheap: a
-    /// capped flood plus a home-cluster seed and a Dijkstra over a few hundred portals. Falls back to
-    /// an exact full flood on a bare graph (no LOD tables).
+    /// speed-unaware estimate), `false` for the steer corridor (it may lead through one). Cheap: one
+    /// home-cluster flood plus a Dijkstra over a few hundred portals. Falls back to an exact full flood
+    /// on a bare graph (no LOD tables).
     pub fn coarse_costs<'a>(&'a self, from: CellId, costs: &'a LinkCosts, sever_chained: bool) -> CoarseCosts<'a> {
         let Some(lod) = self.lod.as_ref() else {
             // No hierarchy (bare test graph): an exact full flood, read directly.
@@ -813,5 +828,332 @@ impl CoarseCosts<'_> {
             }
         }
         best
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{build_navmesh, RocketJumpParams, SpeedJumpParams, TeleportInfo};
+    use super::*;
+    use glam::Vec3;
+    use std::collections::HashSet;
+
+    /// The quad on bravado — same reference point as `bot::tests::bravado_quad_reachability`.
+    const QUAD: Vec3 = Vec3::new(752.0, 24.0, 288.0);
+    /// `STEER_LOD_HORIZON` (crates/rtx-game/src/bot/mod.rs) inlined — rtx-nav can't see the game crate.
+    const HORIZON: f32 = 3.0;
+
+    /// Build the bravado navmesh the way the rjtest live server does: `rtx_doublejump 0`, grapple off,
+    /// bhop + rocket-jump on. So the LOD tables this probe dissects are the ones the live bot steers on.
+    /// Liquid columns stay empty (worker build) — a fidelity gap that only drops *cost*, never links, so
+    /// an eviction / INF / window finding here is structural and real. `None` when the env isn't set to
+    /// bravado (the test then no-ops, mirroring `bravado_quad_reachability`).
+    fn build_bravado() -> Option<NavGraph> {
+        let path = std::env::var("RTX_TEST_BSP").ok()?;
+        if !path.to_lowercase().contains("bravado") {
+            return None;
+        }
+        let bytes = std::fs::read(&path).expect("read bsp");
+        // The two trigger_teleports from the entity lump — both far from the quad, included for fidelity.
+        let teleports = vec![
+            TeleportInfo {
+                tmin: Vec3::new(-63.0, 1249.0, 1.0),
+                tmax: Vec3::new(31.0, 1255.0, 111.0),
+                dest: Vec3::new(256.0, 1256.0, 164.0),
+            },
+            TeleportInfo {
+                tmin: Vec3::new(-167.0, 401.0, 1.0),
+                tmax: Vec3::new(-161.0, 495.0, 111.0),
+                dest: Vec3::new(-664.0, 480.0, 312.0),
+            },
+        ];
+        let (_bsp, graph) = build_navmesh(
+            bytes,
+            vec![],
+            teleports,
+            vec![],
+            None,
+            false,
+            Some(SpeedJumpParams { gravity: 800.0, accel: 10.0, maxspeed: 320.0, friction: 4.0, stopspeed: 100.0, curl: false }),
+            Some(RocketJumpParams { gravity: 800.0, rj_extra: 0.0 }),
+        )
+        .expect("build navmesh");
+        Some(graph)
+    }
+
+    /// The walk/step-connected plateau containing the quad cell (jump links excluded) — the same
+    /// "on the platform" flood `bravado_quad_reachability` uses.
+    fn platform_of(graph: &NavGraph, quad: CellId) -> Vec<bool> {
+        let mut on = vec![false; graph.cells.len()];
+        let mut stack = vec![quad];
+        on[quad as usize] = true;
+        while let Some(c) = stack.pop() {
+            for l in &graph.links {
+                let walkish = matches!(l.kind, LinkKind::Walk | LinkKind::Step);
+                for (a, b) in [(l.from, l.to), (l.to, l.from)] {
+                    if walkish && a == c && !on[b as usize] {
+                        on[b as usize] = true;
+                        stack.push(b);
+                    }
+                }
+            }
+        }
+        on
+    }
+
+    /// Root-cause probe *and* regression guard for the "bot can't reach the bravado quad under LOD"
+    /// bug. Dumps clustering, crossing eviction, coverage, coarse-vs-exact cost, and corridor decisions
+    /// (read the output to diagnose), and asserts the invariants the storey-band fix restores: the
+    /// quad's cluster stays on the plateau (not welded to the pit), a fine-reachable quad has a finite
+    /// coarse cost, and the steer corridor reaches the quad from every sampled source. Pre-fix the quad
+    /// cluster spanned 208u (platform + pit), every climb crossing was evicted by a cheap low walk, and
+    /// the platform read `cost_to = INFINITY` from the mid-level. Run:
+    /// `RTX_TEST_BSP=…/bravado.bsp cargo test -p rtx-nav bravado_quad_lod_probe -- --nocapture`.
+    #[test]
+    fn bravado_quad_lod_probe() {
+        let Some(graph) = build_bravado() else { return };
+        let lod = graph.lod.as_ref().expect("lod tables built");
+        let costs = LinkCosts::default();
+
+        let (nc, np, ne, nr) = graph.lod_stats();
+        eprintln!(
+            "\n=== bravado LOD probe ===\n[stats] cells={} links={} clusters={} portals={} abs_edges={} reach_entries={}",
+            graph.cells.len(),
+            graph.links.len(),
+            nc,
+            np,
+            ne,
+            nr
+        );
+
+        // §1 goal cell
+        let quad = graph.nearest_collectable(QUAD).expect("collectable cell near quad");
+        let qo = graph.cells[quad as usize].origin;
+        let qcl = lod.cluster_of[quad as usize];
+        eprintln!(
+            "[goal] nearest_collectable=cell {} origin=({:.0},{:.0},{:.0}) gx={} gy={} cluster={}  (nearest=cell {})",
+            quad,
+            qo.x,
+            qo.y,
+            qo.z,
+            graph.cells[quad as usize].gx,
+            graph.cells[quad as usize].gy,
+            qcl,
+            graph.nearest(QUAD).unwrap()
+        );
+
+        // §2 platform set
+        let on_platform = platform_of(&graph, quad);
+        let plat_cells: Vec<u32> = (0..graph.cells.len() as u32).filter(|&c| on_platform[c as usize]).collect();
+        eprintln!("[platform] {} walk/step-connected cells", plat_cells.len());
+
+        // §3 cluster census (H-A)
+        let members: Vec<u32> = (0..graph.cells.len() as u32).filter(|&c| lod.cluster_of[c as usize] == qcl).collect();
+        let zmin = members.iter().map(|&c| graph.cells[c as usize].origin.z).fold(f32::INFINITY, f32::min);
+        let zmax = members.iter().map(|&c| graph.cells[c as usize].origin.z).fold(f32::NEG_INFINITY, f32::max);
+        let pit = members.iter().filter(|&&c| graph.cells[c as usize].origin.z < qo.z - 100.0).count();
+        let on_plat_in_cluster = members.iter().filter(|&&c| on_platform[c as usize]).count();
+        let off_plat_same_z = members
+            .iter()
+            .filter(|&&c| !on_platform[c as usize] && (graph.cells[c as usize].origin.z - qo.z).abs() <= 48.0)
+            .count();
+        let mut plat_clusters: Vec<u32> = plat_cells.iter().map(|&c| lod.cluster_of[c as usize]).collect();
+        plat_clusters.sort_unstable();
+        plat_clusters.dedup();
+        eprintln!(
+            "[cluster {}] members={} z=[{:.0}..{:.0}] on_platform={} pit(z<{:.0})={} off_platform_same_z={}",
+            qcl,
+            members.len(),
+            zmin,
+            zmax,
+            on_plat_in_cluster,
+            qo.z - 100.0,
+            pit,
+            off_plat_same_z
+        );
+        eprintln!(
+            "[cluster] platform spans clusters {:?}  => H-A {}",
+            plat_clusters,
+            if pit > 0 || off_plat_same_z > 0 { "LIKELY (cluster spills off the plateau)" } else { "not indicated" }
+        );
+        // The storey band must keep the quad's cluster on the plateau, not welded to the pit below it.
+        assert!(
+            zmax - zmin <= LOD_STOREY + 1.0,
+            "quad cluster spans {:.0}u in Z (> one {LOD_STOREY}u storey) — platform merged with the pit",
+            zmax - zmin
+        );
+        assert_eq!(pit, 0, "quad cluster must hold no pit cells (z < platform − 100)");
+
+        // §4 crossing audit (H-B): which fine climb links onto the platform survived as abstract edges?
+        let mut kept: HashSet<u32> = HashSet::new();
+        for edges in &lod.abs_adj {
+            for e in edges {
+                if e.link != u32::MAX {
+                    kept.insert(e.link);
+                }
+            }
+        }
+        eprintln!("[inbound climbs] non-drop links landing on the platform from off it:");
+        for (li, l) in graph.links.iter().enumerate() {
+            let li = li as u32;
+            if !(on_platform[l.to as usize] && !on_platform[l.from as usize] && !matches!(l.kind, LinkKind::Drop)) {
+                continue;
+            }
+            let (fc, tc) = (lod.cluster_of[l.from as usize], lod.cluster_of[l.to as usize]);
+            let (fo, to) = (graph.cells[l.from as usize].origin, graph.cells[l.to as usize].origin);
+            let cross = fc != tc;
+            eprintln!(
+                "  link {} {:?} cost={:.1}  cell {} (cl {}, z {:.0}) -> cell {} (cl {}, z {:.0})  cross={} kept={}",
+                li,
+                l.kind,
+                l.cost,
+                l.from,
+                fc,
+                fo.z,
+                l.to,
+                tc,
+                to.z,
+                cross,
+                kept.contains(&li)
+            );
+            if cross && !kept.contains(&li) {
+                for (lj, m) in graph.links.iter().enumerate() {
+                    let lj = lj as u32;
+                    if kept.contains(&lj) && lod.cluster_of[m.from as usize] == fc && lod.cluster_of[m.to as usize] == tc {
+                        eprintln!(
+                            "      >>> EVICTED — pair ({fc}->{tc}) rep is link {} {:?} cost={:.1} landing z {:.0}",
+                            lj,
+                            m.kind,
+                            m.cost,
+                            graph.cells[m.to as usize].origin.z
+                        );
+                    }
+                }
+            }
+        }
+
+        // §5 cell_reach of the quad + each covering portal's inbound abstract degree
+        eprintln!("[cell_reach quad] {} entries:", lod.cell_reach[quad as usize].len());
+        for r in &lod.cell_reach[quad as usize] {
+            let p = &lod.portals[r.portal as usize];
+            let indeg = lod.abs_adj.iter().flatten().filter(|e| e.to == r.portal).count();
+            eprintln!(
+                "  portal {} = cell {} (cl {}, z {:.0}) dist={:.1} inbound_abs_edges={}",
+                r.portal,
+                p.cell,
+                p.cluster,
+                graph.cells[p.cell as usize].origin.z,
+                r.dist,
+                indeg
+            );
+        }
+
+        // §6/§7 coarse-vs-exact + corridor + convergence, from sampled sources
+        let mut sources: Vec<u32> = graph
+            .links
+            .iter()
+            .filter(|l| on_platform[l.to as usize] && !on_platform[l.from as usize] && !matches!(l.kind, LinkKind::Drop))
+            .map(|l| l.from)
+            .collect();
+        sources.sort_unstable();
+        sources.dedup();
+        // A few off-platform vantage points: west of the launch ledge, and the two teleport dests.
+        for p in [Vec3::new(560.0, 24.0, 288.0), Vec3::new(-664.0, 480.0, 312.0), Vec3::new(256.0, 1256.0, 164.0)] {
+            if let Some(c) = graph.nearest(p) {
+                if !sources.contains(&c) {
+                    sources.push(c);
+                }
+            }
+        }
+
+        eprintln!("[costs + corridor per source]");
+        for &s in &sources {
+            let so = graph.cells[s as usize].origin;
+            let reach = graph.reachable(s, quad);
+            let exact = graph.costs_from(s, &costs)[quad as usize];
+            let score = graph.coarse_costs(s, &costs, true);
+            let cs = score.cost_to(quad);
+            let cc = graph.coarse_costs(s, &costs, false).cost_to(quad);
+            eprintln!(
+                "  src cell {} ({:.0},{:.0},{:.0}) cl {}: reachable={} exact={:.1} coarse_score={:.1} coarse_corr={:.1}{}",
+                s,
+                so.x,
+                so.y,
+                so.z,
+                lod.cluster_of[s as usize],
+                reach,
+                exact,
+                cs,
+                cc,
+                if reach && !cs.is_finite() { "   <<< reachable but INF (H-C)" } else { "" }
+            );
+            // The invariant the fix restores: a fine-reachable quad has a finite coarse cost.
+            assert_eq!(reach, cs.is_finite(), "src {s}: reachable={reach} but coarse-finite={} — reachable⟺finite broken", cs.is_finite());
+            for r in &lod.cell_reach[quad as usize] {
+                eprintln!("      via portal {} abs_cost={:.1}", r.portal, score.abs_cost[r.portal as usize]);
+            }
+            match graph.corridor(s, quad, &costs, HORIZON) {
+                None => eprintln!("      corridor=None (steer directly, unrestricted)"),
+                Some(c) => {
+                    let win = c.allowed.iter().filter(|&&b| b).count();
+                    let giw = c.allowed.get(qcl as usize).copied().unwrap_or(false);
+                    eprintln!(
+                        "      corridor: interim=cell {} (z {:.0}) window={} clusters goal_cluster_in_window={}{}",
+                        c.interim,
+                        graph.cells[c.interim as usize].origin.z,
+                        win,
+                        giw,
+                        if !giw { "   <<< quad cluster EXCLUDED from window (H-B)" } else { "" }
+                    );
+                }
+            }
+        }
+
+        // Convergence: replay steer's repath cadence (corridor → windowed_route → advance) from each
+        // source and see whether the fine bot ever reaches the quad, orbits, or strands.
+        eprintln!("[convergence] (corridor-follow, mirroring steer::windowed_route):");
+        for &s in &sources {
+            let mut cur = s;
+            let mut seen = HashSet::new();
+            let mut hops = 0u32;
+            let verdict = loop {
+                if cur == quad {
+                    break format!("ARRIVED in {hops} hops");
+                }
+                match graph.corridor(cur, quad, &costs, HORIZON) {
+                    None => {
+                        let r = graph.find_path(cur, quad, &costs).unwrap_or_default();
+                        break if r.is_empty() {
+                            format!("DIRECT-EMPTY after {hops} hops (cell {cur})")
+                        } else {
+                            format!("CONVERGED-DIRECT after {hops} hops + {} fine legs", r.len())
+                        };
+                    }
+                    Some(c) => {
+                        let mut route = graph.find_path_within(cur, c.interim, &costs, &c.allowed).unwrap_or_default();
+                        if route.is_empty() {
+                            route = graph.find_path(cur, c.interim, &costs).unwrap_or_default();
+                        }
+                        if route.is_empty() {
+                            break format!("STRANDED at cell {cur} (interim {} unreachable)", c.interim);
+                        }
+                        cur = graph.links[*route.last().unwrap() as usize].to;
+                        hops += 1;
+                        if !seen.insert(cur) {
+                            break format!("LOOP — revisited cell {cur} after {hops} hops");
+                        }
+                        if hops >= 40 {
+                            break format!("NO-CONVERGE in 40 hops (last cell {cur})");
+                        }
+                    }
+                }
+            };
+            eprintln!("  src cell {} -> {}", s, verdict);
+            assert!(
+                verdict.starts_with("ARRIVED") || verdict.starts_with("CONVERGED"),
+                "src {s}: corridor-follow never reached the quad — {verdict}"
+            );
+        }
+        eprintln!("=== end probe ===\n");
     }
 }

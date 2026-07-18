@@ -3081,6 +3081,60 @@ mod tests {
         }
     }
 
+    /// Storey-banded clustering: a platform and the pit directly beneath it (same 256u XY block, joined
+    /// only by a one-way drop) must land in *different* clusters, so the cheap drop into the pit can't
+    /// evict the climb onto the platform as the block pair's single representative crossing. Z-blind,
+    /// the two merged into one cluster spanning both heights; the cheap drop won the rep slot, the
+    /// abstract route into the block landed in the pit (which can't climb back up), and the platform
+    /// read `cost_to = INFINITY` while the fine graph reached it — the bravado quad, unreachable under
+    /// LOD. Block A (gx&lt;8) is a launch walkway at platform height; block B (gx≥8) is the platform
+    /// (z 256) over a pit (z 0). The platform's outbound jump makes it a self-covering portal, so the
+    /// coverage pass can't paper over the eviction — exactly the bravado shape.
+    #[test]
+    fn coarse_reaches_a_platform_over_the_pit_below_it() {
+        let at = |x: f32, y: f32, z: f32, gx: i32, gy: i32| Cell { origin: Vec3::new(x, y, z), gx, gy };
+        let cells = vec![
+            at(224.0, 0.0, 256.0, 7, 0),  // 0 W  — launch walkway (block A, storey 2)
+            at(224.0, 32.0, 256.0, 7, 1), // 1 W2 — walkway neighbour (gives the platform an outbound portal)
+            at(256.0, 0.0, 256.0, 8, 0),  // 2 P0 — platform edge (block B, storey 2)
+            at(288.0, 0.0, 256.0, 9, 0),  // 3 P1 — platform interior — the "quad"
+            at(256.0, 0.0, 0.0, 8, 0),    // 4 D0 — pit below the platform (block B, storey 0)
+            at(288.0, 0.0, 0.0, 9, 0),    // 5 D1 — pit
+        ];
+        let jump = |from, to| Link { from, to, kind: LinkKind::JumpGap, cost: 1.0 };
+        let drop = |from, to| Link { from, to, kind: LinkKind::Drop, cost: 0.3 };
+        let links = vec![
+            reach_link(0, 1),
+            reach_link(1, 0), // walkway intra (block A)
+            reach_link(2, 3),
+            reach_link(3, 2), // platform intra (block B, storey 2)
+            reach_link(4, 5),
+            reach_link(5, 4), // pit intra (block B, storey 0)
+            jump(0, 2),       // climb: walkway → platform edge (the crossing that must survive)
+            drop(0, 4),       // cheaper drop: walkway → pit (the evictor — same block B pre-banding)
+            drop(2, 4),       // one-way drop platform → pit (merges the two pre-banding)
+            jump(3, 1),       // platform → walkway: makes the platform a self-covering takeoff portal
+        ];
+        let mut g = NavGraph::test_graph(cells, links);
+        g.build_reachability();
+        g.build_lod();
+
+        // The storey band keeps the platform (cell 3, z 256) out of the pit's cluster (cell 4, z 0).
+        assert_ne!(g.cluster_of(3), g.cluster_of(4), "platform and the pit beneath it must not share a cluster");
+
+        let costs = LinkCosts::default();
+        let coarse = g.coarse_costs(0, &costs, false);
+        let exact = g.costs_from(0, &costs);
+        assert!(g.reachable(0, 3), "the platform is reachable via the climb");
+        assert!(coarse.cost_to(3).is_finite(), "coarse must reach the platform — the climb wasn't evicted into the pit");
+        for c in 0..6u32 {
+            assert_eq!(g.reachable(0, c), coarse.cost_to(c).is_finite(), "reachability/finiteness must agree at cell {c}");
+            if exact[c as usize].is_finite() {
+                assert!(coarse.cost_to(c) >= exact[c as usize] - 1e-3, "cell {c}: coarse {} underestimates exact {}", coarse.cost_to(c), exact[c as usize]);
+            }
+        }
+    }
+
     /// A directed cluster pair whose *cheapest* crossing is a shut gate but which also has a pricier
     /// gate-free crossing: keeping a gate-free representative lets the coarse cost route around the shut
     /// door, so a prize past the gate-free crossing reads reachable (below the closed-gate wall) exactly
