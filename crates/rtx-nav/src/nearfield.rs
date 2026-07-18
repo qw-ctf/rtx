@@ -58,6 +58,14 @@ const DROP_WEIGHT: f32 = 1.0;
 /// scraping without being pinned to the far wall or stalling.
 const WALL_WEIGHT: f32 = 0.6;
 
+/// The flood classifies columns only within this radius of the bot. [`steer_push`](NearField::steer_push)
+/// reads at most [`REACH`] from a bot that has strayed up to [`NEAR_RECENTER`] off-centre, so anything
+/// past `NEAR_RECENTER + REACH` is never read — leaving the far corners of the 384u footprint `Unknown`
+/// (never classified) skips those hull traces and roughly halves the per-build cost on open maps, which
+/// was overrunning the frame when a rebuild met a repath. The glide, which looks further, degrades to
+/// the raw waypoint out here (`chord_clear` reads `Unknown` as not-walkable — its safe fallback).
+const FLOOD_REACH: f32 = NEAR_RECENTER + REACH;
+
 /// The eight compass directions the repulsion probes, pre-normalised (diagonals at 0.707). Shared
 /// shape with [`crate::hazard::HAZARD_DIRS`].
 const DIRS8: [(f32, f32); 8] = [
@@ -160,6 +168,11 @@ impl NearField {
                 let idx = nj * NEAR_N + ni;
                 if grid[idx] != Col::Unknown {
                     continue; // already classified this frame
+                }
+                // Past the read radius: leave it Unknown and don't pay to classify or flood on.
+                let (ddi, ddj) = ((ni as f32 - si as f32) * NEAR_RES, (nj as f32 - sj as f32) * NEAR_RES);
+                if ddi * ddi + ddj * ddj > FLOOD_REACH * FLOOD_REACH {
+                    continue;
                 }
                 let c = col_center(ni, nj, cz);
                 let col = if blocks(c, cz, blocked) {
