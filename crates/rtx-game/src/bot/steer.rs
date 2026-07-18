@@ -148,6 +148,9 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // `!on_air` guards, leaving holes such as gate errands; one ownership bit closes those seams.
     let on_air = bot.air.is_some();
     let route_frozen = hooking || on_sj || on_rj || on_air || pinned;
+    // Read the LOD toggle once for the whole steer pass (errand reachability bound, repath corridor,
+    // far gate pre-arm, errand route) — one engine cvar lookup, one consistent value across the frame.
+    let lod = host.cvar_bool(c"rtx_bot_lod");
 
     // Gate errand: drop it once the gate's door has opened — or give up if we stop making progress
     // toward its button (stuck at a door whose button we can't actually reach), so we don't camp
@@ -166,7 +169,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 bot.gate.errand = None; // door opened — done
                 bot.route.clear();
                 bot.repath_time = now;
-            } else if now >= bot.repath_time && !button_reachable(graph, bot_cell, gi, &costs) {
+            } else if now >= bot.repath_time && !button_reachable(graph, bot_cell, gi, &costs, lod) {
                 // Re-verify the button is reachable without crossing this very gate (the arenazap
                 // chicken-and-egg case) only at the repath cadence, not every frame: `button_reachable`
                 // runs a whole-graph search, and the far pre-arm now routinely aims errands at distant
@@ -192,9 +195,6 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         Some(errand) => graph.gate(errand.index).button_cell,
         None => goal_cell,
     };
-    // Read the LOD toggle once for the whole steer pass (repath corridor, far gate pre-arm, errand
-    // route) — one engine cvar lookup instead of three, and one consistent value across the frame.
-    let lod = host.cvar_bool(c"rtx_bot_lod");
 
     // Re-path when the route is empty, the goal changed, or the timer elapsed. Frozen mid-hook, on a
     // speed/rocket jump, or committed to a plain jump arc, so the traversal keeps the route that put
@@ -289,7 +289,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             .filter(|&gi| Some(gi) != avoid)
             .or(far);
         if let Some(gi) = block {
-            if button_reachable(graph, bot_cell, gi, &costs) {
+            if button_reachable(graph, bot_cell, gi, &costs, lod) {
                 let button_cell = graph.gate(gi).button_cell;
                 // first frame records the starting distance (best_dist starts at +inf)
                 bot.gate.errand = Some(GateErrand { index: gi, best_dist: f32::INFINITY, since: now });

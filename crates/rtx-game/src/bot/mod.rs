@@ -1756,7 +1756,7 @@ fn penalize_link(bot: &mut BotState, link: u32, now: f32) {
 /// door. False for the chicken-and-egg case (e.g. arenazap's central plate, which opens all four
 /// pillars but sits behind them): a bot outside can't reach it, so committing to that gate is
 /// futile — it should route around the pillar instead. A `None` path counts as unreachable.
-fn button_reachable(graph: &NavGraph, from: CellId, gi: usize, costs: &LinkCosts) -> bool {
+fn button_reachable(graph: &NavGraph, from: CellId, gi: usize, costs: &LinkCosts, lod: bool) -> bool {
     let button = graph.gate(gi).button_cell;
     // Topologically severed from here (a different component entirely)? Then no route exists even
     // through the gate — skip the search. A button reachable only *by* crossing the gate still passes
@@ -1764,6 +1764,16 @@ fn button_reachable(graph: &NavGraph, from: CellId, gi: usize, costs: &LinkCosts
     // actually rules out the chicken-and-egg case.
     if !graph.reachable(from, button) {
         return false;
+    }
+    // Bound the gate-avoidance search. The walled-off-behind-its-own-gate case (arenazap's central
+    // plate, only reachable *through* the gate it opens) is inherently *local* — the button sits right
+    // behind its door. So under LOD a button beyond the corridor horizon is far, not walled off, and
+    // the O(1) reachable() above already settles it; only a near button pays the exact find_path, which
+    // is then a local, cheap search rather than a whole-graph A* the far pre-arm would otherwise run
+    // every errand. If that far button really is a rare far chicken-and-egg, the bot heads toward it
+    // and the exact check fires (with the give-up clock) once it's near. Exact mode keeps the full search.
+    if lod && graph.corridor(from, button, costs, STEER_LOD_HORIZON).is_some() {
+        return true;
     }
     match graph.find_path(from, button, costs) {
         Some(route) => !route.iter().any(|&leg| graph.gate_of_link(leg) == Some(gi)),
