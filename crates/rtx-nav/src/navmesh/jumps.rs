@@ -225,6 +225,14 @@ impl NavGraph {
                 .map(|ledge| {
                     let mut out = Vec::new();
                     this.solve_chained_ground_turn_from(bsp, ledge, params, &GT_ENTRY_SPEEDS, &mut out);
+                    // Additive low-entry sibling: the ground-optimal single-sided sweep
+                    // (GROUND_TURN_OPTIMAL_VERSION contracts) from the carried ~320..360
+                    // band. Always on for this branch (no cvar gate). It appends into the
+                    // same `out`; the per-target dedup below (cheapest-cost-wins,
+                    // one-per-source-envelope, seen_from) mixes v1 and v3 candidates
+                    // deterministically — a v3 link only survives if it is cheaper than
+                    // the v1 covering the same target, exactly as within-version.
+                    this.solve_chained_ground_turn_optimal_curl(bsp, ledge, params, &GT_OPT_ENTRY_SPEEDS, &mut out);
                     out
                 })
                 .collect();
@@ -2108,6 +2116,13 @@ const GT_OPT_LAUNCH_OFFSETS: [f32; 7] = [16.0, 24.0, 35.0, 42.0, 50.0, 60.0, 68.
 /// prefilter so high-`v_req` targets are not pruned before certification proves
 /// or rejects them.
 const GT_OPT_BUILD_FRAC: f32 = 1.3;
+/// Low-entry ladder for the production emission of the optimal-sweep solver.
+/// From the corpus calibration the carried DM3 entry band clusters at
+/// p10/p50 = 332/358 u/s; this ladder brackets that (320/340/360) so the
+/// built-exit law is certified from the speeds a chained route actually
+/// delivers, distinct from the high-entry `GT_ENTRY_SPEEDS` (~439/500) the
+/// default weave assumes.
+const GT_OPT_ENTRY_SPEEDS: [f32; 3] = [320.0, 340.0, 360.0];
 
 /// The deterministic ground-optimal single-sided sweep -- the "optimal curl"
 /// grounded styrlag (see [`NavGraph::solve_chained_ground_turn_optimal_curl`]).
@@ -2161,6 +2176,34 @@ pub fn ground_turn_ground_cmd_optimal(vel_xy: Vec2, gt: &GroundTurnCurl, accel: 
         side: (-side_sign * MOVE_SPEED * s).round(),
         jump: false,
     }
+}
+
+/// Launch gate for an optimal-sweep ([`GROUND_TURN_OPTIMAL_VERSION`]) contract:
+/// the runtime analogue of the `launch_now` closure inside
+/// [`ground_turn_rolls_optimal_tol`]. Fire on the first grounded tick inside the
+/// takeoff box whose carried velocity has rotated to within
+/// [`GT_OPT_LAUNCH_SLACK`] of `launch_yaw` (approach side).
+///
+/// Deviation from the rollout: the rollout fixes `sweep_side` from the *entry*
+/// heading and tests `wrap180(launch_yaw - vel_yaw) * sweep_side <= SLACK`, while
+/// here `sweep_side = sign(wrap180(launch_yaw - vel_yaw))` is recomputed from the
+/// *current* velocity — matching [`ground_turn_ground_cmd_optimal`], which also
+/// derives its strafe side from the live velocity. The two are equivalent for the
+/// launch decision: the sweep rotates the velocity monotonically toward
+/// `launch_yaw`, so `sign(wrap180(launch_yaw - vel_yaw))` is invariant until the
+/// velocity actually reaches the launch heading; on every pre-fire tick both
+/// forms therefore agree, and `x * sign(x) = |x|` so the test reduces to
+/// `|wrap180(launch_yaw - vel_yaw)| <= SLACK`, firing on exactly the same first
+/// tick the entry-fixed form fires.
+pub fn ground_turn_should_launch_optimal(origin: Vec3, vel_xy: Vec2, on_ground: bool, gt: &GroundTurnCurl) -> bool {
+    let in_box = origin.x >= gt.box_min.x
+        && origin.x <= gt.box_max.x
+        && origin.y >= gt.box_min.y
+        && origin.y <= gt.box_max.y
+        && origin.z >= gt.box_min.z;
+    let delta = wrap180(gt.launch_yaw - yaw_of(vel_xy));
+    let sweep_side = if delta >= 0.0 { 1.0 } else { -1.0 };
+    on_ground && in_box && delta * sweep_side <= GT_OPT_LAUNCH_SLACK
 }
 
 /// One certified **optimal-sweep** rollout (the [`ground_turn_ground_cmd_optimal`]

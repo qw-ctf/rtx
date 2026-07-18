@@ -176,14 +176,23 @@ fn dm3_ra_curl_coverage() {
                 let Some(gt) = tr.ground_turn else { continue };
                 gt_links += 1;
                 assert!(gt.entry_speed_lo < gt.entry_speed_hi, "link {li} envelope");
-                if tr.chained {
+                // v3 (optimal-sweep) contracts are certified from the carried
+                // low-entry band (ladder 320/340/360, tol 2% => floor >= 313);
+                // the >=420 floor is a v1/v2 (bearing-follow) plausibility bound.
+                if gt.version == rtx_nav::navmesh::GROUND_TURN_OPTIMAL_VERSION {
+                    assert!(gt.entry_speed_lo >= 313.0, "link {li} implausibly slow optimal entry floor");
+                } else if tr.chained {
                     assert!(gt.entry_speed_lo >= 420.0, "link {li} implausibly slow chained entry floor");
                 } else {
                     assert!(gt.entry_speed_lo >= 300.0, "link {li} implausibly slow runway entry floor");
                 }
                 assert!(gt.landing_speed_lo > 0.0, "link {li} landing carry not stamped");
                 assert!(gt.box_min.x < gt.box_max.x && gt.box_min.y < gt.box_max.y, "link {li} box");
-                assert_eq!(gt.version, if gt.blended_runway { 2 } else { 1 }, "link {li} contract version");
+                if gt.version == rtx_nav::navmesh::GROUND_TURN_OPTIMAL_VERSION {
+                    assert!(!gt.blended_runway, "link {li} v3 contract must not blend runway");
+                } else {
+                    assert_eq!(gt.version, if gt.blended_runway { 2 } else { 1 }, "link {li} contract version");
+                }
                 let _ = link;
             }
             assert!(gt_links > 0, "no chained ground-turn links generated at all");

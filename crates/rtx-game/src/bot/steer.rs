@@ -1435,7 +1435,14 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             // Ground-turn curl: the leap fires on the certified yaw/box gate, not on crossing a
             // takeoff line — synthesize the "past the lip" signal from the shared gate check.
             (Some(gt), _, _) => {
-                if crate::navmesh::ground_turn_should_launch(origin, v_xy, on_ground, &gt) {
+                // Optimal-sweep (v3) contracts use the single-sided-sweep launch gate;
+                // v1/v2 weave contracts use the yaw_min-rotation gate.
+                let launched = if gt.version == crate::navmesh::GROUND_TURN_OPTIMAL_VERSION {
+                    crate::navmesh::ground_turn_should_launch_optimal(origin, v_xy, on_ground, &gt)
+                } else {
+                    crate::navmesh::ground_turn_should_launch(origin, v_xy, on_ground, &gt)
+                };
+                if launched {
                     -1.0
                 } else {
                     bhop::LIP_REACH + 64.0
@@ -1509,9 +1516,16 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         // Override the generic hop-cycle command with the exact same single-sourced ticks used by
         // the BSP rollout; the hop state machine above still owns commit, jump-pulse and watchdogs.
         if let (Some(gt), Some((takeoff, _)), Some(generic)) = (sj_gt, sj_takeoff, cmd) {
+            // Optimal-sweep (v3) contracts reproduce ground_turn_rolls_optimal_tol: the
+            // single-sided sweep on the ground, launch aimed along the stored launch_yaw.
+            // v1/v2 weave contracts keep the bearing-follow ground law and runway bearing.
+            let optimal = gt.version == crate::navmesh::GROUND_TURN_OPTIMAL_VERSION;
             cmd = Some(if on_ground {
                 if generic.jump {
-                    crate::navmesh::ground_turn_launch_cmd(v_xy, bearing, &gt, env.accel, env.maxspeed, env.dt)
+                    let launch_bearing = if optimal { gt.launch_yaw } else { bearing };
+                    crate::navmesh::ground_turn_launch_cmd(v_xy, launch_bearing, &gt, env.accel, env.maxspeed, env.dt)
+                } else if optimal {
+                    crate::navmesh::ground_turn_ground_cmd_optimal(v_xy, &gt, env.accel, env.maxspeed, env.dt)
                 } else {
                     bot.bhop.ground_turn_ground_cmd(origin, v_xy, takeoff, &gt, env.accel, env.maxspeed, env.dt)
                 }
