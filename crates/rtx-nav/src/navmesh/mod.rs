@@ -122,7 +122,7 @@ const RJ_MAX_PER_CELL: usize = 2;
 pub const GRID: f32 = 32.0;
 /// Player hull half-width (the QW player box is ±16 in X/Y). Used to grow obstacles by the agent
 /// radius so a bot doesn't clip geometry its path's centre-line technically clears.
-const PLAYER_HALF_WIDTH: f32 = 16.0;
+pub(crate) const PLAYER_HALF_WIDTH: f32 = 16.0;
 /// Vertical sweep step when scanning a column for floors (refined by bisection after).
 const SCAN_DZ: f32 = 8.0;
 /// Spacing of the floor-continuity samples along a grounded link (see [`geom::ground_along`]).
@@ -3083,6 +3083,8 @@ mod tests {
         let gate = g.gates.push(Gate {
             obstruction: 0,
             closed_origin: g.cells[2].origin,
+            closed_min: Vec3::ZERO,
+            closed_max: Vec3::ZERO,
             activator: 0,
             button_cell: 0,
             aim: g.cells[0].origin,

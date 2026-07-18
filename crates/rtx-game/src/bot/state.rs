@@ -74,6 +74,11 @@ pub struct BotState {
     pub vigil: Vigil,
     /// Plat standoff — the lift we're holding off from while it's raised. See [`PlatWait`].
     pub plat_wait: Option<PlatWait>,
+    /// Near-field steering grid (see [`crate::nearfield`]): an 8u clearance field around the bot for
+    /// last-metre wall/ledge repulsion, rebuilt lazily when the bot strays off it or a nearby door
+    /// changes state (`None` until first built, or when `rtx_bot_nearfield` is off). Off the routing
+    /// path entirely — it only reshapes the immediate wish on grounded walk/step/approach legs.
+    pub near: Option<crate::nearfield::NearField>,
     /// Grappling-hook traversal state machine (see [`HookState`]), driven when the current route leg
     /// is a [`LinkKind::Hook`](crate::navmesh::LinkKind::Hook).
     pub hook: HookState,

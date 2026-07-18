@@ -129,6 +129,19 @@ const TURN_SLOW_COS: f32 = 0.5;
 /// the inner edge of an open-cored spiral without pinning it to the outer wall or stalling progress.
 const EDGE_BIAS_WEIGHT: f32 = 0.6;
 
+/// Near-field glide (see [`steer`] / [`crate::nearfield`]): how far down the corridor the look-ahead
+/// chord reaches when the near-field certifies it clear, and the wall/drop clearance it demands (a
+/// body half-width). 96u ≈ three cells of straightening — enough to erase the grid's constant 45°
+/// zigzag on a plain walk without cutting a real corner (the chord must stay on clear floor).
+const NEAR_GLIDE_AHEAD: f32 = 96.0;
+const NEAR_GLIDE_MARGIN: f32 = 16.0;
+
+/// How hard the near-field bends a fast bot's *hop/zigzag* bearing off a drop edge or wall beside the
+/// path (see [`steer`]). Firmer than the walking [`EDGE_BIAS_WEIGHT`] — a bot moving at hop speed needs
+/// a stronger correction to hold a narrow line (a staircase, a catwalk) instead of weaving off it
+/// toward the raw xy goal. Inert on open ground, where the near-field push is zero.
+const NEARFIELD_BHOP_WEIGHT: f32 = 1.0;
+
 /// Outcome of a ballistic-phase landing check, shared by the hook and rocket-jump drivers: both fly
 /// a frictionless arc that matches their solve, so the only questions are whether we've touched down
 /// and whether we overran the predicted airtime without a clean landing.

@@ -61,10 +61,10 @@ mod triggers;
 mod weapons;
 mod world;
 
-// The BSP parser, navmesh, and hazard classifier live in the shared `rtx-nav` crate; re-export
-// them under their old module paths so game code keeps referring to `crate::bsp` / `crate::navmesh`
-// / `crate::hazard` unchanged.
-pub(crate) use rtx_nav::{bsp, hazard, navmesh};
+// The BSP parser, navmesh, hazard classifier, and near-field steering grid live in the shared
+// `rtx-nav` crate; re-export them under their old module paths so game code keeps referring to
+// `crate::bsp` / `crate::navmesh` / `crate::hazard` / `crate::nearfield` unchanged.
+pub(crate) use rtx_nav::{bsp, hazard, navmesh, nearfield};
 
 use game::GameState;
 use game_command::GameCommand;

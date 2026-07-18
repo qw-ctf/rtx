@@ -11,6 +11,7 @@ pub mod bsp;
 pub mod hazard;
 pub mod math;
 pub mod navmesh;
+pub mod nearfield;
 pub mod pmove;
 pub mod qphys;
 pub mod strafe;

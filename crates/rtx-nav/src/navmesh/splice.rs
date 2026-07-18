@@ -45,6 +45,11 @@ pub struct TeleportInfo {
 pub struct Gate {
     pub obstruction: u32,
     pub closed_origin: Vec3,
+    /// The obstruction's world AABB while shut — carried so the near-field steering grid can stamp a
+    /// closed door's volume unwalkable (the world clip hull can't see inline-model doors). Same box
+    /// the link-gating intersection test uses in [`NavGraph::add_gates`].
+    pub closed_min: Vec3,
+    pub closed_max: Vec3,
     /// The activator entity (button or shootable trigger), to read its cooldown/`takedamage`
     /// state — a re-triggerable activator goes dead for a while after each use.
     pub activator: u32,
@@ -363,6 +368,8 @@ impl NavGraph {
             let idx = self.gates.push(Gate {
                 obstruction: gi.obstruction,
                 closed_origin: gi.closed_origin,
+                closed_min: gi.closed_min,
+                closed_max: gi.closed_max,
                 activator: gi.activator,
                 button_cell,
                 aim: gi.button,

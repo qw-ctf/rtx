@@ -21,6 +21,7 @@ use crate::defs::{Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JU
 use crate::game::cstring;
 use crate::nav_build::PlatStatus;
 use crate::navmesh::{CellId, Corridor, LinkCosts, LinkKind, NavGraph};
+use crate::nearfield;
 
 /// The all-`Copy` frame snapshot `steer` reads: the [`Sense`] and [`Objective`] this frame, the
 /// per-bot A* costs, and the live gate/plat state gathered before the borrow (see `run_bot`).
@@ -75,6 +76,21 @@ fn windowed_route(graph: &NavGraph, from: CellId, target: CellId, costs: &LinkCo
         return graph.find_path(from, target, costs).unwrap_or_default();
     }
     r
+}
+
+/// The closed gates whose shut volume sits near `origin` — the near-field's invalidation key (each a
+/// bit) and, when it rebuilds, the door boxes it stamps unwalkable. A door opening/shutting nearby
+/// flips a bit and forces a rebuild; the radius carries a recenter's slack so a bit stays stable under
+/// sub-recenter movement (no per-frame churn). Gate ids are single-digit, so `1 << gi` fits a `u32`.
+fn nearfield_gates<'a>(graph: &'a NavGraph, gate_closed: &'a [bool], origin: Vec3) -> impl Iterator<Item = usize> + 'a {
+    let reach = nearfield::NEAR_HALF + nearfield::NEAR_RECENTER;
+    (0..graph.gate_count()).filter(move |&gi| {
+        gate_closed.get(gi).copied().unwrap_or(false) && {
+            let g = graph.gate(gi);
+            let nearest = origin.xy().clamp(g.closed_min.xy(), g.closed_max.xy());
+            (nearest - origin.xy()).length() <= reach
+        }
+    })
 }
 
 pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> SteerOut {
@@ -721,6 +737,32 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         }
     };
 
+    // Near-field ensure (see [`crate::nearfield`]): build/refresh the fine 8u clearance grid whenever
+    // the bot is doing GROUNDED locomotion on a walk/step/approach leg — walking, zigzagging, OR
+    // bhopping over ground — so the *fast-movement* hop bearing below can be steered clear of drop
+    // edges and walls, not just the slow walk. Excluded on a committed ballistic arc (speed/rocket
+    // jump, hook, launched air-commit), where the flight must commit to its landing and must not be
+    // nudged. Built on grounded frames (the seed needs footing); the cache survives the brief airborne
+    // phase of a hop (which rises well under the recenter height), so the bearing stays aware mid-hop.
+    // The slow-walk edge margin below re-reads this same grid.
+    let nf_locomotion = !on_air
+        && !sj_active
+        && !hook_active
+        && !rj_active
+        && matches!(kind, Some(LinkKind::Walk | LinkKind::Step) | None);
+    let nf_active = nf_locomotion && host.cvar_bool(c"rtx_bot_nearfield");
+    if nf_active && on_ground {
+        if let Some(bsp) = bsp {
+            let key = nearfield_gates(graph, gate_closed, origin).fold(0u32, |k, gi| k | (1u32 << gi.min(31)));
+            if bot.near.as_ref().is_none_or(|nf| !nf.valid_for(origin, key)) {
+                let boxes: Vec<(Vec3, Vec3)> = nearfield_gates(graph, gate_closed, origin)
+                    .map(|gi| { let g = graph.gate(gi); (g.closed_min, g.closed_max) })
+                    .collect();
+                bot.near = Some(nearfield::NearField::build(&|p| bsp.is_solid(p), origin, &boxes, key));
+            }
+        }
+    }
+
     // Drive the hop-cycle controller (see `bhop::Bhop`). On a speed jump the runway is the
     // run-up to the takeoff edge and the bearing aims straight at the landing so the leap goes
     // across the gap; otherwise steer toward the look-ahead corridor point (smoother than the 32u
@@ -761,6 +803,18 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         };
         let to_wp = waypoint.xy() - origin.xy();
         let dir = if ahead.length() > 8.0 { ahead } else { to_wp };
+        // Near-field-aware hop bearing: bend the heading off nearby drop edges and walls so a fast bot
+        // (bhop or zigzag) holds the walkable line — e.g. tracking up a staircase — instead of weaving
+        // straight off the edge toward the raw xy goal. `nf_active` already excludes committed jumps,
+        // and a speed jump takes the `sj_active` branch above (so a gap leap still commits to its
+        // landing). Inert on open ground, where the near-field push is zero.
+        let dir = match bot.near.as_ref().filter(|_| nf_active).and_then(|nf| nf.steer_push(origin)) {
+            Some(push) => {
+                let bent = dir.normalize_or_zero() + push.xy() * NEARFIELD_BHOP_WEIGHT;
+                if bent.length() > 1e-3 { bent * dir.length() } else { dir }
+            }
+            None => dir,
+        };
         let bearing = yaw_of(dir);
         let bhop_runway = match (sj_takeoff, sj_progress) {
             // Curl: signed along-corridor distance to the takeoff (past-lip goes negative → leap).
@@ -981,35 +1035,65 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             1.0
         }
     };
-    // Edge margin: on a grounded Walk/Step leg, steer away from a one-sided drop beside the line of
-    // travel — the inner edge of an open-cored spiral, a catwalk lip — instead of drifting off it while
-    // homing on the next cell centre (which sits on the grid, up to a hull-width from the true edge).
-    // Probed along actual velocity when we're moving, else the waypoint bearing. Self-cancelling on
-    // open floor and on a thin beam with drops both sides (there it holds the centre). Off while
-    // airborne / bhopping / speed-/rocket-jumping / hooking, so bhop and jump arcs are untouched.
-    let edge_push = if on_ground
+    // Edge margin: on a grounded walk/step (or final-approach) leg while NOT bhopping, steer the
+    // slow-walk wish away from a wall or drop beside the line of travel — the inner edge of an
+    // open-cored spiral, a catwalk lip, a doorframe — instead of drifting into it while homing on the
+    // next cell centre (which sits on the grid, up to a hull-width from the true edge). Bhop's own
+    // bearing was made near-field-aware above, so this stays gated to the non-bhop walk.
+    //
+    // With `rtx_bot_nearfield` on, this reads the fine (8u) near-field clearance grid ensured before
+    // the bhop block (see `nearfield`): wall-aware, self-cancelling through doorways/thin beams. When
+    // the grid is off, absent, or the bot's been shoved off its own field, it falls back to the
+    // drop-only `hazard::edge_bias` probe (Walk/Step only, as before — a final-approach `None` leg got
+    // no push in that path historically).
+    let nf_ground = on_ground
         && !on_air
         && bot.bhop.phase == bhop::Phase::Off
         && !bhop_active
         && !sj_active
         && !hook_engaged
         && !rj_engaged
-        && matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
-        && dist > ARRIVE_RADIUS
-    {
-        bsp.map_or(Vec3::ZERO, |bsp| {
-            let feet = origin - Vec3::new(0.0, 0.0, ORIGIN_TO_FEET);
-            let travel = if speed > 40.0 { v_xy.normalize_or_zero() } else { to_wp.normalize_or_zero() };
-            crate::hazard::edge_bias(&|p| bsp.is_solid(p), feet, Vec3::new(travel.x, travel.y, 0.0))
+        && dist > ARRIVE_RADIUS;
+    let edge_push = if nf_ground {
+        let near_push = nf_active.then(|| bot.near.as_ref()?.steer_push(origin)).flatten();
+        near_push.unwrap_or_else(|| {
+            // No field → today's drop-only probe, which only runs on a real Walk/Step leg.
+            if matches!(kind, Some(LinkKind::Walk | LinkKind::Step)) {
+                bsp.map_or(Vec3::ZERO, |bsp| {
+                    let feet = origin - Vec3::new(0.0, 0.0, ORIGIN_TO_FEET);
+                    let travel = if speed > 40.0 { v_xy.normalize_or_zero() } else { to_wp.normalize_or_zero() };
+                    crate::hazard::edge_bias(&|p| bsp.is_solid(p), feet, Vec3::new(travel.x, travel.y, 0.0))
+                })
+            } else {
+                Vec3::ZERO
+            }
         })
     } else {
         Vec3::ZERO
     };
 
+    // Glide look-ahead: on a grounded walk/step leg, if the near-field certifies a straight chord to a
+    // point ~96u down the corridor stays on clear floor, aim the feet at *that* instead of the raw 32u
+    // next cell — straightening the grid's constant 45° zigzag. Everything else still keys on the raw
+    // waypoint (leg advancement, `wish_scale`, the magnet, the watchdogs): the chord follows the leg
+    // polyline, so it passes within `ARRIVE_RADIUS` of each cell centre, exactly the magnet's argument.
+    // Off on the final approach (home straight on the target) and whenever the chord isn't clear.
+    let heading = {
+        let want_glide = nf_ground
+            && nf_active
+            && host.cvar_bool(c"rtx_bot_glide")
+            && matches!(kind, Some(LinkKind::Walk | LinkKind::Step));
+        let glide = want_glide.then_some(bot.near.as_ref()).flatten().and_then(|nf| {
+            let g = corridor_point(graph, &bot.route, bot.route_pos, origin, NEAR_GLIDE_AHEAD);
+            nf.chord_clear(origin, g, NEAR_GLIDE_MARGIN).then_some(g)
+        });
+        glide.map_or(to_wp, |g| g.xy() - origin.xy())
+    };
+
     let close_enough = final_leg && polite && dist <= POLITE_DIST;
     if !close_enough {
         let (fwd, right, _) = angle_vectors(angles);
-        let dir = (Vec3::new(to_wp.x, to_wp.y, 0.0).normalize_or_zero() + edge_push * EDGE_BIAS_WEIGHT).normalize_or_zero();
+        let dir = (Vec3::new(heading.x, heading.y, 0.0).normalize_or_zero() + edge_push * EDGE_BIAS_WEIGHT).normalize_or_zero();
         forward = (fwd.dot(dir) * MOVE_SPEED * wish_scale) as i32;
         side = (right.dot(dir) * MOVE_SPEED * wish_scale) as i32;
     }

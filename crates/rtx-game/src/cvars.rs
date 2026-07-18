@@ -68,6 +68,15 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // stronghold/rocka/ultrav 6 bots stay under the frame budget, behaviour parity incl. the ultrav
         // gated quad). Escape hatch: 0 → the exact whole-graph floods + unwindowed steer.
         ("rtx_bot_lod", Bool(true)),
+        // Steer the last metre off a fine (8u) near-field clearance grid built around each grounded bot
+        // (see `nearfield`): the wish is nudged off nearby walls and drop-edges and centres through
+        // doorways, instead of homing on the raw 32u cell centre. Off the routing path — only the
+        // immediate wish changes. On by default; 0 → today's `hazard::edge_bias` drop-only probe.
+        ("rtx_bot_nearfield", Bool(true)),
+        // Sub-toggle of `rtx_bot_nearfield`: when the near-field certifies a straight look-ahead chord
+        // is clear, glide toward it instead of the next 32u cell centre (smooths the residual grid
+        // zigzag on plain walk legs). On by default; inert when `rtx_bot_nearfield` is 0.
+        ("rtx_bot_glide", Bool(true)),
         // A bot's health weights how willing it is to shortcut through lava/slime: hurt bots detour,
         // healthy (or armored, or biosuited) ones clip the corner. `0` prices every bot as a bare
         // spawn — hazards still cost, but the same to everyone. See `bot::bot_hazard_strength`.
