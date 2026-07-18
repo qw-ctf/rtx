@@ -825,6 +825,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         // ahead (clamped 96–448u) so a fast bot's bearing anticipates the corridor far enough to
         // start curving, rather than chasing the fixed ~2-legs `look_point` it has already overrun.
         let bhop_look = corridor_point(graph, &bot.route, bot.route_pos, origin, (speed * 0.6).clamp(96.0, 448.0));
+        let to_wp = waypoint.xy() - origin.xy();
         let ahead = match race_line_ahead {
             Some(lp) if !sj_active => lp.xy() - origin.xy(),
             // On a speed jump the run-up aims at the *takeoff* (follow the corridor to the lip), and
@@ -843,9 +844,22 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 };
                 aim.xy() - origin.xy()
             }
-            _ => bhop_look.xy() - origin.xy(),
+            // Normal corridor follow: aim at the speed-scaled look-ahead — but only while the straight
+            // line to it stays on near-field-clear floor. On a wall-hugging spiral staircase the far
+            // look-ahead wraps around the inner curve, so the chord to it cuts across the open centre;
+            // certifying it (as the slow walk-glide path does) and otherwise dropping back to the near
+            // waypoint keeps the fast bot on its current flight instead of steering off the inner edge.
+            // Past the grid the chord passes — the route out there is trusted; the veto fires only on a
+            // drop the near-field actually sees, so open corridors keep the full anticipatory look-ahead.
+            _ => {
+                let look_clear = bot
+                    .near
+                    .as_ref()
+                    .filter(|_| nf_active)
+                    .is_none_or(|nf| nf.chord_open(origin, bhop_look));
+                if look_clear { bhop_look.xy() - origin.xy() } else { to_wp }
+            }
         };
-        let to_wp = waypoint.xy() - origin.xy();
         let dir = if ahead.length() > 8.0 { ahead } else { to_wp };
         // Near-field-aware hop bearing: bend the heading off nearby drop edges and walls so a fast bot
         // (bhop or zigzag) holds the walkable line — e.g. tracking up a staircase — instead of weaving

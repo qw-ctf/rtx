@@ -252,6 +252,26 @@ impl NearField {
         })
     }
 
+    /// Whether the straight chord `a`→`b` runs over walkable floor for as far as the grid has actually
+    /// flooded: a wall/drop/hazard column on the line vetoes it, while reaching the flood frontier (an
+    /// `Unknown` column, or off the footprint) stops the scan and passes — the route out there is
+    /// trusted. Unlike [`chord_clear`], which needs the *whole* chord certified in-footprint (with a
+    /// margin), this trims at the frontier and checks only the centre line, so the long bhop look-ahead
+    /// keeps its far anticipation on open ground (the frontier passes) yet is vetoed the instant a near
+    /// drop — a spiral staircase's open centre — lies across the line.
+    pub fn chord_open(&self, a: Vec3, b: Vec3) -> bool {
+        let steps = ((b.xy() - a.xy()).length() / NEAR_RES).ceil().max(1.0) as i32;
+        for i in 0..=steps {
+            let p = a.lerp(b, i as f32 / steps as f32);
+            match self.col_at(p) {
+                Some(Col::Walk(_)) => {}                   // on floor — keep scanning
+                None | Some(Col::Unknown) => return true,  // flood frontier — trust the route beyond it
+                Some(_) => return false,                   // a wall / drop / hazard lies across the line
+            }
+        }
+        true
+    }
+
     /// Whether no wall/drop column lies within `margin` of `p` (a small box scan around `p`).
     fn clear_by(&self, p: Vec3, margin: f32) -> bool {
         let cells = (margin / NEAR_RES).ceil() as i32;
@@ -387,6 +407,22 @@ mod tests {
         let nf = build(&solid);
         let push = nf.steer_push(EYE).expect("walkable");
         assert!(push.y > 0.3, "should steer +y off the −y drop: {push:?}");
+    }
+
+    #[test]
+    fn chord_open_vetoes_a_line_across_a_drop_but_trusts_the_frontier() {
+        // A ledge: floor for y ≥ -16, an open drop beyond it (a spiral flight's inner edge).
+        let solid = |p: Vec3| p.y >= -16.0 && p.z <= 0.0;
+        let nf = build(&solid);
+        // Along the ledge → open (the fast bearing keeps its look-ahead).
+        assert!(nf.chord_open(EYE, Vec3::new(64.0, 0.0, 1.0)), "a chord along the ledge is open");
+        // Angling across the drop → vetoed (the spiral look-ahead that cuts the inner corner off the edge).
+        assert!(!nf.chord_open(EYE, Vec3::new(48.0, -80.0, 1.0)), "a chord across the drop is vetoed");
+        // A long open-floor look-ahead reaches the flood frontier still clear and passes — the route
+        // beyond the grid is trusted, so open corridors keep their far anticipation (no false cap).
+        assert!(nf.chord_open(EYE, Vec3::new(400.0, 0.0, 1.0)), "an open chord past the flood frontier passes");
+        // Contrast: `chord_clear` rejects that same long chord for leaving the certified footprint.
+        assert!(!nf.chord_clear(EYE, Vec3::new(400.0, 0.0, 1.0), 8.0), "chord_clear needs the whole chord in-footprint");
     }
 
     #[test]
