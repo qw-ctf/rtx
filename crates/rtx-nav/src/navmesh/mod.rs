@@ -1228,6 +1228,16 @@ impl NavGraph {
             .collect()
     }
 
+    /// The nearest cell an item at `p` is actually **collectable from**: within a wide XY reach but only
+    /// `48` vertically — mirroring the game's `on_item` pickup Z gate — so a thin ledge or pedestal item
+    /// resolves to a cell *on* its shelf, never a floor cell a storey below it. Item goals resolve
+    /// through this (the caller falls back to [`nearest`](Self::nearest) if nothing is close enough), so
+    /// a bot never parks under an item it can't reach waiting for it — and the true route (a rocket jump
+    /// up, say) gets its real pricing.
+    pub fn nearest_collectable(&self, p: Vec3) -> Option<CellId> {
+        self.nearest_within(p, GRID * 5.0, 48.0)
+    }
+
     /// Nearest cell to `p` within `horiz` XY and `vert` Z of it, by 3D distance.
     fn nearest_within(&self, p: Vec3, horiz: f32, vert: f32) -> Option<CellId> {
         let (gx, gy) = (floor_grid(p.x), floor_grid(p.y));

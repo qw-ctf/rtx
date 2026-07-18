@@ -285,7 +285,13 @@ impl GameState {
                 if i == 0 || !ent.in_use || !bot_goals::is_goal_classname(cn) {
                     return None;
                 }
-                Some((i as u32, graph.nearest(ent.v.origin)?))
+                // Resolve to a cell the item is collectable *from* (Z-aware), not merely the nearest
+                // floor — a ledge/pedestal item must not alias to the ground under it, or a bot parks
+                // beneath it forever. Fall back to the plain nearest when no cell is close enough
+                // (better an imperfect goal than a silently dropped item; the runtime `gdz` telemetry
+                // surfaces any residual aliasing).
+                let cell = graph.nearest_collectable(ent.v.origin).or_else(|| graph.nearest(ent.v.origin))?;
+                Some((i as u32, cell))
             })
             .collect()
     }
