@@ -3046,6 +3046,54 @@ mod tests {
         }
     }
 
+    /// A directed cluster pair whose *cheapest* crossing is a shut gate but which also has a pricier
+    /// gate-free crossing: keeping a gate-free representative lets the coarse cost route around the shut
+    /// door, so a prize past the gate-free crossing reads reachable (below the closed-gate wall) exactly
+    /// as the exact flood does — the very input the openable-gate valuation reads. Without the second
+    /// rep the strictly-cheaper gated crossing evicts the gate-free one and the prize reads sealed.
+    #[test]
+    fn coarse_routes_around_a_shut_gate_via_a_gate_free_crossing() {
+        let at = |gx: i32, gy: i32| Cell { origin: Vec3::new(gx as f32 * 32.0, gy as f32 * 32.0, 0.0), gx, gy };
+        // Cluster A = block (0,0): cells 0,1. Cluster B = block (1,0): cells 2,3.
+        let cells = vec![at(0, 0), at(1, 0), at(8, 0), at(15, 7)];
+        let links = vec![
+            reach_link(0, 1),
+            reach_link(1, 0),
+            reach_link(2, 3), // B intra
+            reach_link(3, 2),
+            Link { from: 1, to: 2, kind: LinkKind::Walk, cost: 1.0 }, // cheap crossing (gated below)
+            Link { from: 1, to: 3, kind: LinkKind::Walk, cost: 3.0 }, // pricier gate-free crossing
+        ];
+        let mut g = NavGraph::test_graph(cells, links);
+        // Tag the cheap 1→2 crossing (link 4) as gated directly — `add_gates` needs a grid index the
+        // bare test graph lacks, and this test exercises the coarse router, not the geometry splice.
+        let gate = g.gates.push(Gate {
+            obstruction: 0,
+            closed_origin: g.cells[2].origin,
+            activator: 0,
+            button_cell: 0,
+            aim: g.cells[0].origin,
+            shoot: false,
+        });
+        g.gates.tag(4, gate);
+        assert_eq!(g.gate_count(), 1, "gate registered");
+        assert_eq!(g.gate_of_link(4), Some(0), "the cheap 1→2 crossing is gated");
+        assert_eq!(g.gate_of_link(5), None, "the pricier 1→3 crossing is gate-free");
+        g.build_reachability();
+        g.build_lod();
+
+        let shut = LinkCosts { gate_closed: &[true], ..Default::default() };
+        // Cell 3 is reachable gate-free (0→1→3, cost 1+3): coarse must price it below the closed wall,
+        // not seal it at ~100k behind the cheaper gated crossing.
+        let c3 = g.coarse_costs(0, &shut, true).cost_to(3);
+        assert!(c3 < CLOSED_GATE_PENALTY, "cell 3 must route around the shut gate, got {c3}");
+        assert!((c3 - 4.0).abs() < 1e-3, "cell 3's gate-free coarse cost should be 4, got {c3}");
+        // With the gate open the cheaper crossing (0→1→2→3 = 1+1+1) wins again — both reps are present,
+        // so the gate-free alternate never costs when the door is open.
+        let c3_open = g.coarse_costs(0, &LinkCosts::default(), true).cost_to(3);
+        assert!((c3_open - 3.0).abs() < 1e-3, "gate open: cheapest route to cell 3 is 3, got {c3_open}");
+    }
+
     /// The LOD steer corridor plants its interim short of a far goal (bounding the fine search) but
     /// steers a near goal directly; its window contains a route the restricted search actually finds.
     #[test]

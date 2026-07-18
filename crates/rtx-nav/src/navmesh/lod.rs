@@ -25,14 +25,18 @@ use super::{hazard_cost, CellId, LinkCosts, LinkKind, NavGraph, CLOSED_GATE_PENA
 const LOD_SHIFT: i32 = 3;
 
 /// A min-heap entry with a NaN-free f32 key (mirrors `query::MinCost`): `BinaryHeap` is a max-heap, so
-/// `Ord` reverses the key and the smallest pops first. `id` is a cell or an abstract-portal index.
+/// `Ord` reverses the key and the smallest pops first. `id` is a cell or an abstract-portal index, and
+/// it also breaks key ties so the settle order is deterministic — otherwise two abstract paths of equal
+/// cost would resolve by heap-internal order (seeded from a `HashMap`'s per-process iteration), and the
+/// corridor's `parent` chain (hence its interim/window/crossed gates) could differ between the server
+/// and netclient brains that must drive the same run, or between consecutive identical-state repaths.
 struct MinNode {
     key: f32,
     id: u32,
 }
 impl PartialEq for MinNode {
     fn eq(&self, o: &Self) -> bool {
-        self.key == o.key
+        self.key == o.key && self.id == o.id
     }
 }
 impl Eq for MinNode {}
@@ -43,7 +47,7 @@ impl PartialOrd for MinNode {
 }
 impl Ord for MinNode {
     fn cmp(&self, o: &Self) -> std::cmp::Ordering {
-        o.key.partial_cmp(&self.key).unwrap_or(std::cmp::Ordering::Equal)
+        o.key.partial_cmp(&self.key).unwrap_or(std::cmp::Ordering::Equal).then(o.id.cmp(&self.id))
     }
 }
 
@@ -184,38 +188,43 @@ impl NavGraph {
         }
         let (cluster_of, cluster_count) = self.cluster_cells();
 
-        // Kept crossings — the cross-cluster links promoted to abstract edges. One representative per
-        // directed cluster pair (a wide border must not become dozens of parallel portals, or the
-        // intra-cluster all-pairs transit explodes to a graph larger than the fine one; the coverage
-        // pass below adds back any crossing a rep fails to cover). Chosen by cheapest, then *gate-free*
-        // (so the abstract graph carries an open route between clusters where one exists, and a shut
-        // door doesn't wrongly seal the pair), then lowest index (deterministic).
+        // Kept crossings — the cross-cluster links promoted to abstract edges. Up to two representatives
+        // per directed cluster pair: the cheapest crossing, and — when that one is gated — the cheapest
+        // *gate-free* crossing, if the pair has one. A wide border must not become dozens of parallel
+        // portals (the intra-cluster all-pairs transit would explode to a graph larger than the fine
+        // one), but keeping the gate-free alternate is what lets the abstract graph express "there is an
+        // open way between these clusters" even when the single cheapest crossing is a shut door:
+        // `cost_to` then routes around a closed gate wherever a fine gate-free route exists, so the
+        // openable-gate valuation (a prize behind an openable door) matches the exact flood instead of
+        // pricing the prize as a sealed ~100k wall. Just preferring gate-free *at equal cost* wouldn't
+        // do it — a strictly-cheaper gated crossing would still evict the gate-free one and seal the
+        // pair. The coverage pass below adds back any landing neither rep covers.
         let mut rep: HashMap<(u32, u32), u32> = HashMap::new();
+        let mut rep_free: HashMap<(u32, u32), u32> = HashMap::new();
         for li in 0..self.links.len() as u32 {
             let link = self.links[li as usize];
             let key = (cluster_of[link.from as usize], cluster_of[link.to as usize]);
             if key.0 == key.1 {
                 continue;
             }
-            let better = match rep.get(&key) {
+            // Cheapest, then lowest index (deterministic).
+            let cheaper = |cur: Option<&u32>| match cur {
                 None => true,
                 Some(&best) => {
                     let best_cost = self.links[best as usize].cost;
-                    if link.cost != best_cost {
-                        link.cost < best_cost
-                    } else if self.gate_of_link(li).is_some() != self.gate_of_link(best).is_some() {
-                        self.gate_of_link(li).is_none() // prefer the gate-free crossing at equal cost
-                    } else {
-                        li < best
-                    }
+                    if link.cost != best_cost { link.cost < best_cost } else { li < best }
                 }
             };
-            if better {
+            if cheaper(rep.get(&key)) {
                 rep.insert(key, li);
             }
+            if self.gate_of_link(li).is_none() && cheaper(rep_free.get(&key)) {
+                rep_free.insert(key, li); // cheapest gate-free crossing of this pair (may equal `rep`)
+            }
         }
-        let mut kept: Vec<u32> = rep.values().copied().collect();
+        let mut kept: Vec<u32> = rep.values().chain(rep_free.values()).copied().collect();
         kept.sort_unstable();
+        kept.dedup();
 
         let mut lod = self.build_lod_tables(&cluster_of, cluster_count, &kept);
 
@@ -511,7 +520,7 @@ impl NavGraph {
                 continue;
             }
             for e in &lod.abs_adj[p as usize] {
-                let ng = g + e.base + self.price_meta(e.gates, e.rj, e.chained, e.hazard_hp, costs, sever_chained);
+                let ng = g + e.base + self.price_meta(e.gates, e.rj, e.chained, e.hazard_hp, costs, sever_chained, e.link);
                 if ng < abs_cost[e.to as usize] {
                     abs_cost[e.to as usize] = ng;
                     heap.push(MinNode { key: ng, id: e.to });
@@ -551,12 +560,29 @@ impl NavGraph {
                 heap.push(MinNode { key: seed, id: p as u32 });
             }
         }
+        // The goal cluster's entry portals: once every one is settled its coarse cost is final (Dijkstra
+        // order), so the search can stop there instead of draining every portal on the map. Unreachable
+        // entry portals never settle, so a truly unreachable goal falls through to a full drain (then
+        // `goal_portal` is `None` below) — same result as before, only the reachable common case is cut.
+        let mut goal_pending = vec![false; np];
+        let mut remaining = 0u32;
+        for r in &lod.cell_reach[goal as usize] {
+            if !std::mem::replace(&mut goal_pending[r.portal as usize], true) {
+                remaining += 1;
+            }
+        }
         while let Some(MinNode { key: g, id: p }) = heap.pop() {
             if g > abs_cost[p as usize] {
                 continue;
             }
+            if std::mem::replace(&mut goal_pending[p as usize], false) {
+                remaining -= 1;
+                if remaining == 0 {
+                    break; // every entry portal of the goal cluster is settled — the rest can't help
+                }
+            }
             for e in &lod.abs_adj[p as usize] {
-                let ng = g + e.base + self.price_meta(e.gates, e.rj, e.chained, e.hazard_hp, costs, false);
+                let ng = g + e.base + self.price_meta(e.gates, e.rj, e.chained, e.hazard_hp, costs, false, e.link);
                 if ng < abs_cost[e.to as usize] {
                     abs_cost[e.to as usize] = ng;
                     parent[e.to as usize] = p;
@@ -565,15 +591,23 @@ impl NavGraph {
                 }
             }
         }
-        // The cheapest entry portal of the goal's cluster (coarse cost into the cluster + the in-cluster
-        // hop to the goal). If the whole thing is within `horizon` the goal is near — steer it directly.
+        // The cheapest entry portal of the goal's cluster: coarse cost into the cluster plus the priced
+        // in-cluster hop to the goal — the *same* sum `CoarseCosts::cost_to` forms, so the horizon test
+        // agrees with goal scoring. (Pricing the final hop matters: a goal whose last in-cluster hop
+        // crosses a shut gate must read far, not near, or the corridor returns `None` and steer runs an
+        // unbounded whole-graph search at a 100k-penalized goal — the very spike the corridor bounds.)
         let mut goal_portal = None;
         let mut goal_cost = f32::INFINITY;
+        let mut goal_gates = 0u32;
         for r in &lod.cell_reach[goal as usize] {
             let via = abs_cost[r.portal as usize];
-            if via.is_finite() && via + r.dist < goal_cost {
-                goal_cost = via + r.dist;
-                goal_portal = Some(r.portal);
+            if via.is_finite() {
+                let c = via + r.dist + self.price_meta(r.gates, r.rj, r.chained, r.hazard_hp, costs, false, u32::MAX);
+                if c < goal_cost {
+                    goal_cost = c;
+                    goal_portal = Some(r.portal);
+                    goal_gates = r.gates;
+                }
             }
         }
         let goal_portal = goal_portal?;
@@ -598,7 +632,11 @@ impl NavGraph {
                 break;
             }
         }
-        Some(Corridor { interim: lod.portals[interim as usize].cell, allowed, crossed_gates: pgate[goal_portal as usize] })
+        Some(Corridor {
+            interim: lod.portals[interim as usize].cell,
+            allowed,
+            crossed_gates: pgate[goal_portal as usize] | goal_gates,
+        })
     }
 
     /// Priced Dijkstra from `from` restricted to cluster `cl`, returning the exact priced cost to every
@@ -631,24 +669,31 @@ impl NavGraph {
     }
 
     /// Price the dynamic terms an abstract edge carries: closed gates (openable ones at the errand
-    /// price), the per-bot rocket-jump-unfit surcharge, and — in scoring mode — a chained speed jump.
-    /// Mirrors the terms `link_extra`/`chained_block` add per fine link.
-    fn price_meta(&self, gates: u32, rj: u8, chained: bool, hazard_hp: f32, costs: &LinkCosts, sever_chained: bool) -> f32 {
+    /// price), the per-bot rocket-jump-unfit surcharge, — in scoring mode — a chained speed jump, and
+    /// (for a crossing edge, whose representative fine link is `link`) that link's transient per-bot
+    /// surcharge. Mirrors the terms `link_extra`/`chained_block` add per fine link. `link` is `u32::MAX`
+    /// for a transit/reach hop (a multi-link intra path with no single representative); its interior
+    /// links' surcharges are the accepted near-field gap — those legs sit in or near the home cluster,
+    /// which the exact `home_flood` already prices in full.
+    fn price_meta(&self, gates: u32, rj: u8, chained: bool, hazard_hp: f32, costs: &LinkCosts, sever_chained: bool, link: u32) -> f32 {
         let mut extra = 0.0;
-        if gates != 0 {
-            for gi in 0..self.gate_count().min(31) {
-                if gates & (1 << gi) != 0 && costs.gate_closed.get(gi).copied().unwrap_or(false) {
-                    extra += if costs.openable_gates.get(gi).copied().unwrap_or(false) {
-                        costs.open_gate_cost
-                    } else {
-                        CLOSED_GATE_PENALTY
-                    };
-                }
+        // Iterate only the gate bits actually set (single-digit gate counts, usually one), not every
+        // gate id. Bit 31 (`SEALED_GATE`) is a "gate id ≥ 31 we can't track" marker, priced as an
+        // always-shut door — a safe overestimate, never an underestimate. See [`SEALED_GATE`].
+        let mut bits = gates & !SEALED_GATE;
+        while bits != 0 {
+            let gi = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            if costs.gate_closed.get(gi).copied().unwrap_or(false) {
+                extra += if costs.openable_gates.get(gi).copied().unwrap_or(false) {
+                    costs.open_gate_cost
+                } else {
+                    CLOSED_GATE_PENALTY
+                };
             }
-            // An untracked (≥31) gate is priced as always shut — never underestimate (see SEALED_GATE).
-            if gates & SEALED_GATE != 0 {
-                extra += CLOSED_GATE_PENALTY;
-            }
+        }
+        if gates & SEALED_GATE != 0 {
+            extra += CLOSED_GATE_PENALTY;
         }
         if rj > 0 && costs.rocket_jump_extra > 0.0 {
             extra += rj as f32 * costs.rocket_jump_extra;
@@ -662,6 +707,18 @@ impl NavGraph {
         if hazard_hp > 0.0 {
             if let Some(price) = costs.hazard {
                 extra += hazard_cost(hazard_hp, price);
+            }
+        }
+        // This crossing's own transient surcharge (a recently-failed link, or a team-occupied
+        // teleport exit — always a crossing). Without it the far field would price a penalized route
+        // *cheaper* than the exact flood does, an underestimate that would call an item closer than it
+        // is. Mirrors `link_extra`'s per-link `penalties` scan.
+        if link != u32::MAX {
+            for &(li, sec) in costs.penalties {
+                if li == link {
+                    extra += sec;
+                    break;
+                }
             }
         }
         extra
@@ -716,7 +773,7 @@ impl CoarseCosts<'_> {
         for r in &lod.cell_reach[cell as usize] {
             let via = self.abs_cost[r.portal as usize];
             if via.is_finite() {
-                let c = via + r.dist + self.graph.price_meta(r.gates, r.rj, r.chained, r.hazard_hp, self.costs, self.sever_chained);
+                let c = via + r.dist + self.graph.price_meta(r.gates, r.rj, r.chained, r.hazard_hp, self.costs, self.sever_chained, u32::MAX);
                 if c < best {
                     best = c;
                 }
