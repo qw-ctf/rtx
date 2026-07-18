@@ -1026,23 +1026,25 @@ impl GameState {
             candidates.push((item, cell, desire, first_leg));
         }
 
+        // The winner is the highest `desire / (first_leg + 0.25)` that also arrives in time. That score
+        // is independent of the second leg (which only *gates*, via `arrives_in_time`), so rank by it
+        // up front and pay the expensive per-candidate second-leg flood — a whole abstract-graph
+        // Dijkstra from each candidate — only until the first survivor: that highest-ranked one is the
+        // answer. Cap the floods at `PLAN_PRIMARY_LIMIT` so a dense pickup cluster (a pile of items
+        // round the quad) can't turn one goal pick into a dozen floods (a squad-sync objective spike).
+        candidates.sort_by(|a, b| {
+            let (sa, sb) = (a.2 / (a.3 + 0.25), b.2 / (b.3 + 0.25));
+            sb.total_cmp(&sa).then_with(|| a.0 .0.cmp(&b.0 .0))
+        });
         candidates
             .into_iter()
-            .filter_map(|(item, cell, desire, first_leg)| {
+            .take(PLAN_PRIMARY_LIMIT)
+            .find_map(|(item, cell, _desire, first_leg)| {
                 let second_leg = PlanCosts::single(graph, cell, &link_costs, lod).cost_to(powerup_cell);
-                if !second_leg.is_finite()
-                    || !powerup_bridge_arrives_in_time(
-                        direct,
-                        first_leg + second_leg,
-                        respawn_wait,
-                    )
-                {
-                    return None;
-                }
-                Some((item, cell, desire / (first_leg + 0.25)))
+                (second_leg.is_finite()
+                    && powerup_bridge_arrives_in_time(direct, first_leg + second_leg, respawn_wait))
+                .then_some((item, cell))
             })
-            .max_by(|a, b| a.2.total_cmp(&b.2).then_with(|| b.0.0.cmp(&a.0.0)))
-            .map(|(item, cell, _)| (item, cell))
     }
 
     /// Strategic fight posture plus its best recovery target. Relative power uses only the shared
