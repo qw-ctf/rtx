@@ -20,7 +20,7 @@ use crate::math::{angle_vectors, angles_to, yaw_of};
 use crate::defs::{Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP};
 use crate::game::cstring;
 use crate::nav_build::PlatStatus;
-use crate::navmesh::{CellId, LinkCosts, LinkKind, NavGraph};
+use crate::navmesh::{CellId, Corridor, LinkCosts, LinkKind, NavGraph};
 
 /// The all-`Copy` frame snapshot `steer` reads: the [`Sense`] and [`Objective`] this frame, the
 /// per-bot A* costs, and the live gate/plat state gathered before the borrow (see `run_bot`).
@@ -52,6 +52,29 @@ pub(super) struct SteerOut {
     pub traversal_lock: bool,
     /// The grenade/rocket overlays may run (not hooking/rj/bhop-ing and not traversal-locked).
     pub overlays_ok: bool,
+}
+
+/// The LOD steer corridor toward `goal` — the interim search target plus its cluster window — or
+/// `None` when lod is off or the goal is near enough to steer at directly. Shared by the main repath
+/// and the one-shot gate-errand route so both bound a far target the same way.
+fn corridor_to(graph: &NavGraph, from: CellId, goal: CellId, costs: &LinkCosts, lod: bool) -> Option<Corridor> {
+    lod.then(|| graph.corridor(from, goal, costs, STEER_LOD_HORIZON)).flatten()
+}
+
+/// A plain (unbanded) route from `from` to `target`, restricted to the corridor `window` when present.
+/// The abstract corridor is a real in-window fine path, so the restricted search normally succeeds; if
+/// it somehow comes up empty it falls back to an unrestricted search to the (near) interim, bounded by
+/// its proximity. This is the one fallback ladder the main repath and the gate errand both use.
+fn windowed_route(graph: &NavGraph, from: CellId, target: CellId, costs: &LinkCosts, window: Option<&[bool]>) -> Vec<u32> {
+    let plain = match window {
+        Some(w) => graph.find_path_within(from, target, costs, w),
+        None => graph.find_path(from, target, costs),
+    };
+    let r = plain.unwrap_or_default();
+    if r.is_empty() && window.is_some() {
+        return graph.find_path(from, target, costs).unwrap_or_default();
+    }
+    r
 }
 
 pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> SteerOut {
@@ -201,9 +224,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         // route to the interim always exists in the window. The next repath advances it; `bot.goal_cell`
         // stays the true `goal`, so change detection and the gate/give-up logic are untouched. Off →
         // today's exact whole-graph search to the target.
-        let corridor = lod
-            .then(|| graph.corridor(bot_cell, target, &costs, STEER_LOD_HORIZON))
-            .flatten();
+        let corridor = corridor_to(graph, bot_cell, target, &costs, lod);
         let (search_target, window) = match &corridor {
             Some(c) => (c.interim, Some(c.allowed.as_slice())),
             None => (target, None),
@@ -218,20 +239,8 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             Some(r) => (r.links, r.bands),
             // Banded came back empty ⇒ band-infeasible (a route that only exists through a speed-jump
             // chain the carried speed can't satisfy) or bands off; the plain A* ignores bands and finds
-            // the reachable target. A windowed plain that still comes up empty (rare — the corridor is a
-            // real in-window path) falls back to an unrestricted plain to the *near* interim, bounded by
-            // its proximity.
-            None => {
-                let plain = match window {
-                    Some(w) => graph.find_path_within(bot_cell, search_target, &costs, w),
-                    None => graph.find_path(bot_cell, search_target, &costs),
-                };
-                let mut r = plain.unwrap_or_default();
-                if r.is_empty() && window.is_some() {
-                    r = graph.find_path(bot_cell, search_target, &costs).unwrap_or_default();
-                }
-                (r, Vec::new())
-            }
+            // the reachable target (windowed, with the unrestricted fallback — see [`windowed_route`]).
+            None => (windowed_route(graph, bot_cell, search_target, &costs, window), Vec::new()),
         };
         // Keep `route_bands` parallel to `route`: zero-fill when unbanded (or on any length mismatch).
         if bands.len() != route.len() {
@@ -287,17 +296,12 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 // Bound this one-shot errand route the same way the main repath does (subsequent
                 // repaths target the button as `goal` and corridor-bound it); a far button on a big
                 // map would otherwise be one unbounded whole-graph A*.
-                let corridor = lod
-                    .then(|| graph.corridor(bot_cell, button_cell, &costs, STEER_LOD_HORIZON))
-                    .flatten();
-                bot.route = match &corridor {
-                    Some(c) => graph
-                        .find_path_within(bot_cell, c.interim, &costs, &c.allowed)
-                        .filter(|r| !r.is_empty())
-                        .or_else(|| graph.find_path(bot_cell, c.interim, &costs))
-                        .unwrap_or_default(),
-                    None => graph.find_path(bot_cell, button_cell, &costs).unwrap_or_default(),
+                let corridor = corridor_to(graph, bot_cell, button_cell, &costs, lod);
+                let (search_target, window) = match &corridor {
+                    Some(c) => (c.interim, Some(c.allowed.as_slice())),
+                    None => (button_cell, None),
                 };
+                bot.route = windowed_route(graph, bot_cell, search_target, &costs, window);
                 bot.route_bands = vec![0u8; bot.route.len()]; // a walking errand, no carried speed
                 bot.route_pos = 0;
                 bot.goal_cell = Some(button_cell);
