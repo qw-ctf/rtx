@@ -103,7 +103,7 @@ const WALL_HOLD_FRAC: f32 = 0.7;
 /// carve toward the bearing (the open corridor) at the full physical turn rate.
 const WALL_PANIC_T: f32 = 0.3;
 /// Slack beyond the current hop's flight distance when deciding whether another hop fits.
-const HOP_MARGIN: f32 = 64.0;
+pub const HOP_MARGIN: f32 = 64.0;
 
 /// Minimum corridor (≈3 grid cells) to bother with a ground zigzag: too short for a hop
 /// ([`RUNWAY_ENGAGE`]) but long and straight enough to profit from the circle-strafe. The caller
@@ -111,9 +111,10 @@ const HOP_MARGIN: f32 = 64.0;
 pub const ZIGZAG_ENGAGE: f32 = 96.0;
 /// Cap the weave band on a ground zigzag. The ground-optimal angle `θg = acos(u*/v)` grows toward
 /// ~55° near the friction equilibrium, and an uncapped serpentine sweeps too wide for a 3-cell
-/// corridor — clamp the deadband so the S-curve stays inside the walls. Launch prestrafe (which
-/// has a long runway by construction) is left uncapped.
-const ZIGZAG_BAND_CAP: f32 = 15.0;
+/// corridor. A narrow five-degree flip band preserves the same equilibrium speed while keeping the
+/// short-bend trace centred; the old 15-degree band intermittently selected DM3's outer y=-857 row.
+/// Launch prestrafe (which has a long runway by construction) is left uncapped.
+const ZIGZAG_BAND_CAP: f32 = 5.0;
 
 // `air_accel_max`, `theta_star`, `omega_max`, `strafe_rate`, `air_correct`, and `AIR_CORRECT_GAIN_DEFAULT`
 // now live in `rtx_nav::strafe` (glob-re-exported above), shared with the navmesh build's curl certifier.
@@ -302,6 +303,21 @@ pub struct Bhop {
 }
 
 impl Bhop {
+    /// Drive the exact shared grounded half of a certified ground-turn traversal while retaining
+    /// this controller's sticky weave sign between live frames.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ground_turn_ground_cmd(
+        &mut self,
+        origin: glam::Vec3,
+        v_xy: Vec2,
+        takeoff: glam::Vec3,
+        gt: &crate::navmesh::GroundTurnCurl,
+        accel: f32,
+        maxspeed: f32,
+        dt: f32,
+    ) -> Cmd {
+        crate::navmesh::ground_turn_ground_cmd(origin, v_xy, takeoff, gt, &mut self.sigma, accel, maxspeed, dt)
+    }
     /// Drive one frame. `Some(cmd)` = the controller owns the view and move this frame;
     /// `None` = not engaged — the caller steers through the normal aim-spring path.
     pub fn step(&mut self, i: &Input, env: &Env) -> Option<Cmd> {
@@ -1251,7 +1267,7 @@ mod sim {
             max_lat = max_lat.max(w.pos.y.abs());
         }
         assert!(w.v.length() >= 430.0, "zigzag only reached {} ups in 1.5s", w.v.length());
-        assert!(max_lat <= 96.0, "zigzag swept {max_lat}u off the corridor centerline (band cap failed)");
+        assert!(max_lat <= 10.5, "zigzag swept {max_lat}u off the corridor centerline (band cap failed)");
     }
 
     #[test]

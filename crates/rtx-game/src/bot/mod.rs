@@ -784,12 +784,18 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // drive combat or audience-roaming; FFA hunts the nearest player. Every mode-specific bot
     // adaptation lives behind this one hook — the rest of run_bot stays mode-agnostic and reusable.
     let mode = game.mode;
+    // A control-channel item trial is intentionally *not* a puppet order: the ordinary item goal,
+    // router, traversal drivers and pickup terminal semantics must all execute. It suppresses only
+    // competing mode/combat intent so the measured run is deterministic.
+    let trial_active = game.entities[e].bot.puppet.item_trial.is_some();
     // Whether to stop politely short of the destination (see `Objective::polite`) — flagged at
     // the arms that tail a human or roam, never for a mode-issued intent.
     let mut polite = false;
     let mut stack_exit = game.entities[e].bot.spawn_exit;
     let benched = crate::mode::team::benched(game, e);
-    let nominated_intent = if benched {
+    let nominated_intent = if trial_active {
+        None
+    } else if benched {
         // Benched spectator (structured match, off the locked roster): stroll the stands, no fighting.
         Some(BotIntent::Move(crate::mode::wander_point(game, e, "info_player_deathmatch", |_| None)))
     } else if host.cvar_bool(c"rtx_bot_pacifist") && mode.allows_bot_pacifist_override() {
@@ -1245,6 +1251,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     let magnet = if host.cvar_bool(c"rtx_bot_magnet")
         && matches!(intent, None | Some(BotIntent::Fight(_) | BotIntent::Advance(_)))
         && !traversal_committed
+        && !trial_active
     {
         if now >= game.entities[e].bot.goal.magnet_pick {
             let pick = game.select_route_magnet(e);
@@ -1404,6 +1411,14 @@ fn emit(
         game.reset_grapple(h);
     }
 
+    // Preserve the exact command submitted to physics for the deterministic item-goal harness.
+    // `frame_end` compares this pending wish with the following frame's observed displacement, so a
+    // wall push is distinguishable from a planner that simply asked the bot to stand still.
+    if let Some(trial) = game.entities[e].bot.puppet.item_trial.as_mut() {
+        trial.pending_wish = move_world;
+        trial.pending_buttons = buttons as u32;
+    }
+
     // Combat/gate diagnostics: what the bot is chasing and whether it's stuck at a gate. Enable
     // with `rtx_bot_debug 1` (conprint shows without `developer`).
     if host.cvar_bool(c"rtx_bot_debug") {
@@ -1433,23 +1448,46 @@ fn emit(
 /// before objective resolution; the steering core repeats the latch defensively after any fresh
 /// repath. Existing commitments are never cleared here — only their physical lifecycle may do so.
 fn prearm_traversal(game: &mut GameState, e: EntId, now: f32, on_ground: bool) {
-    let current = {
+    let (current, incoming_speed_jump) = {
         let Some(graph) = game.nav.graph.as_ref() else {
             return;
         };
         let b = &game.entities[e].bot;
-        b.route.get(b.route_pos).copied().map(|leg| {
+        let current = b.route.get(b.route_pos).copied().map(|leg| {
             (
                 leg,
                 graph.link_kind(leg),
                 graph.link_target(leg),
             )
-        })
+        });
+        // Arm an immediately incoming SpeedJump before the periodic repath gate runs.  At speed the
+        // bot can enter the shared source cell and hit the 0.4 s repath boundary in the same frame;
+        // without this look-ahead, A* may replace the solved traversal with an ordinary floor edge
+        // before the route-advance loop ever makes it current.  The tight source-cell radius keeps
+        // this an atomic handoff, not a general early commitment.
+        let incoming = current.and_then(|(_, kind, target)| {
+            let next = b.route.get(b.route_pos + 1).copied()?;
+            (on_ground
+                && matches!(kind, LinkKind::Walk | LinkKind::Step)
+                && graph.link_kind(next) == LinkKind::SpeedJump
+                && graph.link_source(next) == target
+                && (game.entities[e].v.origin.xy() - graph.cell_origin(target).xy()).length() <= ARRIVE_RADIUS)
+                .then_some(next)
+        });
+        (current, incoming)
     };
+    let bhop = game.host().cvar_bool(c"rtx_bot_bhop");
+    if bhop {
+        if let Some(leg) = incoming_speed_jump {
+            let b = &mut game.entities[e].bot;
+            if b.sj.map(|c| c.leg) != Some(leg) {
+                b.sj = Some(Commit { leg, since: now, entry_checked: false });
+            }
+        }
+    }
     let Some((leg, kind, target)) = current else {
         return;
     };
-    let bhop = game.host().cvar_bool(c"rtx_bot_bhop");
     let b = &mut game.entities[e].bot;
     match kind {
         LinkKind::JumpGap | LinkKind::DoubleJump => {
@@ -1465,7 +1503,7 @@ fn prearm_traversal(game: &mut GameState, e: EntId, now: f32, on_ground: bool) {
             }
         }
         LinkKind::SpeedJump if bhop && b.sj.map(|c| c.leg) != Some(leg) => {
-            b.sj = Some(Commit { leg, since: now });
+            b.sj = Some(Commit { leg, since: now, entry_checked: false });
         }
         _ => {}
     }
@@ -1928,6 +1966,39 @@ impl GameState {
         }
     }
 
+    /// Link pricing for the control-channel stock-loadout item trial, computed without mutating the
+    /// live bot. It removes only this bot's transient failed-link surcharge (retaining any merged
+    /// teammate/teleporter surcharge) and prices rocket jumps/hazards as the stock 100-health,
+    /// unarmored SG body that the trial installs after every fallible setup check has passed.
+    pub(crate) fn bot_item_trial_link_pricing(&self, e: EntId, now: f32) -> LinkPricing {
+        let mut pricing = self.bot_link_pricing(e, now);
+        for &(link, until, strikes) in &self.entities[e].bot.failed_links {
+            if until <= now {
+                continue;
+            }
+            if let Some((_, extra)) = pricing.penalties.iter_mut().find(|(li, _)| *li == link) {
+                *extra = (*extra - link_penalty_secs(strikes)).max(0.0);
+            }
+        }
+        pricing.penalties.retain(|&(_, extra)| extra > 0.0);
+        let mut stock = self.entities[e].v;
+        stock.health = 100.0;
+        stock.armorvalue = 0.0;
+        stock.armortype = 0.0;
+        stock.items = (Items::AXE | Items::SHOTGUN).as_f32();
+        stock.ammo_rockets = 0.0;
+        pricing.rj_extra = rj::rocket_jump_extra(&stock, 0.0, now);
+        pricing.hazard = Some(HazardPrice {
+            strength: if self.rtx_cvar_bool("rtx_bot_hazard_health") {
+                goals::total_strength(100.0, 0.0, 0.0)
+            } else {
+                HAZARD_STRENGTH_NEUTRAL
+            },
+            k: self.host().cvar(c"rtx_bot_hazard_k").max(0.0),
+        });
+        pricing
+    }
+
     /// How much this bot values its skin when a route offers a lava/slime shortcut, as the effective
     /// strength [`NavGraph::link_extra`] prices hazard links against: its `total_strength` (health
     /// through armor — lava damage really is absorbed by armor, so plate genuinely buys nerve).
@@ -2117,32 +2188,48 @@ fn ground_leg_targets<'a>(
 
 /// Straight-and-level runway from `origin` along a corridor of successive leg-target points: sum XY
 /// leg lengths while the corridor keeps roughly its heading *and* stays roughly level, stopping
-/// before the first ~96u chord that either turns more than `MAX_BEND` or **climbs** more than
-/// `MAX_CLIMB`. The climb stop is why bots run (not hop) up stairs: an ascending staircase — a chain
-/// of positive-dz Step legs, riser 8–18u per 32u cell — rises ~24u per chord and reads as "not a
-/// bhop runway". Descents never stop it (hopping *down* stairs is fine), and a lone step inside an
-/// otherwise level chord stays under the threshold (single steps are hoppable; pmove steps up on
-/// landing anyway). Judging on chords rather than per 32u leg avoids misreading grid-quantized cell
-/// centres (which zigzag between grid axes) as constant turning.
+/// before the first ~96u chord that either turns more than `MAX_BEND` or **climbs** persistently.
+/// The climb stop is why bots run (not hop) up stairs and ramps: two or more positive-dz risers in a
+/// chord use the lower `MAX_SUSTAINED_CLIMB`, while one isolated step may use `MAX_SINGLE_CLIMB`.
+/// That distinction matters on DM3's lower RA ramp, whose nav cells rise only 16u per 96u chord —
+/// too gentle for the old 20u net-climb test, but still narrow enough that entering a new hop chain
+/// overshoots the ramp. Descents never stop it (hopping *down* stairs is fine), and a lone 16u step
+/// stays hoppable because pmove can step up on landing. Judging on chords rather than per 32u leg
+/// avoids misreading grid-quantized cell centres (which zigzag between grid axes) as constant turning.
 fn runway_over(origin: Vec3, targets: impl Iterator<Item = Vec3>) -> f32 {
     const CHORD: f32 = 96.0;
-    const MAX_BEND: f32 = 35.0;
-    const MAX_CLIMB: f32 = 20.0;
-    let (mut dist, mut prev) = (0.0, origin.xy());
+    // A full-height ordinary hop cannot safely follow the ~32.3-degree two-chord turn on DM3's
+    // upper RA spiral: the air lobe intermittently grazed link 5682. Thirty degrees still admits
+    // the controller's proven 30-degree bend while leaving enough margin for frame/origin jitter.
+    const MAX_BEND: f32 = 30.0;
+    const MAX_SINGLE_CLIMB: f32 = 20.0;
+    const MAX_SUSTAINED_CLIMB: f32 = 12.0;
+    let (mut dist, mut prev, mut prev_z) = (0.0, origin.xy(), origin.z);
     let (mut anchor, mut anchor_dist, mut anchor_z) = (origin.xy(), 0.0, origin.z);
     let mut chord_yaw = None::<f32>;
+    let mut rising_legs = 0u8;
     for tgt in targets {
         let t = tgt.xy();
         dist += (t - prev).length();
         prev = t;
+        if tgt.z > prev_z + 0.5 {
+            rising_legs = rising_legs.saturating_add(1);
+        }
+        prev_z = tgt.z;
         if dist - anchor_dist >= CHORD {
             let c = t - anchor;
             let yaw = yaw_of(c);
-            if chord_yaw.is_some_and(|p| wrap180(yaw - p).abs() > MAX_BEND) || tgt.z - anchor_z > MAX_CLIMB {
+            let climb = tgt.z - anchor_z;
+            let sustained_climb = rising_legs >= 2 && climb > MAX_SUSTAINED_CLIMB;
+            if chord_yaw.is_some_and(|p| wrap180(yaw - p).abs() > MAX_BEND)
+                || climb > MAX_SINGLE_CLIMB
+                || sustained_climb
+            {
                 return anchor_dist; // the corridor turned or climbed in this chord — stop before it
             }
             chord_yaw = Some(yaw);
             (anchor, anchor_dist, anchor_z) = (t, dist, tgt.z);
+            rising_legs = 0;
         }
     }
     dist
@@ -2396,6 +2483,47 @@ mod tests {
             p.z = 16.0; // a single 16u lip partway along an otherwise level corridor
         }
         assert!(runway_over(origin, step.iter().copied()) > 350.0, "a lone step should not truncate the runway");
+
+        // Exact lower-RA-ramp cadence from DM3: alternating flat/+8u cells add only 16u per 96u.
+        // It is a sustained ascent, not a flat bhop runway; a fresh hop chain here caused the live
+        // bot to sail off the narrow ramp and loop below RA until timeout.
+        let dm3_ra_ramp = [
+            Vec3::new(256.0, -832.0, 32.0),
+            Vec3::new(288.0, -832.0, 32.0),
+            Vec3::new(320.0, -832.0, 40.0),
+            Vec3::new(352.0, -832.0, 40.0),
+            Vec3::new(384.0, -832.0, 48.0),
+            Vec3::new(416.0, -832.0, 48.0),
+            Vec3::new(448.0, -800.0, 56.0),
+        ];
+        let ramp_runway = runway_over(Vec3::new(224.0, -832.0, 24.0), dm3_ra_ramp.into_iter());
+        assert!(
+            ramp_runway < bhop::ZIGZAG_ENGAGE,
+            "DM3's sustained lower-RA ascent must be run, not hopped: {ramp_runway}u"
+        );
+
+        // Exact ordinary corridor preceding the recorded single-frame contact on DM3 link 5682.
+        // Chord one heads southwest; chord two turns south by ~32.3 degrees. At the observed
+        // ~398 ups a full hop needs ~333u, so this bend must truncate the runway before +jump.
+        let dm3_upper_bend = [
+            Vec3::new(-192.0, -608.0, 152.0),
+            Vec3::new(-224.0, -640.0, 152.0),
+            Vec3::new(-224.0, -672.0, 152.0),
+            Vec3::new(-224.0, -704.0, 152.0),
+            Vec3::new(-224.0, -736.0, 152.0),
+            Vec3::new(-224.0, -768.0, 152.0),
+            Vec3::new(-192.0, -800.0, 152.0),
+            Vec3::new(-192.0, -832.0, 152.0),
+        ];
+        let upper_runway = runway_over(
+            Vec3::new(-161.35172, -572.8917, 152.03125),
+            dm3_upper_bend.into_iter(),
+        );
+        let observed_hop_need = 398.0 * bhop::T_HOP + bhop::HOP_MARGIN;
+        assert!(
+            upper_runway < 160.0 && upper_runway < observed_hop_need,
+            "DM3 upper bend must stop at the first ~124u chord and hold the observed full hop: runway={upper_runway} need={observed_hop_need}",
+        );
     }
 
     #[test]

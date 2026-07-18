@@ -188,13 +188,17 @@ pub fn prestrafe_delivered_from(v0: f32, runway: f32, accel: f32, maxspeed: f32,
 /// Coarse entry-speed classes for the banded planner. A route's carried speed changes both the
 /// feasibility of a leg (a chained speed jump needs a minimum band) and its cost (a fast band
 /// covers a Walk leg quicker). Four bands keep the search state at `cells · 4`.
-/// `BAND_EDGES[i]` is the upper edge of band `i`: `<340 → 0`, `<430 → 1`, `<540 → 2`, else `3`.
-pub const BAND_EDGES: [f32; 3] = [340.0, 430.0, 540.0];
+/// `BAND_EDGES[i]` is the upper edge of band `i`: `<340 → 0`, `<430 → 1`, `<490 → 2`, `<540 → 3`,
+/// else `4`. The 490 edge exists because the certified chained ground-turn curls
+/// ([`SpeedJumpTraversal::ground_turn`]) sit entirely inside the old 430..540 band: their entry
+/// envelopes start near 490, and a 430 floor could never prove them even when the delivering jump
+/// certifiably lands at ~500.
+pub const BAND_EDGES: [f32; 4] = [340.0, 430.0, 490.0, 540.0];
 /// Number of speed bands.
-pub const NBANDS: usize = 4;
+pub const NBANDS: usize = 5;
 /// The speed *credited* to a band — its lower edge. Feasibility and cost always use this floor,
 /// never a midpoint, so the planner never assumes more speed than a band guarantees.
-pub const BAND_FLOOR: [f32; NBANDS] = [MAX_SPEED, 340.0, 430.0, 540.0];
+pub const BAND_FLOOR: [f32; NBANDS] = [MAX_SPEED, 340.0, 430.0, 490.0, 540.0];
 /// Planning speed ceiling — the banded heuristic's denominator (matches [`SPEED_JUMP_V_CAP`]).
 /// Larger than [`MAX_SPEED`], so the banded heuristic is *smaller* (more conservative) than the
 /// cell-only one — at worst it expands more nodes, never less optimal than the existing search.

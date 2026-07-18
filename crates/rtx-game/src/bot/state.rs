@@ -276,6 +276,9 @@ pub struct Vigil {
 pub struct Commit {
     pub leg: u32,
     pub since: f32,
+    /// A ground-turn entry envelope is checked exactly once. Its controller intentionally rotates
+    /// out of that envelope after acceptance, so rechecking on later runway frames is incorrect.
+    pub entry_checked: bool,
 }
 
 /// A plain gap/double-jump commitment. Unlike [`Commit`] (the speed-jump run-up latch), this records
@@ -575,6 +578,82 @@ pub struct Puppet {
     /// FlyLink bring-up: the horizontal speed captured at the takeoff frame (ground → airborne). 0 until
     /// takeoff. Reported in `fly_result` so the harness can read what the takeoff regime delivered.
     pub fly_takeoff_speed: f32,
+    /// Deterministic item-goal acceptance run driven by the control channel. Unlike `order`, this
+    /// deliberately leaves the ordinary item objective/router/terminal machinery in charge; the
+    /// harness only freezes competing intent and records whether that real path actually succeeds.
+    pub item_trial: Option<ItemTrial>,
+}
+
+/// One frame of an item-goal acceptance run. The compact row is retained until the terminal event
+/// so failures can be replayed without enabling noisy server-wide debug logging.
+#[derive(Clone, Copy)]
+pub struct ItemTrialSample {
+    pub t: f32,
+    pub origin: Vec3,
+    pub velocity: Vec3,
+    pub wish: Vec3,
+    pub buttons: u32,
+    pub on_ground: bool,
+    pub wall: bool,
+    pub route_pos: usize,
+    pub link: u32,
+    pub terminal: CellId,
+}
+
+/// Route state that produced the item-trial command currently awaiting physical observation.
+/// Steering may advance to another leg while emitting the next command, so this snapshot must
+/// travel with `wish`; reading the bot's live route one frame later would misattribute the move.
+#[derive(Clone, Copy)]
+pub struct ItemTrialMoveFrame {
+    pub route_pos: usize,
+    pub link: u32,
+    pub terminal: CellId,
+}
+
+/// State for a control-channel item-goal acceptance run (currently DM3 Ring-side entrance → RA).
+/// `wish` is the command whose physical result is observed this frame; `pending_wish` is what
+/// `emit` just submitted for the following engine movement step.
+pub struct ItemTrial {
+    pub request_id: i64,
+    pub item: u32,
+    pub terminal: CellId,
+    pub scenario: &'static str,
+    pub start_hint: Vec3,
+    pub started: f32,
+    pub deadline: f32,
+    pub start_origin: Vec3,
+    pub initial_armor: f32,
+    pub wish: Vec3,
+    pub pending_wish: Vec3,
+    pub buttons: u32,
+    pub pending_buttons: u32,
+    pub move_frame: ItemTrialMoveFrame,
+    pub last_origin: Vec3,
+    /// Velocity entering the movement step represented by `wish`. Unlike the new wish direction,
+    /// this retains lateral momentum that can carry the player into a different wall plane.
+    pub last_velocity: Vec3,
+    pub last_t: f32,
+    pub motion_anchor: Vec3,
+    pub motion_since: f32,
+    pub wall_run: f32,
+    pub wall_max: f32,
+    pub wall_contacts: u32,
+    pub wall_normal: Vec3,
+    pub ground_z: f32,
+    pub terminal_touch_since: Option<f32>,
+    /// Latched only when the forced RA goal disappears on a frame without an authoritative pickup.
+    /// A normal armor touch clears the goal in its success frame and must not look like cancellation.
+    pub goal_lost: bool,
+    pub min_z: f32,
+    pub peak_speed: f32,
+    pub initial_route: Vec<u32>,
+    pub route_captured: bool,
+    /// Per-attempt telemetry budget derived from this trial's deadline. Keeping it on the trial
+    /// makes collection independent of later cvar/protocol changes and prevents a 100 Hz run from
+    /// silently truncating before its own timeout.
+    pub sample_limit: usize,
+    pub samples: Vec<ItemTrialSample>,
+    pub samples_truncated: bool,
 }
 
 /// A scripted control order for a puppeted bot (see [`crate::control`]). Lives here (not in

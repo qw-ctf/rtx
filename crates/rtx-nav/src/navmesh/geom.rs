@@ -205,6 +205,45 @@ pub(super) fn ballistic_clear(bsp: &Bsp, a: Vec3, b: Vec3) -> bool {
     })
 }
 
+/// Whether an aligned stock jump travelling at `speed` can reach the target's XY without striking
+/// geometry or arriving below its standing-origin height. This is deliberately a *hot-entry* check,
+/// not the descending-root reach check in [`ballistic_clear`]: a short rise close to the jump apex
+/// can be reachable only in a narrow, slow speed window. Encoding that as an ordinary `JumpGap`
+/// lets a max-speed runner reach the riser before gaining enough height and run its hull into the
+/// wall. Such a ledge needs a takeoff farther back, which the windowed jump pass can emit.
+///
+/// Hull traces join the ballistic samples, so a thin leading lip cannot fall between point samples.
+pub(super) fn ballistic_clear_at_speed(bsp: &Bsp, a: Vec3, b: Vec3, speed: f32) -> bool {
+    let delta = b.xy() - a.xy();
+    let horiz = delta.length();
+    if !speed.is_finite() || speed <= 0.0 || horiz <= f32::EPSILON {
+        return false;
+    }
+
+    let t_target = horiz / speed;
+    let z_target = a.z + JUMP_VZ * t_target - 400.0 * t_target * t_target;
+    if z_target < b.z {
+        return false;
+    }
+
+    let dir = delta / horiz;
+    let steps = ((horiz / 16.0).ceil() as i32).clamp(8, 48);
+    let mut prev = a;
+    for i in 1..=steps {
+        let f = i as f32 / steps as f32;
+        let t = t_target * f;
+        let xy = a.xy() + dir * (speed * t);
+        let z = a.z + JUMP_VZ * t - 400.0 * t * t;
+        let next = Vec3::new(xy.x, xy.y, z);
+        let tr = bsp.hull1_trace(prev, next);
+        if tr.start_solid || tr.fraction <= 0.99 {
+            return false;
+        }
+        prev = next;
+    }
+    true
+}
+
 /// A point at parameter `t ∈ [0, 1]` along a jump arc from `a` to `b` with apex `apex` above the
 /// higher endpoint: xy is linear in `t`, z is the parabola through `a.z` (t=0) and `b.z` (t=1)
 /// peaking at `max(a.z, b.z) + apex`. Shared by the build's clearance check (`arc_clear_peak`) and

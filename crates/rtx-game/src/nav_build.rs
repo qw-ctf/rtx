@@ -450,7 +450,7 @@ mod tests {
     use crate::defs::{Bits, Items, Solid};
     use crate::entity::{Entity, Touch};
     use crate::netclient::host::NetHost;
-    use crate::navmesh::NavGraph;
+    use crate::navmesh::{LinkCosts, LinkKind, NavGraph};
     use std::path::PathBuf;
 
     fn armor_entity(classname: &str, origin: Vec3) -> Entity {
@@ -570,6 +570,66 @@ mod tests {
             let terminal = graph.cell_origin(terminals[0]);
             assert!(crate::bot::item_terminal_touches(terminal, &armor));
             assert_armor_take(classname, item_origin, terminal);
+        }
+    }
+
+    /// The control-channel acceptance anchors must reach a physical RA take without a planned Drop.
+    /// The RA-tunnel case is additionally bound to the exact stock deathmatch-spawn BSP entity and
+    /// its deterministic standing-cell snap, so a nearby nickname cannot silently replace it.
+    #[test]
+    fn dm3_real_ring_anchors_route_to_ra_without_a_drop() {
+        let Ok(path) = std::env::var("RTX_TEST_BSP") else {
+            return;
+        };
+        if !path.to_ascii_lowercase().contains("dm3") {
+            return;
+        }
+        let bytes = std::fs::read(path).expect("read dm3 bsp");
+        let bsp = Bsp::parse(&bytes).expect("parse dm3 bsp");
+        let graph = NavGraph::build(&bsp);
+        let ra_spawn = Vec3::new(192.0, -208.0, -176.0);
+        assert!(
+            bsp.entities.split('}').any(|block| {
+                block.contains("\"classname\" \"info_player_deathmatch\"")
+                    && block.contains("\"origin\" \"192 -208 -176\"")
+            }),
+            "stock DM3 RA.tunnel deathmatch spawn entity moved or vanished"
+        );
+        let ra_spawn_cell = graph.nearest(ra_spawn).expect("RA spawn has no standing nav cell");
+        assert_eq!(graph.cell_origin(ra_spawn_cell), Vec3::new(192.0, -224.0, -176.0));
+        let armor = armor_entity("item_armorInv", Vec3::new(256.0, -704.0, 304.0));
+        let terminals = collect_touch_terminals(
+            graph
+                .cells
+                .iter()
+                .enumerate()
+                .map(|(cell, c)| (cell as navmesh::CellId, c.origin)),
+            &armor,
+        );
+        assert!(!terminals.is_empty(), "RA has no touch-valid terminal");
+
+        for (name, hint) in [
+            ("local", Vec3::new(360.0, -677.0, 264.0)),
+            ("ra_spawn", ra_spawn),
+            ("ring", Vec3::new(240.0, -32.0, 56.0)),
+        ] {
+            let start = graph.nearest(hint).unwrap_or_else(|| panic!("{name} start has no nav cell"));
+            let costs = LinkCosts::default();
+            let travel = graph.costs_from(start, &costs);
+            let terminal = terminals
+                .iter()
+                .copied()
+                .filter(|&cell| travel[cell as usize].is_finite())
+                .min_by(|&a, &b| travel[a as usize].total_cmp(&travel[b as usize]))
+                .unwrap_or_else(|| panic!("{name} cannot reach an RA terminal"));
+            let route = graph
+                .find_path(start, terminal, &costs)
+                .unwrap_or_else(|| panic!("{name} RA route vanished"));
+            assert!(
+                route.iter().all(|&link| graph.link_kind(link) != LinkKind::Drop),
+                "{name} RA route contains a Drop: {route:?}"
+            );
+            assert!(crate::bot::item_terminal_touches(graph.cell_origin(terminal), &armor));
         }
     }
 }

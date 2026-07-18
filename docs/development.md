@@ -121,6 +121,60 @@ floods the whole navmesh but only every 1.5s, and A* re-paths every 0.4s. The `p
 attributes a spike (`objective` is goal selection, `steer` is A*, `combat` is traces and grenade
 rollouts); they sum to less than the frame total, the remainder being sensing and command emit.
 
+### DM3 Ring→RA acceptance trial
+
+The authoritative server control channel also exposes:
+
+```text
+<id> ra_trial <bot> [ring|ra_spawn|local] [max_secs]
+```
+
+`ring` is the default and starts at the corpus major-zone centre `(240,-32,56)`. `ra_spawn` is
+bound to the exact stock `info_player_deathmatch` entity at `(192,-208,-176)` in `RA.tunnel`; it
+refuses a custom entity set that moved/removed that spawn. The planner starts from nearest standing
+cell 1281 at `(192,-224,-176)`, but physical placement preserves the production spawn XY and its
+engine `+1 Z` offset exactly: `(192,-208,-175)`. `local` starts at the upper-lip regression reproduction `(360,-677,264)` and is
+only an internal micro-regression. The default hard deadline is scenario-specific: 2.435059 seconds
+for `local`, 12.6255 seconds for `ra_spawn`, and 9.604003 seconds for `ring`; callers may pass a longer safety deadline and grade the emitted
+telemetry separately. The command is server-only: it restores
+DM3's red armor, resets the bot to a stock SG spawn, chooses the cheapest reachable touch-valid RA
+terminal with the live bot link pricing, and installs a completion-critical RA item goal. It does
+not issue a coordinate `goto`; ordinary A*, traversal, terminal retry, item touch, and armor pickup
+code execute unchanged. Because RA is deliberately seeded, this trial proves item-goal execution,
+not autonomous strategic selection (`forced_item_goal:true` is explicit in the result).
+
+The acknowledgement records the snapped start, selected terminal, and complete planned route. One
+`ra_trial_result` event with the same `request_id` then records the authoritative pickup triplet
+(200 armor, `ARMOR3`, hidden RA), elapsed time, current route/link, commanded wish/buttons and a
+per-frame trajectory. It hard-fails `planned_drop`, `fall`, sustained BSP-blocked `wall_push`,
+`no_pickup`, `item_taken_elsewhere`, `goal_lost`, `stall`, death, or `timeout`. Thus a movement
+change cannot pass merely by reaching a coordinate near RA.
+
+`elapsed` is start-centre→authoritative-pickup time. It is deliberately conservative, but it is not
+the corpus benchmark's Ring-sphere-exit→RA-sphere-entry interval; the lab runner derives that
+interval (and next-distinct-zone, low-speed, minimum-Z, and maximum-velocity checks) from the frame
+samples. `wall_contacts` covers physical contacts with static BSP. Dynamic brush contacts require
+engine collision telemetry and are outside that metric; stock DM3's accepted Ring→RA route has no
+dynamic gate.
+
+The `ra_spawn` default is independently calibrated from the local 2026-07-17 MVD snapshot. A run
+starts only when the authoritative spawn event's trajectory sample is exactly the stock entity
+origin `(192,-208,-176)` and ends at the same slot's authoritative RA `taken` event within 30
+seconds. To make the race comparable, admission requires RA to be active at spawn and the runner to
+make the first subsequent RA take, with no intervening same-slot spawn before that pickup. The
+admitted same-life set is 86 runs across 77 demos: min 6.680, p10 10.0095, p50 12.6255, p90 18.0630
+seconds. These are controller-safe aggregates, not human routes or input sequences.
+
+For a one-off raw run, keep one TCP connection open long enough to receive both messages:
+
+```sh
+printf '1 ra_trial 1 local 9.604\n' | nc -q 12 127.0.0.1 27950
+```
+
+The repeatable streak grader and corpus-derived thresholds live in the separate
+`bot-control-kit` lab repo (`ops/dm3_ra_acceptance.py`). Its JSONL artifacts retain the full result
+event for A/B comparison and replayable diagnosis.
+
 ## Contributing notes
 
 The source is hand-wrapped narrower than rustfmt's `max_width` — please don't run `cargo fmt`;
