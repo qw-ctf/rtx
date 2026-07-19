@@ -277,6 +277,9 @@ pub(crate) fn no_map(start: Vec3) -> rtx_nav::bsp::HullTrace {
         fraction: 0.0,
         endpos: start,
         plane_normal: Vec3::ZERO,
+        plane_dist: 0.0,
+        in_open: false,
+        in_water: false,
     }
 }
 

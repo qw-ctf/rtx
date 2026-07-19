@@ -407,13 +407,13 @@ impl Bsp {
         self.pointcontents(p) == CONTENTS_SOLID
     }
 
-    /// Trace the segment `p1 → p2` through the world's player hull (hull 1) — a port of
-    /// `SV_RecursiveHullCheck`. Returns where it first hits solid (`fraction`/`endpos`) and the
-    /// **surface normal** of the plane it struck (`plane_normal`, oriented against the segment), so a
-    /// bouncing projectile can reflect off it. `fraction == 1` means the whole segment is clear.
-    /// `start_solid` means `p1` was already inside solid. Pure over `planes`/`clipnodes`, no syscall.
+    /// Trace the segment `p1 → p2` through the world's player hull (hull 1) — "would a player fit".
+    /// Returns where it first hits solid (`fraction`/`endpos`) and the **surface normal** of the
+    /// plane it struck (`plane_normal`, oriented against the segment), so a bouncing projectile can
+    /// reflect off it. `fraction == 1` means the whole segment is clear. `start_solid` means `p1` was
+    /// already inside solid. Pure over `planes`/`clipnodes`, no syscall. See [`trace_nodes`].
     pub fn hull1_trace(&self, p1: Vec3, p2: Vec3) -> HullTrace {
-        self.trace_in(&self.clipnodes, self.hull1_headnode, p1, p2)
+        trace_nodes(&self.planes, &self.clipnodes, self.hull1_headnode, p1, p2)
     }
 
     /// Trace the segment `p1 → p2` through the world's **point** hull (hull 0).
@@ -423,118 +423,212 @@ impl Bsp {
     /// here to there", and for anything else about a thing with no width. [`hull1_trace`] answers a
     /// different question: would a *player* fit.
     pub fn hull0_trace(&self, p1: Vec3, p2: Vec3) -> HullTrace {
-        self.trace_in(&self.hull0_clipnodes, self.render_headnode, p1, p2)
+        trace_nodes(&self.planes, &self.hull0_clipnodes, self.render_headnode, p1, p2)
     }
 
-    /// The body of both traces, over whichever tree.
-    fn trace_in(&self, nodes: &[ClipNode], headnode: i32, p1: Vec3, p2: Vec3) -> HullTrace {
-        let mut trace = HullTrace {
-            fraction: 1.0,
-            endpos: p2,
-            plane_normal: Vec3::ZERO,
-            start_solid: false,
-            all_solid: true,
-        };
-        self.recursive_hull_check(nodes, headnode, headnode, 0.0, 1.0, p1, p2, &mut trace);
-        trace
+    /// Trace the segment `p1 → p2` through inline submodel `n`'s **point** hull (hull 0) — the door,
+    /// plat or trigger shaped like `"*n"`. `Mod_MakeHull0` rewrote the whole render-node array into
+    /// clipnodes once, and every submodel's `headnode[0]` indexes into that same array, so the trace
+    /// shares [`hull0_clipnodes`](Self::hull0_clipnodes). Coordinates are the submodel's own frame
+    /// (world brushes at their compiled position); the caller offsets by the entity's live origin. A
+    /// missing submodel traces as open air (clear), never blocking.
+    pub fn submodel_hull0_trace(&self, n: usize, p1: Vec3, p2: Vec3) -> HullTrace {
+        let head = self.models.get(n).map_or(CONTENTS_EMPTY, |m| m.render_head);
+        trace_nodes(&self.planes, &self.hull0_clipnodes, head, p1, p2)
     }
+}
 
-    /// The recursion behind [`hull1_trace`] (`SV_RecursiveHullCheck`). Returns `true` while the
-    /// segment stays out of solid; `false` once it records an impact.
-    #[allow(clippy::too_many_arguments)]
-    fn recursive_hull_check(
-        &self,
-        nodes: &[ClipNode],
-        headnode: i32,
-        num: i32,
-        p1f: f32,
-        p2f: f32,
-        p1: Vec3,
-        p2: Vec3,
-        trace: &mut HullTrace,
-    ) -> bool {
-        // Leaf: negative `num` is a CONTENTS_* value, not a node index.
-        if num < 0 {
-            if num != CONTENTS_SOLID {
-                trace.all_solid = false;
-            } else {
+/// Which of the three trace states a subtree resolved to. Mirrors mvdsv's `RecursiveHullTrace`
+/// (`TR_EMPTY`/`TR_SOLID`/`TR_BLOCKED`) — the FTE-style rewrite the engine actually runs, so our
+/// own trace answers bit-for-bit what a server-side `traceline` would.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Tr {
+    Empty,
+    Solid,
+    Blocked,
+}
+
+/// Trace `p1 → p2` through a clip tree `(planes, nodes, headnode)` — the shared body of every hull
+/// trace (world hull 0/1, an inline submodel, or a [`BoxHull`]). A port of mvdsv `CM_HullTrace` +
+/// `RecursiveHullTrace` (cmodel.c): a segment that is solid the whole way reports
+/// `start_solid == all_solid == true` with `endpos == p1` and **`fraction == 1`** (the id quirk the
+/// engine preserves, not `0`); an impact places `endpos` exactly `DIST_EPSILON` shy of the plane
+/// with no back-out drift. `plane_dist` is the struck plane's signed distance (oriented with
+/// `plane_normal`), and `in_open`/`in_water` record whether the segment passed through empty / a
+/// liquid leaf.
+fn trace_nodes(planes: &[Plane], nodes: &[ClipNode], headnode: i32, p1: Vec3, p2: Vec3) -> HullTrace {
+    let mut trace = HullTrace {
+        fraction: 1.0,
+        endpos: p2,
+        plane_normal: Vec3::ZERO,
+        plane_dist: 0.0,
+        start_solid: false,
+        all_solid: false,
+        in_open: false,
+        in_water: false,
+    };
+    let mut leafcount = 0;
+    let check = recursive_hull_trace(planes, nodes, headnode, 0.0, 1.0, p1, p2, &mut trace, &mut leafcount);
+    if check == Tr::Solid {
+        // Whole path was solid. Match the engine: flag both, snap the endpoint back to the start,
+        // and leave `fraction` at 1 (id left it there; mvdsv emulates it, so we do too).
+        trace.start_solid = true;
+        trace.all_solid = true;
+        trace.endpos = p1;
+    }
+    trace
+}
+
+/// The recursion behind [`trace_nodes`]. Returns the subtree's [`Tr`] state; writes the impact into
+/// `trace` on the transition from an empty near side to a solid far side.
+#[allow(clippy::too_many_arguments)]
+fn recursive_hull_trace(
+    planes: &[Plane],
+    nodes: &[ClipNode],
+    num: i32,
+    p1f: f32,
+    p2f: f32,
+    p1: Vec3,
+    p2: Vec3,
+    trace: &mut HullTrace,
+    leafcount: &mut i32,
+) -> Tr {
+    // Leaf: a negative `num` is a CONTENTS_* value, not a node index.
+    if num < 0 {
+        *leafcount += 1;
+        if num == CONTENTS_SOLID {
+            // startsolid is the *first* leaf only — a segment that starts in open air and later
+            // re-enters solid is an impact, not a start-in-solid.
+            if *leafcount == 1 {
                 trace.start_solid = true;
             }
-            return true;
+            return Tr::Solid;
         }
-        let Some(node) = nodes.get(num as usize) else {
-            trace.start_solid = true;
-            return true;
-        };
-        let Some(plane) = self.planes.get(node.plane as usize) else {
-            trace.start_solid = true;
-            return true;
-        };
-        let (t1, t2) = if plane.kind < 3 {
-            let k = plane.kind as usize;
-            (p1[k] - plane.dist, p2[k] - plane.dist)
+        if num == CONTENTS_EMPTY {
+            trace.in_open = true;
         } else {
-            (plane.normal.dot(p1) - plane.dist, plane.normal.dot(p2) - plane.dist)
-        };
-        if t1 >= 0.0 && t2 >= 0.0 {
-            return self.recursive_hull_check(nodes, headnode, node.children[0], p1f, p2f, p1, p2, trace);
+            trace.in_water = true;
         }
-        if t1 < 0.0 && t2 < 0.0 {
-            return self.recursive_hull_check(nodes, headnode, node.children[1], p1f, p2f, p1, p2, trace);
-        }
-        // The segment crosses this plane — split it `DIST_EPSILON` onto the near side.
-        let mut frac = if t1 < 0.0 {
-            (t1 + DIST_EPSILON) / (t1 - t2)
-        } else {
-            (t1 - DIST_EPSILON) / (t1 - t2)
-        }
-        .clamp(0.0, 1.0);
-        let mut midf = p1f + (p2f - p1f) * frac;
-        let mut mid = p1 + (p2 - p1) * frac;
-        let side = usize::from(t1 < 0.0);
-        // Walk the near side first.
-        if !self.recursive_hull_check(nodes, headnode, node.children[side], p1f, midf, p1, mid, trace) {
-            return false;
-        }
-        // If the far side isn't solid at the crossing, keep going into it.
-        if self.contents_in(nodes, node.children[side ^ 1], mid) != CONTENTS_SOLID {
-            return self.recursive_hull_check(nodes, headnode, node.children[side ^ 1], midf, p2f, mid, p2, trace);
-        }
-        if trace.all_solid {
-            return false; // never got out of the solid area
-        }
-        // Impact: the far side is solid. Record the (segment-facing) plane normal.
-        trace.plane_normal = if side == 0 { plane.normal } else { -plane.normal };
-        // Back the impact point out of solid if the epsilon split left it just inside.
-        while self.contents_in(nodes, headnode, mid) == CONTENTS_SOLID {
-            frac -= 0.1;
-            if frac < 0.0 {
-                trace.fraction = midf;
-                trace.endpos = mid;
-                return false;
-            }
-            midf = p1f + (p2f - p1f) * frac;
-            mid = p1 + (p2 - p1) * frac;
-        }
-        trace.fraction = midf;
-        trace.endpos = mid;
-        false
+        return Tr::Empty;
+    }
+    // Out-of-range clipnode index (a malformed file): treat as solid — conservative, never panics.
+    let Some(node) = nodes.get(num as usize) else {
+        return Tr::Solid;
+    };
+    let Some(plane) = planes.get(node.plane as usize) else {
+        return Tr::Solid;
+    };
+    let (t1, t2) = if plane.kind < 3 {
+        let k = plane.kind as usize;
+        (p1[k] - plane.dist, p2[k] - plane.dist)
+    } else {
+        (plane.normal.dot(p1) - plane.dist, plane.normal.dot(p2) - plane.dist)
+    };
+    if t1 >= 0.0 && t2 >= 0.0 {
+        return recursive_hull_trace(planes, nodes, node.children[0], p1f, p2f, p1, p2, trace, leafcount);
+    }
+    if t1 < 0.0 && t2 < 0.0 {
+        return recursive_hull_trace(planes, nodes, node.children[1], p1f, p2f, p1, p2, trace, leafcount);
+    }
+    // The segment crosses this plane. Split at the *exact* intersection to recurse each half.
+    let frac = (t1 / (t1 - t2)).clamp(0.0, 1.0);
+    let midf = p1f + (p2f - p1f) * frac;
+    let mid = p1 + (p2 - p1) * frac;
+    let nearside = usize::from(t1 < t2); // the side `p1` lies on
+    let check = recursive_hull_trace(planes, nodes, node.children[nearside], p1f, midf, p1, mid, trace, leafcount);
+    if check == Tr::Blocked {
+        return check;
+    }
+    // Started in solid but have since reached open/water: stop, don't drive deeper.
+    if check == Tr::Solid && (trace.in_open || trace.in_water) {
+        return check;
+    }
+    let oldcheck = check;
+    let check = recursive_hull_trace(planes, nodes, node.children[1 - nearside], midf, p2f, mid, p2, trace, leafcount);
+    if check == Tr::Empty || check == Tr::Blocked {
+        return check;
+    }
+    if oldcheck != Tr::Empty {
+        return check; // still in solid
+    }
+    // Near side empty, far side solid: this plane is the impact. Record the segment-facing normal.
+    if nearside == 0 {
+        trace.plane_normal = plane.normal;
+        trace.plane_dist = plane.dist;
+    } else {
+        trace.plane_normal = -plane.normal;
+        trace.plane_dist = -plane.dist;
+    }
+    // Put the final point DIST_EPSILON onto the near side (single split, no back-out iteration).
+    let frac = if t1 < t2 {
+        (t1 + DIST_EPSILON) / (t1 - t2)
+    } else {
+        (t1 - DIST_EPSILON) / (t1 - t2)
+    }
+    .clamp(0.0, 1.0);
+    trace.fraction = p1f + (p2f - p1f) * frac;
+    trace.endpos = p1 + (p2 - p1) * frac;
+    Tr::Blocked
+}
+
+/// A bounding box turned into a six-plane clip tree — mvdsv `CM_InitBoxHull` + `CM_HullForBox`. A
+/// sized entity with no BSP model (a `Solid::BBox`/`SlideBox` item or player) clips through one of
+/// these, so a world trace treats every entity uniformly as a hull, exactly as the engine does.
+pub struct BoxHull {
+    planes: [Plane; 6],
+    nodes: [ClipNode; 6],
+}
+
+/// Build the [`BoxHull`] for the box `mins..maxs` (both in the same frame the trace endpoints use).
+pub fn box_hull(mins: Vec3, maxs: Vec3) -> BoxHull {
+    let mut planes = [Plane { normal: Vec3::ZERO, dist: 0.0, kind: 0 }; 6];
+    let mut nodes = [ClipNode { plane: 0, children: [0, 0] }; 6];
+    for i in 0..6 {
+        let side = i & 1;
+        nodes[i].plane = i as u32;
+        nodes[i].children[side] = CONTENTS_EMPTY;
+        nodes[i].children[side ^ 1] = if i != 5 { (i + 1) as i32 } else { CONTENTS_SOLID };
+        let mut n = [0.0f32; 3];
+        n[i >> 1] = 1.0;
+        planes[i].normal = Vec3::from_array(n);
+        planes[i].kind = (i >> 1) as i32;
+    }
+    planes[0].dist = maxs.x;
+    planes[1].dist = mins.x;
+    planes[2].dist = maxs.y;
+    planes[3].dist = mins.y;
+    planes[4].dist = maxs.z;
+    planes[5].dist = mins.z;
+    BoxHull { planes, nodes }
+}
+
+impl BoxHull {
+    /// Trace `p1 → p2` against this box (`0` is its root clipnode). Same semantics as [`trace_nodes`].
+    pub fn trace(&self, p1: Vec3, p2: Vec3) -> HullTrace {
+        trace_nodes(&self.planes, &self.nodes, 0, p1, p2)
     }
 }
 
 /// The result of a hull segment trace ([`Bsp::hull1_trace`]).
 #[derive(Clone, Copy, Debug)]
 pub struct HullTrace {
-    /// Fraction of the segment traversed before impact (`1.0` = clear).
+    /// Fraction of the segment traversed before impact (`1.0` = clear, and also `1.0` when the whole
+    /// segment is solid — the id quirk, see [`trace_nodes`]).
     pub fraction: f32,
-    /// The impact point (or `p2` if clear).
+    /// The impact point (`p2` if clear, `p1` if wholly solid).
     pub endpos: Vec3,
     /// Surface normal at the impact, oriented against the incoming segment (`ZERO` if clear).
     pub plane_normal: Vec3,
+    /// Signed distance of the struck plane, oriented with `plane_normal` (`0.0` if clear).
+    pub plane_dist: f32,
     /// `p1` started inside solid.
     pub start_solid: bool,
     /// The whole segment was inside solid.
     pub all_solid: bool,
+    /// The segment passed through an empty (`CONTENTS_EMPTY`) leaf at some point.
+    pub in_open: bool,
+    /// The segment passed through a liquid leaf (water/slime/lava) at some point.
+    pub in_water: bool,
 }
 
 /// Read a lump as a `Vec<T>` (count derived from the lump size and `T`'s on-disk size).
@@ -641,6 +735,79 @@ mod tests {
         // Starting inside the solid half is flagged.
         let inside = bsp.hull1_trace(Vec3::new(150.0, 0.0, 0.0), Vec3::new(160.0, 0.0, 0.0));
         assert!(inside.start_solid);
+    }
+
+    /// The mvdsv (`CM_HullTrace`) semantics the engine actually runs, so a server-side `traceline`
+    /// cutover is a no-op: a wholly-solid segment reports start+all solid with `endpos == start` and
+    /// `fraction == 1` (the id quirk, not `0`); an impact sits exactly `DIST_EPSILON` shy of the
+    /// plane with no `frac -= 0.1` back-out drift; a leaf's `in_open`/`in_water` are tracked.
+    #[test]
+    fn hull_trace_mvdsv_semantics() {
+        let bsp = wall_at_x100();
+
+        // Wholly inside solid (both ends x > 100): start+all solid, endpos snaps to start, fraction 1.
+        let (a, b) = (Vec3::new(150.0, 0.0, 0.0), Vec3::new(160.0, 0.0, 0.0));
+        let solid = bsp.hull1_trace(a, b);
+        assert!(solid.start_solid && solid.all_solid, "wholly-solid trace flags both");
+        assert_eq!(solid.fraction, 1.0, "id quirk: fraction stays 1 on all-solid, not 0");
+        assert_eq!(solid.endpos, a, "endpos snaps back to the start point");
+
+        // Impact sits DIST_EPSILON shy on the near side — a single split, no iterative back-out.
+        let hit = bsp.hull1_trace(Vec3::new(0.0, 0.0, 0.0), Vec3::new(200.0, 0.0, 0.0));
+        assert!(hit.endpos.x < 100.0 && hit.endpos.x > 99.9, "endpos {} not just shy of 100", hit.endpos.x);
+        // The signed plane distance is oriented with the (negated) normal: normal −x, dist −100.
+        assert!((hit.plane_dist - -100.0).abs() < 1e-3, "plane_dist {}", hit.plane_dist);
+
+        // A clear pass through the empty half records in_open (CONTENTS_EMPTY leaf), not in_water.
+        let clear = bsp.hull1_trace(Vec3::new(0.0, 0.0, 0.0), Vec3::new(50.0, 0.0, 0.0));
+        assert!(clear.in_open && !clear.in_water, "empty leaf → in_open");
+        assert!(!clear.start_solid && !clear.all_solid);
+    }
+
+    /// A one-plane hull whose back side is a **liquid** leaf (not empty): a trace through it is clear
+    /// (liquid isn't solid) but flags `in_water`, the field the mirror's waterlevel logic keys on.
+    #[test]
+    fn hull_trace_tracks_water_leaf() {
+        let bsp = Bsp {
+            planes: vec![Plane { normal: Vec3::new(1.0, 0.0, 0.0), dist: 100.0, kind: 0 }],
+            // front (x ≥ 100) SOLID; back (x < 100) WATER (-3).
+            clipnodes: vec![ClipNode { plane: 0, children: [CONTENTS_SOLID, CONTENTS_WATER] }],
+            hull1_headnode: 0,
+            mins: Vec3::splat(-256.0),
+            maxs: Vec3::splat(256.0),
+            entities: String::new(),
+            hull0_clipnodes: Vec::new(),
+            models: vec![Model { mins: Vec3::splat(-256.0), maxs: Vec3::splat(256.0), render_head: 0, clip1: 0 }],
+            render_nodes: Vec::new(),
+            leaf_contents: Vec::new(),
+            render_headnode: 0,
+        };
+        let tr = bsp.hull1_trace(Vec3::new(0.0, 0.0, 0.0), Vec3::new(50.0, 0.0, 0.0));
+        assert_eq!(tr.fraction, 1.0, "liquid is not solid — the segment is clear");
+        assert!(tr.in_water && !tr.in_open, "the back leaf is water");
+    }
+
+    /// A `BoxHull` clips like the engine's `CM_HullForBox`: a segment entering the box stops at the
+    /// face with the segment-facing normal; one passing outside is clear; a point inside is solid.
+    #[test]
+    fn box_hull_clips_a_bounding_box() {
+        let hull = box_hull(Vec3::splat(-16.0), Vec3::splat(16.0));
+
+        // Straight through the middle along +x: hits the −x face (x = −16), normal faces −x.
+        let hit = hull.trace(Vec3::new(-100.0, 0.0, 0.0), Vec3::new(100.0, 0.0, 0.0));
+        // Enter at x ≈ −16 over a 200u span from x = −100 → fraction ≈ (−16 − −100)/200 = 0.42.
+        assert!((hit.fraction - 0.42).abs() < 0.01, "fraction {}", hit.fraction);
+        assert!((hit.endpos.x - -16.0).abs() < 0.5 && hit.endpos.x > -16.5, "endpos {:?}", hit.endpos);
+        assert!((hit.plane_normal - Vec3::new(-1.0, 0.0, 0.0)).length() < 1e-4, "normal {:?}", hit.plane_normal);
+
+        // Parallel but 50u to the side (|y| > 16): misses the box entirely.
+        let miss = hull.trace(Vec3::new(-100.0, 50.0, 0.0), Vec3::new(100.0, 50.0, 0.0));
+        assert_eq!(miss.fraction, 1.0, "a segment outside the box is clear");
+
+        // A segment wholly inside the box is solid the whole way (start+all solid, endpos = start).
+        let inside = hull.trace(Vec3::new(-4.0, 0.0, 0.0), Vec3::new(4.0, 0.0, 0.0));
+        assert!(inside.start_solid && inside.all_solid, "inside the box is solid");
+        assert_eq!(inside.endpos, Vec3::new(-4.0, 0.0, 0.0));
     }
 
     /// Hull 0 and hull 1 answer different questions, and a real map is the only place to see it.

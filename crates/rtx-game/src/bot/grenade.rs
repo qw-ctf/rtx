@@ -911,8 +911,11 @@ mod tests {
                 fraction: 1.0,
                 endpos: b,
                 plane_normal: Vec3::ZERO,
+                plane_dist: 0.0,
                 start_solid: false,
                 all_solid: false,
+                in_open: true,
+                in_water: false,
             };
         }
         let f = if (a.z - b.z).abs() < 1e-6 {
@@ -924,8 +927,11 @@ mod tests {
             fraction: f,
             endpos: a + (b - a) * f,
             plane_normal: Vec3::new(0.0, 0.0, 1.0),
+            plane_dist: 0.0,
             start_solid: a.z < 0.0,
             all_solid: false,
+            in_open: true,
+            in_water: false,
         }
     }
 
@@ -936,8 +942,11 @@ mod tests {
             fraction: 1.0,
             endpos: b,
             plane_normal: Vec3::ZERO,
+            plane_dist: 0.0,
             start_solid: false,
             all_solid: false,
+            in_open: true,
+            in_water: false,
         };
         let far = |_: f32| Vec3::new(100000.0, 0.0, 0.0); // enemy elsewhere, never touched
         let p0 = Vec3::ZERO;
@@ -964,8 +973,11 @@ mod tests {
             fraction: 1.0,
             endpos: b,
             plane_normal: Vec3::ZERO,
+            plane_dist: 0.0,
             start_solid: false,
             all_solid: false,
+            in_open: true,
+            in_water: false,
         };
         let v0 = launch_velocity(Vec3::new(18.435, 0.0, 0.0)); // level launch (elevation 0) along +x
                                                                // Enemy ~120u ahead, at the height the level throw has fallen to there → the path passes
