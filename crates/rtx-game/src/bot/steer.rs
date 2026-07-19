@@ -14,13 +14,13 @@ use glam::{Vec2, Vec3, Vec3Swizzles};
 
 use super::*;
 use crate::bsp::Bsp;
-use rtx_nav::qphys::{JUMP_VZ, ORIGIN_TO_FEET};
+use rtx_nav::qphys::{JUMP_VZ, ORIGIN_TO_FEET, STEP_HEIGHT};
 use crate::bot::state::{AirCommit, Commit, GateErrand, PlatWait, TerminalArrival};
 use crate::math::{angle_vectors, angles_to, yaw_of};
 use crate::defs::{Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP};
 use crate::game::cstring;
 use crate::nav_build::PlatStatus;
-use crate::navmesh::{CellId, Corridor, LinkCosts, LinkKind, NavGraph};
+use crate::navmesh::{CellId, Corridor, LinkCosts, LinkKind, NavGraph, GRID};
 use crate::nearfield;
 
 /// How long a real network client waits at a reached pickup terminal for the authoritative server
@@ -68,6 +68,14 @@ const WALL_CENTER_WEIGHT: f32 = 1.5;
 /// retained velocity is within one hull-width-plus-slack of the vertical face ahead. A plain open
 /// ledge has no such face and should keep its speed.
 const EDGE_BHOP_WALL_CLEAR: f32 = 40.0;
+/// Horizontal spacing between the down-whiskers that validate an ordinary bhop's curved flight
+/// footprint. One nav cell is fine-grained enough to catch a missing landing strip without turning
+/// every grounded bot frame into a dense BSP survey.
+const BHOP_FLOOR_SAMPLE: f32 = GRID;
+/// The vertical hull trace starts just above the predicted standing origin. Starting exactly on the
+/// floor inherits the trace epsilon from the current contact and can report `start_solid` on flat
+/// ground instead of classifying the floor below the future point.
+const BHOP_FLOOR_TRACE_LIFT: f32 = 1.0;
 
 /// Ordinary route-leg arrival. Most ordinary links intentionally use XY-only arrival: airborne
 /// bhop progression and swimming can cross cells at a very different Z. `require_level` is reserved
@@ -190,6 +198,59 @@ fn bhop_side_open(left: f32, right: f32) -> bool {
 
 fn bhop_carry_fits(runway: f32, speed: f32) -> bool {
     runway >= speed * bhop::T_HOP + bhop::HOP_MARGIN
+}
+
+/// Validate the curved horizontal footprint of one *ordinary* bhop against a caller-supplied floor
+/// oracle. The current velocity heading eases toward the route-corridor heading across the flight;
+/// sampling only either endpoint misses exactly the high-speed corner cut this guards. `horizon` is
+/// capped by the caller to the remaining ordinary runway, so an intentional non-ground traversal
+/// after the runway is never mistaken for an unsupported Walk/Step landing.
+fn ordinary_bhop_floor_supported_by(
+    origin: Vec3,
+    v_xy: Vec2,
+    corridor: Vec2,
+    horizon: f32,
+    mut supported: impl FnMut(Vec3, f32) -> bool,
+) -> bool {
+    let velocity_dir = v_xy.normalize_or_zero();
+    let corridor_dir = corridor.normalize_or_zero();
+    if horizon <= 0.0 || velocity_dir == Vec2::ZERO || corridor_dir == Vec2::ZERO {
+        return true;
+    }
+
+    let samples = (horizon / BHOP_FLOOR_SAMPLE).ceil().clamp(1.0, 16.0) as usize;
+    let stride = horizon / samples as f32;
+    let velocity_yaw = yaw_of(velocity_dir);
+    let turn = wrap180(yaw_of(corridor_dir) - velocity_yaw);
+    let mut probe = origin;
+    for i in 1..=samples {
+        let t = i as f32 / samples as f32;
+        let yaw = (velocity_yaw + turn * t).to_radians();
+        let (sin, cos) = yaw.sin_cos();
+        probe += Vec3::new(cos, sin, 0.0) * stride;
+        // Descending stairs remain ordinary ground: allow the same one-step-per-cell envelope as
+        // `hazard::ledge_ahead`. An open shaft still fails well before a full hop reaches its lip.
+        let distance = stride * i as f32;
+        let max_drop = 8.0 + STEP_HEIGHT * (1.0 + distance / GRID);
+        if !supported(probe, max_drop) {
+            return false;
+        }
+    }
+    true
+}
+
+/// BSP-backed ordinary-bhop floor forecast. Each down-whisker uses the live player hull, so a point
+/// route that looks clear while the bot's 32u-wide body hangs over a lip fails closed. Solid at the
+/// raised start is an obstacle/step rather than a drop; the existing forward-wall controller owns it.
+fn ordinary_bhop_floor_supported(bsp: &Bsp, origin: Vec3, v_xy: Vec2, corridor: Vec2, horizon: f32) -> bool {
+    ordinary_bhop_floor_supported_by(origin, v_xy, corridor, horizon, |probe, max_drop| {
+        let start = probe + Vec3::Z * BHOP_FLOOR_TRACE_LIFT;
+        let end = probe - Vec3::Z * max_drop;
+        let trace = bsp.hull1_trace(start, end);
+        trace.start_solid
+            || trace.all_solid
+            || (trace.fraction < 1.0 && trace.plane_normal.z >= 0.7)
+    })
 }
 
 /// Route distance to the next certified ground-turn handoff, provided only ordinary ground links
@@ -956,6 +1017,18 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // disengage) is `bhop::Bhop::step`'s job. The entry runway bar is deliberately fixed:
     // the old `speed·0.9` bar rose as the bot gained speed and cut runs short mid-air.
     let runway_dist = runway(graph, &bot.route, bot.route_pos, origin);
+    // Use the same speed-scaled route bearing as the hop controller for the floor forecast. At a
+    // bend, checking only current velocity sees the old straight and checking only the waypoint sees
+    // the new one; the sampled curve between them is the physical lobe the controller will attempt.
+    let bhop_look =
+        corridor_point(graph, &bot.route, bot.route_pos, origin, (speed * 0.6).clamp(96.0, 448.0));
+    let ordinary_bhop_floor_risk = on_ground
+        && speed > LEDGE_MIN_SPEED
+        && matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
+        && bsp.is_some_and(|bsp| {
+            let horizon = runway_dist.min(speed * bhop::T_HOP);
+            !ordinary_bhop_floor_supported(bsp, origin, v_xy, bhop_look.xy() - origin.xy(), horizon)
+        });
     // The slalom needs room on both sides of the *current* route bearing. Hull traces include the
     // player's width. A narrow tunnel/ramp therefore runs normally, while the same route may resume
     // hopping as soon as its next landing reaches an open straight.
@@ -998,6 +1071,10 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         || in_water // can't hop while swimming — the engine's pmove turns jumps into swim strokes
         || speed_jump_handoff
         || ground_turn_handoff
+        // A plain bhop is never a gap traversal. If its speed-scaled curved footprint loses
+        // walkable floor, release the hop state on this grounded frame and let the brake below shed
+        // carry before normal waypoint steering resumes. Certified traversal kinds bypass this.
+        || ordinary_bhop_floor_risk
         || hook_active
         || rj_active
         // Spectating: a bhop cmd would overwrite the view yaw in `emit` and clobber the watch —
@@ -1351,7 +1428,6 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         // (race mode, when a line exists) or a *speed-scaled* corridor look-ahead — ~0.6 s of travel
         // ahead (clamped 96–448u) so a fast bot's bearing anticipates the corridor far enough to
         // start curving, rather than chasing the fixed ~2-legs `look_point` it has already overrun.
-        let bhop_look = corridor_point(graph, &bot.route, bot.route_pos, origin, (speed * 0.6).clamp(96.0, 448.0));
         let to_wp = waypoint.xy() - origin.xy();
         // A certified two-phase curl first pursues an open-space "hug" point, then switches to a
         // landing-side aim after crossing the stored along-axis gate.  The points live on the
@@ -2011,13 +2087,11 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         }
     }
 
-    // Ledge brake: a grounded bot on a Walk/Step leg whose *velocity* has drifted well off the corridor
-    // to its waypoint (an overshot corner — e.g. run straight at a stair side) and is one stride from
-    // running off the floor: kill the wish and thrust backward to stop before the lip. After the
-    // navmesh's `ground_along` fix an *aligned* Walk/Step leg always has floor under it, so a drop
-    // along velocity is unintended; and balancing along a thin wall-top keeps velocity aligned to the
-    // waypoints, so the misalignment gate keeps this dead there. Dead too while airborne, bhopping,
-    // speed-/rocket-jumping, or hooking — those own their motion (and the hook/rj overrides below win).
+    // Ledge brake: a grounded bot on a Walk/Step leg brakes either when its speed-scaled bhop curve
+    // loses floor or when its *velocity* has drifted well off the local corridor and is one stride
+    // from a ledge. The former catches a fast corner cut before takeoff; the latter remains the local
+    // overshoot backstop. Both are dead while airborne or on an explicit traversal — those own their
+    // motion (and the hook/rj overrides below win).
     if let Some(bsp) = bsp {
         let braking = on_ground
             && !on_air
@@ -2033,8 +2107,11 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             let aligned = vdir.dot(to_wp.normalize_or_zero()) >= LEDGE_ALIGN_COS;
             let vdir3 = Vec3::new(vdir.x, vdir.y, 0.0);
             let feet = origin - Vec3::new(0.0, 0.0, ORIGIN_TO_FEET);
-            if !aligned && crate::hazard::ledge_ahead(&|p| bsp.is_solid(p), feet, vdir3) {
+            if ordinary_bhop_floor_risk
+                || (!aligned && crate::hazard::ledge_ahead(&|p| bsp.is_solid(p), feet, vdir3))
+            {
                 move_world = -vdir3 * MOVE_SPEED;
+                buttons &= !BUTTON_JUMP;
             }
         }
     }
@@ -2158,6 +2235,48 @@ mod tests {
             !bhop_faces_compound_corner(f32::INFINITY, away),
             "an open ledge must not pay a corner-wall recovery penalty",
         );
+    }
+
+    #[test]
+    fn ordinary_bhop_floor_forecast_catches_a_fast_corner_cut() {
+        let origin = Vec3::ZERO;
+        let velocity = Vec2::new(0.0, -430.0);
+        let corridor = Vec2::new(1.0, 0.6);
+        let horizon = velocity.length() * bhop::T_HOP;
+
+        assert!(ordinary_bhop_floor_supported_by(
+            origin,
+            velocity,
+            corridor,
+            horizon,
+            |_, _| true,
+        ));
+        assert!(!ordinary_bhop_floor_supported_by(
+            origin,
+            velocity,
+            corridor,
+            horizon,
+            |probe, _| probe.x < 128.0,
+        ));
+    }
+
+    #[test]
+    fn ordinary_bhop_floor_forecast_respects_the_ground_runway_horizon() {
+        let mut furthest = 0.0f32;
+        let mut last_drop = 0.0f32;
+        assert!(ordinary_bhop_floor_supported_by(
+            Vec3::ZERO,
+            Vec2::new(320.0, 0.0),
+            Vec2::X,
+            64.0,
+            |probe, max_drop| {
+                furthest = furthest.max(probe.x);
+                last_drop = max_drop;
+                probe.x <= 64.01
+            },
+        ));
+        assert!(furthest <= 64.01, "floor forecast escaped ordinary runway: {furthest}");
+        assert!(last_drop >= 8.0 + 3.0 * STEP_HEIGHT);
     }
 
     #[test]
@@ -2361,6 +2480,31 @@ mod tests {
             );
         }
 
+    }
+
+    /// Optional stock-DM3 binding for the ring-exit failure. The route corridor itself remains on
+    /// the z=56 floor, but a full ordinary hop from the high-speed turn cuts across unsupported
+    /// space; the live hull forecast must therefore force a grounded carve instead of another hop.
+    #[test]
+    fn dm3_ring_exit_rejects_the_ordinary_bhop_corner_cut() {
+        let Ok(path) = std::env::var("RTX_TEST_BSP") else {
+            return;
+        };
+        if !path.to_ascii_lowercase().contains("dm3") {
+            return;
+        }
+        let bytes = std::fs::read(path).expect("read dm3 bsp");
+        let bsp = Bsp::parse(&bytes).expect("parse dm3 bsp");
+        let origin = Vec3::new(426.8, 142.1, 56.03125);
+        let velocity = Vec2::new(44.8, -421.8);
+        let corridor = Vec2::new(704.0, 320.0) - origin.xy();
+        assert!(!ordinary_bhop_floor_supported(
+            &bsp,
+            origin,
+            velocity,
+            corridor,
+            velocity.length() * bhop::T_HOP,
+        ));
     }
 
     #[test]
