@@ -329,6 +329,10 @@ enum ControlCmd {
     /// exists only at runtime). The runtime flies exactly these params and the rj telemetry reports
     /// the real outcome: certification by live trial.
     PlanRjRaw { from: Vec3, tgt: Vec3, pitch: f32, yaw: f32, delay: f32, airtime: f32 },
+    /// Curated link disable (nav-editor A/B): add a prohibitive surcharge to one link's cost so the
+    /// planner routes around it — e.g. a detour the router loves but bots can't execute. Reversible
+    /// only by navmesh rebuild (map restart); the patch driver re-applies its edits after each build.
+    Unlink { link: u32 },
 }
 
 /// Split the first whitespace-delimited token off `s`, returning `(token, rest)` with `rest` trimmed
@@ -499,6 +503,7 @@ fn parse_line(line: &str) -> Result<(i64, ControlCmd), String> {
             }
             ControlCmd::PlanRjRaw { from, tgt, pitch, yaw, delay, airtime }
         }
+        "unlink" => ControlCmd::Unlink { link: parse_u32(rest.split_whitespace().next(), "link")? },
         other => return Err(format!("unknown verb '{other}'")),
     };
     Ok((id, cmd))
@@ -561,6 +566,12 @@ fn exec_cmd(game: &mut GameState, id: i64, cmd: ControlCmd) {
         ControlCmd::PlanRjRaw { from, tgt, pitch, yaw, delay, airtime } => {
             match ensure_global_item_trial_idle(game) {
                 Ok(()) => plant_rj_raw_json(game, from, tgt, pitch, yaw, delay, airtime),
+                Err(e) => Err(e),
+            }
+        }
+        ControlCmd::Unlink { link } => {
+            match ensure_global_item_trial_idle(game) {
+                Ok(()) => unlink_json(game, link),
                 Err(e) => Err(e),
             }
         }
@@ -1431,6 +1442,31 @@ fn plant_rj_raw_json(
     ))
 }
 
+/// Curated link disable — see [`ControlCmd::Unlink`]. Adds a prohibitive surcharge (same magnitude
+/// as the closed-gate/unfit penalties, which every search already treats as "never worth it") to
+/// the link's stored cost, so all bots route around it until the next navmesh rebuild.
+fn unlink_json(game: &mut GameState, link: u32) -> Result<String, String> {
+    const UNLINK_PENALTY: f32 = 100_000.0;
+    let g = game.nav.graph.as_mut().ok_or("navmesh not ready")?;
+    let n = g.links.len() as u32;
+    if link >= n {
+        return Err(format!("link {link} out of range (0..{n})"));
+    }
+    let old = g.links[link as usize].cost;
+    if old >= UNLINK_PENALTY {
+        return Err(format!("link {link} is already unlinked (cost {old})"));
+    }
+    g.links[link as usize].cost = old + UNLINK_PENALTY;
+    let (src, dst) = (g.cell_origin(g.link_source(link)), g.cell_origin(g.link_target(link)));
+    Ok(format!(
+        "{{\"link\":{link},\"oldCost\":{},\"newCost\":{},\"src\":{},\"tgt\":{}}}",
+        jnum(old),
+        jnum(old + UNLINK_PENALTY),
+        jvec3(src),
+        jvec3(dst),
+    ))
+}
+
 /// Probe the build-time curl certifier — see `ControlCmd::Probe`.
 fn probe_json(game: &GameState, takeoff: Vec3, tgt: Vec3, psi0: f32, runway: f32) -> Result<String, String> {
     let bsp = game.nav.bsp.as_ref().ok_or("no bsp")?;
@@ -2266,6 +2302,8 @@ mod tests {
             )
         );
         assert!(parse_line("7 planrjraw 0 0 0 1 1 1 65 158 9.0").unwrap_err().contains("delay"));
+        assert_eq!(parse_line("8 unlink 412").unwrap(), (8, ControlCmd::Unlink { link: 412 }));
+        assert!(parse_line("9 unlink").unwrap_err().contains("link"));
     }
 
     #[test]
