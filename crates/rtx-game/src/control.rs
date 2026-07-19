@@ -319,6 +319,16 @@ enum ControlCmd {
     /// nearest `from` (the run-up start), taking off at `takeoff` (the lip), to the cell nearest `tgt`,
     /// requiring `v_req` ups at the lip. Lets us fly the takeoff regime before the generator emits it.
     PlanLink { from: Vec3, takeoff: Vec3, tgt: Vec3, v_req: f32 },
+    /// Hand-plant a `RocketJump` link (harness bring-up): certify a real two-phase RJ arc from the
+    /// cell nearest `from` onto a landing cell near `tgt` with the generator's physics but without
+    /// its range caps, and insert it into the live graph — works even when the graph was built with
+    /// `rtx_bot_rocketjump 0` (zero generated RJ links). `rj <bot> <link>` then flies it.
+    PlanRj { from: Vec3, tgt: Vec3 },
+    /// Hand-plant a `RocketJump` link with caller-supplied fire params and NO offline certification
+    /// — for lift-assisted jumps the static solver can't model (a rising plat's launch velocity
+    /// exists only at runtime). The runtime flies exactly these params and the rj telemetry reports
+    /// the real outcome: certification by live trial.
+    PlanRjRaw { from: Vec3, tgt: Vec3, pitch: f32, yaw: f32, delay: f32, airtime: f32 },
 }
 
 /// Split the first whitespace-delimited token off `s`, returning `(token, rest)` with `rest` trimmed
@@ -464,6 +474,31 @@ fn parse_line(line: &str) -> Result<(i64, ControlCmd), String> {
             let v_req = parse_f32(t.next(), "v_req")?;
             ControlCmd::PlanLink { from, takeoff, tgt, v_req }
         }
+        "planrj" => {
+            let mut t = rest.split_whitespace();
+            let from = Vec3::new(parse_f32(t.next(), "fx")?, parse_f32(t.next(), "fy")?, parse_f32(t.next(), "fz")?);
+            let tgt = Vec3::new(parse_f32(t.next(), "tx")?, parse_f32(t.next(), "ty")?, parse_f32(t.next(), "tz")?);
+            ControlCmd::PlanRj { from, tgt }
+        }
+        "planrjraw" => {
+            let mut t = rest.split_whitespace();
+            let from = Vec3::new(parse_f32(t.next(), "fx")?, parse_f32(t.next(), "fy")?, parse_f32(t.next(), "fz")?);
+            let tgt = Vec3::new(parse_f32(t.next(), "tx")?, parse_f32(t.next(), "ty")?, parse_f32(t.next(), "tz")?);
+            let pitch = parse_f32(t.next(), "pitch")?;
+            let yaw = parse_f32(t.next(), "yaw")?;
+            let delay = parse_f32(t.next(), "delay")?;
+            let airtime = match t.next() {
+                Some(tok) => tok.parse::<f32>().map_err(|_| "bad airtime".to_string())?,
+                None => 1.5,
+            };
+            if !(0.0..=2.0).contains(&delay) {
+                return Err("delay out of range (0..=2 s)".into());
+            }
+            if !(0.1..=5.0).contains(&airtime) {
+                return Err("airtime out of range (0.1..=5 s)".into());
+            }
+            ControlCmd::PlanRjRaw { from, tgt, pitch, yaw, delay, airtime }
+        }
         other => return Err(format!("unknown verb '{other}'")),
     };
     Ok((id, cmd))
@@ -514,6 +549,18 @@ fn exec_cmd(game: &mut GameState, id: i64, cmd: ControlCmd) {
         ControlCmd::PlanLink { from, takeoff, tgt, v_req } => {
             match ensure_global_item_trial_idle(game) {
                 Ok(()) => plant_link_json(game, from, takeoff, tgt, v_req),
+                Err(e) => Err(e),
+            }
+        }
+        ControlCmd::PlanRj { from, tgt } => {
+            match ensure_global_item_trial_idle(game) {
+                Ok(()) => plant_rj_json(game, from, tgt),
+                Err(e) => Err(e),
+            }
+        }
+        ControlCmd::PlanRjRaw { from, tgt, pitch, yaw, delay, airtime } => {
+            match ensure_global_item_trial_idle(game) {
+                Ok(()) => plant_rj_raw_json(game, from, tgt, pitch, yaw, delay, airtime),
                 Err(e) => Err(e),
             }
         }
@@ -1307,6 +1354,79 @@ fn plant_link_json(game: &mut GameState, from: Vec3, takeoff: Vec3, tgt: Vec3, v
         jvec3(curl_entry_aim),
         jnum(curl_switch_dist),
         jvec3(curl_landing_aim),
+    ))
+}
+
+/// Hand-plant a rocket-jump link — see [`ControlCmd::PlanRj`]. Snapshots the live gravity and the
+/// `rj` self-boost cvar exactly like the build does (`nav_build.rs`), so the offline blast solve
+/// matches the knockback the runtime flight will get. The solve itself (targeted, cap-free but
+/// fully certified) lives in [`NavGraph::plant_rocket_jump`](crate::navmesh); the reply reads the
+/// inserted link back through the same accessors `links_json` uses.
+fn plant_rj_json(game: &mut GameState, from: Vec3, tgt: Vec3) -> Result<String, String> {
+    let params = crate::navmesh::RocketJumpParams {
+        gravity: {
+            let g = game.host.cvar(c"sv_gravity");
+            if g > 0.0 { g } else { 800.0 }
+        },
+        rj_extra: game.host.cvar(c"rj"),
+    };
+    let nav = &mut game.nav;
+    let bsp = nav.bsp.as_ref().ok_or("no bsp loaded")?;
+    let g = nav.graph.as_mut().ok_or("navmesh not ready")?;
+    let li = g.plant_rocket_jump(bsp, from, tgt, params)?;
+    let (src_cell, tgt_cell) = (g.link_source(li), g.link_target(li));
+    let (src, dst) = (g.cell_origin(src_cell), g.cell_origin(tgt_cell));
+    let tr = g.rocket_jump_of_link(li).ok_or("planted link lost its traversal")?;
+    Ok(format!(
+        "{{\"link\":{li},\"from_cell\":{src_cell},\"to_cell\":{tgt_cell},\"src\":{},\"tgt\":{},\
+         \"fire_pitch\":{},\"fire_yaw\":{},\"fire_delay\":{},\"airtime\":{},\"self_damage\":{},\
+         \"v0\":{},\"blast\":{},\"land\":{}}}",
+        jvec3(src),
+        jvec3(dst),
+        jnum(tr.fire_angles.x),
+        jnum(tr.fire_angles.y),
+        jnum(tr.fire_delay),
+        jnum(tr.airtime),
+        jnum(tr.self_damage),
+        jvec3(tr.v0),
+        jvec3(tr.blast),
+        jvec3(tr.land),
+    ))
+}
+
+/// Hand-plant an uncertified rocket-jump link with explicit fire params — see
+/// [`ControlCmd::PlanRjRaw`]. `self_damage` is a nominal full-blast estimate (the runtime fitness
+/// gate and health cost accounting need an honest number; ~35 is a typical point-blank floor shot).
+fn plant_rj_raw_json(
+    game: &mut GameState,
+    from: Vec3,
+    tgt: Vec3,
+    pitch: f32,
+    yaw: f32,
+    delay: f32,
+    airtime: f32,
+) -> Result<String, String> {
+    const RAW_SELF_DAMAGE: f32 = 35.0;
+    let g = game.nav.graph.as_mut().ok_or("navmesh not ready")?;
+    let li = g.plant_rocket_jump_raw(
+        from,
+        tgt,
+        Vec3::new(pitch, yaw, 0.0),
+        delay,
+        airtime,
+        RAW_SELF_DAMAGE,
+    )?;
+    let (src_cell, tgt_cell) = (g.link_source(li), g.link_target(li));
+    let (src, dst) = (g.cell_origin(src_cell), g.cell_origin(tgt_cell));
+    Ok(format!(
+        "{{\"link\":{li},\"from_cell\":{src_cell},\"to_cell\":{tgt_cell},\"src\":{},\"tgt\":{},\
+         \"fire_pitch\":{},\"fire_yaw\":{},\"fire_delay\":{},\"airtime\":{},\"certified\":false}}",
+        jvec3(src),
+        jvec3(dst),
+        jnum(pitch),
+        jnum(yaw),
+        jnum(delay),
+        jnum(airtime),
     ))
 }
 
@@ -2115,6 +2235,36 @@ mod tests {
             (2, ControlCmd::Goto { bot: 1, pos: Vec3::ZERO })
         );
         assert_eq!(parse_line("9 rj 1 412").unwrap(), (9, ControlCmd::Rj { bot: 1, link: 412 }));
+    }
+
+    #[test]
+    fn parses_planrj() {
+        assert_eq!(
+            parse_line("4 planrj 608 880 -290 1152 640 86").unwrap(),
+            (
+                4,
+                ControlCmd::PlanRj {
+                    from: Vec3::new(608.0, 880.0, -290.0),
+                    tgt: Vec3::new(1152.0, 640.0, 86.0),
+                }
+            )
+        );
+        assert!(parse_line("5 planrj 608 880 -290").unwrap_err().contains("tx"));
+        assert_eq!(
+            parse_line("6 planrjraw 608 880 -290 1152 640 86 65 158 0.3").unwrap(),
+            (
+                6,
+                ControlCmd::PlanRjRaw {
+                    from: Vec3::new(608.0, 880.0, -290.0),
+                    tgt: Vec3::new(1152.0, 640.0, 86.0),
+                    pitch: 65.0,
+                    yaw: 158.0,
+                    delay: 0.3,
+                    airtime: 1.5,
+                }
+            )
+        );
+        assert!(parse_line("7 planrjraw 0 0 0 1 1 1 65 158 9.0").unwrap_err().contains("delay"));
     }
 
     #[test]

@@ -1440,6 +1440,160 @@ impl NavGraph {
         self.rocket_jumps.tag(self.links.len() - 1, r);
     }
 
+    /// Hand-plant a rocket-jump link post-build (harness / bring-up): run the real two-phase RJ
+    /// ballistics from the cell nearest `from` onto a landing cell near `tgt`, unconstrained by the
+    /// automatic generator's search caps — `RJ_RANGE_XY` / `RJ_MIN_RISE..=RJ_MAX_RISE` and the
+    /// useful-apex rule bound the map-wide candidate *spray*, not physics, and a curated plant has
+    /// already decided the jump is wanted. Certification is NOT relaxed: the shot must simulate
+    /// clean on both hulls, resolve to a standable landing cell within the standard tolerance
+    /// (`RJ_LAND_XY`/`RJ_LAND_Z`), apex past it by `RJ_APEX_MARGIN`, and survive the same
+    /// perturbation check as a generated link. The yaw sweeps ±20° around the straight-line
+    /// bearing so an off-axis opening (e.g. a window) the 8-octant search never aims at can still
+    /// be threaded. The cheapest surviving arc is inserted; the runtime flies a planted link
+    /// exactly like a generated one. Works on a graph built with rocket-jump generation off.
+    /// Not used by the automatic build.
+    pub fn plant_rocket_jump(
+        &mut self,
+        bsp: &Bsp,
+        from: Vec3,
+        tgt: Vec3,
+        params: RocketJumpParams,
+    ) -> Result<u32, String> {
+        /// How far the resolved landing cell may sit from the requested `tgt` and still count as
+        /// "the target": a few grid columns of slack, since the caller aims at a ledge, not a cell.
+        const TGT_XY: f32 = 96.0;
+        const TGT_Z: f32 = 64.0;
+        let from_cell = self.nearest(from).ok_or("no cell near from")?;
+        let a = self.cells[from_cell as usize].origin;
+        if bsp.is_liquid_at(a) {
+            return Err("submerged takeoff: can't jump to start the rocket jump".into());
+        }
+        let is_solid = |p: Vec3| bsp.is_solid(p);
+        let rocket_solid = |p: Vec3| bsp.is_point_solid(p);
+        // Fire opposite the travel direction, like the generator.
+        let to_xy = tgt.xy() - a.xy();
+        if to_xy.length() < 1.0 {
+            return Err("tgt is directly above from; no bearing to fire against".into());
+        }
+        let base_yaw = to_xy.y.atan2(to_xy.x).to_degrees() + 180.0;
+        let mut best: Option<(f32, Link, RocketJumpTraversal)> = None;
+        let mut clean = 0u32;
+        let mut best_miss = f32::INFINITY;
+        // Full-circle yaw sweep, 15° steps: a curated plant is a one-shot solve, so unlike the
+        // map-wide generator we can afford to try every wall — the blast's push direction is set by
+        // which surface the rocket finds, and the geometry that reaches an off-axis target is often
+        // a wall far from the straight-line bearing.
+        for yaw_step in 0..24 {
+            let yaw_off = yaw_step as f32 * 15.0 - 180.0;
+            for pitch in RJ_PITCHES {
+                for delay in RJ_DELAYS {
+                    let angles = Vec3::new(pitch, base_yaw + yaw_off, 0.0);
+                    let Some(s) =
+                        simulate_rocket_jump(is_solid, rocket_solid, a, angles, delay, params)
+                    else {
+                        continue;
+                    };
+                    clean += 1;
+                    best_miss = best_miss.min((s.land - tgt).length());
+                    // Harness diagnostics for a failing plant: where does every clean arc land?
+                    if std::env::var_os("RTX_PLANT_RJ_DEBUG").is_some() {
+                        eprintln!(
+                            "planrj arc: yaw_off {yaw_off} pitch {pitch} delay {delay} -> land \
+                             {:.0} {:.0} {:.0} (miss {:.0}u, apex {:.0})",
+                            s.land.x,
+                            s.land.y,
+                            s.land.z,
+                            (s.land - tgt).length(),
+                            s.pos_blast.z + s.v0.z.max(0.0).powi(2) / (2.0 * params.gravity),
+                        );
+                    }
+                    let Some(to) = self.nearest_within(s.land, RJ_LAND_XY, RJ_LAND_Z) else {
+                        continue;
+                    };
+                    if to == from_cell {
+                        continue;
+                    }
+                    let b = self.cells[to as usize].origin;
+                    if (b.xy() - tgt.xy()).length() > TGT_XY || (b.z - tgt.z).abs() > TGT_Z {
+                        continue;
+                    }
+                    let apex = s.pos_blast.z + s.v0.z.max(0.0).powi(2) / (2.0 * params.gravity);
+                    if apex >= b.z + RJ_APEX_MARGIN
+                        && rj_perturb_ok(is_solid, rocket_solid, a, angles, delay, params, b)
+                    {
+                        let cost = rocket_jump_cost(s.t_blast, s.airtime, s.vz_land, s.self_damage);
+                        if best.as_ref().is_none_or(|(bc, _, _)| cost < *bc) {
+                            let link = Link { from: from_cell, to, kind: LinkKind::RocketJump, cost };
+                            let tr = RocketJumpTraversal {
+                                fire_angles: angles,
+                                fire_delay: delay,
+                                blast: s.blast,
+                                pos_blast: s.pos_blast,
+                                v0: s.v0,
+                                land: s.land,
+                                airtime: s.airtime,
+                                self_damage: s.self_damage,
+                            };
+                            best = Some((cost, link, tr));
+                        }
+                    }
+                }
+            }
+        }
+        let Some((_, link, tr)) = best else {
+            return Err(format!(
+                "no certifiable arc: {clean} clean simulations, best landing miss {best_miss:.0}u \
+                 from tgt {:.0} {:.0} {:.0}",
+                tgt.x, tgt.y, tgt.z
+            ));
+        };
+        self.push_rocket_jump(link, tr);
+        Ok((self.links.len() - 1) as u32)
+    }
+
+    /// Hand-plant a rocket-jump link with caller-supplied fire parameters and NO offline
+    /// certification — the bring-up primitive for lift-assisted rocket jumps, which the static
+    /// solver cannot certify: a rising `func_plat` adds launch velocity that exists only at
+    /// runtime (see the pentlift→window refutation in `tests/plant_rocket_jump_dm3.rs`). The
+    /// traversal is synthesized — the runtime flies jump+fire with exactly these angles and delay
+    /// and reports the real outcome through the standard rj telemetry, so certification happens
+    /// live, by trial. Harness-only; never emitted by the automatic build.
+    pub fn plant_rocket_jump_raw(
+        &mut self,
+        from: Vec3,
+        tgt: Vec3,
+        fire_angles: Vec3,
+        fire_delay: f32,
+        airtime: f32,
+        self_damage: f32,
+    ) -> Result<u32, String> {
+        let from_cell = self.nearest(from).ok_or("no cell near from")?;
+        let to_cell = self.nearest(tgt).ok_or("no cell near tgt")?;
+        if from_cell == to_cell {
+            return Err("from and tgt resolve to the same cell".into());
+        }
+        let a = self.cells[from_cell as usize].origin;
+        let b = self.cells[to_cell as usize].origin;
+        // Price the stated flight like a certified link (exact pricing is irrelevant for a
+        // puppet-flown drill leg; it just has to be finite and honest about the health cost).
+        let cost = rocket_jump_cost(fire_delay, airtime, 0.0, self_damage);
+        let tr = RocketJumpTraversal {
+            fire_angles,
+            fire_delay,
+            blast: a,
+            pos_blast: a,
+            v0: Vec3::ZERO,
+            land: b,
+            airtime,
+            self_damage,
+        };
+        self.push_rocket_jump(
+            Link { from: from_cell, to: to_cell, kind: LinkKind::RocketJump, cost },
+            tr,
+        );
+        Ok((self.links.len() - 1) as u32)
+    }
+
     /// Append a free-standing cell (not from the column carve) and index it. Used for plat
     /// surfaces, which don't exist in the static world hull.
     fn add_cell(&mut self, origin: Vec3) -> CellId {
