@@ -683,9 +683,6 @@ impl GameState {
         // and the previous map's race routes with it.
         self.nav = navmesh::NavState::default();
         self.race = race::RaceState::default();
-        // Parse the map BSP now (mapname is set), so `pointcontents`/world traces have geometry to
-        // read from the first frame — independent of bots. The navmesh worker later shares this Arc.
-        self.load_map_bsp();
 
         // The worldspawn block configures `world` and runs the global precaches.
         let Some(world_fields) = self.parse_block() else {
@@ -696,6 +693,11 @@ impl GameState {
         self.setup_string_refs(EntId::WORLD);
         self.apply_fields(EntId::WORLD, &world_fields);
         world::worldspawn(self);
+        // Parse the map BSP now — `worldspawn` has set `level.mapname`, so this can find the file, and
+        // it runs before any entity spawns so `pointcontents`/world traces (and the netclient's item
+        // settling) have geometry from the first query. Independent of bots; the navmesh worker later
+        // shares this Arc.
+        self.load_map_bsp();
         self.host.flush_signon();
 
         // Parse and spawn each remaining entity one at a time, flushing the signon after each
