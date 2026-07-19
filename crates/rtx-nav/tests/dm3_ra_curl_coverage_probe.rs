@@ -7,6 +7,7 @@
 //! Env-gated on RTX_TEST_BSP; changes nothing.
 
 use glam::Vec3;
+use rtx_nav::bsp::Bsp;
 use rtx_nav::navmesh::{build_navmesh, CellId, LinkCosts, LinkKind, NavGraph, SpeedJumpParams};
 
 fn params(curl: bool) -> SpeedJumpParams {
@@ -32,12 +33,12 @@ fn dm3_ra_curl_coverage() {
         return;
     };
     let bytes = std::fs::read(&path).expect("read bsp");
+    let bsp = Bsp::parse(&bytes).expect("parse bsp");
 
     // double_jump=false mirrors the live green config (rtx_doublejump 0).
     for curl in [false, true] {
-        let build = build_navmesh(bytes.clone(), vec![], vec![], vec![], None, false, Some(params(curl)), None)
-            .expect("build navmesh");
-        let graph = &build.1;
+        let build = build_navmesh(&bsp, vec![], vec![], vec![], None, false, Some(params(curl)), None);
+        let graph = &build;
         let summary = graph.summary();
         eprintln!(
             "curl={curl}: cells={} links={} speed_jump={}",

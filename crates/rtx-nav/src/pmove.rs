@@ -315,8 +315,11 @@ mod tests {
             fraction,
             endpos: Vec3::ZERO,
             plane_normal: normal,
+            plane_dist: 0.0,
             start_solid,
             all_solid,
+            in_open: !start_solid,
+            in_water: false,
         }
     }
 

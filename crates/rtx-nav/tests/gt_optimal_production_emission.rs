@@ -21,6 +21,7 @@
 //! corridor heading `runway_yaw`) using only the crate's public functions.
 
 use glam::{Vec3, Vec3Swizzles};
+use rtx_nav::bsp::Bsp;
 use rtx_nav::navmesh::{
     build_navmesh, ground_turn_air_cmd, ground_turn_ground_cmd_optimal, ground_turn_launch_cmd,
     ground_turn_should_launch_optimal, CellId, GroundTurnCurl, LinkKind, NavGraph, SpeedJumpParams,
@@ -123,9 +124,9 @@ fn runtime_rollout(graph: &NavGraph, bsp: &rtx_nav::bsp::Bsp, from: CellId, gt: 
 #[test]
 fn gt_optimal_production_emission() {
     let bytes = std::fs::read(BSP_PATH).unwrap_or_else(|e| panic!("read dm3.bsp at {BSP_PATH}: {e}"));
-    let build = build_navmesh(bytes, vec![], vec![], vec![], None, false, Some(prod_params()), None)
-        .expect("build dm3 navmesh");
-    let (bsp, graph) = (&build.0, &build.1);
+    let parsed = Bsp::parse(&bytes).expect("parse dm3 bsp");
+    let build = build_navmesh(&parsed, vec![], vec![], vec![], None, false, Some(prod_params()), None);
+    let (bsp, graph) = (&parsed, &build);
 
     // (1) The production path emits v3 contracts.
     let mut v3_links: Vec<(usize, CellId, CellId, f32, GroundTurnCurl)> = Vec::new();

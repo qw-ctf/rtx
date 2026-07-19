@@ -12,6 +12,7 @@
 //!   "cells":[[x,y,z],...],"links":[[from,to,"Kind",cost],...]}`
 //! Cells are origin positions; link indexes refer into `cells`.
 
+use rtx_nav::bsp::Bsp;
 use rtx_nav::navmesh::{build_navmesh, LinkKind, RocketJumpParams};
 
 fn main() {
@@ -29,12 +30,11 @@ fn main() {
         }
     };
     let rocket_jump = rjump.then_some(RocketJumpParams { gravity: 800.0, rj_extra: 0.0 });
-    let Some((_bsp, graph)) =
-        build_navmesh(bytes, vec![], vec![], vec![], None, false, None, rocket_jump)
-    else {
+    let Some(bsp) = Bsp::parse(&bytes) else {
         eprintln!("unsupported/malformed BSP: {path}");
         std::process::exit(1);
     };
+    let graph = build_navmesh(&bsp, vec![], vec![], vec![], None, false, None, rocket_jump);
     let stem = std::path::Path::new(&path)
         .file_stem()
         .and_then(|s| s.to_str())

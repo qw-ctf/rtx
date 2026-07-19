@@ -15,6 +15,7 @@
 //! flip the drill back to a certified `planrj` and celebrate.
 
 use glam::{Vec3, Vec3Swizzles};
+use rtx_nav::bsp::Bsp;
 use rtx_nav::navmesh::{build_navmesh, LinkKind, RocketJumpParams};
 
 /// Pent lift base and window ledge, from the corpus-derived spawn-7 targets
@@ -36,9 +37,8 @@ fn dm3_pentlift_window_rj_plants() {
 
     // Mirror the live green config: no hooks, no double jump, no speed-jump
     // params needed for this drill, and — decisively — rocket_jump: None.
-    let build = build_navmesh(bytes, vec![], vec![], vec![], None, false, None, None)
-        .expect("build navmesh");
-    let (bsp, mut graph) = (build.0, build.1);
+    let bsp = Bsp::parse(&bytes).expect("parse bsp");
+    let mut graph = build_navmesh(&bsp, vec![], vec![], vec![], None, false, None, None);
     let rj_before = (0..graph.links.len() as u32)
         .filter(|&li| graph.link_kind(li) == LinkKind::RocketJump)
         .count();

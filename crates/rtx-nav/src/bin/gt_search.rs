@@ -39,6 +39,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use glam::Vec3;
+use rtx_nav::bsp::Bsp;
 use rtx_nav::navmesh::{build_navmesh, CellId, Link, SpeedJumpParams, SpeedJumpTraversal};
 
 const GT_SEARCH_VERSION: &str = "gt-search/1";
@@ -197,10 +198,11 @@ fn main() {
     // as crates/rtx-nav/tests/dm3_ra_curl_coverage_probe.rs, and the same build_navmesh entry
     // point production/tests use — no bespoke loading path.
     let params = SpeedJumpParams { gravity: 800.0, accel: 10.0, maxspeed: 320.0, friction: 4.0, stopspeed: 100.0, curl: true };
-    let Some((bsp, graph)) = build_navmesh(bytes.clone(), vec![], vec![], vec![], None, false, Some(params), None) else {
-        eprintln!("failed to build navmesh from {:?}", args.bsp);
+    let Some(bsp) = Bsp::parse(&bytes) else {
+        eprintln!("failed to parse BSP {:?}", args.bsp);
         std::process::exit(1);
     };
+    let graph = build_navmesh(&bsp, vec![], vec![], vec![], None, false, Some(params), None);
 
     // Stable modulo-N shard over the ledge-cell space, ascending cell-id order.
     let n_cells = graph.cells.len() as CellId;

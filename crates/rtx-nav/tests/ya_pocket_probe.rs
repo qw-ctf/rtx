@@ -14,6 +14,7 @@
 //! Changes nothing; prints evidence for the fix decision.
 
 use glam::{Vec3, Vec3Swizzles};
+use rtx_nav::bsp::Bsp;
 use rtx_nav::navmesh::build_navmesh;
 
 #[test]
@@ -23,8 +24,8 @@ fn ya_pocket_probe() {
         return;
     };
     let bytes = std::fs::read(&path).expect("read bsp");
-    let (bsp, graph) = build_navmesh(bytes, vec![], vec![], vec![], None, false, None, None)
-        .expect("build navmesh");
+    let bsp = Bsp::parse(&bytes).expect("parse bsp");
+    let graph = build_navmesh(&bsp, vec![], vec![], vec![], None, false, None, None);
 
     // 1. Solid bands in the severed strip and its neighbors.
     for x in [1344.0f32, 1376.0, 1408.0] {
