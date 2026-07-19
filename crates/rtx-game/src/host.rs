@@ -205,13 +205,6 @@ pub(crate) trait ClientHost {
     fn cvar_set(&self, name: &CStr, value: &CStr);
     /// A serverinfo key (and the pseudo-key `"modelname"`).
     fn infokey<'b>(&self, ent: EntId, key: &CStr, buf: &'b mut [u8]) -> &'b str;
-    /// Trace through the map's **player** hull (hull 1) — "would a player fit". The host owns the
-    /// map, so it owns this, and it must answer from the moment a map is bound, because the world is
-    /// *spawned* against it.
-    fn world_trace(&self, start: Vec3, end: Vec3) -> rtx_nav::bsp::HullTrace;
-    /// Trace through the map's **point** hull (hull 0) — "is there anything in the way". What
-    /// QuakeC's `traceline` asks, and the right question for sight and for shooting.
-    fn world_trace_point(&self, start: Vec3, end: Vec3) -> rtx_nav::bsp::HullTrace;
     /// The bounds of inline submodel `n` — the shape of a door, plat or trigger.
     fn submodel_bounds(&self, n: usize) -> Option<(Vec3, Vec3)>;
     /// Read a whole file, searching the gamedir then the base game.
@@ -268,24 +261,6 @@ impl HostApi {
     #[cfg(feature = "netclient")]
     pub(crate) fn new_client(host: &'static dyn ClientHost, ents: *const Entity) -> Self {
         Self { backend: Backend::Client(host), ents }
-    }
-
-    /// Trace the player hull, client-side. See [`ClientHost::world_trace`].
-    #[cfg(feature = "netclient")]
-    pub(crate) fn world_trace(&self, start: Vec3, end: Vec3) -> rtx_nav::bsp::HullTrace {
-        match self.backend {
-            Backend::Client(c) => c.world_trace(start, end),
-            Backend::Pr2(_) => unreachable!("client-only: a server traces through its own engine"),
-        }
-    }
-
-    /// Trace the point hull, client-side. See [`ClientHost::world_trace_point`].
-    #[cfg(feature = "netclient")]
-    pub(crate) fn world_trace_point(&self, start: Vec3, end: Vec3) -> rtx_nav::bsp::HullTrace {
-        match self.backend {
-            Backend::Client(c) => c.world_trace_point(start, end),
-            Backend::Pr2(_) => unreachable!("client-only: a server traces through its own engine"),
-        }
     }
 
     /// An inline submodel's bounds, client-side. See [`ClientHost::submodel_bounds`].
@@ -675,24 +650,6 @@ impl HostApi {
             )
         };
         cstr_from_buf(buf)
-    }
-
-    /// `G_TRACELINE` — trace a line, writing results into the engine globals (the caller
-    /// reads `trace_*` afterwards). `nomonsters` follows QuakeC (`TRUE` skips monsters).
-    pub fn traceline(&self, start: Vec3, end: Vec3, nomonsters: bool, ignore: EntId) {
-        unsafe {
-            (self.syscall())(
-                B::TraceLine as isize,
-                pf(start.x),
-                pf(start.y),
-                pf(start.z),
-                pf(end.x),
-                pf(end.y),
-                pf(end.z),
-                nomonsters as isize,
-                ignore.0 as isize,
-            )
-        };
     }
 
     /// `G_DROPTOFLOOR` — drop an entity straight down onto the floor; returns whether it

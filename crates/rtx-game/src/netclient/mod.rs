@@ -17,8 +17,9 @@
 //!   ─────────────────                     ──────────────────
 //!   engine fills EntVars       ──▶        mirror writes EntVars from svc_playerinfo /
 //!                                         svc_packetentities / stats
-//!   engine answers traceline,  ──▶        NetHost answers from the map's own BSP
-//!     pointcontents, cvars                (rtx-nav) and its own cvar store
+//!   engine answers cvars       ──▶        NetHost answers from its own cvar store
+//!   (traceline & pointcontents are no longer host-specific: both embodiments answer them from the
+//!    parsed BSP + entity array — GameState::sv_trace / GameState::pointcontents)
 //!   set_bot_cmd → SV_RunCmd    ──▶        cmd sink → clc_move on the wire
 //!   server runs trigger touches──▶        the server does it for us (we're a real client)
 //! ```

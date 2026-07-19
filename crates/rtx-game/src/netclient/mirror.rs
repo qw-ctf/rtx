@@ -2677,8 +2677,8 @@ mod tests {
 
     /// Nobody looks through a map we haven't got.
     ///
-    /// A trace with no BSP behind it reports solid ([`super::host::no_map`]), so `anyone_looked` says
-    /// no and every item keeps whatever we last knew about it. That's fail-closed, and the direction
+    /// A trace with no BSP behind it fails closed (`sv_trace` reports all-solid), so `anyone_looked`
+    /// says no and every item keeps whatever we last knew about it. That's fail-closed, and the direction
     /// worth failing in: a client that concluded "taken" from a trace it couldn't answer would empty
     /// the map of items on the strength of not having read it, and send its bots to stand hopefully
     /// over bare floor. It's also why the tests around this one are honest about asserting so little
