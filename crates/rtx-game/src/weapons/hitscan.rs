@@ -158,14 +158,15 @@ impl GameState {
 
     // --- lightning ---
 
-    fn lightning_hit(&mut self, from: EntId, damage: f32) {
-        let endpos = self.globals.trace_endpos;
-        let trace_ent = EntId::from_prog(self.globals.trace_ent);
+    /// The lightning blood + damage for one bolt trace that hit `hit` at `endpos`. Takes the impact
+    /// from the caller's [`TraceResult`] rather than the shared `trace_*` globals — the same values
+    /// the LG traceline produced, but robust to any intervening trace.
+    fn lightning_hit(&mut self, endpos: Vec3, hit: EntId, from: EntId, damage: f32) {
         self.host.write_te(MsgDest::Multicast, Te::LightningBlood);
         self.write_coords(MsgDest::Multicast, endpos);
         self.host.multicast(endpos, Multicast::Pvs);
-        self.entities[trace_ent].deathtype = DeathType::LightningBeam;
-        self.t_damage(trace_ent, from, from, damage);
+        self.entities[hit].deathtype = DeathType::LightningBeam;
+        self.t_damage(hit, from, from, damage);
     }
 
     /// `LightningDamage` — three parallel traces along the bolt.
@@ -182,7 +183,7 @@ impl GameState {
             return;
         }
         if self.entities[e1].v.takedamage != TakeDamage::No {
-            self.lightning_hit(from, damage);
+            self.lightning_hit(tr.endpos, e1, from, damage);
         }
 
         let start = p1 + f;
@@ -196,7 +197,7 @@ impl GameState {
             return;
         }
         if e2 != e1 && self.entities[e2].v.takedamage != TakeDamage::No {
-            self.lightning_hit(from, damage);
+            self.lightning_hit(tr.endpos, e2, from, damage);
         }
 
         let start = p1 - f;
@@ -210,7 +211,7 @@ impl GameState {
             return;
         }
         if e3 != e1 && e3 != e2 && self.entities[e3].v.takedamage != TakeDamage::No {
-            self.lightning_hit(from, damage);
+            self.lightning_hit(tr.endpos, e3, from, damage);
         }
     }
 

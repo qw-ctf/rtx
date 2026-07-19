@@ -33,8 +33,9 @@ pub const GAME_API_VERSION: i32 = 16;
 pub(crate) type SpawnFields = Vec<(String, String)>;
 pub(crate) type SpawnFn = fn(&mut GameState, EntId) -> bool;
 
-/// The result of a [`GameState::traceline`], read out of the engine's `trace_*` globals.
-/// (Some fields are not yet consumed by the ported subset but complete the trace contract.)
+/// The result of a [`GameState::traceline`] — computed by [`GameState::sv_trace`] and mirrored into
+/// the engine-shared `trace_*` globals. (Some fields are not yet consumed by the ported subset but
+/// complete the trace contract.)
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code)]
 pub struct TraceResult {
@@ -43,6 +44,7 @@ pub struct TraceResult {
     pub fraction: f32,
     pub endpos: Vec3,
     pub plane_normal: Vec3,
+    pub plane_dist: f32,
     pub ent: EntId,
     pub in_open: bool,
     pub in_water: bool,
@@ -433,27 +435,14 @@ impl GameState {
         id
     }
 
-    /// `traceline` — trace from `start` to `end` and read the result out of the engine
-    /// globals into a value (so callers don't juggle the shared `trace_*` block).
+    /// `traceline` — trace from `start` to `end`, ignoring `ignore` (the shooter), and return the
+    /// result. Answered from our own parsed BSP + entity array ([`sv_trace`](Self::sv_trace)) in both
+    /// embodiments — no engine syscall — then mirrored into the shared `trace_*` globals, which a
+    /// touch callback still reads stale (see [`write_trace_globals`](Self::write_trace_globals)).
     pub(crate) fn traceline(&mut self, start: Vec3, end: Vec3, nomonsters: bool, ignore: EntId) -> TraceResult {
-        #[cfg(feature = "netclient")]
-        if self.host.is_client() {
-            return self.client_traceline(start, end, ignore);
-        }
-        // The traceline builtin takes the ignore entity as an edict *index* (it runs
-        // `EdictNum(arg)`), unlike entvars `.entity` fields which store byte offsets.
-        self.host.traceline(start, end, nomonsters, ignore);
-        let g = &self.globals;
-        TraceResult {
-            allsolid: g.trace_allsolid != 0.0,
-            startsolid: g.trace_startsolid != 0.0,
-            fraction: g.trace_fraction,
-            endpos: g.trace_endpos,
-            plane_normal: g.trace_plane_normal,
-            ent: EntId::from_prog(g.trace_ent),
-            in_open: g.trace_inopen != 0.0,
-            in_water: g.trace_inwater != 0.0,
-        }
+        let tr = self.sv_trace(start, end, nomonsters, ignore);
+        self.write_trace_globals(&tr);
+        tr
     }
 
     /// `pointcontents` — the Quake point-contents at `p` (`SOLID`/`EMPTY`/`WATER`/`SLIME`/`LAVA`/

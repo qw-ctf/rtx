@@ -956,7 +956,7 @@ fn anyone_looked(game: &mut GameState, squad: &Squad, home: Vec3) -> bool {
         .eyes
         .iter()
         .filter(|(_, eye)| eye.distance(home) <= ITEM_SIGHT_RANGE)
-        .any(|&(body, eye)| game.client_traceline(eye, to, body).fraction >= 1.0)
+        .any(|&(body, eye)| game.traceline(eye, to, false, body).fraction >= 1.0)
 }
 
 /// The squad's one world: the map's furniture, and everything in flight.

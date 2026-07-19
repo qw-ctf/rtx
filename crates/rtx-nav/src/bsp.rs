@@ -320,6 +320,27 @@ impl Bsp {
         })
     }
 
+    /// A hand-built BSP for fixtures: `planes`, the hull-0 point-clip tree `nodes` rooted at
+    /// `headnode`, and the `models` (`models[0]` is the world, traced from `headnode`; a submodel's
+    /// `render_head` indexes into the same `nodes`). Hull 1 aliases hull 0, and the render
+    /// point-contents tree is left empty (so `pointcontents` answers `CONTENTS_SOLID`). Lets a
+    /// consuming crate build trace / submodel test worlds without a real `.bsp` on disk.
+    pub fn synthetic(planes: Vec<Plane>, nodes: Vec<ClipNode>, headnode: i32, models: Vec<Model>) -> Bsp {
+        Bsp {
+            clipnodes: nodes.clone(),
+            hull0_clipnodes: nodes,
+            planes,
+            hull1_headnode: headnode,
+            render_headnode: headnode,
+            mins: Vec3::splat(-4096.0),
+            maxs: Vec3::splat(4096.0),
+            entities: String::new(),
+            models,
+            render_nodes: Vec::new(),
+            leaf_contents: Vec::new(),
+        }
+    }
+
     /// The bounds of inline submodel `n` (the shape of an entity whose model is `"*n"`), or `None`
     /// if the map has no such submodel.
     ///

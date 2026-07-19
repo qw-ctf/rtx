@@ -57,6 +57,7 @@ mod spawn;
 mod spectate;
 mod subs;
 mod text;
+mod trace;
 mod triggers;
 mod weapons;
 mod world;

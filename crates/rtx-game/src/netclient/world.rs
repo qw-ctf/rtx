@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! The engine's world traps, done ourselves: linking, `setmodel`, and `traceline`.
+//! The engine's world traps, done ourselves: shadow-world spawn, linking, `setmodel`, and
+//! `droptofloor`. (Line tracing is no longer here or host-specific: both embodiments answer
+//! `traceline` from the parsed BSP + entity array through [`GameState::sv_trace`](crate::game).)
 //!
 //! These are the traps that write our own entity array. A [`ClientHost`](crate::host::ClientHost)
 //! can't perform them — it would alias the `&mut GameState` the game is holding while it calls —
@@ -15,7 +17,7 @@ use glam::Vec3;
 
 use crate::defs::{Bits, Flags};
 use crate::entity::{EntId, Think};
-use crate::game::{GameState, TraceResult};
+use crate::game::GameState;
 use crate::game_command::GameCommand;
 
 /// How far `droptofloor` looks for a floor before giving up (`SV_DropToFloor`). A mapper's item
@@ -141,7 +143,13 @@ impl GameState {
         let offset = hull_offset(mins, maxs);
 
         let start = origin - offset;
-        let tr = self.host.world_trace(start, start - Vec3::new(0.0, 0.0, DROP_DISTANCE));
+        // Our own parsed BSP (hull 1 — "would a player fit"). Populated at map load
+        // (`load_map_bsp`, inside `load_entities`), which `spawn_shadow_world` runs before it settles
+        // items, so the map is here by now. No map → leave the item where it is.
+        let Some(bsp) = self.nav.bsp.as_deref() else {
+            return false;
+        };
+        let tr = bsp.hull1_trace(start, start - Vec3::new(0.0, 0.0, DROP_DISTANCE));
         if tr.all_solid || tr.fraction == 1.0 {
             return false; // buried in a wall, or nothing under it within reach
         }
@@ -153,53 +161,6 @@ impl GameState {
         true
     }
 
-    /// `PF_traceline`, client side: trace a line against the map and the players in it.
-    ///
-    /// Note *which* hull. QuakeC's `traceline` passes a zero-size box, which `SV_HullForEntity`
-    /// reads as hull 0 — the point hull, real surfaces. Hull 1's planes were pushed out by the
-    /// player box at compile time, so answering with it says "would a player fit" when the question
-    /// was "can I see". On catalyst that mistake hides **half** the sightlines that exist: a bot
-    /// that declines every shot through a gap narrower than itself.
-    ///
-    /// It knows about the world and the players in it, and deliberately nothing else: a client's
-    /// entity picture is PVS-culled anyway, so a trace here is already a question about what we can
-    /// see.
-    pub(crate) fn client_traceline(&mut self, start: Vec3, end: Vec3, ignore: EntId) -> TraceResult {
-        // The map lives on the host, not in `nav` — the navmesh is built *later*, from the world
-        // this very trap helps spawn. Reading it from `nav.bsp` would make every trace during the
-        // spawn hit a map that isn't loaded yet, and `droptofloor` would delete the map's items as
-        // having "fallen out of the level".
-        let world = self.host.world_trace_point(start, end);
-
-        let mut best = TraceResult {
-            allsolid: world.all_solid,
-            startsolid: world.start_solid,
-            fraction: world.fraction,
-            endpos: world.endpos,
-            plane_normal: world.plane_normal,
-            ent: EntId::WORLD,
-            in_open: !world.start_solid,
-            in_water: false,
-        };
-
-        // Players are the only entities worth blocking a trace here: they're what "can I see you"
-        // is about, and a rocket in flight doesn't stop a line of sight.
-        for p in crate::netclient::live_players(self) {
-            if p == ignore {
-                continue;
-            }
-            let v = &self.entities[p].v;
-            let Some(hit) = ray_box(start, end, v.absmin, v.absmax) else { continue };
-            if hit < best.fraction {
-                best.fraction = hit;
-                best.endpos = start + (end - start) * hit;
-                best.ent = p;
-                best.plane_normal = Vec3::ZERO;
-                best.allsolid = false;
-            }
-        }
-        best
-    }
 }
 
 /// How far to shift a trace so an entity's box lines up with the hull the BSP was compiled with
@@ -224,72 +185,3 @@ fn hull_offset(mins: Vec3, maxs: Vec3) -> Vec3 {
     crate::defs::VEC_HULL_MIN - mins
 }
 
-/// Slab-method ray/box intersection: the fraction along `start`→`end` at which the segment first
-/// enters the box, or `None` if it misses or only touches behind the start.
-///
-/// A start *inside* the box yields `0.0` — you can't see past someone you're standing in.
-fn ray_box(start: Vec3, end: Vec3, mins: Vec3, maxs: Vec3) -> Option<f32> {
-    let dir = end - start;
-    let (mut tmin, mut tmax) = (0.0f32, 1.0f32);
-
-    for i in 0..3 {
-        if dir[i].abs() < 1e-6 {
-            // Parallel to this slab: a miss unless we're already between its faces.
-            if start[i] < mins[i] || start[i] > maxs[i] {
-                return None;
-            }
-            continue;
-        }
-        let inv = 1.0 / dir[i];
-        let (mut t1, mut t2) = ((mins[i] - start[i]) * inv, (maxs[i] - start[i]) * inv);
-        if t1 > t2 {
-            std::mem::swap(&mut t1, &mut t2);
-        }
-        tmin = tmin.max(t1);
-        tmax = tmax.min(t2);
-        if tmin > tmax {
-            return None;
-        }
-    }
-    Some(tmin)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The slab test, including the cases that decide whether a bot thinks it can see someone.
-    #[test]
-    fn ray_box_hits_and_misses() {
-        let (mins, maxs) = (Vec3::new(-16.0, -16.0, -24.0), Vec3::new(16.0, 16.0, 32.0));
-        let at = |o: Vec3| (mins + o, maxs + o);
-
-        // Straight through a box 100 units away: enters at 84/200 of the way.
-        let (bmin, bmax) = at(Vec3::new(100.0, 0.0, 0.0));
-        let f = ray_box(Vec3::ZERO, Vec3::new(200.0, 0.0, 0.0), bmin, bmax).expect("hit");
-        assert!((f - 84.0 / 200.0).abs() < 1e-4, "{f}");
-
-        // Beside it, and short of it.
-        assert!(ray_box(Vec3::new(0.0, 100.0, 0.0), Vec3::new(200.0, 100.0, 0.0), bmin, bmax).is_none());
-        assert!(ray_box(Vec3::ZERO, Vec3::new(50.0, 0.0, 0.0), bmin, bmax).is_none(), "stops short");
-
-        // Behind us doesn't count — a trace is a segment, not a line.
-        assert!(ray_box(Vec3::ZERO, Vec3::new(-200.0, 0.0, 0.0), bmin, bmax).is_none());
-
-        // Standing inside: fraction 0, because you can't see past what you're in.
-        let (bmin, bmax) = at(Vec3::ZERO);
-        assert_eq!(ray_box(Vec3::ZERO, Vec3::new(200.0, 0.0, 0.0), bmin, bmax), Some(0.0));
-    }
-
-    /// A ray exactly parallel to a slab must not divide by zero into a false hit or a false miss.
-    #[test]
-    fn ray_box_handles_parallel_rays() {
-        let (mins, maxs) = (Vec3::new(-16.0, -16.0, -24.0), Vec3::new(16.0, 16.0, 32.0));
-        // Parallel to X, inside the Y/Z slabs → hits.
-        assert!(ray_box(Vec3::new(-100.0, 0.0, 0.0), Vec3::new(100.0, 0.0, 0.0), mins, maxs).is_some());
-        // Parallel to X, outside the Y slab → misses, rather than dividing by zero.
-        assert!(ray_box(Vec3::new(-100.0, 99.0, 0.0), Vec3::new(100.0, 99.0, 0.0), mins, maxs).is_none());
-        // A zero-length trace at a point inside the box.
-        assert_eq!(ray_box(Vec3::ZERO, Vec3::ZERO, mins, maxs), Some(0.0));
-    }
-}
