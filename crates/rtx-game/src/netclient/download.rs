@@ -170,9 +170,20 @@ pub(crate) struct ServerDownload {
 
 enum ServerState {
     Awaiting,
-    Legacy,
+    Legacy(LegacyState),
     Chunked(ChunkedState),
     Complete,
+}
+
+struct LegacyState {
+    request: LegacyRequest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyRequest {
+    None,
+    Queued,
+    Sent(u32),
 }
 
 struct ChunkedState {
@@ -226,11 +237,12 @@ impl ServerDownload {
         }
         if matches!(self.state, ServerState::Awaiting) {
             self.file = Some(self.paths.create()?);
-            self.state = ServerState::Legacy;
+            self.state = ServerState::Legacy(LegacyState { request: LegacyRequest::None });
         }
-        if !matches!(self.state, ServerState::Legacy) {
+        let ServerState::Legacy(active) = &mut self.state else {
             return Err("legacy block arrived during a different download method".to_string());
-        }
+        };
+        active.request = LegacyRequest::None;
         self.file
             .as_mut()
             .ok_or_else(|| "legacy download has no temporary file".to_string())?
@@ -241,6 +253,36 @@ impl ServerDownload {
             self.finish().map(Some)
         } else {
             Ok(None)
+        }
+    }
+
+    /// A regular block is a response to the previous reliable `nextdl`. QuakeWorld can replay a
+    /// reliable server payload while that request is still queued or in flight, so only accept the
+    /// next block after the server has acknowledged the packet that actually carried `nextdl`.
+    pub(crate) fn legacy_reply_ready(&self, acknowledged: u32, reliable_acked: bool) -> bool {
+        match &self.state {
+            ServerState::Awaiting => true,
+            ServerState::Legacy(active) => match active.request {
+                LegacyRequest::None => true,
+                LegacyRequest::Queued => false,
+                LegacyRequest::Sent(sequence) => {
+                    reliable_acked && acknowledged.wrapping_sub(sequence) < (1 << 30)
+                }
+            },
+            _ => false,
+        }
+    }
+
+    pub(crate) fn mark_legacy_request_queued(&mut self) {
+        if let ServerState::Legacy(active) = &mut self.state {
+            active.request = LegacyRequest::Queued;
+        }
+    }
+
+    /// Called when the netchan promotes its queued reliable bytes into this outgoing packet.
+    pub(crate) fn mark_legacy_request_sent(&mut self, sequence: u32) {
+        if let ServerState::Legacy(LegacyState { request: request @ LegacyRequest::Queued }) = &mut self.state {
+            *request = LegacyRequest::Sent(sequence);
         }
     }
 
@@ -620,6 +662,12 @@ mod tests {
         let bytes = bsp_bytes(1500);
         let mut dl = ServerDownload::new(root.clone(), "qw", "legacy", 1).unwrap();
         assert!(dl.receive_legacy(&bytes[..768], 51).unwrap().is_none());
+        dl.mark_legacy_request_queued();
+        assert!(!dl.legacy_reply_ready(16, true), "a replay before nextdl is sent is not a new block");
+        dl.mark_legacy_request_sent(17);
+        assert!(!dl.legacy_reply_ready(16, true), "nor is a replay before the nextdl packet is acknowledged");
+        assert!(!dl.legacy_reply_ready(18, false), "a later packet is insufficient without the reliable ack bit");
+        assert!(dl.legacy_reply_ready(17, true));
         let path = dl.receive_legacy(&bytes[768..], 100).unwrap().unwrap();
         assert_eq!(std::fs::read(path).unwrap(), bytes);
 

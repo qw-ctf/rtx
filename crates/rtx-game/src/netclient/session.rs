@@ -398,11 +398,15 @@ impl Session {
         let Some(transfer) = self.server_download.as_mut() else { return };
         let outcome = match message {
             DownloadMessage::LegacyBlock { percent, data } => {
-                let cookie = transfer.cookie();
-                match transfer.receive_legacy(data, *percent) {
-                    Ok(Some(path)) => DownloadOutcome::Complete { path, chunked: false, cookie },
-                    Ok(None) => DownloadOutcome::NextLegacyBlock,
-                    Err(e) => DownloadOutcome::Failed(e),
+                if !transfer.legacy_reply_ready(self.chan.incoming_acknowledged, self.chan.can_reliable()) {
+                    DownloadOutcome::Waiting
+                } else {
+                    let cookie = transfer.cookie();
+                    match transfer.receive_legacy(data, *percent) {
+                        Ok(Some(path)) => DownloadOutcome::Complete { path, chunked: false, cookie },
+                        Ok(None) => DownloadOutcome::NextLegacyBlock,
+                        Err(e) => DownloadOutcome::Failed(e),
+                    }
                 }
             }
             DownloadMessage::LegacyError(code) => {
@@ -453,7 +457,12 @@ impl Session {
     fn apply_download_outcome(&mut self, outcome: DownloadOutcome, host: &NetHost) {
         match outcome {
             DownloadOutcome::Waiting => {}
-            DownloadOutcome::NextLegacyBlock => self.stringcmd("nextdl"),
+            DownloadOutcome::NextLegacyBlock => {
+                self.stringcmd("nextdl");
+                if let Some(transfer) = self.server_download.as_mut() {
+                    transfer.mark_legacy_request_queued();
+                }
+            }
             DownloadOutcome::Complete { path, chunked, cookie } => {
                 // FTE and mvdsv use this as their compatible end-of-transfer cleanup command.
                 if chunked {
@@ -968,9 +977,16 @@ impl Session {
 
     fn transmit(&mut self, payload: &[u8]) -> io::Result<()> {
         let slot = self.chan.outgoing_sequence as usize % self.sent_at.len();
+        let sequence = self.chan.outgoing_sequence;
+        let promotes_reliable = self.chan.can_reliable() && self.chan.reliable_pending();
         let datagram = self.chan.transmit(payload);
         self.sent_at[slot] = Instant::now();
         self.send(&datagram)?;
+        if promotes_reliable {
+            if let Some(transfer) = self.server_download.as_mut() {
+                transfer.mark_legacy_request_sent(sequence);
+            }
+        }
         Ok(())
     }
 
@@ -1129,6 +1145,46 @@ mod tests {
         assert!(host.has_map(), "the installed BSP is rebound before signon resumes");
         assert_eq!(std::fs::read(root.join("qw/maps/tiny.bsp")).unwrap(), bytes);
         assert!(s.chan.reliable_pending(), "cleanup and prespawn are queued reliably");
+
+        drop(s);
+        drop(host);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A lost acknowledgement can make QuakeWorld replay a reliable server payload under a fresh
+    /// packet sequence. Do not append that old regular block again while our `nextdl` is unsent or
+    /// unacknowledged; accept the next block once the server proves it saw the request.
+    #[test]
+    fn regular_download_ignores_reliable_replays() {
+        let (root, host) = temporary_host("regular-replay");
+        let mut bytes = minimal_bsp();
+        bytes.resize(1500, 0x5a);
+        let mut s = session();
+        s.signon = Signon::Downloading;
+        s.gamedir = "qw".to_string();
+        s.mapname = "regular".to_string();
+        s.server_download = Some(
+            super::super::download::ServerDownload::new(root.clone(), "qw", "regular", 1).unwrap(),
+        );
+
+        let first = DownloadMessage::LegacyBlock { percent: 51, data: bytes[..768].to_vec() };
+        s.handle_server_download(&first, &host);
+        s.handle_server_download(&first, &host); // replay before queued nextdl has even left
+
+        let request_sequence = s.chan.outgoing_sequence;
+        s.transmit(&clc::write_nop()).unwrap();
+        let mut ack = Vec::new();
+        ack.extend_from_slice(&1u32.to_le_bytes());
+        ack.extend_from_slice(&(request_sequence | (1 << 31)).to_le_bytes());
+        assert!(s.chan.process(&ack).is_some());
+        s.handle_server_download(
+            &DownloadMessage::LegacyBlock { percent: 100, data: bytes[768..].to_vec() },
+            &host,
+        );
+
+        assert_eq!(std::fs::read(root.join("qw/maps/regular.bsp")).unwrap(), bytes);
+        assert_eq!(s.signon, Signon::Loading);
+        assert!(host.has_map());
 
         drop(s);
         drop(host);
