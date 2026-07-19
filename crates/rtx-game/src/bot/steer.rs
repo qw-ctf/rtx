@@ -31,12 +31,6 @@ pub(super) const TERMINAL_TAKE_GRACE: f32 = 0.35;
 /// gap's certified launch floor. Airborne bhop/swim progression remains XY-only (see
 /// [`ordinary_leg_arrived`]).
 const ROUTE_LEVEL_TOL: f32 = 1.0;
-/// Plain-gap takeoff safety: require a little more forward speed than the ideal ballistic minimum.
-const JUMP_TAKEOFF_MARGIN: f32 = 1.03;
-/// Stock `JumpGap` links are certified at ordinary ground maxspeed. Preserve a little pmove/frame
-/// slack, but bleed a faster bhop carry before committing: the extra distance changes which side of
-/// a narrow landing lip the hull reaches even when its heading is nominally aligned.
-const JUMP_MAXSPEED_SLACK: f32 = 1.02;
 /// A takeoff heading farther than ~18 degrees from its certified source->target line must be
 /// straightened before +jump. Horizontal speed by itself says nothing about gap reach.
 const JUMP_ALIGN_COS: f32 = 0.95;
@@ -96,22 +90,25 @@ fn ordinary_leg_arrived(
     to.length() <= arrive_r || (fast && to.dot(v_xy) < 0.0 && to.length() <= 64.0)
 }
 
-/// Horizontal speed the source-centre ballistic arc needs to reach `target` on its descending root.
-/// The graph certifies the same stock-QW jump impulse; this turns that geometric promise into a live
-/// takeoff gate instead of accepting unrelated sideways speed.
-fn jump_required_speed(source: Vec3, target: Vec3, gravity: f32) -> f32 {
+/// Descending-root flight time for the stock-QW jump impulse used by `JumpGap` certification.
+fn jump_airtime(source: Vec3, target: Vec3, gravity: f32) -> Option<f32> {
     let g = gravity.max(1.0);
     let dz = target.z - source.z;
     let disc = JUMP_VZ * JUMP_VZ - 2.0 * g * dz;
     if disc < 0.0 {
-        return f32::INFINITY;
+        return None;
     }
     let airtime = (JUMP_VZ + disc.sqrt()) / g;
-    if airtime <= 0.0 {
-        f32::INFINITY
-    } else {
-        (target.xy() - source.xy()).length() / airtime * JUMP_TAKEOFF_MARGIN
-    }
+    (airtime > 0.0).then_some(airtime)
+}
+
+/// Horizontal speed the source-centre ballistic arc needs to reach `target` on its descending root.
+/// The graph certifies the same stock-QW jump impulse; this turns that geometric promise into a live
+/// takeoff gate instead of accepting unrelated sideways speed.
+fn jump_required_speed(source: Vec3, target: Vec3, gravity: f32) -> f32 {
+    jump_airtime(source, target, gravity)
+        .map(|airtime| (target.xy() - source.xy()).length() / airtime)
+        .unwrap_or(f32::INFINITY)
 }
 
 /// Decide whether a grounded `JumpGap` may launch and which way to wish while preparing it.
@@ -130,7 +127,13 @@ fn jump_takeoff_prep(
     if dir == Vec2::ZERO {
         return (false, Vec2::ZERO);
     }
-    let required = jump_required_speed(source, target, gravity).max(runup_frac.max(0.0) * maxspeed);
+    let Some(airtime) = jump_airtime(source, target, gravity) else {
+        return (false, -v_xy.normalize_or_zero());
+    };
+    let delta = target.xy() - source.xy();
+    let horiz = delta.length();
+    let required = jump_required_speed(source, target, gravity);
+    let runup_required = runup_frac.max(0.0) * maxspeed;
     let speed = v_xy.length();
     let projected = v_xy.dot(dir);
     let aligned = speed <= JUMP_BRAKE_SPEED || projected >= speed * JUMP_ALIGN_COS;
@@ -138,12 +141,18 @@ fn jump_takeoff_prep(
     let along = rel.dot(dir);
     let cross = rel - dir * along;
     let at_source = along >= -JUMP_SOURCE_EARLY_TOL && cross.length() <= JUMP_SOURCE_LATERAL_TOL;
-    // The nav builder certifies a plain gap with stock ground speed. A carried bhop can arrive above
-    // that envelope; DM3's lower-RA jump showed why that must not be treated as free margin: 339 ups
-    // reached the east lip while the same line at 314 ups cleared it. `SpeedJump` is the link kind
-    // for geometry that intentionally requires/preserves an overspeed takeoff.
-    let too_hot = required <= maxspeed && projected > maxspeed * JUMP_MAXSPEED_SLACK;
-    let ready = at_source && aligned && projected >= required && !too_hot;
+    // Predict the descending-root hull centre from the *live* approach position and velocity. The
+    // target is reached once the centre gets there; one inscribed hull radius beyond it is still a
+    // physical landing because the trailing edge overlaps the target floor. This is the launch
+    // hysteresis: its entire width comes from the Quake player hull, not a tuned speed allowance.
+    let landing_rel = rel + v_xy * airtime;
+    let landing_along = landing_rel.dot(dir);
+    let landing_cross = (landing_rel - dir * landing_along).length();
+    let landing_radius = VEC_HULL_MAX.x.min(VEC_HULL_MAX.y);
+    let reaches_target = landing_along >= horiz;
+    let overshoots_target = landing_along > horiz + landing_radius;
+    let inside_touchdown = reaches_target && !overshoots_target && landing_cross <= landing_radius;
+    let ready = at_source && aligned && projected >= runup_required && inside_touchdown;
     // An offset runner can be nominally aligned with the outgoing heading while its retained
     // lateral component is still carrying it farther away from the certified centre line. That was
     // the intermittent lower-RA failure: the southbound component looked good, but +X momentum
@@ -158,9 +167,14 @@ fn jump_takeoff_prep(
     let wish = if !aligned || !feasible_from_ground {
         -v_xy.normalize_or_zero()
     } else if leaving_line && speed > JUMP_BRAKE_SPEED {
+        // Positional cross-track divergence must win over the longitudinal coast: friction alone
+        // preserves the bad heading and would carry an offset runner farther away from the line.
         -cross.normalize_or_zero()
-    } else if too_hot {
-        -v_xy.normalize_or_zero()
+    } else if overshoots_target {
+        // Zero wish applies ground friction without immediately accelerating back to maxspeed. The
+        // predicted touchdown therefore moves monotonically into the hull-width acceptance window
+        // instead of pumping between full gas and reverse braking around a scalar speed threshold.
+        Vec2::ZERO
     } else if !at_source {
         let join = source.xy() + dir * (along.max(0.0) + JUMP_SOURCE_LOOKAHEAD);
         (join - origin.xy()).normalize_or_zero()
@@ -2353,6 +2367,53 @@ mod tests {
     }
 
     #[test]
+    fn dm3_bridge_sng_jumpgap_rejects_maxspeed_overshoot_and_accepts_center_arc() {
+        let gravity = 800.0;
+        let maxspeed = 320.0;
+        let airtime = 2.0 * JUMP_VZ / gravity;
+        let source = Vec3::new(-544.0, 800.0, 120.0);
+        let target = Vec3::new(-544.0, 672.0, 120.0);
+        let dir = (target.xy() - source.xy()).normalize();
+        let center_speed = (target.xy() - source.xy()).length() / airtime;
+
+        let (center_ready, _) =
+            jump_takeoff_prep(source, source, target, dir * center_speed, gravity, maxspeed, 0.0);
+        assert!(center_ready, "the exact descending-root centre arc must be launchable");
+
+        let (maxspeed_ready, maxspeed_wish) =
+            jump_takeoff_prep(source, source, target, dir * maxspeed, gravity, maxspeed, 0.0);
+        assert!(
+            !maxspeed_ready,
+            "maxspeed travels {:.1}u beyond a 128u target, more than the {:.1}u hull half-width",
+            maxspeed * airtime - 128.0,
+            VEC_HULL_MAX.x,
+        );
+        assert_eq!(
+            maxspeed_wish,
+            Vec2::ZERO,
+            "overspeed approach must coast monotonically under ground friction",
+        );
+    }
+
+    #[test]
+    fn max_reach_flat_jumpgap_keeps_maxspeed_launch() {
+        let gravity = 800.0;
+        let maxspeed = 320.0;
+        let airtime = 2.0 * JUMP_VZ / gravity;
+        let source = Vec3::ZERO;
+        // At the physical reach limit the target centre is one player-hull half-width before the
+        // descending-root centre. The trailing hull edge is exactly over the target at touchdown.
+        let reach = maxspeed * airtime - VEC_HULL_MAX.x;
+        let target = Vec3::new(reach, 0.0, 0.0);
+        let dir = (target.xy() - source.xy()).normalize();
+
+        let (ready, wish) =
+            jump_takeoff_prep(source, source, target, dir * maxspeed, gravity, maxspeed, 0.0);
+        assert!(ready, "the physics-derived max-reach launch must remain executable");
+        assert!(wish.dot(dir) > 0.999);
+    }
+
+    #[test]
     fn dm3_ring_ra_takeoff_brakes_the_observed_backwards_velocity() {
         let source = Vec3::new(96.0, -576.0, 296.0);
         let target = Vec3::new(128.0, -672.0, 328.0);
@@ -2362,8 +2423,12 @@ mod tests {
         assert!(!ready, "sideways/backwards total speed must not launch a gap jump");
         assert!(wish.dot(velocity.normalize()) < -0.99, "must counter-steer away from the x wall: {wish:?}");
         let required = jump_required_speed(source, target, 800.0);
+        let airtime = jump_airtime(source, target, 800.0).expect("reachable jump");
         let projected = velocity.dot((target.xy() - source.xy()).normalize());
-        assert!(required > 199.0 && required < 201.0, "unexpected DM3 ballistic requirement: {required}");
+        assert!(
+            (required * airtime - (target.xy() - source.xy()).length()).abs() < 0.001,
+            "requirement must be the exact descending-root centre arc: {required}",
+        );
         assert!(projected < 0.0, "the recorded takeoff was not moving toward RA: {projected}");
     }
 
@@ -2413,27 +2478,26 @@ mod tests {
     fn dm3_lower_ra_jump_bleeds_the_observed_overspeed_wall_launch() {
         let source = Vec3::new(192.0, -704.0, -16.0);
         let target = Vec3::new(224.0, -832.0, 24.0);
-        // First airborne observation from the otherwise successful strict trial that touched the
-        // east lip. The netclient sees the server's launch one movement frame before its submitted
-        // +jump appears in trial telemetry, so this is the physical velocity the launch gate must
-        // refuse when its grounded snapshot still owns the press.
-        let origin = Vec3::new(197.77971, -707.0683, -15.96875);
+        // Velocity from the first airborne observation of the otherwise successful strict trial
+        // that touched the east lip. Apply it to the certified source because the launch gate runs
+        // on the preceding grounded snapshot; the later airborne position has already consumed
+        // part of the flight and is not a second takeoff state.
         let velocity = Vec2::new(47.37983, -337.39536);
-        let (ready, wish) = jump_takeoff_prep(origin, source, target, velocity, 800.0, 320.0, 0.0);
+        let (ready, wish) = jump_takeoff_prep(source, source, target, velocity, 800.0, 320.0, 0.0);
 
         assert!(!ready, "a stock gap must not inherit the 339-ups wall-launch envelope");
-        assert!(wish.dot(velocity.normalize()) < -0.99, "overspeed setup must brake first: {wish:?}");
+        assert_eq!(wish, Vec2::ZERO, "overspeed setup must coast under friction: {wish:?}");
     }
 
     #[test]
     fn dm3_lower_ra_jump_keeps_the_observed_clean_takeoff() {
         let source = Vec3::new(192.0, -704.0, -16.0);
         let target = Vec3::new(224.0, -832.0, 24.0);
-        // First airborne observation from a zero-contact 12.36s pickup on the same graph/link.
-        let origin = Vec3::new(196.55014, -733.07214, -15.96875);
+        // Velocity from the first airborne observation of a zero-contact 12.36s pickup on the same
+        // graph/link, projected from the certified source as the preceding grounded snapshot.
         let velocity = Vec2::new(87.16784, -302.0417);
         let dir = (target.xy() - source.xy()).normalize();
-        let (ready, wish) = jump_takeoff_prep(origin, source, target, velocity, 800.0, 320.0, 0.0);
+        let (ready, wish) = jump_takeoff_prep(source, source, target, velocity, 800.0, 320.0, 0.0);
 
         assert!(ready, "the 314-ups zero-contact takeoff must remain inside the stock envelope");
         assert!(wish.dot(dir) > 0.999, "clean takeoff must keep the certified heading: {wish:?}");
