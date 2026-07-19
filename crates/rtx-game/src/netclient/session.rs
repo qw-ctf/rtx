@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use rtx_proto::info::{Info, UserinfoBuilder};
 use rtx_proto::netchan::Netchan;
 use rtx_proto::protocol::{self, magic, ProtoState};
-use rtx_proto::svc::{self, SvcEvent, Usercmd};
+use rtx_proto::svc::{self, DownloadMessage, SvcEvent, Usercmd};
 use rtx_proto::{checksum, clc, oob};
 
 use super::frames::{Applied, EntityState, Frames};
@@ -68,6 +68,18 @@ pub(crate) enum Signon {
 
 /// How often to retry an unanswered `getchallenge` / `connect`.
 const RESEND_INTERVAL: Duration = Duration::from_secs(5);
+
+/// What accepting one server download message requires once the mutable transfer borrow is over.
+enum DownloadOutcome {
+    Waiting,
+    NextLegacyBlock,
+    Complete {
+        path: std::path::PathBuf,
+        chunked: bool,
+        cookie: u32,
+    },
+    Failed(String),
+}
 
 /// The CRCs of stock `progs/player.mdl` and `progs/eyes.mdl`.
 ///
@@ -172,8 +184,13 @@ pub(crate) struct Session {
     /// Whether to fetch a missing map rather than give up on it. Off (`--no-download`) restores the
     /// old behaviour: a map we don't have is a connection we can't make.
     download_enabled: bool,
-    /// The map download in flight, while [`Signon::Downloading`].
+    /// The first attempt: an HTTP worker, while [`Signon::Downloading`].
     download: Option<super::download::Download>,
+    /// The fallback transfer over this connection, after HTTP failed.
+    server_download: Option<super::download::ServerDownload>,
+    /// Non-zero identifier echoed by FTE's out-of-band chunks. Incremented per server transfer so
+    /// a late block from the last map cannot satisfy the next one.
+    download_cookie: u32,
 }
 
 // A session answers two callers: the tick loop, which drives it, and the world mirror, which asks
@@ -227,6 +244,8 @@ impl Session {
             wiretap,
             download_enabled,
             download: None,
+            server_download: None,
+            download_cookie: 0,
         };
         Ok(s)
     }
@@ -316,12 +335,11 @@ impl Session {
         self.chan.queue_reliable(&clc::write_stringcmd(cmd));
     }
 
-    /// If a map download is running, see whether it finished, and resume signon when it did.
+    /// If the HTTP attempt is running, see whether it finished. Any failure starts an in-protocol
+    /// QuakeWorld transfer on the same connection; the server messages drive that second phase.
     ///
     /// The server is still holding at `prespawn`, waiting for us; the nops the tick loop sends while
-    /// we're `Downloading` have kept the connection alive. On success the map is now on disk, so
-    /// `bind_map_then_prespawn` rebinds and sends the `prespawn` we owed. On failure there's no
-    /// playing without the map — drop cleanly rather than send a checksum of nothing.
+    /// downloading keep the connection alive and carry chunk requests once metadata arrives.
     fn poll_download(&mut self, host: &NetHost) {
         if self.signon != Signon::Downloading {
             return;
@@ -332,15 +350,132 @@ impl Session {
         self.download = None;
         match result {
             Ok(path) => {
-                eprintln!("rtx-client: downloaded {}", path.display());
-                self.signon = Signon::Loading;
-                self.bind_map_then_prespawn(host);
+                eprintln!("rtx-client: downloaded {} over HTTP", path.display());
+                self.resume_with_downloaded_map(host);
             }
             Err(e) => {
-                eprintln!("rtx-client: map download failed: {e}");
-                self.signon = Signon::Disconnected;
+                eprintln!("rtx-client: HTTP map download failed ({e}); asking the server");
+                self.start_server_download(host);
             }
         }
+    }
+
+    fn start_server_download(&mut self, host: &NetHost) {
+        self.server_download = None;
+        self.download_cookie = self.download_cookie.wrapping_add(1);
+        if self.download_cookie == 0 {
+            self.download_cookie = 1;
+        }
+        let transfer = match super::download::ServerDownload::new(
+            host.basedir(),
+            &self.gamedir,
+            &self.mapname,
+            self.download_cookie,
+        ) {
+            Ok(transfer) => transfer,
+            Err(e) => {
+                self.fail_server_download(e);
+                return;
+            }
+        };
+        let name = transfer.expected_name().to_string();
+        eprintln!(
+            "rtx-client: requesting {name} from the server ({})",
+            if self.proto.has_fte(protocol::fte::CHUNKEDDOWNLOADS) {
+                "FTE chunked"
+            } else {
+                "regular QuakeWorld"
+            }
+        );
+        self.server_download = Some(transfer);
+        self.stringcmd(&format!("download \"{name}\""));
+    }
+
+    fn handle_server_download(&mut self, message: &DownloadMessage, host: &NetHost) {
+        if self.signon != Signon::Downloading {
+            return;
+        }
+        let Some(transfer) = self.server_download.as_mut() else { return };
+        let outcome = match message {
+            DownloadMessage::LegacyBlock { percent, data } => {
+                let cookie = transfer.cookie();
+                match transfer.receive_legacy(data, *percent) {
+                    Ok(Some(path)) => DownloadOutcome::Complete { path, chunked: false, cookie },
+                    Ok(None) => DownloadOutcome::NextLegacyBlock,
+                    Err(e) => DownloadOutcome::Failed(e),
+                }
+            }
+            DownloadMessage::LegacyError(code) => {
+                DownloadOutcome::Failed(format!("server rejected the regular download (error {code})"))
+            }
+            DownloadMessage::ChunkedStart { name, size } => match size {
+                Ok(size) => match transfer.begin_chunked(name, *size, Instant::now()) {
+                    Ok(()) => DownloadOutcome::Waiting,
+                    Err(e) => DownloadOutcome::Failed(e),
+                },
+                Err(code) => DownloadOutcome::Failed(format!(
+                    "server rejected the FTE chunked download of {name:?} (error {code})"
+                )),
+            },
+            DownloadMessage::ChunkedBlock { chunk, data } => {
+                let cookie = transfer.cookie();
+                match transfer.receive_chunk(*chunk, data.as_ref()) {
+                    Ok(Some(path)) => DownloadOutcome::Complete { path, chunked: true, cookie },
+                    Ok(None) => DownloadOutcome::Waiting,
+                    Err(e) => DownloadOutcome::Failed(e),
+                }
+            }
+        };
+        self.apply_download_outcome(outcome, host);
+    }
+
+    /// Accept an OOB chunk only for the active transfer. The source address was checked in `poll`;
+    /// the cookie separates this file from late packets belonging to an earlier one.
+    fn receive_server_chunk(
+        &mut self,
+        cookie: u32,
+        chunk: u32,
+        data: &[u8; svc::DOWNLOAD_CHUNK_SIZE],
+        host: &NetHost,
+    ) {
+        let Some(transfer) = self.server_download.as_mut() else { return };
+        if transfer.cookie() != cookie || !transfer.is_chunked() {
+            return;
+        }
+        let outcome = match transfer.receive_chunk(chunk, data) {
+            Ok(Some(path)) => DownloadOutcome::Complete { path, chunked: true, cookie },
+            Ok(None) => DownloadOutcome::Waiting,
+            Err(e) => DownloadOutcome::Failed(e),
+        };
+        self.apply_download_outcome(outcome, host);
+    }
+
+    fn apply_download_outcome(&mut self, outcome: DownloadOutcome, host: &NetHost) {
+        match outcome {
+            DownloadOutcome::Waiting => {}
+            DownloadOutcome::NextLegacyBlock => self.stringcmd("nextdl"),
+            DownloadOutcome::Complete { path, chunked, cookie } => {
+                // FTE and mvdsv use this as their compatible end-of-transfer cleanup command.
+                if chunked {
+                    self.stringcmd(&format!("nextdl -1 100 {cookie}"));
+                }
+                self.server_download = None;
+                eprintln!(
+                    "rtx-client: downloaded {} from the server ({})",
+                    path.display(),
+                    if chunked { "FTE chunked" } else { "regular QuakeWorld" }
+                );
+                self.resume_with_downloaded_map(host);
+            }
+            DownloadOutcome::Failed(error) => self.fail_server_download(error),
+        }
+    }
+
+    fn fail_server_download(&mut self, error: String) {
+        eprintln!("rtx-client: server map download failed: {error}");
+        self.download = None;
+        self.server_download = None;
+        self.signon = Signon::Disconnected;
     }
 
     /// Tell the server we're willing to play, once per level.
@@ -374,21 +509,27 @@ impl Session {
         let mut out = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
-            let len = match self.sock.recv(&mut buf) {
-                Ok(n) => n,
+            let (len, from) = match self.sock.recv_from(&mut buf) {
+                Ok(received) => received,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 // A closed port answers with ICMP, which surfaces here on some platforms. It isn't
                 // fatal — the server may simply not be up yet, and we're about to retry anyway.
                 Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
                 Err(e) => return Err(e),
             };
+            // The socket is intentionally unconnected so the same send path can handle the OOB
+            // handshake. Once packets arrive, though, only the selected server is authoritative —
+            // especially for OOB chunk replies, whose cookie is correlation rather than security.
+            if from != self.server {
+                continue;
+            }
             let data = &buf[..len];
             if let Some(w) = self.wiretap.as_mut() {
                 w.record(data, false);
             }
 
             if oob::is_oob(data) {
-                self.handle_oob(data);
+                self.handle_oob(data, host);
                 continue;
             }
             let Some(payload) = self.chan.process(data) else { continue };
@@ -403,6 +544,8 @@ impl Session {
                     eprintln!("rtx-client: protocol desync: {e}");
                     eprintln!("rtx-client: seq={} proto={:?}", self.chan.incoming_sequence, self.proto);
                     eprintln!("{}", svc::hexdump(payload));
+                    self.download = None;
+                    self.server_download = None;
                     self.signon = Signon::Disconnected;
                     return Ok(out);
                 }
@@ -445,7 +588,7 @@ impl Session {
         }
     }
 
-    fn handle_oob(&mut self, data: &[u8]) {
+    fn handle_oob(&mut self, data: &[u8], host: &NetHost) {
         match oob::parse(data) {
             Some(oob::Oob::Challenge { challenge, fte, fte2, mvd1 }) if self.signon == Signon::Challenge => {
                 self.challenge = challenge;
@@ -462,6 +605,11 @@ impl Session {
             Some(oob::Oob::Accepted) if self.signon == Signon::Connecting => {
                 self.signon = Signon::Loading;
                 self.stringcmd("new");
+            }
+            Some(oob::Oob::DownloadChunk { cookie, chunk, data })
+                if self.signon == Signon::Downloading =>
+            {
+                self.receive_server_chunk(cookie, chunk, data.as_ref(), host);
             }
             Some(oob::Oob::Print(text)) => {
                 eprintln!("rtx-client: server: {}", crate::text::readable(text.trim_end()))
@@ -485,6 +633,8 @@ impl Session {
                 self.sounds.clear();
                 self.models.clear();
                 self.frames.clear();
+                self.download = None;
+                self.server_download = None;
                 self.signon = Signon::Loading;
                 // A fresh level is a fresh match to say yes to, and the only way out of an
                 // intermission — there is no message that ends one.
@@ -528,6 +678,9 @@ impl Session {
                     self.prespawn(host);
                 }
             }
+            SvcEvent::Download(message) if self.signon == Signon::Downloading => {
+                self.handle_server_download(message, host);
+            }
             SvcEvent::SpawnBaseline { entity, baseline } => self.frames.set_baseline(*entity, *baseline),
             SvcEvent::SpawnBaselineDelta { entity, delta } => self.frames.set_baseline_delta(*entity, delta),
             SvcEvent::PacketEntities(pe) => {
@@ -554,7 +707,11 @@ impl Session {
             // brain thinks it's doing, it isn't playing, and it certainly isn't shooting.
             SvcEvent::Intermission { .. } | SvcEvent::Finale(_) => self.intermission = true,
             SvcEvent::ChokeCount(n) => self.chokes += *n as u32,
-            SvcEvent::Disconnect => self.signon = Signon::Disconnected,
+            SvcEvent::Disconnect => {
+                self.download = None;
+                self.server_download = None;
+                self.signon = Signon::Disconnected;
+            }
             _ => {}
         }
     }
@@ -602,6 +759,7 @@ impl Session {
         if !host.rebind(&self.gamedir, &self.mapname) {
             if self.download_enabled {
                 eprintln!("rtx-client: don't have maps/{}.bsp — downloading it", self.mapname);
+                self.server_download = None;
                 self.download = Some(super::download::Download::start(
                     host.basedir(),
                     self.gamedir.clone(),
@@ -618,6 +776,26 @@ impl Session {
             return;
         }
 
+        self.send_prespawn(host);
+    }
+
+    /// Re-index the freshly installed file and resume exactly where the missing map paused signon.
+    fn resume_with_downloaded_map(&mut self, host: &NetHost) {
+        if !host.rebind(&self.gamedir, &self.mapname) {
+            eprintln!(
+                "rtx-client: downloaded maps/{}.bsp, but it could not be loaded",
+                self.mapname
+            );
+            self.download = None;
+            self.server_download = None;
+            self.signon = Signon::Disconnected;
+            return;
+        }
+        self.signon = Signon::Loading;
+        self.send_prespawn(host);
+    }
+
+    fn send_prespawn(&mut self, host: &NetHost) {
         let checksum = host
             .read_file(&std::ffi::CString::new(format!("maps/{}.bsp", self.mapname)).unwrap_or_default())
             .and_then(|bytes| checksum::map_checksum2(&bytes, &self.mapname).ok())
@@ -693,11 +871,15 @@ impl Session {
             match line {
                 // The map is changing: hold everything until the next serverdata.
                 "changing" => {
+                    self.download = None;
+                    self.server_download = None;
                     self.signon = Signon::Changing;
                     self.frames.clear();
                 }
                 // Restart the signon on the same connection.
                 "reconnect" => {
+                    self.download = None;
+                    self.server_download = None;
                     self.signon = Signon::Loading;
                     self.stringcmd("new");
                 }
@@ -748,9 +930,40 @@ impl Session {
     }
 
     /// Send a packet with nothing in it — keeps the sequence advancing and the reliable queue
-    /// moving while we're still connecting.
+    /// moving while we're still connecting. During an FTE download it also carries a wide batch of
+    /// unreliable `nextdl` commands: loss is handled by the chunk scheduler, so one missing request
+    /// never stalls the whole transfer behind QuakeWorld's one-message reliable channel.
     pub(crate) fn send_nop(&mut self) -> io::Result<()> {
-        self.transmit(&clc::write_nop())
+        let mut payload = clc::write_nop();
+        self.append_download_requests(&mut payload);
+        self.transmit(&payload)
+    }
+
+    fn append_download_requests(&mut self, payload: &mut Vec<u8>) {
+        if self.signon != Signon::Downloading || self.chan.reliable_pending() {
+            return;
+        }
+        let Some(transfer) = self.server_download.as_mut() else { return };
+        let now = Instant::now();
+        let sequence = self.chan.outgoing_sequence;
+        let budget = transfer.request_budget(now, self.chan.incoming_acknowledged, self.rtt);
+        let max_payload = protocol::MAX_MSGLEN - rtx_proto::netchan::HEADER_BYTES;
+
+        for _ in 0..budget {
+            let Some((chunk, percent, cookie)) = self.server_download.as_ref().and_then(|transfer| {
+                transfer.next_missing_chunk().map(|chunk| (chunk, transfer.percent(), transfer.cookie()))
+            }) else {
+                break;
+            };
+            let command = clc::write_stringcmd(&format!("nextdl {chunk} {percent} {cookie}"));
+            if payload.len() + command.len() > max_payload {
+                break;
+            }
+            let Some(transfer) = self.server_download.as_mut() else { break };
+            if transfer.mark_requested(chunk, sequence, now) {
+                payload.extend_from_slice(&command);
+            }
+        }
     }
 
     fn transmit(&mut self, payload: &[u8]) -> io::Result<()> {
@@ -821,6 +1034,105 @@ mod tests {
 
     fn host() -> NetHost {
         NetHost::new(PathBuf::from("/nonexistent"))
+    }
+
+    /// Smallest BSP our client-side reader accepts: a v29 header with empty lumps and one zeroed
+    /// world model. It is enough to prove a downloaded file is rebound before `prespawn` resumes.
+    fn minimal_bsp() -> Vec<u8> {
+        const LUMPS: usize = 15;
+        const HEADER: usize = 4 + LUMPS * 8;
+        const MODEL_SIZE: usize = 64;
+        let mut bytes = vec![0; HEADER + MODEL_SIZE];
+        bytes[..4].copy_from_slice(&29u32.to_le_bytes());
+        for lump in 0..LUMPS {
+            let at = 4 + lump * 8;
+            bytes[at..at + 4].copy_from_slice(&(HEADER as u32).to_le_bytes());
+        }
+        let models = 4 + 14 * 8;
+        bytes[models + 4..models + 8].copy_from_slice(&(MODEL_SIZE as u32).to_le_bytes());
+        bytes
+    }
+
+    fn temporary_host(tag: &str) -> (PathBuf, NetHost) {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rtx-session-{tag}-{}-{nonce}", std::process::id()));
+        (root.clone(), NetHost::new(root))
+    }
+
+    #[test]
+    fn an_http_failure_falls_back_to_the_connected_server() {
+        let (root, host) = temporary_host("fallback");
+        let mut s = session();
+        s.signon = Signon::Downloading;
+        s.gamedir = "qw".to_string();
+        s.mapname = "missing".to_string();
+        s.download = Some(super::super::download::Download::completed(Err("HTTP 404".to_string())));
+
+        s.poll_download(&host);
+
+        assert!(s.server_download.is_some());
+        assert_eq!(s.signon, Signon::Downloading);
+        let packet = s.chan.transmit(b"");
+        let body = &packet[rtx_proto::netchan::HEADER_BYTES..];
+        assert_eq!(body[0], clc::op::STRINGCMD);
+        assert_eq!(
+            rtx_proto::sizebuf::Reader::new(&body[1..]).string().unwrap(),
+            "download \"maps/missing.bsp\""
+        );
+
+        drop(s);
+        drop(host);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Chunk requests belong to the unreliable half of the packet, and an OOB response must carry
+    /// this transfer's cookie. Completion installs, rebinds, and continues at prespawn.
+    #[test]
+    fn fte_download_requests_are_unreliable_and_resume_prespawn() {
+        let (root, host) = temporary_host("chunked");
+        let bytes = minimal_bsp();
+        let cookie = 7;
+        let mut transfer = super::super::download::ServerDownload::new(root.clone(), "qw", "tiny", cookie).unwrap();
+        transfer
+            .begin_chunked("maps/tiny.bsp", bytes.len() as u64, Instant::now())
+            .unwrap();
+
+        let mut s = session();
+        s.signon = Signon::Downloading;
+        s.gamedir = "qw".to_string();
+        s.mapname = "tiny".to_string();
+        s.server_download = Some(transfer);
+
+        let mut payload = clc::write_nop();
+        s.append_download_requests(&mut payload);
+        assert_eq!(payload[0], clc::op::NOP);
+        assert_eq!(payload[1], clc::op::STRINGCMD);
+        assert_eq!(
+            rtx_proto::sizebuf::Reader::new(&payload[2..]).string().unwrap(),
+            "nextdl 0 0 7"
+        );
+        assert!(!s.chan.reliable_pending(), "chunk requests must not enter the reliable queue");
+
+        let mut chunk = [0; svc::DOWNLOAD_CHUNK_SIZE];
+        chunk[..bytes.len()].copy_from_slice(&bytes);
+        s.receive_server_chunk(cookie + 1, 0, &chunk, &host);
+        assert_eq!(s.signon, Signon::Downloading, "a stale cookie cannot complete this file");
+        assert!(s.server_download.is_some());
+        assert!(!root.join("qw/maps/tiny.bsp").exists());
+
+        s.receive_server_chunk(cookie, 0, &chunk, &host);
+        assert!(s.server_download.is_none());
+        assert_eq!(s.signon, Signon::Loading);
+        assert!(host.has_map(), "the installed BSP is rebound before signon resumes");
+        assert_eq!(std::fs::read(root.join("qw/maps/tiny.bsp")).unwrap(), bytes);
+        assert!(s.chan.reliable_pending(), "cleanup and prespawn are queued reliably");
+
+        drop(s);
+        drop(host);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Resource lists are 1-based: index 0 is a placeholder the server never sends. An off-by-one
