@@ -426,7 +426,7 @@ fn name_of(ev: &SvcEvent) -> &'static str {
         SvcEvent::MaxSpeed(_) => "maxspeed",
         SvcEvent::EntGravity(_) => "entgravity",
         SvcEvent::SetPause(_) => "setpause",
-        SvcEvent::Download { .. } => "download",
+        SvcEvent::Download(_) => "download",
         SvcEvent::PlayerInfo(_) => "playerinfo",
         // Worth splitting: a session that only ever saw full updates never exercised the delta
         // path, which is what carries essentially all real gameplay traffic.

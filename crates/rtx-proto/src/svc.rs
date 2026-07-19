@@ -24,6 +24,10 @@ use glam::Vec3;
 use crate::protocol::{fte, mvd1, z_ext, ProtoState};
 use crate::sizebuf::{Reader, Underflow};
 
+/// FTE chunked downloads always transfer this many bytes. The final chunk is zero-padded on the
+/// wire and truncated to the advertised file size by the receiver.
+pub const DOWNLOAD_CHUNK_SIZE: usize = 1024;
+
 /// `svc_*` opcodes (ezQuake `qwprot/src/protocol.h`). Only the ones a QuakeWorld server sends;
 /// the NetQuake-legacy numbers in the same range are deliberately absent, and land as
 /// [`ParseError::UnknownSvc`] if a server ever sends one.
@@ -625,6 +629,20 @@ pub struct ResourceList {
     pub next: u8,
 }
 
+/// One `svc_download` message. Its wire shape changes completely when
+/// `FTE_PEXT_CHUNKEDDOWNLOADS` is negotiated.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DownloadMessage {
+    /// A sequential QuakeWorld block. `percent == 100` completes the file.
+    LegacyBlock { percent: u8, data: Vec<u8> },
+    /// A sequential download failed. FTEQW uses `-1` for a missing or denied file.
+    LegacyError(i16),
+    /// Metadata beginning a random-access transfer. Negative results are FTE's `DLERR_*` values.
+    ChunkedStart { name: String, size: Result<u64, i32> },
+    /// One fixed-size random-access block. This form can also arrive out of band.
+    ChunkedBlock { chunk: u32, data: Box<[u8; DOWNLOAD_CHUNK_SIZE]> },
+}
+
 /// One decoded server message.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SvcEvent {
@@ -751,9 +769,8 @@ pub enum SvcEvent {
     EntGravity(f32),
     /// The game was paused or unpaused.
     SetPause(bool),
-    /// A file download chunk, which we skip: we never ask for one, but a server may push the map
-    /// anyway, and skipping it correctly is the difference between ignoring it and desyncing.
-    Download { size: i16, percent: u8 },
+    /// A legacy or negotiated-FTE file download message.
+    Download(DownloadMessage),
     /// A player's per-frame state.
     PlayerInfo(Box<PlayerInfo>),
     /// Entity updates for this frame.
@@ -929,14 +946,37 @@ fn parse_one(
             userinfo: r.string()?,
         },
         op::DOWNLOAD => {
-            // We never ask for a file, but a server can push one anyway. -1 means "no such file"
-            // and carries no payload; anything else is followed by that many bytes.
-            let size = r.i16()?;
-            let percent = r.u8()?;
-            if size > 0 {
-                r.skip(size as usize)?;
+            if proto.has_fte(fte::CHUNKEDDOWNLOADS) {
+                let chunk = r.i32()?;
+                if chunk == -1 {
+                    let flag = r.i32()?;
+                    let size = if flag == i32::MIN {
+                        let low = r.u32()? as u64;
+                        let high = r.u32()? as u64;
+                        Ok(low | high << 32)
+                    } else if flag < 0 {
+                        Err(flag)
+                    } else {
+                        Ok(flag as u64)
+                    };
+                    SvcEvent::Download(DownloadMessage::ChunkedStart { name: r.string()?, size })
+                } else {
+                    let data: [u8; DOWNLOAD_CHUNK_SIZE] = r.bytes(DOWNLOAD_CHUNK_SIZE)?.try_into().unwrap();
+                    SvcEvent::Download(DownloadMessage::ChunkedBlock {
+                        chunk: chunk as u32,
+                        data: Box::new(data),
+                    })
+                }
+            } else {
+                let size = r.i16()?;
+                let percent = r.u8()?;
+                if size < 0 {
+                    SvcEvent::Download(DownloadMessage::LegacyError(size))
+                } else {
+                    let data = r.bytes(size as usize)?.to_vec();
+                    SvcEvent::Download(DownloadMessage::LegacyBlock { percent, data })
+                }
             }
-            SvcEvent::Download { size, percent }
         }
         op::PLAYERINFO => SvcEvent::PlayerInfo(Box::new(read_playerinfo(proto, r)?)),
         op::NAILS => SvcEvent::Nails(read_nails(r, false)?),
@@ -1895,10 +1935,10 @@ mod tests {
         assert_eq!(pe.updates[0].colourmod, Some([10, 20, 30]));
     }
 
-    /// A `svc_download` we never asked for must still be skipped by exactly its length, or
+    /// Legacy download data is retained for the transfer layer and consumes exactly its length, or
     /// everything after it in the packet is garbage.
     #[test]
-    fn skips_download_payload_exactly() {
+    fn parses_legacy_download_payload_exactly() {
         let mut w = Writer::new();
         w.u8(op::DOWNLOAD);
         w.i16(4);
@@ -1906,7 +1946,16 @@ mod tests {
         w.bytes(&[0xde, 0xad, 0xbe, 0xef]);
         w.u8(op::NOP);
         let evs = parse(&mut vanilla(), &w.into_vec()).unwrap();
-        assert_eq!(evs, vec![SvcEvent::Download { size: 4, percent: 50 }, SvcEvent::Nop]);
+        assert_eq!(
+            evs,
+            vec![
+                SvcEvent::Download(DownloadMessage::LegacyBlock {
+                    percent: 50,
+                    data: vec![0xde, 0xad, 0xbe, 0xef],
+                }),
+                SvcEvent::Nop,
+            ]
+        );
 
         // -1 means "no such file" and carries no payload at all.
         let mut w = Writer::new();
@@ -1915,7 +1964,69 @@ mod tests {
         w.u8(0);
         w.u8(op::NOP);
         let evs = parse(&mut vanilla(), &w.into_vec()).unwrap();
-        assert_eq!(evs, vec![SvcEvent::Download { size: -1, percent: 0 }, SvcEvent::Nop]);
+        assert_eq!(
+            evs,
+            vec![SvcEvent::Download(DownloadMessage::LegacyError(-1)), SvcEvent::Nop]
+        );
+    }
+
+    /// FTE replaces the legacy short/percent body with either file metadata or a fixed-size random
+    /// access chunk. Both the ordinary and 64-bit size forms are on the wire in deployed servers.
+    #[test]
+    fn parses_fte_chunked_download_messages() {
+        let mut p = with(fte::CHUNKEDDOWNLOADS, 0, 0);
+        let mut w = Writer::new();
+        w.u8(op::DOWNLOAD);
+        w.i32(-1);
+        w.i32(4097);
+        w.string("maps/test.bsp");
+        w.u8(op::DOWNLOAD);
+        w.i32(2);
+        w.bytes(&[0x5a; DOWNLOAD_CHUNK_SIZE]);
+        let evs = parse(&mut p, &w.into_vec()).unwrap();
+        assert_eq!(
+            evs,
+            vec![
+                SvcEvent::Download(DownloadMessage::ChunkedStart {
+                    name: "maps/test.bsp".into(),
+                    size: Ok(4097),
+                }),
+                SvcEvent::Download(DownloadMessage::ChunkedBlock {
+                    chunk: 2,
+                    data: Box::new([0x5a; DOWNLOAD_CHUNK_SIZE]),
+                }),
+            ]
+        );
+
+        let mut w = Writer::new();
+        w.u8(op::DOWNLOAD);
+        w.i32(-1);
+        w.i32(i32::MIN);
+        w.u32(7);
+        w.u32(1);
+        w.string("maps/huge.bsp");
+        let evs = parse(&mut p, &w.into_vec()).unwrap();
+        assert_eq!(
+            evs,
+            vec![SvcEvent::Download(DownloadMessage::ChunkedStart {
+                name: "maps/huge.bsp".into(),
+                size: Ok((1u64 << 32) | 7),
+            })]
+        );
+
+        let mut w = Writer::new();
+        w.u8(op::DOWNLOAD);
+        w.i32(-1);
+        w.i32(-3);
+        w.string("maps/missing.bsp");
+        let evs = parse(&mut p, &w.into_vec()).unwrap();
+        assert_eq!(
+            evs,
+            vec![SvcEvent::Download(DownloadMessage::ChunkedStart {
+                name: "maps/missing.bsp".into(),
+                size: Err(-3),
+            })]
+        );
     }
 
     /// Resource lists arrive in chunks with a continuation index; `next == 0` ends the list.

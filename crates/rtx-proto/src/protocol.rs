@@ -66,7 +66,7 @@ pub mod fte {
     pub const SPAWNSTATIC2: u32 = 0x0040_0000;
     /// Up to 256 entities per `svc_packetentities`.
     pub const PACKETENTITIES_256: u32 = 0x0100_0000;
-    /// Alternate download method. **Not advertised** — we never download.
+    /// Random-access 1024-byte file chunks, including out-of-band replies.
     pub const CHUNKEDDOWNLOADS: u32 = 0x2000_0000;
     /// Client-side QuakeC. **Not advertised** — we have no CSQC VM.
     pub const CSQC: u32 = 0x4000_0000;
@@ -130,8 +130,8 @@ pub mod z_ext {
     pub const PF_SOLID: u32 = 1 << 8;
 }
 
-/// The FTE extensions this client advertises: everything it parses, minus downloads (we never ask
-/// for a file) and CSQC (no VM). Matches qualia's set apart from those two.
+/// The FTE extensions this client advertises: everything it parses, including random-access
+/// downloads, but excluding CSQC (there is no VM).
 pub const FTE: u32 = fte::TRANS
     | fte::ACCURATE_TIMINGS
     | fte::HLBSP
@@ -141,7 +141,8 @@ pub const FTE: u32 = fte::TRANS
     | fte::FLOATCOORDS
     | fte::COLOURMOD
     | fte::SPAWNSTATIC2
-    | fte::PACKETENTITIES_256;
+    | fte::PACKETENTITIES_256
+    | fte::CHUNKEDDOWNLOADS;
 
 /// The FTE2 extensions this client advertises: none. Both bits in that mask (voice, replacement
 /// deltas) would change what we must parse without giving a bot anything.
@@ -283,13 +284,13 @@ mod tests {
     /// totals makes adding a bit a deliberate, reviewable act rather than a merge artifact.
     #[test]
     fn advertised_masks_are_what_we_parse() {
-        assert_eq!(FTE, 0x0148_f248);
+        assert_eq!(FTE, 0x2148_f248);
         assert_eq!(FTE2, 0);
         assert_eq!(MVD1, 0b11);
         assert_eq!(Z_EXT, 0x1ff);
 
-        // The three we deliberately don't ask for, because each would change parsing.
-        assert_eq!(FTE & fte::CHUNKEDDOWNLOADS, 0);
+        assert_ne!(FTE & fte::CHUNKEDDOWNLOADS, 0);
+        // The two we deliberately don't ask for, because each would change parsing.
         assert_eq!(FTE & fte::CSQC, 0);
         assert_eq!(FTE2 & fte2::REPLACEMENTDELTAS, 0);
     }

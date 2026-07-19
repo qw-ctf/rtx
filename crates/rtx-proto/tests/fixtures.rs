@@ -190,7 +190,7 @@ fn kind(ev: &SvcEvent) -> String {
         SvcEvent::MaxSpeed(_) => "maxspeed",
         SvcEvent::EntGravity(_) => "entgravity",
         SvcEvent::SetPause(_) => "setpause",
-        SvcEvent::Download { .. } => "download",
+        SvcEvent::Download(_) => "download",
         SvcEvent::PlayerInfo(_) => "playerinfo",
         SvcEvent::PacketEntities(pe) => {
             // Full and delta updates take different paths, and a capture that only ever saw full
