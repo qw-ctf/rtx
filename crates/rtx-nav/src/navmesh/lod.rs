@@ -14,8 +14,8 @@
 //! pass) keeps a few representative crossings per cluster pair (one per border level and gatedness —
 //! see [`rep_band`] and `build_lod`) plus any landing a rep misses; queries layer on top —
 //! [`coarse_costs`](NavGraph::coarse_costs) for scoring, [`corridor`](NavGraph::corridor) for the
-//! bounded steer window. Liquid link costs are folded in at the graph-swap
-//! ([`patch_lod_liquids`](NavGraph::patch_lod_liquids)) since they don't exist on the worker build.
+//! bounded steer window. The worker build flags the liquid link columns (`water_extra`/`hazard_hp`)
+//! before this runs, so the abstract tables price water and hazard directly at build time.
 
 use std::collections::{BinaryHeap, HashMap};
 
@@ -72,9 +72,9 @@ struct Portal {
 
 /// A directed abstract edge: a boundary crossing (one cross-cluster link) or intra-cluster transit
 /// (the shortest in-cluster hop between two of its portals). `base` is the static travel cost
-/// *including* the water tax (baked at the graph-swap patch, since the liquid columns don't exist on
-/// the worker); the rest of the dynamic terms are priced per query from the metadata, never baked, so
-/// live door state and per-bot hazard nerve stay honest.
+/// *including* the water tax (the liquid columns are flagged on the worker before this table is
+/// built, so it bakes in at build time); the rest of the dynamic terms are priced per query from the
+/// metadata, never baked, so live door state and per-bot hazard nerve stay honest.
 struct AbsEdge {
     to: u32,
     base: f32,
@@ -88,8 +88,8 @@ struct AbsEdge {
     chained: bool,
     /// Health lost to lava/slime along this edge — priced per bot via `hazard_cost` in [`price_meta`].
     hazard_hp: f32,
-    /// For a crossing edge, the representative fine link, so the swap patch can re-read its liquid
-    /// costs; `u32::MAX` for a transit edge (rebuilt wholesale at the patch instead).
+    /// For a crossing edge, the representative fine link, so [`price_meta`] can look up its transient
+    /// per-link penalty; `u32::MAX` for a transit edge (a multi-link intra path with no single rep).
     link: u32,
 }
 
@@ -365,8 +365,8 @@ impl NavGraph {
     /// Dijkstra from `src` restricted to the cells of cluster `cl`, with a metadata accumulator (gates
     /// OR'd, rocket jumps counted, chained flag OR'd, hazard-hp summed) along each cell's min-cost
     /// in-cluster path. Cost includes the water tax (`link_water_extra`), so the min-cost path is the
-    /// wettest-aware one. On the worker build the liquid columns are empty (both read 0); the swap
-    /// patch re-runs this once they are filled — see [`patch_lod_liquids`](Self::patch_lod_liquids).
+    /// wettest-aware one — the worker build flags the liquid columns before this runs, so those costs
+    /// are already in place.
     ///
     /// The metadata rides the min-*cost* path, chosen gate-blind (gates are metadata, not a cost term
     /// here). So a cell whose cheapest in-cluster path clips a gate carries that gate's bit even if a
@@ -406,64 +406,6 @@ impl NavGraph {
             }
         }
         out
-    }
-
-    /// Fold water and hazard costs into the abstract graph, once the graph-swap has filled the liquid
-    /// columns (they don't exist on the worker build — see `nav_build::poll_navmesh_build`). Re-reads
-    /// each crossing's own water/hazard, and re-runs the intra-cluster tables for the clusters that
-    /// contain a liquid link. Cheap: dry clusters — the overwhelming majority — keep their build-time
-    /// costs untouched. A no-op on a bare or liquid-free graph.
-    pub fn patch_lod_liquids(&mut self) {
-        let Some(mut lod) = self.lod.take() else {
-            return;
-        };
-        // Crossing edges: re-read each representative crossing's own liquid costs (idempotent for a
-        // dry crossing, where both read 0).
-        for edges in &mut lod.abs_adj {
-            for e in edges.iter_mut() {
-                if e.link != u32::MAX {
-                    e.base = self.links[e.link as usize].cost + self.link_water_extra(e.link);
-                    e.hazard_hp = self.link_hazard_hp(e.link);
-                }
-            }
-        }
-        // Clusters holding an intra liquid link need their transit + reach recomputed with liquids.
-        let mut liquid = vec![false; lod.cluster_count as usize];
-        for li in 0..self.links.len() as u32 {
-            if self.link_water_extra(li) <= 0.0 && self.link_hazard_hp(li) <= 0.0 {
-                continue;
-            }
-            let link = self.links[li as usize];
-            let (cf, ct) = (lod.cluster_of[link.from as usize], lod.cluster_of[link.to as usize]);
-            if cf == ct {
-                liquid[cf as usize] = true;
-            }
-        }
-        if liquid.iter().any(|&x| x) {
-            for c in 0..self.cells.len() {
-                if liquid[lod.cluster_of[c] as usize] {
-                    lod.cell_reach[c].clear();
-                }
-            }
-            let cluster_of = lod.cluster_of.clone();
-            for pi in 0..lod.portals.len() as u32 {
-                let (src, cl) = (lod.portals[pi as usize].cell, lod.portals[pi as usize].cluster);
-                if !liquid[cl as usize] {
-                    continue;
-                }
-                // Drop this portal's stale transit edges (identified by the sentinel link), keeping the
-                // crossings, then re-add the liquid-aware transit + reach from a fresh intra flood.
-                lod.abs_adj[pi as usize].retain(|e| e.link != u32::MAX);
-                for (cell, dist, gates, rj, chained, hazard_hp) in self.intra_reach(src, cl, &cluster_of) {
-                    let pc = lod.portal_of_cell[cell as usize];
-                    if pc >= 0 && cell != src {
-                        lod.abs_adj[pi as usize].push(AbsEdge { to: pc as u32, base: dist, gates, rj, chained, hazard_hp, link: u32::MAX });
-                    }
-                    lod.cell_reach[cell as usize].push(PortalReach { portal: pi, dist, gates, rj, chained, hazard_hp });
-                }
-            }
-        }
-        self.lod = Some(lod);
     }
 
     /// The cluster id of cell `c`, or `None` when the LOD layer isn't built (bare test graphs).
@@ -860,6 +802,7 @@ impl CoarseCosts<'_> {
 mod tests {
     use super::super::{build_navmesh, RocketJumpParams, SpeedJumpParams, TeleportInfo};
     use super::*;
+    use crate::bsp::Bsp;
     use glam::Vec3;
     use std::collections::HashSet;
 
@@ -869,16 +812,16 @@ mod tests {
     const HORIZON: f32 = 3.0;
 
     /// Build the bravado navmesh the way the rjtest live server does: `rtx_doublejump 0`, grapple off,
-    /// bhop + rocket-jump on. So the LOD tables this probe dissects are the ones the live bot steers on.
-    /// Liquid columns stay empty (worker build) — a fidelity gap that only drops *cost*, never links, so
-    /// an eviction / INF / window finding here is structural and real. `None` when the env isn't set to
-    /// bravado (the test then no-ops, mirroring `bravado_quad_reachability`).
+    /// bhop + rocket-jump on. So the LOD tables this probe dissects are the ones the live bot steers on
+    /// (liquid columns included — `build_navmesh` flags them on the worker). `None` when the env isn't
+    /// set to bravado (the test then no-ops, mirroring `bravado_quad_reachability`).
     fn build_bravado() -> Option<NavGraph> {
         let path = std::env::var("RTX_TEST_BSP").ok()?;
         if !path.to_lowercase().contains("bravado") {
             return None;
         }
         let bytes = std::fs::read(&path).expect("read bsp");
+        let bsp = Bsp::parse(&bytes).expect("parse bsp");
         // The two trigger_teleports from the entity lump — both far from the quad, included for fidelity.
         let teleports = vec![
             TeleportInfo {
@@ -892,8 +835,8 @@ mod tests {
                 dest: Vec3::new(-664.0, 480.0, 312.0),
             },
         ];
-        let (_bsp, graph) = build_navmesh(
-            bytes,
+        let graph = build_navmesh(
+            &bsp,
             vec![],
             teleports,
             vec![],
@@ -901,8 +844,7 @@ mod tests {
             false,
             Some(SpeedJumpParams { gravity: 800.0, accel: 10.0, maxspeed: 320.0, friction: 4.0, stopspeed: 100.0, curl: false }),
             Some(RocketJumpParams { gravity: 800.0, rj_extra: 0.0 }),
-        )
-        .expect("build navmesh");
+        );
         Some(graph)
     }
 

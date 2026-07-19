@@ -1,37 +1,39 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Minimal BSP reader — only the lumps the navmesh needs from the **player clip hull**.
+//! Minimal BSP reader — the lumps the navmesh and the world queries need.
 //!
 //! Declarative `binrw` parsing in the style of the `bsp` crate at
-//! `/Users/daniel/Development/home/bsp`, pared down to the three lumps navigation needs and
-//! extended with the one that crate doesn't expose: `clipnodes`. The header skips straight to
-//! `planes`, `clipnodes`, and `models` with `pad_before`, and v29/HL clipnodes (`i16` children)
-//! normalize to the BSP2 shape (`i32`) via a `From` conversion — same approach the crate uses
-//! for nodes/leaves.
+//! `/Users/daniel/Development/home/bsp`, pared down to the lumps we use and extended with the one
+//! that crate doesn't expose: `clipnodes`. The header reads `planes`, `clipnodes`, and `models`,
+//! plus the render tree's `nodes` + `leaves` (for `pointcontents`); v29/HL clipnodes (`i16`
+//! children) normalize to the BSP2 shape (`i32`) via a `From` conversion — same approach the crate
+//! uses for nodes/leaves.
 //!
-//! Hull 1 is Quake's *standing player* collision hull: its clip planes were already beveled by
-//! the player box at compile time, so a single **point** test against hull 1 answers "would the
-//! player box collide here?" (classic `SV_HullPointContents`). Everything else in the file
-//! (rendering BSP tree, faces, lightmaps, textures, vis) is irrelevant to navigation.
+//! Two hulls matter here. **Hull 1** is Quake's *standing player* collision hull: its clip planes
+//! were already beveled by the player box at compile time, so a single **point** test against
+//! hull 1 answers "would the player box collide here?" (classic `SV_HullPointContents`) — that's
+//! what the navmesh reachability walks. **Hull 0** is the render tree, the only hull that carries
+//! liquid/sky leaf contents; [`Bsp::pointcontents`] walks it (≡ mvdsv `SV_PointContents`) so the
+//! game can answer `pointcontents`/world traces without an engine syscall, in either embodiment.
+//! Everything else in the file (faces, lightmaps, textures, vis) is irrelevant to us.
 
 use std::io::{Cursor, Seek, SeekFrom};
 
 use binrw::{BinRead, BinReaderExt, BinResult};
 use glam::Vec3;
 
-/// `CONTENTS_SOLID` — the only clip-hull leaf value we test against. Clip hulls (1/2) resolve
-/// to either `SOLID` or `CONTENTS_EMPTY` (`-1`); water/lava/sky live in the render hull (0),
-/// which this minimal parser doesn't read.
+/// `CONTENTS_SOLID`. The clip hulls (1/2) resolve to either `SOLID` or `CONTENTS_EMPTY` (`-1`);
+/// the render hull (0) carries the liquids and sky below as well.
 pub const CONTENTS_SOLID: i32 = -2;
 
-/// The Quake liquid/empty point-contents values (as returned by the engine's `pointcontents`).
-/// The clip hull this parser reads never yields them — they come from a caller-supplied `contents`
-/// oracle — but they're single-sourced here so the hazard classifier and its tests agree with the
-/// engine. (`SOLID` above is the render-hull `-2`; `SKY` `-6` is unused by navigation.)
+/// The Quake point-contents values, as returned by [`Bsp::pointcontents`] (the render-hull walk,
+/// bit-identical to the engine's `pointcontents`). Single-sourced here so the hazard classifier,
+/// the world queries, and their tests all agree with the engine.
 pub const CONTENTS_EMPTY: i32 = -1;
 pub const CONTENTS_WATER: i32 = -3;
 pub const CONTENTS_SLIME: i32 = -4;
 pub const CONTENTS_LAVA: i32 = -5;
+pub const CONTENTS_SKY: i32 = -6;
 
 /// `DIST_EPSILON` — the crossing point is placed this far onto the near side of a plane during a
 /// hull trace, so a bounce restart doesn't immediately re-collide with the surface it left.

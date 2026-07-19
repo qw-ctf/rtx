@@ -96,7 +96,7 @@ impl GameState {
         }
         // Never hook the sky.
         let hook_org = self.entities[hook].v.origin;
-        if self.host.pointcontents(hook_org) == Content::Sky.as_f32() {
+        if self.pointcontents(hook_org) == crate::bsp::CONTENTS_SKY {
             self.reset_grapple(hook);
             return;
         }

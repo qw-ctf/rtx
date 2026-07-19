@@ -373,13 +373,12 @@ fn player_center(game: &GameState, p: EntId) -> Vec3 {
 }
 
 /// The best hazard to shove enemy `en` into, if any — the shared detection both the grenade lob and
-/// the rocket shove use. Builds the solidity/liquid oracles over the live BSP + `pointcontents`.
+/// the rocket shove use. Builds the solidity/liquid oracles over our parsed BSP (`pointcontents`).
 fn enemy_hazard(game: &GameState, en: EntId) -> Option<Hazard> {
     let e_feet = game.entities[en].v.origin - Vec3::new(0.0, 0.0, 24.0);
-    let bsp = game.nav.bsp.as_ref();
-    let host = game.host();
+    let bsp = game.nav.bsp.as_deref();
     let is_solid = |p: Vec3| bsp.is_some_and(|b| b.is_solid(p));
-    let contents = |p: Vec3| host.pointcontents(p);
+    let contents = |p: Vec3| game.pointcontents(p);
     find_hazard(&is_solid, &contents, e_feet)
 }
 

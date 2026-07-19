@@ -89,19 +89,19 @@ enum Below {
 /// face value: [`solid_or_film`] refines the exact boundary and runs the engine's own waterlevel-1
 /// test there, catching the film the coarse march stepped over. (The very first sample landing solid
 /// has no open bracket above it to refine — that's a wall, reported as plain solid.)
-fn probe_below(is_solid: &impl Fn(Vec3) -> bool, contents: &impl Fn(Vec3) -> f32, p: Vec3) -> Below {
+fn probe_below(is_solid: &impl Fn(Vec3) -> bool, contents: &impl Fn(Vec3) -> i32, p: Vec3) -> Below {
     let mut d = 0.0;
     let mut open_above = None; // depth of the last sample that was neither solid nor liquid
     while d <= HAZARD_PROBE_DEPTH {
         let q = p - Vec3::new(0.0, 0.0, d);
         let c = contents(q);
-        if c == CONTENTS_LAVA as f32 {
+        if c == CONTENTS_LAVA {
             return Below::Lava;
         }
-        if c == CONTENTS_SLIME as f32 {
+        if c == CONTENTS_SLIME {
             return Below::Slime;
         }
-        if c == CONTENTS_WATER as f32 {
+        if c == CONTENTS_WATER {
             return Below::Water;
         }
         if is_solid(q) {
@@ -130,7 +130,7 @@ fn probe_below(is_solid: &impl Fn(Vec3) -> bool, contents: &impl Fn(Vec3) -> f32
 /// coarse march to land inside — the whole reason ankle-deep lava used to read as safe ground.
 fn solid_or_film(
     is_solid: &impl Fn(Vec3) -> bool,
-    contents: &impl Fn(Vec3) -> f32,
+    contents: &impl Fn(Vec3) -> i32,
     p: Vec3,
     lo: f32,
     hi: f32,
@@ -147,11 +147,11 @@ fn solid_or_film(
         }
     }
     let c = contents(p - Vec3::new(0.0, 0.0, hi + 23.0));
-    if c == CONTENTS_LAVA as f32 {
+    if c == CONTENTS_LAVA {
         Below::Lava
-    } else if c == CONTENTS_SLIME as f32 {
+    } else if c == CONTENTS_SLIME {
         Below::Slime
-    } else if c == CONTENTS_WATER as f32 {
+    } else if c == CONTENTS_WATER {
         Below::Water
     } else {
         Below::Solid(hi) // refined depth — at worst 24u shallower than the coarse march's, a hair more accurate against HAZARD_DROP
@@ -164,7 +164,7 @@ fn solid_or_film(
 /// past its surface to the floor and misread as a pit).
 pub(crate) fn hazard_below(
     is_solid: &impl Fn(Vec3) -> bool,
-    contents: &impl Fn(Vec3) -> f32,
+    contents: &impl Fn(Vec3) -> i32,
     p: Vec3,
 ) -> Option<HazardKind> {
     match probe_below(is_solid, contents, p) {
@@ -181,7 +181,7 @@ pub(crate) fn hazard_below(
 /// clear horizontal path to it (a railing/wall between blocks the shove). Pure over the two oracles.
 pub fn find_hazard(
     is_solid: &impl Fn(Vec3) -> bool,
-    contents: &impl Fn(Vec3) -> f32,
+    contents: &impl Fn(Vec3) -> i32,
     e_feet: Vec3,
 ) -> Option<Hazard> {
     let mut best: Option<Hazard> = None;
@@ -221,7 +221,7 @@ pub fn find_hazard(
 /// [`hazard_below`]; the game's combat movement guard uses it to veto a lethal step.
 pub fn hazard_ahead(
     is_solid: &impl Fn(Vec3) -> bool,
-    contents: &impl Fn(Vec3) -> f32,
+    contents: &impl Fn(Vec3) -> i32,
     feet: Vec3,
     dir: Vec3,
 ) -> Option<HazardKind> {
@@ -243,7 +243,7 @@ pub fn hazard_ahead(
 /// so a bot picks a dry candidate move over a wet one when both are safe.
 pub fn water_ahead(
     is_solid: &impl Fn(Vec3) -> bool,
-    contents: &impl Fn(Vec3) -> f32,
+    contents: &impl Fn(Vec3) -> i32,
     feet: Vec3,
     dir: Vec3,
 ) -> bool {
@@ -321,14 +321,14 @@ pub fn edge_bias(is_solid: &impl Fn(Vec3) -> bool, feet: Vec3, dir: Vec3) -> Vec
 /// jump. Marches up in strides: reaching `CONTENTS_EMPTY` means an open surface overhead (true);
 /// hitting solid first means a roofed underwater tunnel (false) — there the bot must swim *out* to
 /// a breathing spot rather than press uselessly into the ceiling. Pure over the render-hull oracle.
-pub fn surface_above(contents: &impl Fn(Vec3) -> f32, p: Vec3) -> bool {
+pub fn surface_above(contents: &impl Fn(Vec3) -> i32, p: Vec3) -> bool {
     let mut d = 0.0;
     while d <= HAZARD_PROBE_DEPTH {
         let c = contents(p + Vec3::new(0.0, 0.0, d));
-        if c == CONTENTS_EMPTY as f32 {
+        if c == CONTENTS_EMPTY {
             return true; // broke the surface into open air
         }
-        if c == CONTENTS_SOLID as f32 {
+        if c == CONTENTS_SOLID {
             return false; // roofed — no surface directly overhead
         }
         d += 24.0;
@@ -352,9 +352,9 @@ mod tests {
         let solid = |p: Vec3| p.z <= 0.0 && p.x <= 200.0;
         let contents = |p: Vec3| {
             if p.x > 200.0 && p.z < 0.0 {
-                CONTENTS_LAVA as f32
+                CONTENTS_LAVA
             } else {
-                CONTENTS_EMPTY as f32
+                CONTENTS_EMPTY
             }
         };
         let e_feet = Vec3::new(160.0, 0.0, 24.0); // enemy near the lava edge
@@ -367,7 +367,7 @@ mod tests {
     fn finds_pit() {
         // Floor at z ≤ 0 for x ≤ 200; bottomless past it.
         let solid = |p: Vec3| p.z <= 0.0 && p.x <= 200.0;
-        let empty = |_: Vec3| CONTENTS_EMPTY as f32;
+        let empty = |_: Vec3| CONTENTS_EMPTY;
         let h = find_hazard(&solid, &empty, Vec3::new(170.0, 0.0, 24.0)).expect("pit found");
         assert_eq!(h.kind, HazardKind::Pit);
         assert!(h.dir.x > 0.5);
@@ -379,9 +379,9 @@ mod tests {
         let solid = |p: Vec3| (p.z <= 0.0 && p.x <= 200.0) || (96.0..104.0).contains(&p.x);
         let contents = |p: Vec3| {
             if p.x > 200.0 && p.z < 0.0 {
-                CONTENTS_LAVA as f32
+                CONTENTS_LAVA
             } else {
-                CONTENTS_EMPTY as f32
+                CONTENTS_EMPTY
             }
         };
         assert!(find_hazard(&solid, &contents, Vec3::new(40.0, 0.0, 24.0)).is_none());
@@ -389,7 +389,7 @@ mod tests {
 
     #[test]
     fn open_floor_has_no_hazard() {
-        let empty = |_: Vec3| CONTENTS_EMPTY as f32;
+        let empty = |_: Vec3| CONTENTS_EMPTY;
         assert!(find_hazard(&floor, &empty, Vec3::new(0.0, 0.0, 24.0)).is_none());
     }
 
@@ -399,9 +399,9 @@ mod tests {
         let never_solid = |_: Vec3| false;
         let water = |p: Vec3| {
             if p.z < 0.0 {
-                CONTENTS_WATER as f32
+                CONTENTS_WATER
             } else {
-                CONTENTS_EMPTY as f32
+                CONTENTS_EMPTY
             }
         };
         assert!(hazard_below(&never_solid, &water, Vec3::new(0.0, 0.0, 24.0)).is_none());
@@ -415,9 +415,9 @@ mod tests {
         let solid = |p: Vec3| p.z <= 0.0 && p.x <= 60.0;
         let contents = |p: Vec3| {
             if p.x > 60.0 && p.z < 0.0 {
-                CONTENTS_LAVA as f32
+                CONTENTS_LAVA
             } else {
-                CONTENTS_EMPTY as f32
+                CONTENTS_EMPTY
             }
         };
         let feet = Vec3::new(0.0, 0.0, 24.0);
@@ -431,7 +431,7 @@ mod tests {
 
     #[test]
     fn hazard_ahead_safe_on_open_floor() {
-        let empty = |_: Vec3| CONTENTS_EMPTY as f32;
+        let empty = |_: Vec3| CONTENTS_EMPTY;
         let feet = Vec3::new(0.0, 0.0, 24.0);
         assert!(hazard_ahead(&floor, &empty, feet, Vec3::new(1.0, 0.0, 0.0)).is_none());
     }
@@ -440,7 +440,7 @@ mod tests {
     fn hazard_ahead_wall_is_not_a_hazard() {
         // Solid wall filling all of x > 60 (including at knee height): a wall, not a pit.
         let solid = |p: Vec3| p.z <= 0.0 || p.x > 60.0;
-        let empty = |_: Vec3| CONTENTS_EMPTY as f32;
+        let empty = |_: Vec3| CONTENTS_EMPTY;
         let feet = Vec3::new(0.0, 0.0, 24.0);
         assert!(hazard_ahead(&solid, &empty, feet, Vec3::new(1.0, 0.0, 0.0)).is_none());
     }
@@ -451,9 +451,9 @@ mod tests {
         let solid = |p: Vec3| p.z <= 0.0 && p.x <= 60.0;
         let contents = |p: Vec3| {
             if p.x > 60.0 && p.z < 0.0 {
-                CONTENTS_WATER as f32
+                CONTENTS_WATER
             } else {
-                CONTENTS_EMPTY as f32
+                CONTENTS_EMPTY
             }
         };
         let feet = Vec3::new(0.0, 0.0, 24.0);
@@ -464,7 +464,7 @@ mod tests {
 
     #[test]
     fn water_ahead_dry_floor_and_wall_are_not_water() {
-        let empty = |_: Vec3| CONTENTS_EMPTY as f32;
+        let empty = |_: Vec3| CONTENTS_EMPTY;
         let feet = Vec3::new(0.0, 0.0, 24.0);
         assert!(!water_ahead(&floor, &empty, feet, Vec3::new(1.0, 0.0, 0.0)));
         // A wall ahead (solid at the probe) is not water.
@@ -486,9 +486,9 @@ mod tests {
         let solid = |p: Vec3| if p.x <= 60.0 { p.z <= 24.0 } else { p.z <= -8.0 };
         let film = |p: Vec3| {
             if p.x > 60.0 && (-32.0..-28.0).contains(&p.z) {
-                CONTENTS_LAVA as f32
+                CONTENTS_LAVA
             } else {
-                CONTENTS_EMPTY as f32
+                CONTENTS_EMPTY
             }
         };
         assert_eq!(
@@ -502,7 +502,7 @@ mod tests {
         // Same geometry with the film removed: the refined boundary sample finds plain floor, so a
         // bot may step into the shallow basin — the guard that we didn't just start flagging drops.
         let solid = |p: Vec3| if p.x <= 60.0 { p.z <= 24.0 } else { p.z <= -8.0 };
-        let empty = |_: Vec3| CONTENTS_EMPTY as f32;
+        let empty = |_: Vec3| CONTENTS_EMPTY;
         assert!(hazard_ahead(&solid, &empty, Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0)).is_none());
     }
 
@@ -512,9 +512,9 @@ mod tests {
         let solid = |p: Vec3| if p.x <= 60.0 { p.z <= 24.0 } else { p.z <= -8.0 };
         let film = |p: Vec3| {
             if p.x > 60.0 && (-32.0..-28.0).contains(&p.z) {
-                CONTENTS_WATER as f32
+                CONTENTS_WATER
             } else {
-                CONTENTS_EMPTY as f32
+                CONTENTS_EMPTY
             }
         };
         assert!(water_ahead(&solid, &film, Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0)));
@@ -527,9 +527,9 @@ mod tests {
         let solid = |p: Vec3| if p.x <= 60.0 { p.z <= 24.0 } else { p.z <= -8.0 };
         let film = |p: Vec3| {
             if p.x > 60.0 && (-32.0..-28.0).contains(&p.z) {
-                CONTENTS_SLIME as f32
+                CONTENTS_SLIME
             } else {
-                CONTENTS_EMPTY as f32
+                CONTENTS_EMPTY
             }
         };
         assert_eq!(hazard_below(&solid, &film, Vec3::new(72.0, 0.0, 8.0)), Some(HazardKind::Slime));
@@ -538,10 +538,10 @@ mod tests {
     #[test]
     fn surface_above_open_pool_vs_roofed_tunnel() {
         // Open pool: water below z = 0, open air above it — a surface to swim up to.
-        let open = |p: Vec3| if p.z < 0.0 { CONTENTS_WATER as f32 } else { CONTENTS_EMPTY as f32 };
+        let open = |p: Vec3| if p.z < 0.0 { CONTENTS_WATER } else { CONTENTS_EMPTY };
         assert!(surface_above(&open, Vec3::new(0.0, 0.0, -40.0)));
         // Roofed tunnel: water below z = 0, solid ceiling above — no surface overhead.
-        let roofed = |p: Vec3| if p.z < 0.0 { CONTENTS_WATER as f32 } else { CONTENTS_SOLID as f32 };
+        let roofed = |p: Vec3| if p.z < 0.0 { CONTENTS_WATER } else { CONTENTS_SOLID };
         assert!(!surface_above(&roofed, Vec3::new(0.0, 0.0, -40.0)));
     }
 

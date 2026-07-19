@@ -261,10 +261,10 @@ impl GameState {
                 ));
             }
             for (ni, node) in route.nodes.iter().enumerate() {
-                let contents = self.host.pointcontents(node.origin);
-                let what = if contents == defs::Content::Solid.as_f32() {
+                let contents = self.pointcontents(node.origin);
+                let what = if contents == crate::bsp::CONTENTS_SOLID {
                     "inside solid"
-                } else if contents == defs::Content::Lava.as_f32() {
+                } else if contents == crate::bsp::CONTENTS_LAVA {
                     "in lava"
                 } else {
                     continue; // water/slime are legitimate on race maps
@@ -765,8 +765,12 @@ race_set_teleport_flags_by_name odd RACEFLAG_BOGUS
             maps_with_routes += 1;
             let models = bsp_lump(&bytes, 14).unwrap_or(&[]);
             let teleports = teleports_of(&blocks, models);
-            let Some((_bsp, graph)) = crate::navmesh::build_navmesh(
-                bytes.clone(),
+            let Some(bsp) = crate::bsp::Bsp::parse(&bytes) else {
+                eprintln!("{name}: BSP failed to parse");
+                continue;
+            };
+            let graph = crate::navmesh::build_navmesh(
+                &bsp,
                 Vec::new(),
                 teleports,
                 Vec::new(),
@@ -774,10 +778,7 @@ race_set_teleport_flags_by_name odd RACEFLAG_BOGUS
                 false, // race-legal: no double-jump links
                 Some(sj),
                 None,
-            ) else {
-                eprintln!("{name}: BSP failed to build a navmesh");
-                continue;
-            };
+            );
             for (ri, route) in routes.iter().enumerate() {
                 let costs = crate::navmesh::LinkCosts::default();
                 // Two verdicts side by side: the plain cell A* vs the speed-band planner (which

@@ -456,6 +456,18 @@ impl GameState {
         }
     }
 
+    /// `pointcontents` — the Quake point-contents at `p` (`SOLID`/`EMPTY`/`WATER`/`SLIME`/`LAVA`/
+    /// `SKY`), answered from our own parsed BSP render hull rather than an engine syscall. Walks the
+    /// same hull-0 tree the engine's `SV_PointContents` does (see [`crate::bsp::Bsp::pointcontents`]),
+    /// so it's bit-identical — one implementation for both embodiments, and no variadic FFI per query.
+    /// `CONTENTS_EMPTY` (open air) when no map BSP has been parsed.
+    pub(crate) fn pointcontents(&self, p: Vec3) -> i32 {
+        self.nav
+            .bsp
+            .as_deref()
+            .map_or(crate::bsp::CONTENTS_EMPTY, |b| b.pointcontents(p))
+    }
+
     /// `setorigin` — move an entity and relink it.
     ///
     /// In server mode the engine does this through our entity array; in client mode we do it
@@ -682,6 +694,9 @@ impl GameState {
         // and the previous map's race routes with it.
         self.nav = navmesh::NavState::default();
         self.race = race::RaceState::default();
+        // Parse the map BSP now (mapname is set), so `pointcontents`/world traces have geometry to
+        // read from the first frame — independent of bots. The navmesh worker later shares this Arc.
+        self.load_map_bsp();
 
         // The worldspawn block configures `world` and runs the global precaches.
         let Some(world_fields) = self.parse_block() else {

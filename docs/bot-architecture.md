@@ -28,8 +28,9 @@ a question:
   ─────────────────                      ──────────────────
   engine fills EntVars        ──▶         mirror writes EntVars from svc_playerinfo /
                                           svc_packetentities / stats
-  engine answers traceline,   ──▶         NetHost answers from the map's own BSP
-    pointcontents, cvars                  (rtx-nav) and its own cvar store
+  engine answers traceline,   ──▶         NetHost answers traceline from the map's own BSP
+    cvars                                 (rtx-nav) and its own cvar store
+  pointcontents from the parsed BSP (rtx-nav) in *both* — no longer an engine syscall
   set_bot_cmd → SV_RunCmd      ──▶         cmd sink → clc_move on the wire
   server runs trigger touches  ──▶         the server does it for us (we are a real client)
 ```
@@ -114,7 +115,7 @@ The graph is assembled in a fixed order — each pass layering richer links onto
 cut beneath it:
 
 ```text
-  off the main thread (pure, liquid-blind clip hull):
+  entirely off the main thread (a pure function of the parsed BSP):
 
     NavGraph::build            cells + walk/step/drop/jump links + ledge flags
       → add_double_jumps       wider gaps an air-jump reaches
@@ -125,18 +126,19 @@ cut beneath it:
       → add_teleports          trigger_teleport pairs
       → add_gates              button-gated door obstructions
       → surcharge_under_plat_links
+      → flag_hazards           lava/slime cell + link surcharges (hull-0 pointcontents)
+      → flag_water             underwater cells + swim tax    (hull-0 pointcontents)
       → build_reachability     SCC + transitive closure (O(1) "can A reach B?")
-      → build_lod              the coarse cluster/portal hierarchy
-
-  then at graph-swap on the main thread (needs the render hull's pointcontents):
-
-    flag_hazards → flag_water → patch_lod_liquids
+      → build_lod              the coarse cluster/portal hierarchy (prices the liquid costs in)
 ```
 
-The two-part split is the **purity seam**. The worker build sees only the liquid-blind clip hull,
-so every liquid-aware pass — hazard flags, water flags, folding those costs into the LOD tables —
-runs afterward on the main thread, where `pointcontents` is available. The worker half is a pure
-function of the BSP, which is what makes it safe to run off-thread and byte-identical to re-run.
+The whole build is a **pure function of the BSP** — which is what makes it safe to run off-thread
+and byte-identical to re-run. The map's BSP is parsed once at map load (`GameState::load_map_bsp`,
+into a shared `Arc<Bsp>`), and the worker holds it in full: hull 1 for the static carve and hull 0
+for the liquid passes' `pointcontents`. So the liquid-aware passes — hazard flags, water flags —
+run *before* `build_reachability`/`build_lod`, and the LOD tables price water and hazard at birth.
+There is no main-thread graph-swap pass and no post-swap patch: the poll frame that installs the
+finished graph does only goal collection and a summary log.
 
 ### The link zoo
 
@@ -266,7 +268,7 @@ that still burns.
 
 Two consumers share it: **offence** (`find_hazard` scans the ring around an enemy for a spot to
 shove them into) and **self-preservation** (`hazard_ahead` / `ledge_ahead` ask "does stepping this
-way walk me into lava or off a ledge?"). At graph-swap the flags are baked in: `flag_hazards`
+way walk me into lava or off a ledge?"). On the worker build the flags are baked in: `flag_hazards`
 stamps a per-cell hazard kind and a per-link `hazard_hp` from the *real* damage model (lava ticks
 10 hp / 0.2 s, slime 4 hp / 1.0 s), a risk premium on links onto a pool edge, and a near-fatal
 surcharge on jump arcs over a lava or slime pool (below).
@@ -634,8 +636,9 @@ the `netclient` feature):
 
 - **`mirror`** writes each entity's `EntVars` from `svc_playerinfo` / `svc_packetentities` / stats,
   where the engine would have filled them.
-- **`NetHost`** answers `traceline` / `pointcontents` / cvar reads from the map's own BSP (via
-  `rtx-nav`) and its own cvar store, where the engine would have answered.
+- **`NetHost`** answers `traceline` / cvar reads from the map's own BSP (via `rtx-nav`) and its own
+  cvar store, where the engine would have answered. `pointcontents` is no longer a host seam at all:
+  both embodiments read it from the parsed BSP through `GameState::pointcontents`.
 - The **cmd sink** turns `set_bot_cmd` into a `clc_move` on the wire, where `SV_RunCmd` would have
   run it. Trigger touches the server performs for us, because the bot is a real client.
 

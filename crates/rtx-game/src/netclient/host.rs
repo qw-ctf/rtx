@@ -383,15 +383,6 @@ impl ClientHost for NetHost {
         fill(buf, info.get(&key).unwrap_or(""))
     }
 
-    fn pointcontents(&self, p: Vec3) -> f32 {
-        // The render hull, not the clip hull: liquids only exist in the former, and this trap's one
-        // job for the bots is telling lava from water from air.
-        match self.bsp.borrow().as_ref() {
-            Some(bsp) => bsp.pointcontents(p) as f32,
-            None => rtx_nav::bsp::CONTENTS_EMPTY as f32,
-        }
-    }
-
     fn world_trace(&self, start: Vec3, end: Vec3) -> rtx_nav::bsp::HullTrace {
         // Hull 1 is the standing-player hull, beveled by the player box at compile time — so a
         // *point* traced through it answers "would a player fit".
@@ -566,12 +557,12 @@ mod tests {
         assert!(h.take_cmds().is_empty(), "taking drains");
     }
 
-    /// With no map bound, `pointcontents` must answer "empty" rather than panic — the brain asks
-    /// before a map is loaded, and a crash there would be a crash on connect.
+    /// A missing map must report failure rather than panic — the brain may ask to rebind before a
+    /// map exists, and a crash there would be a crash on connect. (Point contents itself is no longer
+    /// a host trap: `GameState::pointcontents` answers "empty" with no BSP bound.)
     #[test]
-    fn pointcontents_without_a_map_is_empty() {
+    fn rebind_missing_map_reports_failure() {
         let h = host();
-        assert_eq!(h.pointcontents(Vec3::ZERO), rtx_nav::bsp::CONTENTS_EMPTY as f32);
         assert!(!h.rebind("qw", "nosuchmap"), "a missing map must report failure");
     }
 

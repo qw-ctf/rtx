@@ -1421,7 +1421,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // rare panic window and self-limits (one breath refills the tank), so it wins outright.
     if s.submerged && s.air_left < DROWN_PANIC_SECS {
         o.surfacing = true;
-        o.swim_up = crate::hazard::surface_above(&|p| host.pointcontents(p), origin);
+        o.swim_up = crate::hazard::surface_above(&|p| game.pointcontents(p), origin);
         let air = surface_target(&mut game.entities[e].bot.surface, graph, bot_cell, &costs, now);
         if let Some(cell) = air.and_then(|a| graph.nearest(a)) {
             goal_cell = cell;
@@ -1486,7 +1486,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
             goal_cell,
             race_line_ahead,
             weapons_hot,
-            bsp: game.nav.bsp.as_ref(),
+            bsp: game.nav.bsp.as_deref(),
         },
     );
 

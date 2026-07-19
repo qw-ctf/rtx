@@ -17,7 +17,7 @@ use crate::bsp::Bsp;
 use rtx_nav::qphys::ORIGIN_TO_FEET;
 use crate::bot::state::{AirCommit, Commit, GateErrand, PlatWait};
 use crate::math::{angle_vectors, angles_to, yaw_of};
-use crate::defs::{Content, Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP};
+use crate::defs::{Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP};
 use crate::game::cstring;
 use crate::nav_build::PlatStatus;
 use crate::navmesh::{CellId, Corridor, LinkCosts, LinkKind, NavGraph};
@@ -818,12 +818,12 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                     .map(|gi| { let g = graph.gate(gi); (g.closed_min, g.closed_max) })
                     .collect();
                 // Liquid oracle: flush lava/slime is invisible to the clip hull, so classify it from the
-                // engine's `pointcontents`. Gated on the map having any hazard cell at all, so the dry
-                // maps (the norm) pay no per-column FFI. A walkable column over lava becomes a repelling
-                // `Col::Hazard`, so the walk margin and the hop bearing both steer off the pool.
+                // render hull's `pointcontents` (our own parsed BSP — no syscall). Gated on the map having
+                // any hazard cell at all, so the dry maps (the norm) pay nothing. A walkable column over
+                // lava becomes a repelling `Col::Hazard`, so the walk margin and hop bearing steer off it.
                 let has_haz = graph.has_hazards();
-                let (lava, slime) = (Content::Lava.as_f32(), Content::Slime.as_f32());
-                let is_hazard = |p: Vec3| has_haz && { let c = host.pointcontents(p); c == lava || c == slime };
+                let (lava, slime) = (crate::bsp::CONTENTS_LAVA, crate::bsp::CONTENTS_SLIME);
+                let is_hazard = |p: Vec3| has_haz && { let c = bsp.pointcontents(p); c == lava || c == slime };
                 bot.near = Some(nearfield::NearField::build(&|p| bsp.is_solid(p), &is_hazard, origin, &boxes, key));
             }
         }

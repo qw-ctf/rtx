@@ -711,14 +711,16 @@ mod tests {
     /// Skipped when `NAVVIEW_TEST_BSP` is unset.
     #[test]
     fn builds_nav_overlay() {
+        use rtx_nav::bsp::Bsp;
         use rtx_nav::navmesh::{build_navmesh, RocketJumpParams, SpeedJumpParams};
         let Ok(path) = std::env::var("NAVVIEW_TEST_BSP") else {
             eprintln!("NAVVIEW_TEST_BSP unset — skipping");
             return;
         };
         let bytes = std::fs::read(&path).expect("read bsp");
-        let (bsp, graph) = build_navmesh(
-            bytes,
+        let bsp = Bsp::parse(&bytes).expect("parse bsp");
+        let graph = build_navmesh(
+            &bsp,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -733,8 +735,7 @@ mod tests {
                 curl: true,
             }),
             Some(RocketJumpParams { gravity: 800.0, rj_extra: 0.0 }),
-        )
-        .expect("build navmesh");
+        );
 
         // No jump-type link may take off from a submerged cell — you can't jump underwater.
         let jump_kinds =

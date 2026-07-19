@@ -20,8 +20,9 @@
 //! The split lives here, in [`Backend`], so that not one line of game or bot code has to know which
 //! host it's running under. Three groups of traps:
 //!
-//! - **Both hosts** — cvars, `pointcontents`, file reads, the entity-token cursor, prints, and the
-//!   usercmd sink. These `match` on the backend.
+//! - **Both hosts** — cvars, file reads, the entity-token cursor, prints, and the usercmd sink. These
+//!   `match` on the backend. (`pointcontents` used to be here; it now answers from our own parsed
+//!   BSP via `GameState::pointcontents`, identically in both hosts — no trap.)
 //! - **Server only** — everything that broadcasts, spawns fake clients, or writes the signon. A
 //!   real client can't do these and never asks; they reach for [`syscall`](HostApi::syscall), which
 //!   says so if the client mode ever does.
@@ -204,8 +205,6 @@ pub(crate) trait ClientHost {
     fn cvar_set(&self, name: &CStr, value: &CStr);
     /// A serverinfo key (and the pseudo-key `"modelname"`).
     fn infokey<'b>(&self, ent: EntId, key: &CStr, buf: &'b mut [u8]) -> &'b str;
-    /// Point contents at `p`, from the map's render hull — the liquids the clip hull can't see.
-    fn pointcontents(&self, p: Vec3) -> f32;
     /// Trace through the map's **player** hull (hull 1) — "would a player fit". The host owns the
     /// map, so it owns this, and it must answer from the moment a map is bound, because the world is
     /// *spawned* against it.
@@ -702,15 +701,6 @@ impl HostApi {
         #[cfg(feature = "netclient")]
         debug_assert!(!self.is_client(), "{}", MUTATING_TRAP);
         unsafe { (self.syscall())(B::DropToFloor as isize, ent.0 as isize) != 0 }
-    }
-
-    /// `G_POINTCONTENTS` — the `Content` value at a point (compare via `Content::X.as_f32()`).
-    pub fn pointcontents(&self, p: Vec3) -> f32 {
-        #[cfg(feature = "netclient")]
-        if let Backend::Client(c) = self.backend {
-            return c.pointcontents(p);
-        }
-        unsafe { (self.syscall())(B::PointContents as isize, pf(p.x), pf(p.y), pf(p.z)) as i32 as f32 }
     }
 
     /// `G_CENTERPRINT` — center-screen message to one client.

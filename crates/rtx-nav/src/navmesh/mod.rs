@@ -48,6 +48,8 @@ use rocketjump::{rj_perturb_ok, rocket_jump_cost, simulate_rocket_jump, RJ_DELAY
 use sidetable::SideTable;
 pub use splice::{Gate, GateInfo, Plat, PlatInfo, TeleportInfo};
 
+use std::sync::Arc;
+
 use crate::bsp::Bsp;
 use crate::qphys::STEP_HEIGHT;
 
@@ -209,9 +211,8 @@ pub struct NavGraph {
     pub adjacency: Vec<Vec<u32>>,
     /// Per-cell "the standing origin is under water" flag (parallel to `cells`), so the planner can
     /// price swimming above walking and the runtime can tell a wet cell from a dry one. Empty until
-    /// [`surcharge_water_links`](Self::surcharge_water_links) runs at graph-swap (it needs the
-    /// engine's liquid-carrying `pointcontents`, unavailable on the pure worker build); an empty vec
-    /// reads as "all dry" via [`cell_in_water`](Self::cell_in_water).
+    /// [`flag_water`](Self::flag_water) runs on the worker build (from the render hull's liquid-carrying
+    /// `pointcontents`); an empty vec reads as "all dry" via [`cell_in_water`](Self::cell_in_water).
     water: Vec<bool>,
     /// Per-cell "a bot standing here can breathe" flag (parallel to `cells`): its eye point is out of
     /// the water, so it's a spot a drowning bot can path to for air. Filled alongside `water`; an
@@ -221,8 +222,8 @@ pub struct NavGraph {
     /// Per-cell "a bot standing here is *in* lava or slime" (parallel to `cells`): the engine's
     /// waterlevel-1 sample (feet+1) reads that liquid, so the game burns anyone standing on the cell —
     /// including interior cells of a shallow film the liquid-edge probe can't see. Never `Pit`. Filled
-    /// alongside `water` by [`surcharge_hazard_links`](Self::surcharge_hazard_links); an empty vec
-    /// reads as "no cell burns" via [`cell_hazard`](Self::cell_hazard).
+    /// alongside `water` by [`flag_hazards`](Self::flag_hazards); an empty vec reads as "no cell burns"
+    /// via [`cell_hazard`](Self::cell_hazard).
     hazard: Vec<Option<crate::hazard::HazardKind>>,
     /// Health a bot expects to lose *taking* each link (parallel to `links`), `0.0` on the
     /// overwhelming majority. Filled by [`flag_hazards`](Self::flag_hazards) from the map's real
@@ -240,7 +241,7 @@ pub struct NavGraph {
     /// lift's index in `plats`. A body resting here blocks the lift's descent *and* keeps resetting
     /// its inner trigger's lower-timer, so a raised plat never comes down — hence these cells are
     /// transit-only: a bot may cross one or grab an item on it, but must never park there. Unlike
-    /// `water`/`hazard` this is pure build-side geometry (no engine `pointcontents` needed), so
+    /// `water`/`hazard` this needs no `pointcontents` lookup at all (pure clip-hull geometry), and
     /// [`add_plats`](Self::add_plats) fills it on the worker build; an empty vec reads as "no cell is
     /// under a lift" via [`cell_under_plat`](Self::cell_under_plat).
     under_plat: Vec<Option<u16>>,
@@ -439,12 +440,12 @@ impl NavGraph {
             adjacency: vec![Vec::new(); cells_grid.0.len()],
             cells: cells_grid.0,
             links: Vec::new(),
-            water: Vec::new(),       // filled at graph-swap by flag_water
-            breathable: Vec::new(),  // (needs the engine's liquid-carrying pointcontents)
+            water: Vec::new(),       // filled on the worker by flag_water
+            breathable: Vec::new(),  // (from the render hull's liquid-carrying pointcontents)
             water_extra: Vec::new(), // (same)
-            hazard: Vec::new(),      // filled at graph-swap by flag_hazards (same reason)
+            hazard: Vec::new(),      // filled on the worker by flag_hazards (same reason)
             hazard_hp: Vec::new(),   // (same)
-            under_plat: Vec::new(),  // filled by add_plats (pure geometry — no engine callback needed)
+            under_plat: Vec::new(),  // filled by add_plats (pure geometry — no pointcontents needed)
             ledge: Vec::new(),       // filled by flag_ledges below (pure geometry too)
             grid: cells_grid.1,
             gates: SideTable::default(),
@@ -728,14 +729,14 @@ impl NavGraph {
     ///
     /// Pits are deliberately not flagged here (every balcony/ledge cell borders a drop — that would
     /// surcharge half the map); the runtime combat guard [`crate::hazard::hazard_ahead`] keeps bots
-    /// from stepping off edges in a fight. Only *liquids* get a routing bias, and the pure
-    /// worker-thread build can't see them — the clip hull it reads carries no liquid contents — so
-    /// this takes the engine's `pointcontents` as `contents` and runs at graph-swap time (from the
-    /// game's navmesh poll) rather than inside [`build_navmesh`].
-    pub fn flag_hazards(&mut self, is_solid: &impl Fn(Vec3) -> bool, contents: &impl Fn(Vec3) -> f32) {
+    /// from stepping off edges in a fight. Only *liquids* get a routing bias. `contents` is a
+    /// render-hull `pointcontents` (the parsed BSP's [`crate::bsp::Bsp::pointcontents`], which carries
+    /// liquid contents the clip hull does not); [`build_navmesh`] runs this on the worker with the BSP
+    /// in hand, before the reachability/LOD passes so their tables price the liquid at birth.
+    pub fn flag_hazards(&mut self, is_solid: &impl Fn(Vec3) -> bool, contents: &impl Fn(Vec3) -> i32) {
         let liquid = |p: Vec3| match contents(p) {
-            x if x == crate::bsp::CONTENTS_LAVA as f32 => Some(crate::hazard::HazardKind::Lava),
-            x if x == crate::bsp::CONTENTS_SLIME as f32 => Some(crate::hazard::HazardKind::Slime),
+            crate::bsp::CONTENTS_LAVA => Some(crate::hazard::HazardKind::Lava),
+            crate::bsp::CONTENTS_SLIME => Some(crate::hazard::HazardKind::Slime),
             _ => None,
         };
         // Each cell's liquid footing and how deep a bot standing there wades. The engine deals
@@ -830,7 +831,7 @@ impl NavGraph {
         &self,
         id: CellId,
         is_solid: &impl Fn(Vec3) -> bool,
-        contents: &impl Fn(Vec3) -> f32,
+        contents: &impl Fn(Vec3) -> i32,
     ) -> bool {
         let c = self.cells[id as usize];
         // Standing player feet sit 24u below the origin (player `mins.z`); probe from there.
@@ -860,11 +861,11 @@ impl NavGraph {
     /// Expressed as the equivalent additive delta, `(mult − 1) · cost`: identical to the old multiply
     /// for the searches that do read `link.cost`, and conservative for the banded one.
     ///
-    /// Also like [`flag_hazards`](Self::flag_hazards) this reads liquid contents, which only the
-    /// engine's render-hull `pointcontents` carries (the worker build's clip hull is liquid-blind), so
-    /// it runs at graph-swap from the game's navmesh poll — not inside [`build`].
-    pub fn flag_water(&mut self, contents: &impl Fn(Vec3) -> f32) {
-        let is_water = |p: Vec3| contents(p) == crate::bsp::CONTENTS_WATER as f32;
+    /// Also like [`flag_hazards`](Self::flag_hazards) this reads liquid contents from a render-hull
+    /// `pointcontents` (the clip hull is liquid-blind), and [`build_navmesh`] runs it on the worker
+    /// before the reachability/LOD passes so the pool tax is baked into the abstract graph.
+    pub fn flag_water(&mut self, contents: &impl Fn(Vec3) -> i32) {
+        let is_water = |p: Vec3| contents(p) == crate::bsp::CONTENTS_WATER;
         self.water = self.cells.iter().map(|c| is_water(c.origin)).collect();
         // Eye height for the breathe test: the standing view offset (pmove samples waterlevel 3 here).
         let eye = Vec3::new(0.0, 0.0, 22.0);
@@ -1576,37 +1577,35 @@ fn link_cost(kind: LinkKind, horiz: f32, dz: f32) -> f32 {
 }
 
 /// Per-map navigation state, reset each map load. Lives on `GameState`.
-/// The product of a background navmesh build handed back to the main thread: the parsed BSP and
-/// the finished graph, or `None` if the BSP couldn't be parsed. `Send` (plain data), so it crosses
-/// the worker→main channel.
-pub type NavBuild = Option<(Bsp, NavGraph)>;
-
 #[derive(Default)]
 pub struct NavState {
-    /// The parsed clip-hull geometry the navmesh is derived from. `None` until a map's BSP
-    /// has been successfully read and parsed.
-    pub bsp: Option<Bsp>,
+    /// The parsed BSP the navmesh is derived from, shared (`Arc`) with the background build worker
+    /// and every `pointcontents`/trace query. `None` until a map's BSP has been read and parsed
+    /// (`GameState::load_map_bsp`, at entity load); populated even on a bot-free server so world
+    /// queries (sky/liquid tests, world traces) have geometry to read.
+    pub bsp: Option<Arc<Bsp>>,
     /// The built navigation graph. `None` until [`NavGraph::build`] runs (bots stay disabled).
     pub graph: Option<NavGraph>,
     /// Whether a build has been kicked off for this map (so a failed BSP read doesn't retry every
     /// frame). Reset when a new map loads.
     pub attempted: bool,
     /// A background build in flight: the channel the worker thread delivers its finished graph on.
-    /// The main thread polls it each frame and swaps the result into `graph`/`bsp` when ready
-    /// (`None` when no build is running). Dropping it (on map change) discards a stale build.
-    pub pending: Option<std::sync::mpsc::Receiver<NavBuild>>,
+    /// The main thread polls it each frame and swaps the result into `graph` when ready (`None` when
+    /// no build is running). Dropping it (on map change) discards a stale build.
+    pub pending: Option<std::sync::mpsc::Receiver<NavGraph>>,
     /// Static catalog of item-goal pickups: `(entity index, nearest cell)`. Built once with the
     /// graph; items don't move, so their cell is fixed. Live availability and desire are read
     /// fresh at selection time (by the game's `bot::goals`).
     pub goals: Vec<(u32, CellId)>,
 }
 
-/// Build a navmesh off the main thread from pre-gathered, `Send` inputs: the raw BSP bytes plus the
-/// entity-derived plat/teleport/gate info. Pure — no engine or game-state access — so it runs
-/// safely on a worker thread whose result the main thread swaps in when ready.
+/// Build a navmesh off the main thread from the parsed BSP plus the entity-derived
+/// plat/teleport/gate info. Pure — no engine or game-state access — so it runs safely on a worker
+/// thread whose finished graph the main thread swaps in when ready. The BSP is parsed once at map
+/// load (see `GameState::load_map_bsp`) and shared here by reference.
 #[allow(clippy::too_many_arguments)] // the per-map build knobs; a params struct would just relocate them
 pub fn build_navmesh(
-    bytes: Vec<u8>,
+    bsp: &Bsp,
     plats: Vec<PlatInfo>,
     teleports: Vec<TeleportInfo>,
     gates: Vec<GateInfo>,
@@ -1614,43 +1613,46 @@ pub fn build_navmesh(
     double_jump: bool,
     speed_jump: Option<SpeedJumpParams>,
     rocket_jump: Option<RocketJumpParams>,
-) -> NavBuild {
-    let run = move || -> NavBuild {
-        let bsp = Bsp::parse(&bytes)?;
-        let mut graph = NavGraph::build(&bsp);
+) -> NavGraph {
+    let run = || -> NavGraph {
+        let mut graph = NavGraph::build(bsp);
         // Static-geometry jump/hook splices first (before the plat/gate splices): keeps plat surfaces
         // off their endpoints and lets `add_gates` tag any of these links that cross a door.
         if double_jump {
-            graph.add_double_jumps(&bsp);
+            graph.add_double_jumps(bsp);
         }
         // Speed jumps after double jumps, so they only fill the gaps double jumps can't (they see the DJ
         // links via `has_direct_link`).
         if let Some(params) = speed_jump {
-            graph.add_speed_jumps(&bsp, params, double_jump);
+            graph.add_speed_jumps(bsp, params, double_jump);
         }
         // Hooks first: they derive from the static hull, and going before the plat/gate splices keeps
         // plat surfaces off hook endpoints and lets `add_gates` tag any hook link crossing a door.
         if let Some(params) = hooks {
-            graph.add_hooks(&bsp, params);
+            graph.add_hooks(bsp, params);
         }
         // Rocket jumps after hooks: `has_direct_link` then skips any ledge a (free, cheaper) hook already
         // reaches, so an RJ link is only spent where nothing else gets there.
         if let Some(params) = rocket_jump {
-            graph.add_rocket_jumps(&bsp, params, double_jump);
+            graph.add_rocket_jumps(bsp, params, double_jump);
         }
-        graph.add_plats(&bsp, &plats);
-        graph.add_teleports(&bsp, &teleports);
+        graph.add_plats(bsp, &plats);
+        graph.add_teleports(bsp, &teleports);
         graph.add_gates(&gates);
         // Last: prices links entering a lift shaft, so it must see every link the splices above added
         // (a teleport that lands under a plat, a jump-aboard from the shaft floor).
         graph.surcharge_under_plat_links();
-        // Now that every link is in place, precompute static reachability and the LOD hierarchy. The
-        // graph-swap steps (`flag_hazards`/`flag_water`) only add *cost* to existing links, never new
-        // links, so the structure these bake stays valid across the swap (liquid costs are patched
-        // into the LOD tables at the swap — see `patch_lod_liquids`).
+        // Liquid flags run here, on the worker: with the whole BSP in hand we read the render hull's
+        // contents directly (`bsp.pointcontents`), so there's no longer a main-thread graph-swap pass.
+        // They must precede `build_reachability`/`build_lod` so the LOD tables price water/hazard at
+        // birth (the tables read `link.cost + water_extra` and carry `hazard_hp` — see
+        // `build_lod_tables`/`intra_reach`; that's why there is no post-swap `patch_lod_liquids`).
+        graph.flag_hazards(&|p| bsp.is_solid(p), &|p| bsp.pointcontents(p));
+        graph.flag_water(&|p| bsp.pointcontents(p));
+        // Now that every link is in place and priced, precompute static reachability and the LOD hierarchy.
         graph.build_reachability();
         graph.build_lod();
-        Some((bsp, graph))
+        graph
     };
     // Run the (rayon-parallel) build on a transient pool sized to leave one core for the caller.
     // A transient pool rather than rayon's process-global one because this crate ships inside a
@@ -2134,6 +2136,7 @@ mod tests {
             return;
         };
         let bytes = std::fs::read(&path).expect("read bsp");
+        let bsp = Bsp::parse(&bytes).expect("parse bsp");
         let hooks = Some(HookParams {
             gravity: 800.0,
             pull: HOOK_PULL_BASE,
@@ -2149,11 +2152,7 @@ mod tests {
         });
         let rj = Some(RocketJumpParams { gravity: 800.0, rj_extra: 0.0 });
         // All solvers on, no entity splices (they're serial and not the subject here).
-        let build = || {
-            build_navmesh(bytes.clone(), vec![], vec![], vec![], hooks, true, speed, rj)
-                .expect("build produced no graph")
-                .1
-        };
+        let build = || build_navmesh(&bsp, vec![], vec![], vec![], hooks, true, speed, rj);
         let a = build();
         let b = build();
 
@@ -2406,8 +2405,8 @@ mod tests {
         assert_eq!(g.link_extra(0, &LinkCosts::default()), 0.0);
     }
 
-    /// `surcharge_hazard_links` flags a cell on a lava edge and bumps the cost of links *into* it,
-    /// while leaving an interior link untouched — over synthetic solid/liquid oracles, no BSP.
+    /// `flag_hazards` flags a cell on a lava edge and bumps the cost of links *into* it, while
+    /// leaving an interior link untouched — over synthetic solid/liquid oracles, no BSP.
     #[test]
     fn surcharge_flags_lava_edge_only() {
         // Two adjacent floor cells in a row; open lava sits past the +x cell (grid column 2 has no
@@ -2432,9 +2431,9 @@ mod tests {
         let is_solid = |p: Vec3| p.x <= 60.0 && p.z <= -40.0;
         let contents = |p: Vec3| {
             if p.x > 60.0 && p.z < 0.0 {
-                crate::bsp::CONTENTS_LAVA as f32
+                crate::bsp::CONTENTS_LAVA
             } else {
-                crate::bsp::CONTENTS_EMPTY as f32
+                crate::bsp::CONTENTS_EMPTY
             }
         };
         g.flag_hazards(&is_solid, &contents);
@@ -2471,9 +2470,9 @@ mod tests {
         // Deep water under and around cell 1 (x = 32), up past its eye point; cell 0 (x = 0) is dry.
         let contents = |p: Vec3| {
             if p.x > 16.0 {
-                crate::bsp::CONTENTS_WATER as f32
+                crate::bsp::CONTENTS_WATER
             } else {
-                crate::bsp::CONTENTS_EMPTY as f32
+                crate::bsp::CONTENTS_EMPTY
             }
         };
         g.flag_water(&contents);
@@ -2506,9 +2505,9 @@ mod tests {
         // Water fills z < 10 only, so cell origins (z = 0) are wet but their eye points (z = 22) are dry.
         let contents = |p: Vec3| {
             if p.z < 10.0 {
-                crate::bsp::CONTENTS_WATER as f32
+                crate::bsp::CONTENTS_WATER
             } else {
-                crate::bsp::CONTENTS_EMPTY as f32
+                crate::bsp::CONTENTS_EMPTY
             }
         };
         g.flag_water(&contents);
@@ -2526,9 +2525,9 @@ mod tests {
         let lava_at = |cx: f32, cy: f32| {
             move |p: Vec3| {
                 if (p.x - cx).abs() < 40.0 && (p.y - cy).abs() < 40.0 && p.z < 0.0 {
-                    crate::bsp::CONTENTS_LAVA as f32
+                    crate::bsp::CONTENTS_LAVA
                 } else {
-                    crate::bsp::CONTENTS_EMPTY as f32
+                    crate::bsp::CONTENTS_EMPTY
                 }
             }
         };
@@ -2556,9 +2555,9 @@ mod tests {
         let is_solid = |_: Vec3| false;
         let lava_everywhere = |p: Vec3| {
             if p.z < 0.0 {
-                crate::bsp::CONTENTS_LAVA as f32
+                crate::bsp::CONTENTS_LAVA
             } else {
-                crate::bsp::CONTENTS_EMPTY as f32
+                crate::bsp::CONTENTS_EMPTY
             }
         };
         g.flag_hazards(&is_solid, &lava_everywhere);
@@ -2601,9 +2600,9 @@ mod tests {
         let is_solid = |_: Vec3| false;
         let lava = |p: Vec3| {
             if (p.x - 100.0).abs() < 40.0 && p.y.abs() < 40.0 && p.z < 0.0 {
-                crate::bsp::CONTENTS_LAVA as f32
+                crate::bsp::CONTENTS_LAVA
             } else {
-                crate::bsp::CONTENTS_EMPTY as f32
+                crate::bsp::CONTENTS_EMPTY
             }
         };
         g.flag_hazards(&is_solid, &lava);
@@ -2730,9 +2729,9 @@ mod tests {
         let is_solid = |p: Vec3| p.z <= -40.0;
         let contents = |p: Vec3| {
             if (p.x - 32.0).abs() < 8.0 && p.y.abs() < 8.0 && (-40.0..0.0).contains(&p.z) {
-                crate::bsp::CONTENTS_LAVA as f32
+                crate::bsp::CONTENTS_LAVA
             } else {
-                crate::bsp::CONTENTS_EMPTY as f32
+                crate::bsp::CONTENTS_EMPTY
             }
         };
         g.flag_hazards(&is_solid, &contents);
@@ -2781,9 +2780,9 @@ mod tests {
         let is_solid = |p: Vec3| p.z <= 0.0;
         let contents = |p: Vec3| {
             if (-24.0..-20.0).contains(&p.z) {
-                crate::bsp::CONTENTS_SLIME as f32
+                crate::bsp::CONTENTS_SLIME
             } else {
-                crate::bsp::CONTENTS_EMPTY as f32
+                crate::bsp::CONTENTS_EMPTY
             }
         };
         g.flag_hazards(&is_solid, &contents);
@@ -3353,10 +3352,11 @@ mod tests {
         assert!(g.corridor(0, 10, &costs, 100.0).is_none(), "a goal within the horizon steers directly");
     }
 
-    /// The graph-swap liquid patch folds the water tax (bot-independent) and hazard hp (priced per bot)
-    /// of a far intra-cluster liquid link into the coarse estimate.
+    /// The LOD build folds the water tax (bot-independent) and hazard hp (priced per bot) of a far
+    /// intra-cluster liquid link into the coarse estimate — because the liquid columns are now flagged
+    /// on the worker *before* `build_lod`, which prices them at birth (no post-swap patch).
     #[test]
-    fn lod_liquid_patch_prices_water_and_hazard() {
+    fn lod_prices_water_and_hazard() {
         let cell = |gx: i32| Cell { origin: Vec3::new(gx as f32 * 32.0, 0.0, 0.0), gx, gy: 0 };
         let cells: Vec<Cell> = (0..15).map(|i| cell(i)).collect();
         let mut links = Vec::new();
@@ -3369,13 +3369,14 @@ mod tests {
         let costs = LinkCosts::default();
         let dry = g.coarse_costs(0, &costs, false).cost_to(12);
 
-        // Flag link 10→11 (index 20) as a water + lava crossing, then patch as the graph-swap does.
+        // Flag link 10→11 (index 20) as a water + lava crossing and rebuild the LOD as the worker does
+        // (liquid columns filled before `build_lod`, which then prices them into the abstract graph).
         let nlinks = g.links.len();
         g.water_extra = vec![0.0; nlinks];
         g.hazard_hp = vec![0.0; nlinks];
         g.water_extra[20] = 3.0;
         g.hazard_hp[20] = 25.0;
-        g.patch_lod_liquids();
+        g.build_lod();
 
         // Cell 12 is reached across 10→11, so its coarse cost grows by exactly the water tax.
         let wet = g.coarse_costs(0, &costs, false).cost_to(12);

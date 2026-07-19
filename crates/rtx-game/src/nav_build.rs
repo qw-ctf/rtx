@@ -90,8 +90,26 @@ impl GameState {
             .collect()
     }
 
+    /// Parse the current map's BSP once and cache it on `nav.bsp` as a shared `Arc`. Called at
+    /// entity load (see `load_entities`), before anything queries the world, and independent of
+    /// whether bots are wanted: the `pointcontents` and world-trace paths read this in both
+    /// embodiments, even on a bot-free server. The worker navmesh build then shares the same `Arc`.
+    /// Best-effort — a read or parse failure leaves `nav.bsp` as `None`, so world queries answer as
+    /// open air and bots stay disabled; never fatal.
+    pub(crate) fn load_map_bsp(&mut self) {
+        let path = cstring(&format!("maps/{}.bsp", self.level.mapname));
+        let Some(bytes) = self.host.read_file(&path) else {
+            self.host.dprint(c"rtx: navmesh: could not read map BSP\n");
+            return;
+        };
+        match crate::bsp::Bsp::parse(&bytes) {
+            Some(bsp) => self.nav.bsp = Some(std::sync::Arc::new(bsp)),
+            None => self.host.dprint(c"rtx: navmesh: unsupported/malformed BSP\n"),
+        }
+    }
+
     /// Ensure the map's navmesh is (being) built. The heavy graph construction runs on a worker
-    /// thread from `Send` inputs gathered here (BSP bytes + entity-derived plats/teleports/gates);
+    /// thread from `Send` inputs gathered here (the parsed BSP + entity-derived plats/teleports/gates);
     /// the result is polled each frame and swapped in atomically when ready, so a big map never
     /// hitches the server frame. Bots stay disabled until the swap lands.
     pub(crate) fn ensure_navmesh(&mut self) {
@@ -107,10 +125,11 @@ impl GameState {
         }
         self.nav.attempted = true;
 
-        let path = cstring(&format!("maps/{}.bsp", self.level.mapname));
-        let Some(bytes) = self.host.read_file(&path) else {
+        // The BSP was parsed once at map load (`load_map_bsp`); share it (`Arc`) into the worker.
+        // A missing parse means the map couldn't be read — bots simply stay disabled.
+        let Some(bsp) = self.nav.bsp.clone() else {
             self.host
-                .dprint(c"rtx: navmesh: could not read map BSP; bots disabled\n");
+                .dprint(c"rtx: navmesh: map BSP not parsed; bots disabled\n");
             return;
         };
         // Gather the entity-derived inputs on the main thread (they read the spawned entities),
@@ -187,7 +206,7 @@ impl GameState {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(navmesh::build_navmesh(
-                bytes,
+                &bsp,
                 plats,
                 teleports,
                 gates,
@@ -202,13 +221,15 @@ impl GameState {
     }
 
     /// Poll the in-flight background build; when it delivers, compute item goals and swap the graph
-    /// in. A `None` result (unparseable BSP) or a dead worker just clears the pending build.
+    /// in. The worker now returns a fully-priced graph — liquid flags and LOD are baked on the worker
+    /// (it holds the parsed BSP), so the swap frame does only goal collection + the summary log, no
+    /// main-thread pointcontents pass. A dead worker just clears the pending build.
     fn poll_navmesh_build(&mut self) {
         let Some(rx) = self.nav.pending.as_ref() else {
             return;
         };
-        let built = match rx.try_recv() {
-            Ok(built) => built,
+        let graph = match rx.try_recv() {
+            Ok(graph) => graph,
             Err(std::sync::mpsc::TryRecvError::Empty) => return, // still building
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.nav.pending = None;
@@ -216,35 +237,20 @@ impl GameState {
             }
         };
         self.nav.pending = None;
-        let Some((bsp, mut graph)) = built else {
-            self.host
-                .dprint(c"rtx: navmesh: unsupported/malformed BSP; bots disabled\n");
-            return;
-        };
-        // Bias routes away from lava/slime edges. Done here, not in the pure worker build: the clip
-        // hull the build reads carries no liquid contents, so we need the engine's `pointcontents`
-        // (which reads the render hull) — available only on the main thread once the graph lands.
-        {
-            let host = self.host();
-            let is_solid = |p: Vec3| bsp.is_solid(p);
-            let contents = |p: Vec3| host.pointcontents(p);
-            graph.flag_hazards(&is_solid, &contents);
-            // Same reason (needs the render-hull `pointcontents`): flag underwater cells and price
-            // swimming above walking, so bots cross water but never loiter in it.
-            graph.flag_water(&contents);
-        }
-        // Fold the now-known water/hazard link costs into the LOD abstract graph (the worker built it
-        // liquid-blind). Cheap — only clusters touching a liquid link are recomputed.
-        graph.patch_lod_liquids();
         let counts = graph.summary();
         let goals = self.collect_goals(&graph);
         let (lclusters, lportals, ledges, lreach) = graph.lod_stats();
+        let (planes, clipnodes) = self
+            .nav
+            .bsp
+            .as_ref()
+            .map_or((0, 0), |b| (b.planes.len(), b.clipnodes.len()));
         let msg = cstring(&format!(
             "rtx: navmesh: {} planes, {} clipnodes -> {} cells, {} links \
              (walk {} step {} drop {} jump {} djump {} sjump {} plat {} tele {} hook {} rjump {}), {} gates, {} item goals; \
              lod {} clusters {} portals {} edges {} reach\n",
-            bsp.planes.len(),
-            bsp.clipnodes.len(),
+            planes,
+            clipnodes,
             graph.cells.len(),
             graph.links.len(),
             counts.walk,
@@ -265,7 +271,6 @@ impl GameState {
             lreach,
         ));
         self.host.dprint(&msg);
-        self.nav.bsp = Some(bsp);
         self.nav.graph = Some(graph);
         self.nav.goals = goals;
     }

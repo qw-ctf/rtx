@@ -415,7 +415,7 @@ impl NavGraph {
     }
 
     /// Whether a bot standing on this cell is under water (its origin is submerged, so pmove swims).
-    /// Set by [`surcharge_water_links`](Self::surcharge_water_links); an unmarked graph reads as dry.
+    /// Set by [`flag_water`](Self::flag_water); an unmarked graph reads as dry.
     pub fn cell_in_water(&self, cell: CellId) -> bool {
         self.water.get(cell as usize).copied().unwrap_or(false)
     }
@@ -427,14 +427,15 @@ impl NavGraph {
     }
 
     /// The liquid a bot standing on this cell is *in* — lava/slime at its feet, which the game burns
-    /// it for — or `None` for safe footing. Set by [`surcharge_hazard_links`](Self::surcharge_hazard_links);
-    /// an unmarked graph reads as all-safe.
+    /// it for — or `None` for safe footing. Set by [`flag_hazards`](Self::flag_hazards); an unmarked
+    /// graph reads as all-safe.
     pub fn cell_hazard(&self, cell: CellId) -> Option<crate::hazard::HazardKind> {
         self.hazard.get(cell as usize).copied().flatten()
     }
 
     /// Whether the map has *any* lava/slime cell — a cheap gate so the near-field's per-column liquid
-    /// oracle (an engine `pointcontents` call) is skipped entirely on the dry maps that are the norm.
+    /// oracle (a `pointcontents` walk of our parsed BSP) is skipped entirely on the dry maps that are
+    /// the norm.
     pub fn has_hazards(&self) -> bool {
         self.hazard.iter().any(Option::is_some)
     }

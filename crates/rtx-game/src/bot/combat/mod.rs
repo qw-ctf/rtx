@@ -537,11 +537,11 @@ fn steps_under_plat(plats: &[(glam::Vec2, glam::Vec2)], feet: Vec3, d: Vec3) -> 
 /// Classify where a horizontal step `mv` from `feet` lands, for the combat/flee/dodge hazard ladders.
 /// A zero move is Dry — holding ground is never a step into anything. A raised lift's shaft rates Wet,
 /// not Hazard: somewhere to leave, not something that kills — move to open ground when there is any,
-/// step in only if every other way is worse. Pure over the oracles (clip-hull solidity plus the
-/// engine's `pointcontents`, the only hull that reports liquids).
+/// step in only if every other way is worse. Pure over the oracles (clip-hull solidity plus
+/// `pointcontents`, the render hull that reports liquids).
 fn step_footing(
     is_solid: &impl Fn(Vec3) -> bool,
-    contents: &impl Fn(Vec3) -> f32,
+    contents: &impl Fn(Vec3) -> i32,
     plats: &[(glam::Vec2, glam::Vec2)],
     feet: Vec3,
     mv: Vec3,
@@ -569,9 +569,8 @@ fn safe_flee_move(game: &GameState, e: EntId, origin: Vec3, away: Vec3) -> (Vec3
         return (away * MOVE_SPEED, grounded);
     };
     let plats = raised_plat_boxes(game, origin);
-    let host = game.host();
     let is_solid = |p: Vec3| bsp.is_solid(p);
-    let contents = |p: Vec3| host.pointcontents(p);
+    let contents = |p: Vec3| game.pointcontents(p);
     let feet = origin - Vec3::new(0.0, 0.0, 24.0);
     let footing = |d: Vec3| step_footing(&is_solid, &contents, &plats, feet, d);
     safe_flee_choice(&footing, away, grounded, is_burning(&game.entities[e].v))
@@ -643,9 +642,8 @@ fn safe_dodge_move(game: &GameState, e: EntId, origin: Vec3, dodge: Vec3, away: 
         return (dodge * MOVE_SPEED, grounded);
     };
     let plats = raised_plat_boxes(game, origin);
-    let host = game.host();
     let is_solid = |p: Vec3| bsp.is_solid(p);
-    let contents = |p: Vec3| host.pointcontents(p);
+    let contents = |p: Vec3| game.pointcontents(p);
     let feet = origin - Vec3::new(0.0, 0.0, 24.0);
     let footing = |d: Vec3| step_footing(&is_solid, &contents, &plats, feet, d);
     safe_dodge_choice(&footing, dodge, away, grounded, is_burning(&game.entities[e].v))
@@ -982,8 +980,8 @@ fn feed_forward(game: &mut GameState, e: EntId, now: f32, skill: f32, clean: Vec
 /// fresh, and we're not ourselves critical) the bot closes to finish rather than holding range;
 /// `press` is false when modeling is off, leaving the range logic unchanged. Grounded near a hazard
 /// the move is filtered so the bot won't strafe or backpedal into lava/slime or off a ledge (the
-/// probes reuse the offensive-shove oracles — clip-hull solidity plus the engine's `pointcontents`,
-/// the only hull that reports liquids), nor orbit a fight into a raised lift's shaft, where its body
+/// probes reuse the offensive-shove oracles — clip-hull solidity plus `pointcontents`, the render
+/// hull that reports liquids), nor orbit a fight into a raised lift's shaft, where its body
 /// would hold the lift up; airborne or map-less it's the original blind composition.
 fn combat_move(game: &mut GameState, e: EntId, enemy: EntId, now: f32, origin: Vec3, to_enemy: Vec3) -> Vec3 {
     let health = game.entities[e].v.health;
@@ -1031,9 +1029,8 @@ fn combat_move(game: &mut GameState, e: EntId, enemy: EntId, now: f32, origin: V
     match (grounded_self, game.nav.bsp.as_ref()) {
         (true, Some(bsp)) => {
             let plats = raised_plat_boxes(game, origin);
-            let host = game.host();
             let is_solid = |p: Vec3| bsp.is_solid(p);
-            let contents = |p: Vec3| host.pointcontents(p);
+            let contents = |p: Vec3| game.pointcontents(p);
             let feet = origin - Vec3::new(0.0, 0.0, 24.0);
             let footing = |mv: Vec3| step_footing(&is_solid, &contents, &plats, feet, mv);
             safe_combat_move(&footing, dir, perp, want_forward, strafe_sign, burning)

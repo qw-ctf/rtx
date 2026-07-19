@@ -36,7 +36,7 @@ impl GameState {
         self.entities[e].combat.voided = 1.0;
 
         let origin = self.entities[e].v.origin;
-        if self.host.pointcontents(origin).is(Content::Sky) {
+        if self.pointcontents(origin) == crate::bsp::CONTENTS_SKY {
             self.free(e);
             return;
         }
@@ -263,7 +263,7 @@ impl GameState {
             return;
         }
         let origin = self.entities[e].v.origin;
-        if self.host.pointcontents(origin).is(Content::Sky) {
+        if self.pointcontents(origin) == crate::bsp::CONTENTS_SKY {
             self.free(e);
             return;
         }

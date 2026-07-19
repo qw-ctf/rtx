@@ -732,8 +732,13 @@ impl Mirror {
             let v = &game.entities[e].v;
             (v.origin, v.mins, v.maxs)
         };
-        let host = *game.host();
-        let probe = |z: f32| host.pointcontents(Vec3::new(origin.x, origin.y, z));
+        // Probe our own parsed BSP (a cheap `Arc` clone so the closure doesn't borrow `game`, leaving
+        // the `&mut` entity write below free). No map bound → open air, exactly as before.
+        let bsp = game.nav.bsp.clone();
+        let probe = |z: f32| {
+            bsp.as_deref()
+                .map_or(rtx_nav::bsp::CONTENTS_EMPTY, |b| b.pointcontents(Vec3::new(origin.x, origin.y, z)))
+        };
 
         let feet = probe(origin.z + mins.z + 1.0);
         let v = &mut game.entities[e].v;
@@ -743,7 +748,7 @@ impl Mirror {
             v.flags = v.flags.without(Flags::INWATER);
             return;
         }
-        v.watertype = feet;
+        v.watertype = feet as f32;
         v.waterlevel = 1.0;
         v.flags = v.flags.with(Flags::INWATER);
 
@@ -1697,10 +1702,9 @@ fn is_player_slot(game: &GameState, e: EntId) -> bool {
 }
 
 /// Whether a `pointcontents` value is one of the liquids.
-fn is_liquid(contents: f32) -> bool {
+fn is_liquid(contents: i32) -> bool {
     use rtx_nav::bsp::{CONTENTS_LAVA, CONTENTS_SLIME, CONTENTS_WATER};
-    let c = contents as i32;
-    c == CONTENTS_WATER || c == CONTENTS_SLIME || c == CONTENTS_LAVA
+    matches!(contents, CONTENTS_WATER | CONTENTS_SLIME | CONTENTS_LAVA)
 }
 
 /// The armour's damage-absorption fraction, from which armour we're wearing. There's no stat for
