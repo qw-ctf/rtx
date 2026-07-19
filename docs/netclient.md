@@ -66,8 +66,9 @@ an FTE `CHUNKEDDOWNLOADS` server gets up to 75 random-access chunk requests in f
 older server falls back to regular sequential QuakeWorld blocks. NetQuake remains HTTP-only.
 
 Downloads are written to a unique partial file beside the destination, checked for a Quake v29 BSP
-header, and renamed into place only after the complete file has arrived. `--no-download` disables
-both HTTP and in-protocol fetching.
+header, and renamed into place only after the complete file has arrived. Progress is logged at every
+5% milestone with the transfer's average speed. `--no-download` disables both HTTP and in-protocol
+fetching.
 
 ## Squads
 

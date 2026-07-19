@@ -37,6 +37,65 @@ const RETRY_ACK_DISTANCE: u32 = 10;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+/// Shared progress reporting for every transport. Milestones are based on bytes accepted into the
+/// transfer, while speed is the average since that transport started; crossing several milestones
+/// in one read still emits each 5% line exactly once.
+struct DownloadProgress {
+    label: String,
+    started: Instant,
+    received: u64,
+    next_percent: u8,
+}
+
+impl DownloadProgress {
+    fn new(label: String, started: Instant) -> Self {
+        DownloadProgress { label, started, received: 0, next_percent: 5 }
+    }
+
+    fn add(&mut self, bytes: u64, percent: u8, source: &str, now: Instant) {
+        self.received = self.received.saturating_add(bytes);
+        self.report(percent, source, now);
+    }
+
+    fn finish(&mut self, source: &str, now: Instant) {
+        self.report(100, source, now);
+    }
+
+    fn report(&mut self, percent: u8, source: &str, now: Instant) {
+        let milestones = self.milestones(percent);
+        if milestones.is_empty() {
+            return;
+        }
+        let speed = format_speed(self.received, now.saturating_duration_since(self.started));
+        for milestone in milestones {
+            eprintln!(
+                "rtx-client: downloading {} {source}: {milestone}% at {speed}",
+                self.label
+            );
+        }
+    }
+
+    fn milestones(&mut self, percent: u8) -> Vec<u8> {
+        let mut crossed = Vec::new();
+        while self.next_percent <= percent.min(100) && self.next_percent <= 100 {
+            crossed.push(self.next_percent);
+            self.next_percent += 5;
+        }
+        crossed
+    }
+}
+
+fn format_speed(bytes: u64, elapsed: Duration) -> String {
+    let bytes_per_second = bytes as f64 / elapsed.as_secs_f64().max(0.001);
+    if bytes_per_second >= 1024.0 * 1024.0 {
+        format!("{:.2} MiB/s", bytes_per_second / (1024.0 * 1024.0))
+    } else if bytes_per_second >= 1024.0 {
+        format!("{:.1} KiB/s", bytes_per_second / 1024.0)
+    } else {
+        format!("{bytes_per_second:.0} B/s")
+    }
+}
+
 /// An HTTP download in flight: the channel its worker reports through.
 pub(crate) struct Download {
     rx: Receiver<Result<PathBuf, String>>,
@@ -166,6 +225,7 @@ pub(crate) struct ServerDownload {
     paths: DownloadPaths,
     file: Option<File>,
     state: ServerState,
+    progress: DownloadProgress,
 }
 
 enum ServerState {
@@ -208,8 +268,10 @@ impl ServerDownload {
         if cookie == 0 {
             return Err("chunked download cookie must be non-zero".to_string());
         }
+        let expected_name = format!("maps/{map}.bsp");
         Ok(ServerDownload {
-            expected_name: format!("maps/{map}.bsp"),
+            progress: DownloadProgress::new(expected_name.clone(), Instant::now()),
+            expected_name,
             cookie,
             paths: DownloadPaths::new(&basedir, gamedir, map)?,
             file: None,
@@ -248,6 +310,12 @@ impl ServerDownload {
             .ok_or_else(|| "legacy download has no temporary file".to_string())?
             .write_all(data)
             .map_err(|e| format!("can't write {}: {e}", self.paths.temporary.display()))?;
+        self.progress.add(
+            data.len() as u64,
+            percent,
+            "from the server (regular QuakeWorld)",
+            Instant::now(),
+        );
 
         if percent == 100 {
             self.finish().map(Some)
@@ -353,8 +421,18 @@ impl ServerDownload {
         }
         active.received_bytes += len as u64;
         active.rate = (active.rate + 1.0).min(MAX_IN_FLIGHT as f32);
-        if active.ranges.is_empty() {
+        let progress_percent = (active.received_bytes.saturating_mul(100) / active.size).min(100) as u8;
+        let complete = active.ranges.is_empty();
+        if complete {
             debug_assert_eq!(active.received_bytes, active.size);
+        }
+        self.progress.add(
+            len as u64,
+            progress_percent,
+            "from the server (FTE chunked)",
+            Instant::now(),
+        );
+        if complete {
             self.finish().map(Some)
         } else {
             Ok(None)
@@ -533,8 +611,9 @@ impl RangeContainer {
 
 fn fetch_http(basedir: &Path, gamedir: &str, map: &str) -> Result<PathBuf, String> {
     let url = format!("{MAP_REPO}/{map}.bsp");
+    let label = format!("maps/{map}.bsp");
     let paths = DownloadPaths::new(basedir, gamedir, map)?;
-    let bytes = http_get(&url)?;
+    let bytes = http_get(&url, &label)?;
     if !is_bsp(&bytes) {
         return Err(format!("{url} did not return a Quake BSP (got {} bytes)", bytes.len()));
     }
@@ -543,16 +622,37 @@ fn fetch_http(basedir: &Path, gamedir: &str, map: &str) -> Result<PathBuf, Strin
     paths.install(file)
 }
 
-fn http_get(url: &str) -> Result<Vec<u8>, String> {
+fn http_get(url: &str, label: &str) -> Result<Vec<u8>, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(HTTP_TIMEOUT)
         .build()
         .map_err(|e| format!("couldn't build the http client: {e}"))?;
     let resp = client.get(url).send().map_err(|e| format!("fetching {url}: {e}"))?;
-    let resp = resp.error_for_status().map_err(|e| format!("fetching {url}: {e}"))?;
-    resp.bytes()
-        .map(|b| b.to_vec())
-        .map_err(|e| format!("reading {url}: {e}"))
+    let mut resp = resp.error_for_status().map_err(|e| format!("fetching {url}: {e}"))?;
+    let expected = resp.content_length();
+    // Content-Length is remote input. It is useful as an allocation hint, but never reserve an
+    // attacker-sized sparse body up front; a genuinely larger map can grow the vector normally.
+    let capacity = expected
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or_default()
+        .min(64 * 1024 * 1024);
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut progress = DownloadProgress::new(label.to_string(), Instant::now());
+    let mut block = [0u8; 64 * 1024];
+    loop {
+        let read = resp.read(&mut block).map_err(|e| format!("reading {url}: {e}"))?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&block[..read]);
+        let percent = expected
+            .filter(|total| *total != 0)
+            .map(|total| ((bytes.len() as u64).saturating_mul(100) / total).min(100) as u8)
+            .unwrap_or(0);
+        progress.add(read as u64, percent, "over HTTP", Instant::now());
+    }
+    progress.finish("over HTTP", Instant::now());
+    Ok(bytes)
 }
 
 fn is_bsp(bytes: &[u8]) -> bool {
@@ -580,6 +680,21 @@ mod tests {
         let mut bytes = vec![0x5a; len.max(4)];
         bytes[..4].copy_from_slice(&29i32.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn progress_reports_every_five_percent_once_with_speed() {
+        let now = Instant::now();
+        let mut progress = DownloadProgress::new("maps/test.bsp".to_string(), now);
+        assert!(progress.milestones(4).is_empty());
+        assert_eq!(progress.milestones(5), vec![5]);
+        assert!(progress.milestones(5).is_empty());
+        assert_eq!(progress.milestones(17), vec![10, 15]);
+        assert_eq!(progress.milestones(100), (20..=100).step_by(5).collect::<Vec<_>>());
+        assert!(progress.milestones(100).is_empty());
+
+        assert_eq!(format_speed(2 * 1024 * 1024, Duration::from_secs(1)), "2.00 MiB/s");
+        assert_eq!(format_speed(1536, Duration::from_secs(1)), "1.5 KiB/s");
     }
 
     #[test]
