@@ -47,8 +47,8 @@ pub struct Config {
     pub spectate: bool,
     /// Say `ready` on a server that waits to be told, so a match can actually start.
     pub auto_ready: bool,
-    /// Fetch a map we don't have (over HTTP) rather than fail the connection. See
-    /// [`crate::netclient::download`].
+    /// Fetch a map we don't have rather than fail the connection: HTTP first, then the connected
+    /// QuakeWorld server when available. See [`crate::netclient::download`].
     pub download: bool,
     /// A cfg file of cvar settings to apply on startup — the client's `server.cfg`. Defaults to
     /// `<basedir>/rtx.cfg` if that exists; `--config` names another. Empty = none.

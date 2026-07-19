@@ -653,8 +653,9 @@ The honesty seam is the whole point. An enemy's health, armor, and ammo are **no
 never will be**, so a client bot leans on the same opponent model it already uses — the answer that
 makes it play like a player rather than a cheat. Server-advertised movement cvars are mirrored from
 serverinfo and forced off on any other server, so the navmesh never plans a double jump the server
-won't grant. Both QuakeWorld and NetQuake are supported, and a missing map is fetched over HTTP
-before signon. Usage lives in [network clients](netclient.md).
+won't grant. Both QuakeWorld and NetQuake are supported. Missing maps are tried over HTTP first;
+QuakeWorld can fall back to the connected server's regular or FTE chunked download protocol before
+signon. Usage lives in [network clients](netclient.md).
 
 ## Performance engineering
 

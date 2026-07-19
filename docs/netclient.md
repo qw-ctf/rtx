@@ -60,9 +60,14 @@ getting that order wrong loads a different copy than the server has, and the che
 `prespawn` is then a checksum of the wrong file, which a server answers by dropping the
 connection without a word.
 
-A map that's nowhere on disk is **downloaded** over HTTP from the community map repository
-before signon completes (`--no-download` to disable), so the client can join a public server
-running a map you've never seen.
+A map that's nowhere on disk is fetched before signon completes. Both protocols first try the
+community HTTP map repository. If that fails, QuakeWorld asks the connected server for the map:
+an FTE `CHUNKEDDOWNLOADS` server gets up to 75 random-access chunk requests in flight, while an
+older server falls back to regular sequential QuakeWorld blocks. NetQuake remains HTTP-only.
+
+Downloads are written to a unique partial file beside the destination, checked for a Quake v29 BSP
+header, and renamed into place only after the complete file has arrived. `--no-download` disables
+both HTTP and in-protocol fetching.
 
 ## Squads
 
