@@ -1300,14 +1300,15 @@ fn plant_link_json(game: &mut GameState, from: Vec3, takeoff: Vec3, tgt: Vec3, v
     let vz0 = rtx_nav::qphys::JUMP_VZ;
     let disc = (vz0 * vz0 - 2.0 * gravity * dz).max(0.0);
     let airtime = (vz0 + disc.sqrt()) / gravity;
-    // A hand-planted link is a curl by default (it's what we plant for the curl bring-up); the runtime
-    // reads this gain to pick `air_correct` over the slalom. A fast run-up overshoots a gentle curl, so
-    // the bring-up default is a firm gain that bleeds the excess onto the landing (see the harness gain
-    // sweep — ~12 lands the bravado LG dead-on). The cvar overrides it for tuning; step 4's solver will
-    // compute a per-link gain from the certified takeoff speed.
+    // A hand-planted link flies STRAIGHT by default (curl_gain 0 → the runtime keeps the slalom
+    // aimed at the landing). The old bring-up default (a firm gain ~12) made every plant a curl and
+    // homed the flight onto `rtx_jump_curl_entry/landing_*` — cvars that are 0 on a server not doing
+    // curl bring-up, which pulled every planted flight toward map origin (spawn-7 blocker: plants
+    // landing 180–230u off toward +x/+y). Curl behavior is now opt-in: set `rtx_jump_curl_gain > 0`
+    // (plus the aim cvars) before planting and the plant is a curl exactly like before.
     let curl_gain = {
         let g = game.host.cvar(c"rtx_jump_curl_gain");
-        if g > 0.0 { g } else { 12.0 }
+        if g > 0.0 { g } else { 0.0 }
     };
     // Curl-link cost the banded planner now trusts (see `banded_step`): the honest run-up travel +
     // flight + a JumpGap-grade commitment (a rollout-certified envelope carries less risk than the
