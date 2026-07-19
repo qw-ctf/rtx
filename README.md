@@ -88,3 +88,8 @@ Copyright © 2026 Daniel Svensson.
 
 Licensed under the GNU Affero General Public License, version 3 or later
 ([AGPL-3.0-or-later](LICENSE)).
+
+## Thanks
+
+Inspiration and compliance with a bit of everything thanks to: 
+[Quake Bot Archive](https://github.com/Jason2Brownlee/QuakeBotArchive), [KTX](https://github.com/qw-group/ktx), [FrogBot Rocket Arena](https://web.archive.org), [ezQuake](https://github.com/qw-group/ezquake-source/), [FTE](https://github.com/fte-team/fteqw/), [QSS-M](https://github.com/timbergeron/QSS-M), [Original Quake](https://github.com/id-software/quake)
