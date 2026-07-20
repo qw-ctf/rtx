@@ -458,7 +458,7 @@ behaviour and a dead route.
 
 **What we have measured so far, stated plainly.** This branch's bot state has been rebased onto
 upstream main once (all commits applied, no skips, build and unit gates green). On that rebased
-tip the RA route then failed **0 of 20 attempts**, with a deterministic fall at the same point
+tip the RA route then succeeded in **0 of 20 attempts**, with a deterministic fall at the same point
 roughly six seconds in — where the unrebased branch clears it. That is a real negative result and
 we are not hiding it. `rtx_bot_ledgecap` was our prime suspect precisely because of the structural
 tension described above — and the retest has since **cleared it**: with `rtx_bot_ledgecap 0` the
@@ -491,12 +491,17 @@ that is precisely the set of legs where speed is load-bearing.
 - `launch_yaw_tol` is left at `0` for them (`steer.rs:1565`), so the launch-yaw veto in
   `bhop.rs:446` never arms — that guard is dead code on the family that most needs it.
 
-For the **plain** curl family this defect was fixed on this branch, and there is a regression test
-pinning it: `dm3_ring_legacy_curls_preserve_the_certified_lateral_profile` (`jumps.rs:2756`) builds
-DM3, takes two ring curls, and asserts (a) that the preserved certified line lands at live-class
-speed, (b) that the previously-observed off-profile launch line still does *not* land — kept as a
-red witness — and (c) `!missing_profile`, i.e. none of the three aim fields is zero
-(`jumps.rs:2824`–`:2830`). Anyone porting this upstream should expect that test to be the contract.
+For the **plain** curl family this defect is fixed on our development branch (commit `a85084d`:
+psi is threaded through the solver's `solved` tuple and emitted as the certified entry aim,
+negative immediate-air switch and landing aim), with a regression test pinning it:
+`dm3_ring_legacy_curls_preserve_the_certified_lateral_profile` builds DM3, takes two ring curls,
+and asserts (a) that the preserved certified line lands at live-class speed, (b) that the
+previously-observed off-profile launch line still does *not* land — kept as a red witness — and
+(c) that none of the three aim fields is zero. **That commit is not yet on this PR branch**: it is
+in a live regression-isolation round on our rig (a candidate that stacked it with planner changes
+measured badly, and we do not port anything here before the isolation verdict). On this branch the
+legacy emission still zeroes the aim fields; the fix lands as its own commit once cleared, and the
+test is the contract anyone porting it upstream should expect.
 
 **The v3 entry envelope is a calibration artifact, not a physical bound.** There is exactly one
 production entry ladder for the optimal-sweep family, `GT_OPT_ENTRY_SPEEDS = [320, 340, 360]`
