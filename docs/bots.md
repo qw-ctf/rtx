@@ -116,6 +116,10 @@ With `rtx_bot_curljump` (off by default), the navmesh also generates **curl jump
 down a corridor, then an air-turn onto an offset platform — each certified by a pmove rollout in
 the navmesh build. A sub-toggle of bhop (`rtx_bot_bhop 0` disables it too).
 
+See [curl-jumps.md](curl-jumps.md) for the full design reference: how the solver certifies a curl,
+what the emitted traversal carries, how `steer.rs`/`bhop.rs` execute it, the DM3 RA jump as the
+acceptance case, and the known limitations.
+
 ### Hook links
 
 When `rtx_grapple` is on, the navmesh also grows **hook links** — edges a bot crosses with the
