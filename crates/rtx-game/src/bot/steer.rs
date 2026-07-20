@@ -443,6 +443,21 @@ fn nearfield_channels(locomotion: bool, configured: bool, jump_approach: bool) -
     (active, active && !jump_approach)
 }
 
+fn bhop_look_direction(
+    near: Option<&nearfield::NearField>,
+    sensor_active: bool,
+    origin: Vec3,
+    bhop_look: Vec3,
+    to_wp: Vec2,
+) -> Vec2 {
+    // This is a protective far-look veto, not a steering force: a certified approach may yield
+    // repulsion while the still-live sensor keeps a blocked chord on the local waypoint.
+    let look_clear = near
+        .filter(|_| sensor_active)
+        .is_none_or(|nf| nf.chord_open(origin, bhop_look));
+    if look_clear { bhop_look.xy() - origin.xy() } else { to_wp }
+}
+
 fn terrain_policy(base: bool, terrain_stop: bool, nearfield_steering: bool) -> bool {
     base && (!terrain_stop || nearfield_steering)
 }
@@ -1590,12 +1605,13 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             // Past the grid the chord passes — the route out there is trusted; the veto fires only on a
             // drop the near-field actually sees, so open corridors keep the full anticipatory look-ahead.
             _ => {
-                let look_clear = bot
-                    .near
-                    .as_ref()
-                    .filter(|_| nf_steering_active)
-                    .is_none_or(|nf| nf.chord_open(origin, bhop_look));
-                if look_clear { bhop_look.xy() - origin.xy() } else { to_wp }
+                bhop_look_direction(
+                    bot.near.as_ref(),
+                    nf_active,
+                    origin,
+                    bhop_look,
+                    to_wp,
+                )
             }
         };
         let dir = if ahead.length() > 8.0 { ahead } else { to_wp };
@@ -2416,6 +2432,57 @@ mod tests {
         assert_eq!(nearfield_channels(true, true, true), (true, false));
         assert_eq!(nearfield_channels(true, true, false), (true, true));
         assert_eq!(nearfield_channels(true, false, true), (false, false));
+    }
+
+    #[test]
+    fn jump_approach_keeps_the_protective_bhop_chord() {
+        let origin = Vec3::new(0.0, 0.0, 1.0);
+        let solid = |p: Vec3| p.y >= -16.0 && p.z <= 0.0;
+        let near = nearfield::NearField::build(&solid, &|_| false, origin, &[], 0);
+        let blocked_look = Vec3::new(48.0, -80.0, 1.0);
+        let to_wp = Vec2::new(64.0, 0.0);
+        let (sensor_active, steering_active) = nearfield_channels(true, true, true);
+        assert!(!steering_active, "the approach must still yield vector steering");
+
+        assert_eq!(
+            bhop_look_direction(
+                Some(&near),
+                sensor_active,
+                origin,
+                blocked_look,
+                to_wp,
+            ),
+            to_wp,
+            "a yielded jump approach must still reject a blocked far chord",
+        );
+    }
+
+    #[test]
+    fn bhop_chord_controls_preserve_open_and_absent_sensor_behavior() {
+        let origin = Vec3::new(0.0, 0.0, 1.0);
+        let solid = |p: Vec3| p.y >= -16.0 && p.z <= 0.0;
+        let near = nearfield::NearField::build(&solid, &|_| false, origin, &[], 0);
+        let open_look = Vec3::new(64.0, 0.0, 1.0);
+        let blocked_look = Vec3::new(48.0, -80.0, 1.0);
+        let to_wp = Vec2::new(0.0, 64.0);
+
+        assert_eq!(
+            bhop_look_direction(Some(&near), true, origin, open_look, to_wp),
+            open_look.xy() - origin.xy(),
+        );
+        assert_eq!(
+            bhop_look_direction(None, false, origin, blocked_look, to_wp),
+            blocked_look.xy() - origin.xy(),
+        );
+        assert_eq!(
+            bhop_look_direction(Some(&near), false, origin, blocked_look, to_wp),
+            blocked_look.xy() - origin.xy(),
+            "a cached field must stay inert while its sensor channel is inactive",
+        );
+        assert_eq!(
+            bhop_look_direction(Some(&near), true, origin, blocked_look, to_wp),
+            to_wp,
+        );
     }
 
     #[test]
