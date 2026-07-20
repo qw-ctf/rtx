@@ -407,12 +407,52 @@ fn nearfield_owns_locomotion(
         && matches!(kind, Some(LinkKind::Walk | LinkKind::Step) | None)
 }
 
-fn bhop_sustain_policy(base: bool, _ascent_ahead: bool) -> bool {
-    base
+#[derive(Clone, Copy)]
+struct ApproachLeg {
+    kind: LinkKind,
+    source: CellId,
+    target: CellId,
+    speed_jump_certified: bool,
 }
 
-fn zigzag_policy(base: bool, _on_ledge: bool) -> bool {
-    base
+fn certified_jump_approach<I>(legs: I) -> bool
+where
+    I: IntoIterator<Item = ApproachLeg>,
+{
+    let mut previous_target = None;
+    let mut saw_ground = false;
+    for leg in legs {
+        if previous_target.is_some_and(|target| target != leg.source) {
+            return false;
+        }
+        match leg.kind {
+            LinkKind::Walk | LinkKind::Step => {
+                saw_ground = true;
+                previous_target = Some(leg.target);
+            }
+            LinkKind::JumpGap => return saw_ground,
+            LinkKind::SpeedJump => return saw_ground && leg.speed_jump_certified,
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn nearfield_channels(locomotion: bool, configured: bool, jump_approach: bool) -> (bool, bool) {
+    let active = locomotion && configured;
+    (active, active && !jump_approach)
+}
+
+fn terrain_policy(base: bool, terrain_stop: bool, nearfield_steering: bool) -> bool {
+    base && (!terrain_stop || nearfield_steering)
+}
+
+fn bhop_sustain_policy(base: bool, ascent_ahead: bool, nearfield_steering: bool) -> bool {
+    terrain_policy(base, ascent_ahead, nearfield_steering)
+}
+
+fn zigzag_policy(base: bool, on_ledge: bool, nearfield_steering: bool) -> bool {
+    terrain_policy(base, on_ledge, nearfield_steering)
 }
 
 /// The lip is "right here" — inside this distance the takeoff jump must fire *now* or the bot wedges
@@ -1086,6 +1126,27 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     let is_jump = |l: u32| matches!(graph.link_kind(l), LinkKind::JumpGap | LinkKind::DoubleJump | LinkKind::SpeedJump);
     let jump_at_hand = cur_leg.is_some_and(&is_jump) || bot.route.get(bot.route_pos + 1).is_some_and(|&l| is_jump(l));
     let on_ledge = graph.is_ledge(bot_cell) && !jump_at_hand;
+    // A certified traversal owns not just its current frame but the contiguous ordinary route that
+    // delivers it to the source. Route bands are deliberately not consulted: completion-lock can
+    // leave them at zero while the link-kind contract remains authoritative.
+    let certified_jump_approach = certified_jump_approach(
+        bot.route
+            .get(bot.route_pos..)
+            .into_iter()
+            .flatten()
+            .map(|&leg| ApproachLeg {
+                kind: graph.link_kind(leg),
+                source: graph.link_source(leg),
+                target: graph.link_target(leg),
+                speed_jump_certified: graph.speed_jump_of_link(leg).is_some(),
+            }),
+    );
+    let nearfield_configured = host.cvar_bool(c"rtx_bot_nearfield");
+    let (_, nearfield_steering_for_policy) = nearfield_channels(
+        nearfield_owns_locomotion(on_air, false, hook_active, rj_active, kind),
+        nearfield_configured,
+        certified_jump_approach,
+    );
     // Do not launch an ordinary hop from the final ground leg into a SpeedJump.  The committed
     // traversal owns its stored run-up and takeoff line; carrying a one-frame +jump across the
     // handoff gives it a timing-dependent airborne entry that its ground certificate never allowed.
@@ -1156,6 +1217,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         && (goal_dist > 150.0 || planned_band >= 1)
         && side_open,
         ascent_ahead,
+        nearfield_steering_for_policy,
     );
     // Ground zigzag: a corridor too short for a hop ([`bhop::RUNWAY_ENGAGE`]) but straight and long
     // enough ([`bhop::ZIGZAG_ENGAGE`]) to gain speed from the circle-strafe alone. The controller
@@ -1169,6 +1231,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         && runway_dist >= bhop::ZIGZAG_ENGAGE
         && side_open,
         on_ledge,
+        nearfield_steering_for_policy,
     );
     // A speed-jump leg is a *committed* bhop run-up + leap: engage bhop unconditionally (the link is a
     // pre-verified runway) and track it so the route stays frozen. Latch/clear `sj_leg` on the leg.
@@ -1422,7 +1485,8 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // jump, hook, launched air-commit), where the flight must commit to its landing and must not be
     // nudged. Built on grounded frames (the seed needs footing); the cache survives the brief airborne
     // phase of a hop (which rises well under the recenter height), so the bearing stays aware mid-hop.
-    // The slow-walk edge margin below re-reads this same grid.
+    // The slow-walk edge margin below re-reads this same grid. A certified jump approach therefore
+    // keeps the sensor warm even though its separate directional channel yields below.
     let nf_locomotion = nearfield_owns_locomotion(
         on_air,
         sj_active,
@@ -1430,7 +1494,8 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         rj_active,
         kind,
     );
-    let nf_active = nf_locomotion && host.cvar_bool(c"rtx_bot_nearfield");
+    let (nf_active, nf_steering_active) =
+        nearfield_channels(nf_locomotion, nearfield_configured, certified_jump_approach);
     if nf_active && on_ground {
         if let Some(bsp) = bsp {
             let key = nearfield_gates(graph, gate_closed, origin).fold(0u32, |k, gi| k | (1u32 << gi.min(31)));
@@ -1528,7 +1593,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 let look_clear = bot
                     .near
                     .as_ref()
-                    .filter(|_| nf_active)
+                    .filter(|_| nf_steering_active)
                     .is_none_or(|nf| nf.chord_open(origin, bhop_look));
                 if look_clear { bhop_look.xy() - origin.xy() } else { to_wp }
             }
@@ -1538,8 +1603,9 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         // (bhop or zigzag) holds the walkable line — e.g. tracking up a staircase — instead of weaving
         // straight off the edge toward the raw xy goal. `nf_active` already excludes committed jumps,
         // and a speed jump takes the `sj_active` branch above (so a gap leap still commits to its
-        // landing). Inert on open ground, where the near-field push is zero.
-        let dir = match bot.near.as_ref().filter(|_| nf_active).and_then(|nf| nf.steer_push(origin)) {
+        // landing). `nf_steering_active` additionally yields the contiguous certified approach.
+        // Inert on open ground, where the near-field push is zero.
+        let dir = match bot.near.as_ref().filter(|_| nf_steering_active).and_then(|nf| nf.steer_push(origin)) {
             Some(push) => {
                 let bent = dir.normalize_or_zero() + push.xy() * NEARFIELD_BHOP_WEIGHT;
                 if bent.length() > 1e-3 { bent * dir.length() } else { dir }
@@ -1890,7 +1956,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         && !hook_engaged
         && !rj_engaged
         && dist > ARRIVE_RADIUS;
-    let near_push = (nf_ground && nf_active).then(|| bot.near.as_ref()?.steer_push(origin)).flatten();
+    let near_push = (nf_ground && nf_steering_active).then(|| bot.near.as_ref()?.steer_push(origin)).flatten();
     let edge_push = if nf_ground {
         near_push.unwrap_or(raw_edge_push)
     } else if bhop_edge_recovery {
@@ -1922,7 +1988,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // Off on the final approach (home straight on the target) and whenever the chord isn't clear.
     let heading = {
         let want_glide = nf_ground
-            && nf_active
+            && nf_steering_active
             && host.cvar_bool(c"rtx_bot_glide")
             && matches!(kind, Some(LinkKind::Walk | LinkKind::Step));
         let glide = want_glide.then_some(bot.near.as_ref()).flatten().and_then(|nf| {
@@ -2234,14 +2300,130 @@ mod tests {
 
     #[test]
     fn rebase_drift_does_not_end_bhop_sustain_on_an_ascent() {
-        assert!(bhop_sustain_policy(true, true));
-        assert!(!bhop_sustain_policy(false, true));
+        assert!(bhop_sustain_policy(true, true, true));
+        assert!(!bhop_sustain_policy(false, true, true));
     }
 
     #[test]
     fn rebase_drift_does_not_end_zigzag_on_a_ledge_cell() {
-        assert!(zigzag_policy(true, true));
-        assert!(!zigzag_policy(false, true));
+        assert!(zigzag_policy(true, true, true));
+        assert!(!zigzag_policy(false, true, true));
+    }
+
+    #[test]
+    fn certified_jump_approach_scans_the_contiguous_ground_contract() {
+        let mut speed_jump = Vec::new();
+        for i in 0..8 {
+            speed_jump.push(ApproachLeg {
+                kind: if i % 2 == 0 { LinkKind::Walk } else { LinkKind::Step },
+                source: i,
+                target: i + 1,
+                speed_jump_certified: false,
+            });
+        }
+        speed_jump.push(ApproachLeg {
+            kind: LinkKind::SpeedJump,
+            source: 8,
+            target: 9,
+            speed_jump_certified: true,
+        });
+        assert!(certified_jump_approach(speed_jump));
+
+        assert!(certified_jump_approach([
+            ApproachLeg {
+                kind: LinkKind::Step,
+                source: 0,
+                target: 1,
+                speed_jump_certified: false,
+            },
+            ApproachLeg {
+                kind: LinkKind::JumpGap,
+                source: 1,
+                target: 2,
+                speed_jump_certified: false,
+            },
+        ]));
+    }
+
+    #[test]
+    fn certified_jump_approach_fails_closed_off_the_ground_contract() {
+        assert!(!certified_jump_approach([
+            ApproachLeg {
+                kind: LinkKind::Walk,
+                source: 0,
+                target: 1,
+                speed_jump_certified: false,
+            },
+            ApproachLeg {
+                kind: LinkKind::Step,
+                source: 1,
+                target: 2,
+                speed_jump_certified: false,
+            },
+        ]));
+        assert!(!certified_jump_approach([
+            ApproachLeg {
+                kind: LinkKind::Walk,
+                source: 0,
+                target: 1,
+                speed_jump_certified: false,
+            },
+            ApproachLeg {
+                kind: LinkKind::Drop,
+                source: 1,
+                target: 2,
+                speed_jump_certified: false,
+            },
+            ApproachLeg {
+                kind: LinkKind::JumpGap,
+                source: 2,
+                target: 3,
+                speed_jump_certified: false,
+            },
+        ]));
+        assert!(!certified_jump_approach([
+            ApproachLeg {
+                kind: LinkKind::Walk,
+                source: 0,
+                target: 1,
+                speed_jump_certified: false,
+            },
+            ApproachLeg {
+                kind: LinkKind::JumpGap,
+                source: 7,
+                target: 8,
+                speed_jump_certified: false,
+            },
+        ]));
+        assert!(!certified_jump_approach([
+            ApproachLeg {
+                kind: LinkKind::Walk,
+                source: 0,
+                target: 1,
+                speed_jump_certified: false,
+            },
+            ApproachLeg {
+                kind: LinkKind::SpeedJump,
+                source: 1,
+                target: 2,
+                speed_jump_certified: false,
+            },
+        ]));
+    }
+
+    #[test]
+    fn jump_approach_yields_steering_but_keeps_nearfield_sensing() {
+        assert_eq!(nearfield_channels(true, true, true), (true, false));
+        assert_eq!(nearfield_channels(true, true, false), (true, true));
+        assert_eq!(nearfield_channels(true, false, true), (false, false));
+    }
+
+    #[test]
+    fn terrain_stops_return_when_nearfield_steering_is_unavailable() {
+        assert!(!terrain_policy(true, true, false));
+        assert!(terrain_policy(true, true, true));
+        assert!(terrain_policy(true, false, false));
+        assert!(!terrain_policy(false, false, true));
     }
 
     #[test]
