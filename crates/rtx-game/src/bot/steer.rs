@@ -393,6 +393,27 @@ fn nearfield_gates<'a>(graph: &'a NavGraph, gate_closed: &'a [bool], origin: Vec
     })
 }
 
+fn nearfield_owns_locomotion(
+    on_air: bool,
+    sj_active: bool,
+    hook_active: bool,
+    rj_active: bool,
+    kind: Option<LinkKind>,
+    planned_band: u8,
+    next_planned_band: u8,
+) -> bool {
+    !on_air
+        && !sj_active
+        && !hook_active
+        && !rj_active
+        // A nonzero band is an executable promise that speed survives this leg (or its immediate
+        // handoff). Near-field remains the authority everywhere else, but it must not replace the
+        // planner-certified line with a local chord/push while that speed is load-bearing.
+        && planned_band == 0
+        && next_planned_band == 0
+        && matches!(kind, Some(LinkKind::Walk | LinkKind::Step) | None)
+}
+
 /// The lip is "right here" — inside this distance the takeoff jump must fire *now* or the bot wedges
 /// against the step face; beyond it the run-up gate applies.
 const JUMP_NOW_DIST: f32 = 40.0;
@@ -1399,11 +1420,15 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // nudged. Built on grounded frames (the seed needs footing); the cache survives the brief airborne
     // phase of a hop (which rises well under the recenter height), so the bearing stays aware mid-hop.
     // The slow-walk edge margin below re-reads this same grid.
-    let nf_locomotion = !on_air
-        && !sj_active
-        && !hook_active
-        && !rj_active
-        && matches!(kind, Some(LinkKind::Walk | LinkKind::Step) | None);
+    let nf_locomotion = nearfield_owns_locomotion(
+        on_air,
+        sj_active,
+        hook_active,
+        rj_active,
+        kind,
+        planned_band,
+        bot.route_bands.get(bot.route_pos + 1).copied().unwrap_or(0),
+    );
     let nf_active = nf_locomotion && host.cvar_bool(c"rtx_bot_nearfield");
     if nf_active && on_ground {
         if let Some(bsp) = bsp {
@@ -2204,6 +2229,16 @@ mod tests {
         assert!(!jump_runup_ok(Vec2::new(0.0, 300.0), fwd, 200.0, 0.5, 320.0));
         // Gate disabled → always allowed (today's behavior).
         assert!(jump_runup_ok(Vec2::ZERO, fwd, 200.0, 0.0, 320.0));
+    }
+
+    #[test]
+    fn speed_banded_legs_keep_nearfield_out_of_the_certified_run() {
+        let owns = |band, next_band| {
+            nearfield_owns_locomotion(false, false, false, false, Some(LinkKind::Walk), band, next_band)
+        };
+        assert!(owns(0, 0), "ordinary zero-band walking must retain near-field protection");
+        assert!(!owns(1, 0), "the current load-bearing speed band owns its line");
+        assert!(!owns(0, 1), "the approach to the next load-bearing speed band owns its line");
     }
 
     #[test]
