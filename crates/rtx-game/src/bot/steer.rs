@@ -20,7 +20,7 @@ use crate::math::{angle_vectors, angles_to, yaw_of};
 use crate::defs::{Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP};
 use crate::game::cstring;
 use crate::nav_build::PlatStatus;
-use crate::navmesh::{CellId, Corridor, LinkCosts, LinkKind, NavGraph, GRID};
+use crate::navmesh::{CellId, Corridor, LinkCosts, LinkKind, NavGraph, BAND_FLOOR, GRID};
 use crate::nearfield;
 
 /// How long a real network client waits at a reached pickup terminal for the authoritative server
@@ -412,6 +412,13 @@ fn nearfield_owns_locomotion(
         && planned_band == 0
         && next_planned_band == 0
         && matches!(kind, Some(LinkKind::Walk | LinkKind::Step) | None)
+}
+
+fn nearfield_glide_owns_locomotion(hops: u32, speed: f32) -> bool {
+    // After a real hop, an above-run-speed landing is still executing carried motion even when the
+    // completion lock has kept the route's original band-0 labels.  Keep the local wall/edge grid,
+    // but do not let its long chord replace the cell-by-cell runout until that physical carry is gone.
+    hops == 0 || speed < BAND_FLOOR[1]
 }
 
 /// The lip is "right here" — inside this distance the takeoff jump must fire *now* or the bot wedges
@@ -1455,9 +1462,6 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // across the gap; otherwise steer toward the look-ahead corridor point (smoother than the 32u
     // next cell) with as much straight-ish corridor as the route offers. `mut` so the hazard-edge
     // brake below can null the hop and drive a reverse wish through `emit` instead.
-    let mut nf_diag_chord_veto = false;
-    let mut nf_diag_bhop_push = false;
-    let mut nf_diag_edge_clear = false;
     let mut bhop_cmd = {
         let dt = frametime.clamp(0.001, 0.05);
         let accel = host.cvar(c"sv_accelerate");
@@ -1533,7 +1537,6 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                     .as_ref()
                     .filter(|_| nf_active)
                     .is_none_or(|nf| nf.chord_open(origin, bhop_look));
-                nf_diag_chord_veto = !look_clear;
                 if look_clear { bhop_look.xy() - origin.xy() } else { to_wp }
             }
         };
@@ -1545,7 +1548,6 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         // landing). Inert on open ground, where the near-field push is zero.
         let dir = match bot.near.as_ref().filter(|_| nf_active).and_then(|nf| nf.steer_push(origin)) {
             Some(push) => {
-                nf_diag_bhop_push = push.xy().length_squared() > 1e-6;
                 let bent = dir.normalize_or_zero() + push.xy() * NEARFIELD_BHOP_WEIGHT;
                 if bent.length() > 1e-3 { bent * dir.length() } else { dir }
             }
@@ -1589,7 +1591,6 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 // near-field sees the drop — cap `clear` at the lip so the controller carves/brakes on
                 // the ground at the edge (turning far faster than in the air) instead of leaping off it.
                 let edge = bot.near.as_ref().filter(|_| nf_active).map_or(d, |nf| nf.edge_ahead(origin, v_xy.extend(0.0), d));
-                nf_diag_edge_clear = edge < wall;
                 wall.min(edge)
             }
             _ => f32::INFINITY,
@@ -1897,7 +1898,6 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         && !rj_engaged
         && dist > ARRIVE_RADIUS;
     let near_push = (nf_ground && nf_active).then(|| bot.near.as_ref()?.steer_push(origin)).flatten();
-    let nf_diag_ground_push = near_push.is_some_and(|push| push.xy().length_squared() > 1e-6);
     let edge_push = if nf_ground {
         near_push.unwrap_or(raw_edge_push)
     } else if bhop_edge_recovery {
@@ -1927,16 +1927,17 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // waypoint (leg advancement, `wish_scale`, the magnet, the watchdogs): the chord follows the leg
     // polyline, so it passes within `ARRIVE_RADIUS` of each cell centre, exactly the magnet's argument.
     // Off on the final approach (home straight on the target) and whenever the chord isn't clear.
-    let (heading, nf_diag_glide) = {
+    let heading = {
         let want_glide = nf_ground
             && nf_active
+            && nearfield_glide_owns_locomotion(bot.bhop.hops, speed)
             && host.cvar_bool(c"rtx_bot_glide")
             && matches!(kind, Some(LinkKind::Walk | LinkKind::Step));
         let glide = want_glide.then_some(bot.near.as_ref()).flatten().and_then(|nf| {
             let g = corridor_point(graph, &bot.route, bot.route_pos, origin, NEAR_GLIDE_AHEAD);
             nf.chord_clear(origin, g, NEAR_GLIDE_MARGIN).then_some(g)
         });
-        (glide.map_or(to_wp, |g| g.xy() - origin.xy()), glide.is_some())
+        glide.map_or(to_wp, |g| g.xy() - origin.xy())
     };
 
     let close_enough = final_leg && polite && dist <= POLITE_DIST;
@@ -2122,7 +2123,6 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // jump run-up (`jump_at_hand`) — the bot needs that speed to clear the gap — and inert on open
     // ground, where `edge_ahead` finds no edge. `nf_active` already limits it to grounded walk/step/
     // approach legs (a Drop leg descends; a jump leg leaps), and the near-field grid is built there.
-    let mut nf_diag_hazard_brake = false;
     if nf_active && on_ground && !jump_at_hand && speed > LEDGE_MIN_SPEED {
         if let Some(nf) = bot.near.as_ref() {
             let vdir = v_xy.normalize_or_zero();
@@ -2131,33 +2131,8 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             if nf.edge_ahead(origin, dir3, stop + nearfield::NEAR_RES) <= stop {
                 move_world = -dir3 * MOVE_SPEED;
                 bhop_cmd = None;
-                nf_diag_hazard_brake = true;
             }
         }
-    }
-    if host.cvar_bool(c"rtx_bot_debug")
-        && (nf_diag_chord_veto
-            || nf_diag_bhop_push
-            || nf_diag_edge_clear
-            || nf_diag_ground_push
-            || nf_diag_glide
-            || nf_diag_hazard_brake
-            || ordinary_bhop_floor_risk
-            || bhop_edge_recovery)
-    {
-        host.conprint(&cstring(&format!(
-            "rtx bot{client}: nf-use rp={} band={planned_band}/{planned_next_band} active={nf_active} ground={on_ground} phase={:?} chord={} bhpush={} clear={} gpush={} glide={} brake={} floor={} recover={} spd={speed:.0}\n",
-            bot.route_pos,
-            bot.bhop.phase,
-            nf_diag_chord_veto as u8,
-            nf_diag_bhop_push as u8,
-            nf_diag_edge_clear as u8,
-            nf_diag_ground_push as u8,
-            nf_diag_glide as u8,
-            nf_diag_hazard_brake as u8,
-            ordinary_bhop_floor_risk as u8,
-            bhop_edge_recovery as u8,
-        )));
     }
 
     // Ledge brake: a grounded bot on a Walk/Step leg brakes either when its speed-scaled bhop curve
@@ -2273,6 +2248,13 @@ mod tests {
         assert!(owns(0, 0), "ordinary zero-band walking must retain near-field protection");
         assert!(!owns(1, 0), "the current load-bearing speed band owns its line");
         assert!(!owns(0, 1), "the approach to the next load-bearing speed band owns its line");
+    }
+
+    #[test]
+    fn retained_bhop_carry_keeps_glide_off_the_hot_runout() {
+        assert!(nearfield_glide_owns_locomotion(0, BAND_FLOOR[1]));
+        assert!(nearfield_glide_owns_locomotion(1, BAND_FLOOR[1] - 0.1));
+        assert!(!nearfield_glide_owns_locomotion(1, BAND_FLOOR[1]));
     }
 
     #[test]
