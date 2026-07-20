@@ -1928,15 +1928,24 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // polyline, so it passes within `ARRIVE_RADIUS` of each cell centre, exactly the magnet's argument.
     // Off on the final approach (home straight on the target) and whenever the chord isn't clear.
     let heading = {
-        let want_glide = nf_ground
+        let glide_scope = nf_ground
             && nf_active
-            && nearfield_glide_owns_locomotion(bot.bhop.hops, speed)
             && host.cvar_bool(c"rtx_bot_glide")
             && matches!(kind, Some(LinkKind::Walk | LinkKind::Step));
+        let glide_yield_armed = !nearfield_glide_owns_locomotion(bot.bhop.hops, speed);
+        let want_glide = glide_scope && !glide_yield_armed;
         let glide = want_glide.then_some(bot.near.as_ref()).flatten().and_then(|nf| {
             let g = corridor_point(graph, &bot.route, bot.route_pos, origin, NEAR_GLIDE_AHEAD);
             nf.chord_clear(origin, g, NEAR_GLIDE_MARGIN).then_some(g)
         });
+        if glide_scope && host.cvar_bool(c"rtx_bot_debug") {
+            host.conprint(&cstring(&format!(
+                "rtx bot{client}: glide-use rp={} hops={} spd={speed:.0} glide={} yield={glide_yield_armed}\n",
+                bot.route_pos,
+                bot.bhop.hops,
+                if glide.is_some() { "Some" } else { "None" },
+            )));
+        }
         glide.map_or(to_wp, |g| g.xy() - origin.xy())
     };
 
