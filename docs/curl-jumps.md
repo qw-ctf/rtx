@@ -460,13 +460,17 @@ behaviour and a dead route.
 upstream main once (all commits applied, no skips, build and unit gates green). On that rebased
 tip the RA route then failed **0 of 20 attempts**, with a deterministic fall at the same point
 roughly six seconds in — where the unrebased branch clears it. That is a real negative result and
-we are not hiding it. `rtx_bot_ledgecap` is our prime suspect precisely because of the structural
-tension described above, but it is a *suspect*: the retest with `rtx_bot_ledgecap 0` is in progress
-and no result exists at the time of writing, so the cap has **not** been shown to be the cause.
-The other rebase-time behavioural drift is itemised in our lab notes and includes a directional
-run-up gate change and a near-field push interaction, either of which could also explain it.
-Nothing above should be read as a claim that the cap does or does not break the RA route in
-practice — only that the two mechanisms are in tension by construction, and that
+we are not hiding it. `rtx_bot_ledgecap` was our prime suspect precisely because of the structural
+tension described above — and the retest has since **cleared it**: with `rtx_bot_ledgecap 0` the
+rebased tip still fails 0/20 with the same failure class (deterministic fall, now ~7.5 s instead of
+~6.2 s — the cap shifts the timing, not the break). For completeness, vanilla upstream with the cap
+at 0 also stays at 0/20 on this route (it lacks the curl emission entirely), while its mega route
+goes from 12/20 to 1/20 with a faster best time — so the cvar has exactly the large
+speed-vs-stability effect its author describes, it just is not what breaks *this* route on the
+rebase. The remaining suspects are itemised in our lab notes: the JumpGap→Step reclassification
+and the merged `bhop_sustain` conditions, both rebase-time drift. Root-causing that is in progress.
+Nothing above should be read as a claim about the cap beyond what was measured — only that the two
+mechanisms are in tension by construction, and that
 the interaction is worth designing deliberately rather than leaving to whichever cell happens to
 carry the ledge flag. If upstream wants a principled fix, the obvious candidate is to widen the
 exemption from "jump at hand" to "any leg the banded planner assigned a nonzero speed band", since
