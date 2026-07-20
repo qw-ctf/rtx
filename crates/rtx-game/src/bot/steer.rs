@@ -20,7 +20,7 @@ use crate::math::{angle_vectors, angles_to, yaw_of};
 use crate::defs::{Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP};
 use crate::game::cstring;
 use crate::nav_build::PlatStatus;
-use crate::navmesh::{CellId, Corridor, LinkCosts, LinkKind, NavGraph, BAND_FLOOR, GRID};
+use crate::navmesh::{CellId, Corridor, LinkCosts, LinkKind, NavGraph, GRID};
 use crate::nearfield;
 
 /// How long a real network client waits at a reached pickup terminal for the authoritative server
@@ -399,26 +399,20 @@ fn nearfield_owns_locomotion(
     hook_active: bool,
     rj_active: bool,
     kind: Option<LinkKind>,
-    planned_band: u8,
-    next_planned_band: u8,
 ) -> bool {
     !on_air
         && !sj_active
         && !hook_active
         && !rj_active
-        // A nonzero band is an executable promise that speed survives this leg (or its immediate
-        // handoff). Near-field remains the authority everywhere else, but it must not replace the
-        // planner-certified line with a local chord/push while that speed is load-bearing.
-        && planned_band == 0
-        && next_planned_band == 0
         && matches!(kind, Some(LinkKind::Walk | LinkKind::Step) | None)
 }
 
-fn nearfield_glide_owns_locomotion(hops: u32, speed: f32) -> bool {
-    // After a real hop, an above-run-speed landing is still executing carried motion even when the
-    // completion lock has kept the route's original band-0 labels.  Keep the local wall/edge grid,
-    // but do not let its long chord replace the cell-by-cell runout until that physical carry is gone.
-    hops == 0 || speed < BAND_FLOOR[1]
+fn bhop_sustain_policy(base: bool, _ascent_ahead: bool) -> bool {
+    base
+}
+
+fn zigzag_policy(base: bool, _on_ledge: bool) -> bool {
+    base
 }
 
 /// The lip is "right here" — inside this distance the takeoff jump must fire *now* or the bot wedges
@@ -1157,24 +1151,25 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         && speed >= bhop::RUN_UP_SPEED;
     // Lenient continuation gate for taking *another* hop from a landing: leg kinds churn as the
     // route advances, and a run in progress shouldn't be dumped by the stricter entry conditions.
-    // But never sustain the chain up an ascending stair run — `runway`'s climb stop keeps *entry* off
-    // stairs, yet a chain carried onto a stairway (a wall-hugging spiral, say) would otherwise keep
-    // hopping and weave off the treads. Drop to the walk, whose near-field glide tracks the steps.
-    let bhop_sustain = matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
+    let bhop_sustain = bhop_sustain_policy(
+        matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
         && (goal_dist > 150.0 || planned_band >= 1)
-        && side_open
-        && !ascent_ahead;
+        && side_open,
+        ascent_ahead,
+    );
     // Ground zigzag: a corridor too short for a hop ([`bhop::RUNWAY_ENGAGE`]) but straight and long
     // enough ([`bhop::ZIGZAG_ENGAGE`]) to gain speed from the circle-strafe alone. The controller
     // hands off to the hop cycle if `bhop_entry` opens up mid-run, and `bhop_veto` (which includes
     // `!rtx_bot_bhop`) still gates it, so this is purely a sub-toggle on the same controller.
-    let zigzag_ok = host.cvar_bool(c"rtx_bot_zigzag")
+    let zigzag_ok = zigzag_policy(
+        host.cvar_bool(c"rtx_bot_zigzag")
         && matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
         && !final_leg
         && goal_dist > 150.0
         && runway_dist >= bhop::ZIGZAG_ENGAGE
-        && side_open
-        && !on_ledge;
+        && side_open,
+        on_ledge,
+    );
     // A speed-jump leg is a *committed* bhop run-up + leap: engage bhop unconditionally (the link is a
     // pre-verified runway) and track it so the route stays frozen. Latch/clear `sj_leg` on the leg.
     let mut sj_active =
@@ -1434,8 +1429,6 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         hook_active,
         rj_active,
         kind,
-        planned_band,
-        planned_next_band,
     );
     let nf_active = nf_locomotion && host.cvar_bool(c"rtx_bot_nearfield");
     if nf_active && on_ground {
@@ -1928,24 +1921,14 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // polyline, so it passes within `ARRIVE_RADIUS` of each cell centre, exactly the magnet's argument.
     // Off on the final approach (home straight on the target) and whenever the chord isn't clear.
     let heading = {
-        let glide_scope = nf_ground
+        let want_glide = nf_ground
             && nf_active
             && host.cvar_bool(c"rtx_bot_glide")
             && matches!(kind, Some(LinkKind::Walk | LinkKind::Step));
-        let glide_yield_armed = !nearfield_glide_owns_locomotion(bot.bhop.hops, speed);
-        let want_glide = glide_scope && !glide_yield_armed;
         let glide = want_glide.then_some(bot.near.as_ref()).flatten().and_then(|nf| {
             let g = corridor_point(graph, &bot.route, bot.route_pos, origin, NEAR_GLIDE_AHEAD);
             nf.chord_clear(origin, g, NEAR_GLIDE_MARGIN).then_some(g)
         });
-        if glide_scope && host.cvar_bool(c"rtx_bot_debug") {
-            host.conprint(&cstring(&format!(
-                "rtx bot{client}: glide-use rp={} hops={} spd={speed:.0} glide={} yield={glide_yield_armed}\n",
-                bot.route_pos,
-                bot.bhop.hops,
-                if glide.is_some() { "Some" } else { "None" },
-            )));
-        }
         glide.map_or(to_wp, |g| g.xy() - origin.xy())
     };
 
@@ -2250,20 +2233,15 @@ mod tests {
     }
 
     #[test]
-    fn speed_banded_legs_keep_nearfield_out_of_the_certified_run() {
-        let owns = |band, next_band| {
-            nearfield_owns_locomotion(false, false, false, false, Some(LinkKind::Walk), band, next_band)
-        };
-        assert!(owns(0, 0), "ordinary zero-band walking must retain near-field protection");
-        assert!(!owns(1, 0), "the current load-bearing speed band owns its line");
-        assert!(!owns(0, 1), "the approach to the next load-bearing speed band owns its line");
+    fn rebase_drift_does_not_end_bhop_sustain_on_an_ascent() {
+        assert!(bhop_sustain_policy(true, true));
+        assert!(!bhop_sustain_policy(false, true));
     }
 
     #[test]
-    fn retained_bhop_carry_keeps_glide_off_the_hot_runout() {
-        assert!(nearfield_glide_owns_locomotion(0, BAND_FLOOR[1]));
-        assert!(nearfield_glide_owns_locomotion(1, BAND_FLOOR[1] - 0.1));
-        assert!(!nearfield_glide_owns_locomotion(1, BAND_FLOOR[1]));
+    fn rebase_drift_does_not_end_zigzag_on_a_ledge_cell() {
+        assert!(zigzag_policy(true, true));
+        assert!(!zigzag_policy(false, true));
     }
 
     #[test]
