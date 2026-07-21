@@ -1484,7 +1484,7 @@ fn prearm_traversal(game: &mut GameState, e: EntId, now: f32, on_ground: bool) {
         if let Some(leg) = incoming_speed_jump {
             let b = &mut game.entities[e].bot;
             if b.sj.map(|c| c.leg) != Some(leg) {
-                b.sj = Some(Commit { leg, since: now, entry_checked: false });
+                b.sj = Some(Commit { leg, since: now, launch_vetoes: 0, entry_checked: false });
             }
         }
     }
@@ -1506,7 +1506,7 @@ fn prearm_traversal(game: &mut GameState, e: EntId, now: f32, on_ground: bool) {
             }
         }
         LinkKind::SpeedJump if bhop && b.sj.map(|c| c.leg) != Some(leg) => {
-            b.sj = Some(Commit { leg, since: now, entry_checked: false });
+            b.sj = Some(Commit { leg, since: now, launch_vetoes: 0, entry_checked: false });
         }
         _ => {}
     }

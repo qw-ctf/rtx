@@ -112,7 +112,7 @@ pub(super) const CURL_MISS_TOL: f32 = 24.0;
 pub(super) const CURL_Z_TOL: f32 = 24.0;
 /// Half-width (degrees) of the launch-heading envelope the certified gain must cover — the ground
 /// prestrafe exits mid-weave, so the real takeoff heading wanders this much around the corridor.
-pub(super) const CURL_PSI_TOL: f32 = 6.0;
+pub const CURL_PSI_TOL: f32 = 6.0;
 /// Run-up headings tried around the corridor's compass axis (degrees). A real lip's approach is rarely
 /// exactly on an axis and certification is sharply heading-sensitive, so the from-cell is placed along
 /// whichever of these certifies — the runtime then flies precisely the proven line. On-axis first, so

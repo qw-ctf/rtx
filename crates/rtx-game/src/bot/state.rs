@@ -276,6 +276,9 @@ pub struct Vigil {
 pub struct Commit {
     pub leg: u32,
     pub since: f32,
+    /// Number of launch-yaw vetoes observed for this link, retained across parallel-profile
+    /// selection so operator telemetry is per traversal rather than per controller frame.
+    pub launch_vetoes: u32,
     /// A ground-turn entry envelope is checked exactly once. Its controller intentionally rotates
     /// out of that envelope after acceptance, so rechecking on later runway frames is incorrect.
     pub entry_checked: bool,

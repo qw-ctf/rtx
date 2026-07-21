@@ -368,8 +368,8 @@ impl NavGraph {
                 // edge, so the leap point slides back (over the near ground, which the arc clears) until
                 // the delivered speed matches the distance. First (latest) leap that certifies wins.
                 let t_max = (runway - CURL_MIN_RUNWAY).clamp(0.0, CURL_TAKEOFF_BACKOFF);
-                let mut solved: Option<(Vec3, Vec3, f32, f32, f32, f32)> = None;
-                // (takeoff, from_pt, v_req, gain, landing_speed_lo, cost)
+                let mut solved: Option<(Vec3, Vec3, f32, f32, f32, f32, f32)> = None;
+                // (takeoff, from_pt, psi, v_req, gain, landing_speed_lo, cost)
                 // The runtime takes off along the from→takeoff line, so that heading is ours to choose —
                 // and certification is sharply sensitive to it (a real lip's approach is rarely exactly on
                 // a compass axis; the dm3 curl_mid certifies at 6° off but not at 0°). Sample a few
@@ -412,7 +412,7 @@ impl NavGraph {
                                     // takeoff speed the runtime will hold (not the equilibrium).
                                     let from_pt = takeoff - dir * runup_len;
                                     let cost = runup_len / ((MAX_SPEED + v_req) * 0.5) + airtime + CURL_COMMIT;
-                                    solved = Some((takeoff, from_pt, v_req, gain, landing_speed_lo, cost));
+                                    solved = Some((takeoff, from_pt, psi, v_req, gain, landing_speed_lo, cost));
                                     break 'psi;
                                 }
                             }
@@ -423,7 +423,7 @@ impl NavGraph {
                         }
                     }
                 }
-                let Some((takeoff, from_pt, v_req, gain, landing_speed_lo, cost)) = solved else {
+                let Some((takeoff, from_pt, psi, v_req, gain, landing_speed_lo, cost)) = solved else {
                     continue;
                 };
                 let Some(start) = self.nearest_within(from_pt, GRID * 1.5, STEP_HEIGHT * 3.0) else {
@@ -432,6 +432,8 @@ impl NavGraph {
                 if start == to || self.has_direct_link(start, to) {
                     continue;
                 }
+                let (sp, cp) = psi.to_radians().sin_cos();
+                let entry_aim = takeoff + Vec3::new(cp, sp, 0.0) * CURL_RUNUP_CAP;
                 let link = Link {
                     from: start,
                     to,
@@ -445,9 +447,12 @@ impl NavGraph {
                     landing_speed_lo,
                     chained: false,
                     curl_gain: gain,
-                    curl_entry_aim: Vec3::ZERO,
-                    curl_switch_dist: 0.0,
-                    curl_landing_aim: Vec3::ZERO,
+                    // `certify_curl` proves the launch around `psi`; preserve that lateral line for
+                    // the live run-up and launch frame. The negative gate switches to the landing
+                    // pursuit on the first airborne frame, matching `curl_lands` tick-for-tick.
+                    curl_entry_aim: entry_aim,
+                    curl_switch_dist: -CURL_LIP_REACH,
+                    curl_landing_aim: b.origin,
                     ground_turn: None,
                 };
                 cands.push((horiz, link, tr)); // every certified curl; the per-cell cap trims below
@@ -2497,6 +2502,129 @@ impl NavGraph {
 mod ground_turn_tests {
     use super::*;
     use crate::bsp::{ClipNode, Plane, CONTENTS_EMPTY, CONTENTS_SOLID};
+
+    fn dm3_legacy_curl(
+        graph: &NavGraph,
+        bsp: &Bsp,
+        from_origin: Vec3,
+        to_origin: Vec3,
+    ) -> (Link, SpeedJumpTraversal) {
+        let params = SpeedJumpParams {
+            gravity: 800.0,
+            accel: 10.0,
+            maxspeed: 320.0,
+            friction: 4.0,
+            stopspeed: 100.0,
+            curl: true,
+        };
+        let from = graph
+            .cells
+            .iter()
+            .position(|cell| cell.origin == from_origin)
+            .expect("legacy curl source cell") as CellId;
+        let to = graph
+            .cells
+            .iter()
+            .position(|cell| cell.origin == to_origin)
+            .expect("legacy curl target cell") as CellId;
+        let mut candidates = Vec::new();
+        for (ledge, cell) in graph.cells.iter().enumerate() {
+            if cell.origin.z != from_origin.z
+                || !(416.0..=480.0).contains(&cell.origin.x)
+                || (cell.origin.y - to_origin.y).abs() > 128.0
+            {
+                continue;
+            }
+            graph.solve_curl_jumps_from(
+                bsp,
+                ledge as CellId,
+                params,
+                bhop_k(params.accel, params.maxspeed),
+                &mut candidates,
+            );
+        }
+        candidates
+            .into_iter()
+            .find(|(link, _)| link.from == from && link.to == to)
+            .unwrap_or_else(|| panic!("legacy curl {from_origin:?}->{to_origin:?}"))
+    }
+
+    #[test]
+    fn dm3_ring_legacy_curls_preserve_the_certified_lateral_profile() {
+        let Ok(path) = std::env::var("RTX_TEST_BSP") else {
+            eprintln!("skip: set RTX_TEST_BSP");
+            return;
+        };
+        let bytes = std::fs::read(path).expect("read dm3 BSP");
+        let bsp = Bsp::parse(&bytes).expect("parse dm3 BSP");
+        let params = SpeedJumpParams {
+            gravity: 800.0,
+            accel: 10.0,
+            maxspeed: 320.0,
+            friction: 4.0,
+            stopspeed: 100.0,
+            curl: false,
+        };
+        let graph = build_navmesh(&bsp, vec![], vec![], vec![], None, false, Some(params), None);
+        let cases = [
+            (
+                Vec3::new(288.0, 288.0, 56.0),
+                Vec3::new(704.0, 160.0, 56.0),
+                279.3,
+            ),
+            (
+                Vec3::new(288.0, -352.0, 56.0),
+                Vec3::new(704.0, -224.0, 56.0),
+                96.0,
+            ),
+        ];
+        let mut missing_profile = false;
+        for (from, to, live_bad_yaw) in cases {
+            let (link, traversal) = dm3_legacy_curl(&graph, &bsp, from, to);
+            let profile_yaw = yaw_of(traversal.curl_entry_aim.xy() - traversal.takeoff.xy());
+            let p = PmParams::default();
+            let profile_lands = curl_lands(
+                &bsp,
+                traversal.takeoff,
+                to,
+                430.0,
+                profile_yaw,
+                traversal.curl_gain,
+                &p,
+                0.020,
+            )
+            .is_some();
+            let live_line_lands = curl_lands(
+                &bsp,
+                traversal.takeoff,
+                to,
+                430.0,
+                live_bad_yaw,
+                traversal.curl_gain,
+                &p,
+                0.020,
+            )
+            .is_some();
+            eprintln!(
+                "legacy ring curl {from:?}->{to:?}: takeoff={:?} v_req={:.1} gain={:.1} entry={:?} switch={:.1} landing={:?} profile_yaw={profile_yaw:.1} profile_lands={profile_lands} live_bad_yaw={live_bad_yaw:.1} live_line_lands={live_line_lands}",
+                traversal.takeoff,
+                traversal.v_req,
+                traversal.curl_gain,
+                traversal.curl_entry_aim,
+                traversal.curl_switch_dist,
+                traversal.curl_landing_aim,
+            );
+            assert_eq!(link.kind, LinkKind::SpeedJump);
+            assert!(traversal.ground_turn.is_none(), "pin the legacy curl family");
+            assert!(traversal.curl_gain > 0.0);
+            assert!(profile_lands, "the preserved certified line must land at live-class speed");
+            assert!(!live_line_lands, "the observed off-profile launch line must remain a red witness");
+            missing_profile |= traversal.curl_entry_aim == Vec3::ZERO
+                || traversal.curl_switch_dist == 0.0
+                || traversal.curl_landing_aim == Vec3::ZERO;
+        }
+        assert!(!missing_profile, "legacy emission discarded its certified lateral profiles");
+    }
 
     fn contract() -> GroundTurnCurl {
         GroundTurnCurl {

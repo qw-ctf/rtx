@@ -22,7 +22,7 @@ use glam::Vec2;
 use crate::math::{wrap180, yaw_of};
 // The band the takeoff regime holds a curl's solved speed within — single-sourced from the certifier,
 // which proves the landing across exactly this band.
-use crate::navmesh::CURL_V_HOLD_TOL;
+use crate::navmesh::{CURL_PSI_TOL, CURL_V_HOLD_TOL};
 use rtx_nav::qphys::AIR_CAP;
 // The pure movement oracles + `Cmd`/`Strafe`/`MOVE_SPEED` now live in `rtx_nav::strafe`, so the
 // navmesh build can run the exact physics the controller flies (curl-jump certification). Glob
@@ -268,6 +268,10 @@ pub struct Input {
     /// [`air_correct`] at this rate (a single smooth pursuit curl onto the landing) rather than the hop
     /// slalom. `> 0` selects the curl (a speed jump is one leap, not a chain); `≤ 0` keeps the slalom.
     pub curl_gain: f32,
+    /// Certified launch-yaw half-width for a profiled curl. `0` means no yaw contract and preserves
+    /// the historical takeoff behavior exactly; a positive value tightens the final ground weave
+    /// and vetoes a jump pulse outside the stored profile's launch envelope.
+    pub launch_yaw_tol: f32,
     /// Free flight distance straight ahead along the velocity (units), from a forward hull trace —
     /// how far the bot could fly before hitting a wall. `f32::INFINITY` = unknown/open (the default
     /// off the live path). Gates leaping at a wall and drives the mid-air carve; see [`Bhop::step`].
@@ -298,6 +302,10 @@ pub struct Bhop {
     pub hops: u32,
     pub flips: u32,
     pub peak: f32,
+    /// Number of distinct profiled launch attempts vetoed for missing their certified yaw. The
+    /// caller associates increments with the active link and emits per-link telemetry.
+    pub launch_vetoes: u32,
+    launch_vetoing: bool,
     /// Telemetry: why the last engagement ended ("veto" / "runway" / "leg").
     pub off_reason: &'static str,
 }
@@ -435,6 +443,17 @@ impl Bhop {
         } else if i.hold_jump || speed < LAUNCH_MIN_FRAC * maxspeed || i.clear < speed * T_HOP * WALL_HOLD_FRAC {
             return Some(self.ground_cmd(i, a_g, maxspeed, f32::INFINITY));
         }
+        let profile_yaw_miss = sj_takeoff
+            && i.launch_yaw_tol > 0.0
+            && wrap180(i.bearing - yaw_of(i.v_xy)).abs() > i.launch_yaw_tol;
+        if profile_yaw_miss {
+            if !self.launch_vetoing {
+                self.launch_vetoes += 1;
+                self.launch_vetoing = true;
+            }
+            return Some(self.takeoff_cmd(i, a_g, maxspeed));
+        }
+        self.launch_vetoing = false;
         let jump = !self.jump_prev;
         self.jump_prev = jump;
         if jump {
@@ -496,7 +515,15 @@ impl Bhop {
             self.jump_prev = false;
             return Cmd { view_yaw: i.bearing, forward: MOVE_SPEED, side: 0.0, jump: false };
         }
-        self.ground_cmd(i, a_g, maxspeed, f32::INFINITY)
+        // A curl's flight certificate accepts only +/-CURL_PSI_TOL at launch. Keep its ground
+        // prestrafe inside that same band; the ordinary wide weave is a speed-building policy, not
+        // authority to leave the lateral line that the BSP rollout proved.
+        let band_cap = if i.launch_yaw_tol > 0.0 {
+            i.launch_yaw_tol
+        } else {
+            f32::INFINITY
+        };
+        self.ground_cmd(i, a_g, maxspeed, band_cap)
     }
 
     /// A prestrafe cmd, with sigma/flip bookkeeping. `band_cap` clamps the weave deadband — `∞` for
@@ -542,6 +569,8 @@ impl Bhop {
         self.hops = 0;
         self.flips = 0;
         self.peak = 0.0;
+        self.launch_vetoes = 0;
+        self.launch_vetoing = false;
     }
 
     /// Enter a standalone ground zigzag. Same bookkeeping reset as [`Self::engage`]; the phase is
@@ -554,6 +583,7 @@ impl Bhop {
         self.hops = 0;
         self.flips = 0;
         self.peak = 0.0;
+        self.launch_vetoing = false;
     }
 
     fn disengage(&mut self, reason: &'static str) {
@@ -562,6 +592,7 @@ impl Bhop {
         self.jump_prev = false;
         self.eligible_since = 0.0;
         self.off_reason = reason;
+        self.launch_vetoing = false;
     }
 }
 
@@ -816,6 +847,7 @@ mod sim {
             hold_jump: false,
             takeoff_speed: 0.0,
             curl_gain: 0.0,
+            launch_yaw_tol: 0.0,
             clear: f32::INFINITY,
             now,
         }
@@ -844,6 +876,7 @@ mod sim {
             hold_jump: false,
             takeoff_speed: 0.0,
             curl_gain: 0.0,
+            launch_yaw_tol: 0.0,
             clear: f32::INFINITY,
             now,
         }
@@ -936,6 +969,7 @@ mod sim {
                 hold_jump: false,
                 takeoff_speed: V_REQ,
                 curl_gain: 0.0,
+                launch_yaw_tol: 0.0,
                 clear: f32::INFINITY,
                 now,
             };
@@ -1002,6 +1036,7 @@ mod sim {
                     hold_jump: false,
                     takeoff_speed: V_STAR,
                     curl_gain: 12.0,
+                    launch_yaw_tol: 0.0,
                     clear: f32::INFINITY,
                     now,
                 };
@@ -1016,6 +1051,144 @@ mod sim {
             assert!((spd - V_STAR).abs() <= band, "entry {entry}: took off at {spd} ups, want {V_STAR} ±{band}");
             assert!(rw < LIP_REACH + 8.0, "entry {entry}: leaped {rw}u short of the lip");
         }
+    }
+
+    #[test]
+    fn curl_takeoff_reaches_its_certified_launch_yaw() {
+        const V_REQ: f32 = 418.2;
+        const RUNWAY: f32 = 226.0;
+        for (profile_yaw, observed_yaw, gain) in [(-45.0f32, 279.3f32, 8.0f32), (45.0, 96.0, 6.0)] {
+            let (vs, vc) = observed_yaw.to_radians().sin_cos();
+            let (ps, pc) = profile_yaw.to_radians().sin_cos();
+            let profile_dir = Vec2::new(pc, ps);
+            let mut w = World::grounded(0.0);
+            w.v = Vec2::new(vc, vs) * 430.0;
+            let mut b = Bhop::default();
+            let mut takeoff = None;
+            for f in 0..200 {
+                let runway = RUNWAY - w.pos.dot(profile_dir);
+                let input = Input {
+                    v_xy: w.v,
+                    on_ground: w.on_ground,
+                    bearing: profile_yaw,
+                    runway,
+                    eligible: false,
+                    zigzag: false,
+                    sustain: false,
+                    veto: false,
+                    committed: true,
+                    carry: false,
+                    hold_jump: false,
+                    takeoff_speed: V_REQ,
+                    curl_gain: gain,
+                    launch_yaw_tol: CURL_PSI_TOL,
+                    clear: f32::INFINITY,
+                    now: f as f32 * DT,
+                };
+                let cmd = b.step(&input, &ENV).unwrap_or(run_cmd(profile_yaw));
+                if cmd.jump {
+                    takeoff = Some((yaw_of(w.v), w.v.length(), runway));
+                    break;
+                }
+                pm_frame(&mut w, &cmd, false);
+            }
+            let (launch_yaw, launch_speed, runway) = takeoff.expect("profiled curl never launched");
+            assert!(
+                wrap180(profile_yaw - launch_yaw).abs() <= CURL_PSI_TOL,
+                "profile {profile_yaw}: launched at yaw {launch_yaw} from observed {observed_yaw}"
+            );
+            assert!(
+                launch_speed >= V_REQ * (1.0 - CURL_V_HOLD_TOL),
+                "profile {profile_yaw}: launch slowed below its certified band: {launch_speed}"
+            );
+            assert!(runway < LIP_REACH + 8.0, "profile {profile_yaw}: launched {runway}u before lip");
+        }
+    }
+
+    #[test]
+    fn curl_without_a_profile_keeps_the_legacy_launch_behavior() {
+        let profile_yaw = -45.0f32;
+        let observed_yaw = 279.3f32;
+        let (vs, vc) = observed_yaw.to_radians().sin_cos();
+        let (ps, pc) = profile_yaw.to_radians().sin_cos();
+        let profile_dir = Vec2::new(pc, ps);
+        let mut w = World::grounded(0.0);
+        w.v = Vec2::new(vc, vs) * 430.0;
+        let mut b = Bhop::default();
+        let mut takeoff = None;
+        for f in 0..200 {
+            let runway = 226.0 - w.pos.dot(profile_dir);
+            let input = Input {
+                v_xy: w.v,
+                on_ground: w.on_ground,
+                bearing: profile_yaw,
+                runway,
+                eligible: false,
+                zigzag: false,
+                sustain: false,
+                veto: false,
+                committed: true,
+                carry: false,
+                hold_jump: false,
+                takeoff_speed: 418.2,
+                curl_gain: 8.0,
+                launch_yaw_tol: 0.0,
+                clear: f32::INFINITY,
+                now: f as f32 * DT,
+            };
+            let cmd = b.step(&input, &ENV).unwrap_or(run_cmd(profile_yaw));
+            if cmd.jump {
+                takeoff = Some(yaw_of(w.v));
+                break;
+            }
+            pm_frame(&mut w, &cmd, false);
+        }
+        let launch_yaw = takeoff.expect("unprofiled legacy curl never launched");
+        assert!(
+            (launch_yaw - -55.627052).abs() < 0.001,
+            "missing profile must preserve the old launch trace exactly: {launch_yaw}"
+        );
+        assert_eq!(b.launch_vetoes, 0, "missing profile must never enable the new veto");
+    }
+
+    #[test]
+    fn profiled_launch_veto_is_counted_once_until_yaw_recovers() {
+        let mut b = Bhop::default();
+        let off_yaw = Vec2::new(430.0, 0.0);
+        let input = Input {
+            v_xy: off_yaw,
+            on_ground: true,
+            bearing: 45.0,
+            runway: 0.0,
+            eligible: false,
+            zigzag: false,
+            sustain: false,
+            veto: false,
+            committed: true,
+            carry: false,
+            hold_jump: false,
+            takeoff_speed: 418.2,
+            curl_gain: 6.0,
+            launch_yaw_tol: CURL_PSI_TOL,
+            clear: f32::INFINITY,
+            now: 0.0,
+        };
+        let first = b.step(&input, &ENV).expect("veto returns a corrective command");
+        assert!(!first.jump);
+        assert_eq!(b.launch_vetoes, 1);
+        let second = b.step(&input, &ENV).expect("same veto streak keeps correcting");
+        assert!(!second.jump);
+        assert_eq!(b.launch_vetoes, 1, "frames are not distinct launch attempts");
+
+        let (s, c) = 45.0f32.to_radians().sin_cos();
+        let aligned = Input {
+            v_xy: Vec2::new(c, s) * 418.2,
+            now: DT * 2.0,
+            ..input
+        };
+        let launch = b.step(&aligned, &ENV).expect("aligned profile launches");
+        assert!(launch.jump);
+        assert_eq!(b.launch_vetoes, 1);
     }
 
     #[test]
@@ -1043,6 +1216,7 @@ mod sim {
                 hold_jump: false,
                 takeoff_speed: 415.0,
                 curl_gain: 12.0,
+                launch_yaw_tol: 0.0,
                 clear: f32::INFINITY,
                 now,
             };

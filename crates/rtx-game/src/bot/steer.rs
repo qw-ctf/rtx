@@ -1316,7 +1316,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         matches!(kind, Some(LinkKind::SpeedJump)) && host.cvar_bool(c"rtx_bot_bhop") && !hook_active && !rj_active;
     if sj_active {
         if bot.sj.map(|c| c.leg) != cur_leg {
-            bot.sj = cur_leg.map(|leg| Commit { leg, since: now, entry_checked: false });
+            bot.sj = cur_leg.map(|leg| Commit { leg, since: now, launch_vetoes: 0, entry_checked: false });
         }
         // Watchdog: the route is frozen mid-leg, so if the run-up stalls (blocked, shoved, never
         // built speed) abandon it and re-path rather than wedging on the runway forever. Penalize the
@@ -1478,7 +1478,12 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                                 // and then failed closed before the ground-turn controller ever ran.
                                 bot.route[bot.route_pos + 1] = selected;
                                 bot.route_pos += 1;
-                                bot.sj = Some(Commit { leg: selected, since: now, entry_checked: true });
+                                bot.sj = Some(Commit {
+                                    leg: selected,
+                                    since: now,
+                                    launch_vetoes: 0,
+                                    entry_checked: true,
+                                });
                                 effective_sj_leg = Some(selected);
                             }
                             GroundTurnPredecessorSelection::Abort => {
@@ -1630,12 +1635,25 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // stored numbers. Fail closed on the entry envelope below.
     let sj_gt = if sj_active { sj_traversal.and_then(|tr| tr.ground_turn) } else { None };
     let sj_gt = if sj_active { sj_gt } else { None };
-    // Signed along-corridor distance from the bot to a curl's takeoff (>0 behind the lip, <0 past it):
-    // the run-up direction is the link's `from`→takeoff line. Used to trigger the leap on crossing the
+    // Signed along-corridor distance from the bot to a curl's takeoff (>0 behind the lip, <0 past it).
+    // A profiled legacy curl stores the exact launch axis its BSP certificate proved; older/unprofiled
+    // links fall back to the emitted `from`→takeoff chord. Used to trigger the leap on crossing the
     // takeoff *line* (not a radial ball the weave can skirt into a U-turn) and to gate the run-up aim.
+    let sj_profile_axis = sj_traversal
+        .filter(|tr| {
+            tr.ground_turn.is_none()
+                && tr.curl_gain > 0.0
+                && tr.curl_entry_aim != Vec3::ZERO
+                && tr.curl_landing_aim != Vec3::ZERO
+                && tr.curl_switch_dist.abs() > f32::EPSILON
+        })
+        .map(|tr| (tr.curl_entry_aim.xy() - tr.takeoff.xy()).normalize_or_zero())
+        .filter(|axis| axis.length_squared() > f32::EPSILON);
     let sj_progress: Option<f32> = if sj_curl {
         if let (Some((takeoff, _)), Some(leg)) = (sj_takeoff, cur_leg) {
-            let dir = (takeoff.xy() - graph.cell_origin(graph.link_source(leg)).xy()).normalize_or_zero();
+            let dir = sj_profile_axis.unwrap_or_else(|| {
+                (takeoff.xy() - graph.cell_origin(graph.link_source(leg)).xy()).normalize_or_zero()
+            });
             Some((takeoff.xy() - origin.xy()).dot(dir))
         } else {
             None
@@ -1782,6 +1800,14 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                             aim.extend(origin.z)
                         }
                     }
+                    // The certifier's stored axis owns every grounded frame, not merely the jump
+                    // pulse: steering at the snapped nav-source chord was the legacy contract gap
+                    // that launched ring curls tens of degrees away from the line their flight proved.
+                    (None, _, Some(_)) if on_ground && sj_profile_axis.is_some() => {
+                        let (aim, source) = sj_flight_aim.unwrap();
+                        aim_source = source;
+                        aim
+                    }
                     // Curl run-up: aim at the takeoff (follow the corridor) while still behind the lip —
                     // grounded *or* briefly airborne (a bumped or carried-airborne entry) — so it never
                     // curls toward the offset landing while still over the run-up and pulls off the edge.
@@ -1883,6 +1909,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             _ => f32::INFINITY,
         };
         let phase_was = bot.bhop.phase;
+        let launch_vetoes_before = bot.bhop.launch_vetoes;
         let mut cmd = bot.bhop.step(
             &bhop::Input {
                 v_xy,
@@ -1917,11 +1944,34 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 } else {
                     0.0
                 },
+                // Only an emitted nonzero profile carries a launch-yaw certificate. Missing
+                // profile data is the legacy behavior exactly: no tightened weave and no veto.
+                launch_yaw_tol: if sj_profile_axis.is_some() {
+                    crate::navmesh::CURL_PSI_TOL
+                } else {
+                    0.0
+                },
                 clear,
                 now,
             },
             &env,
         );
+        if bot.bhop.launch_vetoes > launch_vetoes_before {
+            if let (Some(leg), Some(profile_axis)) = (effective_sj_leg, sj_profile_axis) {
+                let per_link_count = if let Some(commit) = bot.sj.as_mut().filter(|commit| commit.leg == leg) {
+                    commit.launch_vetoes += 1;
+                    commit.launch_vetoes
+                } else {
+                    1
+                };
+                host.conprint(&cstring(&format!(
+                    "rtx bot{client}: sj-launch-veto link={leg} count={per_link_count} speed={speed:.1} velocity_yaw={:.1} certified_yaw={:.1} tol={:.1} runway={bhop_runway:.1}\n",
+                    yaw_of(v_xy),
+                    yaw_of(profile_axis),
+                    crate::navmesh::CURL_PSI_TOL,
+                )));
+            }
+        }
         // A certified ground turn is an executable controller contract, not merely guidance data.
         // Override the generic hop-cycle command with the exact same single-sourced ticks used by
         // the BSP rollout; the hop state machine above still owns commit, jump-pulse and watchdogs.
