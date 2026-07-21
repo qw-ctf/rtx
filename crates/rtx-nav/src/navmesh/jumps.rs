@@ -325,9 +325,9 @@ impl NavGraph {
             );
             let v_max_straight = SPEED_JUMP_V_CAP.min(BHOP_EFF * attainable_speed(MAX_SPEED, runway, k));
             let psi0 = yaw_of(Vec2::new(dgx as f32, dgy as f32)); // corridor / takeoff heading
-                                                                  // A rollout can only certify a landing it reaches inside the tick cap, so bound the target
-                                                                  // scan (and the per-target airtime) by that flight time — not the full SJ_MAX_DROP fall, which
-                                                                  // on low-gravity servers is many seconds of futile scan-and-rollout.
+            // A rollout can only certify a landing it reaches inside the tick cap, so bound the target
+            // scan (and the per-target airtime) by that flight time — not the full SJ_MAX_DROP fall, which
+            // on low-gravity servers is many seconds of futile scan-and-rollout.
             let fly_cap = CURL_MAX_TICKS as f32 * CURL_DT;
             let reach = v_deliver * fly_cap;
             let scan = ((reach / GRID).ceil() as i32).max(1);
@@ -479,8 +479,8 @@ impl NavGraph {
         }
         let mut cands: Vec<(f32, Link, SpeedJumpTraversal)> = Vec::new(); // stand-start (v_req, link, tr)
         let mut cands_chained: Vec<(f32, Link, SpeedJumpTraversal)> = Vec::new(); // chained
-                                                                                  // The most speed a chained entry can ever carry into a jump (the top band's floor); a jump
-                                                                                  // needing more than this is unroutable even chained, so it bounds the chained target scan.
+        // The most speed a chained entry can ever carry into a jump (the top band's floor); a jump
+        // needing more than this is unroutable even chained, so it bounds the chained target scan.
         let v_chain_max = BAND_FLOOR[NBANDS - 1] / SJ_MARGIN;
         for (dgx, dgy) in COMPASS {
             // Take off from a ledge edge (a runway only *helps* — a chained jump needs none).
@@ -1923,9 +1923,10 @@ impl NavGraph {
     /// breaks). Emits contracts tagged [`GROUND_TURN_OPTIMAL_VERSION`] so the
     /// flown law equals the proven law.
     ///
-    /// Production is unaffected: no live build path calls this; it is driven only
-    /// by the `gt-search` harness (`--optimal`). Deterministic: a pure bounded
-    /// lattice over the same inputs, no wall clock and no rng.
+    /// The production curl pass calls this with `GT_OPT_ENTRY_SPEEDS`; `gt-search --optimal`
+    /// calls the same solver with an operator-supplied entry ladder.
+    /// Deterministic: a pure bounded lattice over the same inputs, no wall clock
+    /// and no rng.
     pub fn solve_chained_ground_turn_optimal_curl(
         &self,
         bsp: &Bsp,
@@ -2619,6 +2620,30 @@ impl NavGraph {
 mod ground_turn_tests {
     use super::*;
 
+    fn dm3_test_bsp(test: &str) -> Option<Bsp> {
+        let required = match std::env::var("RTX_TEST_BSP_REQUIRED") {
+            Err(std::env::VarError::NotPresent) => false,
+            Ok(value) if value == "1" => true,
+            Ok(value) => panic!("RTX_TEST_BSP_REQUIRED must be 1 or unset, got {value:?}"),
+            Err(std::env::VarError::NotUnicode(_)) => panic!("RTX_TEST_BSP_REQUIRED must be UTF-8"),
+        };
+        let path = match std::env::var("RTX_TEST_BSP") {
+            Ok(path) => path,
+            Err(std::env::VarError::NotPresent) if !required => {
+                eprintln!(
+                    "SKIP {test}: RTX_TEST_BSP is unset; lab/CI must set RTX_TEST_BSP_REQUIRED=1 and provide dm3.bsp"
+                );
+                return None;
+            }
+            Err(std::env::VarError::NotPresent) => {
+                panic!("{test}: RTX_TEST_BSP_REQUIRED=1 but RTX_TEST_BSP is unset")
+            }
+            Err(std::env::VarError::NotUnicode(_)) => panic!("{test}: RTX_TEST_BSP must be UTF-8"),
+        };
+        let bytes = std::fs::read(&path).unwrap_or_else(|err| panic!("{test}: read {path}: {err}"));
+        Some(Bsp::parse(&bytes).unwrap_or_else(|| panic!("{test}: parse BSP at {path}")))
+    }
+
     fn fixed_setup_clock(controller_dt: f32, move_dt: f32) -> Option<GroundTurnSetupClock> {
         Some(
             GroundTurnSetupClock::from_verified_schedule(controller_dt, move_dt)
@@ -2675,10 +2700,9 @@ mod ground_turn_tests {
 
     #[test]
     fn dm3_ring_legacy_curls_preserve_the_certified_lateral_profile() {
-        let path = std::env::var("RTX_TEST_BSP")
-            .expect("RTX_TEST_BSP must name dm3.bsp for the legacy-curl regression");
-        let bytes = std::fs::read(path).expect("read dm3 BSP");
-        let bsp = Bsp::parse(&bytes).expect("parse dm3 BSP");
+        let Some(bsp) = dm3_test_bsp("dm3_ring_legacy_curls_preserve_the_certified_lateral_profile") else {
+            return;
+        };
         let params = SpeedJumpParams {
             gravity: 800.0,
             accel: 10.0,
@@ -2754,10 +2778,9 @@ mod ground_turn_tests {
         // recidivs at their matching physical states, then replay the emitted wishes at the
         // fake-client's truncated 12 ms.  The v2 payload is the same source/takeoff/target geometry
         // captured in a85084d-rich-graph.json; numeric link ids deliberately do not cross families.
-        let path = std::env::var("RTX_TEST_BSP")
-            .expect("RTX_TEST_BSP must name dm3.bsp for the producer-replay regression");
-        let bytes = std::fs::read(path).expect("read dm3 BSP");
-        let bsp = Bsp::parse(&bytes).expect("parse dm3 BSP");
+        let Some(bsp) = dm3_test_bsp("dm3_recap_setup_corner_replays_cross_attempt_producer_ticks") else {
+            return;
+        };
         let params = PmParams::default();
         let source = Vec3::new(-256.0, -736.0, 152.0);
         let target = Vec3::new(96.0, -864.0, 184.0);

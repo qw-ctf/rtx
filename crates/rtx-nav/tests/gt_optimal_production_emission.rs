@@ -29,7 +29,35 @@ use rtx_nav::navmesh::{
 };
 use rtx_nav::pmove::{pm_step_report, PmParams, PmState};
 
-const BSP_PATH: &str = "/mnt/c/Users/benya/projects/quakeworld/mvd_analyzer/bsps/dm3.bsp";
+fn dm3_test_bsp() -> Option<Bsp> {
+    let required = match std::env::var("RTX_TEST_BSP_REQUIRED") {
+        Err(std::env::VarError::NotPresent) => false,
+        Ok(value) if value == "1" => true,
+        Ok(value) => panic!("RTX_TEST_BSP_REQUIRED must be 1 or unset, got {value:?}"),
+        Err(std::env::VarError::NotUnicode(_)) => panic!("RTX_TEST_BSP_REQUIRED must be UTF-8"),
+    };
+    let path = match std::env::var("RTX_TEST_BSP") {
+        Ok(path) => path,
+        Err(std::env::VarError::NotPresent) if !required => {
+            eprintln!(
+                "SKIP gt_optimal_production_emission: RTX_TEST_BSP is unset; lab/CI must set RTX_TEST_BSP_REQUIRED=1 and provide dm3.bsp"
+            );
+            return None;
+        }
+        Err(std::env::VarError::NotPresent) => {
+            panic!("gt_optimal_production_emission: RTX_TEST_BSP_REQUIRED=1 but RTX_TEST_BSP is unset")
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("gt_optimal_production_emission: RTX_TEST_BSP must be UTF-8")
+        }
+    };
+    let bytes = std::fs::read(&path)
+        .unwrap_or_else(|err| panic!("gt_optimal_production_emission: read {path}: {err}"));
+    Some(
+        Bsp::parse(&bytes)
+            .unwrap_or_else(|| panic!("gt_optimal_production_emission: parse BSP at {path}")),
+    )
+}
 
 fn prod_params() -> SpeedJumpParams {
     // Exactly the gt-search / green-config build parameters.
@@ -123,8 +151,9 @@ fn runtime_rollout(graph: &NavGraph, bsp: &rtx_nav::bsp::Bsp, from: CellId, gt: 
 
 #[test]
 fn gt_optimal_production_emission() {
-    let bytes = std::fs::read(BSP_PATH).unwrap_or_else(|e| panic!("read dm3.bsp at {BSP_PATH}: {e}"));
-    let parsed = Bsp::parse(&bytes).expect("parse dm3 bsp");
+    let Some(parsed) = dm3_test_bsp() else {
+        return;
+    };
     let build = build_navmesh(&parsed, vec![], vec![], vec![], None, false, Some(prod_params()), None);
     let (bsp, graph) = (&parsed, &build);
 

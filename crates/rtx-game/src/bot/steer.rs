@@ -1676,7 +1676,6 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // drives the SAME shared controller functions the build-time certifier rolled, from the same
     // stored numbers. Fail closed on the entry envelope below.
     let sj_gt = if sj_active { sj_traversal.and_then(|tr| tr.ground_turn) } else { None };
-    let sj_gt = if sj_active { sj_gt } else { None };
     let sj_gt_phase = effective_sj_leg
         .and_then(|leg| bot.sj.filter(|commit| commit.leg == leg))
         .map_or_else(GroundTurnPhase::setup, |commit| commit.ground_turn_phase);

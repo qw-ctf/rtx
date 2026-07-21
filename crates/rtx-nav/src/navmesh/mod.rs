@@ -330,8 +330,8 @@ pub struct SpeedJumpTraversal {
 
 /// The self-contained, versioned contract for one chained ground-turn curl (see
 /// [`SpeedJumpTraversal::ground_turn`]). Both the build-time certifier and the live executor drive
-/// the same controller ([`ground_turn_cmd`](crate::navmesh::groundturn::ground_turn_cmd)) from
-/// exactly these numbers, so what was proven offline is what flies. Fail-closed: the executor
+/// the same version-selected controller functions from exactly these numbers, so what was proven
+/// offline is what flies. Fail-closed: the executor
 /// checks the live entry state against the stored envelope and abandons the leg (replans) when
 /// outside it, instead of improvising over the lip.
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -187,10 +187,10 @@ pub fn prestrafe_delivered_from(v0: f32, runway: f32, accel: f32, maxspeed: f32,
 
 /// Coarse entry-speed classes for the banded planner. A route's carried speed changes both the
 /// feasibility of a leg (a chained speed jump needs a minimum band) and its cost (a fast band
-/// covers a Walk leg quicker). Four bands keep the search state at `cells · 4`.
+/// covers a Walk leg quicker). Five bands keep the search state at `cells · 5`.
 /// `BAND_EDGES[i]` is the upper edge of band `i`: `<340 → 0`, `<430 → 1`, `<490 → 2`, `<540 → 3`,
 /// else `4`. The 490 edge exists because the certified chained ground-turn curls
-/// ([`SpeedJumpTraversal::ground_turn`]) sit entirely inside the old 430..540 band: their entry
+/// ([`super::SpeedJumpTraversal::ground_turn`]) sit entirely inside the old 430..540 band: their entry
 /// envelopes start near 490, and a 430 floor could never prove them even when the delivering jump
 /// certifiably lands at ~500.
 pub const BAND_EDGES: [f32; 4] = [340.0, 430.0, 490.0, 540.0];

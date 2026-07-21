@@ -175,6 +175,20 @@ The repeatable streak grader and corpus-derived thresholds live in the separate
 `bot-control-kit` lab repo (`ops/dm3_ra_acceptance.py`). Its JSONL artifacts retain the full result
 event for A/B comparison and replayable diagnosis.
 
+### BSP-backed test fixtures
+
+Map-specific tests read their fixture from `RTX_TEST_BSP`; no repository test contains a local
+machine path. An ordinary maintainer `cargo test` without the map prints an explicit `SKIP` for
+these tests. Lab and CI jobs that claim the DM3 regressions must make absence fatal by setting both
+variables:
+
+```sh
+RTX_TEST_BSP_REQUIRED=1 RTX_TEST_BSP=/path/to/dm3.bsp cargo test -p rtx-nav
+```
+
+`RTX_TEST_BSP_REQUIRED` accepts only `1` or unset. Setting it without `RTX_TEST_BSP` fails before
+generation, so a fixture-bearing gate cannot pass vacuously.
+
 ## Contributing notes
 
 The source is hand-wrapped narrower than rustfmt's `max_width` — please don't run `cargo fmt`;

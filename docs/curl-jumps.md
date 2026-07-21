@@ -318,9 +318,10 @@ velocity is outside that same tolerance. Certified and executed lateral axis are
   into the pit.
 - **Stall watchdog**: a speed-jump leg is abandoned, penalized and re-pathed after 4s
   (`steer.rs:1074`), so a run-up that never builds speed cannot wedge on the runway forever.
-- **v3 entry replay** (`steer.rs:1288`): before the first v3 controller frame may launch, the
-  entire remaining pmove is replayed from the observed live state against the BSP; an off-lattice
-  runway state that no certified corner covered fails closed instead of inheriting the latch.
+- **v3 full-witness replay** (`steer.rs` ground-turn entry path): before the first v3 controller
+  frame may launch, the entire remaining pmove is replayed from the observed live state against the
+  BSP. During an airborne setup the executor also retains the admitted controller/movement clock
+  pair and revalidates it every frame; a changed schedule aborts rather than inheriting the latch.
 
 ## Operator cvars
 
@@ -456,52 +457,28 @@ flagged ledge cell caps the approach at 210 u/s and the bot arrives below the ce
 envelope's floor. The fail-closed check then does its job and refuses the leg, which is correct
 behaviour and a dead route.
 
-**What we have measured so far, stated plainly.** This branch's bot state has been rebased onto
-upstream main once (all commits applied, no skips, build and unit gates green). On that rebased
-tip the RA route then succeeded in **0 of 20 attempts**, with a deterministic fall at the same point
-roughly six seconds in — where the unrebased branch clears it. That is a real negative result and
-we are not hiding it. `rtx_bot_ledgecap` was our prime suspect precisely because of the structural
-tension described above — and the retest has since **cleared it**: with `rtx_bot_ledgecap 0` the
-rebased tip still fails 0/20 with the same failure class (deterministic fall, now ~7.5 s instead of
-~6.2 s — the cap shifts the timing, not the break). For completeness, vanilla upstream with the cap
-at 0 also stays at 0/20 on this route (it lacks the curl emission entirely), while its mega route
-goes from 12/20 to 1/20 with a faster best time — so the cvar has exactly the large
-speed-vs-stability effect its author describes, it just is not what breaks *this* route on the
-rebase. The remaining suspects are itemised in our lab notes: the JumpGap→Step reclassification
-and the merged `bhop_sustain` conditions, both rebase-time drift. Root-causing that is in progress.
-Nothing above should be read as a claim about the cap beyond what was measured — only that the two
-mechanisms are in tension by construction, and that
-the interaction is worth designing deliberately rather than leaving to whichever cell happens to
-carry the ledge flag. If upstream wants a principled fix, the obvious candidate is to widen the
-exemption from "jump at hand" to "any leg the banded planner assigned a nonzero speed band", since
-that is precisely the set of legs where speed is load-bearing.
+**Current measured status.** The rebased branch now passes two consecutive 20-attempt RA-spawn
+streaks (**40/40**) with near-field steering enabled and prohibited movement assists, including
+the ledge cap, disabled. The failures were not fixed by a cvar workaround. Their two code causes
+were approach steering acting several ordinary legs before a certified jump, and a v3 setup latch
+that assumed a future frame cadence it had not proved. The current implementation scopes the
+approach forces by the upcoming link contract and requires a full physical rollout under a
+per-frame-revalidated controller/movement clock. The structural tension above remains useful when
+reviewing upstream ledge policy, but this branch neither depends on nor certifies the ledge cap.
 
 ## Known limitations and open defects
 
-**The certified lateral axis is discarded for the ground-turn families.** `curl_entry_aim` and
-`curl_switch_dist` are emitted as `Vec3::ZERO` / `0.0` by all three ground-turn emission sites
-(`jumps.rs:1941`, `jumps.rs:2156`, `jumps.rs:2465`). Consequences:
-
-- `sj_profile_axis` is `None` for those links (`steer.rs:1354` filters on `ground_turn.is_none()`),
-  so `sj_progress` falls back to the **snapped nav-source → takeoff chord** (`steer.rs:1360`) —
-  a different quantity from anything the certifier proved. For these links that fallback only feeds
-  the too-slow abort, since the aim and the launch gate both come from the `GroundTurnCurl`
-  (`steer.rs:1456`, `steer.rs:1488`); but the abort is a safety mechanism deciding on an
-  uncertified axis.
-- `launch_yaw_tol` is left at `0` for them (`steer.rs:1565`), so the launch-yaw veto in
-  `bhop.rs:446` never arms — that guard is dead code on the family that most needs it.
-
-For the **plain** curl family this defect is fixed on our development branch (commit `a85084d`:
+**Lateral controller state is family-specific, not discarded.** For the **plain** curl family,
 psi is threaded through the solver's `solved` tuple and emitted as the certified entry aim,
-negative immediate-air switch and landing aim), with a regression test pinning it:
+negative immediate-air switch and landing aim. A regression test pins it:
 `dm3_ring_legacy_curls_preserve_the_certified_lateral_profile` builds DM3, takes two ring curls,
 and asserts (a) that the preserved certified line lands at live-class speed, (b) that the
 previously-observed off-profile launch line still does *not* land — kept as a red witness — and
-(c) that none of the three aim fields is zero. **That commit is not yet on this PR branch**: it is
-in a live regression-isolation round on our rig (a candidate that stacked it with planner changes
-measured badly, and we do not port anything here before the isolation verdict). On this branch the
-legacy emission still zeroes the aim fields; the fix lands as its own commit once cleared, and the
-test is the contract anyone porting it upstream should expect.
+(c) that none of the three aim fields is zero. Ground-turn curls deliberately retain the zero
+two-phase sentinel because their lateral proof lives instead in `GroundTurnCurl` (`runway_yaw`,
+`launch_yaw`, `hold_aim`, launch gate and `landing_aim`). Their runtime admission and setup use
+that complete contract in the full-witness replay; treating the legacy fields as a second source
+of truth would be wrong.
 
 **The v3 entry envelope is a calibration artifact, not a physical bound.** There is exactly one
 production entry ladder for the optimal-sweep family, `GT_OPT_ENTRY_SPEEDS = [320, 340, 360]`
@@ -510,9 +487,11 @@ production entry ladder for the optimal-sweep family, `GT_OPT_ENTRY_SPEEDS = [32
 332/358), and the coverage probe's plausibility assertion hard-codes the resulting floor
 (`assert!(gt.entry_speed_lo >= 313.0)`, `dm3_ra_curl_coverage_probe.rs:183`). The same corridor is
 observably clearable at roughly 440 u/s. Nothing in the physics makes 326 a ceiling — it is
-simply the highest rung anyone certified at. A bot arriving hot is therefore refused a link it
-could fly, and the executor's fail-closed path (correctly) turns that into a replan. Widening the
-ladder is cheap; the reason it has not been done is build time, not correctness.
+simply the highest rung this solver certified. A bot arriving hot is therefore refused the
+available contract even though the corridor is physically flyable. The remedy is not to widen
+the stamped envelope after the fact: a high-speed profile must itself pass the BSP/cadence
+certificate and the same runtime full-witness replay. Candidate search cost is one constraint,
+but the missing certificate is the correctness boundary.
 
 *(The ~440 u/s figure is calibration evidence from recorded human play, not something derivable
 from this repository. It is stated as a measured speed only.)*
@@ -524,7 +503,7 @@ from this repository. It is stated as a measured speed only.)*
   cheaper link from a corridor the bot can never actually enter at speed can evict the one it would
   really arrive through. The chained pass partially compensates by de-duplicating on
   `(source, exact entry envelope)` instead of source alone (`jumps.rs:280`), on the reasoning that
-  cold, mid and hot arrivals are disjoint executable contracts and the planner's four speed bands
+  cold, mid and hot arrivals are disjoint executable contracts and the planner's five speed bands
   are too coarse a key — but the plain curl pass has no such protection.
 - **Build cost.** Certification is `6 corners × 3 tick classes × up to 8 gains × up to 25 speed
   rungs × 5 psi samples × takeoff-backoff steps` of full `pm_step` rollout per candidate target.
