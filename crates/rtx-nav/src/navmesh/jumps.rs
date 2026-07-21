@@ -1450,11 +1450,6 @@ impl NavGraph {
         if bsp.is_liquid_at(a.origin) {
             return;
         }
-        // Build-time diagnostics for one ledge: RTX_GT_DEBUG_LEDGE=<cell id>.
-        let dbg = std::env::var("RTX_GT_DEBUG_LEDGE")
-            .ok()
-            .and_then(|s| s.parse::<CellId>().ok())
-            == Some(ledge);
         let p = PmParams {
             gravity: params.gravity,
             accel: params.accel,
@@ -1469,9 +1464,6 @@ impl NavGraph {
             // too; the certifier, rather than an axis-only prefilter, decides
             // whether their stepped approach and rotation are safe.
             let runway = self.measure_runway_lax(bsp, &a, dgx, dgy);
-            if dbg {
-                eprintln!("GTDBG ledge={ledge} dir=({dgx},{dgy}) runway={runway:.0}");
-            }
             if runway < GT_MIN_RUNWAY {
                 continue;
             }
@@ -1513,9 +1505,6 @@ impl NavGraph {
                         continue;
                     }
                     if self.has_direct_link(ledge, to) || self.has_direct_link(from, to) {
-                        if dbg {
-                            eprintln!("GTDBG ledge={ledge} to={to} SKIP direct-link");
-                        }
                         continue;
                     }
                     // A strict plain curl already owns every direct link that
@@ -1525,19 +1514,7 @@ impl NavGraph {
                     // fixed-heading curl failed. The expensive lattice remains
                     // behind the physical lip and center-rollout scouts below.
                     let v_floor = v_required(horiz, dz, params.gravity);
-                    let v_del_local = prestrafe_delivered(
-                        runway.min(CURL_RUNUP_CAP),
-                        params.accel,
-                        params.maxspeed,
-                        params.friction,
-                        params.stopspeed,
-                    );
                     if !v_floor.is_finite() || v_floor > entry_speed_max * (1.0 + GT_ENTRY_V_TOL) {
-                        if dbg {
-                            eprintln!(
-                            "GTDBG ledge={ledge} to={to} SKIP speed-filter v_floor={v_floor:.0} v_del_local={v_del_local:.0}"
-                        );
-                        }
                         continue;
                     }
                     // A genuine lip: the flight direction must leave the floor within
@@ -1547,11 +1524,6 @@ impl NavGraph {
                     let (sx, sy) = (bearing.cos().round() as i32, bearing.sin().round() as i32);
                     let lip = !self.has_ground_near(a.gx + sx, a.gy + sy, a.origin.z)
                         || !self.has_ground_near(a.gx + 2 * sx, a.gy + 2 * sy, a.origin.z);
-                    if dbg {
-                        eprintln!(
-                        "GTDBG ledge={ledge} to={to} CANDIDATE from={from} off={off:.0} horiz={horiz:.0} dz={dz:.0} v_floor={v_floor:.0} lip={lip}"
-                    );
-                    }
                     targets.push((v_floor, to, off, horiz, dz, lip));
                 }
                 targets.sort_by(|x, y| x.0.total_cmp(&y.0));
@@ -1653,12 +1625,6 @@ impl NavGraph {
                     }
                     if !self_contained.is_empty() {
                         for (worst, v_req, gt) in self_contained {
-                            if dbg {
-                                eprintln!(
-                            "GTDBG ledge={ledge} to={to} SELF-CERT from={from} cost={worst:.3} entry={v_req:.1} land={:.1}",
-                            gt.landing_speed_lo,
-                        );
-                            }
                             let airtime = jump_airtime(dz, params.gravity);
                             let link = Link {
                                 from,
@@ -1768,12 +1734,8 @@ impl NavGraph {
                         ok
                     };
                     if !canonical_ok {
-                        if dbg {
-                            eprintln!("GTDBG ledge={ledge} to={to} canonical scouts all missed");
-                        }
                         continue;
                     }
-                    let mut scouts_ok = 0usize;
                     let mut solved: Option<(f32, f32, GroundTurnCurl)> = None; // (worst_elapsed, v_req, contract)
                     'search: for &v in entry_speeds {
                         if v < v_floor {
@@ -1832,7 +1794,6 @@ impl NavGraph {
                                                     {
                                                         continue;
                                                     }
-                                                    scouts_ok += 1;
                                                     if let Some((worst, land_lo, land_yaw)) = self.certify_ground_turn(
                                                         bsp,
                                                         entry_origin,
@@ -1858,12 +1819,6 @@ impl NavGraph {
                                 }
                             }
                         }
-                    }
-                    if dbg {
-                        eprintln!(
-                            "GTDBG ledge={ledge} to={to} scouts_ok={scouts_ok} certified={}",
-                            solved.is_some()
-                        );
                     }
                     let Some((worst, v_req, gt)) = solved else {
                         continue;

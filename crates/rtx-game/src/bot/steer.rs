@@ -631,6 +631,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         ..
     } = o;
     let gate_closed = costs.gate_closed;
+    let debug = host.cvar_bool(c"rtx_bot_debug");
 
     // Plain-jump commitment is normally pre-armed before objective resolution. Remember the first
     // physical airborne frame here; route kind/position is intentionally irrelevant to release.
@@ -685,7 +686,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             if let Some(&leg) = bot.route.get(bot.route_pos) {
                 if graph.link_kind(leg) == LinkKind::Teleport {
                     stamp_tele_reuse(bot, graph, leg, origin, now);
-                    if host.cvar_bool(c"rtx_bot_debug") {
+                    if debug {
                         host.conprint(&cstring(&format!("rtx bot{client}: tele leg={leg}\n")));
                     }
                 }
@@ -813,7 +814,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         // Empty-route telemetry (C6): a resolved repath that came back with no legs while the bot isn't
         // already at its goal — the "parked in place" signature. `corr` shows whether a corridor was in
         // play (a same-cluster/near None vs a windowed search that found nothing).
-        if host.cvar_bool(c"rtx_bot_debug") && route.is_empty() && bot_cell != target {
+        if debug && route.is_empty() && bot_cell != target {
             host.conprint(&cstring(&format!(
                 "rtx bot{client}: route=0 corr={} tgt_eq_goal={}\n",
                 corridor.is_some(),
@@ -1501,7 +1502,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                             GroundTurnPredecessorSelection::Defer => {}
                             GroundTurnPredecessorSelection::Commit(_) => unreachable!(),
                         }
-                        if work.candidates > 0 && host.cvar_bool(c"rtx_bot_debug") {
+                        if work.candidates > 0 && debug {
                             host.conprint(&cstring(&format!(
                                 "rtx bot{client}: sj-entry predecessor candidates={} pmove_steps={} selected={} adjusted={}\n",
                                 work.candidates,
@@ -1611,7 +1612,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 sj_active = false;
             }
         }
-        if host.cvar_bool(c"rtx_bot_debug") {
+        if debug {
             host.conprint(&cstring(&format!(
                 "rtx bot{client}: sj-entry current candidates={} pmove_steps={} selected={} adjusted={}\n",
                 work.candidates,
@@ -1964,12 +1965,14 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 } else {
                     1
                 };
-                host.conprint(&cstring(&format!(
-                    "rtx bot{client}: sj-launch-veto link={leg} count={per_link_count} speed={speed:.1} velocity_yaw={:.1} certified_yaw={:.1} tol={:.1} runway={bhop_runway:.1}\n",
-                    yaw_of(v_xy),
-                    yaw_of(profile_axis),
-                    crate::navmesh::CURL_PSI_TOL,
-                )));
+                if debug {
+                    host.conprint(&cstring(&format!(
+                        "rtx bot{client}: sj-launch-veto link={leg} count={per_link_count} speed={speed:.1} velocity_yaw={:.1} certified_yaw={:.1} tol={:.1} runway={bhop_runway:.1}\n",
+                        yaw_of(v_xy),
+                        yaw_of(profile_axis),
+                        crate::navmesh::CURL_PSI_TOL,
+                    )));
+                }
             }
         }
         // A certified ground turn is an executable controller contract, not merely guidance data.
@@ -1995,7 +1998,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             });
         }
         // A phase transition is the interesting diagnostic moment — why a run started or ended.
-        if bot.bhop.phase != phase_was && host.cvar_bool(c"rtx_bot_debug") {
+        if bot.bhop.phase != phase_was && debug {
             let why = if bot.bhop.phase == bhop::Phase::Off {
                 format!(" ({})", bot.bhop.off_reason)
             } else {
@@ -2547,7 +2550,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
 
     // Debug-only, per-frame SpeedJump contract trace. Keep both the controller's final jump request
     // and the pending button: later safety/driver overrides can intentionally differ from it.
-    if host.cvar_bool(c"rtx_bot_debug") {
+    if debug {
         if let Some(leg) = effective_sj_leg.filter(|&leg| graph.link_kind(leg) == LinkKind::SpeedJump) {
             let gt = graph.speed_jump_of_link(leg).and_then(|tr| tr.ground_turn);
             let should_launch = active_sj_should_launch.or_else(|| {

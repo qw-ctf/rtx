@@ -22,7 +22,9 @@ use glam::Vec2;
 use crate::math::{wrap180, yaw_of};
 // The band the takeoff regime holds a curl's solved speed within — single-sourced from the certifier,
 // which proves the landing across exactly this band.
-use crate::navmesh::{CURL_PSI_TOL, CURL_V_HOLD_TOL};
+use crate::navmesh::CURL_V_HOLD_TOL;
+#[cfg(test)]
+use crate::navmesh::CURL_PSI_TOL;
 use rtx_nav::qphys::AIR_CAP;
 // The pure movement oracles + `Cmd`/`Strafe`/`MOVE_SPEED` now live in `rtx_nav::strafe`, so the
 // navmesh build can run the exact physics the controller flies (curl-jump certification). Glob
