@@ -951,6 +951,28 @@ mod sim {
     }
 
     #[test]
+    fn terminal_hold_cleans_a_landed_hop_as_leg_policy_not_veto() {
+        let w = World::grounded(400.0);
+        let mut b = Bhop::default();
+        let mut committed = input(&w, 0.0, 100.0, 0.0);
+        committed.committed = true;
+        committed.eligible = false;
+        assert!(b.step(&committed, &ENV).is_some());
+        assert_eq!(b.phase, Phase::Hop);
+
+        // A terminal Hold/route-clear removes the committed leg on the next grounded frame. It does
+        // not assert the hard veto channel; normal landing policy owns the cleanup and labels it leg.
+        let mut hold = input(&w, 0.0, 100.0, DT);
+        hold.committed = false;
+        hold.eligible = false;
+        hold.sustain = false;
+        hold.veto = false;
+        assert!(b.step(&hold, &ENV).is_none());
+        assert_eq!(b.phase, Phase::Off);
+        assert_eq!(b.off_reason, "leg");
+    }
+
+    #[test]
     fn curl_takeoff_holds_the_solved_speed() {
         // The takeoff regime holds the link's *solved* takeoff speed rather than maxing to the ~484
         // prestrafe equilibrium (whose reach overshoots any moderate gap — a human holds ~400 too, as

@@ -1213,6 +1213,56 @@ fn ground_turn_rolls_tol(
     p: &PmParams,
     accept_near: f32,
 ) -> Option<(f32, PmState)> {
+    ground_turn_rolls_tol_report(graph, bsp, entry, dt, takeoff, gt, to, p, accept_near).result
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GroundTurnRolloutTrace {
+    result: Option<(f32, PmState)>,
+    pmove_steps: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ground_turn_rolls_tol_report(
+    graph: &NavGraph,
+    bsp: &Bsp,
+    entry: PmState,
+    dt: f32,
+    takeoff: Vec3,
+    gt: &GroundTurnCurl,
+    to: CellId,
+    p: &PmParams,
+    accept_near: f32,
+) -> GroundTurnRolloutTrace {
+    let mut pmove_steps = 0usize;
+    let result = ground_turn_rolls_tol_counted(
+        graph,
+        bsp,
+        entry,
+        dt,
+        takeoff,
+        gt,
+        to,
+        p,
+        accept_near,
+        &mut pmove_steps,
+    );
+    GroundTurnRolloutTrace { result, pmove_steps }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ground_turn_rolls_tol_counted(
+    graph: &NavGraph,
+    bsp: &Bsp,
+    entry: PmState,
+    dt: f32,
+    takeoff: Vec3,
+    gt: &GroundTurnCurl,
+    to: CellId,
+    p: &PmParams,
+    accept_near: f32,
+    pmove_steps: &mut usize,
+) -> Option<(f32, PmState)> {
     use crate::pmove::pm_step_report;
     let solid = |o: Vec3| {
         let tr = bsp.hull1_trace(o, o);
@@ -1235,6 +1285,7 @@ fn ground_turn_rolls_tol(
         if solid(s.origin) {
             return None;
         }
+        *pmove_steps += 1;
         let rep = pm_step_report(bsp, &mut s, &cmd, p, dt);
         if rep.wall_contact || solid(s.origin) || s.origin.z < floor_z {
             return None;
@@ -1259,6 +1310,7 @@ fn ground_turn_rolls_tol(
     if solid(s.origin) {
         return None;
     }
+    *pmove_steps += 1;
     let rep = pm_step_report(bsp, &mut s, &cmd, p, dt);
     if rep.wall_contact || solid(s.origin) || s.on_ground {
         return None;
@@ -1269,6 +1321,7 @@ fn ground_turn_rolls_tol(
         if solid(s.origin) {
             return None;
         }
+        *pmove_steps += 1;
         let rep = pm_step_report(bsp, &mut s, &cmd, p, dt);
         if rep.wall_contact || solid(s.origin) || s.origin.z < floor_z {
             return None;
@@ -2226,6 +2279,50 @@ fn ground_turn_rolls_optimal_tol(
     p: &PmParams,
     accept_near: f32,
 ) -> Option<(f32, PmState)> {
+    ground_turn_rolls_optimal_tol_report(graph, bsp, entry, dt, takeoff, gt, to, p, accept_near).result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ground_turn_rolls_optimal_tol_report(
+    graph: &NavGraph,
+    bsp: &Bsp,
+    entry: PmState,
+    dt: f32,
+    takeoff: Vec3,
+    gt: &GroundTurnCurl,
+    to: CellId,
+    p: &PmParams,
+    accept_near: f32,
+) -> GroundTurnRolloutTrace {
+    let mut pmove_steps = 0usize;
+    let result = ground_turn_rolls_optimal_tol_counted(
+        graph,
+        bsp,
+        entry,
+        dt,
+        takeoff,
+        gt,
+        to,
+        p,
+        accept_near,
+        &mut pmove_steps,
+    );
+    GroundTurnRolloutTrace { result, pmove_steps }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ground_turn_rolls_optimal_tol_counted(
+    graph: &NavGraph,
+    bsp: &Bsp,
+    entry: PmState,
+    dt: f32,
+    takeoff: Vec3,
+    gt: &GroundTurnCurl,
+    to: CellId,
+    p: &PmParams,
+    accept_near: f32,
+    pmove_steps: &mut usize,
+) -> Option<(f32, PmState)> {
     use crate::pmove::pm_step_report;
     let solid = |o: Vec3| {
         let tr = bsp.hull1_trace(o, o);
@@ -2256,6 +2353,7 @@ fn ground_turn_rolls_optimal_tol(
         if solid(s.origin) {
             return None;
         }
+        *pmove_steps += 1;
         let rep = pm_step_report(bsp, &mut s, &cmd, p, dt);
         if rep.wall_contact || solid(s.origin) || s.origin.z < floor_z {
             return None;
@@ -2281,6 +2379,7 @@ fn ground_turn_rolls_optimal_tol(
     if solid(s.origin) {
         return None;
     }
+    *pmove_steps += 1;
     let rep = pm_step_report(bsp, &mut s, &cmd, p, dt);
     if rep.wall_contact || solid(s.origin) || s.on_ground {
         return None;
@@ -2291,6 +2390,7 @@ fn ground_turn_rolls_optimal_tol(
         if solid(s.origin) {
             return None;
         }
+        *pmove_steps += 1;
         let rep = pm_step_report(bsp, &mut s, &cmd, p, dt);
         if rep.wall_contact || solid(s.origin) || s.origin.z < floor_z {
             return None;
@@ -2312,9 +2412,91 @@ fn ground_turn_rolls_optimal_tol(
     None
 }
 
+/// Result of one live ground-turn entry witness. `outcome` is the exact target-cell touchdown
+/// state when the stored controller can execute from the supplied physical state; `None` is a
+/// fail-closed rejection. `pmove_steps` includes work performed before a rejection, so callers can
+/// account for unsuccessful parallel candidates as well as the selected one.
+#[derive(Clone, Copy, Debug)]
+pub struct GroundTurnLiveRollout {
+    pub outcome: Option<PmState>,
+    pub pmove_steps: usize,
+}
+
+impl NavGraph {
+    /// Re-run a ground-turn SpeedJump's own versioned certificate controller from a live entry
+    /// state. An optional corrective command is first advanced through the same pmove tick; its
+    /// resulting state must enter the stored speed/yaw envelope before the complete ground, launch,
+    /// air, and exact-target touchdown rollout is attempted. Non-ground-turn links return `None` so
+    /// ordinary SpeedJump/Walk/JumpGap execution never passes through this gate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ground_turn_live_entry_rollout(
+        &self,
+        bsp: &Bsp,
+        link: u32,
+        mut entry: PmState,
+        adjustment: Option<Cmd>,
+        dt: f32,
+        p: &PmParams,
+    ) -> Option<GroundTurnLiveRollout> {
+        use crate::pmove::pm_step_report;
+
+        let traversal = self.speed_jump_of_link(link)?;
+        let gt = traversal.ground_turn?;
+        let mut prefix_steps = 0usize;
+        if let Some(cmd) = adjustment {
+            let solid = |o: Vec3| {
+                let tr = bsp.hull1_trace(o, o);
+                tr.start_solid || tr.all_solid
+            };
+            if solid(entry.origin) {
+                return Some(GroundTurnLiveRollout { outcome: None, pmove_steps: prefix_steps });
+            }
+            prefix_steps += 1;
+            let rep = pm_step_report(bsp, &mut entry, &cmd, p, dt);
+            if rep.wall_contact || solid(entry.origin) || !entry.on_ground || entry.jump_held {
+                return Some(GroundTurnLiveRollout { outcome: None, pmove_steps: prefix_steps });
+            }
+        }
+        if !ground_turn_entry_ok(entry.vel.xy().length(), entry.vel.xy(), entry.on_ground, &gt) {
+            return Some(GroundTurnLiveRollout { outcome: None, pmove_steps: prefix_steps });
+        }
+        let target = self.link_target(link);
+        let trace = match gt.version {
+            GROUND_TURN_OPTIMAL_VERSION => ground_turn_rolls_optimal_tol_report(
+                self,
+                bsp,
+                entry,
+                dt,
+                traversal.takeoff,
+                &gt,
+                target,
+                p,
+                0.0,
+            ),
+            GROUND_TURN_VERSION | RUNWAY_TURN_VERSION => ground_turn_rolls_tol_report(
+                self,
+                bsp,
+                entry,
+                dt,
+                traversal.takeoff,
+                &gt,
+                target,
+                p,
+                0.0,
+            ),
+            _ => GroundTurnRolloutTrace { result: None, pmove_steps: 0 },
+        };
+        Some(GroundTurnLiveRollout {
+            outcome: trace.result.map(|(_, landing)| landing),
+            pmove_steps: prefix_steps + trace.pmove_steps,
+        })
+    }
+}
+
 #[cfg(test)]
 mod ground_turn_tests {
     use super::*;
+    use crate::bsp::{ClipNode, Plane, CONTENTS_EMPTY, CONTENTS_SOLID};
 
     fn contract() -> GroundTurnCurl {
         GroundTurnCurl {
@@ -2342,6 +2524,93 @@ mod ground_turn_tests {
             landing_speed_lo: 493.0,
             landing_yaw: 258.0,
         }
+    }
+
+    /// An infinite floor up to `runway_edge`, a gap, then an infinite landing floor.  Coordinates
+    /// are standing-origin coordinates because the synthetic clip hull is already player-inflated,
+    /// just like a real BSP hull 1.
+    fn runway_gap(runway_edge: f32, landing_edge: f32) -> Bsp {
+        Bsp::synthetic(
+            vec![
+                Plane { normal: Vec3::Z, dist: 0.0, kind: 2 },
+                Plane { normal: Vec3::X, dist: runway_edge, kind: 0 },
+                Plane { normal: Vec3::X, dist: landing_edge, kind: 0 },
+            ],
+            vec![
+                // z >= 0 is open.  Below the floor plane, split the runway/gap/landing slabs.
+                ClipNode { plane: 0, children: [CONTENTS_EMPTY, 1] },
+                ClipNode { plane: 1, children: [2, CONTENTS_SOLID] },
+                ClipNode { plane: 2, children: [CONTENTS_SOLID, CONTENTS_EMPTY] },
+            ],
+            0,
+            Vec::new(),
+        )
+    }
+
+    fn optimal_spatial_contract() -> (NavGraph, Bsp, PmState, GroundTurnCurl, u32) {
+        let takeoff = Vec3::new(48.0, 25.0, 0.03125);
+        let landing = Vec3::new(215.0, 268.0, 0.03125);
+        let cells = [Vec3::new(0.0, 0.0, 0.03125), takeoff, landing]
+            .into_iter()
+            .map(|origin| Cell { origin, gx: floor_grid(origin.x), gy: floor_grid(origin.y) })
+            .collect();
+        let mut graph = NavGraph::test_graph(cells, Vec::new());
+        for (id, cell) in graph.cells.iter().enumerate() {
+            graph.grid.entry((cell.gx, cell.gy)).or_default().push(id as CellId);
+        }
+        let bsp = runway_gap(60.0, 120.0);
+        let launch_yaw = 54.0f32;
+        let (s, c) = launch_yaw.to_radians().sin_cos();
+        let launch_dir = Vec3::new(c, s, 0.0);
+        let gt = GroundTurnCurl {
+            version: GROUND_TURN_OPTIMAL_VERSION,
+            runway_aim: takeoff,
+            blended_runway: false,
+            runway_yaw: 0.0,
+            lip_reach: 0.0,
+            hold_speed: 0.0,
+            turn_dist: 0.0,
+            launch_yaw,
+            yaw_min: launch_yaw - GT_OPT_LAUNCH_SLACK,
+            box_min: takeoff - Vec3::new(GT_BOX_HALF, GT_BOX_HALF, 1.0),
+            box_max: takeoff + Vec3::new(GT_BOX_HALF, GT_BOX_HALF, 0.0),
+            launch_gain: 32.0,
+            hold_aim: takeoff + launch_dir * 512.0,
+            gate_point: takeoff,
+            gate_normal: Vec3::ZERO,
+            air_gain: 128.0,
+            landing_aim: landing,
+            entry_speed_lo: 319.0,
+            entry_speed_hi: 321.0,
+            entry_yaw_lo: 359.0,
+            entry_yaw_hi: 1.0,
+            landing_speed_lo: 0.0,
+            landing_yaw: 0.0,
+        };
+        let entry = PmState {
+            origin: Vec3::new(0.0, 0.0, 0.03125),
+            vel: Vec3::new(320.0, 0.0, 0.0),
+            on_ground: true,
+            jump_held: false,
+        };
+        let link = graph.plant_speed_jump(
+            0,
+            2,
+            1.0,
+            SpeedJumpTraversal {
+                takeoff,
+                v_req: 320.0,
+                airtime: 0.8,
+                landing_speed_lo: 0.0,
+                chained: true,
+                curl_gain: gt.air_gain,
+                curl_entry_aim: gt.hold_aim,
+                curl_switch_dist: 0.0,
+                curl_landing_aim: landing,
+                ground_turn: Some(gt),
+            },
+        );
+        (graph, bsp, entry, gt, link)
     }
 
     #[test]
@@ -2428,5 +2697,128 @@ mod ground_turn_tests {
             !ground_turn_entry_ok(500.0, off_yaw, true, &gt),
             "outside the yaw envelope"
         );
+    }
+
+    #[test]
+    fn live_entry_rejects_a_spatial_shift_that_misses_the_certified_launch() {
+        let (graph, bsp, certified, gt, link) = optimal_spatial_contract();
+        let params = PmParams::default();
+        let certified_roll = graph
+            .ground_turn_live_entry_rollout(&bsp, link, certified, None, 0.020, &params)
+            .expect("ground-turn link");
+        assert!(certified_roll.outcome.is_some(), "fixture error: the source-centred state must be executable");
+        assert!(certified_roll.pmove_steps > 1, "the witness must include launch and flight");
+        assert!(certified_roll.pmove_steps <= GT_SETUP_TICK_CAP + 1 + GT_FLIGHT_TICK_CAP);
+
+        let shifted = PmState { origin: certified.origin + Vec3::new(24.0, 0.0, 0.0), ..certified };
+        let shifted_roll = graph
+            .ground_turn_live_entry_rollout(&bsp, link, shifted, None, 0.020, &params)
+            .expect("ground-turn link");
+
+        // The scalar envelope deliberately cannot distinguish these states; the physical witness must.
+        assert!(ground_turn_entry_ok(certified.vel.xy().length(), certified.vel.xy(), true, &gt));
+        assert!(
+            ground_turn_entry_ok(shifted.vel.xy().length(), shifted.vel.xy(), true, &gt),
+            "fixture error: shifted entry must retain the same scalar envelope"
+        );
+        assert!(shifted_roll.outcome.is_none(), "the full-state witness admitted a runway miss");
+    }
+
+    #[test]
+    fn live_entry_accepts_a_safe_off_centre_state_without_a_radius_rule() {
+        let (graph, bsp, certified, _, link) = optimal_spatial_contract();
+        let off_centre = PmState { origin: certified.origin - Vec3::new(24.0, 0.0, 0.0), ..certified };
+        let roll = graph
+            .ground_turn_live_entry_rollout(&bsp, link, off_centre, None, 0.020, &PmParams::default())
+            .expect("ground-turn link");
+        assert!(roll.outcome.is_some(), "an executable off-centre state must not be rejected by distance alone");
+    }
+
+    #[test]
+    fn adjusted_entry_requires_both_the_envelope_and_a_safe_continuation() {
+        let (graph, bsp, certified, gt, link) = optimal_spatial_contract();
+        let params = PmParams::default();
+        let (entry_sin, entry_cos) = 10.0f32.to_radians().sin_cos();
+        let entry = PmState { vel: Vec3::new(320.0 * entry_cos, 320.0 * entry_sin, 0.0), ..certified };
+        let adjustment = ground_turn_entry_adjust_cmd(
+            entry.vel.xy(),
+            entry.on_ground,
+            &gt,
+            params.friction,
+            params.stopspeed,
+            params.accel,
+            params.maxspeed,
+            0.020,
+        )
+        .expect("fixture must have a one-tick envelope adjustment");
+        let mut post = entry;
+        crate::pmove::pm_step(&bsp, &mut post, &adjustment, &params, 0.020);
+        assert!(ground_turn_entry_ok(post.vel.xy().length(), post.vel.xy(), post.on_ground, &gt));
+
+        let safe = graph
+            .ground_turn_live_entry_rollout(&bsp, link, entry, Some(adjustment), 0.020, &params)
+            .expect("ground-turn link");
+        assert!(safe.outcome.is_some(), "adjustment plus full safe rollout must be accepted");
+        assert!(safe.pmove_steps <= 1 + GT_SETUP_TICK_CAP + 1 + GT_FLIGHT_TICK_CAP);
+
+        let unsafe_entry = PmState { origin: entry.origin + Vec3::new(24.0, 0.0, 0.0), ..entry };
+        let unsafe_roll = graph
+            .ground_turn_live_entry_rollout(&bsp, link, unsafe_entry, Some(adjustment), 0.020, &params)
+            .expect("ground-turn link");
+        assert!(unsafe_roll.pmove_steps > 1, "the adjustment must enter the envelope before geometry rejects");
+        assert!(unsafe_roll.outcome.is_none(), "velocity-only adjustment admitted an unsafe continuation");
+    }
+
+    #[test]
+    fn live_rollout_dispatches_legacy_versions_and_skips_other_link_kinds() {
+        let (mut graph, bsp, entry, gt, base) = optimal_spatial_contract();
+        let params = PmParams::default();
+        let base_traversal = *graph.speed_jump_of_link(base).unwrap();
+        for version in [GROUND_TURN_VERSION, RUNWAY_TURN_VERSION] {
+            let mut legacy_gt = gt;
+            legacy_gt.version = version;
+            legacy_gt.blended_runway = version == RUNWAY_TURN_VERSION;
+            legacy_gt.lip_reach = GT_BOX_HALF;
+            legacy_gt.hold_speed = entry.vel.xy().length();
+            legacy_gt.turn_dist = 512.0;
+            legacy_gt.yaw_min = legacy_gt.launch_yaw - GT_OPT_LAUNCH_SLACK;
+            let mut traversal = base_traversal;
+            traversal.ground_turn = Some(legacy_gt);
+            let link = graph.plant_speed_jump(0, 2, 2.0 + version as f32, traversal);
+            let direct = ground_turn_rolls_tol_report(
+                &graph,
+                &bsp,
+                entry,
+                0.020,
+                traversal.takeoff,
+                &legacy_gt,
+                2,
+                &params,
+                0.0,
+            );
+            let live = graph
+                .ground_turn_live_entry_rollout(&bsp, link, entry, None, 0.020, &params)
+                .expect("legacy ground-turn link");
+            assert!(direct.pmove_steps > 0, "legacy fixture must exercise version {version}'s controller");
+            if version == GROUND_TURN_VERSION {
+                assert!(direct.result.is_some(), "v1 fixture must reach its exact target");
+            }
+            assert_eq!(live.outcome.is_some(), direct.result.is_some(), "version {version} dispatch outcome");
+            assert_eq!(live.pmove_steps, direct.pmove_steps, "version {version} dispatch controller");
+        }
+
+        let mut plain = base_traversal;
+        plain.ground_turn = None;
+        let plain_speed_jump = graph.plant_speed_jump(0, 2, 8.0, plain);
+        assert!(graph
+            .ground_turn_live_entry_rollout(&bsp, plain_speed_jump, entry, None, 0.020, &params)
+            .is_none());
+        for kind in [LinkKind::Walk, LinkKind::JumpGap] {
+            graph.push_link(Link { from: 0, to: 1, kind, cost: 1.0 });
+            let link = (graph.links.len() - 1) as u32;
+            assert!(graph
+                .ground_turn_live_entry_rollout(&bsp, link, entry, None, 0.020, &params)
+                .is_none());
+        }
     }
 }

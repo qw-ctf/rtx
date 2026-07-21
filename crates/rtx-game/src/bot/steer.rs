@@ -22,6 +22,7 @@ use crate::game::cstring;
 use crate::nav_build::PlatStatus;
 use crate::navmesh::{CellId, Corridor, LinkCosts, LinkKind, NavGraph, GRID};
 use crate::nearfield;
+use rtx_nav::pmove::{PmParams, PmState};
 
 /// How long a real network client waits at a reached pickup terminal for the authoritative server
 /// touch/stat update before trying another terminal or abandoning the item.
@@ -391,6 +392,67 @@ fn nearfield_gates<'a>(graph: &'a NavGraph, gate_closed: &'a [bool], origin: Vec
             (nearest - origin.xy()).length() <= reach
         }
     })
+}
+
+#[derive(Clone, Copy)]
+struct GroundTurnEntryCandidate {
+    leg: u32,
+    cost: f32,
+    adjustment: Option<bhop::Cmd>,
+    accepted: bool,
+    pmove_steps: usize,
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct GroundTurnEntryWork {
+    candidates: usize,
+    pmove_steps: usize,
+}
+
+#[derive(Clone, Copy)]
+enum GroundTurnPredecessorSelection {
+    Commit(GroundTurnEntryCandidate),
+    Abort,
+    Defer,
+}
+
+fn ground_turn_predecessor_selection(
+    selected: Option<GroundTurnEntryCandidate>,
+    work: GroundTurnEntryWork,
+) -> GroundTurnPredecessorSelection {
+    match selected {
+        Some(candidate) => GroundTurnPredecessorSelection::Commit(candidate),
+        None if work.candidates > 0 => GroundTurnPredecessorSelection::Abort,
+        None => GroundTurnPredecessorSelection::Defer,
+    }
+}
+
+fn predecessor_adjustments_complete(profiles: usize, adjustments: usize) -> bool {
+    profiles > 0 && profiles == adjustments
+}
+
+/// Choose only among physically witnessed entries, retaining the cheapest graph profile. Work from
+/// rejected candidates is included in the report: it is still real one-shot pmove cost even though
+/// no route mutation follows from it.
+fn select_ground_turn_entry(
+    candidates: impl IntoIterator<Item = GroundTurnEntryCandidate>,
+) -> (Option<GroundTurnEntryCandidate>, GroundTurnEntryWork) {
+    let mut best = None::<GroundTurnEntryCandidate>;
+    let mut work = GroundTurnEntryWork::default();
+    for candidate in candidates {
+        work.candidates += 1;
+        work.pmove_steps += candidate.pmove_steps;
+        if !candidate.accepted {
+            continue;
+        }
+        let replace = best.is_none_or(|current| {
+            candidate.cost.total_cmp(&current.cost).then(candidate.leg.cmp(&current.leg)).is_lt()
+        });
+        if replace {
+            best = Some(candidate);
+        }
+    }
+    (best, work)
 }
 
 fn nearfield_owns_locomotion(
@@ -1310,6 +1372,28 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // the first accepted frame: the controller is supposed to rotate out of its entry yaw envelope.
     let mut effective_sj_leg = cur_leg;
     let mut gt_entry_adjust = None::<Vec2>;
+    let ground_turn_pmove = || {
+        let mut p = PmParams::default();
+        let gravity = host.cvar(c"sv_gravity");
+        let friction = host.cvar(c"sv_friction");
+        let stopspeed = host.cvar(c"sv_stopspeed");
+        let accel = host.cvar(c"sv_accelerate");
+        let maxspeed = host.cvar(c"sv_maxspeed");
+        if gravity > 0.0 { p.gravity = gravity; }
+        if friction > 0.0 { p.friction = friction; }
+        if stopspeed > 0.0 { p.stopspeed = stopspeed; }
+        if accel > 0.0 { p.accel = accel; }
+        if maxspeed > 0.0 { p.maxspeed = maxspeed; }
+        p
+    };
+    let ground_turn_entry = PmState {
+        origin,
+        vel: v_xy.extend(vz),
+        on_ground,
+        // The bot pulses +jump; a grounded GroundTurn handoff is entered after the release frame.
+        // The engine's private pmove jump-held latch is not exposed on the edict.
+        jump_held: false,
+    };
     // Adjust on the final ordinary predecessor, before the arrival loop advances into the
     // ground-turn link on the following frame. The live failure reached this point only ~25u from
     // the source; waiting one more generic turn tick moved the hull outside the certified origin.
@@ -1322,11 +1406,8 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                     let source_origin = graph.cell_origin(source);
                     if (source_origin.xy() - origin.xy()).length() <= ARRIVE_RADIUS + 8.0 {
                         let dt = frametime.clamp(0.001, 0.05);
-                        let friction = host.cvar(c"sv_friction");
-                        let stopspeed = host.cvar(c"sv_stopspeed");
-                        let accel = host.cvar(c"sv_accelerate");
-                        let maxspeed = host.cvar(c"sv_maxspeed");
-                        let adjustment = graph
+                        let params = ground_turn_pmove();
+                        let profiles: Vec<(u32, f32, crate::navmesh::GroundTurnCurl)> = graph
                             .links
                             .iter()
                             .enumerate()
@@ -1335,30 +1416,94 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                                     return None;
                                 }
                                 let gt = graph.speed_jump_of_link(li as u32)?.ground_turn?;
-                                let cmd = crate::navmesh::ground_turn_entry_adjust_cmd(
+                                Some((li as u32, link.cost, gt))
+                            })
+                            .collect();
+                        let adjustments: Vec<(u32, f32, bhop::Cmd)> = profiles
+                            .iter()
+                            .filter_map(|&(li, cost, gt)| {
+                                crate::navmesh::ground_turn_entry_adjust_cmd(
                                     v_xy,
                                     true,
                                     &gt,
-                                    if friction > 0.0 { friction } else { 4.0 },
-                                    if stopspeed > 0.0 { stopspeed } else { 100.0 },
-                                    if accel > 0.0 { accel } else { 10.0 },
-                                    if maxspeed > 0.0 { maxspeed } else { 320.0 },
+                                    params.friction,
+                                    params.stopspeed,
+                                    params.accel,
+                                    params.maxspeed,
                                     dt,
-                                )?;
-                                Some((li as u32, cmd))
+                                )
+                                .map(|cmd| (li, cost, cmd))
                             })
-                            .min_by(|a, b| a.1.forward.total_cmp(&b.1.forward));
-                        if let Some((selected, cmd)) = adjustment {
-                            gt_entry_adjust =
-                                Some(bhop::wishdir_fs(cmd.view_yaw, cmd.forward, cmd.side) * cmd.forward);
-                            // This is a certified one-tick transition into `selected`, not a
-                            // standing brake mode. Latch and advance atomically: leaving the
-                            // ordinary predecessor current returned control to generic steering,
-                            // which circled around the source, destroyed the certified entry speed
-                            // and then failed closed before the ground-turn controller ever ran.
-                            bot.route[bot.route_pos + 1] = selected;
-                            bot.route_pos += 1;
-                            bot.sj = Some(Commit { leg: selected, since: now, entry_checked: true });
+                            .collect();
+                        // `None` from the adjustment solver is ambiguous per profile: it can mean
+                        // the live state is already directly compatible. Do not let a different,
+                        // rejected adjusted profile turn that into an abort; defer all work to the
+                        // current-leg direct witness instead.
+                        let candidates = predecessor_adjustments_complete(profiles.len(), adjustments.len())
+                            .then_some(adjustments)
+                            .into_iter()
+                            .flatten()
+                            .map(|(li, cost, cmd)| {
+                                let rollout = bsp.and_then(|bsp| {
+                                    graph.ground_turn_live_entry_rollout(
+                                        bsp,
+                                        li,
+                                        ground_turn_entry,
+                                        Some(cmd),
+                                        dt,
+                                        &params,
+                                    )
+                                });
+                                GroundTurnEntryCandidate {
+                                    leg: li,
+                                    cost,
+                                    adjustment: Some(cmd),
+                                    accepted: rollout.is_some_and(|r| r.outcome.is_some()),
+                                    pmove_steps: rollout.map_or(0, |r| r.pmove_steps),
+                                }
+                            });
+                        let (selected, work) = select_ground_turn_entry(candidates);
+                        match ground_turn_predecessor_selection(selected, work) {
+                            GroundTurnPredecessorSelection::Commit(GroundTurnEntryCandidate {
+                                leg: selected,
+                                adjustment: Some(cmd),
+                                ..
+                            }) => {
+                                gt_entry_adjust =
+                                    Some(bhop::wishdir_fs(cmd.view_yaw, cmd.forward, cmd.side) * cmd.forward);
+                                // This is a certified one-tick transition into `selected`, not a
+                                // standing brake mode. Latch and advance atomically: leaving the
+                                // ordinary predecessor current returned control to generic steering,
+                                // which circled around the source, destroyed the certified entry speed
+                                // and then failed closed before the ground-turn controller ever ran.
+                                bot.route[bot.route_pos + 1] = selected;
+                                bot.route_pos += 1;
+                                bot.sj = Some(Commit { leg: selected, since: now, entry_checked: true });
+                                effective_sj_leg = Some(selected);
+                            }
+                            GroundTurnPredecessorSelection::Abort => {
+                                // A real adjustment set was evaluated and none had a physical
+                                // continuation. Fail this approach once; otherwise a stalled bot can
+                                // repeat every full rollout on every frame in the source annulus.
+                                penalize_leg(bot, Some(next), Some(LinkKind::SpeedJump), now);
+                                bot.sj = None;
+                                bot.route.clear();
+                                bot.repath_time = now;
+                            }
+                            // No adjustment command means no expensive candidate was run. The state
+                            // may already be directly compatible; let normal leg advance perform the
+                            // direct full-witness check instead of treating absence as rejection.
+                            GroundTurnPredecessorSelection::Defer => {}
+                            GroundTurnPredecessorSelection::Commit(_) => unreachable!(),
+                        }
+                        if work.candidates > 0 && host.cvar_bool(c"rtx_bot_debug") {
+                            host.conprint(&cstring(&format!(
+                                "rtx bot{client}: sj-entry predecessor candidates={} pmove_steps={} selected={} adjusted={}\n",
+                                work.candidates,
+                                work.pmove_steps,
+                                selected.map_or(-1, |c| c.leg as i64),
+                                selected.is_some_and(|c| c.adjustment.is_some()),
+                            )));
                         }
                     }
                 }
@@ -1372,8 +1517,11 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         let current = cur_leg.unwrap();
         let source = graph.link_source(current);
         let target = graph.link_target(current);
-        let parallel = || {
-            graph.links.iter().enumerate().filter_map(|(li, link)| {
+        let parallel: Vec<(u32, f32, crate::navmesh::GroundTurnCurl)> = graph
+            .links
+            .iter()
+            .enumerate()
+            .filter_map(|(li, link)| {
                 if link.kind != LinkKind::SpeedJump || link.from != source || link.to != target {
                     return None;
                 }
@@ -1381,13 +1529,24 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 let gt = tr.ground_turn?;
                 Some((li as u32, link.cost, gt))
             })
-        };
-        let compatible = parallel()
-            .filter(|(_, _, gt)| crate::navmesh::ground_turn_entry_ok(speed, v_xy, on_ground, gt))
-            .map(|(li, cost, _)| (li, cost))
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(li, _)| li);
-        if let Some(selected) = compatible {
+            .collect();
+        let dt = frametime.clamp(0.001, 0.05);
+        let params = ground_turn_pmove();
+        let direct = parallel.iter().map(|&(li, cost, _)| {
+            let rollout = bsp.and_then(|bsp| {
+                graph.ground_turn_live_entry_rollout(bsp, li, ground_turn_entry, None, dt, &params)
+            });
+            GroundTurnEntryCandidate {
+                leg: li,
+                cost,
+                adjustment: None,
+                accepted: rollout.is_some_and(|r| r.outcome.is_some()),
+                pmove_steps: rollout.map_or(0, |r| r.pmove_steps),
+            }
+        });
+        let (compatible, mut work) = select_ground_turn_entry(direct);
+        let mut selected_for_debug = compatible;
+        if let Some(GroundTurnEntryCandidate { leg: selected, .. }) = compatible {
             bot.route[bot.route_pos] = selected;
             if let Some(commit) = bot.sj.as_mut() {
                 commit.leg = selected;
@@ -1396,28 +1555,47 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             effective_sj_leg = Some(selected);
         } else {
             // Find the smallest one-tick ground adjustment whose predicted post-friction velocity
-            // enters a parallel certified contract. This neither widens an unsafe envelope nor
-            // guesses a brake; the release probe certifies the continuous transition at every tick.
-            let dt = frametime.clamp(0.001, 0.05);
-            let friction = host.cvar(c"sv_friction");
-            let stopspeed = host.cvar(c"sv_stopspeed");
-            let accel = host.cvar(c"sv_accelerate");
-            let maxspeed = host.cvar(c"sv_maxspeed");
-            let adjustment = parallel()
-                .filter_map(|(_, _, gt)| {
-                    crate::navmesh::ground_turn_entry_adjust_cmd(
+            // enters a parallel certified contract, then require its complete geometric witness.
+            let adjusted = parallel.iter().filter_map(|&(li, cost, gt)| {
+                let cmd = crate::navmesh::ground_turn_entry_adjust_cmd(
                         v_xy,
                         on_ground,
                         &gt,
-                        if friction > 0.0 { friction } else { 4.0 },
-                        if stopspeed > 0.0 { stopspeed } else { 100.0 },
-                        if accel > 0.0 { accel } else { 10.0 },
-                        if maxspeed > 0.0 { maxspeed } else { 320.0 },
+                        params.friction,
+                        params.stopspeed,
+                        params.accel,
+                        params.maxspeed,
                         dt,
+                    )?;
+                let rollout = bsp.and_then(|bsp| {
+                    graph.ground_turn_live_entry_rollout(
+                        bsp,
+                        li,
+                        ground_turn_entry,
+                        Some(cmd),
+                        dt,
+                        &params,
                     )
+                });
+                Some(GroundTurnEntryCandidate {
+                    leg: li,
+                    cost,
+                    adjustment: Some(cmd),
+                    accepted: rollout.is_some_and(|r| r.outcome.is_some()),
+                    pmove_steps: rollout.map_or(0, |r| r.pmove_steps),
                 })
-                .min_by(|a, b| a.forward.total_cmp(&b.forward));
-            if let Some(cmd) = adjustment {
+            });
+            let (adjustment, adjusted_work) = select_ground_turn_entry(adjusted);
+            work.candidates += adjusted_work.candidates;
+            work.pmove_steps += adjusted_work.pmove_steps;
+            selected_for_debug = adjustment;
+            if let Some(GroundTurnEntryCandidate { leg: selected, adjustment: Some(cmd), .. }) = adjustment {
+                bot.route[bot.route_pos] = selected;
+                if let Some(commit) = bot.sj.as_mut() {
+                    commit.leg = selected;
+                    commit.entry_checked = true;
+                }
+                effective_sj_leg = Some(selected);
                 gt_entry_adjust = Some(bhop::wishdir_fs(cmd.view_yaw, cmd.forward, cmd.side) * cmd.forward);
                 sj_active = false;
             } else {
@@ -1427,6 +1605,15 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 bot.repath_time = now;
                 sj_active = false;
             }
+        }
+        if host.cvar_bool(c"rtx_bot_debug") {
+            host.conprint(&cstring(&format!(
+                "rtx bot{client}: sj-entry current candidates={} pmove_steps={} selected={} adjusted={}\n",
+                work.candidates,
+                work.pmove_steps,
+                selected_for_debug.map_or(-1, |c| c.leg as i64),
+                selected_for_debug.is_some_and(|c| c.adjustment.is_some()),
+            )));
         }
     }
     let sj_traversal = if sj_active {
@@ -1533,9 +1720,9 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // Drive the hop-cycle controller (see `bhop::Bhop`). On a speed jump the runway is the
     // run-up to the takeoff edge and the bearing aims straight at the landing so the leap goes
     // across the gap; otherwise steer toward the look-ahead corridor point (smoother than the 32u
-    // next cell) with as much straight-ish corridor as the route offers. `mut` so the hazard-edge
-    // brake below can null the hop and drive a reverse wish through `emit` instead.
-    let mut bhop_cmd = {
+    // next cell) with as much straight-ish corridor as the route offers. The aim-source tag travels
+    // with the command for debug-only per-frame traversal telemetry below.
+    let (bhop_cmd, mut sj_aim_source, active_sj_should_launch) = {
         let dt = frametime.clamp(0.001, 0.05);
         let accel = host.cvar(c"sv_accelerate");
         let maxspeed = host.cvar(c"sv_maxspeed");
@@ -1562,13 +1749,17 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 // "switch on the first airborne frame", while a positive gate retains it farther
                 // into the arc.
                 if on_ground || travelled < tr.curl_switch_dist {
-                    tr.curl_entry_aim
+                    (tr.curl_entry_aim, "curl-entry")
                 } else {
-                    tr.curl_landing_aim
+                    (tr.curl_landing_aim, "curl-landing")
                 }
             });
+        let mut aim_source: &'static str;
         let ahead = match race_line_ahead {
-            Some(lp) if !sj_active => lp.xy() - origin.xy(),
+            Some(lp) if !sj_active => {
+                aim_source = "race-line";
+                lp.xy() - origin.xy()
+            }
             // On a speed jump the run-up aims at the *takeoff* (follow the corridor to the lip), and
             // only once airborne does the bearing swing to the *landing* — so a curl jump (run-up and
             // leap not collinear) tracks its corridor instead of cutting across it and off the edge.
@@ -1579,21 +1770,41 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                     // rotation point while grounded, hold-or-landing pursuit once airborne.
                     (Some(gt), Some((takeoff, _)), _) => {
                         if on_ground {
+                            aim_source = if gt.version == crate::navmesh::GROUND_TURN_OPTIMAL_VERSION {
+                                "gt-v3-ground"
+                            } else {
+                                "gt-v12-ground"
+                            };
                             crate::navmesh::ground_turn_ground_aim(origin, takeoff, &gt).extend(origin.z)
                         } else {
-                            crate::navmesh::ground_turn_air_aim(origin, &gt).0.extend(origin.z)
+                            let (aim, _) = crate::navmesh::ground_turn_air_aim(origin, &gt);
+                            aim_source = if aim == gt.hold_aim.xy() { "gt-air-hold" } else { "gt-air-land" };
+                            aim.extend(origin.z)
                         }
                     }
                     // Curl run-up: aim at the takeoff (follow the corridor) while still behind the lip —
                     // grounded *or* briefly airborne (a bumped or carried-airborne entry) — so it never
                     // curls toward the offset landing while still over the run-up and pulls off the edge.
-                    (None, Some((takeoff, _)), Some(p)) if p > bhop::LIP_REACH => takeoff,
+                    (None, Some((takeoff, _)), Some(p)) if p > bhop::LIP_REACH => {
+                        aim_source = "takeoff";
+                        takeoff
+                    }
                     // Straight speed jump on the ground: aim at the takeoff (collinear → no-op vs landing).
-                    (None, Some((takeoff, _)), None) if on_ground => takeoff,
+                    (None, Some((takeoff, _)), None) if on_ground => {
+                        aim_source = "takeoff";
+                        takeoff
+                    }
                     // At the lip and throughout the flight, execute a rollout-certified two-stage
                     // pursuit instead of homing straight onto the nav-cell centre.
-                    _ if sj_flight_aim.is_some() => sj_flight_aim.unwrap(),
-                    _ => waypoint,
+                    _ if sj_flight_aim.is_some() => {
+                        let (aim, source) = sj_flight_aim.unwrap();
+                        aim_source = source;
+                        aim
+                    }
+                    _ => {
+                        aim_source = "waypoint";
+                        waypoint
+                    }
                 };
                 aim.xy() - origin.xy()
             }
@@ -1605,6 +1816,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             // Past the grid the chord passes — the route out there is trusted; the veto fires only on a
             // drop the near-field actually sees, so open corridors keep the full anticipatory look-ahead.
             _ => {
+                aim_source = "bhop-look";
                 bhop_look_direction(
                     bot.near.as_ref(),
                     nf_active,
@@ -1629,18 +1841,18 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             None => dir,
         };
         let bearing = yaw_of(dir);
+        let sj_should_launch = sj_gt.map(|gt| {
+            if gt.version == crate::navmesh::GROUND_TURN_OPTIMAL_VERSION {
+                crate::navmesh::ground_turn_should_launch_optimal(origin, v_xy, on_ground, &gt)
+            } else {
+                crate::navmesh::ground_turn_should_launch(origin, v_xy, on_ground, &gt)
+            }
+        });
         let bhop_runway = match (sj_gt, sj_takeoff, sj_progress) {
             // Ground-turn curl: the leap fires on the certified yaw/box gate, not on crossing a
             // takeoff line — synthesize the "past the lip" signal from the shared gate check.
-            (Some(gt), _, _) => {
-                // Optimal-sweep (v3) contracts use the single-sided-sweep launch gate;
-                // v1/v2 weave contracts use the yaw_min-rotation gate.
-                let launched = if gt.version == crate::navmesh::GROUND_TURN_OPTIMAL_VERSION {
-                    crate::navmesh::ground_turn_should_launch_optimal(origin, v_xy, on_ground, &gt)
-                } else {
-                    crate::navmesh::ground_turn_should_launch(origin, v_xy, on_ground, &gt)
-                };
-                if launched {
+            (Some(_), _, _) => {
+                if sj_should_launch == Some(true) {
                     -1.0
                 } else {
                     bhop::LIP_REACH + 64.0
@@ -1720,6 +1932,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             let optimal = gt.version == crate::navmesh::GROUND_TURN_OPTIMAL_VERSION;
             cmd = Some(if on_ground {
                 if generic.jump {
+                    aim_source = "gt-launch";
                     let launch_bearing = if optimal { gt.launch_yaw } else { bearing };
                     crate::navmesh::ground_turn_launch_cmd(v_xy, launch_bearing, &gt, env.accel, env.maxspeed, env.dt)
                 } else if optimal {
@@ -1743,7 +1956,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 bot.bhop.phase,
             )));
         }
-        cmd
+        (cmd, aim_source, sj_should_launch)
     };
     // Route-kind churn can leave the bhop state in Hop even after a banded run reaches a JumpGap.
     // Suppress that stale output: otherwise `emit` replaces this function's world-space gap wish.
@@ -2275,10 +2488,35 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     }
 
     // Apply the exact contract-entry adjustment after every generic movement override and lock out
-    // overlays below; the unchecked speed-jump commit remains available for selection next frame.
+    // overlays below. Its full post-tick traversal was witnessed before the commit was marked checked.
     if let Some(adjust) = gt_entry_adjust {
         move_world = adjust.extend(0.0);
         buttons &= !BUTTON_JUMP;
+        sj_aim_source = "entry-adjust";
+    }
+
+    // Debug-only, per-frame SpeedJump contract trace. Keep both the controller's final jump request
+    // and the pending button: later safety/driver overrides can intentionally differ from it.
+    if host.cvar_bool(c"rtx_bot_debug") {
+        if let Some(leg) = effective_sj_leg.filter(|&leg| graph.link_kind(leg) == LinkKind::SpeedJump) {
+            let gt = graph.speed_jump_of_link(leg).and_then(|tr| tr.ground_turn);
+            let should_launch = active_sj_should_launch.or_else(|| {
+                gt.map(|gt| {
+                    if gt.version == crate::navmesh::GROUND_TURN_OPTIMAL_VERSION {
+                        crate::navmesh::ground_turn_should_launch_optimal(origin, v_xy, on_ground, &gt)
+                    } else {
+                        crate::navmesh::ground_turn_should_launch(origin, v_xy, on_ground, &gt)
+                    }
+                })
+            });
+            let gt_version = gt.map_or_else(|| "none".to_owned(), |gt| gt.version.to_string());
+            let should_launch = should_launch.map_or("none", |launch| if launch { "true" } else { "false" });
+            host.conprint(&cstring(&format!(
+                "rtx bot{client}: sj-frame leg={leg} sj_gt-version={gt_version} should_launch={should_launch} cmd.jump={} pending_jump={} aim-source={sj_aim_source}\n",
+                bhop_cmd.is_some_and(|cmd| cmd.jump),
+                buttons & BUTTON_JUMP != 0,
+            )));
+        }
     }
 
     // Bundle the frame's decisions into one command for the combat/grenade overlays to mutate.
@@ -2298,6 +2536,58 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ground_turn_selection_skips_a_cheaper_unwitnessed_profile() {
+        let candidates = [
+            GroundTurnEntryCandidate {
+                leg: 11,
+                cost: 0.5,
+                adjustment: None,
+                accepted: false,
+                pmove_steps: 5,
+            },
+            GroundTurnEntryCandidate {
+                leg: 12,
+                cost: 0.8,
+                adjustment: None,
+                accepted: true,
+                pmove_steps: 7,
+            },
+        ];
+        let (selected, work) = select_ground_turn_entry(candidates);
+        assert_eq!(selected.map(|candidate| candidate.leg), Some(12));
+        assert_eq!(work, GroundTurnEntryWork { candidates: 2, pmove_steps: 12 });
+    }
+
+    #[test]
+    fn predecessor_entry_rejection_is_one_shot_but_no_candidate_defers() {
+        assert!(matches!(
+            ground_turn_predecessor_selection(None, GroundTurnEntryWork { candidates: 1, pmove_steps: 7 }),
+            GroundTurnPredecessorSelection::Abort
+        ));
+        assert!(matches!(
+            ground_turn_predecessor_selection(None, GroundTurnEntryWork::default()),
+            GroundTurnPredecessorSelection::Defer
+        ));
+        assert!(predecessor_adjustments_complete(2, 2));
+        assert!(
+            !predecessor_adjustments_complete(2, 1),
+            "a skipped direct-compatible profile must prevent another profile's rejection from aborting"
+        );
+
+        let accepted = GroundTurnEntryCandidate {
+            leg: 12,
+            cost: 0.8,
+            adjustment: Some(bhop::Cmd { view_yaw: 0.0, forward: 1.0, side: 0.0, jump: false }),
+            accepted: true,
+            pmove_steps: 7,
+        };
+        assert!(matches!(
+            ground_turn_predecessor_selection(Some(accepted), GroundTurnEntryWork { candidates: 1, pmove_steps: 7 }),
+            GroundTurnPredecessorSelection::Commit(candidate) if candidate.leg == accepted.leg
+        ));
+    }
 
     #[test]
     fn jump_runup_gate_wants_speed_toward_the_waypoint() {

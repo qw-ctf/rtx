@@ -33,8 +33,8 @@ pub use geom::arc_point;
 pub use jumps::{
     ground_turn_air_aim, ground_turn_air_cmd, ground_turn_entry_adjust_cmd, ground_turn_entry_ok,
     ground_turn_ground_aim, ground_turn_ground_cmd, ground_turn_ground_cmd_optimal, ground_turn_launch_cmd,
-    ground_turn_should_launch, ground_turn_should_launch_optimal, yaw360_of, GROUND_TURN_OPTIMAL_VERSION,
-    GROUND_TURN_VERSION,
+    ground_turn_should_launch, ground_turn_should_launch_optimal, yaw360_of, GroundTurnLiveRollout,
+    GROUND_TURN_OPTIMAL_VERSION, GROUND_TURN_VERSION, RUNWAY_TURN_VERSION,
 };
 use geom::*;
 pub use hook::arc_land;
