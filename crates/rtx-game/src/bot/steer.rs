@@ -15,7 +15,7 @@ use glam::{Vec2, Vec3, Vec3Swizzles};
 use super::*;
 use crate::bsp::Bsp;
 use rtx_nav::qphys::{JUMP_VZ, ORIGIN_TO_FEET, STEP_HEIGHT};
-use crate::bot::state::{AirCommit, Commit, GateErrand, PlatWait, TerminalArrival};
+use crate::bot::state::{AirCommit, Commit, GateErrand, GroundTurnPhase, PlatWait, TerminalArrival};
 use crate::math::{angle_vectors, angles_to, yaw_of};
 use crate::defs::{Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP};
 use crate::game::cstring;
@@ -23,6 +23,54 @@ use crate::nav_build::PlatStatus;
 use crate::navmesh::{CellId, Corridor, LinkCosts, LinkKind, NavGraph, GRID};
 use crate::nearfield;
 use rtx_nav::pmove::{PmParams, PmState};
+
+/// Select the certified ground-turn controller phase. This is factored so the stored traversal
+/// phase, rather than an incidental contact bit, can be the single discriminator for both aim and
+/// movement command dispatch.
+fn ground_turn_uses_setup_controller(phase: GroundTurnPhase) -> bool {
+    matches!(phase, GroundTurnPhase::Setup { .. })
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GroundTurnDriverInput {
+    Setup(bhop::Cmd),
+    Launched,
+    Abort,
+}
+
+/// A checked setup still needs the bhop machine's pulse decision; absence is a hard veto and must
+/// fail closed. Once launched, the stored air controller no longer depends on generic bhop output.
+fn ground_turn_driver_input(
+    phase: GroundTurnPhase,
+    generic: Option<bhop::Cmd>,
+) -> GroundTurnDriverInput {
+    match phase {
+        GroundTurnPhase::Setup { .. } => generic
+            .map(GroundTurnDriverInput::Setup)
+            .unwrap_or(GroundTurnDriverInput::Abort),
+        GroundTurnPhase::Launched => GroundTurnDriverInput::Launched,
+    }
+}
+
+/// Fail-closed movement for a rejected ground-turn continuation. Route invalidation only affects
+/// the next frame, so counter the current carry now rather than letting the unsafe setup command
+/// reach pmove once more.
+fn ground_turn_entry_abort_wish(v_xy: Vec2) -> Vec2 {
+    -v_xy.normalize_or_zero() * MOVE_SPEED
+}
+
+fn abort_ground_turn_setup(
+    bot: &mut BotState,
+    leg: Option<u32>,
+    v_xy: Vec2,
+    now: f32,
+) -> Vec2 {
+    penalize_leg(bot, leg, Some(LinkKind::SpeedJump), now);
+    bot.sj = None;
+    bot.route.clear();
+    bot.repath_time = now;
+    ground_turn_entry_abort_wish(v_xy)
+}
 
 /// How long a real network client waits at a reached pickup terminal for the authoritative server
 /// touch/stat update before trying another terminal or abandoning the item.
@@ -1317,7 +1365,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         matches!(kind, Some(LinkKind::SpeedJump)) && host.cvar_bool(c"rtx_bot_bhop") && !hook_active && !rj_active;
     if sj_active {
         if bot.sj.map(|c| c.leg) != cur_leg {
-            bot.sj = cur_leg.map(|leg| Commit { leg, since: now, launch_vetoes: 0, entry_checked: false });
+            bot.sj = cur_leg.map(|leg| Commit::new(leg, now, false));
         }
         // Watchdog: the route is frozen mid-leg, so if the run-up stalls (blocked, shoved, never
         // built speed) abandon it and re-path rather than wedging on the runway forever. Penalize the
@@ -1479,12 +1527,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                                 // and then failed closed before the ground-turn controller ever ran.
                                 bot.route[bot.route_pos + 1] = selected;
                                 bot.route_pos += 1;
-                                bot.sj = Some(Commit {
-                                    leg: selected,
-                                    since: now,
-                                    launch_vetoes: 0,
-                                    entry_checked: true,
-                                });
+                                bot.sj = Some(Commit::new(selected, now, true));
                                 effective_sj_leg = Some(selected);
                             }
                             GroundTurnPredecessorSelection::Abort => {
@@ -1555,8 +1598,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         if let Some(GroundTurnEntryCandidate { leg: selected, .. }) = compatible {
             bot.route[bot.route_pos] = selected;
             if let Some(commit) = bot.sj.as_mut() {
-                commit.leg = selected;
-                commit.entry_checked = true;
+                commit.retarget_ground_turn(selected, true);
             }
             effective_sj_leg = Some(selected);
         } else {
@@ -1598,8 +1640,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             if let Some(GroundTurnEntryCandidate { leg: selected, adjustment: Some(cmd), .. }) = adjustment {
                 bot.route[bot.route_pos] = selected;
                 if let Some(commit) = bot.sj.as_mut() {
-                    commit.leg = selected;
-                    commit.entry_checked = true;
+                    commit.retarget_ground_turn(selected, true);
                 }
                 effective_sj_leg = Some(selected);
                 gt_entry_adjust = Some(bhop::wishdir_fs(cmd.view_yaw, cmd.forward, cmd.side) * cmd.forward);
@@ -1636,6 +1677,9 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // stored numbers. Fail closed on the entry envelope below.
     let sj_gt = if sj_active { sj_traversal.and_then(|tr| tr.ground_turn) } else { None };
     let sj_gt = if sj_active { sj_gt } else { None };
+    let sj_gt_phase = effective_sj_leg
+        .and_then(|leg| bot.sj.filter(|commit| commit.leg == leg))
+        .map_or_else(GroundTurnPhase::setup, |commit| commit.ground_turn_phase);
     // Signed along-corridor distance from the bot to a curl's takeoff (>0 behind the lip, <0 past it).
     // A profiled legacy curl stores the exact launch axis its BSP certificate proved; older/unprofiled
     // links fall back to the emitted `from`→takeoff chord. Used to trigger the leap on crossing the
@@ -1788,7 +1832,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                     // Ground-turn curl: the shared controller owns both phases — runway line /
                     // rotation point while grounded, hold-or-landing pursuit once airborne.
                     (Some(gt), Some((takeoff, _)), _) => {
-                        if on_ground {
+                        if ground_turn_uses_setup_controller(sj_gt_phase) {
                             aim_source = if gt.version == crate::navmesh::GROUND_TURN_OPTIMAL_VERSION {
                                 "gt-v3-ground"
                             } else {
@@ -1978,24 +2022,125 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         // A certified ground turn is an executable controller contract, not merely guidance data.
         // Override the generic hop-cycle command with the exact same single-sourced ticks used by
         // the BSP rollout; the hop state machine above still owns commit, jump-pulse and watchdogs.
-        if let (Some(gt), Some((takeoff, _)), Some(generic)) = (sj_gt, sj_takeoff, cmd) {
+        if let (Some(gt), Some((takeoff, _))) = (sj_gt, sj_takeoff) {
             // Optimal-sweep (v3) contracts reproduce ground_turn_rolls_optimal_tol: the
             // single-sided sweep on the ground, launch aimed along the stored launch_yaw.
-            // v1/v2 weave contracts keep the bearing-follow ground law and runway bearing.
+            // v1/v2 weave contracts keep the bearing-follow ground law and runway bearing. An
+            // unknown version is never interpreted as a legacy controller.
+            let supported = matches!(
+                gt.version,
+                crate::navmesh::GROUND_TURN_VERSION
+                    | crate::navmesh::RUNWAY_TURN_VERSION
+                    | crate::navmesh::GROUND_TURN_OPTIMAL_VERSION
+            );
             let optimal = gt.version == crate::navmesh::GROUND_TURN_OPTIMAL_VERSION;
-            cmd = Some(if on_ground {
-                if generic.jump {
-                    aim_source = "gt-launch";
-                    let launch_bearing = if optimal { gt.launch_yaw } else { bearing };
-                    crate::navmesh::ground_turn_launch_cmd(v_xy, launch_bearing, &gt, env.accel, env.maxspeed, env.dt)
-                } else if optimal {
-                    crate::navmesh::ground_turn_ground_cmd_optimal(v_xy, &gt, env.accel, env.maxspeed, env.dt)
-                } else {
-                    bot.bhop.ground_turn_ground_cmd(origin, v_xy, takeoff, &gt, env.accel, env.maxspeed, env.dt)
+            let mut setup_abort = !supported;
+            if supported {
+                match ground_turn_driver_input(sj_gt_phase, cmd) {
+                    GroundTurnDriverInput::Setup(generic) => {
+                        cmd = Some(if generic.jump {
+                            aim_source = "gt-launch";
+                            let launch_bearing = if optimal { gt.launch_yaw } else { bearing };
+                            crate::navmesh::ground_turn_launch_cmd(
+                                v_xy,
+                                launch_bearing,
+                                &gt,
+                                env.accel,
+                                env.maxspeed,
+                                env.dt,
+                            )
+                        } else if optimal {
+                            crate::navmesh::ground_turn_ground_cmd_optimal(
+                                v_xy,
+                                &gt,
+                                env.accel,
+                                env.maxspeed,
+                                env.dt,
+                            )
+                        } else {
+                            bot.bhop.ground_turn_ground_cmd(
+                                origin,
+                                v_xy,
+                                takeoff,
+                                &gt,
+                                env.accel,
+                                env.maxspeed,
+                                env.dt,
+                            )
+                        });
+
+                        let GroundTurnPhase::Setup { airborne_streak } = sj_gt_phase else {
+                            unreachable!();
+                        };
+                        if cmd.is_some_and(|ground_turn_cmd| ground_turn_cmd.jump) {
+                            let latched = effective_sj_leg.is_some_and(|leg| {
+                                bot.sj
+                                    .as_mut()
+                                    .filter(|commit| commit.leg == leg)
+                                    .is_some_and(|commit| commit.ground_turn_launch_emitted(true))
+                            });
+                            setup_abort = !latched;
+                        } else if let (Some(bsp), Some(leg), Some(ground_turn_cmd)) =
+                            (bsp, effective_sj_leg, cmd)
+                        {
+                            match graph.ground_turn_setup_continuation(
+                                bsp,
+                                leg,
+                                ground_turn_entry,
+                                ground_turn_cmd,
+                                airborne_streak,
+                                env.dt,
+                                &ground_turn_pmove(),
+                            ) {
+                                crate::navmesh::GroundTurnSetupContinuation::Continue {
+                                    airborne_streak,
+                                    ..
+                                } => {
+                                    let continued = bot
+                                        .sj
+                                        .as_mut()
+                                        .filter(|commit| commit.leg == leg)
+                                        .is_some_and(|commit| {
+                                            commit.continue_ground_turn_setup(airborne_streak)
+                                        });
+                                    setup_abort = !continued;
+                                }
+                                crate::navmesh::GroundTurnSetupContinuation::NotGroundTurn
+                                | crate::navmesh::GroundTurnSetupContinuation::Abort => {
+                                    setup_abort = true;
+                                }
+                            }
+                        } else {
+                            setup_abort = true;
+                        }
+                    }
+                    GroundTurnDriverInput::Launched => {
+                        cmd = Some(crate::navmesh::ground_turn_air_cmd(
+                            origin,
+                            v_xy,
+                            &gt,
+                            env.accel,
+                            env.maxspeed,
+                            env.dt,
+                        ));
+                    }
+                    GroundTurnDriverInput::Abort => {
+                        cmd = None;
+                        setup_abort = true;
+                    }
                 }
-            } else {
-                crate::navmesh::ground_turn_air_cmd(origin, v_xy, &gt, env.accel, env.maxspeed, env.dt)
-            });
+            }
+            if setup_abort {
+                gt_entry_adjust = Some(abort_ground_turn_setup(
+                    bot,
+                    effective_sj_leg,
+                    v_xy,
+                    now,
+                ));
+                aim_source = "gt-setup-abort";
+                cmd = None;
+                sj_active = false;
+            }
         }
         // A phase transition is the interesting diagnostic moment — why a run started or ended.
         if bot.bhop.phase != phase_was && debug {
@@ -2589,6 +2734,77 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ground_turn_setup_phase_survives_a_transient_airborne_frame() {
+        assert!(
+            ground_turn_uses_setup_controller(GroundTurnPhase::Setup { airborne_streak: 1 }),
+            "an airborne nonjump setup frame must keep the certified setup controller",
+        );
+    }
+
+    #[test]
+    fn ground_turn_phase_latches_only_on_an_emitted_jump() {
+        let mut commit = Commit::new(7, 1.0, true);
+        assert!(commit.continue_ground_turn_setup(1));
+        assert!(!commit.ground_turn_launch_emitted(false));
+        assert_eq!(
+            commit.ground_turn_phase,
+            GroundTurnPhase::Setup { airborne_streak: 1 }
+        );
+        assert!(ground_turn_uses_setup_controller(commit.ground_turn_phase));
+
+        assert!(commit.ground_turn_launch_emitted(true));
+        assert_eq!(commit.ground_turn_phase, GroundTurnPhase::Launched);
+        assert!(!ground_turn_uses_setup_controller(commit.ground_turn_phase));
+        assert!(
+            !commit.continue_ground_turn_setup(0),
+            "a later contact must not reset a launched contract to setup"
+        );
+    }
+
+    #[test]
+    fn ground_turn_driver_cannot_bypass_the_contract_when_generic_bhop_is_absent() {
+        assert!(matches!(
+            ground_turn_driver_input(GroundTurnPhase::setup(), None),
+            GroundTurnDriverInput::Abort
+        ));
+        assert!(matches!(
+            ground_turn_driver_input(GroundTurnPhase::Launched, None),
+            GroundTurnDriverInput::Launched
+        ));
+    }
+
+    #[test]
+    fn unsafe_ground_turn_setup_aborts_before_the_stale_command_can_escape() {
+        let mut bot = BotState::default();
+        bot.route = vec![17];
+        bot.sj = Some(Commit::new(17, 1.0, true));
+        let velocity = Vec2::new(300.0, -120.0);
+
+        let wish = abort_ground_turn_setup(&mut bot, Some(17), velocity, 9.0);
+        assert!(bot.sj.is_none());
+        assert!(bot.route.is_empty());
+        assert_eq!(bot.repath_time, 9.0);
+        assert!(bot.failed_links.iter().any(|&(leg, until, strikes)| {
+            leg == 17 && until > 9.0 && strikes == 1
+        }));
+        assert!(wish.dot(velocity) < 0.0, "same-frame output must counter the unsafe carry");
+    }
+
+    #[test]
+    fn ground_turn_profile_retarget_resets_setup_without_erasing_history() {
+        let mut commit = Commit::new(7, 12.5, false);
+        commit.launch_vetoes = 4;
+        assert!(commit.ground_turn_launch_emitted(true));
+
+        commit.retarget_ground_turn(9, true);
+        assert_eq!(commit.leg, 9);
+        assert_eq!(commit.since, 12.5);
+        assert_eq!(commit.launch_vetoes, 4);
+        assert!(commit.entry_checked);
+        assert_eq!(commit.ground_turn_phase, GroundTurnPhase::setup());
+    }
 
     #[test]
     fn ground_turn_selection_skips_a_cheaper_unwitnessed_profile() {

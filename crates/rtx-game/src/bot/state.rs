@@ -272,6 +272,18 @@ pub struct Vigil {
 /// A latched route-leg commitment — a speed jump or a plain-jump arc — that freezes the route while
 /// in flight: the leg being flown and when the commitment began (the watchdog's timeout base). While
 /// Some, a goal flip mid-air can't replace the route and yank the bot off the jump.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroundTurnPhase {
+    Setup { airborne_streak: usize },
+    Launched,
+}
+
+impl GroundTurnPhase {
+    pub const fn setup() -> Self {
+        Self::Setup { airborne_streak: 0 }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Commit {
     pub leg: u32,
@@ -282,6 +294,47 @@ pub struct Commit {
     /// A ground-turn entry envelope is checked exactly once. Its controller intentionally rotates
     /// out of that envelope after acceptance, so rechecking on later runway frames is incorrect.
     pub entry_checked: bool,
+    /// Explicit execution phase for a checked ground-turn contract. Physical floor contact is not
+    /// a launch bit: the certified setup tolerates brief airborne seams before an actual +jump.
+    pub ground_turn_phase: GroundTurnPhase,
+}
+
+impl Commit {
+    pub(crate) const fn new(leg: u32, since: f32, entry_checked: bool) -> Self {
+        Self {
+            leg,
+            since,
+            launch_vetoes: 0,
+            entry_checked,
+            ground_turn_phase: GroundTurnPhase::setup(),
+        }
+    }
+
+    /// Change to a parallel certified profile while preserving watchdog/veto history. The new link
+    /// always starts before launch even when the physical state happens to be transient-airborne.
+    pub(crate) fn retarget_ground_turn(&mut self, leg: u32, entry_checked: bool) {
+        self.leg = leg;
+        self.entry_checked = entry_checked;
+        self.ground_turn_phase = GroundTurnPhase::setup();
+    }
+
+    pub(crate) fn continue_ground_turn_setup(&mut self, airborne_streak: usize) -> bool {
+        if matches!(self.ground_turn_phase, GroundTurnPhase::Setup { .. }) {
+            self.ground_turn_phase = GroundTurnPhase::Setup { airborne_streak };
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn ground_turn_launch_emitted(&mut self, emitted_jump: bool) -> bool {
+        if emitted_jump && matches!(self.ground_turn_phase, GroundTurnPhase::Setup { .. }) {
+            self.ground_turn_phase = GroundTurnPhase::Launched;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// A plain gap/double-jump commitment. Unlike [`Commit`] (the speed-jump run-up latch), this records

@@ -996,7 +996,7 @@ mod tests {
         bot.hook.link = n + 6;
         bot.rj.phase = RjPhase::Ballistic;
         bot.rj.link = n + 7;
-        bot.sj = Some(Commit { leg: n + 8, since: 8.0, launch_vetoes: 0, entry_checked: false });
+        bot.sj = Some(Commit::new(n + 8, 8.0, false));
         bot.air = Some(AirCommit {
             leg: n + 9,
             target: n + 10,
