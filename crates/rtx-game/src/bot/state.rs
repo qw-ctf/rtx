@@ -274,13 +274,18 @@ pub struct Vigil {
 /// Some, a goal flip mid-air can't replace the route and yank the bot off the jump.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GroundTurnPhase {
-    Setup { airborne_streak: usize },
+    Setup {
+        airborne_streak: usize,
+        /// Fixed scheduler contract admitted by the prospective edge witness. `None` before an
+        /// edge episode and after physical re-landing; `Some` must match every airborne setup frame.
+        clock: Option<crate::navmesh::GroundTurnSetupClock>,
+    },
     Launched,
 }
 
 impl GroundTurnPhase {
     pub const fn setup() -> Self {
-        Self::Setup { airborne_streak: 0 }
+        Self::Setup { airborne_streak: 0, clock: None }
     }
 }
 
@@ -318,13 +323,44 @@ impl Commit {
         self.ground_turn_phase = GroundTurnPhase::setup();
     }
 
-    pub(crate) fn continue_ground_turn_setup(&mut self, airborne_streak: usize) -> bool {
-        if matches!(self.ground_turn_phase, GroundTurnPhase::Setup { .. }) {
-            self.ground_turn_phase = GroundTurnPhase::Setup { airborne_streak };
-            true
-        } else {
-            false
+    /// Whether the current physical setup frame still belongs to the admitted clock episode. A
+    /// grounded frame has already re-landed and ends the episode. An airborne frame must carry the
+    /// exact stored raw/wire pair; missing or changed provenance fails closed before its command.
+    pub(crate) fn ground_turn_setup_clock_valid(
+        &self,
+        on_ground: bool,
+        observed: Option<crate::navmesh::GroundTurnSetupClock>,
+    ) -> bool {
+        match self.ground_turn_phase {
+            GroundTurnPhase::Setup { .. } if on_ground => true,
+            GroundTurnPhase::Setup { clock: Some(admitted), .. } => observed == Some(admitted),
+            GroundTurnPhase::Setup { clock: None, .. } => false,
+            GroundTurnPhase::Launched => false,
         }
+    }
+
+    /// Commit the one-step result. The first physical edge departure latches the proven clock;
+    /// every airborne continuation preserves it, and the first grounded result clears it.
+    pub(crate) fn continue_ground_turn_setup(
+        &mut self,
+        airborne_streak: usize,
+        on_ground: bool,
+        observed: Option<crate::navmesh::GroundTurnSetupClock>,
+    ) -> bool {
+        let GroundTurnPhase::Setup { clock, .. } = self.ground_turn_phase else {
+            return false;
+        };
+        let clock = if on_ground {
+            None
+        } else {
+            match (clock, observed) {
+                (None, Some(first)) => Some(first),
+                (Some(admitted), Some(current)) if admitted == current => Some(admitted),
+                _ => return false,
+            }
+        };
+        self.ground_turn_phase = GroundTurnPhase::Setup { airborne_streak, clock };
+        true
     }
 
     pub(crate) fn ground_turn_launch_emitted(&mut self, emitted_jump: bool) -> bool {

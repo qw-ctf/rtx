@@ -2378,10 +2378,11 @@ pub struct GroundTurnLiveRollout {
     pub pmove_steps: usize,
 }
 
-/// Result of the one-tick live continuation guard for a checked ground-turn setup. Ordinary links
-/// are reported separately so callers can preserve their exact legacy execution path without doing
-/// any pmove work. `Continue` carries the predicted state for tests/diagnostics and the streak that
-/// must be stored for the next real setup frame.
+/// Result of the live continuation guard for a checked ground-turn setup. Ordinary links are
+/// reported separately so callers can preserve their exact legacy execution path without doing any
+/// pmove work. `Continue` carries the first-tick predicted state for tests/diagnostics and the streak
+/// that must be stored for the next real setup frame. Only a grounded-to-airborne first tick runs a
+/// bounded prospective seam witness through the remaining existing airborne-cap steps.
 #[derive(Clone, Copy, Debug)]
 pub enum GroundTurnSetupContinuation {
     NotGroundTurn,
@@ -2389,11 +2390,54 @@ pub enum GroundTurnSetupContinuation {
     Abort,
 }
 
+/// A raw-controller/wire-pmove clock pair verified for one setup frame. It is evidence about that
+/// frame, not proof of future cadence: the executor must re-observe the same bits on every airborne
+/// setup frame. A missing or changed observation withholds the witness and fails the edge projection
+/// closed instead of inventing future timing from a stale frame.
+#[derive(Clone, Copy, Debug)]
+pub struct GroundTurnSetupClock {
+    controller_dt: f32,
+    move_dt: f32,
+}
+
+impl GroundTurnSetupClock {
+    /// Record a raw-controller/wire-pmove pair after the caller has verified the current frame's
+    /// schedule. This does not prove the future: the executor must compare the pair again on every
+    /// airborne setup frame and withhold the witness when it changes or disappears.
+    pub fn from_verified_schedule(controller_dt: f32, move_dt: f32) -> Option<Self> {
+        let usable =
+            controller_dt.is_finite() && controller_dt > 0.0 && move_dt.is_finite() && move_dt > 0.0;
+        debug_assert!(usable, "a verified setup schedule must contain finite positive durations");
+        usable.then_some(Self { controller_dt, move_dt })
+    }
+
+    pub fn controller_dt(self) -> f32 {
+        self.controller_dt
+    }
+
+    pub fn move_dt(self) -> f32 {
+        self.move_dt
+    }
+}
+
+impl PartialEq for GroundTurnSetupClock {
+    fn eq(&self, other: &Self) -> bool {
+        self.controller_dt.to_bits() == other.controller_dt.to_bits()
+            && self.move_dt.to_bits() == other.move_dt.to_bits()
+    }
+}
+
+impl Eq for GroundTurnSetupClock {}
+
 impl NavGraph {
-    /// Advance exactly one non-launch setup command through the same pmove/contact checks as the
-    /// ground-turn certifier. This is a bounded live guard, not a second full witness: one call does
-    /// at most one pmove step and allocates nothing. Unsupported contracts fail closed; links without
-    /// a ground-turn payload do no work and retain their legacy behavior.
+    /// Advance one non-launch setup command through the same pmove/contact checks as the ground-turn
+    /// certifier. A grounded-to-airborne result is additionally followed, using the same controller,
+    /// only through the remaining existing airborne-cap steps and must re-land safely. The returned
+    /// state is still the first real setup tick; prospective states are veto-only. Unsupported
+    /// contracts fail closed; links without a ground-turn payload do no work and retain their legacy
+    /// behavior. `move_dt` is the current fake-client `msec` duration that engine physics actually
+    /// executes. `future_clock` is accepted only as an explicit fixed-schedule contract; without one
+    /// a grounded-to-airborne projection aborts rather than assuming the current clocks will repeat.
     #[allow(clippy::too_many_arguments)]
     pub fn ground_turn_setup_continuation(
         &self,
@@ -2401,8 +2445,10 @@ impl NavGraph {
         link: u32,
         mut state: PmState,
         cmd: Cmd,
+        setup_sigma: f32,
         prior_airborne_streak: usize,
-        dt: f32,
+        move_dt: f32,
+        future_clock: Option<GroundTurnSetupClock>,
         p: &PmParams,
     ) -> GroundTurnSetupContinuation {
         use crate::pmove::pm_step_report;
@@ -2428,12 +2474,13 @@ impl NavGraph {
         if solid(state.origin) {
             return GroundTurnSetupContinuation::Abort;
         }
+        let started_grounded = state.on_ground;
         let observed_streak = if state.on_ground {
             0
         } else {
             prior_airborne_streak.max(1)
         };
-        let report = pm_step_report(bsp, &mut state, &cmd, p, dt);
+        let report = pm_step_report(bsp, &mut state, &cmd, p, move_dt);
         let source_floor = self.cell_origin(self.link_source(link)).z;
         let floor_z = source_floor.min(traversal.takeoff.z) - GT_FLOOR_DROP;
         if report.wall_contact || solid(state.origin) || state.origin.z < floor_z || state.jump_held {
@@ -2444,7 +2491,58 @@ impl NavGraph {
         else {
             return GroundTurnSetupContinuation::Abort;
         };
-        GroundTurnSetupContinuation::Continue { state, airborne_streak }
+        let first_state = state;
+        if started_grounded && !first_state.on_ground {
+            let Some(future_clock) = future_clock else {
+                return GroundTurnSetupContinuation::Abort;
+            };
+            let mut witness = first_state;
+            let mut witness_streak = airborne_streak;
+            let mut sigma = setup_sigma;
+            loop {
+                let witness_cmd = if gt.version == GROUND_TURN_OPTIMAL_VERSION {
+                    ground_turn_ground_cmd_optimal(
+                        witness.vel.xy(),
+                        &gt,
+                        p.accel,
+                        p.maxspeed,
+                        future_clock.controller_dt(),
+                    )
+                } else {
+                    ground_turn_ground_cmd(
+                        witness.origin,
+                        witness.vel.xy(),
+                        traversal.takeoff,
+                        &gt,
+                        &mut sigma,
+                        p.accel,
+                        p.maxspeed,
+                        future_clock.controller_dt(),
+                    )
+                };
+                if solid(witness.origin) {
+                    return GroundTurnSetupContinuation::Abort;
+                }
+                let report = pm_step_report(bsp, &mut witness, &witness_cmd, p, future_clock.move_dt());
+                if report.wall_contact
+                    || solid(witness.origin)
+                    || witness.origin.z < floor_z
+                    || witness.jump_held
+                {
+                    return GroundTurnSetupContinuation::Abort;
+                }
+                let Some(next_streak) =
+                    next_ground_turn_setup_airborne_streak(witness_streak, witness.on_ground)
+                else {
+                    return GroundTurnSetupContinuation::Abort;
+                };
+                witness_streak = next_streak;
+                if witness.on_ground {
+                    break;
+                }
+            }
+        }
+        GroundTurnSetupContinuation::Continue { state: first_state, airborne_streak }
     }
 
     /// Re-run a ground-turn SpeedJump's own versioned certificate controller from a live entry
@@ -2520,6 +2618,13 @@ impl NavGraph {
 #[cfg(test)]
 mod ground_turn_tests {
     use super::*;
+
+    fn fixed_setup_clock(controller_dt: f32, move_dt: f32) -> Option<GroundTurnSetupClock> {
+        Some(
+            GroundTurnSetupClock::from_verified_schedule(controller_dt, move_dt)
+                .expect("finite positive test schedule"),
+        )
+    }
     use crate::bsp::{ClipNode, Plane, CONTENTS_EMPTY, CONTENTS_SOLID};
 
     fn dm3_legacy_curl(
@@ -2570,10 +2675,8 @@ mod ground_turn_tests {
 
     #[test]
     fn dm3_ring_legacy_curls_preserve_the_certified_lateral_profile() {
-        let Ok(path) = std::env::var("RTX_TEST_BSP") else {
-            eprintln!("skip: set RTX_TEST_BSP");
-            return;
-        };
+        let path = std::env::var("RTX_TEST_BSP")
+            .expect("RTX_TEST_BSP must name dm3.bsp for the legacy-curl regression");
         let bytes = std::fs::read(path).expect("read dm3 BSP");
         let bsp = Bsp::parse(&bytes).expect("parse dm3 BSP");
         let params = SpeedJumpParams {
@@ -2643,6 +2746,210 @@ mod ground_turn_tests {
                 || traversal.curl_landing_aim == Vec3::ZERO;
         }
         assert!(!missing_profile, "legacy emission discarded its certified lateral profiles");
+    }
+
+    #[test]
+    fn dm3_recap_setup_corner_replays_cross_attempt_producer_ticks() {
+        // The normal-frame recorder can skip/lag 77 Hz bot producer ticks.  Stitch the two
+        // recidivs at their matching physical states, then replay the emitted wishes at the
+        // fake-client's truncated 12 ms.  The v2 payload is the same source/takeoff/target geometry
+        // captured in a85084d-rich-graph.json; numeric link ids deliberately do not cross families.
+        let path = std::env::var("RTX_TEST_BSP")
+            .expect("RTX_TEST_BSP must name dm3.bsp for the producer-replay regression");
+        let bytes = std::fs::read(path).expect("read dm3 BSP");
+        let bsp = Bsp::parse(&bytes).expect("parse dm3 BSP");
+        let params = PmParams::default();
+        let source = Vec3::new(-256.0, -736.0, 152.0);
+        let target = Vec3::new(96.0, -864.0, 184.0);
+        let cells = [source, target]
+            .into_iter()
+            .map(|origin| Cell { origin, gx: floor_grid(origin.x), gy: floor_grid(origin.y) })
+            .collect();
+        let mut graph = NavGraph::test_graph(cells, Vec::new());
+        let gt = GroundTurnCurl {
+            version: RUNWAY_TURN_VERSION,
+            runway_aim: Vec3::new(-119.51472, -872.4853, 152.0),
+            blended_runway: true,
+            runway_yaw: -45.0,
+            lip_reach: 28.0,
+            hold_speed: 477.41782,
+            turn_dist: 181.01933,
+            launch_yaw: 337.5,
+            yaw_min: 302.5,
+            box_min: Vec3::new(-156.0, -892.0, 151.0),
+            box_max: Vec3::new(-100.0, -836.0, 152.0),
+            launch_gain: 8.0,
+            hold_aim: Vec3::new(345.02634, -1059.934, 152.0),
+            gate_point: Vec3::new(-128.0, -864.0, 152.0),
+            gate_normal: Vec3::ZERO,
+            air_gain: 8.0,
+            landing_aim: target,
+            entry_speed_lo: 307.19998,
+            entry_speed_hi: 332.8,
+            entry_yaw_lo: 268.0,
+            entry_yaw_hi: 272.0,
+            landing_speed_lo: 474.0367,
+            landing_yaw: 6.1398907,
+        };
+        let link = graph.plant_speed_jump(
+            0,
+            1,
+            0.88,
+            SpeedJumpTraversal {
+                takeoff: gt.gate_point,
+                v_req: 320.0,
+                airtime: 0.5216365,
+                landing_speed_lo: gt.landing_speed_lo,
+                chained: false,
+                curl_gain: 8.0,
+                curl_entry_aim: Vec3::ZERO,
+                curl_switch_dist: 0.0,
+                curl_landing_aim: target,
+                ground_turn: Some(gt),
+            },
+        );
+        let mut state = PmState {
+            origin: Vec3::new(-184.91031, -809.2948, 152.03125),
+            vel: Vec3::new(375.34518, -226.8765, 0.0),
+            on_ground: true,
+            jump_held: false,
+        };
+        let observed = [
+            (
+                Vec2::new(115.046, -791.684),
+                PmState {
+                    origin: Vec3::new(-180.4505, -812.119, 152.03125),
+                    vel: Vec3::new(362.744, -254.015, 0.0),
+                    on_ground: true,
+                    jump_held: false,
+                },
+            ),
+            (
+                Vec2::new(768.8646, 221.0139),
+                PmState {
+                    origin: Vec3::new(-175.97086, -815.1161, 152.03125),
+                    vel: Vec3::new(382.2099, -231.1021, 0.0),
+                    on_ground: false,
+                    jump_held: false,
+                },
+            ),
+            (
+                Vec2::new(-684.58685, 413.93347),
+                PmState {
+                    origin: Vec3::new(-171.77887, -815.96875, 151.91605),
+                    vel: Vec3::new(349.33185, 0.0, -9.6),
+                    on_ground: false,
+                    jump_held: false,
+                },
+            ),
+        ];
+        let producer_dt = 1.0 / 77.0;
+        let wire_dt = 12.0 / 1000.0;
+        let mut continuation = None;
+
+        for (tick, (wish, expected)) in observed.into_iter().enumerate() {
+            let cmd = Cmd {
+                view_yaw: yaw_of(wish),
+                forward: wish.length(),
+                side: 0.0,
+                jump: false,
+            };
+            if tick == 1 {
+                let mut setup_sigma = wrap180(yaw_of(wish) - yaw_of(state.vel.xy())).signum();
+                let guard_cmd = ground_turn_ground_cmd(
+                    state.origin,
+                    state.vel.xy(),
+                    gt.gate_point,
+                    &gt,
+                    &mut setup_sigma,
+                    params.accel,
+                    params.maxspeed,
+                    producer_dt,
+                );
+                let guard_wish = crate::strafe::wishdir_fs(
+                    guard_cmd.view_yaw,
+                    guard_cmd.forward,
+                    guard_cmd.side,
+                );
+                let wish_error = guard_wish.distance(wish.normalize_or_zero());
+                assert!(
+                    wish_error < 2.0e-3
+                        && guard_cmd.forward.hypot(guard_cmd.side) >= params.maxspeed
+                        && wish.length() >= params.maxspeed
+                        && guard_cmd.jump == cmd.jump,
+                    "guard command must be pmove-equivalent to the captured producer command: wish_error={wish_error:.6} guard={guard_cmd:?} captured={cmd:?}",
+                );
+                let pre_tick = state;
+                let mut guard_post = pre_tick;
+                let guard_report = crate::pmove::pm_step_report(
+                    &bsp,
+                    &mut guard_post,
+                    &guard_cmd,
+                    &params,
+                    wire_dt,
+                );
+                let mut captured_post = pre_tick;
+                let captured_report = crate::pmove::pm_step_report(
+                    &bsp,
+                    &mut captured_post,
+                    &cmd,
+                    &params,
+                    wire_dt,
+                );
+                let pmove_pos_error = guard_post.origin.distance(captured_post.origin);
+                let pmove_vel_error = guard_post.vel.distance(captured_post.vel);
+                assert!(
+                    pmove_pos_error < 5.0e-3
+                        && pmove_vel_error < 0.2
+                        && guard_post.on_ground == captured_post.on_ground
+                        && guard_post.jump_held == captured_post.jump_held
+                        && guard_report == captured_report,
+                    "guard/captured commands diverged in the actual wire pmove: pos_error={pmove_pos_error:.6} vel_error={pmove_vel_error:.6} guard={guard_post:?}/{guard_report:?} captured={captured_post:?}/{captured_report:?}",
+                );
+                continuation = Some(graph.ground_turn_setup_continuation(
+                    &bsp,
+                    link,
+                    state,
+                    guard_cmd,
+                    setup_sigma,
+                    0,
+                    wire_dt,
+                    fixed_setup_clock(producer_dt, wire_dt),
+                    &params,
+                ));
+            }
+            let report = crate::pmove::pm_step_report(&bsp, &mut state, &cmd, &params, wire_dt);
+            eprintln!(
+                "tick={} state={state:?} report={report:?} pos_err={:.6} vel_err={:.6} expected_ground={}",
+                tick + 1,
+                state.origin.distance(expected.origin),
+                state.vel.distance(expected.vel),
+                expected.on_ground,
+            );
+            assert!(
+                state.origin.distance(expected.origin) < 0.25
+                    && state.vel.distance(expected.vel) < 1.0
+                    && state.on_ground == expected.on_ground,
+                "cross-attempt producer stitch diverged at tick {}",
+                tick + 1,
+            );
+        }
+
+        let continuation = continuation.expect("edge-departure continuation");
+        let class = match continuation {
+            GroundTurnSetupContinuation::Continue { state, .. } if state.on_ground => {
+                "B: guard predicted grounded but the quantized wire move became airborne"
+            }
+            GroundTurnSetupContinuation::Continue { .. } => {
+                "A: guard predicted airborne and the airborne-cap grace accepted it"
+            }
+            GroundTurnSetupContinuation::Abort => "guard already rejected the edge departure",
+            GroundTurnSetupContinuation::NotGroundTurn => "fixture did not bind the ground-turn payload",
+        };
+        assert!(
+            matches!(continuation, GroundTurnSetupContinuation::Abort),
+            "producer-near replay classified the live failure as {class}: {continuation:?}",
+        );
     }
 
     fn contract() -> GroundTurnCurl {
@@ -2934,8 +3241,10 @@ mod ground_turn_tests {
             link,
             entry,
             first_cmd,
+            0.0,
             0,
             first_dt,
+            fixed_setup_clock(first_dt, first_dt),
             &params,
         ) {
             GroundTurnSetupContinuation::Continue { state, airborne_streak } => {
@@ -2960,8 +3269,10 @@ mod ground_turn_tests {
             link,
             first,
             second_cmd,
+            0.0,
             first_streak,
             second_dt,
+            fixed_setup_clock(second_dt, second_dt),
             &params,
         ) {
             GroundTurnSetupContinuation::Continue { state, airborne_streak } => {
@@ -2987,6 +3298,144 @@ mod ground_turn_tests {
     }
 
     #[test]
+    fn live_setup_clock_is_wire_timed_and_unknown_futures_fail_closed() {
+        let (graph, _, base_entry, gt, link) = optimal_spatial_contract();
+        let bsp = runway_gap(5.0, 10.0);
+        let params = PmParams::default();
+        let controller_dt = 1.0 / 77.0;
+        let move_dt = 12.0 / 1000.0;
+        let clock = fixed_setup_clock(controller_dt, move_dt);
+
+        // A grounded one-step path uses the wire duration even when no prospective schedule is
+        // needed. This explicitly pins the clock correction outside the edge-witness branch.
+        let grounded = PmState { origin: Vec3::new(-10.0, 0.0, 0.03125), ..base_entry };
+        let grounded_cmd = ground_turn_ground_cmd_optimal(
+            grounded.vel.xy(),
+            &gt,
+            params.accel,
+            params.maxspeed,
+            controller_dt,
+        );
+        let mut grounded_wire = grounded;
+        crate::pmove::pm_step(&bsp, &mut grounded_wire, &grounded_cmd, &params, move_dt);
+        let mut grounded_raw = grounded;
+        crate::pmove::pm_step(&bsp, &mut grounded_raw, &grounded_cmd, &params, controller_dt);
+        let grounded_guard = graph.ground_turn_setup_continuation(
+            &bsp,
+            link,
+            grounded,
+            grounded_cmd,
+            0.0,
+            0,
+            move_dt,
+            None,
+            &params,
+        );
+        let GroundTurnSetupContinuation::Continue { state: grounded_state, .. } = grounded_guard else {
+            panic!("grounded one-step path unexpectedly rejected: {grounded_guard:?}");
+        };
+        assert!(grounded_state.on_ground);
+        assert!(grounded_state.origin.distance(grounded_wire.origin) < 1.0e-6);
+        assert!(grounded_state.origin.distance(grounded_raw.origin) > 0.01);
+
+        // The same wire clock owns an already-airborne one-step contact decision. At this seam the
+        // raw duration reaches the far floor, while the 12 ms fake-client move remains airborne.
+        let airborne = PmState {
+            origin: Vec3::new(6.1, 0.0, 0.03125),
+            on_ground: false,
+            jump_held: false,
+            ..base_entry
+        };
+        let airborne_cmd = ground_turn_ground_cmd_optimal(
+            airborne.vel.xy(),
+            &gt,
+            params.accel,
+            params.maxspeed,
+            controller_dt,
+        );
+        let mut airborne_wire = airborne;
+        let airborne_wire_report =
+            crate::pmove::pm_step_report(&bsp, &mut airborne_wire, &airborne_cmd, &params, move_dt);
+        let mut airborne_raw = airborne;
+        let airborne_raw_report = crate::pmove::pm_step_report(
+            &bsp,
+            &mut airborne_raw,
+            &airborne_cmd,
+            &params,
+            controller_dt,
+        );
+        let airborne_guard = graph.ground_turn_setup_continuation(
+            &bsp,
+            link,
+            airborne,
+            airborne_cmd,
+            0.0,
+            1,
+            move_dt,
+            None,
+            &params,
+        );
+        let GroundTurnSetupContinuation::Continue {
+            state: airborne_state,
+            airborne_streak,
+        } = airborne_guard
+        else {
+            panic!("already-airborne one-step path unexpectedly rejected: {airborne_guard:?}");
+        };
+        assert_eq!(airborne_streak, 2);
+        assert!(!airborne_state.on_ground);
+        assert!(
+            airborne_raw_report.wall_contact && !airborne_wire_report.wall_contact,
+            "fixture must distinguish raw and wire contact timing: raw={airborne_raw:?} wire={airborne_wire:?}",
+        );
+        assert!(airborne_state.origin.distance(airborne_wire.origin) < 1.0e-6);
+
+        // A grounded departure can re-land on the equal-height far floor only when the caller
+        // supplies a fixed raw/wire schedule. Unknown future cadence must fail closed.
+        let edge = PmState { origin: Vec3::new(3.0, 0.0, 0.03125), ..base_entry };
+        let edge_cmd = ground_turn_ground_cmd_optimal(
+            edge.vel.xy(),
+            &gt,
+            params.accel,
+            params.maxspeed,
+            controller_dt,
+        );
+        // Zero gravity isolates the clock contract: the far floor is exactly the runway's height,
+        // so only the fixed raw/wire schedule decides whether the bounded witness can re-land.
+        let seam_params = PmParams { gravity: 0.0, ..params };
+        assert!(matches!(
+            graph.ground_turn_setup_continuation(
+                &bsp,
+                link,
+                edge,
+                edge_cmd,
+                0.0,
+                0,
+                move_dt,
+                None,
+                &seam_params,
+            ),
+            GroundTurnSetupContinuation::Abort
+        ));
+        let safe = graph.ground_turn_setup_continuation(
+            &bsp,
+            link,
+            edge,
+            edge_cmd,
+            0.0,
+            0,
+            move_dt,
+            clock,
+            &seam_params,
+        );
+        let GroundTurnSetupContinuation::Continue { state: edge_state, airborne_streak } = safe else {
+            panic!("fixed raw/wire schedule rejected an equal-height re-landing: {safe:?}");
+        };
+        assert!(!edge_state.on_ground, "first real tick must still expose the seam departure");
+        assert_eq!(airborne_streak, 1);
+    }
+
+    #[test]
     fn live_setup_continuation_rejects_wall_floor_and_airborne_cap() {
         let (graph, bsp, entry, gt, link) = optimal_spatial_contract();
         let params = PmParams::default();
@@ -3004,8 +3453,10 @@ mod ground_turn_tests {
                     jump_held: false,
                 },
                 setup_cmd,
+                0.0,
                 1,
                 dt,
+                fixed_setup_clock(dt, dt),
                 &params,
             ),
             GroundTurnSetupContinuation::Abort
@@ -3016,8 +3467,10 @@ mod ground_turn_tests {
                 link,
                 PmState { origin: Vec3::new(101.0, 0.0, 10.0), ..entry },
                 setup_cmd,
+                0.0,
                 0,
                 dt,
+                fixed_setup_clock(dt, dt),
                 &params,
             ),
             GroundTurnSetupContinuation::Abort
@@ -3030,7 +3483,17 @@ mod ground_turn_tests {
             jump_held: false,
         };
         assert!(matches!(
-            graph.ground_turn_setup_continuation(&bsp, link, falling, setup_cmd, 1, dt, &params),
+            graph.ground_turn_setup_continuation(
+                &bsp,
+                link,
+                falling,
+                setup_cmd,
+                0.0,
+                1,
+                dt,
+                fixed_setup_clock(dt, dt),
+                &params,
+            ),
             GroundTurnSetupContinuation::Abort
         ));
 
@@ -3046,8 +3509,28 @@ mod ground_turn_tests {
                 link,
                 airborne,
                 setup_cmd,
+                0.0,
                 GROUND_TURN_SETUP_AIRBORNE_TICK_CAP - 1,
                 dt,
+                fixed_setup_clock(dt, dt),
+                &params,
+            ),
+            GroundTurnSetupContinuation::Abort
+        ));
+
+        let gap_entry = PmState { origin: Vec3::new(55.0, 0.0, 0.03125), ..entry };
+        let gap_cmd =
+            ground_turn_ground_cmd_optimal(gap_entry.vel.xy(), &gt, params.accel, params.maxspeed, dt);
+        assert!(matches!(
+            graph.ground_turn_setup_continuation(
+                &runway_gap(60.0, 1000.0),
+                link,
+                gap_entry,
+                gap_cmd,
+                0.0,
+                0,
+                dt,
+                fixed_setup_clock(dt, dt),
                 &params,
             ),
             GroundTurnSetupContinuation::Abort
@@ -3056,7 +3539,17 @@ mod ground_turn_tests {
         let mut launch_cmd = setup_cmd;
         launch_cmd.jump = true;
         assert!(matches!(
-            graph.ground_turn_setup_continuation(&bsp, link, entry, launch_cmd, 0, dt, &params),
+            graph.ground_turn_setup_continuation(
+                &bsp,
+                link,
+                entry,
+                launch_cmd,
+                0.0,
+                0,
+                dt,
+                fixed_setup_clock(dt, dt),
+                &params,
+            ),
             GroundTurnSetupContinuation::Abort
         ));
     }
@@ -3114,7 +3607,17 @@ mod ground_turn_tests {
         let optimal_cmd =
             ground_turn_ground_cmd_optimal(entry.vel.xy(), &gt, params.accel, params.maxspeed, 0.020);
         assert!(matches!(
-            graph.ground_turn_setup_continuation(&bsp, base, entry, optimal_cmd, 0, 0.020, &params),
+            graph.ground_turn_setup_continuation(
+                &bsp,
+                base,
+                entry,
+                optimal_cmd,
+                0.0,
+                0,
+                0.020,
+                fixed_setup_clock(0.020, 0.020),
+                &params,
+            ),
             GroundTurnSetupContinuation::Continue { .. }
         ));
         for version in [GROUND_TURN_VERSION, RUNWAY_TURN_VERSION] {
@@ -3160,7 +3663,17 @@ mod ground_turn_tests {
                 0.020,
             );
             assert!(matches!(
-                graph.ground_turn_setup_continuation(&bsp, link, entry, setup_cmd, 0, 0.020, &params),
+                graph.ground_turn_setup_continuation(
+                    &bsp,
+                    link,
+                    entry,
+                    setup_cmd,
+                    sigma,
+                    0,
+                    0.020,
+                    fixed_setup_clock(0.020, 0.020),
+                    &params,
+                ),
                 GroundTurnSetupContinuation::Continue { .. }
             ));
         }
@@ -3171,7 +3684,17 @@ mod ground_turn_tests {
         unknown_traversal.ground_turn = Some(unknown_gt);
         let unknown = graph.plant_speed_jump(0, 2, 7.0, unknown_traversal);
         assert!(matches!(
-            graph.ground_turn_setup_continuation(&bsp, unknown, entry, optimal_cmd, 0, 0.020, &params),
+            graph.ground_turn_setup_continuation(
+                &bsp,
+                unknown,
+                entry,
+                optimal_cmd,
+                0.0,
+                0,
+                0.020,
+                fixed_setup_clock(0.020, 0.020),
+                &params,
+            ),
             GroundTurnSetupContinuation::Abort
         ));
 
@@ -3187,8 +3710,10 @@ mod ground_turn_tests {
                 plain_speed_jump,
                 entry,
                 optimal_cmd,
+                0.0,
                 0,
                 0.020,
+                fixed_setup_clock(0.020, 0.020),
                 &params,
             ),
             GroundTurnSetupContinuation::NotGroundTurn
@@ -3200,7 +3725,17 @@ mod ground_turn_tests {
                 .ground_turn_live_entry_rollout(&bsp, link, entry, None, 0.020, &params)
                 .is_none());
             assert!(matches!(
-                graph.ground_turn_setup_continuation(&bsp, link, entry, optimal_cmd, 0, 0.020, &params),
+                graph.ground_turn_setup_continuation(
+                    &bsp,
+                    link,
+                    entry,
+                    optimal_cmd,
+                    0.0,
+                    0,
+                    0.020,
+                    fixed_setup_clock(0.020, 0.020),
+                    &params,
+                ),
                 GroundTurnSetupContinuation::NotGroundTurn
             ));
         }

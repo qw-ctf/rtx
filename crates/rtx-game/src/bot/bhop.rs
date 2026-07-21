@@ -328,6 +328,13 @@ impl Bhop {
     ) -> Cmd {
         crate::navmesh::ground_turn_ground_cmd(origin, v_xy, takeoff, gt, &mut self.sigma, accel, maxspeed, dt)
     }
+
+    /// Sticky weave side after producing the current ground-turn command. The prospective setup
+    /// witness advances a local copy so checking future seam ticks cannot mutate live bhop state.
+    pub(super) fn ground_turn_sigma(&self) -> f32 {
+        self.sigma
+    }
+
     /// Drive one frame. `Some(cmd)` = the controller owns the view and move this frame;
     /// `None` = not engaged — the caller steers through the normal aim-spring path.
     pub fn step(&mut self, i: &Input, env: &Env) -> Option<Cmd> {

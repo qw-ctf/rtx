@@ -311,9 +311,51 @@ pub(crate) struct BotCmd {
 
 // --- per-frame driving (P2 follow + P4 behavior) ---
 
+/// What the caller claims about the frame driving the bot brain. `is_bot_frame` does not prove this:
+/// both mvdsv scheduler variants set it. A claim only permits the current bitwise schedule check;
+/// the stored setup clock is rechecked on every airborne frame and that revalidation is the actual
+/// safety guarantee. Normal-frame fallback and the network client make no fixed-schedule claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BotFrameScheduleClaim {
+    ClaimedFixed,
+    Unclaimed,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BotFrameClock {
+    claim: BotFrameScheduleClaim,
+    scheduled_dt: f32,
+    matches_schedule: bool,
+}
+
+impl BotFrameClock {
+    fn observe(claim: BotFrameScheduleClaim, maxfps: f32, frametime: f32) -> Self {
+        let scheduled_dt = prof::scheduled_dt(maxfps);
+        let matches_schedule = frametime.to_bits() == scheduled_dt.to_bits();
+        Self { claim, scheduled_dt, matches_schedule }
+    }
+
+    fn fixed_setup_clock(
+        self,
+        controller_dt: f32,
+        move_dt: f32,
+    ) -> Option<crate::navmesh::GroundTurnSetupClock> {
+        (self.claim == BotFrameScheduleClaim::ClaimedFixed
+            && self.matches_schedule
+            && controller_dt.to_bits() == self.scheduled_dt.to_bits())
+            .then(|| {
+                crate::navmesh::GroundTurnSetupClock::from_verified_schedule(
+                    self.scheduled_dt,
+                    move_dt,
+                )
+            })
+            .flatten()
+    }
+}
+
 /// Drive every bot for this server bot-frame: pick the nearest human, path to them, and emit
 /// each bot's usercmd. Skipped entirely without a navmesh.
-pub fn run_bots(game: &mut GameState) {
+pub fn run_bots(game: &mut GameState, clock_claim: BotFrameScheduleClaim) {
     if !game.nav.is_loaded() {
         return;
     }
@@ -333,7 +375,9 @@ pub fn run_bots(game: &mut GameState) {
     game.bot_pool.ensure(&host);
     let interval = host.cvar(c"rtx_bot_prof");
     let profiling = interval > 0.0;
-    let budget = prof::budget_ms(&host);
+    let maxfps = host.cvar(c"maxfps");
+    let budget = prof::budget_ms(maxfps);
+    let frame_clock = BotFrameClock::observe(clock_claim, maxfps, game.globals.frametime);
     game.bot_prof.set_profiling(profiling);
     if !profiling || game.bot_prof.budget_changed(budget) {
         game.bot_prof.reset();
@@ -349,7 +393,7 @@ pub fn run_bots(game: &mut GameState) {
             if fake_client {
                 bot_pickup_items(game, e);
             }
-            run_bot(game, e);
+            run_bot(game, e, frame_clock);
             if profiling {
                 bots += 1;
                 game.bot_prof.add_bot(one.stop());
@@ -513,6 +557,7 @@ struct Sense {
     now: f32,
     frametime: f32,
     msec: i32,
+    frame_clock: BotFrameClock,
     origin: Vec3,
     v_angle: Vec3,
     client: i32,
@@ -556,7 +601,7 @@ struct Sense {
     rj_knobs: rj::RjKnobs,
 }
 
-fn sense(game: &GameState, e: EntId) -> Sense {
+fn sense(game: &GameState, e: EntId, frame_clock: BotFrameClock) -> Sense {
     let host = *game.host();
     let now = game.time();
     let frametime = game.globals.frametime;
@@ -618,7 +663,7 @@ fn sense(game: &GameState, e: EntId) -> Sense {
         pitch_bias: host.cvar(c"rtx_rj_pitch_bias"),
     };
     Sense {
-        host, now, frametime, msec, origin, v_angle, client, weapon, on_ground, in_water, submerged, burning, air_left, alive, vz, air_jumped, enemy_seen_time, v_xy, speed, grapple_hook, has_grapple, hook_out, on_hook, anchor, reel_half_step,
+        host, now, frametime, msec, frame_clock, origin, v_angle, client, weapon, on_ground, in_water, submerged, burning, air_left, alive, vz, air_jumped, enemy_seen_time, v_xy, speed, grapple_hook, has_grapple, hook_out, on_hook, anchor, reel_half_step,
         attack_finished, has_rl, ammo_rockets, health, armortype, armorvalue, quad, rj_knobs,
     }
 }
@@ -1512,8 +1557,8 @@ fn prearm_traversal(game: &mut GameState, e: EntId, now: f32, on_ground: bool) {
     }
 }
 
-fn run_bot(game: &mut GameState, e: EntId) {
-    let s = sense(game, e);
+fn run_bot(game: &mut GameState, e: EntId, frame_clock: BotFrameClock) {
+    let s = sense(game, e, frame_clock);
     // The spine reads only these; `steer` re-destructures the full snapshot from `s` via `SteerCtx`.
     let Sense { host, now, msec, origin, v_angle, client, alive, .. } = s;
     // Flip the per-frame pulse used for press/release-edge buttons.

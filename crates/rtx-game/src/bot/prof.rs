@@ -298,10 +298,19 @@ fn percentile(sorted: &[f32], q: f32) -> f32 {
 /// server it's the very cvar `SV_RunBots` reads, and on the netclient it's a `SERVER_RULE_CVARS` key
 /// resolved from serverinfo (mvdsv publishes it: `CVAR_SERVERINFO`), which is what the client paces
 /// itself to anyway.
-pub(crate) fn budget_ms(host: &HostApi) -> f32 {
-    let fps = host.cvar(c"maxfps");
+fn sanitized_fps(fps: f32) -> f32 {
     let fps = if (20.0..=1000.0).contains(&fps) { fps } else { 77.0 };
-    1000.0 / fps
+    fps
+}
+
+/// The exact raw controller quantum claimed by mvdsv's fixed bot scheduler. Kept separate from
+/// [`budget_ms`]: operation order is observable in `f32`, and clock admission must mirror `1/fps`.
+pub(crate) fn scheduled_dt(fps: f32) -> f32 {
+    1.0 / sanitized_fps(fps)
+}
+
+pub(crate) fn budget_ms(fps: f32) -> f32 {
+    1000.0 / sanitized_fps(fps)
 }
 
 #[cfg(test)]

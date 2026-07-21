@@ -561,7 +561,10 @@ impl Client {
         self.game.client_lead = self.latency();
         self.feed_phase();
         crate::control::frame_begin(&mut self.game);
-        crate::bot::run_bots(&mut self.game);
+        crate::bot::run_bots(
+            &mut self.game,
+            crate::bot::BotFrameScheduleClaim::Unclaimed,
+        );
         for b in &mut self.bots {
             b.measure_travel(&self.game);
         }

@@ -658,7 +658,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     let SteerCtx { s, o, costs, plat_status, gate_ready, bot_cell, goal_cell, race_line_ahead, weapons_hot, bsp } =
         ctx;
     let Sense {
-        host, now, frametime, origin, v_angle, client, weapon, on_ground, in_water, vz, air_jumped,
+        host, now, frametime, msec, frame_clock, origin, v_angle, client, weapon, on_ground, in_water, vz, air_jumped,
         enemy_seen_time, v_xy, speed, grapple_hook, has_grapple, hook_out, on_hook, anchor, reel_half_step,
         attack_finished, has_rl, ammo_rockets, health, armortype, armorvalue, quad, ..
     } = s;
@@ -2069,7 +2069,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                             )
                         });
 
-                        let GroundTurnPhase::Setup { airborne_streak } = sj_gt_phase else {
+                        let GroundTurnPhase::Setup { airborne_streak, .. } = sj_gt_phase else {
                             unreachable!();
                         };
                         if cmd.is_some_and(|ground_turn_cmd| ground_turn_cmd.jump) {
@@ -2083,31 +2083,60 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                         } else if let (Some(bsp), Some(leg), Some(ground_turn_cmd)) =
                             (bsp, effective_sj_leg, cmd)
                         {
-                            match graph.ground_turn_setup_continuation(
-                                bsp,
-                                leg,
-                                ground_turn_entry,
-                                ground_turn_cmd,
-                                airborne_streak,
-                                env.dt,
-                                &ground_turn_pmove(),
-                            ) {
-                                crate::navmesh::GroundTurnSetupContinuation::Continue {
+                            // Current fake-client physics uses integer msec; the netclient uses its
+                            // measured packet dt. Only the frame-proven SERVERONLY scheduler can
+                            // mint a future pair, and Commit must retain that exact pair throughout
+                            // every airborne setup frame until physical re-landing.
+                            let move_dt = if host.is_client() {
+                                env.dt
+                            } else {
+                                msec as f32 / 1000.0
+                            };
+                            let future_clock = frame_clock.fixed_setup_clock(env.dt, move_dt);
+                            let clock_valid = bot
+                                .sj
+                                .filter(|commit| commit.leg == leg)
+                                .is_some_and(|commit| {
+                                    commit.ground_turn_setup_clock_valid(
+                                        ground_turn_entry.on_ground,
+                                        future_clock,
+                                    )
+                                });
+                            if !clock_valid {
+                                setup_abort = true;
+                            } else {
+                                match graph.ground_turn_setup_continuation(
+                                    bsp,
+                                    leg,
+                                    ground_turn_entry,
+                                    ground_turn_cmd,
+                                    bot.bhop.ground_turn_sigma(),
                                     airborne_streak,
-                                    ..
-                                } => {
-                                    let continued = bot
-                                        .sj
-                                        .as_mut()
-                                        .filter(|commit| commit.leg == leg)
-                                        .is_some_and(|commit| {
-                                            commit.continue_ground_turn_setup(airborne_streak)
-                                        });
-                                    setup_abort = !continued;
-                                }
-                                crate::navmesh::GroundTurnSetupContinuation::NotGroundTurn
-                                | crate::navmesh::GroundTurnSetupContinuation::Abort => {
-                                    setup_abort = true;
+                                    move_dt,
+                                    future_clock,
+                                    &ground_turn_pmove(),
+                                ) {
+                                    crate::navmesh::GroundTurnSetupContinuation::Continue {
+                                        state,
+                                        airborne_streak,
+                                    } => {
+                                        let continued = bot
+                                            .sj
+                                            .as_mut()
+                                            .filter(|commit| commit.leg == leg)
+                                            .is_some_and(|commit| {
+                                                commit.continue_ground_turn_setup(
+                                                    airborne_streak,
+                                                    state.on_ground,
+                                                    future_clock,
+                                                )
+                                            });
+                                        setup_abort = !continued;
+                                    }
+                                    crate::navmesh::GroundTurnSetupContinuation::NotGroundTurn
+                                    | crate::navmesh::GroundTurnSetupContinuation::Abort => {
+                                        setup_abort = true;
+                                    }
                                 }
                             }
                         } else {
@@ -2736,9 +2765,100 @@ mod tests {
     use super::*;
 
     #[test]
+    fn prospective_ground_turn_clock_requires_the_exact_server_schedule() {
+        // Exercise the production clock chain rather than handing equal clocks to the final helper:
+        // maxfps -> scheduled_dt -> clamped bhop Env dt -> integer SetBotCMD msec. At 60 Hz the
+        // profiler's exact historical 1000/maxfps budget differs by one ulp and must stay separate.
+        let maxfps = 60.0;
+        let budget_ms = prof::budget_ms(maxfps);
+        let frametime = prof::scheduled_dt(maxfps);
+        assert_eq!(budget_ms.to_bits(), (1000.0f32 / maxfps).to_bits());
+        assert_ne!(budget_ms.to_bits(), (frametime * 1000.0).to_bits());
+        let env = bhop::Env { dt: frametime.clamp(0.001, 0.05), accel: 10.0, maxspeed: 320.0 };
+        let msec = ((frametime * 1000.0) as i32).clamp(1, 100);
+        let observed = BotFrameClock::observe(
+            BotFrameScheduleClaim::ClaimedFixed,
+            maxfps,
+            frametime,
+        );
+        let fixed = observed
+            .fixed_setup_clock(env.dt, msec as f32 / 1000.0)
+            .expect("the claimed frame exactly matches the scheduled maxfps quantum");
+        assert_eq!(fixed.controller_dt().to_bits(), env.dt.to_bits());
+        assert_eq!(fixed.move_dt().to_bits(), (msec as f32 / 1000.0).to_bits());
+
+        let variable = BotFrameClock::observe(
+            BotFrameScheduleClaim::Unclaimed,
+            maxfps,
+            frametime,
+        );
+        assert!(
+            variable.fixed_setup_clock(env.dt, msec as f32 / 1000.0).is_none(),
+            "normal-frame and netclient pacing cannot promise future intervals",
+        );
+    }
+
+    #[test]
+    fn mismatched_fixed_schedule_claim_withholds_without_panicking() {
+        let maxfps = 77.0;
+        let frametime = prof::scheduled_dt(maxfps);
+        let move_dt = ((frametime * 1000.0) as i32).clamp(1, 100) as f32 / 1000.0;
+        let admitted = BotFrameClock::observe(
+            BotFrameScheduleClaim::ClaimedFixed,
+            maxfps,
+            frametime,
+        )
+        .fixed_setup_clock(frametime, move_dt)
+        .unwrap();
+        let mut commit = Commit::new(7, 1.0, true);
+        assert!(commit.continue_ground_turn_setup(1, false, Some(admitted)));
+
+        let mismatch = std::panic::catch_unwind(|| {
+            BotFrameClock::observe(
+                BotFrameScheduleClaim::ClaimedFixed,
+                maxfps,
+                frametime.next_up(),
+            )
+            .fixed_setup_clock(frametime.next_up(), move_dt)
+        })
+        .expect("a false fixed-schedule claim must never panic the bot driver");
+        assert!(mismatch.is_none(), "the mismatched frame must withhold its clock witness");
+        assert!(
+            !commit.ground_turn_setup_clock_valid(false, mismatch),
+            "an airborne setup episode must turn a withheld witness into Abort",
+        );
+    }
+
+    #[test]
+    fn ground_turn_setup_clock_persists_until_physical_relanding() {
+        let admitted = crate::navmesh::GroundTurnSetupClock::from_verified_schedule(
+            1.0 / 77.0,
+            12.0 / 1000.0,
+        )
+        .unwrap();
+        let changed = crate::navmesh::GroundTurnSetupClock::from_verified_schedule(
+            (1.0 / 77.0f32).next_up(),
+            12.0 / 1000.0,
+        )
+        .unwrap();
+        let mut commit = Commit::new(7, 1.0, true);
+
+        assert!(commit.ground_turn_setup_clock_valid(true, Some(admitted)));
+        assert!(commit.continue_ground_turn_setup(1, false, Some(admitted)));
+        assert!(commit.ground_turn_setup_clock_valid(false, Some(admitted)));
+        assert!(!commit.ground_turn_setup_clock_valid(false, None));
+        assert!(!commit.ground_turn_setup_clock_valid(false, Some(changed)));
+        assert!(commit.continue_ground_turn_setup(0, true, None));
+        assert_eq!(commit.ground_turn_phase, GroundTurnPhase::setup());
+    }
+
+    #[test]
     fn ground_turn_setup_phase_survives_a_transient_airborne_frame() {
         assert!(
-            ground_turn_uses_setup_controller(GroundTurnPhase::Setup { airborne_streak: 1 }),
+            ground_turn_uses_setup_controller(GroundTurnPhase::Setup {
+                airborne_streak: 1,
+                clock: None,
+            }),
             "an airborne nonjump setup frame must keep the certified setup controller",
         );
     }
@@ -2746,11 +2866,16 @@ mod tests {
     #[test]
     fn ground_turn_phase_latches_only_on_an_emitted_jump() {
         let mut commit = Commit::new(7, 1.0, true);
-        assert!(commit.continue_ground_turn_setup(1));
+        let clock = crate::navmesh::GroundTurnSetupClock::from_verified_schedule(
+            1.0 / 77.0,
+            12.0 / 1000.0,
+        )
+        .unwrap();
+        assert!(commit.continue_ground_turn_setup(1, false, Some(clock)));
         assert!(!commit.ground_turn_launch_emitted(false));
         assert_eq!(
             commit.ground_turn_phase,
-            GroundTurnPhase::Setup { airborne_streak: 1 }
+            GroundTurnPhase::Setup { airborne_streak: 1, clock: Some(clock) }
         );
         assert!(ground_turn_uses_setup_controller(commit.ground_turn_phase));
 
@@ -2758,7 +2883,7 @@ mod tests {
         assert_eq!(commit.ground_turn_phase, GroundTurnPhase::Launched);
         assert!(!ground_turn_uses_setup_controller(commit.ground_turn_phase));
         assert!(
-            !commit.continue_ground_turn_setup(0),
+            !commit.continue_ground_turn_setup(0, true, None),
             "a later contact must not reset a launched contract to setup"
         );
     }
