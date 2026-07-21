@@ -27,9 +27,9 @@ use crate::navmesh::{CellId, LinkCosts, LinkKind, NavGraph};
 const VIGIL_NEAR: f32 = 250.0;
 const VIGIL_DZ: f32 = 96.0;
 
-/// Cruise-post ring around the pickup: far enough not to idle inside the pickup box (`PICKUP_XY` 40),
-/// close enough to scout it and get back on spawn. A handoff hold uses the tight max so the
-/// reservation stays defensible against the 400u contest range.
+/// Cruise-post ring around the pickup: far enough not to idle inside a pickup trigger, close enough
+/// to scout it and get back on spawn. A handoff hold uses the tight max so the reservation stays
+/// defensible against the 400u contest range.
 const POST_MIN: f32 = 64.0;
 const POST_MAX: f32 = 224.0;
 const HOLD_POST_MAX: f32 = 96.0;
@@ -82,13 +82,22 @@ pub(crate) fn maybe(game: &mut GameState, e: EntId, origin: Vec3, holding: bool,
     } else {
         return None; // collectable now (bot_pickup_items will grab it) or truly gone — not a wait
     };
-    Some(update(game, e, origin, item_org, holding, respawn_at, now))
+    Some(update(game, e, item, origin, item_org, holding, respawn_at, now))
 }
 
 /// Advance the cruise post and scan bearing and return the frame's navigation target. Mirrors
 /// [`roam_target`](super::roam_target)'s borrow order — draw randoms first, then borrow the graph,
 /// then write the (disjoint) bot fields.
-fn update(game: &mut GameState, e: EntId, origin: Vec3, item_org: Vec3, holding: bool, respawn_at: Option<f32>, now: f32) -> (Vec3, Option<CellId>) {
+fn update(
+    game: &mut GameState,
+    e: EntId,
+    item: EntId,
+    origin: Vec3,
+    item_org: Vec3,
+    holding: bool,
+    respawn_at: Option<f32>,
+    now: f32,
+) -> (Vec3, Option<CellId>) {
     // Waiting near a known respawn *is* making progress toward the goal — keep the give-up watchdog
     // (super::resolve_objective's GOAL_GIVEUP_TIME) from abandoning a legitimate wait. A hold is
     // bounded by its own HOLD_MAX deadline, so refreshing this is safe there too.
@@ -109,6 +118,27 @@ fn update(game: &mut GameState, e: EntId, origin: Vec3, item_org: Vec3, holding:
         return (item_org, None);
     };
 
+    // The return post is a physical take endpoint, not merely the cell nearest the entity origin.
+    // Prefer the selector's current terminal; a handoff goal may predate terminal cataloging, so
+    // fall back to the nearest catalogued terminal for this same item. No catalog entry means there
+    // is no endpoint we can honestly claim will collect it.
+    let selected = game.entities[e].bot.goal.item_cell;
+    let return_cell = game
+        .nav
+        .goals
+        .iter()
+        .filter_map(|&(idx, cell)| (idx == item.0).then_some(cell))
+        .min_by(|&a, &b| {
+            let a_selected = a == selected;
+            let b_selected = b == selected;
+            b_selected.cmp(&a_selected).then_with(|| {
+                g.cell_origin(a)
+                    .distance_squared(origin)
+                    .total_cmp(&g.cell_origin(b).distance_squared(origin))
+            })
+        });
+    let return_target = return_cell.map(|cell| (g.cell_origin(cell), Some(cell)));
+
     // Scan: sweep to a fresh bearing when the hold lapses (or on first use), else keep the last point
     // so the view settles there.
     let (new_scan, new_scan_until) = if scan == Vec3::ZERO || scan_due(scan_until, now) {
@@ -121,17 +151,17 @@ fn update(game: &mut GameState, e: EntId, origin: Vec3, item_org: Vec3, holding:
     // ring, re-picking on arrival / expiry / when unset. Fall back to the item if nothing validates.
     let max_r = if holding { HOLD_POST_MAX } else { POST_MAX };
     let (target, target_cell, out_post, out_until) = if returning {
-        (item_org, g.nearest(item_org), Vec3::ZERO, post_until)
+        let (target, cell) = return_target.unwrap_or((item_org, None));
+        (target, cell, Vec3::ZERO, post_until)
     } else if post != Vec3::ZERO && !post_due(post, post_until, origin, now) {
         (post, g.nearest(post), post, post_until) // keep heading to the current post
     } else if let Some((cell, p)) = g.nearest(origin).and_then(|from| pick_post(g, from, item_org, POST_MIN, max_r, r_post)) {
         (p, Some(cell), p, now + POST_HOLD + r_hold * POST_JITTER)
     } else {
-        // No trivial post anywhere in the ring — sit on the item itself. The one spot a vigil can still
-        // put a bot under a raised lift, and only when the item is *itself* in the shaft and not one cell
-        // of the surrounding ring could be walked to; on a real map the ring always has something. Left
-        // as-is rather than grown a special case: `GOAL_GIVEUP_TIME` already bounds a wait that never pays.
-        (item_org, g.nearest(item_org), Vec3::ZERO, post_until)
+        // No trivial post in the ring: wait on a catalogued take endpoint. Falling back to nearest
+        // item-origin would recreate the wrong-side/upper-floor endpoint this catalog exists to reject.
+        let (target, cell) = return_target.unwrap_or((item_org, None));
+        (target, cell, Vec3::ZERO, post_until)
     };
 
     let b = &mut game.entities[e].bot;

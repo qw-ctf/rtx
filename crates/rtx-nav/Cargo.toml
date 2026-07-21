@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+# Shardable, deterministic ground-turn-curl candidate search harness (route-lab
+# docs/plans/2026-07-18-vmonster-gt-curl-farm.md). No new dependencies.
+[[bin]]
+name = "gt-search"
+path = "src/bin/gt_search.rs"
+
 [dependencies]
 binrw.workspace = true
 glam.workspace = true

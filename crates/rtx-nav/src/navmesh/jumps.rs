@@ -13,7 +13,7 @@ use super::*;
 use crate::bsp::Bsp;
 use crate::math::{wrap180, yaw_of};
 use crate::pmove::{pm_step, PmParams, PmState};
-use crate::strafe::{air_accel_max, air_correct, Cmd, MOVE_SPEED};
+use crate::strafe::{air_accel_max, air_correct, apply_friction, apply_groundaccel, Cmd, MOVE_SPEED};
 
 impl NavGraph {
     /// Jump links out of `from`: only from a **ledge edge** (the adjacent column toward the
@@ -169,8 +169,8 @@ impl NavGraph {
     pub fn add_speed_jumps(&mut self, bsp: &Bsp, params: SpeedJumpParams, double_jump: bool) {
         let k = bhop_k(params.accel, params.maxspeed);
         self.sj_k = k; // the banded planner prices carried speed with this map's k
-        // Solve per ledge in parallel (read-only borrow); indexed `collect` keeps cell order, so the
-        // serial splice below reproduces the sequential build's link indices exactly.
+                       // Solve per ledge in parallel (read-only borrow); indexed `collect` keeps cell order, so the
+                       // serial splice below reproduces the sequential build's link indices exactly.
         let this = &*self;
         let pending: Vec<Vec<(Link, SpeedJumpTraversal)>> = (0..this.cells.len() as CellId)
             .into_par_iter()
@@ -199,7 +199,8 @@ impl NavGraph {
             // keep only the cheapest few per target (the same landing from a dozen corridors is noise the
             // planner never needs). Deterministic: iterate the indexed collect in cell order, and among
             // equal-cost keep the earliest. `CURL_TARGET_MAX` distinct sources per target land here.
-            let mut per_target: std::collections::HashMap<CellId, Vec<(Link, SpeedJumpTraversal)>> = std::collections::HashMap::new();
+            let mut per_target: std::collections::HashMap<CellId, Vec<(Link, SpeedJumpTraversal)>> =
+                std::collections::HashMap::new();
             for (link, tr) in curls.into_iter().flatten() {
                 let slot = per_target.entry(link.to).or_default();
                 slot.push((link, tr));
@@ -215,6 +216,60 @@ impl NavGraph {
                     self.push_speed_jump(link, tr);
                 }
             }
+            // Chained ground-turn curls third: leaps no local run-up can deliver
+            // at all (carried entry speed + grounded pre-launch rotation). Same
+            // dedup discipline, own per-cell budget.
+            let this = &*self;
+            let gts: Vec<Vec<(Link, SpeedJumpTraversal)>> = (0..this.cells.len() as CellId)
+                .into_par_iter()
+                .map(|ledge| {
+                    let mut out = Vec::new();
+                    this.solve_chained_ground_turn_from(bsp, ledge, params, &GT_ENTRY_SPEEDS, &mut out);
+                    // Additive low-entry sibling: the ground-optimal single-sided sweep
+                    // (GROUND_TURN_OPTIMAL_VERSION contracts) from the carried ~320..360
+                    // band. Always on for this branch (no cvar gate). It appends into the
+                    // same `out`; the per-target dedup below (cheapest-cost-wins,
+                    // one-per-source-envelope, seen_from) mixes v1 and v3 candidates
+                    // deterministically — a v3 link only survives if it is cheaper than
+                    // the v1 covering the same target, exactly as within-version.
+                    this.solve_chained_ground_turn_optimal_curl(bsp, ledge, params, &GT_OPT_ENTRY_SPEEDS, &mut out);
+                    out
+                })
+                .collect();
+            let mut per_target: std::collections::HashMap<CellId, Vec<(Link, SpeedJumpTraversal)>> =
+                std::collections::HashMap::new();
+            for (link, tr) in gts.into_iter().flatten() {
+                per_target.entry(link.to).or_default().push((link, tr));
+            }
+            let mut targets: Vec<CellId> = per_target.keys().copied().collect();
+            targets.sort_unstable();
+            for tgt in targets {
+                let mut v = per_target.remove(&tgt).unwrap();
+                v.sort_by(|a, b| a.0.cost.total_cmp(&b.0.cost).then(a.0.from.cmp(&b.0.from)));
+                // Chained links are only traversable where the entry band is
+                // provable, so source diversity matters more than for plain
+                // curls: a cheap link from an unreachable-at-speed corridor
+                // must not evict the one the certified chain arrives through.
+                // One link per source and exact certified entry envelope. Cold, mid and hot
+                // arrivals — and distinct yaws at the same speed — are disjoint executable
+                // contracts. Planner bands are too coarse a dedup key: 354 and 380 ups share one.
+                let mut seen_from_contract = std::collections::HashSet::new();
+                v.retain(|(link, tr)| {
+                    let envelope = tr.ground_turn.map_or((0, 0, 0, 0), |gt| {
+                        (
+                            gt.entry_speed_lo.to_bits(),
+                            gt.entry_speed_hi.to_bits(),
+                            gt.entry_yaw_lo.to_bits(),
+                            gt.entry_yaw_hi.to_bits(),
+                        )
+                    });
+                    seen_from_contract.insert((link.from, envelope))
+                });
+                v.truncate(GT_TARGET_MAX);
+                for (link, tr) in v {
+                    self.push_speed_jump(link, tr);
+                }
+            }
         }
     }
 
@@ -225,7 +280,14 @@ impl NavGraph {
     /// carrying its certified `curl_gain`, so the banded planner prices it by its stored cost and the
     /// runtime flies it with the curl controller. Its own per-cell budget, so it never evicts a straight
     /// jump.
-    fn solve_curl_jumps_from(&self, bsp: &Bsp, ledge: CellId, params: SpeedJumpParams, k: f32, out: &mut Vec<(Link, SpeedJumpTraversal)>) {
+    fn solve_curl_jumps_from(
+        &self,
+        bsp: &Bsp,
+        ledge: CellId,
+        params: SpeedJumpParams,
+        k: f32,
+        out: &mut Vec<(Link, SpeedJumpTraversal)>,
+    ) {
         let a = self.cells[ledge as usize];
         if bsp.is_liquid_at(a.origin) {
             return; // submerged takeoff: can't jump
@@ -254,7 +316,13 @@ impl NavGraph {
             }
             // The takeoff speed is the ground-prestrafe equilibrium (saturates well inside CURL_RUNUP_CAP),
             // so it's the *committed* run-up — not the full measured corridor — that a curl builds over.
-            let v_deliver = prestrafe_delivered(runway.min(CURL_RUNUP_CAP), params.accel, params.maxspeed, params.friction, params.stopspeed);
+            let v_deliver = prestrafe_delivered(
+                runway.min(CURL_RUNUP_CAP),
+                params.accel,
+                params.maxspeed,
+                params.friction,
+                params.stopspeed,
+            );
             let v_max_straight = SPEED_JUMP_V_CAP.min(BHOP_EFF * attainable_speed(MAX_SPEED, runway, k));
             let psi0 = yaw_of(Vec2::new(dgx as f32, dgy as f32)); // corridor / takeoff heading
             // A rollout can only certify a landing it reaches inside the tick cap, so bound the target
@@ -300,7 +368,8 @@ impl NavGraph {
                 // edge, so the leap point slides back (over the near ground, which the arc clears) until
                 // the delivered speed matches the distance. First (latest) leap that certifies wins.
                 let t_max = (runway - CURL_MIN_RUNWAY).clamp(0.0, CURL_TAKEOFF_BACKOFF);
-                let mut solved: Option<(Vec3, Vec3, f32, f32, f32)> = None; // (takeoff, from_pt, v_req, gain, cost)
+                let mut solved: Option<(Vec3, Vec3, f32, f32, f32, f32, f32)> = None;
+                // (takeoff, from_pt, psi, v_req, gain, landing_speed_lo, cost)
                 // The runtime takes off along the from→takeoff line, so that heading is ours to choose —
                 // and certification is sharply sensitive to it (a real lip's approach is rarely exactly on
                 // a compass axis; the dm3 curl_mid certifies at 6° off but not at 0°). Sample a few
@@ -319,21 +388,31 @@ impl NavGraph {
                             let back = (takeoff.xy() - a.origin.xy()).length();
                             // The committed run-up is capped (CURL_RUNUP_CAP) but must fit behind this takeoff.
                             let runup_len = (runway - back).min(CURL_RUNUP_CAP);
-                            let v_del = prestrafe_delivered(runup_len, params.accel, params.maxspeed, params.friction, params.stopspeed);
+                            let v_del = prestrafe_delivered(
+                                runup_len,
+                                params.accel,
+                                params.maxspeed,
+                                params.friction,
+                                params.stopspeed,
+                            );
                             // Cheap scout first — one mid-gain rollout with a generous tolerance — so the full
                             // envelope certify only runs where a landing is already near the target (else the
                             // pass is ~50× slower).
-                            let scout_ok = curl_land_point(bsp, takeoff, b.origin, v_del, psi, 10.0, &p).is_some_and(|land| {
-                                (land.xy() - b.origin.xy()).length() <= CURL_MISS_TOL * 2.5 && (land.z - b.origin.z).abs() <= CURL_Z_TOL * 2.0
-                            });
+                            let scout_ok =
+                                curl_land_point(bsp, takeoff, b.origin, v_del, psi, 10.0, &p).is_some_and(|land| {
+                                    (land.xy() - b.origin.xy()).length() <= CURL_MISS_TOL * 2.5
+                                        && (land.z - b.origin.z).abs() <= CURL_Z_TOL * 2.0
+                                });
                             if scout_ok {
-                                if let Some((v_req, gain)) = certify_curl(bsp, takeoff, b.origin, psi, v_del, &p) {
+                                if let Some((v_req, gain, landing_speed_lo)) =
+                                    certify_curl(bsp, takeoff, b.origin, psi, v_del, &p)
+                                {
                                     // From-cell one committed run-up back *along the certified heading*, so the
                                     // runtime's run-up line is the one that was proven. Honest cost at the solved
                                     // takeoff speed the runtime will hold (not the equilibrium).
                                     let from_pt = takeoff - dir * runup_len;
                                     let cost = runup_len / ((MAX_SPEED + v_req) * 0.5) + airtime + CURL_COMMIT;
-                                    solved = Some((takeoff, from_pt, v_req, gain, cost));
+                                    solved = Some((takeoff, from_pt, psi, v_req, gain, landing_speed_lo, cost));
                                     break 'psi;
                                 }
                             }
@@ -344,7 +423,7 @@ impl NavGraph {
                         }
                     }
                 }
-                let Some((takeoff, from_pt, v_req, gain, cost)) = solved else {
+                let Some((takeoff, from_pt, psi, v_req, gain, landing_speed_lo, cost)) = solved else {
                     continue;
                 };
                 let Some(start) = self.nearest_within(from_pt, GRID * 1.5, STEP_HEIGHT * 3.0) else {
@@ -353,8 +432,29 @@ impl NavGraph {
                 if start == to || self.has_direct_link(start, to) {
                     continue;
                 }
-                let link = Link { from: start, to, kind: LinkKind::SpeedJump, cost };
-                let tr = SpeedJumpTraversal { takeoff, v_req, airtime, chained: false, curl_gain: gain };
+                let (sp, cp) = psi.to_radians().sin_cos();
+                let entry_aim = takeoff + Vec3::new(cp, sp, 0.0) * CURL_RUNUP_CAP;
+                let link = Link {
+                    from: start,
+                    to,
+                    kind: LinkKind::SpeedJump,
+                    cost,
+                };
+                let tr = SpeedJumpTraversal {
+                    takeoff,
+                    v_req,
+                    airtime,
+                    landing_speed_lo,
+                    chained: false,
+                    curl_gain: gain,
+                    // `certify_curl` proves the launch around `psi`; preserve that lateral line for
+                    // the live run-up and launch frame. The negative gate switches to the landing
+                    // pursuit on the first airborne frame, matching `curl_lands` tick-for-tick.
+                    curl_entry_aim: entry_aim,
+                    curl_switch_dist: -CURL_LIP_REACH,
+                    curl_landing_aim: b.origin,
+                    ground_turn: None,
+                };
                 cands.push((horiz, link, tr)); // every certified curl; the per-cell cap trims below
             }
         }
@@ -438,8 +538,24 @@ impl NavGraph {
                     if let Some(start) = self.nearest_within(a.origin - dir * need, GRID * 1.5, STEP_HEIGHT * 3.0) {
                         if start != to {
                             let cost = runway_time(v_req * SJ_MARGIN, MAX_SPEED, k) + airtime + 1.0;
-                            let link = Link { from: start, to, kind: LinkKind::SpeedJump, cost };
-                            let tr = SpeedJumpTraversal { takeoff: a.origin, v_req, airtime, chained: false, curl_gain: 0.0 };
+                            let link = Link {
+                                from: start,
+                                to,
+                                kind: LinkKind::SpeedJump,
+                                cost,
+                            };
+                            let tr = SpeedJumpTraversal {
+                                takeoff: a.origin,
+                                v_req,
+                                airtime,
+                                landing_speed_lo: 0.0,
+                                chained: false,
+                                curl_gain: 0.0,
+                                curl_entry_aim: Vec3::ZERO,
+                                curl_switch_dist: 0.0,
+                                curl_landing_aim: Vec3::ZERO,
+                                ground_turn: None,
+                            };
                             if best.is_none_or(|(bv, _, _)| v_req < bv) {
                                 best = Some((v_req, link, tr));
                             }
@@ -452,8 +568,24 @@ impl NavGraph {
                 // price it away). Bounded to what the top band can carry.
                 if v_req * SJ_MARGIN <= v_chain_max {
                     let cost = airtime + 1.0;
-                    let link = Link { from: ledge, to, kind: LinkKind::SpeedJump, cost };
-                    let tr = SpeedJumpTraversal { takeoff: a.origin, v_req, airtime, chained: true, curl_gain: 0.0 };
+                    let link = Link {
+                        from: ledge,
+                        to,
+                        kind: LinkKind::SpeedJump,
+                        cost,
+                    };
+                    let tr = SpeedJumpTraversal {
+                        takeoff: a.origin,
+                        v_req,
+                        airtime,
+                        landing_speed_lo: 0.0,
+                        chained: true,
+                        curl_gain: 0.0,
+                        curl_entry_aim: Vec3::ZERO,
+                        curl_switch_dist: 0.0,
+                        curl_landing_aim: Vec3::ZERO,
+                        ground_turn: None,
+                    };
                     if best_chained.is_none_or(|(bv, _, _)| v_req < bv) {
                         best_chained = Some((v_req, link, tr));
                     }
@@ -516,7 +648,7 @@ pub struct CurlProbe {
     /// The certified envelope, if one lands: the gentlest gain that works, and the low corner of the
     /// speed envelope — what the runtime must at least deliver. `None` when nothing certifies, which
     /// is the case the harness is usually asking about.
-    pub certified: Option<(f32, f32)>,
+    pub certified: Option<(f32, f32, f32)>,
     /// Where the centre corner lands, per gain tried. The miss distances are the *why* behind a
     /// `certified: None`.
     pub landings: Vec<(f32, Vec3)>,
@@ -548,7 +680,12 @@ impl NavGraph {
             certified: certify_curl(bsp, takeoff, target, psi0, v_deliver, &p),
             landings: CURL_GAINS
                 .iter()
-                .map(|&gain| (gain, curl_land_point(bsp, takeoff, target, v_deliver, psi0, gain, &p).unwrap_or(Vec3::ZERO)))
+                .map(|&gain| {
+                    (
+                        gain,
+                        curl_land_point(bsp, takeoff, target, v_deliver, psi0, gain, &p).unwrap_or(Vec3::ZERO),
+                    )
+                })
                 .collect(),
         }
     }
@@ -560,14 +697,29 @@ fn curl_land_point(bsp: &Bsp, takeoff: Vec3, target: Vec3, v0: f32, psi: f32, ga
     let dt = CURL_DT;
     let amax = air_accel_max(p.accel, p.maxspeed, dt);
     let (s0, c0) = psi.to_radians().sin_cos();
-    let mut s = PmState { origin: takeoff, vel: Vec3::new(v0 * c0, v0 * s0, 0.0), on_ground: true, jump_held: false };
+    let mut s = PmState {
+        origin: takeoff,
+        vel: Vec3::new(v0 * c0, v0 * s0, 0.0),
+        on_ground: true,
+        jump_held: false,
+    };
     for tick in 0..CURL_MAX_TICKS {
         let cmd = if tick == 0 {
-            Cmd { view_yaw: psi, forward: MOVE_SPEED, side: 0.0, jump: true }
+            Cmd {
+                view_yaw: psi,
+                forward: MOVE_SPEED,
+                side: 0.0,
+                jump: true,
+            }
         } else {
             let v_xy = s.vel.xy();
             let st = air_correct(v_xy, yaw_of(target.xy() - s.origin.xy()), amax, dt, gain);
-            Cmd { view_yaw: st.view_yaw, forward: st.forward, side: st.side, jump: false }
+            Cmd {
+                view_yaw: st.view_yaw,
+                forward: st.forward,
+                side: st.side,
+                jump: false,
+            }
         };
         pm_step(bsp, &mut s, &cmd, p, dt);
         if tick > 3 && s.on_ground {
@@ -579,9 +731,18 @@ fn curl_land_point(bsp: &Bsp, takeoff: Vec3, target: Vec3, v0: f32, psi: f32, ga
 
 /// Certify a curl from `takeoff` onto `target`: the run-up delivers ~`v_deliver` ups along `psi0` (the
 /// corridor heading, degrees); find the gentlest [`CURL_GAINS`] gain whose `air_correct` arc lands the
-/// target cell across the whole delivered-speed × launch-heading envelope. Returns `(v_req, gain)` —
-/// `v_req` the envelope's low corner (what the runtime must at least deliver) — or `None`.
-fn certify_curl(bsp: &Bsp, takeoff: Vec3, target: Vec3, psi0: f32, v_deliver: f32, p: &PmParams) -> Option<(f32, f32)> {
+/// target cell across the whole delivered-speed × launch-heading × cadence
+/// envelope. Returns `(v_req, gain, landing_speed_lo)` — `v_req` is the
+/// takeoff envelope's low corner and `landing_speed_lo` is the minimum clean
+/// touchdown carry the planner may credit — or `None`.
+fn certify_curl(
+    bsp: &Bsp,
+    takeoff: Vec3,
+    target: Vec3,
+    psi0: f32,
+    v_deliver: f32,
+    p: &PmParams,
+) -> Option<(f32, f32, f32)> {
     let (s0, c0) = psi0.to_radians().sin_cos();
     // The runtime leaps on crossing the takeoff *line*, up to a lip-reach *before* this point (the frame
     // progress < LIP_REACH, at ~6u/tick), so every corner is proven from both leap points.
@@ -619,8 +780,22 @@ fn certify_curl(bsp: &Bsp, takeoff: Vec3, target: Vec3, psi0: f32, v_deliver: f3
             (early, v, -CURL_PSI_TOL),
         ];
         for &gain in &CURL_GAINS {
-            if corners.iter().all(|&(tk, v0, dp)| curl_lands(bsp, tk, target, v0, psi0 + dp, gain, p)) {
-                return Some((v, gain)); // v* — the runtime holds this
+            let mut landing_speed_lo = f32::INFINITY;
+            let mut passed = true;
+            for &dt in &GT_DT_CLASSES {
+                for &(tk, v0, dp) in &corners {
+                    let Some(land) = curl_lands(bsp, tk, target, v0, psi0 + dp, gain, p, dt) else {
+                        passed = false;
+                        break;
+                    };
+                    landing_speed_lo = landing_speed_lo.min(land.vel.xy().length());
+                }
+                if !passed {
+                    break;
+                }
+            }
+            if passed {
+                return Some((v, gain, landing_speed_lo));
             }
         }
     }
@@ -632,15 +807,34 @@ fn certify_curl(bsp: &Bsp, takeoff: Vec3, target: Vec3, psi0: f32, v_deliver: f3
 /// exact runtime air policy. Accepts the first touchdown after the leap that resolves to the target
 /// within tolerance; rejects a heading that crosses the target bearing mid-flight (an overshoot the
 /// held-sign air-strafe diverges from) or an arc that falls well below / flies past the target.
-fn curl_lands(bsp: &Bsp, takeoff: Vec3, target: Vec3, v0: f32, psi: f32, gain: f32, p: &PmParams) -> bool {
-    let dt = CURL_DT;
+fn curl_lands(
+    bsp: &Bsp,
+    takeoff: Vec3,
+    target: Vec3,
+    v0: f32,
+    psi: f32,
+    gain: f32,
+    p: &PmParams,
+    dt: f32,
+) -> Option<PmState> {
+    use crate::pmove::pm_step_report;
     let amax = air_accel_max(p.accel, p.maxspeed, dt);
     let (s0, c0) = psi.to_radians().sin_cos();
-    let mut s = PmState { origin: takeoff, vel: Vec3::new(v0 * c0, v0 * s0, 0.0), on_ground: true, jump_held: false };
+    let mut s = PmState {
+        origin: takeoff,
+        vel: Vec3::new(v0 * c0, v0 * s0, 0.0),
+        on_ground: true,
+        jump_held: false,
+    };
     let mut prev_sign = 0.0f32;
     for tick in 0..CURL_MAX_TICKS {
         let cmd = if tick == 0 {
-            Cmd { view_yaw: psi, forward: MOVE_SPEED, side: 0.0, jump: true }
+            Cmd {
+                view_yaw: psi,
+                forward: MOVE_SPEED,
+                side: 0.0,
+                jump: true,
+            }
         } else {
             let v_xy = s.vel.xy();
             let bearing = yaw_of(target.xy() - s.origin.xy());
@@ -650,19 +844,2923 @@ fn curl_lands(bsp: &Bsp, takeoff: Vec3, target: Vec3, v0: f32, psi: f32, gain: f
             // so only treat it as divergence while still well short of the target.
             let far = (s.origin.xy() - target.xy()).length() > CURL_MISS_TOL * 1.5;
             if far && prev_sign != 0.0 && err.signum() != prev_sign && err.abs() > 2.0 {
-                return false;
+                return None;
             }
             prev_sign = err.signum();
             let st = air_correct(v_xy, bearing, amax, dt, gain);
-            Cmd { view_yaw: st.view_yaw, forward: st.forward, side: st.side, jump: false }
+            Cmd {
+                view_yaw: st.view_yaw,
+                forward: st.forward,
+                side: st.side,
+                jump: false,
+            }
         };
-        pm_step(bsp, &mut s, &cmd, p, dt);
+        let cmd = Cmd {
+            forward: cmd.forward.round(),
+            side: cmd.side.round(),
+            ..cmd
+        };
+        let before = bsp.hull1_trace(s.origin, s.origin);
+        if before.start_solid || before.all_solid {
+            return None;
+        }
+        let report = pm_step_report(bsp, &mut s, &cmd, p, dt);
+        let after = bsp.hull1_trace(s.origin, s.origin);
+        if report.wall_contact || after.start_solid || after.all_solid {
+            return None;
+        }
         if s.vel.z < 0.0 && s.origin.z < target.z - 100.0 {
-            return false; // fell past the target's level — undershoot
+            return None; // fell past the target's level — undershoot
         }
         if tick > 3 && s.on_ground {
-            return (s.origin.xy() - target.xy()).length() <= CURL_MISS_TOL && (s.origin.z - target.z).abs() <= CURL_Z_TOL;
+            return ((s.origin.xy() - target.xy()).length() <= CURL_MISS_TOL
+                && (s.origin.z - target.z).abs() <= CURL_Z_TOL)
+                .then_some(s);
         }
     }
-    false
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Chained ground-turn curls
+// ---------------------------------------------------------------------------
+//
+// A leap whose flight-time budget closes ONLY with carried entry speed (no
+// local run-up delivers it — `prestrafe_delivered` saturates near 430 while
+// the flight needs ~470) and whose launch heading is not the corridor
+// heading (the grounded rotation happens in the final `turn_dist` before the
+// jump; rotating after a lip launch provably cannot close the budget: air
+// accel gives ~3-4 deg/tick at these speeds and gravity caps the flight at
+// ~30 ticks). Both the certifier below and the live executor drive
+// [`ground_turn_ground_aim`]/[`ground_turn_should_launch`]/
+// [`ground_turn_air_aim`] from the same stored [`GroundTurnCurl`], so the
+// proven contract is the flown contract. Fail closed: the executor checks
+// the live entry state against the stored envelope and replans when outside.
+
+/// Contract version stamped into every generated [`GroundTurnCurl`].
+pub const GROUND_TURN_VERSION: u16 = 1;
+/// Self-contained blended-runway contract; distinct from the original
+/// carried-speed switch-at-distance controller.
+pub const RUNWAY_TURN_VERSION: u16 = 2;
+
+/// The fake-bot integer-millisecond cadence classes the live artifact
+/// accepts (see the live20 provenance): every envelope corner must certify
+/// at all three.
+const GT_DT_CLASSES: [f32; 3] = [0.019, 0.020, 0.021];
+/// Minimum measured (stepped, lax) runway behind the takeoff.
+const GT_MIN_RUNWAY: f32 = 64.0;
+/// Committed run-up lengths: the link's from-cell sits this far back along
+/// the corridor (or as far as the runway allows); both a long and a short
+/// variant are searched (see the loop at the ledge scan).
+const GT_RUNUP_CAP: f32 = 320.0;
+const GT_RUNUP_SHORT: f32 = 64.0;
+/// Carried entry speeds searched, low first — v_req is the lowest that
+/// certifies its whole envelope. Chosen so the envelope FLOOR
+/// (`v * (1 - GT_ENTRY_V_TOL)`) lands exactly on a planner band floor
+/// (430, 490): a certified envelope the banded planner can actually prove
+/// (a floor 1 u/s above a band edge is a link no route can ever take).
+const GT_ENTRY_SPEEDS: [f32; 2] = [430.0 / (1.0 - GT_ENTRY_V_TOL), 490.0 / (1.0 - GT_ENTRY_V_TOL)];
+/// Entry-speed envelope half-width (fraction) certified around v_req.
+const GT_ENTRY_V_TOL: f32 = 0.02;
+/// Entry-yaw envelope half-width (degrees) certified around the corridor.
+const GT_ENTRY_YAW_TOL: f32 = 12.0;
+/// Launch-heading offsets (degrees off the corridor axis, signed toward the
+/// target side) sampled by the generator.
+const GT_LAUNCH_OFFSETS: [f32; 6] = [8.0, 16.0, 24.0, 35.0, 42.0, 50.0];
+/// Ground-rotation window distances sampled.
+const GT_TURN_DISTS: [f32; 4] = [48.0, 64.0, 96.0, 224.0];
+/// Yaw slack: the jump may fire this many degrees short of `launch_yaw`.
+const GT_YAW_SLACKS: [f32; 3] = [3.0, 8.0, 18.0];
+/// Launch-frame and air-curl gains sampled.
+const GT_LAUNCH_GAINS: [f32; 3] = [8.0, 16.0, 32.0];
+const GT_AIR_GAINS: [f32; 3] = [8.0, 64.0, 256.0];
+/// Lateral runway-aim offsets (perpendicular to the corridor) sampled.
+const GT_RUNWAY_LATERALS: [f32; 3] = [0.0, -8.0, 8.0];
+/// Target offset band off the corridor axis (degrees) — beyond the plain
+/// curl pass's reach, a genuine turn-then-leap. The high edge admits the
+/// DM3 gap-1 class (~111 deg off the eastbound corridor).
+const GT_OFF_LO: f32 = 40.0;
+const GT_OFF_HI: f32 = 115.0;
+/// Hold-phase gate distances sampled along the launch heading before the
+/// curl engages (0 = immediate curl, no hold phase). A hold lets the
+/// flight clear a near wall corner before turning onto the target.
+const GT_GATE_DISTS: [f32; 3] = [0.0, 96.0, 160.0];
+/// Tick caps for the grounded approach and the flight.
+const GT_SETUP_TICK_CAP: usize = 45;
+const GT_FLIGHT_TICK_CAP: usize = 60;
+/// Consecutive non-ground setup ticks tolerated by the certified controller. Reaching this count
+/// means the approach has left its runway rather than crossed a transient floor seam.
+pub const GROUND_TURN_SETUP_AIRBORNE_TICK_CAP: usize = 3;
+/// How far a setup/flight may fall below the certified runway floor before its rollout is unsafe.
+const GT_FLOOR_DROP: f32 = 80.0;
+/// Per-ledge emission cap (cheapest-cost first), own budget like the plain
+/// curl pass — never evicts a straight jump.
+const GT_MAX_PER_CELL: usize = 16;
+/// Global per-target cap after dedup (see the source-diversity note at the
+/// splice site).
+const GT_TARGET_MAX: usize = 16;
+
+fn next_ground_turn_setup_airborne_streak(prior: usize, on_ground: bool) -> Option<usize> {
+    let next = if on_ground { 0 } else { prior.saturating_add(1) };
+    (next < GROUND_TURN_SETUP_AIRBORNE_TICK_CAP).then_some(next)
+}
+/// Candidate targets examined per (ledge, corridor direction). Effectively
+/// uncapped: every candidate first passes the cheap canonical-scout gate
+/// below, so an infeasible one costs a handful of rollouts, not a full
+/// lattice — the cap only bounds pathological geometry.
+const GT_TARGETS_PER_DIR: usize = 96;
+/// Takeoff box half-widths around the ledge-cell origin.
+const GT_BOX_HALF: f32 = 28.0;
+
+/// Velocity yaw mapped to [0,360): the ground rotation crosses +-180 in the
+/// middle of the turn, so gates compare in a wrap-free domain.
+pub fn yaw360_of(v: Vec2) -> f32 {
+    yaw_of(v).rem_euclid(360.0)
+}
+
+/// Grounded steering waypoint for the current position: the runway line
+/// while farther than `turn_dist` from the takeoff, else a far point along
+/// the launch heading (rotating the carried velocity before the jump).
+pub fn ground_turn_ground_aim(origin: Vec3, takeoff: Vec3, gt: &GroundTurnCurl) -> Vec2 {
+    if gt.blended_runway {
+        let (rs, rc) = gt.runway_yaw.to_radians().sin_cos();
+        let runway_dir = Vec2::new(rc, rs);
+        let remaining = (takeoff.xy() - origin.xy()).dot(runway_dir);
+        let u = ((gt.turn_dist - remaining) / gt.turn_dist.max(1.0)).clamp(0.0, 1.0);
+        let smooth = u * u * (3.0 - 2.0 * u);
+        let bearing = gt.runway_yaw + wrap180(gt.launch_yaw - gt.runway_yaw) * smooth;
+        let (s, c) = bearing.to_radians().sin_cos();
+        return origin.xy() + Vec2::new(c, s) * 512.0;
+    }
+    if (origin.xy() - takeoff.xy()).length() > gt.turn_dist {
+        gt.runway_aim.xy()
+    } else {
+        let (s, c) = gt.launch_yaw.to_radians().sin_cos();
+        takeoff.xy() + Vec2::new(c, s) * 512.0
+    }
+}
+
+/// Exact grounded command for a certified ground-turn traversal.  The build-time rollout and the
+/// live executor call this same function so the last-moment sigma reset, speed hold and rounded
+/// usercmd cannot drift apart.
+#[allow(clippy::too_many_arguments)]
+pub fn ground_turn_ground_cmd(
+    origin: Vec3,
+    vel_xy: Vec2,
+    takeoff: Vec3,
+    gt: &GroundTurnCurl,
+    sigma: &mut f32,
+    accel: f32,
+    maxspeed: f32,
+    dt: f32,
+) -> Cmd {
+    use crate::strafe::ground_prestrafe;
+
+    let aim = ground_turn_ground_aim(origin, takeoff, gt);
+    let bearing = yaw_of(aim - origin.xy());
+    let st = if gt.blended_runway {
+        let (rs, rc) = gt.runway_yaw.to_radians().sin_cos();
+        let remaining = (takeoff.xy() - origin.xy()).dot(Vec2::new(rc, rs));
+        if remaining <= 40.0 {
+            ground_prestrafe(vel_xy, bearing, 0.0, accel * maxspeed * dt, maxspeed)
+        } else if vel_xy.length() > gt.hold_speed * 1.03 {
+            return Cmd {
+                view_yaw: bearing,
+                forward: MOVE_SPEED,
+                side: 0.0,
+                jump: false,
+            };
+        } else {
+            let st = ground_prestrafe(vel_xy, bearing, *sigma, accel * maxspeed * dt, maxspeed);
+            *sigma = st.sigma;
+            st
+        }
+    } else {
+        let st = ground_prestrafe(vel_xy, bearing, *sigma, accel * maxspeed * dt, maxspeed);
+        *sigma = st.sigma;
+        st
+    };
+    Cmd {
+        view_yaw: st.view_yaw,
+        forward: st.forward.round(),
+        side: st.side.round(),
+        jump: false,
+    }
+}
+
+/// Exact launch tick for a certified ground-turn traversal.
+pub fn ground_turn_launch_cmd(
+    vel_xy: Vec2,
+    bearing: f32,
+    gt: &GroundTurnCurl,
+    accel: f32,
+    maxspeed: f32,
+    dt: f32,
+) -> Cmd {
+    let st = air_correct(vel_xy, bearing, air_accel_max(accel, maxspeed, dt), dt, gt.launch_gain);
+    Cmd {
+        view_yaw: st.view_yaw,
+        forward: st.forward.round(),
+        side: st.side.round(),
+        jump: true,
+    }
+}
+
+/// Exact airborne tick for a certified ground-turn traversal.
+pub fn ground_turn_air_cmd(origin: Vec3, vel_xy: Vec2, gt: &GroundTurnCurl, accel: f32, maxspeed: f32, dt: f32) -> Cmd {
+    let (aim, gain) = ground_turn_air_aim(origin, gt);
+    let st = air_correct(
+        vel_xy,
+        yaw_of(aim - origin.xy()),
+        air_accel_max(accel, maxspeed, dt),
+        dt,
+        gain,
+    );
+    Cmd {
+        view_yaw: st.view_yaw,
+        forward: st.forward.round(),
+        side: st.side.round(),
+        jump: false,
+    }
+}
+
+/// Fire the jump? First grounded tick inside the takeoff box, at platform
+/// height, with the carried velocity rotated at least to `yaw_min`.
+pub fn ground_turn_should_launch(origin: Vec3, vel_xy: Vec2, on_ground: bool, gt: &GroundTurnCurl) -> bool {
+    if gt.blended_runway {
+        let takeoff = (gt.box_min + gt.box_max) * 0.5;
+        let (rs, rc) = gt.runway_yaw.to_radians().sin_cos();
+        let remaining = (takeoff.xy() - origin.xy()).dot(Vec2::new(rc, rs));
+        let speed = vel_xy.length();
+        return on_ground
+            && remaining <= gt.lip_reach
+            && (takeoff.xy() - origin.xy()).length() <= 48.0
+            && (origin.z - gt.box_max.z).abs() <= 2.0
+            && (speed - gt.hold_speed).abs() <= gt.hold_speed * 0.06
+            && wrap180(yaw_of(vel_xy) - gt.launch_yaw).abs() <= 35.0;
+    }
+    on_ground
+        && origin.x >= gt.box_min.x
+        && origin.x <= gt.box_max.x
+        && origin.y >= gt.box_min.y
+        && origin.y <= gt.box_max.y
+        && origin.z >= gt.box_min.z
+        && yaw360_of(vel_xy) >= gt.yaw_min
+}
+
+/// Airborne pursuit point: `hold_aim` while still on the near side of the
+/// gate plane, else the landing aim. A zero gate normal disables the hold
+/// phase entirely (immediate curl).
+pub fn ground_turn_air_aim(origin: Vec3, gt: &GroundTurnCurl) -> (Vec2, f32) {
+    let held = gt.gate_normal != Vec3::ZERO && (origin - gt.gate_point).dot(gt.gate_normal) > 0.0;
+    if held {
+        (gt.hold_aim.xy(), gt.air_gain)
+    } else {
+        (gt.landing_aim.xy(), gt.air_gain)
+    }
+}
+
+/// Live entry check (fail closed): grounded arrival at the link source with
+/// speed and yaw inside the certified envelope.
+pub fn ground_turn_entry_ok(speed: f32, vel_xy: Vec2, on_ground: bool, gt: &GroundTurnCurl) -> bool {
+    let yaw = yaw360_of(vel_xy);
+    on_ground
+        && speed >= gt.entry_speed_lo
+        && speed <= gt.entry_speed_hi
+        && if gt.entry_yaw_lo <= gt.entry_yaw_hi {
+            yaw >= gt.entry_yaw_lo && yaw <= gt.entry_yaw_hi
+        } else {
+            yaw >= gt.entry_yaw_lo || yaw <= gt.entry_yaw_hi
+        }
+}
+
+/// One grounded corrective command that moves a nearby entry state into this contract's certified
+/// speed/yaw envelope after normal QW friction. Returns `None` when the envelope cannot be reached
+/// in one tick at stock-style ground acceleration. The target is inset slightly from every boundary
+/// so fake-client integer command quantization cannot turn a valid adjustment into an envelope miss.
+pub fn ground_turn_entry_adjust_cmd(
+    vel_xy: Vec2,
+    on_ground: bool,
+    gt: &GroundTurnCurl,
+    friction: f32,
+    stopspeed: f32,
+    accel: f32,
+    maxspeed: f32,
+    dt: f32,
+) -> Option<Cmd> {
+    if !on_ground || dt <= 0.0 || accel <= 0.0 || maxspeed <= 0.0 {
+        return None;
+    }
+    let after_friction = apply_friction(vel_xy, friction, stopspeed, dt);
+    let speed_margin = ((gt.entry_speed_hi - gt.entry_speed_lo) * 0.05).clamp(0.25, 1.0);
+    let speed_lo = gt.entry_speed_lo + speed_margin;
+    let speed_hi = gt.entry_speed_hi - speed_margin;
+    if speed_lo > speed_hi {
+        return None;
+    }
+    let target_speed = after_friction.length().clamp(speed_lo, speed_hi);
+
+    let yaw = yaw360_of(after_friction);
+    let yaw_margin = 0.25;
+    let lo = (gt.entry_yaw_lo + yaw_margin).rem_euclid(360.0);
+    let hi = (gt.entry_yaw_hi - yaw_margin).rem_euclid(360.0);
+    let inside = if lo <= hi {
+        yaw >= lo && yaw <= hi
+    } else {
+        yaw >= lo || yaw <= hi
+    };
+    let target_yaw = if inside {
+        yaw
+    } else if wrap180(lo - yaw).abs() <= wrap180(hi - yaw).abs() {
+        lo
+    } else {
+        hi
+    };
+    let (sy, cy) = target_yaw.to_radians().sin_cos();
+    let target = Vec2::new(cy, sy) * target_speed;
+    let delta = target - after_friction;
+    let delta_len = delta.length();
+    if delta_len < 0.01 {
+        return None;
+    }
+    let wishspeed = delta_len / (accel * dt);
+    if wishspeed > maxspeed {
+        return None;
+    }
+    let wishdir = delta / delta_len;
+    let predicted = apply_groundaccel(after_friction, wishdir, wishspeed, accel, dt);
+    ground_turn_entry_ok(predicted.length(), predicted, true, gt).then_some(Cmd {
+        view_yaw: yaw_of(wishdir),
+        forward: wishspeed,
+        side: 0.0,
+        jump: false,
+    })
+}
+
+/// One certified rollout: grounded weave from `entry` up the runway,
+/// rotation, launch, curl, first touchdown resolving to `to` — zero wall
+/// contact, zero start-solid, no fall. Returns (elapsed, landing state).
+fn ground_turn_rolls(
+    graph: &NavGraph,
+    bsp: &Bsp,
+    entry: PmState,
+    dt: f32,
+    takeoff: Vec3,
+    gt: &GroundTurnCurl,
+    to: CellId,
+    p: &PmParams,
+) -> Option<(f32, PmState)> {
+    ground_turn_rolls_tol(graph, bsp, entry, dt, takeoff, gt, to, p, 0.0)
+}
+
+/// [`ground_turn_rolls`] with a landing tolerance: `accept_near > 0` also
+/// accepts a touchdown within that XY distance of the target cell (the
+/// canonical-scout feasibility gate; certification always uses exact).
+#[allow(clippy::too_many_arguments)]
+fn ground_turn_rolls_tol(
+    graph: &NavGraph,
+    bsp: &Bsp,
+    entry: PmState,
+    dt: f32,
+    takeoff: Vec3,
+    gt: &GroundTurnCurl,
+    to: CellId,
+    p: &PmParams,
+    accept_near: f32,
+) -> Option<(f32, PmState)> {
+    ground_turn_rolls_tol_report(graph, bsp, entry, dt, takeoff, gt, to, p, accept_near).result
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GroundTurnRolloutTrace {
+    result: Option<(f32, PmState)>,
+    pmove_steps: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ground_turn_rolls_tol_report(
+    graph: &NavGraph,
+    bsp: &Bsp,
+    entry: PmState,
+    dt: f32,
+    takeoff: Vec3,
+    gt: &GroundTurnCurl,
+    to: CellId,
+    p: &PmParams,
+    accept_near: f32,
+) -> GroundTurnRolloutTrace {
+    let mut pmove_steps = 0usize;
+    let result = ground_turn_rolls_tol_counted(
+        graph,
+        bsp,
+        entry,
+        dt,
+        takeoff,
+        gt,
+        to,
+        p,
+        accept_near,
+        &mut pmove_steps,
+    );
+    GroundTurnRolloutTrace { result, pmove_steps }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ground_turn_rolls_tol_counted(
+    graph: &NavGraph,
+    bsp: &Bsp,
+    entry: PmState,
+    dt: f32,
+    takeoff: Vec3,
+    gt: &GroundTurnCurl,
+    to: CellId,
+    p: &PmParams,
+    accept_near: f32,
+    pmove_steps: &mut usize,
+) -> Option<(f32, PmState)> {
+    use crate::pmove::pm_step_report;
+    let solid = |o: Vec3| {
+        let tr = bsp.hull1_trace(o, o);
+        tr.start_solid || tr.all_solid
+    };
+    let mut s = entry;
+    let mut sigma = 0.0;
+    let mut elapsed = 0.0;
+    let mut airborne_streak = 0usize;
+    let floor_z = entry.origin.z.min(takeoff.z) - GT_FLOOR_DROP;
+    let mut setup = 0usize;
+    loop {
+        if ground_turn_should_launch(s.origin, s.vel.xy(), s.on_ground, gt) {
+            break;
+        }
+        if setup >= GT_SETUP_TICK_CAP {
+            return None;
+        }
+        let cmd = ground_turn_ground_cmd(s.origin, s.vel.xy(), takeoff, gt, &mut sigma, p.accel, p.maxspeed, dt);
+        if solid(s.origin) {
+            return None;
+        }
+        *pmove_steps += 1;
+        let rep = pm_step_report(bsp, &mut s, &cmd, p, dt);
+        if rep.wall_contact || solid(s.origin) || s.origin.z < floor_z {
+            return None;
+        }
+        elapsed += dt;
+        setup += 1;
+        airborne_streak = next_ground_turn_setup_airborne_streak(airborne_streak, s.on_ground)?;
+        if s.jump_held {
+            return None;
+        }
+    }
+    // Launch tick.
+    let aim = ground_turn_ground_aim(s.origin, takeoff, gt);
+    let cmd = ground_turn_launch_cmd(s.vel.xy(), yaw_of(aim - s.origin.xy()), gt, p.accel, p.maxspeed, dt);
+    if solid(s.origin) {
+        return None;
+    }
+    *pmove_steps += 1;
+    let rep = pm_step_report(bsp, &mut s, &cmd, p, dt);
+    if rep.wall_contact || solid(s.origin) || s.on_ground {
+        return None;
+    }
+    elapsed += dt;
+    for _ in 0..GT_FLIGHT_TICK_CAP {
+        let cmd = ground_turn_air_cmd(s.origin, s.vel.xy(), gt, p.accel, p.maxspeed, dt);
+        if solid(s.origin) {
+            return None;
+        }
+        *pmove_steps += 1;
+        let rep = pm_step_report(bsp, &mut s, &cmd, p, dt);
+        if rep.wall_contact || solid(s.origin) || s.origin.z < floor_z {
+            return None;
+        }
+        elapsed += dt;
+        if s.on_ground {
+            let land = graph.nearest_within(s.origin, 24.0, 2.0);
+            let target = graph.cells[to as usize].origin;
+            let near = accept_near > 0.0
+                && (s.origin.xy() - target.xy()).length() <= accept_near
+                && (s.origin.z - target.z).abs() <= CURL_Z_TOL;
+            return if land == Some(to) || near {
+                Some((elapsed, s))
+            } else {
+                None
+            };
+        }
+    }
+    None
+}
+
+impl NavGraph {
+    /// Stepped, hop-wide-relaxed runway measure: walk grid columns back from
+    /// `a` opposite `(dgx,dgy)` while a cell exists within step height and
+    /// jump headroom — no side-column requirement (the certified weave holds
+    /// the corridor line; certification, not corridor width, is the proof).
+    fn measure_runway_lax(&self, bsp: &Bsp, a: &Cell, dgx: i32, dgy: i32) -> f32 {
+        let (bx, by) = (-dgx.signum(), -dgy.signum());
+        if bx == 0 && by == 0 {
+            return 0.0;
+        }
+        let step_len = GRID * (((bx * bx + by * by) as f32).sqrt());
+        let (mut gx, mut gy, mut z, mut len) = (a.gx, a.gy, a.origin.z, 0.0);
+        while len < RUNWAY_MAX {
+            let (ngx, ngy) = (gx + bx, gy + by);
+            let Some(cid) = self.cell_near(ngx, ngy, z) else {
+                break;
+            };
+            let c = self.cells[cid as usize].origin;
+            if bsp.is_solid(c + Vec3::new(0.0, 0.0, JUMP_APEX)) {
+                break;
+            }
+            len += step_len;
+            (gx, gy, z) = (ngx, ngy, c.z);
+        }
+        len
+    }
+
+    /// Certify one ground-turn profile across its whole envelope: entry
+    /// speeds {lo, mid, hi}, entry yaws {-tol, 0, +tol}, all three cadence
+    /// classes. Returns the worst (largest) certified elapsed and the
+    /// minimum horizontal landing speed across the envelope.
+    fn certify_ground_turn(
+        &self,
+        bsp: &Bsp,
+        entry_origin: Vec3,
+        entry_yaw0: f32,
+        v_req: f32,
+        entry_v_tol: f32,
+        entry_yaw_tol: f32,
+        takeoff: Vec3,
+        gt: &GroundTurnCurl,
+        to: CellId,
+        p: &PmParams,
+    ) -> Option<(f32, f32, f32)> {
+        let mut worst = 0.0f32;
+        let mut land_lo = f32::INFINITY;
+        let mut land_yaw = 0.0f32;
+        let speeds = [v_req * (1.0 - entry_v_tol), v_req, v_req * (1.0 + entry_v_tol)];
+        let yaws = [entry_yaw0 - entry_yaw_tol, entry_yaw0, entry_yaw0 + entry_yaw_tol];
+        for &dt in &GT_DT_CLASSES {
+            for &v in &speeds {
+                for &yaw in &yaws {
+                    let (sy, cy) = yaw.to_radians().sin_cos();
+                    let entry = PmState {
+                        origin: entry_origin,
+                        vel: Vec3::new(v * cy, v * sy, 0.0),
+                        on_ground: true,
+                        jump_held: false,
+                    };
+                    let (elapsed, land) = ground_turn_rolls(self, bsp, entry, dt, takeoff, gt, to, p)?;
+                    worst = worst.max(elapsed);
+                    land_lo = land_lo.min(land.vel.xy().length());
+                    if dt == GT_DT_CLASSES[1] && v == v_req && yaw == entry_yaw0 {
+                        land_yaw = yaw360_of(land.vel.xy());
+                    }
+                }
+            }
+        }
+        Some((worst, land_lo, land_yaw))
+    }
+
+    /// The chained ground-turn curl links leaving ledge cell `ledge`:
+    /// candidate targets sit far off the corridor axis (beyond the plain
+    /// curl pass), the flight needs carried speed no local run-up delivers,
+    /// and the launch needs a grounded rotation. Bounded lattice per
+    /// candidate; emitted `chained` so the banded planner only takes the
+    /// link when the entry band carries `v_req`. Own per-cell budget.
+    ///
+    /// `entry_speeds` is the carried-entry ladder sampled by both the
+    /// canonical-scout gate and the full lattice search (low-to-high order
+    /// not required; the reach/floor bounds below use the max of the
+    /// slice). The production call site passes [`GT_ENTRY_SPEEDS`]
+    /// unchanged; a search harness (e.g. `bin/gt_search.rs`) may pass a
+    /// different ladder — e.g. a lower-entry exploration — without
+    /// otherwise touching this solver. Note [`GT_ENTRY_SPEEDS`] itself is
+    /// pre-divided by `(1.0 - GT_ENTRY_V_TOL)` so its envelope's low corner
+    /// lands exactly on a planner band floor; callers passing raw target
+    /// entry speeds (not band-floor-aligned) get a correctly-certified but
+    /// not necessarily banded-plannable link — fine for search/calibration,
+    /// not for direct production splicing.
+    pub fn solve_chained_ground_turn_from(
+        &self,
+        bsp: &Bsp,
+        ledge: CellId,
+        params: SpeedJumpParams,
+        entry_speeds: &[f32],
+        out: &mut Vec<(Link, SpeedJumpTraversal)>,
+    ) {
+        let a = self.cells[ledge as usize];
+        if bsp.is_liquid_at(a.origin) {
+            return;
+        }
+        let p = PmParams {
+            gravity: params.gravity,
+            accel: params.accel,
+            friction: params.friction,
+            stopspeed: params.stopspeed,
+            maxspeed: params.maxspeed,
+        };
+        let mut cands: Vec<(f32, Link, SpeedJumpTraversal)> = Vec::new();
+        for (dgx, dgy) in COMPASS {
+            // The corridor RUN direction is (dgx,dgy); measure the runway feeding
+            // the ledge from behind it. Diagonal grid corridors are real runways
+            // too; the certifier, rather than an axis-only prefilter, decides
+            // whether their stepped approach and rotation are safe.
+            let runway = self.measure_runway_lax(bsp, &a, dgx, dgy);
+            if runway < GT_MIN_RUNWAY {
+                continue;
+            }
+            let psi0 = yaw_of(Vec2::new(dgx as f32, dgy as f32));
+            let run_dir = Vec3::new(dgx as f32, dgy as f32, 0.0).normalize();
+            // Two committed run-up lengths: the full cap, and a short variant
+            // whose from-cell sits closer to the lip — a chained link is only
+            // traversable where the entry band is provable, and the proving
+            // jump may land PAST the long variant's entry cell.
+            for runup in [runway.min(GT_RUNUP_CAP), runway.min(GT_RUNUP_SHORT)] {
+                let entry_pt = a.origin - run_dir * runup;
+                let Some(from) = self.nearest_within(entry_pt, GRID * 1.5, STEP_HEIGHT * (runup / GRID + 1.0)) else {
+                    continue;
+                };
+                if from == ledge {
+                    continue;
+                }
+                let entry_origin = self.cells[from as usize].origin + Vec3::new(0.0, 0.0, 0.03125);
+                let fly_cap = GT_FLIGHT_TICK_CAP as f32 * 0.021;
+                let entry_speed_max = entry_speeds.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let reach = entry_speed_max * fly_cap;
+                let scan = ((reach / GRID).ceil() as i32).max(1);
+                // Collect candidate targets first, keep only the few most
+                // feasible (lowest ballistic floor): the lattice below is the
+                // expensive part and an all-fail candidate costs the full grid.
+                let mut targets: Vec<(f32, CellId, f32, f32, f32, bool)> = Vec::new(); // (v_floor, to, off, horiz, dz, lip)
+                for to in self.neighbors_within(a.gx, a.gy, scan) {
+                    if to == ledge || to == from {
+                        continue;
+                    }
+                    let b = self.cells[to as usize];
+                    let dz = b.origin.z - a.origin.z;
+                    let horiz = (b.origin.xy() - a.origin.xy()).length();
+                    if !(-SJ_MAX_DROP..=JUMP_APEX).contains(&dz) || horiz <= JUMP_REACH {
+                        continue;
+                    }
+                    let off = wrap180(yaw_of(b.origin.xy() - a.origin.xy()) - psi0);
+                    if !(GT_OFF_LO..=GT_OFF_HI).contains(&off.abs()) {
+                        continue;
+                    }
+                    if self.has_direct_link(ledge, to) || self.has_direct_link(from, to) {
+                        continue;
+                    }
+                    // A strict plain curl already owns every direct link that
+                    // certified above. Keep the remaining ballistic candidates
+                    // here even when a local runway can build their speed: a
+                    // self-contained runway-turn may succeed where the plain
+                    // fixed-heading curl failed. The expensive lattice remains
+                    // behind the physical lip and center-rollout scouts below.
+                    let v_floor = v_required(horiz, dz, params.gravity);
+                    if !v_floor.is_finite() || v_floor > entry_speed_max * (1.0 + GT_ENTRY_V_TOL) {
+                        continue;
+                    }
+                    // A genuine lip: the flight direction must leave the floor within
+                    // two grid columns of the takeoff (an interior floor cell would
+                    // otherwise pay for a full all-fail lattice).
+                    let bearing = yaw_of(b.origin.xy() - a.origin.xy()).to_radians();
+                    let (sx, sy) = (bearing.cos().round() as i32, bearing.sin().round() as i32);
+                    let lip = !self.has_ground_near(a.gx + sx, a.gy + sy, a.origin.z)
+                        || !self.has_ground_near(a.gx + 2 * sx, a.gy + 2 * sy, a.origin.z);
+                    targets.push((v_floor, to, off, horiz, dz, lip));
+                }
+                targets.sort_by(|x, y| x.0.total_cmp(&y.0));
+                targets.truncate(GT_TARGETS_PER_DIR);
+                for (v_floor, to, off, _horiz, dz, lip) in targets {
+                    let b = self.cells[to as usize];
+                    let side = off.signum();
+                    // Generic self-contained runway-turn scout. A real ordinary
+                    // predecessor supplies the entry heading; the traversal then
+                    // owns the complete connected runway, grounded rotation and
+                    // flight. This is deliberately derived only from graph/BSP
+                    // geometry -- no map name, cell id or coordinate oracle.
+                    let mut self_contained = Vec::new();
+                    for predecessor in self
+                        .links
+                        .iter()
+                        .filter(|link| link.to == from && matches!(link.kind, LinkKind::Walk | LinkKind::Step))
+                    {
+                        let pred_origin = self.cells[predecessor.from as usize].origin;
+                        let incoming = self.cells[from as usize].origin.xy() - pred_origin.xy();
+                        if incoming.length_squared() < 1.0 {
+                            continue;
+                        }
+                        let entry_yaw_base = yaw_of(incoming);
+                        let acquisition_turn = wrap180(entry_yaw_base - psi0).abs();
+                        if !(30.0..=150.0).contains(&acquisition_turn) {
+                            continue;
+                        }
+                        // Keep ordinary and hot ground arrivals as separate certificates. A single
+                        // convex envelope spanning both could contain an unsafe middle state. The
+                        // turned yaw is derived from graph geometry rather than a map coordinate.
+                        let turn_away = wrap180(entry_yaw_base - psi0);
+                        let turned_yaw = (entry_yaw_base + turn_away * 0.40).rem_euclid(360.0);
+                        // A graph diagonal is not necessarily traversable by the expanded player hull
+                        // around a BSP corner. Only the straight predecessor profile depends on that
+                        // chord; fail it closed if the hull clips before the handoff cell.
+                        let profiles = [
+                            (params.maxspeed, 0.04, entry_yaw_base, 2.0),
+                            (params.maxspeed, 0.04, turned_yaw, 4.0),
+                            (params.maxspeed * 1.1875, 0.04, turned_yaw, 4.0),
+                        ];
+                        for (v, entry_v_tol, entry_yaw0, entry_yaw_tol) in profiles {
+                            let launch_yaw = (psi0 + off * 0.5).rem_euclid(360.0);
+                            let (ls, lc) = launch_yaw.to_radians().sin_cos();
+                            let launch_dir = Vec3::new(lc, ls, 0.0);
+                            let gt = GroundTurnCurl {
+                                version: RUNWAY_TURN_VERSION,
+                                runway_aim: a.origin + run_dir * 12.0,
+                                blended_runway: true,
+                                runway_yaw: psi0,
+                                lip_reach: 28.0,
+                                hold_speed: v_floor + 48.0,
+                                turn_dist: runup.min(224.0),
+                                launch_yaw,
+                                yaw_min: (launch_yaw - 35.0).rem_euclid(360.0),
+                                box_min: a.origin - Vec3::new(GT_BOX_HALF, GT_BOX_HALF, 1.0),
+                                box_max: a.origin + Vec3::new(GT_BOX_HALF, GT_BOX_HALF, 0.0),
+                                launch_gain: 8.0,
+                                hold_aim: a.origin + launch_dir * 512.0,
+                                gate_point: a.origin,
+                                gate_normal: Vec3::ZERO,
+                                air_gain: 8.0,
+                                landing_aim: b.origin,
+                                entry_speed_lo: v * (1.0 - entry_v_tol),
+                                entry_speed_hi: v * (1.0 + entry_v_tol),
+                                entry_yaw_lo: (entry_yaw0 - entry_yaw_tol).rem_euclid(360.0),
+                                entry_yaw_hi: (entry_yaw0 + entry_yaw_tol).rem_euclid(360.0),
+                                landing_speed_lo: 0.0,
+                                landing_yaw: 0.0,
+                            };
+                            let (sy, cy) = entry_yaw0.to_radians().sin_cos();
+                            let entry = PmState {
+                                origin: entry_origin,
+                                vel: Vec3::new(v * cy, v * sy, 0.0),
+                                on_ground: true,
+                                jump_held: false,
+                            };
+                            if ground_turn_rolls(self, bsp, entry, 0.020, a.origin, &gt, to, &p).is_none() {
+                                continue;
+                            }
+                            if let Some((worst, land_lo, land_yaw)) = self.certify_ground_turn(
+                                bsp,
+                                entry_origin,
+                                entry_yaw0,
+                                v,
+                                entry_v_tol,
+                                entry_yaw_tol,
+                                a.origin,
+                                &gt,
+                                to,
+                                &p,
+                            ) {
+                                let mut gt = gt;
+                                gt.landing_speed_lo = land_lo;
+                                gt.landing_yaw = land_yaw;
+                                self_contained.push((worst, v, gt));
+                            }
+                        }
+                    }
+                    if !self_contained.is_empty() {
+                        for (worst, v_req, gt) in self_contained {
+                            let airtime = jump_airtime(dz, params.gravity);
+                            let link = Link {
+                                from,
+                                to,
+                                kind: LinkKind::SpeedJump,
+                                cost: worst,
+                            };
+                            let tr = SpeedJumpTraversal {
+                                takeoff: a.origin,
+                                v_req,
+                                airtime,
+                                landing_speed_lo: gt.landing_speed_lo,
+                                chained: false,
+                                curl_gain: gt.air_gain,
+                                curl_entry_aim: Vec3::ZERO,
+                                curl_switch_dist: 0.0,
+                                curl_landing_aim: gt.landing_aim,
+                                ground_turn: Some(gt),
+                            };
+                            cands.push((worst, link, tr));
+                        }
+                        continue;
+                    }
+                    if !lip {
+                        continue;
+                    }
+                    // The legacy carried-speed lattice remains scoped to gaps
+                    // whose ballistic floor exceeds the locally deliverable
+                    // plain-curl regime. The self-contained scout above is the
+                    // only new work for candidates below this boundary.
+                    let v_del_local = prestrafe_delivered(
+                        runway.min(CURL_RUNUP_CAP),
+                        params.accel,
+                        params.maxspeed,
+                        params.friction,
+                        params.stopspeed,
+                    );
+                    if v_floor * SJ_MARGIN <= v_del_local * CURL_V_LO_FRAC {
+                        continue;
+                    }
+                    let entry_yaw0 = psi0;
+                    // Canonical-scout gate: a handful of representative profiles;
+                    // only a candidate at least one of them lands pays for the
+                    // full lattice. (The lattice re-searches from scratch, so a
+                    // canonical near-miss still gets its neighbors tried.)
+                    let canonical_ok = {
+                        let (sy, cy) = entry_yaw0.to_radians().sin_cos();
+                        let mut ok = false;
+                        'canon: for &v in entry_speeds {
+                            if v < v_floor {
+                                continue;
+                            }
+                            for &(gate_dist, off_l, lat) in &[
+                                (0.0f32, 8.0f32, 0.0f32),
+                                (0.0, 16.0, 0.0),
+                                (0.0, 24.0, 0.0),
+                                (0.0f32, 42.0f32, 0.0f32),
+                                (0.0, 50.0, 0.0),
+                                (0.0, 42.0, -8.0),
+                                (0.0, 50.0, -8.0),
+                                (0.0, 42.0, 8.0),
+                                (0.0, 50.0, 8.0),
+                                (96.0, 50.0, 0.0),
+                                (160.0, 42.0, 0.0),
+                            ] {
+                                let launch_yaw = (psi0 + side * off_l).rem_euclid(360.0);
+                                let (ls, lc) = launch_yaw.to_radians().sin_cos();
+                                let launch_dir = Vec3::new(lc, ls, 0.0);
+                                let gt = GroundTurnCurl {
+                                    version: GROUND_TURN_VERSION,
+                                    runway_aim: a.origin + run_dir * 12.0 + Vec3::new(-run_dir.y, run_dir.x, 0.0) * lat,
+                                    blended_runway: false,
+                                    runway_yaw: 0.0,
+                                    lip_reach: 0.0,
+                                    hold_speed: 0.0,
+                                    turn_dist: 64.0,
+                                    launch_yaw,
+                                    yaw_min: (launch_yaw - 18.0).rem_euclid(360.0),
+                                    box_min: a.origin - Vec3::new(GT_BOX_HALF, GT_BOX_HALF, 1.0),
+                                    box_max: a.origin + Vec3::new(GT_BOX_HALF, GT_BOX_HALF, 0.0),
+                                    launch_gain: 32.0,
+                                    hold_aim: a.origin + launch_dir * 512.0,
+                                    gate_point: a.origin + launch_dir * gate_dist,
+                                    gate_normal: if gate_dist > 0.0 { -launch_dir } else { Vec3::ZERO },
+                                    air_gain: 256.0,
+                                    landing_aim: b.origin,
+                                    entry_speed_lo: v * (1.0 - GT_ENTRY_V_TOL),
+                                    entry_speed_hi: v * (1.0 + GT_ENTRY_V_TOL),
+                                    entry_yaw_lo: (entry_yaw0 - GT_ENTRY_YAW_TOL).rem_euclid(360.0),
+                                    entry_yaw_hi: (entry_yaw0 + GT_ENTRY_YAW_TOL).rem_euclid(360.0),
+                                    landing_speed_lo: 0.0,
+                                    landing_yaw: 0.0,
+                                };
+                                let entry = PmState {
+                                    origin: entry_origin,
+                                    vel: Vec3::new(v * cy, v * sy, 0.0),
+                                    on_ground: true,
+                                    jump_held: false,
+                                };
+                                if ground_turn_rolls_tol(self, bsp, entry, 0.020, a.origin, &gt, to, &p, 64.0).is_some()
+                                {
+                                    ok = true;
+                                    break 'canon;
+                                }
+                            }
+                        }
+                        ok
+                    };
+                    if !canonical_ok {
+                        continue;
+                    }
+                    let mut solved: Option<(f32, f32, GroundTurnCurl)> = None; // (worst_elapsed, v_req, contract)
+                    'search: for &v in entry_speeds {
+                        if v < v_floor {
+                            continue;
+                        }
+                        for &gate_dist in &GT_GATE_DISTS {
+                            for &lat in &GT_RUNWAY_LATERALS {
+                                for &turn_dist in &GT_TURN_DISTS {
+                                    for &off_l in &GT_LAUNCH_OFFSETS {
+                                        for &slack in &GT_YAW_SLACKS {
+                                            for &lgain in &GT_LAUNCH_GAINS {
+                                                for &again in &GT_AIR_GAINS {
+                                                    let launch_yaw = (psi0 + side * off_l).rem_euclid(360.0);
+                                                    let (ls, lc) = launch_yaw.to_radians().sin_cos();
+                                                    let launch_dir = Vec3::new(lc, ls, 0.0);
+                                                    let lateral = Vec3::new(-run_dir.y, run_dir.x, 0.0) * lat;
+                                                    let gt = GroundTurnCurl {
+                                                        version: GROUND_TURN_VERSION,
+                                                        runway_aim: a.origin + run_dir * 12.0 + lateral,
+                                                        blended_runway: false,
+                                                        runway_yaw: 0.0,
+                                                        lip_reach: 0.0,
+                                                        hold_speed: 0.0,
+                                                        turn_dist,
+                                                        launch_yaw,
+                                                        yaw_min: (launch_yaw - slack).rem_euclid(360.0),
+                                                        box_min: a.origin - Vec3::new(GT_BOX_HALF, GT_BOX_HALF, 1.0),
+                                                        box_max: a.origin + Vec3::new(GT_BOX_HALF, GT_BOX_HALF, 0.0),
+                                                        launch_gain: lgain,
+                                                        hold_aim: a.origin + launch_dir * 512.0,
+                                                        gate_point: a.origin + launch_dir * gate_dist,
+                                                        gate_normal: if gate_dist > 0.0 {
+                                                            -launch_dir
+                                                        } else {
+                                                            Vec3::ZERO
+                                                        },
+                                                        air_gain: again,
+                                                        landing_aim: b.origin,
+                                                        entry_speed_lo: v * (1.0 - GT_ENTRY_V_TOL),
+                                                        entry_speed_hi: v * (1.0 + GT_ENTRY_V_TOL),
+                                                        entry_yaw_lo: (entry_yaw0 - GT_ENTRY_YAW_TOL).rem_euclid(360.0),
+                                                        entry_yaw_hi: (entry_yaw0 + GT_ENTRY_YAW_TOL).rem_euclid(360.0),
+                                                        landing_speed_lo: 0.0, // stamped after certification
+                                                        landing_yaw: 0.0,      // stamped after certification
+                                                    };
+                                                    // Cheap scout: one center rollout at 20 ms.
+                                                    let (sy, cy) = entry_yaw0.to_radians().sin_cos();
+                                                    let entry = PmState {
+                                                        origin: entry_origin,
+                                                        vel: Vec3::new(v * cy, v * sy, 0.0),
+                                                        on_ground: true,
+                                                        jump_held: false,
+                                                    };
+                                                    if ground_turn_rolls(self, bsp, entry, 0.020, a.origin, &gt, to, &p)
+                                                        .is_none()
+                                                    {
+                                                        continue;
+                                                    }
+                                                    if let Some((worst, land_lo, land_yaw)) = self.certify_ground_turn(
+                                                        bsp,
+                                                        entry_origin,
+                                                        entry_yaw0,
+                                                        v,
+                                                        GT_ENTRY_V_TOL,
+                                                        GT_ENTRY_YAW_TOL,
+                                                        a.origin,
+                                                        &gt,
+                                                        to,
+                                                        &p,
+                                                    ) {
+                                                        let mut gt = gt;
+                                                        gt.landing_speed_lo = land_lo;
+                                                        gt.landing_yaw = land_yaw;
+                                                        solved = Some((worst, v, gt));
+                                                        break 'search;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let Some((worst, v_req, gt)) = solved else {
+                        continue;
+                    };
+                    let airtime = jump_airtime(dz, params.gravity);
+                    // The certified worst elapsed IS the whole leg (run-up,
+                    // rotation, flight) — no commit padding on top; padding it
+                    // would double-count and misrank the chain against routes
+                    // whose walk legs are priced optimistically.
+                    let cost = worst;
+                    let link = Link {
+                        from,
+                        to,
+                        kind: LinkKind::SpeedJump,
+                        cost,
+                    };
+                    let tr = SpeedJumpTraversal {
+                        takeoff: a.origin,
+                        v_req,
+                        airtime,
+                        landing_speed_lo: gt.landing_speed_lo,
+                        chained: true,
+                        curl_gain: gt.air_gain,
+                        curl_entry_aim: Vec3::ZERO,
+                        curl_switch_dist: 0.0,
+                        curl_landing_aim: gt.landing_aim,
+                        ground_turn: Some(gt),
+                    };
+                    cands.push((cost, link, tr));
+                }
+            }
+        }
+        cands.sort_by(|x, y| x.0.total_cmp(&y.0));
+        cands.truncate(GT_MAX_PER_CELL);
+        out.extend(cands.into_iter().map(|(_, l, t)| (l, t)));
+    }
+
+    /// Certify one **optimal-sweep** ground-turn profile across its whole
+    /// envelope (entry speeds {lo, mid, hi} x entry yaws {-tol, 0, +tol} x the
+    /// three cadence classes), exactly like [`Self::certify_ground_turn`] but
+    /// flying the grounded approach with [`ground_turn_ground_cmd_optimal`]
+    /// (see [`Self::solve_chained_ground_turn_optimal_curl`]). Returns the
+    /// worst (largest) certified elapsed, the minimum horizontal landing speed,
+    /// and the centre-corner landing yaw.
+    #[allow(clippy::too_many_arguments)]
+    fn certify_ground_turn_optimal(
+        &self,
+        bsp: &Bsp,
+        entry_origin: Vec3,
+        entry_yaw0: f32,
+        v_req: f32,
+        entry_v_tol: f32,
+        entry_yaw_tol: f32,
+        takeoff: Vec3,
+        gt: &GroundTurnCurl,
+        to: CellId,
+        p: &PmParams,
+    ) -> Option<(f32, f32, f32)> {
+        let mut worst = 0.0f32;
+        let mut land_lo = f32::INFINITY;
+        let mut land_yaw = 0.0f32;
+        let speeds = [v_req * (1.0 - entry_v_tol), v_req, v_req * (1.0 + entry_v_tol)];
+        let yaws = [entry_yaw0 - entry_yaw_tol, entry_yaw0, entry_yaw0 + entry_yaw_tol];
+        for &dt in &GT_DT_CLASSES {
+            for &v in &speeds {
+                for &yaw in &yaws {
+                    let (sy, cy) = yaw.to_radians().sin_cos();
+                    let entry = PmState {
+                        origin: entry_origin,
+                        vel: Vec3::new(v * cy, v * sy, 0.0),
+                        on_ground: true,
+                        jump_held: false,
+                    };
+                    let (elapsed, land) = ground_turn_rolls_optimal_tol(self, bsp, entry, dt, takeoff, gt, to, p, 0.0)?;
+                    worst = worst.max(elapsed);
+                    land_lo = land_lo.min(land.vel.xy().length());
+                    if dt == GT_DT_CLASSES[1] && v == v_req && yaw == entry_yaw0 {
+                        land_yaw = yaw360_of(land.vel.xy());
+                    }
+                }
+            }
+        }
+        Some((worst, land_lo, land_yaw))
+    }
+
+    /// Additive low-entry sibling of [`Self::solve_chained_ground_turn_from`]:
+    /// identical target discovery and identical certification matrix, but the
+    /// grounded approach is flown with the **ground-optimal single-sided sweep**
+    /// ([`ground_turn_ground_cmd_optimal`]) instead of the default bearing-follow
+    /// weave. That law holds the per-tick speed-maximising wish offset
+    /// (theta = acos(u*/speed)) off the *current* velocity while rotating onto
+    /// `launch_yaw`, so a low carried-entry runway (~320..360) can build the exit
+    /// speed the flight budget needs -- the regime the default weave saturates
+    /// below (C2 diagnosis; cf. `crates/rtx-nav/tests/gt_greedy_angle_probe.rs`,
+    /// where the same physics reaches ~452 u/s from a 358 entry). Because the
+    /// exit speed is *built*, the ballistic-floor prefilter is relaxed to
+    /// [`GT_OPT_BUILD_FRAC`] x the entry ladder (the default solver assumes
+    /// launch speed ~= entry speed, which is exactly the assumption this law
+    /// breaks). Emits contracts tagged [`GROUND_TURN_OPTIMAL_VERSION`] so the
+    /// flown law equals the proven law.
+    ///
+    /// The production curl pass calls this with `GT_OPT_ENTRY_SPEEDS`; `gt-search --optimal`
+    /// calls the same solver with an operator-supplied entry ladder.
+    /// Deterministic: a pure bounded lattice over the same inputs, no wall clock
+    /// and no rng.
+    pub fn solve_chained_ground_turn_optimal_curl(
+        &self,
+        bsp: &Bsp,
+        ledge: CellId,
+        params: SpeedJumpParams,
+        entry_speeds: &[f32],
+        out: &mut Vec<(Link, SpeedJumpTraversal)>,
+    ) {
+        let a = self.cells[ledge as usize];
+        if bsp.is_liquid_at(a.origin) {
+            return;
+        }
+        let p = PmParams {
+            gravity: params.gravity,
+            accel: params.accel,
+            friction: params.friction,
+            stopspeed: params.stopspeed,
+            maxspeed: params.maxspeed,
+        };
+        let entry_speed_max = entry_speeds.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        // The optimal law BUILDS exit speed above entry, so a reachable target's
+        // ballistic floor may exceed the entry ladder; scan/prefilter to the
+        // built ceiling, not the entry ceiling.
+        let built_ceiling = entry_speed_max * GT_OPT_BUILD_FRAC;
+        let mut cands: Vec<(f32, Link, SpeedJumpTraversal)> = Vec::new();
+        for (dgx, dgy) in COMPASS {
+            let runway = self.measure_runway_lax(bsp, &a, dgx, dgy);
+            if runway < GT_MIN_RUNWAY {
+                continue;
+            }
+            let psi0 = yaw_of(Vec2::new(dgx as f32, dgy as f32));
+            let run_dir = Vec3::new(dgx as f32, dgy as f32, 0.0).normalize();
+            for runup in [runway.min(GT_RUNUP_CAP), runway.min(GT_RUNUP_SHORT)] {
+                let entry_pt = a.origin - run_dir * runup;
+                let Some(from) = self.nearest_within(entry_pt, GRID * 1.5, STEP_HEIGHT * (runup / GRID + 1.0)) else {
+                    continue;
+                };
+                if from == ledge {
+                    continue;
+                }
+                let entry_origin = self.cells[from as usize].origin + Vec3::new(0.0, 0.0, 0.03125);
+                let fly_cap = GT_FLIGHT_TICK_CAP as f32 * 0.021;
+                let reach = built_ceiling * fly_cap;
+                let scan = ((reach / GRID).ceil() as i32).max(1);
+                let mut targets: Vec<(f32, CellId, f32, f32)> = Vec::new(); // (v_floor, to, off, dz)
+                for to in self.neighbors_within(a.gx, a.gy, scan) {
+                    if to == ledge || to == from {
+                        continue;
+                    }
+                    let b = self.cells[to as usize];
+                    let dz = b.origin.z - a.origin.z;
+                    let horiz = (b.origin.xy() - a.origin.xy()).length();
+                    if !(-SJ_MAX_DROP..=JUMP_APEX).contains(&dz) || horiz <= JUMP_REACH {
+                        continue;
+                    }
+                    let off = wrap180(yaw_of(b.origin.xy() - a.origin.xy()) - psi0);
+                    if !(GT_OFF_LO..=GT_OFF_HI).contains(&off.abs()) {
+                        continue;
+                    }
+                    if self.has_direct_link(ledge, to) || self.has_direct_link(from, to) {
+                        continue;
+                    }
+                    let v_floor = v_required(horiz, dz, params.gravity);
+                    if !v_floor.is_finite() || v_floor > built_ceiling * (1.0 + GT_ENTRY_V_TOL) {
+                        continue;
+                    }
+                    // A genuine lip: the flight direction must leave the floor
+                    // within two grid columns of the takeoff.
+                    let bearing = yaw_of(b.origin.xy() - a.origin.xy()).to_radians();
+                    let (sx, sy) = (bearing.cos().round() as i32, bearing.sin().round() as i32);
+                    let lip = !self.has_ground_near(a.gx + sx, a.gy + sy, a.origin.z)
+                        || !self.has_ground_near(a.gx + 2 * sx, a.gy + 2 * sy, a.origin.z);
+                    if !lip {
+                        continue;
+                    }
+                    targets.push((v_floor, to, off, dz));
+                }
+                targets.sort_by(|x, y| x.0.total_cmp(&y.0));
+                targets.truncate(GT_TARGETS_PER_DIR);
+                for (v_floor, to, off, dz) in targets {
+                    let b = self.cells[to as usize];
+                    let side = off.signum();
+                    let entry_yaw0 = psi0;
+                    let mut solved: Option<(f32, f32, GroundTurnCurl)> = None; // (worst, v_req, contract)
+                    'search: for &v in entry_speeds {
+                        for &gate_dist in &GT_GATE_DISTS {
+                            for &off_l in &GT_OPT_LAUNCH_OFFSETS {
+                                for &again in &GT_AIR_GAINS {
+                                    let launch_yaw = (psi0 + side * off_l).rem_euclid(360.0);
+                                    let (ls, lc) = launch_yaw.to_radians().sin_cos();
+                                    let launch_dir = Vec3::new(lc, ls, 0.0);
+                                    let gt = GroundTurnCurl {
+                                        version: GROUND_TURN_OPTIMAL_VERSION,
+                                        runway_aim: a.origin + run_dir * 12.0,
+                                        blended_runway: false,
+                                        runway_yaw: psi0,
+                                        lip_reach: 0.0,
+                                        hold_speed: 0.0,
+                                        // Unused by the optimal law (it sweeps from entry, no
+                                        // runway->rotation switch); stamped inert for provenance.
+                                        turn_dist: 0.0,
+                                        launch_yaw,
+                                        yaw_min: (launch_yaw - side * GT_OPT_LAUNCH_SLACK).rem_euclid(360.0),
+                                        box_min: a.origin - Vec3::new(GT_BOX_HALF, GT_BOX_HALF, 1.0),
+                                        box_max: a.origin + Vec3::new(GT_BOX_HALF, GT_BOX_HALF, 0.0),
+                                        launch_gain: 32.0,
+                                        hold_aim: a.origin + launch_dir * 512.0,
+                                        gate_point: a.origin + launch_dir * gate_dist,
+                                        gate_normal: if gate_dist > 0.0 { -launch_dir } else { Vec3::ZERO },
+                                        air_gain: again,
+                                        landing_aim: b.origin,
+                                        entry_speed_lo: v * (1.0 - GT_ENTRY_V_TOL),
+                                        entry_speed_hi: v * (1.0 + GT_ENTRY_V_TOL),
+                                        entry_yaw_lo: (entry_yaw0 - GT_ENTRY_YAW_TOL).rem_euclid(360.0),
+                                        entry_yaw_hi: (entry_yaw0 + GT_ENTRY_YAW_TOL).rem_euclid(360.0),
+                                        landing_speed_lo: 0.0,
+                                        landing_yaw: 0.0,
+                                    };
+                                    // Cheap scout: one centre rollout at 20 ms.
+                                    let (sy, cy) = entry_yaw0.to_radians().sin_cos();
+                                    let entry = PmState {
+                                        origin: entry_origin,
+                                        vel: Vec3::new(v * cy, v * sy, 0.0),
+                                        on_ground: true,
+                                        jump_held: false,
+                                    };
+                                    if ground_turn_rolls_optimal_tol(self, bsp, entry, 0.020, a.origin, &gt, to, &p, 0.0)
+                                        .is_none()
+                                    {
+                                        continue;
+                                    }
+                                    if let Some((worst, land_lo, land_yaw)) = self.certify_ground_turn_optimal(
+                                        bsp,
+                                        entry_origin,
+                                        entry_yaw0,
+                                        v,
+                                        GT_ENTRY_V_TOL,
+                                        GT_ENTRY_YAW_TOL,
+                                        a.origin,
+                                        &gt,
+                                        to,
+                                        &p,
+                                    ) {
+                                        let mut gt = gt;
+                                        gt.landing_speed_lo = land_lo;
+                                        gt.landing_yaw = land_yaw;
+                                        solved = Some((worst, v, gt));
+                                        break 'search;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let Some((worst, v_req, gt)) = solved else {
+                        continue;
+                    };
+                    let _ = v_floor;
+                    let airtime = jump_airtime(dz, params.gravity);
+                    let link = Link {
+                        from,
+                        to,
+                        kind: LinkKind::SpeedJump,
+                        cost: worst,
+                    };
+                    let tr = SpeedJumpTraversal {
+                        takeoff: a.origin,
+                        v_req,
+                        airtime,
+                        landing_speed_lo: gt.landing_speed_lo,
+                        chained: true,
+                        curl_gain: gt.air_gain,
+                        curl_entry_aim: Vec3::ZERO,
+                        curl_switch_dist: 0.0,
+                        curl_landing_aim: gt.landing_aim,
+                        ground_turn: Some(gt),
+                    };
+                    cands.push((worst, link, tr));
+                }
+            }
+        }
+        cands.sort_by(|x, y| x.0.total_cmp(&y.0));
+        cands.truncate(GT_MAX_PER_CELL);
+        out.extend(cands.into_iter().map(|(_, l, t)| (l, t)));
+    }
+}
+
+/// Contract version tag for [`NavGraph::solve_chained_ground_turn_optimal_curl`]
+/// candidates: the grounded approach is the ground-optimal single-sided sweep
+/// ([`ground_turn_ground_cmd_optimal`]), distinct from the bearing-follow weave
+/// of [`GROUND_TURN_VERSION`]/[`RUNWAY_TURN_VERSION`]. A runtime executor MUST
+/// dispatch on this tag to reproduce the proven trajectory.
+pub const GROUND_TURN_OPTIMAL_VERSION: u16 = 3;
+/// Launch fires when the carried velocity is within this many degrees of
+/// `launch_yaw` (approach side) and inside the takeoff box — part of the
+/// optimal-sweep styrlag; a runtime reproduces it verbatim.
+const GT_OPT_LAUNCH_SLACK: f32 = 8.0;
+/// Launch-heading offsets (deg off the corridor axis, toward the target side)
+/// sampled by the optimal-sweep solver. Wider than [`GT_LAUNCH_OFFSETS`]: the
+/// single-sided sweep can rotate far while still accelerating.
+const GT_OPT_LAUNCH_OFFSETS: [f32; 7] = [16.0, 24.0, 35.0, 42.0, 50.0, 60.0, 68.0];
+/// Fraction of the entry ladder the optimal sweep is assumed to be able to
+/// build the exit speed up to (calibrated near the C2 greedy result 452/358
+/// ~= 1.26; a small margin above). Used only to widen the reach/ballistic-floor
+/// prefilter so high-`v_req` targets are not pruned before certification proves
+/// or rejects them.
+const GT_OPT_BUILD_FRAC: f32 = 1.3;
+/// Low-entry ladder for the production emission of the optimal-sweep solver.
+/// From the corpus calibration the carried DM3 entry band clusters at
+/// p10/p50 = 332/358 u/s; this ladder brackets that (320/340/360) so the
+/// built-exit law is certified from the speeds a chained route actually
+/// delivers, distinct from the high-entry `GT_ENTRY_SPEEDS` (~439/500) the
+/// default weave assumes.
+const GT_OPT_ENTRY_SPEEDS: [f32; 3] = [320.0, 340.0, 360.0];
+
+/// The deterministic ground-optimal single-sided sweep -- the "optimal curl"
+/// grounded styrlag (see [`NavGraph::solve_chained_ground_turn_optimal_curl`]).
+///
+/// The default grounded steering ([`ground_turn_ground_cmd`]) follows a
+/// *position-scheduled* world bearing (`runway_yaw` -> `launch_yaw`) and weaves
+/// its strafe sign to recentre the run onto that bearing; that recentre caps the
+/// exit speed a low carried-entry runway can build. This law instead holds the
+/// **ground-optimal wish offset off the current velocity**:
+/// `theta = acos(u*/speed)` with `u* = maxspeed - accel*maxspeed*dt`, which is
+/// the closed form of the per-tick speed-maximising angle above `sv_maxspeed`
+/// (deriving it: velocity gain squared is `2*speed*A*cos(theta) + A^2` with
+/// `A = min(accel*maxspeed*dt, maxspeed - speed*cos(theta))`, maximised at
+/// `cos(theta) = u*/speed`; a greedy 1-degree probe over 0..70 converges to it).
+/// The strafe side is taken **toward `launch_yaw`** and recomputed each tick, so
+/// the carried velocity rotates monotonically onto the launch heading and then
+/// holds there (a tight weave about `launch_yaw`) while still accelerating, until
+/// the launch gate fires. Below the angling threshold (`speed <= u*`, never
+/// reached by the >=320 entry ladder) it simply runs forward at `launch_yaw`.
+///
+/// Runtime reproduction: this is a pure function of
+/// `(velocity, launch_yaw, accel, maxspeed, dt)`; a live executor reproduces the
+/// exact grounded trajectory by calling it every grounded setup tick until the
+/// launch gate (`|wrap180(launch_yaw - vel_yaw)| <= GT_OPT_LAUNCH_SLACK` while
+/// inside the takeoff box) fires, then flies the stored launch/air curl.
+pub fn ground_turn_ground_cmd_optimal(vel_xy: Vec2, gt: &GroundTurnCurl, accel: f32, maxspeed: f32, dt: f32) -> Cmd {
+    let speed = vel_xy.length();
+    let a_ground = accel * maxspeed * dt;
+    let u_star = (maxspeed - a_ground).max(0.0);
+    if speed <= u_star.max(60.0) {
+        // No over-cap speed to preserve: spend the runway running onto the
+        // launch heading. (Unreached by the certified >=320 entry ladder.)
+        return Cmd {
+            view_yaw: gt.launch_yaw,
+            forward: MOVE_SPEED,
+            side: 0.0,
+            jump: false,
+        };
+    }
+    let vel_yaw = yaw_of(vel_xy);
+    // Fixed-per-tick side toward launch_yaw (no recentre onto a runway bearing):
+    // monotonic rotation onto the launch heading, then a tight hold about it.
+    let side_sign = if wrap180(gt.launch_yaw - vel_yaw) >= 0.0 { 1.0 } else { -1.0 };
+    let theta = (u_star / speed).clamp(0.0, 1.0).acos();
+    let (s, c) = theta.sin_cos();
+    // Emit with the view riding the velocity and the angle in forward/side
+    // (wishdir = vel_yaw + side_sign*theta), rounded like every other emitted cmd.
+    Cmd {
+        view_yaw: vel_yaw,
+        forward: (MOVE_SPEED * c).round(),
+        side: (-side_sign * MOVE_SPEED * s).round(),
+        jump: false,
+    }
+}
+
+/// Launch gate for an optimal-sweep ([`GROUND_TURN_OPTIMAL_VERSION`]) contract:
+/// the runtime analogue of the `launch_now` closure inside
+/// [`ground_turn_rolls_optimal_tol`]. Fire on the first grounded tick inside the
+/// takeoff box whose carried velocity has rotated to within
+/// [`GT_OPT_LAUNCH_SLACK`] of `launch_yaw` (approach side).
+///
+/// Deviation from the rollout: the rollout fixes `sweep_side` from the *entry*
+/// heading and tests `wrap180(launch_yaw - vel_yaw) * sweep_side <= SLACK`, while
+/// here `sweep_side = sign(wrap180(launch_yaw - vel_yaw))` is recomputed from the
+/// *current* velocity — matching [`ground_turn_ground_cmd_optimal`], which also
+/// derives its strafe side from the live velocity. The two are equivalent for the
+/// launch decision: the sweep rotates the velocity monotonically toward
+/// `launch_yaw`, so `sign(wrap180(launch_yaw - vel_yaw))` is invariant until the
+/// velocity actually reaches the launch heading; on every pre-fire tick both
+/// forms therefore agree, and `x * sign(x) = |x|` so the test reduces to
+/// `|wrap180(launch_yaw - vel_yaw)| <= SLACK`, firing on exactly the same first
+/// tick the entry-fixed form fires.
+pub fn ground_turn_should_launch_optimal(origin: Vec3, vel_xy: Vec2, on_ground: bool, gt: &GroundTurnCurl) -> bool {
+    let in_box = origin.x >= gt.box_min.x
+        && origin.x <= gt.box_max.x
+        && origin.y >= gt.box_min.y
+        && origin.y <= gt.box_max.y
+        && origin.z >= gt.box_min.z;
+    let delta = wrap180(gt.launch_yaw - yaw_of(vel_xy));
+    let sweep_side = if delta >= 0.0 { 1.0 } else { -1.0 };
+    on_ground && in_box && delta * sweep_side <= GT_OPT_LAUNCH_SLACK
+}
+
+/// One certified **optimal-sweep** rollout (the [`ground_turn_ground_cmd_optimal`]
+/// analogue of [`ground_turn_rolls`]): grounded ground-optimal sweep from `entry`
+/// onto `launch_yaw`, launch on the first grounded tick within
+/// [`GT_OPT_LAUNCH_SLACK`] of `launch_yaw` inside the takeoff box, then the stored
+/// launch/air curl to first touchdown resolving to `to` -- zero wall contact,
+/// zero start-solid, no fall. `accept_near > 0` also accepts a touchdown within
+/// that XY distance of the target cell (the feasibility scout; certification uses
+/// exact, `accept_near = 0`). Returns (elapsed, landing state).
+#[allow(clippy::too_many_arguments)]
+fn ground_turn_rolls_optimal_tol(
+    graph: &NavGraph,
+    bsp: &Bsp,
+    entry: PmState,
+    dt: f32,
+    takeoff: Vec3,
+    gt: &GroundTurnCurl,
+    to: CellId,
+    p: &PmParams,
+    accept_near: f32,
+) -> Option<(f32, PmState)> {
+    ground_turn_rolls_optimal_tol_report(graph, bsp, entry, dt, takeoff, gt, to, p, accept_near).result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ground_turn_rolls_optimal_tol_report(
+    graph: &NavGraph,
+    bsp: &Bsp,
+    entry: PmState,
+    dt: f32,
+    takeoff: Vec3,
+    gt: &GroundTurnCurl,
+    to: CellId,
+    p: &PmParams,
+    accept_near: f32,
+) -> GroundTurnRolloutTrace {
+    let mut pmove_steps = 0usize;
+    let result = ground_turn_rolls_optimal_tol_counted(
+        graph,
+        bsp,
+        entry,
+        dt,
+        takeoff,
+        gt,
+        to,
+        p,
+        accept_near,
+        &mut pmove_steps,
+    );
+    GroundTurnRolloutTrace { result, pmove_steps }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ground_turn_rolls_optimal_tol_counted(
+    graph: &NavGraph,
+    bsp: &Bsp,
+    entry: PmState,
+    dt: f32,
+    takeoff: Vec3,
+    gt: &GroundTurnCurl,
+    to: CellId,
+    p: &PmParams,
+    accept_near: f32,
+    pmove_steps: &mut usize,
+) -> Option<(f32, PmState)> {
+    use crate::pmove::pm_step_report;
+    let solid = |o: Vec3| {
+        let tr = bsp.hull1_trace(o, o);
+        tr.start_solid || tr.all_solid
+    };
+    let mut s = entry;
+    let mut elapsed = 0.0;
+    let mut airborne_streak = 0usize;
+    let floor_z = entry.origin.z.min(takeoff.z) - GT_FLOOR_DROP;
+    // Sweep side fixed from the entry heading; the launch gate measures signed
+    // progress toward launch_yaw on that side (fires from first reaching it).
+    let sweep_side = if wrap180(gt.launch_yaw - yaw_of(entry.vel.xy())) >= 0.0 { 1.0 } else { -1.0 };
+    let in_box = |o: Vec3| {
+        o.x >= gt.box_min.x && o.x <= gt.box_max.x && o.y >= gt.box_min.y && o.y <= gt.box_max.y && o.z >= gt.box_min.z
+    };
+    let launch_now = |o: Vec3, v: Vec2, og: bool| {
+        og && in_box(o) && wrap180(gt.launch_yaw - yaw_of(v)) * sweep_side <= GT_OPT_LAUNCH_SLACK
+    };
+    let mut setup = 0usize;
+    loop {
+        if launch_now(s.origin, s.vel.xy(), s.on_ground) {
+            break;
+        }
+        if setup >= GT_SETUP_TICK_CAP {
+            return None;
+        }
+        let cmd = ground_turn_ground_cmd_optimal(s.vel.xy(), gt, p.accel, p.maxspeed, dt);
+        if solid(s.origin) {
+            return None;
+        }
+        *pmove_steps += 1;
+        let rep = pm_step_report(bsp, &mut s, &cmd, p, dt);
+        if rep.wall_contact || solid(s.origin) || s.origin.z < floor_z {
+            return None;
+        }
+        elapsed += dt;
+        setup += 1;
+        airborne_streak = next_ground_turn_setup_airborne_streak(airborne_streak, s.on_ground)?;
+        if s.jump_held {
+            return None;
+        }
+    }
+    // Launch tick: fire the jump aiming along launch_yaw.
+    let (ls, lc) = gt.launch_yaw.to_radians().sin_cos();
+    let aim = s.origin.xy() + Vec2::new(lc, ls) * 512.0;
+    let cmd = ground_turn_launch_cmd(s.vel.xy(), yaw_of(aim - s.origin.xy()), gt, p.accel, p.maxspeed, dt);
+    if solid(s.origin) {
+        return None;
+    }
+    *pmove_steps += 1;
+    let rep = pm_step_report(bsp, &mut s, &cmd, p, dt);
+    if rep.wall_contact || solid(s.origin) || s.on_ground {
+        return None;
+    }
+    elapsed += dt;
+    for _ in 0..GT_FLIGHT_TICK_CAP {
+        let cmd = ground_turn_air_cmd(s.origin, s.vel.xy(), gt, p.accel, p.maxspeed, dt);
+        if solid(s.origin) {
+            return None;
+        }
+        *pmove_steps += 1;
+        let rep = pm_step_report(bsp, &mut s, &cmd, p, dt);
+        if rep.wall_contact || solid(s.origin) || s.origin.z < floor_z {
+            return None;
+        }
+        elapsed += dt;
+        if s.on_ground {
+            let land = graph.nearest_within(s.origin, 24.0, 2.0);
+            let target = graph.cells[to as usize].origin;
+            let near = accept_near > 0.0
+                && (s.origin.xy() - target.xy()).length() <= accept_near
+                && (s.origin.z - target.z).abs() <= CURL_Z_TOL;
+            return if land == Some(to) || near {
+                Some((elapsed, s))
+            } else {
+                None
+            };
+        }
+    }
+    None
+}
+
+/// Result of one live ground-turn entry witness. `outcome` is the exact target-cell touchdown
+/// state when the stored controller can execute from the supplied physical state; `None` is a
+/// fail-closed rejection. `pmove_steps` includes work performed before a rejection, so callers can
+/// account for unsuccessful parallel candidates as well as the selected one.
+#[derive(Clone, Copy, Debug)]
+pub struct GroundTurnLiveRollout {
+    pub outcome: Option<PmState>,
+    pub pmove_steps: usize,
+}
+
+/// Result of the live continuation guard for a checked ground-turn setup. Ordinary links are
+/// reported separately so callers can preserve their exact legacy execution path without doing any
+/// pmove work. `Continue` carries the first-tick predicted state for tests/diagnostics and the streak
+/// that must be stored for the next real setup frame. Only a grounded-to-airborne first tick runs a
+/// bounded prospective seam witness through the remaining existing airborne-cap steps.
+#[derive(Clone, Copy, Debug)]
+pub enum GroundTurnSetupContinuation {
+    NotGroundTurn,
+    Continue { state: PmState, airborne_streak: usize },
+    Abort,
+}
+
+/// A raw-controller/wire-pmove clock pair verified for one setup frame. It is evidence about that
+/// frame, not proof of future cadence: the executor must re-observe the same bits on every airborne
+/// setup frame. A missing or changed observation withholds the witness and fails the edge projection
+/// closed instead of inventing future timing from a stale frame.
+#[derive(Clone, Copy, Debug)]
+pub struct GroundTurnSetupClock {
+    controller_dt: f32,
+    move_dt: f32,
+}
+
+impl GroundTurnSetupClock {
+    /// Record a raw-controller/wire-pmove pair after the caller has verified the current frame's
+    /// schedule. This does not prove the future: the executor must compare the pair again on every
+    /// airborne setup frame and withhold the witness when it changes or disappears.
+    pub fn from_verified_schedule(controller_dt: f32, move_dt: f32) -> Option<Self> {
+        let usable =
+            controller_dt.is_finite() && controller_dt > 0.0 && move_dt.is_finite() && move_dt > 0.0;
+        debug_assert!(usable, "a verified setup schedule must contain finite positive durations");
+        usable.then_some(Self { controller_dt, move_dt })
+    }
+
+    pub fn controller_dt(self) -> f32 {
+        self.controller_dt
+    }
+
+    pub fn move_dt(self) -> f32 {
+        self.move_dt
+    }
+}
+
+impl PartialEq for GroundTurnSetupClock {
+    fn eq(&self, other: &Self) -> bool {
+        self.controller_dt.to_bits() == other.controller_dt.to_bits()
+            && self.move_dt.to_bits() == other.move_dt.to_bits()
+    }
+}
+
+impl Eq for GroundTurnSetupClock {}
+
+impl NavGraph {
+    /// Advance one non-launch setup command through the same pmove/contact checks as the ground-turn
+    /// certifier. A grounded-to-airborne result is additionally followed, using the same controller,
+    /// only through the remaining existing airborne-cap steps and must re-land safely. The returned
+    /// state is still the first real setup tick; prospective states are veto-only. Unsupported
+    /// contracts fail closed; links without a ground-turn payload do no work and retain their legacy
+    /// behavior. `move_dt` is the current fake-client `msec` duration that engine physics actually
+    /// executes. `future_clock` is accepted only as an explicit fixed-schedule contract; without one
+    /// a grounded-to-airborne projection aborts rather than assuming the current clocks will repeat.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ground_turn_setup_continuation(
+        &self,
+        bsp: &Bsp,
+        link: u32,
+        mut state: PmState,
+        cmd: Cmd,
+        setup_sigma: f32,
+        prior_airborne_streak: usize,
+        move_dt: f32,
+        future_clock: Option<GroundTurnSetupClock>,
+        p: &PmParams,
+    ) -> GroundTurnSetupContinuation {
+        use crate::pmove::pm_step_report;
+
+        let Some(traversal) = self.speed_jump_of_link(link) else {
+            return GroundTurnSetupContinuation::NotGroundTurn;
+        };
+        let Some(gt) = traversal.ground_turn else {
+            return GroundTurnSetupContinuation::NotGroundTurn;
+        };
+        if !matches!(
+            gt.version,
+            GROUND_TURN_VERSION | RUNWAY_TURN_VERSION | GROUND_TURN_OPTIMAL_VERSION
+        ) || cmd.jump
+        {
+            return GroundTurnSetupContinuation::Abort;
+        }
+
+        let solid = |o: Vec3| {
+            let tr = bsp.hull1_trace(o, o);
+            tr.start_solid || tr.all_solid
+        };
+        if solid(state.origin) {
+            return GroundTurnSetupContinuation::Abort;
+        }
+        let started_grounded = state.on_ground;
+        let observed_streak = if state.on_ground {
+            0
+        } else {
+            prior_airborne_streak.max(1)
+        };
+        let report = pm_step_report(bsp, &mut state, &cmd, p, move_dt);
+        let source_floor = self.cell_origin(self.link_source(link)).z;
+        let floor_z = source_floor.min(traversal.takeoff.z) - GT_FLOOR_DROP;
+        if report.wall_contact || solid(state.origin) || state.origin.z < floor_z || state.jump_held {
+            return GroundTurnSetupContinuation::Abort;
+        }
+        let Some(airborne_streak) =
+            next_ground_turn_setup_airborne_streak(observed_streak, state.on_ground)
+        else {
+            return GroundTurnSetupContinuation::Abort;
+        };
+        let first_state = state;
+        if started_grounded && !first_state.on_ground {
+            let Some(future_clock) = future_clock else {
+                return GroundTurnSetupContinuation::Abort;
+            };
+            let mut witness = first_state;
+            let mut witness_streak = airborne_streak;
+            let mut sigma = setup_sigma;
+            loop {
+                let witness_cmd = if gt.version == GROUND_TURN_OPTIMAL_VERSION {
+                    ground_turn_ground_cmd_optimal(
+                        witness.vel.xy(),
+                        &gt,
+                        p.accel,
+                        p.maxspeed,
+                        future_clock.controller_dt(),
+                    )
+                } else {
+                    ground_turn_ground_cmd(
+                        witness.origin,
+                        witness.vel.xy(),
+                        traversal.takeoff,
+                        &gt,
+                        &mut sigma,
+                        p.accel,
+                        p.maxspeed,
+                        future_clock.controller_dt(),
+                    )
+                };
+                if solid(witness.origin) {
+                    return GroundTurnSetupContinuation::Abort;
+                }
+                let report = pm_step_report(bsp, &mut witness, &witness_cmd, p, future_clock.move_dt());
+                if report.wall_contact
+                    || solid(witness.origin)
+                    || witness.origin.z < floor_z
+                    || witness.jump_held
+                {
+                    return GroundTurnSetupContinuation::Abort;
+                }
+                let Some(next_streak) =
+                    next_ground_turn_setup_airborne_streak(witness_streak, witness.on_ground)
+                else {
+                    return GroundTurnSetupContinuation::Abort;
+                };
+                witness_streak = next_streak;
+                if witness.on_ground {
+                    break;
+                }
+            }
+        }
+        GroundTurnSetupContinuation::Continue { state: first_state, airborne_streak }
+    }
+
+    /// Re-run a ground-turn SpeedJump's own versioned certificate controller from a live entry
+    /// state. An optional corrective command is first advanced through the same pmove tick; its
+    /// resulting state must enter the stored speed/yaw envelope before the complete ground, launch,
+    /// air, and exact-target touchdown rollout is attempted. Non-ground-turn links return `None` so
+    /// ordinary SpeedJump/Walk/JumpGap execution never passes through this gate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ground_turn_live_entry_rollout(
+        &self,
+        bsp: &Bsp,
+        link: u32,
+        mut entry: PmState,
+        adjustment: Option<Cmd>,
+        dt: f32,
+        p: &PmParams,
+    ) -> Option<GroundTurnLiveRollout> {
+        use crate::pmove::pm_step_report;
+
+        let traversal = self.speed_jump_of_link(link)?;
+        let gt = traversal.ground_turn?;
+        let mut prefix_steps = 0usize;
+        if let Some(cmd) = adjustment {
+            let solid = |o: Vec3| {
+                let tr = bsp.hull1_trace(o, o);
+                tr.start_solid || tr.all_solid
+            };
+            if solid(entry.origin) {
+                return Some(GroundTurnLiveRollout { outcome: None, pmove_steps: prefix_steps });
+            }
+            prefix_steps += 1;
+            let rep = pm_step_report(bsp, &mut entry, &cmd, p, dt);
+            if rep.wall_contact || solid(entry.origin) || !entry.on_ground || entry.jump_held {
+                return Some(GroundTurnLiveRollout { outcome: None, pmove_steps: prefix_steps });
+            }
+        }
+        if !ground_turn_entry_ok(entry.vel.xy().length(), entry.vel.xy(), entry.on_ground, &gt) {
+            return Some(GroundTurnLiveRollout { outcome: None, pmove_steps: prefix_steps });
+        }
+        let target = self.link_target(link);
+        let trace = match gt.version {
+            GROUND_TURN_OPTIMAL_VERSION => ground_turn_rolls_optimal_tol_report(
+                self,
+                bsp,
+                entry,
+                dt,
+                traversal.takeoff,
+                &gt,
+                target,
+                p,
+                0.0,
+            ),
+            GROUND_TURN_VERSION | RUNWAY_TURN_VERSION => ground_turn_rolls_tol_report(
+                self,
+                bsp,
+                entry,
+                dt,
+                traversal.takeoff,
+                &gt,
+                target,
+                p,
+                0.0,
+            ),
+            _ => GroundTurnRolloutTrace { result: None, pmove_steps: 0 },
+        };
+        Some(GroundTurnLiveRollout {
+            outcome: trace.result.map(|(_, landing)| landing),
+            pmove_steps: prefix_steps + trace.pmove_steps,
+        })
+    }
+}
+
+#[cfg(test)]
+mod ground_turn_tests {
+    use super::*;
+
+    fn dm3_test_bsp(test: &str) -> Option<Bsp> {
+        let required = match std::env::var("RTX_TEST_BSP_REQUIRED") {
+            Err(std::env::VarError::NotPresent) => false,
+            Ok(value) if value == "1" => true,
+            Ok(value) => panic!("RTX_TEST_BSP_REQUIRED must be 1 or unset, got {value:?}"),
+            Err(std::env::VarError::NotUnicode(_)) => panic!("RTX_TEST_BSP_REQUIRED must be UTF-8"),
+        };
+        let path = match std::env::var("RTX_TEST_BSP") {
+            Ok(path) => path,
+            Err(std::env::VarError::NotPresent) if !required => {
+                eprintln!(
+                    "SKIP {test}: RTX_TEST_BSP is unset; lab/CI must set RTX_TEST_BSP_REQUIRED=1 and provide dm3.bsp"
+                );
+                return None;
+            }
+            Err(std::env::VarError::NotPresent) => {
+                panic!("{test}: RTX_TEST_BSP_REQUIRED=1 but RTX_TEST_BSP is unset")
+            }
+            Err(std::env::VarError::NotUnicode(_)) => panic!("{test}: RTX_TEST_BSP must be UTF-8"),
+        };
+        let bytes = std::fs::read(&path).unwrap_or_else(|err| panic!("{test}: read {path}: {err}"));
+        Some(Bsp::parse(&bytes).unwrap_or_else(|| panic!("{test}: parse BSP at {path}")))
+    }
+
+    fn fixed_setup_clock(controller_dt: f32, move_dt: f32) -> Option<GroundTurnSetupClock> {
+        Some(
+            GroundTurnSetupClock::from_verified_schedule(controller_dt, move_dt)
+                .expect("finite positive test schedule"),
+        )
+    }
+    use crate::bsp::{ClipNode, Plane, CONTENTS_EMPTY, CONTENTS_SOLID};
+
+    fn dm3_legacy_curl(
+        graph: &NavGraph,
+        bsp: &Bsp,
+        from_origin: Vec3,
+        to_origin: Vec3,
+    ) -> (Link, SpeedJumpTraversal) {
+        let params = SpeedJumpParams {
+            gravity: 800.0,
+            accel: 10.0,
+            maxspeed: 320.0,
+            friction: 4.0,
+            stopspeed: 100.0,
+            curl: true,
+        };
+        let from = graph
+            .cells
+            .iter()
+            .position(|cell| cell.origin == from_origin)
+            .expect("legacy curl source cell") as CellId;
+        let to = graph
+            .cells
+            .iter()
+            .position(|cell| cell.origin == to_origin)
+            .expect("legacy curl target cell") as CellId;
+        let mut candidates = Vec::new();
+        for (ledge, cell) in graph.cells.iter().enumerate() {
+            if cell.origin.z != from_origin.z
+                || !(416.0..=480.0).contains(&cell.origin.x)
+                || (cell.origin.y - to_origin.y).abs() > 128.0
+            {
+                continue;
+            }
+            graph.solve_curl_jumps_from(
+                bsp,
+                ledge as CellId,
+                params,
+                bhop_k(params.accel, params.maxspeed),
+                &mut candidates,
+            );
+        }
+        candidates
+            .into_iter()
+            .find(|(link, _)| link.from == from && link.to == to)
+            .unwrap_or_else(|| panic!("legacy curl {from_origin:?}->{to_origin:?}"))
+    }
+
+    #[test]
+    fn dm3_ring_legacy_curls_preserve_the_certified_lateral_profile() {
+        let Some(bsp) = dm3_test_bsp("dm3_ring_legacy_curls_preserve_the_certified_lateral_profile") else {
+            return;
+        };
+        let params = SpeedJumpParams {
+            gravity: 800.0,
+            accel: 10.0,
+            maxspeed: 320.0,
+            friction: 4.0,
+            stopspeed: 100.0,
+            curl: false,
+        };
+        let graph = build_navmesh(&bsp, vec![], vec![], vec![], None, false, Some(params), None);
+        let cases = [
+            (
+                Vec3::new(288.0, 288.0, 56.0),
+                Vec3::new(704.0, 160.0, 56.0),
+                279.3,
+            ),
+            (
+                Vec3::new(288.0, -352.0, 56.0),
+                Vec3::new(704.0, -224.0, 56.0),
+                96.0,
+            ),
+        ];
+        let mut missing_profile = false;
+        for (from, to, live_bad_yaw) in cases {
+            let (link, traversal) = dm3_legacy_curl(&graph, &bsp, from, to);
+            let profile_yaw = yaw_of(traversal.curl_entry_aim.xy() - traversal.takeoff.xy());
+            let p = PmParams::default();
+            let profile_lands = curl_lands(
+                &bsp,
+                traversal.takeoff,
+                to,
+                430.0,
+                profile_yaw,
+                traversal.curl_gain,
+                &p,
+                0.020,
+            )
+            .is_some();
+            let live_line_lands = curl_lands(
+                &bsp,
+                traversal.takeoff,
+                to,
+                430.0,
+                live_bad_yaw,
+                traversal.curl_gain,
+                &p,
+                0.020,
+            )
+            .is_some();
+            eprintln!(
+                "legacy ring curl {from:?}->{to:?}: takeoff={:?} v_req={:.1} gain={:.1} entry={:?} switch={:.1} landing={:?} profile_yaw={profile_yaw:.1} profile_lands={profile_lands} live_bad_yaw={live_bad_yaw:.1} live_line_lands={live_line_lands}",
+                traversal.takeoff,
+                traversal.v_req,
+                traversal.curl_gain,
+                traversal.curl_entry_aim,
+                traversal.curl_switch_dist,
+                traversal.curl_landing_aim,
+            );
+            assert_eq!(link.kind, LinkKind::SpeedJump);
+            assert!(traversal.ground_turn.is_none(), "pin the legacy curl family");
+            assert!(traversal.curl_gain > 0.0);
+            assert!(profile_lands, "the preserved certified line must land at live-class speed");
+            assert!(!live_line_lands, "the observed off-profile launch line must remain a red witness");
+            missing_profile |= traversal.curl_entry_aim == Vec3::ZERO
+                || traversal.curl_switch_dist == 0.0
+                || traversal.curl_landing_aim == Vec3::ZERO;
+        }
+        assert!(!missing_profile, "legacy emission discarded its certified lateral profiles");
+    }
+
+    #[test]
+    fn dm3_recap_setup_corner_replays_cross_attempt_producer_ticks() {
+        // The normal-frame recorder can skip/lag 77 Hz bot producer ticks.  Stitch the two
+        // recidivs at their matching physical states, then replay the emitted wishes at the
+        // fake-client's truncated 12 ms.  The v2 payload is the same source/takeoff/target geometry
+        // captured in a85084d-rich-graph.json; numeric link ids deliberately do not cross families.
+        let Some(bsp) = dm3_test_bsp("dm3_recap_setup_corner_replays_cross_attempt_producer_ticks") else {
+            return;
+        };
+        let params = PmParams::default();
+        let source = Vec3::new(-256.0, -736.0, 152.0);
+        let target = Vec3::new(96.0, -864.0, 184.0);
+        let cells = [source, target]
+            .into_iter()
+            .map(|origin| Cell { origin, gx: floor_grid(origin.x), gy: floor_grid(origin.y) })
+            .collect();
+        let mut graph = NavGraph::test_graph(cells, Vec::new());
+        let gt = GroundTurnCurl {
+            version: RUNWAY_TURN_VERSION,
+            runway_aim: Vec3::new(-119.51472, -872.4853, 152.0),
+            blended_runway: true,
+            runway_yaw: -45.0,
+            lip_reach: 28.0,
+            hold_speed: 477.41782,
+            turn_dist: 181.01933,
+            launch_yaw: 337.5,
+            yaw_min: 302.5,
+            box_min: Vec3::new(-156.0, -892.0, 151.0),
+            box_max: Vec3::new(-100.0, -836.0, 152.0),
+            launch_gain: 8.0,
+            hold_aim: Vec3::new(345.02634, -1059.934, 152.0),
+            gate_point: Vec3::new(-128.0, -864.0, 152.0),
+            gate_normal: Vec3::ZERO,
+            air_gain: 8.0,
+            landing_aim: target,
+            entry_speed_lo: 307.19998,
+            entry_speed_hi: 332.8,
+            entry_yaw_lo: 268.0,
+            entry_yaw_hi: 272.0,
+            landing_speed_lo: 474.0367,
+            landing_yaw: 6.1398907,
+        };
+        let link = graph.plant_speed_jump(
+            0,
+            1,
+            0.88,
+            SpeedJumpTraversal {
+                takeoff: gt.gate_point,
+                v_req: 320.0,
+                airtime: 0.5216365,
+                landing_speed_lo: gt.landing_speed_lo,
+                chained: false,
+                curl_gain: 8.0,
+                curl_entry_aim: Vec3::ZERO,
+                curl_switch_dist: 0.0,
+                curl_landing_aim: target,
+                ground_turn: Some(gt),
+            },
+        );
+        let mut state = PmState {
+            origin: Vec3::new(-184.91031, -809.2948, 152.03125),
+            vel: Vec3::new(375.34518, -226.8765, 0.0),
+            on_ground: true,
+            jump_held: false,
+        };
+        let observed = [
+            (
+                Vec2::new(115.046, -791.684),
+                PmState {
+                    origin: Vec3::new(-180.4505, -812.119, 152.03125),
+                    vel: Vec3::new(362.744, -254.015, 0.0),
+                    on_ground: true,
+                    jump_held: false,
+                },
+            ),
+            (
+                Vec2::new(768.8646, 221.0139),
+                PmState {
+                    origin: Vec3::new(-175.97086, -815.1161, 152.03125),
+                    vel: Vec3::new(382.2099, -231.1021, 0.0),
+                    on_ground: false,
+                    jump_held: false,
+                },
+            ),
+            (
+                Vec2::new(-684.58685, 413.93347),
+                PmState {
+                    origin: Vec3::new(-171.77887, -815.96875, 151.91605),
+                    vel: Vec3::new(349.33185, 0.0, -9.6),
+                    on_ground: false,
+                    jump_held: false,
+                },
+            ),
+        ];
+        let producer_dt = 1.0 / 77.0;
+        let wire_dt = 12.0 / 1000.0;
+        let mut continuation = None;
+
+        for (tick, (wish, expected)) in observed.into_iter().enumerate() {
+            let cmd = Cmd {
+                view_yaw: yaw_of(wish),
+                forward: wish.length(),
+                side: 0.0,
+                jump: false,
+            };
+            if tick == 1 {
+                let mut setup_sigma = wrap180(yaw_of(wish) - yaw_of(state.vel.xy())).signum();
+                let guard_cmd = ground_turn_ground_cmd(
+                    state.origin,
+                    state.vel.xy(),
+                    gt.gate_point,
+                    &gt,
+                    &mut setup_sigma,
+                    params.accel,
+                    params.maxspeed,
+                    producer_dt,
+                );
+                let guard_wish = crate::strafe::wishdir_fs(
+                    guard_cmd.view_yaw,
+                    guard_cmd.forward,
+                    guard_cmd.side,
+                );
+                let wish_error = guard_wish.distance(wish.normalize_or_zero());
+                assert!(
+                    wish_error < 2.0e-3
+                        && guard_cmd.forward.hypot(guard_cmd.side) >= params.maxspeed
+                        && wish.length() >= params.maxspeed
+                        && guard_cmd.jump == cmd.jump,
+                    "guard command must be pmove-equivalent to the captured producer command: wish_error={wish_error:.6} guard={guard_cmd:?} captured={cmd:?}",
+                );
+                let pre_tick = state;
+                let mut guard_post = pre_tick;
+                let guard_report = crate::pmove::pm_step_report(
+                    &bsp,
+                    &mut guard_post,
+                    &guard_cmd,
+                    &params,
+                    wire_dt,
+                );
+                let mut captured_post = pre_tick;
+                let captured_report = crate::pmove::pm_step_report(
+                    &bsp,
+                    &mut captured_post,
+                    &cmd,
+                    &params,
+                    wire_dt,
+                );
+                let pmove_pos_error = guard_post.origin.distance(captured_post.origin);
+                let pmove_vel_error = guard_post.vel.distance(captured_post.vel);
+                assert!(
+                    pmove_pos_error < 5.0e-3
+                        && pmove_vel_error < 0.2
+                        && guard_post.on_ground == captured_post.on_ground
+                        && guard_post.jump_held == captured_post.jump_held
+                        && guard_report == captured_report,
+                    "guard/captured commands diverged in the actual wire pmove: pos_error={pmove_pos_error:.6} vel_error={pmove_vel_error:.6} guard={guard_post:?}/{guard_report:?} captured={captured_post:?}/{captured_report:?}",
+                );
+                continuation = Some(graph.ground_turn_setup_continuation(
+                    &bsp,
+                    link,
+                    state,
+                    guard_cmd,
+                    setup_sigma,
+                    0,
+                    wire_dt,
+                    fixed_setup_clock(producer_dt, wire_dt),
+                    &params,
+                ));
+            }
+            let report = crate::pmove::pm_step_report(&bsp, &mut state, &cmd, &params, wire_dt);
+            eprintln!(
+                "tick={} state={state:?} report={report:?} pos_err={:.6} vel_err={:.6} expected_ground={}",
+                tick + 1,
+                state.origin.distance(expected.origin),
+                state.vel.distance(expected.vel),
+                expected.on_ground,
+            );
+            assert!(
+                state.origin.distance(expected.origin) < 0.25
+                    && state.vel.distance(expected.vel) < 1.0
+                    && state.on_ground == expected.on_ground,
+                "cross-attempt producer stitch diverged at tick {}",
+                tick + 1,
+            );
+        }
+
+        let continuation = continuation.expect("edge-departure continuation");
+        let class = match continuation {
+            GroundTurnSetupContinuation::Continue { state, .. } if state.on_ground => {
+                "B: guard predicted grounded but the quantized wire move became airborne"
+            }
+            GroundTurnSetupContinuation::Continue { .. } => {
+                "A: guard predicted airborne and the airborne-cap grace accepted it"
+            }
+            GroundTurnSetupContinuation::Abort => "guard already rejected the edge departure",
+            GroundTurnSetupContinuation::NotGroundTurn => "fixture did not bind the ground-turn payload",
+        };
+        assert!(
+            matches!(continuation, GroundTurnSetupContinuation::Abort),
+            "producer-near replay classified the live failure as {class}: {continuation:?}",
+        );
+    }
+
+    fn contract() -> GroundTurnCurl {
+        GroundTurnCurl {
+            version: GROUND_TURN_VERSION,
+            runway_aim: Vec3::new(148.0, -576.0, 152.0),
+            blended_runway: false,
+            runway_yaw: 0.0,
+            lip_reach: 0.0,
+            hold_speed: 0.0,
+            turn_dist: 64.0,
+            launch_yaw: 222.0,
+            yaw_min: 204.0,
+            box_min: Vec3::new(132.0, -604.0, 151.0),
+            box_max: Vec3::new(188.0, -548.0, 152.0),
+            launch_gain: 32.0,
+            hold_aim: Vec3::new(-220.0, -920.0, 152.0),
+            gate_point: Vec3::new(160.0, -576.0, 152.0),
+            gate_normal: Vec3::ZERO,
+            air_gain: 256.0,
+            landing_aim: Vec3::new(64.0, -832.0, 168.0),
+            entry_speed_lo: 490.0,
+            entry_speed_hi: 510.0,
+            entry_yaw_lo: 168.0,
+            entry_yaw_hi: 192.0,
+            landing_speed_lo: 493.0,
+            landing_yaw: 258.0,
+        }
+    }
+
+    /// An infinite floor up to `runway_edge`, a gap, then an infinite landing floor.  Coordinates
+    /// are standing-origin coordinates because the synthetic clip hull is already player-inflated,
+    /// just like a real BSP hull 1.
+    fn runway_gap(runway_edge: f32, landing_edge: f32) -> Bsp {
+        Bsp::synthetic(
+            vec![
+                Plane { normal: Vec3::Z, dist: 0.0, kind: 2 },
+                Plane { normal: Vec3::X, dist: runway_edge, kind: 0 },
+                Plane { normal: Vec3::X, dist: landing_edge, kind: 0 },
+            ],
+            vec![
+                // z >= 0 is open.  Below the floor plane, split the runway/gap/landing slabs.
+                ClipNode { plane: 0, children: [CONTENTS_EMPTY, 1] },
+                ClipNode { plane: 1, children: [2, CONTENTS_SOLID] },
+                ClipNode { plane: 2, children: [CONTENTS_SOLID, CONTENTS_EMPTY] },
+            ],
+            0,
+            Vec::new(),
+        )
+    }
+
+    /// The same launch gap with a shallow floor seam early in the setup runway. One grounded setup
+    /// tick crosses the 1.1u dip (just beyond the 1u ground probe), the following nonjump setup tick
+    /// re-categorizes on its lower floor, and the ordinary step solver climbs back onto the runway.
+    fn runway_gap_with_setup_seam(
+        seam_start: f32,
+        seam_end: f32,
+        runway_edge: f32,
+        landing_edge: f32,
+    ) -> Bsp {
+        Bsp::synthetic(
+            vec![
+                Plane { normal: Vec3::X, dist: seam_start, kind: 0 },
+                Plane { normal: Vec3::X, dist: seam_end, kind: 0 },
+                Plane { normal: Vec3::Z, dist: 0.0, kind: 2 },
+                Plane { normal: Vec3::Z, dist: -1.1, kind: 2 },
+                Plane { normal: Vec3::X, dist: runway_edge, kind: 0 },
+                Plane { normal: Vec3::X, dist: landing_edge, kind: 0 },
+            ],
+            vec![
+                ClipNode { plane: 0, children: [1, 2] },
+                ClipNode { plane: 1, children: [4, 3] },
+                ClipNode { plane: 2, children: [CONTENTS_EMPTY, CONTENTS_SOLID] },
+                ClipNode { plane: 3, children: [CONTENTS_EMPTY, CONTENTS_SOLID] },
+                ClipNode { plane: 4, children: [5, 2] },
+                ClipNode { plane: 5, children: [2, CONTENTS_EMPTY] },
+            ],
+            0,
+            Vec::new(),
+        )
+    }
+
+    fn wall_at_x(x: f32) -> Bsp {
+        Bsp::synthetic(
+            vec![Plane { normal: Vec3::X, dist: x, kind: 0 }],
+            vec![ClipNode { plane: 0, children: [CONTENTS_SOLID, CONTENTS_EMPTY] }],
+            0,
+            Vec::new(),
+        )
+    }
+
+    fn optimal_spatial_contract() -> (NavGraph, Bsp, PmState, GroundTurnCurl, u32) {
+        let takeoff = Vec3::new(48.0, 25.0, 0.03125);
+        let landing = Vec3::new(215.0, 268.0, 0.03125);
+        let cells = [Vec3::new(0.0, 0.0, 0.03125), takeoff, landing]
+            .into_iter()
+            .map(|origin| Cell { origin, gx: floor_grid(origin.x), gy: floor_grid(origin.y) })
+            .collect();
+        let mut graph = NavGraph::test_graph(cells, Vec::new());
+        for (id, cell) in graph.cells.iter().enumerate() {
+            graph.grid.entry((cell.gx, cell.gy)).or_default().push(id as CellId);
+        }
+        let bsp = runway_gap(60.0, 120.0);
+        let launch_yaw = 54.0f32;
+        let (s, c) = launch_yaw.to_radians().sin_cos();
+        let launch_dir = Vec3::new(c, s, 0.0);
+        let gt = GroundTurnCurl {
+            version: GROUND_TURN_OPTIMAL_VERSION,
+            runway_aim: takeoff,
+            blended_runway: false,
+            runway_yaw: 0.0,
+            lip_reach: 0.0,
+            hold_speed: 0.0,
+            turn_dist: 0.0,
+            launch_yaw,
+            yaw_min: launch_yaw - GT_OPT_LAUNCH_SLACK,
+            box_min: takeoff - Vec3::new(GT_BOX_HALF, GT_BOX_HALF, 1.0),
+            box_max: takeoff + Vec3::new(GT_BOX_HALF, GT_BOX_HALF, 0.0),
+            launch_gain: 32.0,
+            hold_aim: takeoff + launch_dir * 512.0,
+            gate_point: takeoff,
+            gate_normal: Vec3::ZERO,
+            air_gain: 128.0,
+            landing_aim: landing,
+            entry_speed_lo: 319.0,
+            entry_speed_hi: 321.0,
+            entry_yaw_lo: 359.0,
+            entry_yaw_hi: 1.0,
+            landing_speed_lo: 0.0,
+            landing_yaw: 0.0,
+        };
+        let entry = PmState {
+            origin: Vec3::new(0.0, 0.0, 0.03125),
+            vel: Vec3::new(320.0, 0.0, 0.0),
+            on_ground: true,
+            jump_held: false,
+        };
+        let link = graph.plant_speed_jump(
+            0,
+            2,
+            1.0,
+            SpeedJumpTraversal {
+                takeoff,
+                v_req: 320.0,
+                airtime: 0.8,
+                landing_speed_lo: 0.0,
+                chained: true,
+                curl_gain: gt.air_gain,
+                curl_entry_aim: gt.hold_aim,
+                curl_switch_dist: 0.0,
+                curl_landing_aim: landing,
+                ground_turn: Some(gt),
+            },
+        );
+        (graph, bsp, entry, gt, link)
+    }
+
+    #[test]
+    fn yaw360_is_wrap_free_over_the_turn_band() {
+        // atan2 wraps at +-180 exactly mid-turn; the [0,360) domain must not.
+        let west = Vec2::new(-1.0, 0.0);
+        let wsw = Vec2::new(-0.74, -0.67); // ~222 deg
+        assert!((yaw360_of(west) - 180.0).abs() < 0.01);
+        assert!((yaw360_of(wsw) - 222.15).abs() < 0.5);
+        assert!(yaw360_of(wsw) > yaw360_of(west));
+    }
+
+    #[test]
+    fn ground_aim_switches_from_runway_to_rotation_inside_turn_dist() {
+        let gt = contract();
+        let takeoff = Vec3::new(160.0, -576.0, 152.0);
+        // Far out on the runway: the aim is the runway line.
+        let far = Vec3::new(340.0, -560.0, 56.0);
+        assert_eq!(ground_turn_ground_aim(far, takeoff, &gt), gt.runway_aim.xy());
+        // Inside the turn window: the aim rotates toward the launch heading.
+        let near = Vec3::new(200.0, -572.0, 152.0);
+        let aim = ground_turn_ground_aim(near, takeoff, &gt);
+        let (s, c) = gt.launch_yaw.to_radians().sin_cos();
+        let expect = takeoff.xy() + Vec2::new(c, s) * 512.0;
+        assert!((aim - expect).length() < 0.01);
+    }
+
+    #[test]
+    fn launch_gate_needs_box_ground_and_rotated_yaw() {
+        let gt = contract();
+        let inside = Vec3::new(170.0, -576.0, 152.0);
+        let rotated = Vec2::new(-350.0, -320.0); // ~222 deg
+        let unrotated = Vec2::new(-500.0, 30.0); // ~177 deg
+        assert!(ground_turn_should_launch(inside, rotated, true, &gt));
+        assert!(
+            !ground_turn_should_launch(inside, rotated, false, &gt),
+            "airborne must not fire"
+        );
+        assert!(!ground_turn_should_launch(inside, unrotated, true, &gt), "yaw gate");
+        let outside = Vec3::new(220.0, -576.0, 152.0);
+        assert!(
+            !ground_turn_should_launch(outside, rotated, true, &gt),
+            "outside the box"
+        );
+        let below = Vec3::new(170.0, -576.0, 120.0);
+        assert!(
+            !ground_turn_should_launch(below, rotated, true, &gt),
+            "below the platform"
+        );
+    }
+
+    #[test]
+    fn air_aim_holds_until_the_gate_plane_then_lands() {
+        let mut gt = contract();
+        // Immediate curl (zero normal): always the landing aim.
+        assert_eq!(
+            ground_turn_air_aim(Vec3::new(150.0, -600.0, 160.0), &gt).0,
+            gt.landing_aim.xy()
+        );
+        // A hold gate 96u along the launch heading: held before, landing after.
+        let (s, c) = gt.launch_yaw.to_radians().sin_cos();
+        let dir = Vec3::new(c, s, 0.0);
+        gt.gate_point = Vec3::new(160.0, -576.0, 152.0) + dir * 96.0;
+        gt.gate_normal = -dir;
+        let before = Vec3::new(160.0, -576.0, 152.0) + dir * 20.0;
+        let after = Vec3::new(160.0, -576.0, 152.0) + dir * 140.0;
+        assert_eq!(ground_turn_air_aim(before, &gt).0, gt.hold_aim.xy());
+        assert_eq!(ground_turn_air_aim(after, &gt).0, gt.landing_aim.xy());
+    }
+
+    #[test]
+    fn entry_envelope_fails_closed() {
+        let gt = contract();
+        let ok_vel = Vec2::new(-500.0, 0.0); // 180 deg, 500 ups
+        assert!(ground_turn_entry_ok(500.0, ok_vel, true, &gt));
+        assert!(!ground_turn_entry_ok(500.0, ok_vel, false, &gt), "airborne entry");
+        assert!(!ground_turn_entry_ok(480.0, ok_vel, true, &gt), "too slow");
+        assert!(
+            !ground_turn_entry_ok(520.0, ok_vel, true, &gt),
+            "too fast is ALSO uncertified"
+        );
+        let off_yaw = Vec2::new(-350.0, 350.0); // 135 deg
+        assert!(
+            !ground_turn_entry_ok(500.0, off_yaw, true, &gt),
+            "outside the yaw envelope"
+        );
+    }
+
+    #[test]
+    fn live_entry_rejects_a_spatial_shift_that_misses_the_certified_launch() {
+        let (graph, bsp, certified, gt, link) = optimal_spatial_contract();
+        let params = PmParams::default();
+        let certified_roll = graph
+            .ground_turn_live_entry_rollout(&bsp, link, certified, None, 0.020, &params)
+            .expect("ground-turn link");
+        assert!(certified_roll.outcome.is_some(), "fixture error: the source-centred state must be executable");
+        assert!(certified_roll.pmove_steps > 1, "the witness must include launch and flight");
+        assert!(certified_roll.pmove_steps <= GT_SETUP_TICK_CAP + 1 + GT_FLIGHT_TICK_CAP);
+
+        let shifted = PmState { origin: certified.origin + Vec3::new(24.0, 0.0, 0.0), ..certified };
+        let shifted_roll = graph
+            .ground_turn_live_entry_rollout(&bsp, link, shifted, None, 0.020, &params)
+            .expect("ground-turn link");
+
+        // The scalar envelope deliberately cannot distinguish these states; the physical witness must.
+        assert!(ground_turn_entry_ok(certified.vel.xy().length(), certified.vel.xy(), true, &gt));
+        assert!(
+            ground_turn_entry_ok(shifted.vel.xy().length(), shifted.vel.xy(), true, &gt),
+            "fixture error: shifted entry must retain the same scalar envelope"
+        );
+        assert!(shifted_roll.outcome.is_none(), "the full-state witness admitted a runway miss");
+    }
+
+    #[test]
+    fn live_setup_continuation_crosses_a_transient_seam_then_launches_to_target() {
+        let (graph, _, entry, gt, link) = optimal_spatial_contract();
+        let bsp = runway_gap_with_setup_seam(5.0, 20.0, 60.0, 120.0);
+        let params = PmParams::default();
+        let witness_dt = 0.020;
+
+        let full = graph
+            .ground_turn_live_entry_rollout(&bsp, link, entry, None, witness_dt, &params)
+            .expect("ground-turn link");
+        assert!(
+            full.outcome.is_some(),
+            "fixture error: the certified controller must tolerate the narrow setup seam"
+        );
+
+        let first_dt = 0.019;
+        let first_cmd =
+            ground_turn_ground_cmd_optimal(entry.vel.xy(), &gt, params.accel, params.maxspeed, first_dt);
+        let (first, first_streak) = match graph.ground_turn_setup_continuation(
+            &bsp,
+            link,
+            entry,
+            first_cmd,
+            0.0,
+            0,
+            first_dt,
+            fixed_setup_clock(first_dt, first_dt),
+            &params,
+        ) {
+            GroundTurnSetupContinuation::Continue { state, airborne_streak } => {
+                (state, airborne_streak)
+            }
+            other => panic!("first safe setup step was rejected: {other:?}"),
+        };
+        assert!(!first.on_ground, "first setup tick must be the transient airborne seam frame");
+        assert_eq!(first_streak, 1);
+        assert!(!first_cmd.jump, "the seam crossing is setup, not launch");
+
+        let second_dt = 0.021;
+        let second_cmd = ground_turn_ground_cmd_optimal(
+            first.vel.xy(),
+            &gt,
+            params.accel,
+            params.maxspeed,
+            second_dt,
+        );
+        let (second, second_streak) = match graph.ground_turn_setup_continuation(
+            &bsp,
+            link,
+            first,
+            second_cmd,
+            0.0,
+            first_streak,
+            second_dt,
+            fixed_setup_clock(second_dt, second_dt),
+            &params,
+        ) {
+            GroundTurnSetupContinuation::Continue { state, airborne_streak } => {
+                (state, airborne_streak)
+            }
+            other => panic!("second safe setup step was rejected: {other:?}"),
+        };
+        assert!(second.on_ground, "the setup controller must re-land beyond the seam");
+        assert_eq!(second_streak, 0);
+
+        let finish = ground_turn_rolls_optimal_tol_report(
+            &graph,
+            &bsp,
+            second,
+            witness_dt,
+            graph.speed_jump_of_link(link).unwrap().takeoff,
+            &gt,
+            graph.link_target(link),
+            &params,
+            0.0,
+        );
+        assert!(finish.result.is_some(), "setup seam must still lead to launch and exact target touchdown");
+    }
+
+    #[test]
+    fn live_setup_clock_is_wire_timed_and_unknown_futures_fail_closed() {
+        let (graph, _, base_entry, gt, link) = optimal_spatial_contract();
+        let bsp = runway_gap(5.0, 10.0);
+        let params = PmParams::default();
+        let controller_dt = 1.0 / 77.0;
+        let move_dt = 12.0 / 1000.0;
+        let clock = fixed_setup_clock(controller_dt, move_dt);
+
+        // A grounded one-step path uses the wire duration even when no prospective schedule is
+        // needed. This explicitly pins the clock correction outside the edge-witness branch.
+        let grounded = PmState { origin: Vec3::new(-10.0, 0.0, 0.03125), ..base_entry };
+        let grounded_cmd = ground_turn_ground_cmd_optimal(
+            grounded.vel.xy(),
+            &gt,
+            params.accel,
+            params.maxspeed,
+            controller_dt,
+        );
+        let mut grounded_wire = grounded;
+        crate::pmove::pm_step(&bsp, &mut grounded_wire, &grounded_cmd, &params, move_dt);
+        let mut grounded_raw = grounded;
+        crate::pmove::pm_step(&bsp, &mut grounded_raw, &grounded_cmd, &params, controller_dt);
+        let grounded_guard = graph.ground_turn_setup_continuation(
+            &bsp,
+            link,
+            grounded,
+            grounded_cmd,
+            0.0,
+            0,
+            move_dt,
+            None,
+            &params,
+        );
+        let GroundTurnSetupContinuation::Continue { state: grounded_state, .. } = grounded_guard else {
+            panic!("grounded one-step path unexpectedly rejected: {grounded_guard:?}");
+        };
+        assert!(grounded_state.on_ground);
+        assert!(grounded_state.origin.distance(grounded_wire.origin) < 1.0e-6);
+        assert!(grounded_state.origin.distance(grounded_raw.origin) > 0.01);
+
+        // The same wire clock owns an already-airborne one-step contact decision. At this seam the
+        // raw duration reaches the far floor, while the 12 ms fake-client move remains airborne.
+        let airborne = PmState {
+            origin: Vec3::new(6.1, 0.0, 0.03125),
+            on_ground: false,
+            jump_held: false,
+            ..base_entry
+        };
+        let airborne_cmd = ground_turn_ground_cmd_optimal(
+            airborne.vel.xy(),
+            &gt,
+            params.accel,
+            params.maxspeed,
+            controller_dt,
+        );
+        let mut airborne_wire = airborne;
+        let airborne_wire_report =
+            crate::pmove::pm_step_report(&bsp, &mut airborne_wire, &airborne_cmd, &params, move_dt);
+        let mut airborne_raw = airborne;
+        let airborne_raw_report = crate::pmove::pm_step_report(
+            &bsp,
+            &mut airborne_raw,
+            &airborne_cmd,
+            &params,
+            controller_dt,
+        );
+        let airborne_guard = graph.ground_turn_setup_continuation(
+            &bsp,
+            link,
+            airborne,
+            airborne_cmd,
+            0.0,
+            1,
+            move_dt,
+            None,
+            &params,
+        );
+        let GroundTurnSetupContinuation::Continue {
+            state: airborne_state,
+            airborne_streak,
+        } = airborne_guard
+        else {
+            panic!("already-airborne one-step path unexpectedly rejected: {airborne_guard:?}");
+        };
+        assert_eq!(airborne_streak, 2);
+        assert!(!airborne_state.on_ground);
+        assert!(
+            airborne_raw_report.wall_contact && !airborne_wire_report.wall_contact,
+            "fixture must distinguish raw and wire contact timing: raw={airborne_raw:?} wire={airborne_wire:?}",
+        );
+        assert!(airborne_state.origin.distance(airborne_wire.origin) < 1.0e-6);
+
+        // A grounded departure can re-land on the equal-height far floor only when the caller
+        // supplies a fixed raw/wire schedule. Unknown future cadence must fail closed.
+        let edge = PmState { origin: Vec3::new(3.0, 0.0, 0.03125), ..base_entry };
+        let edge_cmd = ground_turn_ground_cmd_optimal(
+            edge.vel.xy(),
+            &gt,
+            params.accel,
+            params.maxspeed,
+            controller_dt,
+        );
+        // Zero gravity isolates the clock contract: the far floor is exactly the runway's height,
+        // so only the fixed raw/wire schedule decides whether the bounded witness can re-land.
+        let seam_params = PmParams { gravity: 0.0, ..params };
+        assert!(matches!(
+            graph.ground_turn_setup_continuation(
+                &bsp,
+                link,
+                edge,
+                edge_cmd,
+                0.0,
+                0,
+                move_dt,
+                None,
+                &seam_params,
+            ),
+            GroundTurnSetupContinuation::Abort
+        ));
+        let safe = graph.ground_turn_setup_continuation(
+            &bsp,
+            link,
+            edge,
+            edge_cmd,
+            0.0,
+            0,
+            move_dt,
+            clock,
+            &seam_params,
+        );
+        let GroundTurnSetupContinuation::Continue { state: edge_state, airborne_streak } = safe else {
+            panic!("fixed raw/wire schedule rejected an equal-height re-landing: {safe:?}");
+        };
+        assert!(!edge_state.on_ground, "first real tick must still expose the seam departure");
+        assert_eq!(airborne_streak, 1);
+    }
+
+    #[test]
+    fn live_setup_continuation_rejects_wall_floor_and_airborne_cap() {
+        let (graph, bsp, entry, gt, link) = optimal_spatial_contract();
+        let params = PmParams::default();
+        let dt = 0.020;
+        let setup_cmd = ground_turn_ground_cmd_optimal(entry.vel.xy(), &gt, params.accel, params.maxspeed, dt);
+
+        assert!(matches!(
+            graph.ground_turn_setup_continuation(
+                &wall_at_x(100.0),
+                link,
+                PmState {
+                    origin: Vec3::new(99.0, 0.0, 10.0),
+                    vel: Vec3::new(320.0, 0.0, 0.0),
+                    on_ground: false,
+                    jump_held: false,
+                },
+                setup_cmd,
+                0.0,
+                1,
+                dt,
+                fixed_setup_clock(dt, dt),
+                &params,
+            ),
+            GroundTurnSetupContinuation::Abort
+        ));
+        assert!(matches!(
+            graph.ground_turn_setup_continuation(
+                &wall_at_x(100.0),
+                link,
+                PmState { origin: Vec3::new(101.0, 0.0, 10.0), ..entry },
+                setup_cmd,
+                0.0,
+                0,
+                dt,
+                fixed_setup_clock(dt, dt),
+                &params,
+            ),
+            GroundTurnSetupContinuation::Abort
+        ));
+
+        let falling = PmState {
+            origin: Vec3::new(80.0, 0.0, -79.0),
+            vel: Vec3::new(0.0, 0.0, -100.0),
+            on_ground: false,
+            jump_held: false,
+        };
+        assert!(matches!(
+            graph.ground_turn_setup_continuation(
+                &bsp,
+                link,
+                falling,
+                setup_cmd,
+                0.0,
+                1,
+                dt,
+                fixed_setup_clock(dt, dt),
+                &params,
+            ),
+            GroundTurnSetupContinuation::Abort
+        ));
+
+        let airborne = PmState {
+            origin: Vec3::new(80.0, 0.0, 10.0),
+            vel: Vec3::ZERO,
+            on_ground: false,
+            jump_held: false,
+        };
+        assert!(matches!(
+            graph.ground_turn_setup_continuation(
+                &bsp,
+                link,
+                airborne,
+                setup_cmd,
+                0.0,
+                GROUND_TURN_SETUP_AIRBORNE_TICK_CAP - 1,
+                dt,
+                fixed_setup_clock(dt, dt),
+                &params,
+            ),
+            GroundTurnSetupContinuation::Abort
+        ));
+
+        let gap_entry = PmState { origin: Vec3::new(55.0, 0.0, 0.03125), ..entry };
+        let gap_cmd =
+            ground_turn_ground_cmd_optimal(gap_entry.vel.xy(), &gt, params.accel, params.maxspeed, dt);
+        assert!(matches!(
+            graph.ground_turn_setup_continuation(
+                &runway_gap(60.0, 1000.0),
+                link,
+                gap_entry,
+                gap_cmd,
+                0.0,
+                0,
+                dt,
+                fixed_setup_clock(dt, dt),
+                &params,
+            ),
+            GroundTurnSetupContinuation::Abort
+        ));
+
+        let mut launch_cmd = setup_cmd;
+        launch_cmd.jump = true;
+        assert!(matches!(
+            graph.ground_turn_setup_continuation(
+                &bsp,
+                link,
+                entry,
+                launch_cmd,
+                0.0,
+                0,
+                dt,
+                fixed_setup_clock(dt, dt),
+                &params,
+            ),
+            GroundTurnSetupContinuation::Abort
+        ));
+    }
+
+    #[test]
+    fn live_entry_accepts_a_safe_off_centre_state_without_a_radius_rule() {
+        let (graph, bsp, certified, _, link) = optimal_spatial_contract();
+        let off_centre = PmState { origin: certified.origin - Vec3::new(24.0, 0.0, 0.0), ..certified };
+        let roll = graph
+            .ground_turn_live_entry_rollout(&bsp, link, off_centre, None, 0.020, &PmParams::default())
+            .expect("ground-turn link");
+        assert!(roll.outcome.is_some(), "an executable off-centre state must not be rejected by distance alone");
+    }
+
+    #[test]
+    fn adjusted_entry_requires_both_the_envelope_and_a_safe_continuation() {
+        let (graph, bsp, certified, gt, link) = optimal_spatial_contract();
+        let params = PmParams::default();
+        let (entry_sin, entry_cos) = 10.0f32.to_radians().sin_cos();
+        let entry = PmState { vel: Vec3::new(320.0 * entry_cos, 320.0 * entry_sin, 0.0), ..certified };
+        let adjustment = ground_turn_entry_adjust_cmd(
+            entry.vel.xy(),
+            entry.on_ground,
+            &gt,
+            params.friction,
+            params.stopspeed,
+            params.accel,
+            params.maxspeed,
+            0.020,
+        )
+        .expect("fixture must have a one-tick envelope adjustment");
+        let mut post = entry;
+        crate::pmove::pm_step(&bsp, &mut post, &adjustment, &params, 0.020);
+        assert!(ground_turn_entry_ok(post.vel.xy().length(), post.vel.xy(), post.on_ground, &gt));
+
+        let safe = graph
+            .ground_turn_live_entry_rollout(&bsp, link, entry, Some(adjustment), 0.020, &params)
+            .expect("ground-turn link");
+        assert!(safe.outcome.is_some(), "adjustment plus full safe rollout must be accepted");
+        assert!(safe.pmove_steps <= 1 + GT_SETUP_TICK_CAP + 1 + GT_FLIGHT_TICK_CAP);
+
+        let unsafe_entry = PmState { origin: entry.origin + Vec3::new(24.0, 0.0, 0.0), ..entry };
+        let unsafe_roll = graph
+            .ground_turn_live_entry_rollout(&bsp, link, unsafe_entry, Some(adjustment), 0.020, &params)
+            .expect("ground-turn link");
+        assert!(unsafe_roll.pmove_steps > 1, "the adjustment must enter the envelope before geometry rejects");
+        assert!(unsafe_roll.outcome.is_none(), "velocity-only adjustment admitted an unsafe continuation");
+    }
+
+    #[test]
+    fn live_rollout_dispatches_legacy_versions_and_skips_other_link_kinds() {
+        let (mut graph, bsp, entry, gt, base) = optimal_spatial_contract();
+        let params = PmParams::default();
+        let base_traversal = *graph.speed_jump_of_link(base).unwrap();
+        let optimal_cmd =
+            ground_turn_ground_cmd_optimal(entry.vel.xy(), &gt, params.accel, params.maxspeed, 0.020);
+        assert!(matches!(
+            graph.ground_turn_setup_continuation(
+                &bsp,
+                base,
+                entry,
+                optimal_cmd,
+                0.0,
+                0,
+                0.020,
+                fixed_setup_clock(0.020, 0.020),
+                &params,
+            ),
+            GroundTurnSetupContinuation::Continue { .. }
+        ));
+        for version in [GROUND_TURN_VERSION, RUNWAY_TURN_VERSION] {
+            let mut legacy_gt = gt;
+            legacy_gt.version = version;
+            legacy_gt.blended_runway = version == RUNWAY_TURN_VERSION;
+            legacy_gt.lip_reach = GT_BOX_HALF;
+            legacy_gt.hold_speed = entry.vel.xy().length();
+            legacy_gt.turn_dist = 512.0;
+            legacy_gt.yaw_min = legacy_gt.launch_yaw - GT_OPT_LAUNCH_SLACK;
+            let mut traversal = base_traversal;
+            traversal.ground_turn = Some(legacy_gt);
+            let link = graph.plant_speed_jump(0, 2, 2.0 + version as f32, traversal);
+            let direct = ground_turn_rolls_tol_report(
+                &graph,
+                &bsp,
+                entry,
+                0.020,
+                traversal.takeoff,
+                &legacy_gt,
+                2,
+                &params,
+                0.0,
+            );
+            let live = graph
+                .ground_turn_live_entry_rollout(&bsp, link, entry, None, 0.020, &params)
+                .expect("legacy ground-turn link");
+            assert!(direct.pmove_steps > 0, "legacy fixture must exercise version {version}'s controller");
+            if version == GROUND_TURN_VERSION {
+                assert!(direct.result.is_some(), "v1 fixture must reach its exact target");
+            }
+            assert_eq!(live.outcome.is_some(), direct.result.is_some(), "version {version} dispatch outcome");
+            assert_eq!(live.pmove_steps, direct.pmove_steps, "version {version} dispatch controller");
+            let mut sigma = 0.0;
+            let setup_cmd = ground_turn_ground_cmd(
+                entry.origin,
+                entry.vel.xy(),
+                traversal.takeoff,
+                &legacy_gt,
+                &mut sigma,
+                params.accel,
+                params.maxspeed,
+                0.020,
+            );
+            assert!(matches!(
+                graph.ground_turn_setup_continuation(
+                    &bsp,
+                    link,
+                    entry,
+                    setup_cmd,
+                    sigma,
+                    0,
+                    0.020,
+                    fixed_setup_clock(0.020, 0.020),
+                    &params,
+                ),
+                GroundTurnSetupContinuation::Continue { .. }
+            ));
+        }
+
+        let mut unknown_traversal = base_traversal;
+        let mut unknown_gt = gt;
+        unknown_gt.version = u16::MAX;
+        unknown_traversal.ground_turn = Some(unknown_gt);
+        let unknown = graph.plant_speed_jump(0, 2, 7.0, unknown_traversal);
+        assert!(matches!(
+            graph.ground_turn_setup_continuation(
+                &bsp,
+                unknown,
+                entry,
+                optimal_cmd,
+                0.0,
+                0,
+                0.020,
+                fixed_setup_clock(0.020, 0.020),
+                &params,
+            ),
+            GroundTurnSetupContinuation::Abort
+        ));
+
+        let mut plain = base_traversal;
+        plain.ground_turn = None;
+        let plain_speed_jump = graph.plant_speed_jump(0, 2, 8.0, plain);
+        assert!(graph
+            .ground_turn_live_entry_rollout(&bsp, plain_speed_jump, entry, None, 0.020, &params)
+            .is_none());
+        assert!(matches!(
+            graph.ground_turn_setup_continuation(
+                &bsp,
+                plain_speed_jump,
+                entry,
+                optimal_cmd,
+                0.0,
+                0,
+                0.020,
+                fixed_setup_clock(0.020, 0.020),
+                &params,
+            ),
+            GroundTurnSetupContinuation::NotGroundTurn
+        ));
+        for kind in [LinkKind::Walk, LinkKind::JumpGap] {
+            graph.push_link(Link { from: 0, to: 1, kind, cost: 1.0 });
+            let link = (graph.links.len() - 1) as u32;
+            assert!(graph
+                .ground_turn_live_entry_rollout(&bsp, link, entry, None, 0.020, &params)
+                .is_none());
+            assert!(matches!(
+                graph.ground_turn_setup_continuation(
+                    &bsp,
+                    link,
+                    entry,
+                    optimal_cmd,
+                    0.0,
+                    0,
+                    0.020,
+                    fixed_setup_clock(0.020, 0.020),
+                    &params,
+                ),
+                GroundTurnSetupContinuation::NotGroundTurn
+            ));
+        }
+    }
 }

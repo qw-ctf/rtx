@@ -25,7 +25,7 @@ use crate::defs::{
 };
 use crate::entity::{EntId, Think, Touch};
 use crate::game::GameState;
-use crate::navmesh::{CellId, LinkCosts, NavGraph, CLOSED_GATE_PENALTY};
+use crate::navmesh::{CellId, LinkCosts, LinkKind, NavGraph, CLOSED_GATE_PENALTY};
 
 /// Beyond this travel-or-respawn time (seconds) an *ordinary* item isn't worth pursuing.
 pub(crate) const LOOKAHEAD: f32 = 10.0;
@@ -85,6 +85,73 @@ const LOCAL_PICKUP_TRAVEL: f32 = 1.0;
 /// Euclidean pre-filter before the local Dijkstra. It is deliberately looser than one second of
 /// stock running to admit a short stair/turn while avoiding a flood when no relevant item is nearby.
 const LOCAL_PICKUP_RADIUS: f32 = 384.0;
+/// Once an already-selected health/armor goal is this close, finish it even when cell-level travel
+/// is inflated by a turn or stair. This covers the analysed 116-209 qu armor stalls while remaining
+/// a terminal approach, not a new cross-room combat detour.
+const TERMINAL_PICKUP_RADIUS: f32 = 256.0;
+/// A Euclidean-near goal across a wall or floor can still have a long route. Keep the terminal
+/// override bounded to a short completion run rather than locking onto a multi-room detour.
+const TERMINAL_PICKUP_TRAVEL: f32 = 3.0;
+
+/// Whether a local pickup's cell-level route is short enough to take movement ownership. The
+/// current-goal bit is deliberately explicit: terminal completion may need a different rule from
+/// opportunistically choosing a new nearby pickup.
+fn local_pickup_in_budget(current_goal: bool, distance: f32, travel: f32) -> bool {
+    distance <= LOCAL_PICKUP_RADIUS
+        && travel.is_finite()
+        && (travel <= LOCAL_PICKUP_TRAVEL
+            || (current_goal
+                && distance <= TERMINAL_PICKUP_RADIUS
+                && travel <= TERMINAL_PICKUP_TRAVEL))
+}
+
+/// Whether standing at `cell` is itself sufficient to overlap the item's pickup trigger. Catalog
+/// construction guarantees this for static items; selectors check it again so a live/dynamic entry
+/// can never acquire completion ownership through an invalid endpoint.
+fn touch_valid_terminal(graph: &crate::navmesh::NavGraph, cell: CellId, item: &crate::entity::Entity) -> bool {
+    super::item_terminal_touches(graph.cell_origin(cell), item)
+}
+
+/// A high stack pickup may beat a slightly nearer low one during a fresh-spawn exit. One second is
+/// enough to choose a bridge/window-level destination when it is genuinely nearby, but too small to
+/// turn an across-map RA into the answer to every spawn.
+const SPAWN_HEIGHT_BONUS_MAX: f32 = 1.0;
+const SPAWN_HEIGHT_BONUS_RISE: f32 = 128.0;
+/// A spawn-stack candidate must fit inside the exit's hard combat-suppression budget and therefore
+/// also stays below the ordinary item goal watchdog's 10-second give-up leash.
+const SPAWN_STACK_TRAVEL_MAX: f32 = super::SPAWN_EXIT_TIME;
+#[derive(Clone, Copy, Debug)]
+struct SpawnStackCandidate {
+    item: EntId,
+    cell: CellId,
+    travel: f32,
+    rise: f32,
+    uses_lift: bool,
+}
+
+/// Choose the nearest reachable spawn-stack pickup, with a bounded preference for gaining height.
+fn choose_spawn_stack(
+    candidates: impl IntoIterator<Item = SpawnStackCandidate>,
+) -> Option<SpawnStackCandidate> {
+    candidates
+        .into_iter()
+        .filter(|c| c.travel.is_finite() && c.travel <= SPAWN_STACK_TRAVEL_MAX)
+        .min_by(|a, b| {
+            let score = |c: &SpawnStackCandidate| {
+                let height_bonus = if c.uses_lift {
+                    0.0
+                } else {
+                    (c.rise.max(0.0) / SPAWN_HEIGHT_BONUS_RISE).min(SPAWN_HEIGHT_BONUS_MAX)
+                };
+                c.travel - height_bonus
+            };
+            score(a)
+                .total_cmp(&score(b))
+                .then_with(|| a.travel.total_cmp(&b.travel))
+                .then_with(|| a.item.0.cmp(&b.item.0))
+        })
+}
+
 /// While committed to a respawning powerup, only consider ordinary pickups this close and this
 /// quick to reach. The second leg is checked against the powerup timer below, so this is a cost
 /// bound as well as a guard against scanning/flooding unrelated items across the room.
@@ -865,6 +932,59 @@ impl GameState {
         self.best_item_plan(bot_e).filter(|p| p.contains_powerup || p.contains_major)
     }
 
+    /// Fresh-spawn exit: take one available armor or weapon before initiating combat. Unlike the
+    /// general value planner this is deliberately one leg and travel-led; the bounded height bonus
+    /// favors bridge/window-level exits without making a distant high item universally win.
+    pub(crate) fn select_spawn_stack_item(&self, bot_e: EntId) -> Option<(EntId, CellId)> {
+        let graph = self.nav.graph.as_ref()?;
+        let origin = self.entities[bot_e].v.origin;
+        let from = graph.nearest(origin)?;
+        let now = self.time();
+        let pricing = self.bot_link_pricing(bot_e, now);
+        let costs = pricing.costs(0);
+        let travel = graph.costs_from(from, &costs);
+        let stats = self.bot_stats(bot_e);
+
+        choose_spawn_stack(self.nav.goals.iter().filter_map(|&(idx, cell)| {
+            let item = EntId(idx);
+            let ent = &self.entities[item];
+            if !touch_valid_terminal(graph, cell, ent) {
+                return None;
+            }
+            if self.entities[bot_e].bot.is_avoided(idx, now) {
+                return None;
+            }
+            let cat = ent.classname().and_then(category)?;
+            if !matches!(cat, Category::Armor { .. } | Category::Weapon(_))
+                || self.item_desire(&stats, item, cat) <= 0.0
+            {
+                return None;
+            }
+            let route = graph.find_path(from, cell, &costs)?;
+            let path_rise = route
+                .iter()
+                .map(|&link| graph.cell_origin(graph.link_target(link)).z - origin.z)
+                .fold(ent.v.origin.z - origin.z, f32::max);
+            let uses_lift = route.iter().any(|&link| graph.link_kind(link) == LinkKind::Plat);
+            let route_time = travel[cell as usize];
+            let collect_time = if ent.v.solid == Solid::Trigger {
+                route_time
+            } else if matches!(ent.think, Think::SubRegen) && ent.v.nextthink - now < LOOKAHEAD {
+                route_time.max(ent.v.nextthink - now)
+            } else {
+                return None;
+            };
+            Some(SpawnStackCandidate {
+                item,
+                cell,
+                travel: collect_time,
+                rise: path_rise,
+                uses_lift,
+            })
+        }))
+        .map(|c| (c.item, c.cell))
+    }
+
     /// Pick a spawned, nearby health/armor recovery or timed powerup that must be completed before
     /// combat movement resumes. This pass is independent of `rtx_bot_greed`: greed governs optional
     /// detours, not stepping the final metre onto armor that prevents an immediate death.
@@ -880,7 +1000,8 @@ impl GameState {
         for &(idx, cell) in &self.nav.goals {
             let item = EntId(idx);
             let ent = &self.entities[item];
-            if ent.v.solid != Solid::Trigger
+            if !touch_valid_terminal(graph, cell, ent)
+                || ent.v.solid != Solid::Trigger
                 || self.entities[bot_e].bot.is_avoided(idx, now)
                 || (ent.v.origin - origin).length() > LOCAL_PICKUP_RADIUS
             {
@@ -899,7 +1020,7 @@ impl GameState {
                 }
                 _ => continue,
             };
-            nearby.push((item, cell, desire, commit));
+            nearby.push((item, cell, desire, commit, (ent.v.origin - origin).length()));
         }
         if nearby.is_empty() {
             return None;
@@ -912,9 +1033,9 @@ impl GameState {
         let (travel, _) = graph.costs_from_within(from, &pricing.costs(0), LOCAL_PICKUP_TRAVEL);
         nearby
             .into_iter()
-            .filter_map(|(item, cell, desire, commit)| {
+            .filter_map(|(item, cell, desire, commit, distance)| {
                 let t = travel[cell as usize];
-                (t.is_finite() && t <= LOCAL_PICKUP_TRAVEL)
+                local_pickup_in_budget(item.0 == self.entities[bot_e].bot.goal.item, distance, t)
                     .then_some((item, cell, commit, desire / (t + 0.25)))
             })
             .max_by(|a, b| a.3.total_cmp(&b.3).then_with(|| b.0.0.cmp(&a.0.0)))
@@ -1007,7 +1128,8 @@ impl GameState {
             }
             let item = EntId(idx);
             let ent = &self.entities[item];
-            if ent.v.solid != Solid::Trigger
+            if !touch_valid_terminal(graph, cell, ent)
+                || ent.v.solid != Solid::Trigger
                 || (ent.v.origin - origin).length() > LOCAL_PICKUP_RADIUS
             {
                 continue;
@@ -1100,7 +1222,10 @@ impl GameState {
             .filter_map(|&(idx, cell)| {
                 let item = EntId(idx);
                 let ent = &self.entities[item];
-                if ent.v.solid != Solid::Trigger || self.entities[bot_e].bot.is_avoided(idx, now) {
+                if !touch_valid_terminal(graph, cell, ent)
+                    || ent.v.solid != Solid::Trigger
+                    || self.entities[bot_e].bot.is_avoided(idx, now)
+                {
                     return None;
                 }
                 let cat = ent.classname().and_then(category)?;
@@ -1126,6 +1251,33 @@ impl GameState {
             })
             .max_by(|a, b| a.2.total_cmp(&b.2).then_with(|| b.0.0.cmp(&a.0.0)))
             .map(|(item, cell, _)| (item, cell))
+    }
+
+    /// Price a second terminal for the same item after steering reached the selected one without a
+    /// take. This preserves pickup ownership while changing only the physical endpoint and uses the
+    /// same live link pricing as normal item planning.
+    pub(crate) fn select_alternate_item_terminal(
+        &self,
+        bot_e: EntId,
+        item: EntId,
+        current: CellId,
+    ) -> Option<CellId> {
+        let graph = self.nav.graph.as_ref()?;
+        let from = graph.nearest(self.entities[bot_e].v.origin)?;
+        let pricing = self.bot_link_pricing(bot_e, self.time());
+        let travel = graph.costs_from(from, &pricing.costs(0));
+        self.nav
+            .goals
+            .iter()
+            .filter_map(|&(idx, cell)| {
+                (idx == item.0
+                    && cell != current
+                    && touch_valid_terminal(graph, cell, &self.entities[item])
+                    && travel[cell as usize].is_finite())
+                .then_some((cell, travel[cell as usize]))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
+            .map(|(cell, _)| cell)
     }
 
     /// The best `(item, cell, desire)` for a bot by `desire × (LOOKAHEAD − t) / (t + 5)`, over both
@@ -1267,7 +1419,7 @@ impl GameState {
             .as_ref()
             .and_then(|g| g.nearest(self.entities[item].v.origin));
         let b = &mut self.entities[e].bot;
-        b.goal.item = item.0;
+        b.goal.set_item(item.0);
         if let Some(c) = cell {
             b.goal.item_cell = c;
         }
@@ -1494,6 +1646,9 @@ impl GameState {
                 continue;
             }
             let item = EntId(idx);
+            if !touch_valid_terminal(graph, cell, &self.entities[item]) {
+                continue;
+            }
             let Some(cat) = self.entities[item].classname().and_then(category) else {
                 continue;
             };
@@ -1609,13 +1764,24 @@ impl GameState {
             b.one_score
                 .total_cmp(&a.one_score)
                 .then_with(|| a.item.0.cmp(&b.item.0))
+                .then_with(|| a.cell.cmp(&b.cell))
         });
         // The up-to-six continuation costs (one per primary), all under the same pricing the base costs
         // used (`base` == `pricing.costs(0)`, still valid — `LinkCosts` is `Copy`). Coarse: a cheap
         // abstract Dijkstra each. Exact: the mutually-independent floods, fanned out in one ordered
         // batch across the worker pool. `leg_costs[pi]` is primary `pi`'s costs.
-        let primaries: Vec<ItemCandidate> =
-            candidates.iter().filter(|c| c.one_score > 0.0).take(PLAN_PRIMARY_LIMIT).copied().collect();
+        // One item may expose several touch-valid terminals. Keep all of them available as second
+        // legs, but do not let six cells for one armor consume the bounded primary-plan budget.
+        let mut primaries: Vec<ItemCandidate> = Vec::new();
+        for &candidate in candidates.iter().filter(|c| c.one_score > 0.0) {
+            if primaries.iter().any(|c: &ItemCandidate| c.item == candidate.item) {
+                continue;
+            }
+            primaries.push(candidate);
+            if primaries.len() == PLAN_PRIMARY_LIMIT {
+                break;
+            }
+        }
         let leg_costs: Vec<PlanCosts> = if lod {
             primaries.iter().map(|c| PlanCosts::Coarse(graph.coarse_costs(c.cell, &base, true))).collect()
         } else {
@@ -1787,6 +1953,80 @@ mod tests {
         // Cell-level path noise on a pickup lying along the route gets the documented tolerance.
         assert!(powerup_bridge_arrives_in_time(2.0, 2.5, 0.0));
         assert!(!powerup_bridge_arrives_in_time(2.0, 2.51, 0.0));
+    }
+
+    #[test]
+    fn chased_armor_enters_terminal_completion_before_touch_range() {
+        // The analysed DM3 stalls were 116-209 qu from armor. Cell-level travel can exceed the
+        // opportunistic one-second budget around stairs/turns, but a goal already selected and
+        // physically this close must keep closing until its hull reaches the trigger (roughly
+        // 80 qu).
+        assert!(local_pickup_in_budget(true, 209.0, 1.5));
+        assert!(!local_pickup_in_budget(true, 209.0, 8.0));
+        // A different item at the same cost remains merely opportunistic and must not hijack
+        // combat.
+        assert!(!local_pickup_in_budget(false, 209.0, 1.5));
+    }
+
+    #[test]
+    fn spawn_stack_choice_is_nearest_with_a_bounded_height_preference() {
+        let low = SpawnStackCandidate {
+            item: EntId(10),
+            cell: 1,
+            travel: 2.0,
+            rise: 0.0,
+            uses_lift: false,
+        };
+        let nearby_high = SpawnStackCandidate {
+            item: EntId(11),
+            cell: 2,
+            travel: 2.6,
+            rise: 128.0,
+            uses_lift: false,
+        };
+        assert_eq!(choose_spawn_stack([low, nearby_high]).unwrap().item, nearby_high.item);
+
+        let distant_high = SpawnStackCandidate {
+            item: EntId(12),
+            cell: 3,
+            travel: 4.0,
+            rise: 256.0,
+            uses_lift: false,
+        };
+        assert_eq!(choose_spawn_stack([low, distant_high]).unwrap().item, low.item);
+
+        let unreachable = SpawnStackCandidate {
+            item: EntId(13),
+            cell: 4,
+            travel: f32::INFINITY,
+            rise: 512.0,
+            uses_lift: false,
+        };
+        assert_eq!(choose_spawn_stack([low, unreachable]).unwrap().item, low.item);
+
+        let lift_high = SpawnStackCandidate {
+            item: EntId(14),
+            cell: 5,
+            travel: 2.6,
+            rise: 256.0,
+            uses_lift: true,
+        };
+        assert_eq!(choose_spawn_stack([low, lift_high]).unwrap().item, low.item);
+
+        let only_far = SpawnStackCandidate {
+            item: EntId(15),
+            cell: 6,
+            travel: 30.0,
+            rise: 0.0,
+            uses_lift: false,
+        };
+        assert!(choose_spawn_stack([only_far]).is_none());
+
+        let at_limit = SpawnStackCandidate {
+            travel: SPAWN_STACK_TRAVEL_MAX,
+            ..only_far
+        };
+        assert_eq!(choose_spawn_stack([at_limit]).unwrap().item, at_limit.item);
     }
 
     #[test]

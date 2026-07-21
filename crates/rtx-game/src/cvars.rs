@@ -131,6 +131,9 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // default), `ffa` (open free-for-all), or a team format `1on1`/`duel`/`2on2`/`2on2on2`/…
         // (a locked N×M match). `ra` ignores this (its 1v1 round queue is fixed). See `crate::mode`.
         ("rtx_match", Str("")),
+        // Non-empty: the first bot is named this (e.g. the experiment/route label)
+        // instead of the rotating roster name; later bots keep the rotation.
+        ("rtx_bot_label", Str("")),
         // Rocket Arena: seconds of spawn-protected countdown before "FIGHT". (Always a 1v1 duel.)
         ("rtx_ra_countdown", Float(3.0)),
         // Team match (`rtx_match 1on1`/`2on2`/…): seconds of spawn-protected countdown after the
@@ -218,6 +221,13 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // All default to today's behavior.
         ("rtx_jump_curl_hold", Float(0.0)),
         ("rtx_jump_curl_gain", Float(0.0)),
+        // Optional two-phase profile copied into a hand-planted SpeedJump by `planlink`.
+        // A positive switch distance enables it; zero keeps the historical single-target curl.
+        ("rtx_jump_curl_entry_x", Float(0.0)),
+        ("rtx_jump_curl_entry_y", Float(0.0)),
+        ("rtx_jump_curl_switch_dist", Float(0.0)),
+        ("rtx_jump_curl_landing_x", Float(0.0)),
+        ("rtx_jump_curl_landing_y", Float(0.0)),
         // Minimum run-up speed toward the waypoint (fraction of sv_maxspeed) before a plain jump leg
         // fires — 0.5 (160 ups, ~4 ticks of ground accel) kills the useless standstill pogo without
         // stalling short approaches (a jump within JUMP_NOW_DIST of the lip fires regardless). 0 = off.

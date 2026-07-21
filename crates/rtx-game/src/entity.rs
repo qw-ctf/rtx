@@ -504,7 +504,7 @@ pub struct BobState {
 
 /// Per-player grappling-hook state (`grapple.rs`). The hook itself is a separate entity (this
 /// player's `hook`); it stores its target in `enemy` and the chain head in `goalentity`.
-#[derive(Default)]
+#[derive(Default, PartialEq)]
 pub struct GrappleState {
     /// The player's live hook entity, or [`EntId::WORLD`] when none is out.
     pub hook: u32,
@@ -528,7 +528,7 @@ pub struct CustomRefs {
     pub movetarget: u32,
 }
 
-#[derive(Default)]
+#[derive(Default, PartialEq)]
 #[allow(dead_code)]
 pub struct CombatState {
     /// Anti-double-fire latch for projectiles (`voided`).

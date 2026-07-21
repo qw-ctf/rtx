@@ -44,7 +44,8 @@ use crate::bot::state::{
     AirCommit, BotState, CombatPosture, Commit, GoalCommit, GrenadePhase, HookPhase, RjPhase, Wander,
 };
 use crate::defs::{
-    Bits, DeadFlag, Flags, Items, Solid, TakeDamage, Weapon, BUTTON_ATTACK, BUTTON_JUMP, VEC_VIEW_OFS,
+    Bits, DeadFlag, Flags, Items, Solid, TakeDamage, Weapon, BUTTON_ATTACK, BUTTON_JUMP, VEC_HULL_MAX,
+    VEC_HULL_MIN, VEC_VIEW_OFS,
 };
 use crate::entity::{EntId, Entity, Touch};
 use crate::game::{cstring, GameState};
@@ -104,8 +105,8 @@ pub(crate) const RJ_BALLISTIC_SLACK: f32 = 1.0;
 const ARRIVE_RADIUS: f32 = 24.0;
 
 /// Waypoint magnetism (see [`steer::magnet_on_corridor`]): the greatest lateral offset from the leg
-/// corridor at which an item is still worth bending the walk onto. ≈ the fake-client pickup box
-/// (`PICKUP_XY` 40) plus slack; small enough that a same-floor magnet always sits on walkable mesh.
+/// corridor at which an item is still worth bending the walk onto. Small enough that a same-floor
+/// magnet always sits on walkable mesh; the final take is still gated by exact hull overlap.
 const MAGNET_LATERAL: f32 = 48.0;
 
 /// Edge-safety (see the ledge brake / turn slowdown in [`steer`]). Below this speed a single frame
@@ -248,6 +249,13 @@ const GOAL_SELECT_INTERVAL: f32 = 1.5;
 /// period lands in ±25% of 1.5s, i.e. 1.125–1.875s. Wide enough that a whole squad de-phases within a
 /// cycle or two, narrow enough that "a bot reconsiders about every 1.5s" is still true of each bot.
 const GOAL_SELECT_SPREAD: f32 = 0.5;
+/// A fresh-spawn stack run may suppress combat for at most this long. The spawn selector uses the
+/// same bound for candidate travel/respawn time, keeping every chosen exit inside both this deadline
+/// and the ordinary item watchdog's 10-second leash.
+const SPAWN_EXIT_TIME: f32 = 8.0;
+/// Close perceived contact immediately ends stack-first behavior. This covers the useful combat
+/// envelope through lightning-gun range without treating a distant sound as a reason to abandon it.
+const SPAWN_EXIT_COMBAT_RANGE: f32 = 600.0;
 /// How long after the last line-of-sight frame the nav view may still point at a Fight enemy's
 /// live origin. Set equal to combat's `HOLD_ANGLE_TIME` (the 2s corner-hold in `combat::engage`):
 /// while that hold owns the view it overrides `look` anyway, so the handoff is seamless — hold the
@@ -303,9 +311,51 @@ pub(crate) struct BotCmd {
 
 // --- per-frame driving (P2 follow + P4 behavior) ---
 
+/// What the caller claims about the frame driving the bot brain. `is_bot_frame` does not prove this:
+/// both mvdsv scheduler variants set it. A claim only permits the current bitwise schedule check;
+/// the stored setup clock is rechecked on every airborne frame and that revalidation is the actual
+/// safety guarantee. Normal-frame fallback and the network client make no fixed-schedule claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BotFrameScheduleClaim {
+    ClaimedFixed,
+    Unclaimed,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BotFrameClock {
+    claim: BotFrameScheduleClaim,
+    scheduled_dt: f32,
+    matches_schedule: bool,
+}
+
+impl BotFrameClock {
+    fn observe(claim: BotFrameScheduleClaim, maxfps: f32, frametime: f32) -> Self {
+        let scheduled_dt = prof::scheduled_dt(maxfps);
+        let matches_schedule = frametime.to_bits() == scheduled_dt.to_bits();
+        Self { claim, scheduled_dt, matches_schedule }
+    }
+
+    fn fixed_setup_clock(
+        self,
+        controller_dt: f32,
+        move_dt: f32,
+    ) -> Option<crate::navmesh::GroundTurnSetupClock> {
+        (self.claim == BotFrameScheduleClaim::ClaimedFixed
+            && self.matches_schedule
+            && controller_dt.to_bits() == self.scheduled_dt.to_bits())
+            .then(|| {
+                crate::navmesh::GroundTurnSetupClock::from_verified_schedule(
+                    self.scheduled_dt,
+                    move_dt,
+                )
+            })
+            .flatten()
+    }
+}
+
 /// Drive every bot for this server bot-frame: pick the nearest human, path to them, and emit
 /// each bot's usercmd. Skipped entirely without a navmesh.
-pub fn run_bots(game: &mut GameState) {
+pub fn run_bots(game: &mut GameState, clock_claim: BotFrameScheduleClaim) {
     if !game.nav.is_loaded() {
         return;
     }
@@ -325,7 +375,9 @@ pub fn run_bots(game: &mut GameState) {
     game.bot_pool.ensure(&host);
     let interval = host.cvar(c"rtx_bot_prof");
     let profiling = interval > 0.0;
-    let budget = prof::budget_ms(&host);
+    let maxfps = host.cvar(c"maxfps");
+    let budget = prof::budget_ms(maxfps);
+    let frame_clock = BotFrameClock::observe(clock_claim, maxfps, game.globals.frametime);
     game.bot_prof.set_profiling(profiling);
     if !profiling || game.bot_prof.budget_changed(budget) {
         game.bot_prof.reset();
@@ -341,7 +393,7 @@ pub fn run_bots(game: &mut GameState) {
             if fake_client {
                 bot_pickup_items(game, e);
             }
-            run_bot(game, e);
+            run_bot(game, e, frame_clock);
             if profiling {
                 bots += 1;
                 game.bot_prof.add_bot(one.stop());
@@ -355,12 +407,6 @@ pub fn run_bots(game: &mut GameState) {
     }
 }
 
-/// Generous fixed pickup half-extents (the player hull ±16 plus the item trigger ±16, with a
-/// little slack). We use a fixed box rather than the item's engine-side `mins`/`maxs` because
-/// `set_size` may not sync those to our shadow `EntVars`, which would make the test a degenerate
-/// point and almost never fire.
-const PICKUP_XY: f32 = 40.0;
-const PICKUP_Z: f32 = 48.0;
 /// How long a just-collected goal item stays on the avoid ring, so the bot re-picks a fresh goal
 /// instead of re-fixating on a pickup that respawns (or lingers solid) the same second.
 const PICKUP_AVOID_TIME: f32 = 3.0;
@@ -401,7 +447,7 @@ fn bot_pickup_items(game: &mut GameState, e: EntId) {
         .iter()
         .enumerate()
         .filter_map(|(i, it)| {
-            (it.v.solid == Solid::Trigger && bot_pickup_touch(it.touch) && on_item(origin, it.v.origin))
+            (it.v.solid == Solid::Trigger && bot_pickup_touch(it.touch) && item_terminal_touches(origin, it))
                 .then_some(EntId(i as u32))
         })
         .collect();
@@ -427,11 +473,12 @@ fn bot_pickup_items(game: &mut GameState, e: EntId) {
                 let b = &mut game.entities[e].bot;
                 b.mark_avoid(item.0, now + PICKUP_AVOID_TIME);
                 if next_item != 0 {
-                    (b.goal.item, b.goal.item_cell, b.goal.commit) = (next_item, next_cell, next_commit);
+                    b.goal.set_item(next_item);
+                    (b.goal.item_cell, b.goal.commit) = (next_cell, next_commit);
                     b.goal.since = now;
                     b.goal.next_pick = now + GOAL_SELECT_INTERVAL;
                 } else {
-                    b.goal.item = 0;
+                    b.goal.set_item(0);
                     b.goal.commit = GoalCommit::None;
                     b.goal.next_pick = now;
                 }
@@ -439,12 +486,6 @@ fn bot_pickup_items(game: &mut GameState, e: EntId) {
             }
         }
     }
-}
-
-/// Whether a bot at `bot_origin` is close enough to an item at `item_origin` to collect it.
-fn on_item(bot_origin: Vec3, item_origin: Vec3) -> bool {
-    let d = item_origin - bot_origin;
-    d.x.abs() <= PICKUP_XY && d.y.abs() <= PICKUP_XY && d.z.abs() <= PICKUP_Z
 }
 
 /// What the bot is trying to do this frame — the output of [`resolve_objective`]. All-Copy so the
@@ -472,10 +513,16 @@ struct Objective {
     /// Standing vigil over an uncollectable goal item (cruising/scanning near it) — exempts the
     /// stuck/progress watchdogs and drives the eyes with the scan sweep.
     vigil: bool,
+    /// Current solidity of the goal item; terminal take confirmation is meaningful only for a live
+    /// pickup trigger.
+    item_solid: Solid,
     /// Where to navigate toward this frame.
     target_origin: Vec3,
     /// The navmesh cell of the item goal, when chasing one (skips a `nearest` lookup).
     item_cell: Option<CellId>,
+    /// A second touch-valid terminal for the same pickup, priced from the bot's current cell. Filled
+    /// only after steering reaches the first terminal and its short confirmation grace elapses.
+    alternate_item_cell: Option<CellId>,
     /// Waypoint magnetism (`rtx_bot_magnet`): a desirable item lying just off the route the bot
     /// should bend its immediate steering waypoint through — grabbed *in passing*, without changing
     /// its goal. `None` = nothing worth the side-step. `steer` applies the bend only when the item is
@@ -510,6 +557,7 @@ struct Sense {
     now: f32,
     frametime: f32,
     msec: i32,
+    frame_clock: BotFrameClock,
     origin: Vec3,
     v_angle: Vec3,
     client: i32,
@@ -553,7 +601,7 @@ struct Sense {
     rj_knobs: rj::RjKnobs,
 }
 
-fn sense(game: &GameState, e: EntId) -> Sense {
+fn sense(game: &GameState, e: EntId, frame_clock: BotFrameClock) -> Sense {
     let host = *game.host();
     let now = game.time();
     let frametime = game.globals.frametime;
@@ -615,7 +663,7 @@ fn sense(game: &GameState, e: EntId) -> Sense {
         pitch_bias: host.cvar(c"rtx_rj_pitch_bias"),
     };
     Sense {
-        host, now, frametime, msec, origin, v_angle, client, weapon, on_ground, in_water, submerged, burning, air_left, alive, vz, air_jumped, enemy_seen_time, v_xy, speed, grapple_hook, has_grapple, hook_out, on_hook, anchor, reel_half_step,
+        host, now, frametime, msec, frame_clock, origin, v_angle, client, weapon, on_ground, in_water, submerged, burning, air_left, alive, vz, air_jumped, enemy_seen_time, v_xy, speed, grapple_hook, has_grapple, hook_out, on_hook, anchor, reel_half_step,
         attack_finished, has_rl, ammo_rockets, health, armortype, armorvalue, quad, rj_knobs,
     }
 }
@@ -625,6 +673,85 @@ fn sense(game: &GameState, e: EntId) -> Sense {
 /// pickup from surviving a restart and replacing the course objective.
 fn hard_mode_objective(intent: Option<BotIntent>) -> bool {
     matches!(intent, Some(BotIntent::Move(_) | BotIntent::Spectate { .. }))
+}
+
+/// Whether a player standing at `player_origin` physically overlaps the server's linked pickup
+/// trigger. This uses the real asymmetric player/item hulls and the engine's 15u horizontal
+/// item-link grow, and is shared by terminal cataloging and fake-client pickup dispatch so every
+/// selectable endpoint can take in both execution modes.
+pub(crate) fn item_terminal_touches(player_origin: Vec3, item: &Entity) -> bool {
+    const ITEM_LINK_GRAB: f32 = 15.0;
+    let player_min = player_origin + VEC_HULL_MIN;
+    let player_max = player_origin + VEC_HULL_MAX;
+    let item_min = item.v.origin + item.v.mins - Vec3::new(ITEM_LINK_GRAB, ITEM_LINK_GRAB, 0.0);
+    let item_max = item.v.origin + item.v.maxs + Vec3::new(ITEM_LINK_GRAB, ITEM_LINK_GRAB, 0.0);
+    (0..3).all(|axis| player_max[axis] >= item_min[axis] && player_min[axis] <= item_max[axis])
+}
+
+/// Completion ownership carried by a bounded item plan. Kept pure so the objective arbiter's
+/// first/continuation mapping cannot silently diverge as new strategic item tiers are added.
+fn planned_goal_commits(
+    contains_powerup: bool,
+    contains_major: bool,
+    next_powerup: bool,
+    next_major: bool,
+) -> (GoalCommit, GoalCommit) {
+    let first = if contains_powerup {
+        GoalCommit::Powerup
+    } else if contains_major {
+        GoalCommit::Pickup
+    } else {
+        GoalCommit::None
+    };
+    let next = if next_powerup {
+        GoalCommit::Powerup
+    } else if next_major {
+        GoalCommit::Pickup
+    } else {
+        GoalCommit::None
+    };
+    (first, next)
+}
+
+/// A fresh DM spawn has completed its one-item exit as soon as it owns armor or any weapon beyond
+/// the stock axe/shotgun (the optional grapple is also part of the spawn kit, not an exit pickup).
+fn spawn_exit_complete(armor_value: f32, items: f32) -> bool {
+    armor_value > 0.0
+        || [
+            Items::SUPER_SHOTGUN,
+            Items::NAILGUN,
+            Items::SUPER_NAILGUN,
+            Items::GRENADE_LAUNCHER,
+            Items::ROCKET_LAUNCHER,
+            Items::LIGHTNING,
+        ]
+        .into_iter()
+        .any(|weapon| items.has(weapon))
+}
+
+/// Whether safety must release a fresh-spawn item lock. Kept pure so the deadline, mirrored damage
+/// signal, and perceived-contact threshold stay deterministic and directly testable.
+fn spawn_exit_should_abort(
+    now: f32,
+    until: f32,
+    took_damage: bool,
+    perceived_enemy_distance: Option<f32>,
+) -> bool {
+    took_damage
+        || now >= until
+        || perceived_enemy_distance.is_some_and(|distance| distance <= SPAWN_EXIT_COMBAT_RANGE)
+}
+
+/// Release every part of the spawn-exit completion lock so ordinary intent and combat movement can
+/// take ownership in the same frame as a timeout, hit, or close perceived contact.
+fn end_spawn_exit(b: &mut BotState, now: f32) {
+    b.spawn_exit = false;
+    b.spawn_exit_until = 0.0;
+    b.goal.set_item(0);
+    b.goal.next_item = 0;
+    b.goal.commit = GoalCommit::None;
+    b.goal.next_commit = GoalCommit::None;
+    b.goal.next_pick = now;
 }
 
 fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, client: i32) -> Objective {
@@ -663,7 +790,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // additionally sets `order_link`, which `steer` uses to pin the route to that one link.
     if let Some(order) = game.entities[e].bot.puppet.order {
         use crate::bot::state::ControlOrder;
-        game.entities[e].bot.goal.item = 0; // no item chase under a puppet order
+        game.entities[e].bot.goal.set_item(0); // no item chase under a puppet order
         game.entities[e].bot.goal.next_item = 0;
         game.entities[e].bot.goal.commit = GoalCommit::None;
         game.entities[e].bot.goal.next_commit = GoalCommit::None;
@@ -686,8 +813,10 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
             item_committed: false,
             polite: false,
             vigil: false,
+            item_solid: Solid::Not,
             target_origin,
             item_cell,
+            alternate_item_cell: None,
             magnet: None, // a puppet-ordered leg is flown as issued — no incidental side-steps
             watch_point: None,
             surfacing: false,
@@ -700,10 +829,18 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // drive combat or audience-roaming; FFA hunts the nearest player. Every mode-specific bot
     // adaptation lives behind this one hook — the rest of run_bot stays mode-agnostic and reusable.
     let mode = game.mode;
+    // A control-channel item trial is intentionally *not* a puppet order: the ordinary item goal,
+    // router, traversal drivers and pickup terminal semantics must all execute. It suppresses only
+    // competing mode/combat intent so the measured run is deterministic.
+    let trial_active = game.entities[e].bot.puppet.item_trial.is_some();
     // Whether to stop politely short of the destination (see `Objective::polite`) — flagged at
     // the arms that tail a human or roam, never for a mode-issued intent.
     let mut polite = false;
-    let intent = if crate::mode::team::benched(game, e) {
+    let mut stack_exit = game.entities[e].bot.spawn_exit;
+    let benched = crate::mode::team::benched(game, e);
+    let nominated_intent = if trial_active {
+        None
+    } else if benched {
         // Benched spectator (structured match, off the locked roster): stroll the stands, no fighting.
         Some(BotIntent::Move(crate::mode::wander_point(game, e, "info_player_deathmatch", |_| None)))
     } else if host.cvar_bool(c"rtx_bot_pacifist") && mode.allows_bot_pacifist_override() {
@@ -729,7 +866,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // collects until real contact — the biggest believability change); keep an *aware but unseen*
     // target as Fight but hunt where it was last seen (`combat_last_seen`) rather than its live
     // origin; leave a *visible* target as-is. Non-Fight intents (Move/None) aren't perceived.
-    let (intent, combat_last_seen) = match intent {
+    let (mut intent, mut combat_last_seen) = match nominated_intent {
         Some(BotIntent::Fight(en)) => match perception::perceive(game, e, en, now) {
             perception::Awareness::Unaware => (None, None),
             perception::Awareness::Known { last_seen } => (Some(BotIntent::Fight(en)), Some(last_seen)),
@@ -743,13 +880,36 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         }
     };
 
+    // A spawn exit still runs normal perception so close contact can break the no-combat lock. A
+    // perceived but distant enemy leaves the one-item run alone; a close one releases the goal and
+    // falls through to this frame's Fight intent. Benched movement keeps its existing precedence.
+    if stack_exit && !benched {
+        let perceived_enemy_distance = match intent {
+            Some(BotIntent::Fight(en)) => Some((game.entities[en].v.origin - origin).length()),
+            _ => None,
+        };
+        if spawn_exit_should_abort(
+            now,
+            game.entities[e].bot.spawn_exit_until,
+            false,
+            perceived_enemy_distance,
+        ) {
+            end_spawn_exit(&mut game.entities[e].bot, now);
+            stack_exit = false;
+        } else {
+            // The dedicated one-leg item selector owns this bounded exit until safety releases it.
+            intent = None;
+            combat_last_seen = None;
+        }
+    }
+
     let greedy = matches!(intent, Some(BotIntent::Fight(_))) && host.cvar_bool(c"rtx_bot_greed");
 
     // A mode-issued Move/Spectate is a hard objective (flag running, race checkpoint, arena
     // audience). It supersedes an old item completion inherited from a previous Fight/idle frame.
     if hard_mode_objective(intent) {
         let b = &mut game.entities[e].bot;
-        b.goal.item = 0;
+        b.goal.set_item(0);
         b.goal.next_item = 0;
         b.goal.commit = GoalCommit::None;
         b.goal.next_commit = GoalCommit::None;
@@ -762,7 +922,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     let committed = game.entities[e].bot.goal.commit != GoalCommit::None;
     if committed && (committed_item == 0 || !game.item_goal_valid(e, EntId(committed_item), now)) {
         let b = &mut game.entities[e].bot;
-        b.goal.item = 0;
+        b.goal.set_item(0);
         b.goal.next_item = 0;
         b.goal.commit = GoalCommit::None;
         b.goal.next_commit = GoalCommit::None;
@@ -790,10 +950,10 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
                     let b = &mut game.entities[e].bot;
                     let preserve = (b.goal.commit == GoalCommit::Powerup && b.goal.item != 0)
                         .then_some((b.goal.item, b.goal.item_cell, GoalCommit::Powerup));
-                    if item.0 != b.goal.item {
+                    if b.goal.set_item(item.0) {
                         b.goal.since = now;
                     }
-                    (b.goal.item, b.goal.item_cell, b.goal.commit) = (item.0, cell, GoalCommit::Pickup);
+                    (b.goal.item_cell, b.goal.commit) = (cell, GoalCommit::Pickup);
                     (b.goal.next_item, b.goal.next_cell, b.goal.next_commit) =
                         preserve.unwrap_or((0, 0, GoalCommit::None));
                     b.goal.next_pick = now + GOAL_SELECT_INTERVAL;
@@ -806,7 +966,8 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
 
     // Fast local survival pass. It is independent of greed and runs while idle or fighting, but not
     // during a ballistic traversal whose route/view already have an indivisible owner.
-    let urgent_allowed = matches!(intent, None | Some(BotIntent::Fight(_) | BotIntent::Advance(_)))
+    let urgent_allowed = !stack_exit
+        && matches!(intent, None | Some(BotIntent::Fight(_) | BotIntent::Advance(_)))
         && !traversal_committed;
     // A timed powerup commitment normally freezes item selection, but a known respawn wait is spare
     // route time: use it to collect a nearby health/armor/weapon only when the complete two-leg path
@@ -823,8 +984,8 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         b.goal.next_urgent = now + 0.2;
         if let Some((item, cell)) = pick {
             b.goal.since = now;
-            (b.goal.item, b.goal.item_cell, b.goal.commit) =
-                (item.0, cell, GoalCommit::Pickup);
+            b.goal.set_item(item.0);
+            (b.goal.item_cell, b.goal.commit) = (cell, GoalCommit::Pickup);
             (b.goal.next_item, b.goal.next_cell, b.goal.next_commit) =
                 (powerup.0, powerup_cell, GoalCommit::Powerup);
             b.goal.next_pick = now + GOAL_SELECT_INTERVAL;
@@ -838,10 +999,10 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         let b = &mut game.entities[e].bot;
         b.goal.next_urgent = now + 0.2;
         if let Some((item, cell, commit)) = pick {
-            if item.0 != b.goal.item {
+            if b.goal.set_item(item.0) {
                 b.goal.since = now;
             }
-            (b.goal.item, b.goal.item_cell, b.goal.commit) = (item.0, cell, commit);
+            (b.goal.item_cell, b.goal.commit) = (cell, commit);
             (b.goal.next_item, b.goal.next_cell, b.goal.next_commit) = (0, 0, GoalCommit::None);
             b.goal.next_pick = now + GOAL_SELECT_INTERVAL;
         }
@@ -853,7 +1014,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     let holding = game.update_handoff_hold(
         e,
         now,
-        intent.is_none() && game.entities[e].bot.goal.commit == GoalCommit::None,
+        intent.is_none() && !stack_exit && game.entities[e].bot.goal.commit == GoalCommit::None,
     );
     if holding {
         // `update_handoff_hold` set `goal_item` to the held weapon — nothing else to pick this frame.
@@ -861,26 +1022,36 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         // Nearby recovery / timed powerup completion owns the slot until its terminal condition.
     } else if intent.is_none() || matches!(intent, Some(BotIntent::Fight(_) | BotIntent::Advance(_))) {
         if now >= game.entities[e].bot.goal.next_pick {
-            let pick = match intent {
-                Some(BotIntent::Fight(_)) if greedy => game.select_combat_item(e),
-                Some(BotIntent::Fight(_)) => game.select_major_item(e),
-                _ => game.select_item_goal(e),
+            let pick = if stack_exit {
+                game.select_spawn_stack_item(e).map(|first| goals::ItemPlan {
+                    first,
+                    second: None,
+                    first_desire: 0.0,
+                    contains_powerup: false,
+                    contains_major: false,
+                })
+            } else {
+                match intent {
+                    Some(BotIntent::Fight(_)) if greedy => game.select_combat_item(e),
+                    Some(BotIntent::Fight(_)) => game.select_major_item(e),
+                    _ => game.select_item_goal(e),
+                }
             };
             let (new_item, new_cell, next_item, next_cell, commit, next_commit) = match pick {
                 Some(plan) => {
                     let (first, first_cell) = plan.first;
                     let (next, next_cell) = plan.second.map_or((0, 0), |(it, cell)| (it.0, cell));
-                    let first_powerup = game.is_powerup_item(first);
                     let next_powerup = next != 0 && game.is_powerup_item(EntId(next));
-                    let commit = if first_powerup || plan.contains_powerup {
-                        GoalCommit::Powerup
+                    let next_major = next != 0 && game.is_major_item(EntId(next));
+                    let (commit, next_commit) = if stack_exit {
+                        (GoalCommit::Pickup, GoalCommit::None)
                     } else {
-                        GoalCommit::None
-                    };
-                    let next_commit = if next_powerup {
-                        GoalCommit::Powerup
-                    } else {
-                        GoalCommit::None
+                        planned_goal_commits(
+                            plan.contains_powerup,
+                            plan.contains_major,
+                            next_powerup,
+                            next_major,
+                        )
                     };
                     (first.0, first_cell, next, next_cell, commit, next_commit)
                 }
@@ -897,17 +1068,17 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
             // only the phase moves. The other `next_pick = now` sites are deliberate re-picks: exact.
             let spread = GOAL_SELECT_INTERVAL * (1.0 + GOAL_SELECT_SPREAD * (game.random() - 0.5));
             let b = &mut game.entities[e].bot;
-            if new_item != b.goal.item {
+            if b.goal.set_item(new_item) {
                 b.goal.since = now; // restart the watchdog for a new goal
             }
-            (b.goal.item, b.goal.item_cell) = (new_item, new_cell);
+            b.goal.item_cell = new_cell;
             (b.goal.next_item, b.goal.next_cell, b.goal.next_commit) = (next_item, next_cell, next_commit);
             b.goal.next_pick = now + spread;
             b.goal.commit = commit;
         }
         if game.entities[e].bot.goal.item != 0 && !game.item_goal_valid(e, EntId(game.entities[e].bot.goal.item), now) {
             let b = &mut game.entities[e].bot;
-            b.goal.item = 0;
+            b.goal.set_item(0);
             b.goal.next_item = 0;
             b.goal.commit = GoalCommit::None;
             b.goal.next_commit = GoalCommit::None;
@@ -915,7 +1086,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         }
     } else {
         let b = &mut game.entities[e].bot;
-        b.goal.item = 0; // a Move objective supersedes any item chase
+        b.goal.set_item(0); // a Move objective supersedes any item chase
         b.goal.next_item = 0;
         b.goal.commit = GoalCommit::None;
         b.goal.next_commit = GoalCommit::None;
@@ -936,7 +1107,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         let gi = game.entities[e].bot.goal.item;
         let (goal, dist, overlap) = if gi != 0 {
             let it = &game.entities[EntId(gi)];
-            let on = it.v.solid == Solid::Trigger && on_item(origin, it.v.origin);
+            let on = it.v.solid == Solid::Trigger && item_terminal_touches(origin, it);
             let name = it
                 .classname()
                 .unwrap_or(if it.touch == Touch::Backpack { "backpack" } else { "?" });
@@ -986,8 +1157,32 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
             crate::mode::ArenaRole::Audience => 'A',
         };
         let msg = cstring(&format!(
-            "rtx bot{client}: role={role} want={goal} dist={dist:.0} gcell={gcell} gdz={gdz:.0} on_item={overlap} ownLG={own_lg} cells={:.0} pen={pen} aware={aware} est={est} hold={hold} mag={mag} commit={commit:?} posture={posture:?} vig={vig} watch={wat}\n",
+            concat!(
+                "rtx bot{client}: role={role} want={goal} dist={dist:.0} ",
+                "gcell={gcell} gdz={gdz:.0} on_item={overlap} ",
+                "ownLG={own_lg} cells={:.0} pen={pen} aware={aware} est={est} ",
+                "hold={hold} mag={mag} commit={commit:?} posture={posture:?} ",
+                "spawnexit={} vig={vig} watch={wat}\n",
+            ),
             game.entities[e].v.ammo_cells,
+            stack_exit as i32,
+            client = client,
+            role = role,
+            goal = goal,
+            dist = dist,
+            gcell = gcell,
+            gdz = gdz,
+            overlap = overlap,
+            own_lg = own_lg,
+            pen = pen,
+            aware = aware,
+            est = est,
+            hold = hold,
+            mag = mag,
+            commit = commit,
+            posture = posture,
+            vig = vig,
+            wat = wat,
         ));
         host.conprint(&msg); // conprint always shows; dprint needs `developer 1`
     }
@@ -1005,23 +1200,39 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // would otherwise just beeline the enemy. This is ktx's "the enemy is one more goal" in effect.
     let chasing = game.entities[e].bot.goal.item != 0;
     let item_committed = game.entities[e].bot.goal.commit != GoalCommit::None;
-    let goal_item_org = {
+    let item_solid = if chasing {
+        game.entities[EntId(game.entities[e].bot.goal.item)].v.solid
+    } else {
+        Solid::Not
+    };
+    let goal_item_terminal = {
         let it = EntId(game.entities[e].bot.goal.item);
-        (game.entities[it].v.origin, Some(game.entities[e].bot.goal.item_cell))
+        let cell = game.entities[e].bot.goal.item_cell;
+        let target = game
+            .nav
+            .graph
+            .as_ref()
+            .map(|g| g.cell_origin(cell))
+            .unwrap_or(game.entities[it].v.origin);
+        (target, Some(cell))
     };
     // Where we're headed: the vigil post (waiting on an uncollectable item), the detour item, the
     // mode's target, the chosen item, or the nearest human.
     let (target_origin, item_cell) = match intent {
-        Some(BotIntent::Fight(_)) if chasing => vigil.unwrap_or(goal_item_org),
+        Some(BotIntent::Fight(_)) if chasing => vigil.unwrap_or(goal_item_terminal),
         // Visible → the enemy's live origin (combat owns aim on sight); aware-but-unseen → the
         // last-seen spot, so the bot searches where they went instead of tracking through walls.
         Some(BotIntent::Fight(en)) => (combat_last_seen.unwrap_or(game.entities[en].v.origin), None),
-        Some(BotIntent::Advance(_)) if chasing => vigil.unwrap_or(goal_item_org),
+        Some(BotIntent::Advance(_)) if chasing => vigil.unwrap_or(goal_item_terminal),
         Some(BotIntent::Advance(pos)) => (pos, None),
         Some(BotIntent::Move(pos)) => (pos, None),
         // Spectate navigates exactly like Move; the watched fighter only redirects the eyes (below).
         Some(BotIntent::Spectate { goal, .. }) => (goal, None),
-        None if chasing => vigil.unwrap_or(goal_item_org),
+        None if chasing => vigil.unwrap_or(goal_item_terminal),
+        // No armor/weapon is currently reachable (all may be deeper in their respawn clocks): hold
+        // this spawn instead of falling into the ordinary human-follow/roam path. The 1.5-second
+        // selector cadence will commit as soon as a respawning stack item enters its lookahead.
+        None if stack_exit => (origin, None),
         None => {
             polite = true; // following / roaming: no need to stand on the exact spot
             if let Some(spot) = mode.bot_idle_roam(game, e) {
@@ -1054,13 +1265,29 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     };
     if chasing && game.entities[e].bot.gate.errand.is_none() && now - game.entities[e].bot.goal.since > giveup {
         let b = &mut game.entities[e].bot;
-        b.mark_avoid(b.goal.item, now + GOAL_AVOID_TIME);
-        b.goal.item = 0;
-        b.goal.next_item = 0;
-        b.goal.commit = GoalCommit::None;
-        b.goal.next_commit = GoalCommit::None;
-        b.goal.next_pick = now; // re-pick (skipping the abandoned item) next frame
+        b.abandon_item_goal(now, now + GOAL_AVOID_TIME);
     }
+
+    // A reached item terminal gets a brief window for the server's touch/stat update. If it is
+    // still active after that, pre-price one other touch-valid terminal. Steering consumes that
+    // retry immediately; a second miss fails/avoids instead of burning the 10/25 s goal watchdog.
+    let active_item = game.entities[e].bot.goal.item;
+    let alternate_item_cell = if active_item != 0 {
+        let b = &game.entities[e].bot;
+        let due = b.goal.terminal_arrival.is_some_and(|arrival| {
+            arrival.item == EntId(active_item)
+                && arrival.cell == b.goal.item_cell
+                && now - arrival.at >= steer::TERMINAL_TAKE_GRACE
+        });
+        (due && b.goal.terminal_retried_item != Some(EntId(active_item)))
+            .then(|| game.select_alternate_item_terminal(e, EntId(active_item), b.goal.item_cell))
+            .flatten()
+    } else {
+        let b = &mut game.entities[e].bot;
+        b.goal.terminal_arrival = None;
+        b.goal.terminal_retried_item = None;
+        None
+    };
 
     // Waypoint magnetism: a desirable up item just off the route corridor is worth stepping onto in
     // passing. The fake-client pickup net grabs incidental items by a generous touch box; a network
@@ -1072,6 +1299,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     let magnet = if host.cvar_bool(c"rtx_bot_magnet")
         && matches!(intent, None | Some(BotIntent::Fight(_) | BotIntent::Advance(_)))
         && !traversal_committed
+        && !trial_active
     {
         if now >= game.entities[e].bot.goal.magnet_pick {
             let pick = game.select_route_magnet(e);
@@ -1099,8 +1327,9 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // `surfacing`/`swim_up` are decided in `run_bot` (they need the borrowed graph + bot cell), so
     // the normal objective leaves them off — the anti-drown override flips them on when it fires.
     Objective {
-        hooking, on_sj, on_rj, enemy, chasing, item_committed, polite, target_origin, item_cell, magnet,
-        watch_point, vigil: vigil.is_some(), surfacing: false, swim_up: false, order_link: None,
+        hooking, on_sj, on_rj, enemy, chasing, item_committed, polite, target_origin, item_cell,
+        alternate_item_cell, magnet, watch_point, vigil: vigil.is_some(), item_solid, surfacing: false,
+        swim_up: false, order_link: None,
     }
 }
 
@@ -1230,6 +1459,14 @@ fn emit(
         game.reset_grapple(h);
     }
 
+    // Preserve the exact command submitted to physics for the deterministic item-goal harness.
+    // `frame_end` compares this pending wish with the following frame's observed displacement, so a
+    // wall push is distinguishable from a planner that simply asked the bot to stand still.
+    if let Some(trial) = game.entities[e].bot.puppet.item_trial.as_mut() {
+        trial.pending_wish = move_world;
+        trial.pending_buttons = buttons as u32;
+    }
+
     // Combat/gate diagnostics: what the bot is chasing and whether it's stuck at a gate. Enable
     // with `rtx_bot_debug 1` (conprint shows without `developer`).
     if host.cvar_bool(c"rtx_bot_debug") {
@@ -1259,23 +1496,46 @@ fn emit(
 /// before objective resolution; the steering core repeats the latch defensively after any fresh
 /// repath. Existing commitments are never cleared here — only their physical lifecycle may do so.
 fn prearm_traversal(game: &mut GameState, e: EntId, now: f32, on_ground: bool) {
-    let current = {
+    let (current, incoming_speed_jump) = {
         let Some(graph) = game.nav.graph.as_ref() else {
             return;
         };
         let b = &game.entities[e].bot;
-        b.route.get(b.route_pos).copied().map(|leg| {
+        let current = b.route.get(b.route_pos).copied().map(|leg| {
             (
                 leg,
                 graph.link_kind(leg),
                 graph.link_target(leg),
             )
-        })
+        });
+        // Arm an immediately incoming SpeedJump before the periodic repath gate runs.  At speed the
+        // bot can enter the shared source cell and hit the 0.4 s repath boundary in the same frame;
+        // without this look-ahead, A* may replace the solved traversal with an ordinary floor edge
+        // before the route-advance loop ever makes it current.  The tight source-cell radius keeps
+        // this an atomic handoff, not a general early commitment.
+        let incoming = current.and_then(|(_, kind, target)| {
+            let next = b.route.get(b.route_pos + 1).copied()?;
+            (on_ground
+                && matches!(kind, LinkKind::Walk | LinkKind::Step)
+                && graph.link_kind(next) == LinkKind::SpeedJump
+                && graph.link_source(next) == target
+                && (game.entities[e].v.origin.xy() - graph.cell_origin(target).xy()).length() <= ARRIVE_RADIUS)
+                .then_some(next)
+        });
+        (current, incoming)
     };
+    let bhop = game.host().cvar_bool(c"rtx_bot_bhop");
+    if bhop {
+        if let Some(leg) = incoming_speed_jump {
+            let b = &mut game.entities[e].bot;
+            if b.sj.map(|c| c.leg) != Some(leg) {
+                b.sj = Some(Commit::new(leg, now, false));
+            }
+        }
+    }
     let Some((leg, kind, target)) = current else {
         return;
     };
-    let bhop = game.host().cvar_bool(c"rtx_bot_bhop");
     let b = &mut game.entities[e].bot;
     match kind {
         LinkKind::JumpGap | LinkKind::DoubleJump => {
@@ -1291,14 +1551,14 @@ fn prearm_traversal(game: &mut GameState, e: EntId, now: f32, on_ground: bool) {
             }
         }
         LinkKind::SpeedJump if bhop && b.sj.map(|c| c.leg) != Some(leg) => {
-            b.sj = Some(Commit { leg, since: now });
+            b.sj = Some(Commit::new(leg, now, false));
         }
         _ => {}
     }
 }
 
-fn run_bot(game: &mut GameState, e: EntId) {
-    let s = sense(game, e);
+fn run_bot(game: &mut GameState, e: EntId, frame_clock: BotFrameClock) {
+    let s = sense(game, e, frame_clock);
     // The spine reads only these; `steer` re-destructures the full snapshot from `s` via `SteerCtx`.
     let Sense { host, now, msec, origin, v_angle, client, alive, .. } = s;
     // Flip the per-frame pulse used for press/release-edge buttons.
@@ -1307,6 +1567,39 @@ fn run_bot(game: &mut GameState, e: EntId) {
         b.pulse = !b.pulse;
         b.pulse
     };
+
+    // Detect the living edge rather than a server-only spawn callback: a network-client body is
+    // spawned by the remote server, but its mirrored health produces the same false→true edge. In
+    // ordinary DM with stack discipline, reserve the first life objective for one armor/weapon.
+    let spawn_exit_done =
+        spawn_exit_complete(game.entities[e].v.armorvalue, game.entities[e].v.items);
+    let fresh_spawn = alive && !game.entities[e].bot.was_alive;
+    let health = game.entities[e].v.health;
+    let armor_value = game.entities[e].v.armorvalue;
+    {
+        let enable = game.mode.name() == "dm" && host.cvar_bool(c"rtx_bot_stack");
+        let b = &mut game.entities[e].bot;
+        let took_damage = b.spawn_exit
+            && !fresh_spawn
+            && (health < b.last_health || armor_value < b.last_armor_value);
+        b.was_alive = alive;
+        if fresh_spawn {
+            b.spawn_exit = enable && !spawn_exit_done;
+            b.spawn_exit_until = if b.spawn_exit { now + SPAWN_EXIT_TIME } else { 0.0 };
+            b.goal.set_item(0);
+            b.goal.next_item = 0;
+            b.goal.commit = GoalCommit::None;
+            b.goal.next_commit = GoalCommit::None;
+            b.goal.next_pick = now;
+        } else if b.spawn_exit
+            && (spawn_exit_done
+                || spawn_exit_should_abort(now, b.spawn_exit_until, took_damage, None))
+        {
+            end_spawn_exit(b, now);
+        }
+        b.last_health = health;
+        b.last_armor_value = armor_value;
+    }
 
     // A dead bot holds nothing and isn't mid-jump — drop the handoff reservation and any airborne
     // commitment so neither resumes after respawn.
@@ -1319,6 +1612,8 @@ fn run_bot(game: &mut GameState, e: EntId) {
         b.sj = None;
         b.goal.commit = GoalCommit::None;
         b.posture = CombatPosture::Hold;
+        b.spawn_exit = false;
+        b.spawn_exit_until = 0.0;
     }
 
     // Connected but never spawned (health 0, not dead): the engine defers `PutClientInServer` — the
@@ -1719,6 +2014,39 @@ impl GameState {
         }
     }
 
+    /// Link pricing for the control-channel stock-loadout item trial, computed without mutating the
+    /// live bot. It removes only this bot's transient failed-link surcharge (retaining any merged
+    /// teammate/teleporter surcharge) and prices rocket jumps/hazards as the stock 100-health,
+    /// unarmored SG body that the trial installs after every fallible setup check has passed.
+    pub(crate) fn bot_item_trial_link_pricing(&self, e: EntId, now: f32) -> LinkPricing {
+        let mut pricing = self.bot_link_pricing(e, now);
+        for &(link, until, strikes) in &self.entities[e].bot.failed_links {
+            if until <= now {
+                continue;
+            }
+            if let Some((_, extra)) = pricing.penalties.iter_mut().find(|(li, _)| *li == link) {
+                *extra = (*extra - link_penalty_secs(strikes)).max(0.0);
+            }
+        }
+        pricing.penalties.retain(|&(_, extra)| extra > 0.0);
+        let mut stock = self.entities[e].v;
+        stock.health = 100.0;
+        stock.armorvalue = 0.0;
+        stock.armortype = 0.0;
+        stock.items = (Items::AXE | Items::SHOTGUN).as_f32();
+        stock.ammo_rockets = 0.0;
+        pricing.rj_extra = rj::rocket_jump_extra(&stock, 0.0, now);
+        pricing.hazard = Some(HazardPrice {
+            strength: if self.rtx_cvar_bool("rtx_bot_hazard_health") {
+                goals::total_strength(100.0, 0.0, 0.0)
+            } else {
+                HAZARD_STRENGTH_NEUTRAL
+            },
+            k: self.host().cvar(c"rtx_bot_hazard_k").max(0.0),
+        });
+        pricing
+    }
+
     /// How much this bot values its skin when a route offers a lava/slime shortcut, as the effective
     /// strength [`NavGraph::link_extra`] prices hazard links against: its `total_strength` (health
     /// through armor — lava damage really is absorbed by armor, so plate genuinely buys nerve).
@@ -1908,32 +2236,48 @@ fn ground_leg_targets<'a>(
 
 /// Straight-and-level runway from `origin` along a corridor of successive leg-target points: sum XY
 /// leg lengths while the corridor keeps roughly its heading *and* stays roughly level, stopping
-/// before the first ~96u chord that either turns more than `MAX_BEND` or **climbs** more than
-/// `MAX_CLIMB`. The climb stop is why bots run (not hop) up stairs: an ascending staircase — a chain
-/// of positive-dz Step legs, riser 8–18u per 32u cell — rises ~24u per chord and reads as "not a
-/// bhop runway". Descents never stop it (hopping *down* stairs is fine), and a lone step inside an
-/// otherwise level chord stays under the threshold (single steps are hoppable; pmove steps up on
-/// landing anyway). Judging on chords rather than per 32u leg avoids misreading grid-quantized cell
-/// centres (which zigzag between grid axes) as constant turning.
+/// before the first ~96u chord that either turns more than `MAX_BEND` or **climbs** persistently.
+/// The climb stop is why bots run (not hop) up stairs and ramps: two or more positive-dz risers in a
+/// chord use the lower `MAX_SUSTAINED_CLIMB`, while one isolated step may use `MAX_SINGLE_CLIMB`.
+/// That distinction matters on DM3's lower RA ramp, whose nav cells rise only 16u per 96u chord —
+/// too gentle for the old 20u net-climb test, but still narrow enough that entering a new hop chain
+/// overshoots the ramp. Descents never stop it (hopping *down* stairs is fine), and a lone 16u step
+/// stays hoppable because pmove can step up on landing. Judging on chords rather than per 32u leg
+/// avoids misreading grid-quantized cell centres (which zigzag between grid axes) as constant turning.
 fn runway_over(origin: Vec3, targets: impl Iterator<Item = Vec3>) -> f32 {
     const CHORD: f32 = 96.0;
-    const MAX_BEND: f32 = 35.0;
-    const MAX_CLIMB: f32 = 20.0;
-    let (mut dist, mut prev) = (0.0, origin.xy());
+    // A full-height ordinary hop cannot safely follow the ~32.3-degree two-chord turn on DM3's
+    // upper RA spiral: the air lobe intermittently grazed link 5682. Thirty degrees still admits
+    // the controller's proven 30-degree bend while leaving enough margin for frame/origin jitter.
+    const MAX_BEND: f32 = 30.0;
+    const MAX_SINGLE_CLIMB: f32 = 20.0;
+    const MAX_SUSTAINED_CLIMB: f32 = 12.0;
+    let (mut dist, mut prev, mut prev_z) = (0.0, origin.xy(), origin.z);
     let (mut anchor, mut anchor_dist, mut anchor_z) = (origin.xy(), 0.0, origin.z);
     let mut chord_yaw = None::<f32>;
+    let mut rising_legs = 0u8;
     for tgt in targets {
         let t = tgt.xy();
         dist += (t - prev).length();
         prev = t;
+        if tgt.z > prev_z + 0.5 {
+            rising_legs = rising_legs.saturating_add(1);
+        }
+        prev_z = tgt.z;
         if dist - anchor_dist >= CHORD {
             let c = t - anchor;
             let yaw = yaw_of(c);
-            if chord_yaw.is_some_and(|p| wrap180(yaw - p).abs() > MAX_BEND) || tgt.z - anchor_z > MAX_CLIMB {
+            let climb = tgt.z - anchor_z;
+            let sustained_climb = rising_legs >= 2 && climb > MAX_SUSTAINED_CLIMB;
+            if chord_yaw.is_some_and(|p| wrap180(yaw - p).abs() > MAX_BEND)
+                || climb > MAX_SINGLE_CLIMB
+                || sustained_climb
+            {
                 return anchor_dist; // the corridor turned or climbed in this chord — stop before it
             }
             chord_yaw = Some(yaw);
             (anchor, anchor_dist, anchor_z) = (t, dist, tgt.z);
+            rising_legs = 0;
         }
     }
     dist
@@ -2119,6 +2463,48 @@ mod tests {
         assert!(!hard_mode_objective(None));
     }
 
+    #[test]
+    fn major_item_plans_own_movement_until_touch() {
+        assert_eq!(
+            planned_goal_commits(false, true, false, false),
+            (GoalCommit::Pickup, GoalCommit::None),
+            "a selected RA/mega plan must not hand its terminal approach back to combat",
+        );
+        assert_eq!(
+            planned_goal_commits(false, true, false, true),
+            (GoalCommit::Pickup, GoalCommit::Pickup),
+            "an ordinary bridge and its major continuation must both retain pickup ownership",
+        );
+    }
+
+    #[test]
+    fn spawn_exit_ends_only_after_armor_or_an_upgraded_weapon() {
+        let stock = (Items::AXE | Items::SHOTGUN | Items::GRAPPLE).as_f32();
+        assert!(!spawn_exit_complete(0.0, stock));
+        assert!(spawn_exit_complete(1.0, stock));
+        assert!(spawn_exit_complete(0.0, stock.with(Items::SUPER_NAILGUN)));
+        assert!(spawn_exit_complete(0.0, stock.with(Items::ROCKET_LAUNCHER)));
+    }
+
+    #[test]
+    fn spawn_exit_safety_aborts_on_deadline_damage_or_close_contact() {
+        assert!(!spawn_exit_should_abort(7.99, 8.0, false, None));
+        assert!(spawn_exit_should_abort(8.0, 8.0, false, None));
+        assert!(spawn_exit_should_abort(1.0, 8.0, true, None));
+        assert!(spawn_exit_should_abort(
+            1.0,
+            8.0,
+            false,
+            Some(SPAWN_EXIT_COMBAT_RANGE),
+        ));
+        assert!(!spawn_exit_should_abort(
+            1.0,
+            8.0,
+            false,
+            Some(SPAWN_EXIT_COMBAT_RANGE + 1.0),
+        ));
+    }
+
     /// The corridor scan (used pure, no NavGraph): a straight level corridor is all runway; a sharp
     /// bend or an ascending staircase truncates it; a lone step or a descent does not.
     #[test]
@@ -2145,6 +2531,47 @@ mod tests {
             p.z = 16.0; // a single 16u lip partway along an otherwise level corridor
         }
         assert!(runway_over(origin, step.iter().copied()) > 350.0, "a lone step should not truncate the runway");
+
+        // Exact lower-RA-ramp cadence from DM3: alternating flat/+8u cells add only 16u per 96u.
+        // It is a sustained ascent, not a flat bhop runway; a fresh hop chain here caused the live
+        // bot to sail off the narrow ramp and loop below RA until timeout.
+        let dm3_ra_ramp = [
+            Vec3::new(256.0, -832.0, 32.0),
+            Vec3::new(288.0, -832.0, 32.0),
+            Vec3::new(320.0, -832.0, 40.0),
+            Vec3::new(352.0, -832.0, 40.0),
+            Vec3::new(384.0, -832.0, 48.0),
+            Vec3::new(416.0, -832.0, 48.0),
+            Vec3::new(448.0, -800.0, 56.0),
+        ];
+        let ramp_runway = runway_over(Vec3::new(224.0, -832.0, 24.0), dm3_ra_ramp.into_iter());
+        assert!(
+            ramp_runway < bhop::ZIGZAG_ENGAGE,
+            "DM3's sustained lower-RA ascent must be run, not hopped: {ramp_runway}u"
+        );
+
+        // Exact ordinary corridor preceding the recorded single-frame contact on DM3 link 5682.
+        // Chord one heads southwest; chord two turns south by ~32.3 degrees. At the observed
+        // ~398 ups a full hop needs ~333u, so this bend must truncate the runway before +jump.
+        let dm3_upper_bend = [
+            Vec3::new(-192.0, -608.0, 152.0),
+            Vec3::new(-224.0, -640.0, 152.0),
+            Vec3::new(-224.0, -672.0, 152.0),
+            Vec3::new(-224.0, -704.0, 152.0),
+            Vec3::new(-224.0, -736.0, 152.0),
+            Vec3::new(-224.0, -768.0, 152.0),
+            Vec3::new(-192.0, -800.0, 152.0),
+            Vec3::new(-192.0, -832.0, 152.0),
+        ];
+        let upper_runway = runway_over(
+            Vec3::new(-161.35172, -572.8917, 152.03125),
+            dm3_upper_bend.into_iter(),
+        );
+        let observed_hop_need = 398.0 * bhop::T_HOP + bhop::HOP_MARGIN;
+        assert!(
+            upper_runway < 160.0 && upper_runway < observed_hop_need,
+            "DM3 upper bend must stop at the first ~124u chord and hold the observed full hop: runway={upper_runway} need={observed_hop_need}",
+        );
     }
 
     #[test]
@@ -2349,6 +2776,50 @@ mod tests {
         for touch in [Touch::Teleport, Touch::Hurt, Touch::ButtonTouch, Touch::Multi, Touch::PlatCenter] {
             assert!(!bot_pickup_touch(touch), "{touch:?} must remain engine/map-owned");
         }
+    }
+
+    #[test]
+    fn fake_client_pickup_accepts_every_catalogued_terminal_overlap() {
+        let mut item = Entity::default();
+        item.v.solid = Solid::Trigger;
+        item.v.mins = Vec3::new(-16.0, -16.0, 0.0);
+        item.v.maxs = Vec3::new(16.0, 16.0, 56.0);
+        item.set_touch(Touch::ItemArmor);
+
+        // The outer catalog band rejected by the old ±40/±48 origin-distance predicate:
+        // 47u horizontal and 80u above the item origin still overlap at the linked hull faces.
+        let terminal = Vec3::new(47.0, 0.0, 80.0);
+        assert!(bot_pickup_touch(item.touch));
+        assert!(item_terminal_touches(terminal, &item));
+        assert!(!item_terminal_touches(Vec3::new(47.01, 0.0, 80.0), &item));
+        assert!(!item_terminal_touches(Vec3::new(47.0, 0.0, 80.01), &item));
+    }
+
+    #[test]
+    fn changing_item_goal_clears_terminal_state_even_across_a_chain() {
+        use super::state::{GoalState, TerminalArrival};
+
+        let mut goal = GoalState::default();
+        goal.set_item(10);
+        goal.item_cell = 3;
+        goal.terminal_arrival = Some(TerminalArrival {
+            item: EntId(10),
+            cell: 3,
+            at: 1.0,
+        });
+        goal.terminal_retried_item = Some(EntId(10));
+
+        assert!(!goal.set_item(10), "same goal retains its in-flight retry state");
+        assert!(goal.terminal_arrival.is_some());
+        assert_eq!(goal.terminal_retried_item, Some(EntId(10)));
+
+        assert!(goal.set_item(11), "pickup continuation is a new goal chain link");
+        assert!(goal.terminal_arrival.is_none());
+        assert_eq!(goal.terminal_retried_item, None);
+
+        goal.terminal_retried_item = Some(EntId(11));
+        assert!(goal.set_item(10), "a later fresh chase of the original item is new again");
+        assert_eq!(goal.terminal_retried_item, None);
     }
 
     #[test]

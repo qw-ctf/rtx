@@ -190,7 +190,7 @@ All routing lives in `navmesh/query.rs`, the read-only side of the graph:
 
 - **`find_path`** — plain A*, with a straight-line-time heuristic that is admissible (never an
   overestimate), so the first path found is optimal.
-- **`find_path_banded`** — a kinodynamic A* over `(cell, band)` states with four speed bands
+- **`find_path_banded`** — a kinodynamic A* over `(cell, band)` states with five speed bands
   (`rtx_bot_bandplan`). It credits the speed a bot carries between legs, so chained speed jumps and
   hot corridors actually route; carried speed only survives a corner inside a 45° cone. This is the
   live planner.

@@ -13,7 +13,7 @@ use crate::abi::EntVars;
 use crate::assets::{Model, Sound};
 use crate::bot;
 use crate::defs::*;
-use crate::entity::{CombatState, Die, EntId, Pain, SpawnState};
+use crate::entity::{CombatState, Die, EntId, Entity, Pain, SpawnState};
 use crate::game::GameState;
 use crate::obituary::DeathType;
 use crate::mode::ModePlayer;
@@ -110,6 +110,86 @@ enum PowerupKind {
     Invulnerability,
     Quad,
     Biosuit,
+}
+
+/// Pure half of [`GameState::configure_fresh_player_body`]. Keep every physical/per-life field in
+/// one place so production respawns and deterministic control trials cannot drift apart. Persistent
+/// identity/match state (name, frags, team, mode role and spawn-selection memory) is deliberately
+/// retained; everything a previous life can contaminate is reset.
+fn reset_fresh_player_body_fields(ent: &mut Entity, time: f32, maxspeed: f32) {
+    ent.in_use = true;
+    ent.maxspeed = maxspeed;
+    ent.classname = Some("player".into());
+
+    ent.v.health = 100.0;
+    ent.v.max_health = 100.0;
+    ent.v.takedamage = TakeDamage::Aim;
+    ent.v.solid = Solid::SlideBox;
+    ent.v.movetype = MoveType::Walk;
+    ent.v.flags = Flags::CLIENT.as_f32();
+    ent.v.effects = 0.0;
+    ent.v.deadflag = DeadFlag::No;
+    ent.v.velocity = Vec3::ZERO;
+    ent.v.avelocity = Vec3::ZERO;
+    ent.v.groundentity = EntId::WORLD.to_prog();
+    ent.v.waterlevel = 0.0;
+    ent.v.watertype = 0.0;
+    ent.v.button0 = 0.0;
+    ent.v.button1 = 0.0;
+    ent.v.button2 = 0.0;
+    ent.v.impulse = 0.0;
+    ent.v.teleport_time = 0.0;
+    ent.v.dmg_take = 0.0;
+    ent.v.dmg_save = 0.0;
+    ent.v.dmg_inflictor = EntId::WORLD.to_prog();
+    ent.v.enemy = EntId::WORLD.to_prog();
+    ent.v.chain = EntId::WORLD.to_prog();
+    ent.v.aiment = EntId::WORLD.to_prog();
+    ent.v.goalentity = EntId::WORLD.to_prog();
+    ent.v.owner = EntId::WORLD.to_prog();
+    ent.v.items = 0.0;
+    ent.v.weapon = Weapon::None;
+    ent.v.weaponframe = 0.0;
+    ent.v.currentammo = 0.0;
+    ent.v.ammo_shells = 0.0;
+    ent.v.ammo_nails = 0.0;
+    ent.v.ammo_rockets = 0.0;
+    ent.v.ammo_cells = 0.0;
+    ent.v.armorvalue = 0.0;
+    ent.v.armortype = 0.0;
+    ent.v.nextthink = 0.0;
+
+    ent.combat = CombatState::default();
+    ent.combat.air_finished = time + 12.0;
+    ent.combat.attack_finished = time;
+    ent.mover = Default::default();
+    ent.mover.dmg = 2.0; // initial water damage
+    ent.grapple = Default::default();
+    ent.refs = Default::default();
+    ent.anim = Default::default();
+    ent.deathtype = Default::default();
+    ent.weaponmodel = None;
+    ent.think = Default::default();
+    ent.think1 = Default::default();
+    ent.touch = Default::default();
+    ent.use_ = Default::default();
+    ent.blocked = Default::default();
+    ent.th_pain = Pain::Player;
+    ent.th_die = Die::Player;
+}
+
+/// Pure pose half of [`GameState::place_fresh_player_body_at`]. Both the body and view angles are
+/// spawn-owned; retaining either from a previous attempt makes otherwise identical runs diverge.
+fn set_fresh_player_pose(ent: &mut Entity, origin: Vec3, angles: Vec3) {
+    ent.v.origin = origin;
+    ent.v.oldorigin = origin;
+    ent.v.angles = angles;
+    ent.v.v_angle = angles;
+    ent.v.ideal_yaw = angles.y;
+    ent.v.fixangle = 1.0;
+    ent.v.view_ofs = VEC_VIEW_OFS;
+    ent.v.velocity = Vec3::ZERO;
+    ent.v.avelocity = Vec3::ZERO;
 }
 
 impl GameState {
@@ -216,7 +296,7 @@ impl GameState {
 
     /// Reset `player`'s edict to a fresh, living body: solid slidebox, walk movetype, full health,
     /// the client flag, a wiped per-life `CombatState`, and the player think/pain/die callbacks.
-    fn configure_fresh_player_body(&mut self, player: EntId) {
+    pub(crate) fn configure_fresh_player_body(&mut self, player: EntId) {
         let time = self.globals.time;
         // The move-speed cap the engine seeds each client's pmove clamp from (via the declared
         // `maxspeed` field). Standard `sv_maxspeed` is 320; fall back to it if the cvar reads as
@@ -229,27 +309,23 @@ impl GameState {
                 320.0
             }
         };
-        let ent = &mut self.entities[player];
-        ent.in_use = true;
-        ent.maxspeed = maxspeed;
-        ent.classname = Some("player".into());
-        ent.v.health = 100.0;
-        ent.v.takedamage = TakeDamage::Aim;
-        ent.v.solid = Solid::SlideBox;
-        ent.v.movetype = MoveType::Walk;
-        ent.v.max_health = 100.0;
-        ent.v.flags = Flags::CLIENT.as_f32();
-        ent.v.effects = 0.0;
-        ent.v.deadflag = DeadFlag::No;
-        // Respawn: a fresh player, so wipe all per-life combat state (powerup timers, pain
-        // and attack cooldowns, the air-jump latch, …) and set only the two time-based timers.
-        ent.combat = CombatState::default();
-        ent.combat.air_finished = time + 12.0;
-        ent.combat.attack_finished = time;
-        ent.mover.dmg = 2.0; // initial water damage
-        ent.mover.pausetime = 0.0;
-        ent.th_pain = Pain::Player;
-        ent.th_die = Die::Player;
+        // A hook is a separate live edict. Release it through the production teardown before the
+        // player's private state is wiped; otherwise an old hook/chain can keep thinking into the
+        // next life. Guard both bounds and ownership so corrupt stale state cannot target a peer.
+        let old_hook = {
+            let state = &self.entities[player].grapple;
+            let hook = EntId(state.hook);
+            (state.hook_out
+                && hook.is_some()
+                && hook.index() < self.entities.len()
+                && self.entities[hook].in_use
+                && self.entities[hook].owner() == player)
+                .then_some(hook)
+        };
+        if let Some(hook) = old_hook {
+            self.reset_grapple(hook);
+        }
+        reset_fresh_player_body_fields(&mut self.entities[player], time, maxspeed);
     }
 
     /// Grant `player` their spawn kit and return whether they were benched. Decoded level parms,
@@ -314,29 +390,10 @@ impl GameState {
         let origin = self.entities[spot].v.origin + Vec3::new(0.0, 0.0, 1.0);
         let origin = mode.adjust_spawn_origin(self, player, origin);
         let angles = self.entities[spot].v.angles;
-        {
-            let ent = &mut self.entities[player];
-            ent.v.origin = origin;
-            ent.v.angles = angles;
-            ent.v.fixangle = 1.0; // snap the client's view immediately
-            ent.v.view_ofs = VEC_VIEW_OFS;
-            ent.v.velocity = Vec3::ZERO;
-            // Freshly spawned players fence nearby spawn spots for a moment (KTX's k_1spawn),
-            // so two respawns in quick succession don't land on adjacent spots.
-            ent.spawn.grace_until = time + 2.6;
-        }
-
-        // Assign the player model and bounding box, then explicitly relink at the spawn
-        // origin via setorigin (the engine warns that a direct origin write does not fix
-        // internal links — this is what makes the player visible/collidable to others).
-        // The "eyes" model is set first purely to capture its modelindex (QuakeC's hack for
-        // the Ring of Shadows), then the real player model.
-        self.set_model(player, Model::PROGS_EYES);
-        self.level.modelindex_eyes = self.entities[player].v.modelindex;
-        self.set_model(player, Model::PROGS_PLAYER);
-        self.level.modelindex_player = self.entities[player].v.modelindex;
-        self.set_size(player, VEC_HULL_MIN, VEC_HULL_MAX);
-        self.set_origin(player, origin);
+        // Freshly spawned players fence nearby spawn spots for a moment (KTX's k_1spawn), so two
+        // respawns in quick succession don't land on adjacent spots.
+        self.entities[player].spawn.grace_until = time + 2.6;
+        self.place_fresh_player_body_at(player, origin, angles);
 
         // Telefrag anyone already standing here, then kick off the idle animation loop.
         self.spawn_tdeath(origin, player);
@@ -346,6 +403,28 @@ impl GameState {
         if benched && !self.entities[player].bot.is_bot {
             self.sprint_to(player, c"Match in progress — you'll join at the next warmup.\n");
         }
+    }
+
+    /// Install the production player pose/model/hull at an already-selected exact origin. Spawn
+    /// selection, telefragging and mode lifecycle deliberately stay with [`Self::place_at_spawn`];
+    /// deterministic trials reuse this physical half without choosing a different source point.
+    pub(crate) fn place_fresh_player_body_at(
+        &mut self,
+        player: EntId,
+        origin: Vec3,
+        angles: Vec3,
+    ) {
+        set_fresh_player_pose(&mut self.entities[player], origin, angles);
+
+        // Assign the player model and bounding box, then explicitly relink via setorigin (a raw
+        // origin write does not fix the engine's internal links). "eyes" is set first only to
+        // capture its modelindex for the Ring of Shadows, exactly like a production spawn.
+        self.set_model(player, Model::PROGS_EYES);
+        self.level.modelindex_eyes = self.entities[player].v.modelindex;
+        self.set_model(player, Model::PROGS_PLAYER);
+        self.level.modelindex_player = self.entities[player].v.modelindex;
+        self.set_size(player, VEC_HULL_MIN, VEC_HULL_MAX);
+        self.set_origin(player, origin);
     }
 
     /// `PlayerPreThink` — runs before engine physics: rules, water, death/respawn, jump.
@@ -576,5 +655,163 @@ impl GameState {
             ent.weaponmodel = model.and_then(|m| m.path().to_str().ok()).map(Into::into);
         }
         self.set_weaponmodel(player, model);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entity::{GrappleState, Think, Touch};
+    #[cfg(feature = "netclient")]
+    use crate::netclient::host::NetHost;
+    #[cfg(feature = "netclient")]
+    use std::path::PathBuf;
+
+    fn poison_previous_life(ent: &mut Entity, n: f32) {
+        ent.v.health = -100.0 - n;
+        ent.v.max_health = 250.0;
+        ent.v.takedamage = TakeDamage::No;
+        ent.v.deadflag = DeadFlag::Dead;
+        ent.v.movetype = MoveType::Toss;
+        ent.v.solid = Solid::Not;
+        ent.v.flags = (Flags::CLIENT | Flags::ONGROUND | Flags::INWATER | Flags::WATERJUMP).as_f32();
+        ent.v.effects = 255.0;
+        ent.v.origin = Vec3::splat(n);
+        ent.v.oldorigin = Vec3::splat(-n);
+        ent.v.velocity = Vec3::new(123.0, -456.0, 789.0);
+        ent.v.avelocity = Vec3::new(5.0, 6.0, 7.0);
+        ent.v.angles = Vec3::new(31.0, 72.0 + n, 9.0);
+        ent.v.v_angle = Vec3::new(-40.0, -91.0, 3.0);
+        ent.v.ideal_yaw = -170.0;
+        ent.v.fixangle = 0.0;
+        ent.v.view_ofs = Vec3::new(0.0, 0.0, -8.0);
+        ent.v.groundentity = EntId(77).to_prog();
+        ent.v.waterlevel = 3.0;
+        ent.v.watertype = Content::Lava.as_f32();
+        ent.v.button0 = 1.0;
+        ent.v.button1 = 1.0;
+        ent.v.button2 = 1.0;
+        ent.v.impulse = 9.0;
+        ent.v.teleport_time = 99.0;
+        ent.v.dmg_take = 60.0;
+        ent.v.dmg_save = 40.0;
+        ent.v.dmg_inflictor = EntId(12).to_prog();
+        ent.v.enemy = EntId(13).to_prog();
+        ent.v.owner = EntId(14).to_prog();
+        ent.v.items = Items::QUAD.as_f32();
+        ent.v.weapon = Weapon::RocketLauncher;
+        ent.v.ammo_rockets = 99.0;
+        ent.v.armorvalue = 200.0;
+        ent.v.armortype = 0.8;
+        ent.v.nextthink = 500.0;
+        ent.think = Think::PlayerDead;
+        ent.touch = Touch::Hurt;
+        ent.th_pain = Pain::None;
+        ent.th_die = Die::None;
+
+        ent.combat.attack_finished = 300.0 + n;
+        ent.combat.super_damage_finished = 400.0 + n;
+        ent.combat.air_finished = -1.0;
+        ent.combat.air_jumped = true;
+        ent.combat.show_hostile = 500.0 + n;
+        ent.mover.pausetime = 600.0 + n;
+        ent.mover.speed = 700.0 + n;
+        ent.grapple.hook = 88;
+        ent.grapple.hook_out = true;
+        ent.grapple.on_hook = true;
+        ent.grapple.lefty = true;
+        ent.refs.oldenemy = 91;
+    }
+
+    #[test]
+    fn repeated_fresh_body_reset_does_not_inherit_previous_life() {
+        let mut ent = Entity::default();
+        ent.netname = Some("kept identity".into());
+        ent.v.frags = 17.0;
+        let origin = Vec3::new(192.0, -208.0, -175.0);
+        let angles = Vec3::new(0.0, 90.0, 0.0);
+        let now = 42.25;
+
+        // Poison the body independently before two attempts. Equality with whole default combat /
+        // grapple values proves no timer or latch from either preceding life survives the reset.
+        for attempt in 1..=2 {
+            poison_previous_life(&mut ent, attempt as f32);
+            reset_fresh_player_body_fields(&mut ent, now, 320.0);
+            set_fresh_player_pose(&mut ent, origin, angles);
+
+            let mut expected_combat = CombatState::default();
+            expected_combat.attack_finished = now;
+            expected_combat.air_finished = now + 12.0;
+            assert!(ent.combat == expected_combat);
+            assert!(ent.grapple == GrappleState::default());
+            assert!(ent.is_alive());
+            assert_eq!(ent.v.deadflag, DeadFlag::No);
+            assert_eq!(ent.v.movetype, MoveType::Walk);
+            assert_eq!(ent.v.solid, Solid::SlideBox);
+            assert_eq!(ent.v.takedamage, TakeDamage::Aim);
+            assert_eq!(ent.v.flags, Flags::CLIENT.as_f32());
+            assert_eq!(ent.v.effects, 0.0);
+            assert_eq!(ent.v.origin, origin);
+            assert_eq!(ent.v.oldorigin, origin);
+            assert_eq!(ent.v.angles, angles);
+            assert_eq!(ent.v.v_angle, angles);
+            assert_eq!(ent.v.ideal_yaw, angles.y);
+            assert_eq!(ent.v.fixangle, 1.0);
+            assert_eq!(ent.v.view_ofs, VEC_VIEW_OFS);
+            assert_eq!(ent.v.velocity, Vec3::ZERO);
+            assert_eq!(ent.v.avelocity, Vec3::ZERO);
+            assert_eq!(ent.v.groundentity, EntId::WORLD.to_prog());
+            assert_eq!(ent.v.waterlevel, 0.0);
+            assert_eq!(ent.v.watertype, 0.0);
+            assert_eq!((ent.v.button0, ent.v.button1, ent.v.button2, ent.v.impulse), (0.0, 0.0, 0.0, 0.0));
+            assert_eq!(ent.mover.pausetime, 0.0);
+            assert_eq!(ent.mover.speed, 0.0);
+            assert_eq!(ent.mover.dmg, 2.0);
+            assert_eq!(ent.refs.oldenemy, 0);
+            assert_eq!(ent.think, Think::None);
+            assert_eq!(ent.touch, Touch::None);
+            assert_eq!(ent.th_pain, Pain::Player);
+            assert_eq!(ent.th_die, Die::Player);
+        }
+
+        // Match identity and score are deliberately outside a per-life reset.
+        assert_eq!(ent.netname.as_deref(), Some("kept identity"));
+        assert_eq!(ent.v.frags, 17.0);
+    }
+
+    #[cfg(feature = "netclient")]
+    #[test]
+    fn production_fresh_helpers_remove_hook_and_install_player_model_and_hull() {
+        let host: &'static NetHost = Box::leak(Box::new(NetHost::new(PathBuf::from("/nonexistent"))));
+        let mut game = GameState::new_client(host);
+        let (player, hook) = (EntId(1), EntId(64));
+        let now = 19.5;
+        let origin = Vec3::new(192.0, -208.0, -175.0);
+        let angles = Vec3::new(0.0, 90.0, 0.0);
+        game.globals.time = now;
+
+        poison_previous_life(&mut game.entities[player], 1.0);
+        game.entities[player].in_use = true;
+        game.entities[player].grapple.hook = hook.0;
+        game.entities[hook].in_use = true;
+        game.entities[hook].set_owner(player);
+
+        game.configure_fresh_player_body(player);
+        game.place_fresh_player_body_at(player, origin, angles);
+
+        let ent = &game.entities[player];
+        assert!(ent.is_alive());
+        assert_eq!(ent.grapple.hook, EntId::WORLD.0);
+        assert!(!ent.grapple.hook_out);
+        assert_eq!(game.entities[hook].think, Think::SubRemove);
+        assert_eq!(game.entities[hook].v.nextthink, now);
+        assert_ne!(ent.v.modelindex, 0.0);
+        assert_eq!(game.level.modelindex_player, ent.v.modelindex);
+        assert_eq!(ent.v.mins, VEC_HULL_MIN);
+        assert_eq!(ent.v.maxs, VEC_HULL_MAX);
+        assert_eq!(ent.v.size, VEC_HULL_MAX - VEC_HULL_MIN);
+        assert_eq!(ent.v.origin, origin);
+        assert_eq!(ent.v.angles, angles);
+        assert_eq!(ent.v.v_angle, angles);
     }
 }

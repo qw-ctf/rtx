@@ -746,7 +746,7 @@ impl GameState {
                         .dprint(c"rtx: no engine bot frame — driving bots from the normal frame\n");
                     self.normal_bot_drive_logged = true;
                 }
-                bot::run_bots(self);
+                bot::run_bots(self, bot::BotFrameScheduleClaim::Unclaimed);
             }
             self.bot_frame_seen = false;
             // Emit the harness's puppet lifecycle events after the bots have run (so a landing/stall
@@ -754,7 +754,10 @@ impl GameState {
             crate::control::frame_end(self);
         } else {
             self.bot_frame_seen = true;
-            bot::run_bots(self);
+            // The deployed mvdsv SERVERONLY scheduler is expected to publish the fixed 1/maxfps
+            // quantum. `is_bot_frame` alone does not prove that build variant, so this is only a
+            // claim: `run_bots` withholds the witness unless this and every later frame match bits.
+            bot::run_bots(self, bot::BotFrameScheduleClaim::ClaimedFixed);
         }
         1
     }

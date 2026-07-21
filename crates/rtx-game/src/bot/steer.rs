@@ -14,14 +14,363 @@ use glam::{Vec2, Vec3, Vec3Swizzles};
 
 use super::*;
 use crate::bsp::Bsp;
-use rtx_nav::qphys::ORIGIN_TO_FEET;
-use crate::bot::state::{AirCommit, Commit, GateErrand, PlatWait};
+use rtx_nav::qphys::{JUMP_VZ, ORIGIN_TO_FEET, STEP_HEIGHT};
+use crate::bot::state::{AirCommit, Commit, GateErrand, GroundTurnPhase, PlatWait, TerminalArrival};
 use crate::math::{angle_vectors, angles_to, yaw_of};
 use crate::defs::{Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, BUTTON_JUMP};
 use crate::game::cstring;
 use crate::nav_build::PlatStatus;
-use crate::navmesh::{CellId, Corridor, LinkCosts, LinkKind, NavGraph};
+use crate::navmesh::{CellId, Corridor, LinkCosts, LinkKind, NavGraph, GRID};
 use crate::nearfield;
+use rtx_nav::pmove::{PmParams, PmState};
+
+/// Select the certified ground-turn controller phase. This is factored so the stored traversal
+/// phase, rather than an incidental contact bit, can be the single discriminator for both aim and
+/// movement command dispatch.
+fn ground_turn_uses_setup_controller(phase: GroundTurnPhase) -> bool {
+    matches!(phase, GroundTurnPhase::Setup { .. })
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GroundTurnDriverInput {
+    Setup(bhop::Cmd),
+    Launched,
+    Abort,
+}
+
+/// A checked setup still needs the bhop machine's pulse decision; absence is a hard veto and must
+/// fail closed. Once launched, the stored air controller no longer depends on generic bhop output.
+fn ground_turn_driver_input(
+    phase: GroundTurnPhase,
+    generic: Option<bhop::Cmd>,
+) -> GroundTurnDriverInput {
+    match phase {
+        GroundTurnPhase::Setup { .. } => generic
+            .map(GroundTurnDriverInput::Setup)
+            .unwrap_or(GroundTurnDriverInput::Abort),
+        GroundTurnPhase::Launched => GroundTurnDriverInput::Launched,
+    }
+}
+
+/// Fail-closed movement for a rejected ground-turn continuation. Route invalidation only affects
+/// the next frame, so counter the current carry now rather than letting the unsafe setup command
+/// reach pmove once more.
+fn ground_turn_entry_abort_wish(v_xy: Vec2) -> Vec2 {
+    -v_xy.normalize_or_zero() * MOVE_SPEED
+}
+
+fn abort_ground_turn_setup(
+    bot: &mut BotState,
+    leg: Option<u32>,
+    v_xy: Vec2,
+    now: f32,
+) -> Vec2 {
+    penalize_leg(bot, leg, Some(LinkKind::SpeedJump), now);
+    bot.sj = None;
+    bot.route.clear();
+    bot.repath_time = now;
+    ground_turn_entry_abort_wish(v_xy)
+}
+
+/// How long a real network client waits at a reached pickup terminal for the authoritative server
+/// touch/stat update before trying another terminal or abandoning the item.
+pub(super) const TERMINAL_TAKE_GRACE: f32 = 0.35;
+
+/// Height tolerance for a grounded ascending ordinary leg and when one hands directly to a
+/// gap's certified launch floor. Airborne bhop/swim progression remains XY-only (see
+/// [`ordinary_leg_arrived`]).
+const ROUTE_LEVEL_TOL: f32 = 1.0;
+/// A takeoff heading farther than ~18 degrees from its certified source->target line must be
+/// straightened before +jump. Horizontal speed by itself says nothing about gap reach.
+const JUMP_ALIGN_COS: f32 = 0.95;
+/// Below this speed, turn into the launch line and accelerate; above it, a badly aligned runner first
+/// counter-steers to shed the sideways/backwards momentum without carrying it into a wall or gap.
+const JUMP_BRAKE_SPEED: f32 = 80.0;
+/// A plain gap is certified from its source-cell centre. Do not press +jump before crossing that
+/// source's launch plane, modulo one unit of frame/trace slack.
+const JUMP_SOURCE_EARLY_TOL: f32 = 1.0;
+/// Maximum cross-track offset from the certified source→target line at takeoff. The lower-RA safe
+/// jump has only a few units of lateral hull clearance; a route arrival ball is far too generous.
+const JUMP_SOURCE_LATERAL_TOL: f32 = 6.0;
+/// Ignore floating-point/tiny lateral noise; only an actual outward carry needs the hard line brake.
+const JUMP_OUTWARD_SPEED: f32 = 8.0;
+/// Look this far down the launch line while converging onto the source, so correction joins the
+/// outgoing heading rather than aiming at the cell centre and then making another sharp turn.
+const JUMP_SOURCE_LOOKAHEAD: f32 = 8.0;
+/// Sideways hull-probe reach used to decide whether the bhop slalom fits and to centre ordinary
+/// ground movement before it grazes a corridor wall.
+const CORRIDOR_SIDE_PROBE: f32 = 64.0;
+/// A hop's broad air lobe needs this much hull-centre travel on *both* sides of the route. Narrower
+/// corridors are run normally; the controller can re-engage on the next open straight.
+const BHOP_SIDE_CLEAR: f32 = 48.0;
+/// Ordinary running starts leaning toward the corridor centre inside this side clearance.
+const WALL_CENTER_CLEAR: f32 = 32.0;
+/// Strength of the wall-centering correction blended with the ordinary waypoint wish.
+const WALL_CENTER_WEIGHT: f32 = 1.5;
+/// The intermittent DM3 departure is a compound corner: floor disappears on one side while the
+/// retained velocity is within one hull-width-plus-slack of the vertical face ahead. A plain open
+/// ledge has no such face and should keep its speed.
+const EDGE_BHOP_WALL_CLEAR: f32 = 40.0;
+/// Horizontal spacing between the down-whiskers that validate an ordinary bhop's curved flight
+/// footprint. One nav cell is fine-grained enough to catch a missing landing strip without turning
+/// every grounded bot frame into a dense BSP survey.
+const BHOP_FLOOR_SAMPLE: f32 = GRID;
+/// The vertical hull trace starts just above the predicted standing origin. Starting exactly on the
+/// floor inherits the trace epsilon from the current contact and can report `start_solid` on flat
+/// ground instead of classifying the floor below the future point.
+const BHOP_FLOOR_TRACE_LIFT: f32 = 1.0;
+
+/// Ordinary route-leg arrival. Most ordinary links intentionally use XY-only arrival: airborne
+/// bhop progression and swimming can cross cells at a very different Z. `require_level` is reserved
+/// for a grounded ascending Walk/Step and an ordinary leg that hands directly to a `JumpGap`; there it
+/// prevents advancing the command producer before pmove has physically climbed the target floor.
+fn ordinary_leg_arrived(
+    origin: Vec3,
+    target: Vec3,
+    v_xy: Vec2,
+    arrive_r: f32,
+    fast: bool,
+    require_level: bool,
+) -> bool {
+    if require_level && (origin.z - target.z).abs() > ROUTE_LEVEL_TOL {
+        return false;
+    }
+    let to = target.xy() - origin.xy();
+    to.length() <= arrive_r || (fast && to.dot(v_xy) < 0.0 && to.length() <= 64.0)
+}
+
+/// Descending-root flight time for the stock-QW jump impulse used by `JumpGap` certification.
+fn jump_airtime(source: Vec3, target: Vec3, gravity: f32) -> Option<f32> {
+    let g = gravity.max(1.0);
+    let dz = target.z - source.z;
+    let disc = JUMP_VZ * JUMP_VZ - 2.0 * g * dz;
+    if disc < 0.0 {
+        return None;
+    }
+    let airtime = (JUMP_VZ + disc.sqrt()) / g;
+    (airtime > 0.0).then_some(airtime)
+}
+
+/// Horizontal speed the source-centre ballistic arc needs to reach `target` on its descending root.
+/// The graph certifies the same stock-QW jump impulse; this turns that geometric promise into a live
+/// takeoff gate instead of accepting unrelated sideways speed.
+fn jump_required_speed(source: Vec3, target: Vec3, gravity: f32) -> f32 {
+    jump_airtime(source, target, gravity)
+        .map(|airtime| (target.xy() - source.xy()).length() / airtime)
+        .unwrap_or(f32::INFINITY)
+}
+
+/// Decide whether a grounded `JumpGap` may launch and which way to wish while preparing it.
+/// `ready=false` suppresses every source of +jump (ordinary traversal, bhop carry, and stuck-jump).
+/// A fast misaligned entry brakes first; a slow/aligned entry accelerates down the certified line.
+fn jump_takeoff_prep(
+    origin: Vec3,
+    source: Vec3,
+    target: Vec3,
+    v_xy: Vec2,
+    gravity: f32,
+    maxspeed: f32,
+    runup_frac: f32,
+) -> (bool, Vec2) {
+    let dir = (target.xy() - source.xy()).normalize_or_zero();
+    if dir == Vec2::ZERO {
+        return (false, Vec2::ZERO);
+    }
+    let Some(airtime) = jump_airtime(source, target, gravity) else {
+        return (false, -v_xy.normalize_or_zero());
+    };
+    let delta = target.xy() - source.xy();
+    let horiz = delta.length();
+    let required = jump_required_speed(source, target, gravity);
+    let runup_required = runup_frac.max(0.0) * maxspeed;
+    let speed = v_xy.length();
+    let projected = v_xy.dot(dir);
+    let aligned = speed <= JUMP_BRAKE_SPEED || projected >= speed * JUMP_ALIGN_COS;
+    let rel = origin.xy() - source.xy();
+    let along = rel.dot(dir);
+    let cross = rel - dir * along;
+    let at_source = along >= -JUMP_SOURCE_EARLY_TOL && cross.length() <= JUMP_SOURCE_LATERAL_TOL;
+    // Predict the descending-root hull centre from the *live* approach position and velocity. The
+    // target is reached once the centre gets there; one inscribed hull radius beyond it is still a
+    // physical landing because the trailing edge overlaps the target floor. This is the launch
+    // hysteresis: its entire width comes from the Quake player hull, not a tuned speed allowance.
+    let landing_rel = rel + v_xy * airtime;
+    let landing_along = landing_rel.dot(dir);
+    let landing_cross = (landing_rel - dir * landing_along).length();
+    let landing_radius = VEC_HULL_MAX.x.min(VEC_HULL_MAX.y);
+    let reaches_target = landing_along >= horiz;
+    let overshoots_target = landing_along > horiz + landing_radius;
+    let inside_touchdown = reaches_target && !overshoots_target && landing_cross <= landing_radius;
+    let ready = at_source && aligned && projected >= runup_required && inside_touchdown;
+    // An offset runner can be nominally aligned with the outgoing heading while its retained
+    // lateral component is still carrying it farther away from the certified centre line. That was
+    // the intermittent lower-RA failure: the southbound component looked good, but +X momentum
+    // reached the east wall before the launch gate could converge. Counter the cross-track error
+    // directly before resuming the short look-ahead join.
+    let leaving_line = cross.length() > JUMP_SOURCE_LATERAL_TOL
+        && v_xy.dot(cross) > JUMP_OUTWARD_SPEED * cross.length();
+    // A malformed/impossible stock jump must wait safely for the commitment watchdog to divert it;
+    // never build speed toward a lip that maxspeed cannot clear. A hot bhop entry may still take it
+    // when it already carries the required projected speed.
+    let feasible_from_ground = required <= maxspeed || projected >= required;
+    let wish = if !aligned || !feasible_from_ground {
+        -v_xy.normalize_or_zero()
+    } else if leaving_line && speed > JUMP_BRAKE_SPEED {
+        // Positional cross-track divergence must win over the longitudinal coast: friction alone
+        // preserves the bad heading and would carry an offset runner farther away from the line.
+        -cross.normalize_or_zero()
+    } else if overshoots_target {
+        // Zero wish applies ground friction without immediately accelerating back to maxspeed. The
+        // predicted touchdown therefore moves monotonically into the hull-width acceptance window
+        // instead of pumping between full gas and reverse braking around a scalar speed threshold.
+        Vec2::ZERO
+    } else if !at_source {
+        let join = source.xy() + dir * (along.max(0.0) + JUMP_SOURCE_LOOKAHEAD);
+        (join - origin.xy()).normalize_or_zero()
+    } else {
+        dir
+    };
+    (ready, wish)
+}
+
+/// A plain gap commitment owns its launch and flight wishes. A carried bhop state may still emit a
+/// command after route-kind churn; letting `emit` translate that command would shadow both the
+/// takeoff brake below and the committed air correction.
+fn gap_owned_bhop(kind: Option<LinkKind>, cmd: Option<bhop::Cmd>) -> Option<bhop::Cmd> {
+    if matches!(kind, Some(LinkKind::JumpGap)) { None } else { cmd }
+}
+
+/// Hull-centre travel available to the left/right of `travel`. The trace already includes the
+/// player's 16u half-width, so these are usable movement margins rather than point distances.
+fn corridor_side_reaches(bsp: &Bsp, origin: Vec3, travel: Vec2) -> (f32, f32) {
+    let dir = travel.normalize_or_zero();
+    if dir == Vec2::ZERO {
+        return (CORRIDOR_SIDE_PROBE, CORRIDOR_SIDE_PROBE);
+    }
+    let left = Vec3::new(-dir.y, dir.x, 0.0);
+    let reach = |side: Vec3| {
+        bsp.hull1_trace(origin, origin + side * CORRIDOR_SIDE_PROBE).fraction
+            * CORRIDOR_SIDE_PROBE
+    };
+    (reach(left), reach(-left))
+}
+
+fn bhop_side_open(left: f32, right: f32) -> bool {
+    left >= BHOP_SIDE_CLEAR && right >= BHOP_SIDE_CLEAR
+}
+
+fn bhop_carry_fits(runway: f32, speed: f32) -> bool {
+    runway >= speed * bhop::T_HOP + bhop::HOP_MARGIN
+}
+
+/// Validate the curved horizontal footprint of one *ordinary* bhop against a caller-supplied floor
+/// oracle. The current velocity heading eases toward the route-corridor heading across the flight;
+/// sampling only either endpoint misses exactly the high-speed corner cut this guards. `horizon` is
+/// capped by the caller to the remaining ordinary runway, so an intentional non-ground traversal
+/// after the runway is never mistaken for an unsupported Walk/Step landing.
+fn ordinary_bhop_floor_supported_by(
+    origin: Vec3,
+    v_xy: Vec2,
+    corridor: Vec2,
+    horizon: f32,
+    mut supported: impl FnMut(Vec3, f32) -> bool,
+) -> bool {
+    let velocity_dir = v_xy.normalize_or_zero();
+    let corridor_dir = corridor.normalize_or_zero();
+    if horizon <= 0.0 || velocity_dir == Vec2::ZERO || corridor_dir == Vec2::ZERO {
+        return true;
+    }
+
+    let samples = (horizon / BHOP_FLOOR_SAMPLE).ceil().clamp(1.0, 16.0) as usize;
+    let stride = horizon / samples as f32;
+    let velocity_yaw = yaw_of(velocity_dir);
+    let turn = wrap180(yaw_of(corridor_dir) - velocity_yaw);
+    let mut probe = origin;
+    for i in 1..=samples {
+        let t = i as f32 / samples as f32;
+        let yaw = (velocity_yaw + turn * t).to_radians();
+        let (sin, cos) = yaw.sin_cos();
+        probe += Vec3::new(cos, sin, 0.0) * stride;
+        // Descending stairs remain ordinary ground: allow the same one-step-per-cell envelope as
+        // `hazard::ledge_ahead`. An open shaft still fails well before a full hop reaches its lip.
+        let distance = stride * i as f32;
+        let max_drop = 8.0 + STEP_HEIGHT * (1.0 + distance / GRID);
+        if !supported(probe, max_drop) {
+            return false;
+        }
+    }
+    true
+}
+
+/// BSP-backed ordinary-bhop floor forecast. Each down-whisker uses the live player hull, so a point
+/// route that looks clear while the bot's 32u-wide body hangs over a lip fails closed. Solid at the
+/// raised start is an obstacle/step rather than a drop; the existing forward-wall controller owns it.
+fn ordinary_bhop_floor_supported(bsp: &Bsp, origin: Vec3, v_xy: Vec2, corridor: Vec2, horizon: f32) -> bool {
+    ordinary_bhop_floor_supported_by(origin, v_xy, corridor, horizon, |probe, max_drop| {
+        let start = probe + Vec3::Z * BHOP_FLOOR_TRACE_LIFT;
+        let end = probe - Vec3::Z * max_drop;
+        let trace = bsp.hull1_trace(start, end);
+        trace.start_solid
+            || trace.all_solid
+            || (trace.fraction < 1.0 && trace.plane_normal.z >= 0.7)
+    })
+}
+
+/// Route distance to the next certified ground-turn handoff, provided only ordinary ground links
+/// remain before it. A normal bhop must release ownership at least one flight before that source:
+/// landing directly on the 32u predecessor retains an arbitrary >maxspeed velocity/yaw that the
+/// executable ground-turn contract correctly rejects.
+fn ground_turn_handoff_distance(
+    graph: &NavGraph,
+    route: &[u32],
+    route_pos: usize,
+    origin: Vec3,
+) -> Option<f32> {
+    let mut at = origin.xy();
+    let mut distance = 0.0;
+    for &leg in route.get(route_pos..)?.iter().take(32) {
+        match graph.link_kind(leg) {
+            LinkKind::Walk | LinkKind::Step => {
+                let target = graph.cell_origin(graph.link_target(leg)).xy();
+                distance += (target - at).length();
+                at = target;
+            }
+            LinkKind::SpeedJump
+                if graph
+                    .speed_jump_of_link(leg)
+                    .is_some_and(|tr| tr.ground_turn.is_some()) =>
+            {
+                distance += (graph.cell_origin(graph.link_source(leg)).xy() - at).length();
+                return Some(distance);
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Last-line launch guard for an ordinary Walk/Step leg. The bhop state normally makes the same
+/// runway decision on a landing, but route/phase churn can still hand back a one-frame +jump after
+/// the corridor scan has truncated at a bend. Never turn that stale pulse into a real takeoff.
+fn ordinary_bhop_jump_fits(kind: Option<LinkKind>, runway: f32, speed: f32) -> bool {
+    !matches!(kind, Some(LinkKind::Walk | LinkKind::Step)) || bhop_carry_fits(runway, speed)
+}
+
+fn bhop_faces_compound_corner(wall_clear: f32, away: Vec2) -> bool {
+    wall_clear < EDGE_BHOP_WALL_CLEAR * 0.99 && away != Vec2::ZERO
+}
+
+/// Unit correction away from the nearer side wall. It is zero in open space and when already
+/// centred between equally-near walls; the ordinary waypoint wish supplies the forward component.
+fn wall_center_bias(travel: Vec2, left: f32, right: f32) -> Vec2 {
+    let dir = travel.normalize_or_zero();
+    if dir == Vec2::ZERO || left.min(right) >= WALL_CENTER_CLEAR || (left - right).abs() < 0.5 {
+        return Vec2::ZERO;
+    }
+    let left_axis = Vec2::new(-dir.y, dir.x);
+    let away = if left < right { -left_axis } else { left_axis };
+    away * ((WALL_CENTER_CLEAR - left.min(right)) / WALL_CENTER_CLEAR).clamp(0.0, 1.0)
+}
 
 /// The all-`Copy` frame snapshot `steer` reads: the [`Sense`] and [`Objective`] this frame, the
 /// per-bot A* costs, and the live gate/plat state gathered before the borrow (see `run_bot`).
@@ -93,6 +442,144 @@ fn nearfield_gates<'a>(graph: &'a NavGraph, gate_closed: &'a [bool], origin: Vec
     })
 }
 
+#[derive(Clone, Copy)]
+struct GroundTurnEntryCandidate {
+    leg: u32,
+    cost: f32,
+    adjustment: Option<bhop::Cmd>,
+    accepted: bool,
+    pmove_steps: usize,
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct GroundTurnEntryWork {
+    candidates: usize,
+    pmove_steps: usize,
+}
+
+#[derive(Clone, Copy)]
+enum GroundTurnPredecessorSelection {
+    Commit(GroundTurnEntryCandidate),
+    Abort,
+    Defer,
+}
+
+fn ground_turn_predecessor_selection(
+    selected: Option<GroundTurnEntryCandidate>,
+    work: GroundTurnEntryWork,
+) -> GroundTurnPredecessorSelection {
+    match selected {
+        Some(candidate) => GroundTurnPredecessorSelection::Commit(candidate),
+        None if work.candidates > 0 => GroundTurnPredecessorSelection::Abort,
+        None => GroundTurnPredecessorSelection::Defer,
+    }
+}
+
+fn predecessor_adjustments_complete(profiles: usize, adjustments: usize) -> bool {
+    profiles > 0 && profiles == adjustments
+}
+
+/// Choose only among physically witnessed entries, retaining the cheapest graph profile. Work from
+/// rejected candidates is included in the report: it is still real one-shot pmove cost even though
+/// no route mutation follows from it.
+fn select_ground_turn_entry(
+    candidates: impl IntoIterator<Item = GroundTurnEntryCandidate>,
+) -> (Option<GroundTurnEntryCandidate>, GroundTurnEntryWork) {
+    let mut best = None::<GroundTurnEntryCandidate>;
+    let mut work = GroundTurnEntryWork::default();
+    for candidate in candidates {
+        work.candidates += 1;
+        work.pmove_steps += candidate.pmove_steps;
+        if !candidate.accepted {
+            continue;
+        }
+        let replace = best.is_none_or(|current| {
+            candidate.cost.total_cmp(&current.cost).then(candidate.leg.cmp(&current.leg)).is_lt()
+        });
+        if replace {
+            best = Some(candidate);
+        }
+    }
+    (best, work)
+}
+
+fn nearfield_owns_locomotion(
+    on_air: bool,
+    sj_active: bool,
+    hook_active: bool,
+    rj_active: bool,
+    kind: Option<LinkKind>,
+) -> bool {
+    !on_air
+        && !sj_active
+        && !hook_active
+        && !rj_active
+        && matches!(kind, Some(LinkKind::Walk | LinkKind::Step) | None)
+}
+
+#[derive(Clone, Copy)]
+struct ApproachLeg {
+    kind: LinkKind,
+    source: CellId,
+    target: CellId,
+    speed_jump_certified: bool,
+}
+
+fn certified_jump_approach<I>(legs: I) -> bool
+where
+    I: IntoIterator<Item = ApproachLeg>,
+{
+    let mut previous_target = None;
+    let mut saw_ground = false;
+    for leg in legs {
+        if previous_target.is_some_and(|target| target != leg.source) {
+            return false;
+        }
+        match leg.kind {
+            LinkKind::Walk | LinkKind::Step => {
+                saw_ground = true;
+                previous_target = Some(leg.target);
+            }
+            LinkKind::JumpGap => return saw_ground,
+            LinkKind::SpeedJump => return saw_ground && leg.speed_jump_certified,
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn nearfield_channels(locomotion: bool, configured: bool, jump_approach: bool) -> (bool, bool) {
+    let active = locomotion && configured;
+    (active, active && !jump_approach)
+}
+
+fn bhop_look_direction(
+    near: Option<&nearfield::NearField>,
+    sensor_active: bool,
+    origin: Vec3,
+    bhop_look: Vec3,
+    to_wp: Vec2,
+) -> Vec2 {
+    // This is a protective far-look veto, not a steering force: a certified approach may yield
+    // repulsion while the still-live sensor keeps a blocked chord on the local waypoint.
+    let look_clear = near
+        .filter(|_| sensor_active)
+        .is_none_or(|nf| nf.chord_open(origin, bhop_look));
+    if look_clear { bhop_look.xy() - origin.xy() } else { to_wp }
+}
+
+fn terrain_policy(base: bool, terrain_stop: bool, nearfield_steering: bool) -> bool {
+    base && (!terrain_stop || nearfield_steering)
+}
+
+fn bhop_sustain_policy(base: bool, ascent_ahead: bool, nearfield_steering: bool) -> bool {
+    terrain_policy(base, ascent_ahead, nearfield_steering)
+}
+
+fn zigzag_policy(base: bool, on_ledge: bool, nearfield_steering: bool) -> bool {
+    terrain_policy(base, on_ledge, nearfield_steering)
+}
+
 /// The lip is "right here" — inside this distance the takeoff jump must fire *now* or the bot wedges
 /// against the step face; beyond it the run-up gate applies.
 const JUMP_NOW_DIST: f32 = 40.0;
@@ -109,16 +596,90 @@ fn jump_runup_ok(v_xy: Vec2, to_wp: Vec2, dist: f32, frac: f32, maxspeed: f32) -
     v_xy.dot(to_wp.normalize_or_zero()) >= frac * maxspeed
 }
 
+fn abandon_terminal_item(bot: &mut BotState, item: u32, now: f32) {
+    debug_assert_eq!(bot.goal.item, item);
+    bot.abandon_item_goal(now, now + GOAL_AVOID_TIME);
+    bot.route.clear();
+    bot.goal_cell = None;
+    bot.repath_time = now;
+}
+
+fn consume_terminal_retry(bot: &mut BotState, item: u32, alternate: CellId, now: f32) {
+    bot.goal.item_cell = alternate;
+    bot.goal.terminal_retried_item = Some(EntId(item));
+    bot.goal.terminal_arrival = None;
+    // The ordinary 1.5 s selector must not immediately rebind the just-failed primary terminal.
+    bot.goal.next_pick = now + GOAL_SELECT_INTERVAL;
+    bot.route.clear();
+    bot.goal_cell = None;
+    bot.repath_time = now;
+}
+
+fn update_item_terminal(
+    bot: &mut BotState,
+    at_item_terminal: bool,
+    item_solid: Solid,
+    goal_cell: CellId,
+    alternate_item_cell: Option<CellId>,
+    now: f32,
+) -> bool {
+    if at_item_terminal && item_solid == Solid::Trigger {
+        let item = bot.goal.item;
+        let arrived_at = match bot.goal.terminal_arrival {
+            Some(arrival) if arrival.item == EntId(item) && arrival.cell == goal_cell => arrival.at,
+            _ => {
+                bot.goal.terminal_arrival = Some(TerminalArrival {
+                    item: EntId(item),
+                    cell: goal_cell,
+                    at: now,
+                });
+                now
+            }
+        };
+        if now - arrived_at >= TERMINAL_TAKE_GRACE {
+            if bot.goal.terminal_retried_item != Some(EntId(item)) {
+                if let Some(alternate) = alternate_item_cell {
+                    consume_terminal_retry(bot, item, alternate, now);
+                    return true;
+                }
+                abandon_terminal_item(bot, item, now);
+                return true;
+            }
+            abandon_terminal_item(bot, item, now);
+            return true;
+        }
+    } else {
+        bot.goal.terminal_arrival = None;
+    }
+    false
+}
+
 pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> SteerOut {
     let SteerCtx { s, o, costs, plat_status, gate_ready, bot_cell, goal_cell, race_line_ahead, weapons_hot, bsp } =
         ctx;
     let Sense {
-        host, now, frametime, origin, v_angle, client, weapon, on_ground, in_water, vz, air_jumped,
+        host, now, frametime, msec, frame_clock, origin, v_angle, client, weapon, on_ground, in_water, vz, air_jumped,
         enemy_seen_time, v_xy, speed, grapple_hook, has_grapple, hook_out, on_hook, anchor, reel_half_step,
         attack_finished, has_rl, ammo_rockets, health, armortype, armorvalue, quad, ..
     } = s;
-    let Objective { hooking, on_sj, on_rj, enemy, chasing, polite, vigil, target_origin, watch_point, .. } = o;
+    let Objective {
+        hooking,
+        on_sj,
+        on_rj,
+        enemy,
+        chasing,
+        item_committed,
+        polite,
+        vigil,
+        item_solid,
+        target_origin,
+        item_cell,
+        alternate_item_cell,
+        watch_point,
+        ..
+    } = o;
     let gate_closed = costs.gate_closed;
+    let debug = host.cvar_bool(c"rtx_bot_debug");
 
     // Plain-jump commitment is normally pre-armed before objective resolution. Remember the first
     // physical airborne frame here; route kind/position is intentionally irrelevant to release.
@@ -173,7 +734,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             if let Some(&leg) = bot.route.get(bot.route_pos) {
                 if graph.link_kind(leg) == LinkKind::Teleport {
                     stamp_tele_reuse(bot, graph, leg, origin, now);
-                    if host.cvar_bool(c"rtx_bot_debug") {
+                    if debug {
                         host.conprint(&cstring(&format!("rtx bot{client}: tele leg={leg}\n")));
                     }
                 }
@@ -242,7 +803,16 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // Re-path when the route is empty, the goal changed, or the timer elapsed. Frozen mid-hook, on a
     // speed/rocket jump, or committed to a plain jump arc, so the traversal keeps the route that put
     // it on that leg (a goal flip mid-air must not replace the route and turn the bot around).
-    if !route_frozen && !on_air && (bot.route.is_empty() || bot.goal_cell != Some(goal) || now >= bot.repath_time) {
+    // A completion-locked item route is static and owns movement until touch/invalidation.  Keep
+    // its selected traversals across the ordinary 0.4 s refresh; a refresh at a SpeedJump source
+    // can otherwise replace the already-certified link one frame before commitment.  Genuine
+    // failures still clear the route or set a new goal through the watchdog/penalty paths below,
+    // which immediately re-enter this block.
+    let periodic_repath = now >= bot.repath_time && !item_committed;
+    if !route_frozen
+        && !on_air
+        && (bot.route.is_empty() || bot.goal_cell != Some(goal) || periodic_repath)
+    {
         // Speed-band planning credits the speed a bot carries between legs (chained speed jumps,
         // cheaper hot Walk legs) — gated on bhop being on (no speed-jump links otherwise) plus its
         // own escape-hatch cvar. `speed` seeds the start band, so a mid-run re-path keeps a hop
@@ -292,7 +862,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         // Empty-route telemetry (C6): a resolved repath that came back with no legs while the bot isn't
         // already at its goal — the "parked in place" signature. `corr` shows whether a corridor was in
         // play (a same-cluster/near None vs a windowed search that found nothing).
-        if host.cvar_bool(c"rtx_bot_debug") && route.is_empty() && bot_cell != target {
+        if debug && route.is_empty() && bot_cell != target {
             host.conprint(&cstring(&format!(
                 "rtx bot{client}: route=0 corr={} tgt_eq_goal={}\n",
                 corridor.is_some(),
@@ -393,9 +963,25 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             // Same for a rocket jump — its driver advances on landing, not on passing the target XY.
             LinkKind::RocketJump => false,
             _ => {
-                let to = target.xy() - origin.xy();
                 let fast = bot.bhop.phase != bhop::Phase::Off || bot.sj.is_some();
-                to.length() <= arrive_r || (fast && to.dot(v_xy) < 0.0 && to.length() <= 64.0)
+                // A grounded dry Step must remain the command producer until pmove has physically
+                // climbed it. This makes both steering and strict trial attribution describe the
+                // riser actually being crossed. Airborne bhop/swim progression remains XY-only.
+                let target_cell = graph.link_target(leg);
+                let source = graph.cell_origin(graph.link_source(leg));
+                let grounded_rise = on_ground
+                    && !in_water
+                    && matches!(graph.link_kind(leg), LinkKind::Walk | LinkKind::Step)
+                    && target.z > source.z + 0.5;
+                // Preserve the existing launch-floor protection for a rising Walk as well: a map
+                // can represent a shallow ramp as Walk immediately before its certified JumpGap.
+                let launch_floor = matches!(graph.link_kind(leg), LinkKind::Walk | LinkKind::Step)
+                    && target.z > source.z + ROUTE_LEVEL_TOL
+                    && bot.route.get(bot.route_pos + 1).is_some_and(|&next| {
+                        graph.link_kind(next) == LinkKind::JumpGap
+                            && graph.link_source(next) == target_cell
+                    });
+                ordinary_leg_arrived(origin, target, v_xy, arrive_r, fast, grounded_rise || launch_floor)
             }
         };
         if arrived {
@@ -430,6 +1016,18 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         (target_origin, None, true, None)
     };
 
+    // Reaching a catalogued pickup terminal while the item remains active means the authoritative
+    // touch has not arrived. Give a network update a short grace, then immediately retry one other
+    // touch-valid terminal. A second miss (or no alternate) avoids the item now — never spend the
+    // ordinary/major goal watchdog pushing into nearby geometry.
+    let at_item_terminal = chasing
+        && item_cell == Some(goal_cell)
+        && final_leg
+        && bot_cell == goal_cell
+        && (target_origin - origin).length() <= ARRIVE_RADIUS;
+    let terminal_changed =
+        update_item_terminal(bot, at_item_terminal, item_solid, goal_cell, alternate_item_cell, now);
+
     // Plat standoff. If an upcoming leg boards/rides a func_plat that isn't at its bottom, and we're
     // not already aboard it, walking to the board point would put us inside the lift's inner trigger
     // (the footprint shrunk 25u, spanning the full travel height) — and `plat_center_touch` resets
@@ -460,12 +1058,16 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // over by a grace period that would, by construction, still stand under the lift for its duration.
     // While holding, steer to the standoff point and borrow the Plat leg's driver treatment (no
     // jump-press, no bhop entry, no air-latch, progress-watchdog exempt) by presenting `kind` as Plat.
-    let (waypoint, kind) = match plat_hold {
+    let (waypoint, kind) = if terminal_changed {
+        (origin, None)
+    } else {
+        match plat_hold {
         Some(pi) => {
             let p = graph.plat(pi);
             (plat_standoff(origin, p.fp_min, p.fp_max), Some(LinkKind::Plat))
         }
         None => (waypoint, kind),
+        }
     };
 
     // Waypoint magnetism: `resolve_objective` picked a desirable up item near the route; if it lies on
@@ -617,6 +1219,23 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // disengage) is `bhop::Bhop::step`'s job. The entry runway bar is deliberately fixed:
     // the old `speed·0.9` bar rose as the bot gained speed and cut runs short mid-air.
     let runway_dist = runway(graph, &bot.route, bot.route_pos, origin);
+    // Use the same speed-scaled route bearing as the hop controller for the floor forecast. At a
+    // bend, checking only current velocity sees the old straight and checking only the waypoint sees
+    // the new one; the sampled curve between them is the physical lobe the controller will attempt.
+    let bhop_look =
+        corridor_point(graph, &bot.route, bot.route_pos, origin, (speed * 0.6).clamp(96.0, 448.0));
+    let ordinary_bhop_floor_risk = on_ground
+        && speed > LEDGE_MIN_SPEED
+        && matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
+        && bsp.is_some_and(|bsp| {
+            let horizon = runway_dist.min(speed * bhop::T_HOP);
+            !ordinary_bhop_floor_supported(bsp, origin, v_xy, bhop_look.xy() - origin.xy(), horizon)
+        });
+    // The slalom needs room on both sides of the *current* route bearing. Hull traces include the
+    // player's width. A narrow tunnel/ramp therefore runs normally, while the same route may resume
+    // hopping as soon as its next landing reaches an open straight.
+    let side_reaches = bsp.map(|bsp| corridor_side_reaches(bsp, origin, waypoint.xy() - origin.xy()));
+    let side_open = side_reaches.map_or(true, |(left, right)| bhop_side_open(left, right));
     // Combat only vetoes bhop while it *owns the view* — the enemy is in sight (or lost a moment
     // ago), when the eyes must aim, not sweep a strafe. A mere Fight target being chased across
     // the map is navigation, and navigation bunnyhops; in FFA every bot always has a target, so
@@ -633,9 +1252,52 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     let is_jump = |l: u32| matches!(graph.link_kind(l), LinkKind::JumpGap | LinkKind::DoubleJump | LinkKind::SpeedJump);
     let jump_at_hand = cur_leg.is_some_and(&is_jump) || bot.route.get(bot.route_pos + 1).is_some_and(|&l| is_jump(l));
     let on_ledge = graph.is_ledge(bot_cell) && !jump_at_hand;
+    // A certified traversal owns not just its current frame but the contiguous ordinary route that
+    // delivers it to the source. Route bands are deliberately not consulted: completion-lock can
+    // leave them at zero while the link-kind contract remains authoritative.
+    let certified_jump_approach = certified_jump_approach(
+        bot.route
+            .get(bot.route_pos..)
+            .into_iter()
+            .flatten()
+            .map(|&leg| ApproachLeg {
+                kind: graph.link_kind(leg),
+                source: graph.link_source(leg),
+                target: graph.link_target(leg),
+                speed_jump_certified: graph.speed_jump_of_link(leg).is_some(),
+            }),
+    );
+    let nearfield_configured = host.cvar_bool(c"rtx_bot_nearfield");
+    let (_, nearfield_steering_for_policy) = nearfield_channels(
+        nearfield_owns_locomotion(on_air, false, hook_active, rj_active, kind),
+        nearfield_configured,
+        certified_jump_approach,
+    );
+    // Do not launch an ordinary hop from the final ground leg into a SpeedJump.  The committed
+    // traversal owns its stored run-up and takeoff line; carrying a one-frame +jump across the
+    // handoff gives it a timing-dependent airborne entry that its ground certificate never allowed.
+    let speed_jump_handoff = on_ground
+        && cur_leg.is_some_and(|leg| matches!(graph.link_kind(leg), LinkKind::Walk | LinkKind::Step))
+        && bot.route.get(bot.route_pos + 1).is_some_and(|&next| {
+            graph.link_kind(next) == LinkKind::SpeedJump
+                && cur_leg.is_some_and(|leg| graph.link_target(leg) == graph.link_source(next))
+        });
+    // Release the broad air slalom early enough to *land*, shed over-maxspeed carry under normal
+    // ground friction, and follow the ordinary predecessor bearing into a ground-turn certificate.
+    // One full current-speed flight plus two margins leaves >=128u of deterministic ground approach;
+    // it does not slow the planned route below maxspeed, it only prevents an uncertified hot landing.
+    let ground_turn_handoff = matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
+        && ground_turn_handoff_distance(graph, &bot.route, bot.route_pos, origin)
+            .is_some_and(|d| d <= speed * bhop::T_HOP + 2.0 * bhop::HOP_MARGIN);
     let bhop_veto = !host.cvar_bool(c"rtx_bot_bhop")
         || combat_view
         || in_water // can't hop while swimming — the engine's pmove turns jumps into swim strokes
+        || speed_jump_handoff
+        || ground_turn_handoff
+        // A plain bhop is never a gap traversal. If its speed-scaled curved footprint loses
+        // walkable floor, release the hop state on this grounded frame and let the brake below shed
+        // carry before normal waypoint steering resumes. Certified traversal kinds bypass this.
+        || ordinary_bhop_floor_risk
         || hook_active
         || rj_active
         // Spectating: a bhop cmd would overwrite the view yaw in `emit` and clobber the watch —
@@ -649,49 +1311,61 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // gates below exist to avoid hopping on trivial approaches — the plan overrides that judgment)
     // and tell the controller to hold the chain across the waypoint rather than disengage per leg.
     let planned_band = bot.route_bands.get(bot.route_pos).copied().unwrap_or(0);
-    // An ascending Walk/Step leg (target more than a walk's worth above the source, i.e. a stair
-    // riser) just ahead: a human runs up stairs, so don't let a planned carry hold the hop chain up
-    // them — `runway`'s climb stop keeps *entry* off stairs, and this keeps *carry* from overriding it.
+    let planned_next_band = bot.route_bands.get(bot.route_pos + 1).copied().unwrap_or(0);
+    // An ascending Walk/Step leg (including DM3's alternating +8u lower-RA ramp cells) just ahead:
+    // a human runs up it, so don't let a planned band carry override `runway`'s climb stop and hold
+    // the hop chain through the narrow ascent. Ignore sub-grid Z noise only.
     let leg_ascends = |leg: u32| {
         matches!(graph.link_kind(leg), LinkKind::Walk | LinkKind::Step)
-            && graph.cell_origin(graph.link_target(leg)).z - graph.cell_origin(graph.link_source(leg)).z > 8.0
+            && graph.cell_origin(graph.link_target(leg)).z - graph.cell_origin(graph.link_source(leg)).z > 4.0
     };
     let ascent_ahead =
         cur_leg.is_some_and(&leg_ascends) || bot.route.get(bot.route_pos + 1).is_some_and(|&l| leg_ascends(l));
-    let carry = (planned_band >= 1 || bot.route_bands.get(bot.route_pos + 1).copied().unwrap_or(0) >= 1)
-        && !ascent_ahead;
+    let carry = (planned_band >= 1 || planned_next_band >= 1)
+        && !ascent_ahead
+        && side_open
+        // A speed band licenses keeping momentum, not blindly taking another broad air lobe into
+        // the non-ground leg/bend at the end of a short corridor. The same physical flight budget
+        // used by the hop state must still fit; otherwise disengage on this landing and run the turn.
+        && bhop_carry_fits(runway_dist, speed);
     let bhop_entry = !final_leg
         && matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
         && (goal_dist > 300.0 || planned_band >= 1)
         && runway_dist >= bhop::RUNWAY_ENGAGE
+        && side_open
         // Run up first: don't start the hop cycle from a standstill — accelerate on the ground until
         // we're actually moving, then leap into the circle-jump (a human never hops from a stop).
         && speed >= bhop::RUN_UP_SPEED;
     // Lenient continuation gate for taking *another* hop from a landing: leg kinds churn as the
     // route advances, and a run in progress shouldn't be dumped by the stricter entry conditions.
-    // But never sustain the chain up an ascending stair run — `runway`'s climb stop keeps *entry* off
-    // stairs, yet a chain carried onto a stairway (a wall-hugging spiral, say) would otherwise keep
-    // hopping and weave off the treads. Drop to the walk, whose near-field glide tracks the steps.
-    let bhop_sustain = matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
+    let bhop_sustain = bhop_sustain_policy(
+        matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
         && (goal_dist > 150.0 || planned_band >= 1)
-        && !ascent_ahead;
+        && side_open,
+        ascent_ahead,
+        nearfield_steering_for_policy,
+    );
     // Ground zigzag: a corridor too short for a hop ([`bhop::RUNWAY_ENGAGE`]) but straight and long
     // enough ([`bhop::ZIGZAG_ENGAGE`]) to gain speed from the circle-strafe alone. The controller
     // hands off to the hop cycle if `bhop_entry` opens up mid-run, and `bhop_veto` (which includes
     // `!rtx_bot_bhop`) still gates it, so this is purely a sub-toggle on the same controller.
-    let zigzag_ok = host.cvar_bool(c"rtx_bot_zigzag")
+    let zigzag_ok = zigzag_policy(
+        host.cvar_bool(c"rtx_bot_zigzag")
         && matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
         && !final_leg
         && goal_dist > 150.0
         && runway_dist >= bhop::ZIGZAG_ENGAGE
-        && !on_ledge;
+        && side_open,
+        on_ledge,
+        nearfield_steering_for_policy,
+    );
     // A speed-jump leg is a *committed* bhop run-up + leap: engage bhop unconditionally (the link is a
     // pre-verified runway) and track it so the route stays frozen. Latch/clear `sj_leg` on the leg.
     let mut sj_active =
         matches!(kind, Some(LinkKind::SpeedJump)) && host.cvar_bool(c"rtx_bot_bhop") && !hook_active && !rj_active;
     if sj_active {
         if bot.sj.map(|c| c.leg) != cur_leg {
-            bot.sj = cur_leg.map(|leg| Commit { leg, since: now });
+            bot.sj = cur_leg.map(|leg| Commit::new(leg, now, false));
         }
         // Watchdog: the route is frozen mid-leg, so if the run-up stalls (blocked, shoved, never
         // built speed) abandon it and re-path rather than wedging on the runway forever. Penalize the
@@ -740,18 +1414,290 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     }
     // "Don't leap to your death": if we somehow reach the takeoff edge too slow to clear the gap,
     // hold the jump (keep accelerating) rather than launching short into it.
-    let sj_takeoff = cur_leg
-        .and_then(|l| graph.speed_jump_of_link(l))
-        .map(|tr| (tr.takeoff, tr.v_req));
+    // Ground-turn entry is a one-shot executable-contract selection. A band-0 plan may carry the
+    // cold profile up to the shared source while real ground steering arrives in a separately
+    // certified hot band. Select a parallel contract with identical source/target that contains the
+    // measured state, replace the route leg atomically, and latch acceptance. Never re-check after
+    // the first accepted frame: the controller is supposed to rotate out of its entry yaw envelope.
+    let mut effective_sj_leg = cur_leg;
+    let mut gt_entry_adjust = None::<Vec2>;
+    let ground_turn_pmove = || {
+        let mut p = PmParams::default();
+        let gravity = host.cvar(c"sv_gravity");
+        let friction = host.cvar(c"sv_friction");
+        let stopspeed = host.cvar(c"sv_stopspeed");
+        let accel = host.cvar(c"sv_accelerate");
+        let maxspeed = host.cvar(c"sv_maxspeed");
+        if gravity > 0.0 { p.gravity = gravity; }
+        if friction > 0.0 { p.friction = friction; }
+        if stopspeed > 0.0 { p.stopspeed = stopspeed; }
+        if accel > 0.0 { p.accel = accel; }
+        if maxspeed > 0.0 { p.maxspeed = maxspeed; }
+        p
+    };
+    let ground_turn_entry = PmState {
+        origin,
+        vel: v_xy.extend(vz),
+        on_ground,
+        // The bot pulses +jump; a grounded GroundTurn handoff is entered after the release frame.
+        // The engine's private pmove jump-held latch is not exposed on the edict.
+        jump_held: false,
+    };
+    // Adjust on the final ordinary predecessor, before the arrival loop advances into the
+    // ground-turn link on the following frame. The live failure reached this point only ~25u from
+    // the source; waiting one more generic turn tick moved the hull outside the certified origin.
+    if on_ground && matches!(kind, Some(LinkKind::Walk | LinkKind::Step)) {
+        if let Some(&next) = bot.route.get(bot.route_pos + 1) {
+            if let Some(next_tr) = graph.speed_jump_of_link(next) {
+                if next_tr.ground_turn.is_some() {
+                    let source = graph.link_source(next);
+                    let target = graph.link_target(next);
+                    let source_origin = graph.cell_origin(source);
+                    if (source_origin.xy() - origin.xy()).length() <= ARRIVE_RADIUS + 8.0 {
+                        let dt = frametime.clamp(0.001, 0.05);
+                        let params = ground_turn_pmove();
+                        let profiles: Vec<(u32, f32, crate::navmesh::GroundTurnCurl)> = graph
+                            .links
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(li, link)| {
+                                if link.kind != LinkKind::SpeedJump || link.from != source || link.to != target {
+                                    return None;
+                                }
+                                let gt = graph.speed_jump_of_link(li as u32)?.ground_turn?;
+                                Some((li as u32, link.cost, gt))
+                            })
+                            .collect();
+                        let adjustments: Vec<(u32, f32, bhop::Cmd)> = profiles
+                            .iter()
+                            .filter_map(|&(li, cost, gt)| {
+                                crate::navmesh::ground_turn_entry_adjust_cmd(
+                                    v_xy,
+                                    true,
+                                    &gt,
+                                    params.friction,
+                                    params.stopspeed,
+                                    params.accel,
+                                    params.maxspeed,
+                                    dt,
+                                )
+                                .map(|cmd| (li, cost, cmd))
+                            })
+                            .collect();
+                        // `None` from the adjustment solver is ambiguous per profile: it can mean
+                        // the live state is already directly compatible. Do not let a different,
+                        // rejected adjusted profile turn that into an abort; defer all work to the
+                        // current-leg direct witness instead.
+                        let candidates = predecessor_adjustments_complete(profiles.len(), adjustments.len())
+                            .then_some(adjustments)
+                            .into_iter()
+                            .flatten()
+                            .map(|(li, cost, cmd)| {
+                                let rollout = bsp.and_then(|bsp| {
+                                    graph.ground_turn_live_entry_rollout(
+                                        bsp,
+                                        li,
+                                        ground_turn_entry,
+                                        Some(cmd),
+                                        dt,
+                                        &params,
+                                    )
+                                });
+                                GroundTurnEntryCandidate {
+                                    leg: li,
+                                    cost,
+                                    adjustment: Some(cmd),
+                                    accepted: rollout.is_some_and(|r| r.outcome.is_some()),
+                                    pmove_steps: rollout.map_or(0, |r| r.pmove_steps),
+                                }
+                            });
+                        let (selected, work) = select_ground_turn_entry(candidates);
+                        match ground_turn_predecessor_selection(selected, work) {
+                            GroundTurnPredecessorSelection::Commit(GroundTurnEntryCandidate {
+                                leg: selected,
+                                adjustment: Some(cmd),
+                                ..
+                            }) => {
+                                gt_entry_adjust =
+                                    Some(bhop::wishdir_fs(cmd.view_yaw, cmd.forward, cmd.side) * cmd.forward);
+                                // This is a certified one-tick transition into `selected`, not a
+                                // standing brake mode. Latch and advance atomically: leaving the
+                                // ordinary predecessor current returned control to generic steering,
+                                // which circled around the source, destroyed the certified entry speed
+                                // and then failed closed before the ground-turn controller ever ran.
+                                bot.route[bot.route_pos + 1] = selected;
+                                bot.route_pos += 1;
+                                bot.sj = Some(Commit::new(selected, now, true));
+                                effective_sj_leg = Some(selected);
+                            }
+                            GroundTurnPredecessorSelection::Abort => {
+                                // A real adjustment set was evaluated and none had a physical
+                                // continuation. Fail this approach once; otherwise a stalled bot can
+                                // repeat every full rollout on every frame in the source annulus.
+                                penalize_leg(bot, Some(next), Some(LinkKind::SpeedJump), now);
+                                bot.sj = None;
+                                bot.route.clear();
+                                bot.repath_time = now;
+                            }
+                            // No adjustment command means no expensive candidate was run. The state
+                            // may already be directly compatible; let normal leg advance perform the
+                            // direct full-witness check instead of treating absence as rejection.
+                            GroundTurnPredecessorSelection::Defer => {}
+                            GroundTurnPredecessorSelection::Commit(_) => unreachable!(),
+                        }
+                        if work.candidates > 0 && debug {
+                            host.conprint(&cstring(&format!(
+                                "rtx bot{client}: sj-entry predecessor candidates={} pmove_steps={} selected={} adjusted={}\n",
+                                work.candidates,
+                                work.pmove_steps,
+                                selected.map_or(-1, |c| c.leg as i64),
+                                selected.is_some_and(|c| c.adjustment.is_some()),
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let unchecked_gt = sj_active
+        && bot.sj.is_some_and(|c| !c.entry_checked)
+        && cur_leg.is_some_and(|leg| graph.speed_jump_of_link(leg).is_some_and(|tr| tr.ground_turn.is_some()));
+    if unchecked_gt {
+        let current = cur_leg.unwrap();
+        let source = graph.link_source(current);
+        let target = graph.link_target(current);
+        let parallel: Vec<(u32, f32, crate::navmesh::GroundTurnCurl)> = graph
+            .links
+            .iter()
+            .enumerate()
+            .filter_map(|(li, link)| {
+                if link.kind != LinkKind::SpeedJump || link.from != source || link.to != target {
+                    return None;
+                }
+                let tr = graph.speed_jump_of_link(li as u32)?;
+                let gt = tr.ground_turn?;
+                Some((li as u32, link.cost, gt))
+            })
+            .collect();
+        let dt = frametime.clamp(0.001, 0.05);
+        let params = ground_turn_pmove();
+        let direct = parallel.iter().map(|&(li, cost, _)| {
+            let rollout = bsp.and_then(|bsp| {
+                graph.ground_turn_live_entry_rollout(bsp, li, ground_turn_entry, None, dt, &params)
+            });
+            GroundTurnEntryCandidate {
+                leg: li,
+                cost,
+                adjustment: None,
+                accepted: rollout.is_some_and(|r| r.outcome.is_some()),
+                pmove_steps: rollout.map_or(0, |r| r.pmove_steps),
+            }
+        });
+        let (compatible, mut work) = select_ground_turn_entry(direct);
+        let mut selected_for_debug = compatible;
+        if let Some(GroundTurnEntryCandidate { leg: selected, .. }) = compatible {
+            bot.route[bot.route_pos] = selected;
+            if let Some(commit) = bot.sj.as_mut() {
+                commit.retarget_ground_turn(selected, true);
+            }
+            effective_sj_leg = Some(selected);
+        } else {
+            // Find the smallest one-tick ground adjustment whose predicted post-friction velocity
+            // enters a parallel certified contract, then require its complete geometric witness.
+            let adjusted = parallel.iter().filter_map(|&(li, cost, gt)| {
+                let cmd = crate::navmesh::ground_turn_entry_adjust_cmd(
+                        v_xy,
+                        on_ground,
+                        &gt,
+                        params.friction,
+                        params.stopspeed,
+                        params.accel,
+                        params.maxspeed,
+                        dt,
+                    )?;
+                let rollout = bsp.and_then(|bsp| {
+                    graph.ground_turn_live_entry_rollout(
+                        bsp,
+                        li,
+                        ground_turn_entry,
+                        Some(cmd),
+                        dt,
+                        &params,
+                    )
+                });
+                Some(GroundTurnEntryCandidate {
+                    leg: li,
+                    cost,
+                    adjustment: Some(cmd),
+                    accepted: rollout.is_some_and(|r| r.outcome.is_some()),
+                    pmove_steps: rollout.map_or(0, |r| r.pmove_steps),
+                })
+            });
+            let (adjustment, adjusted_work) = select_ground_turn_entry(adjusted);
+            work.candidates += adjusted_work.candidates;
+            work.pmove_steps += adjusted_work.pmove_steps;
+            selected_for_debug = adjustment;
+            if let Some(GroundTurnEntryCandidate { leg: selected, adjustment: Some(cmd), .. }) = adjustment {
+                bot.route[bot.route_pos] = selected;
+                if let Some(commit) = bot.sj.as_mut() {
+                    commit.retarget_ground_turn(selected, true);
+                }
+                effective_sj_leg = Some(selected);
+                gt_entry_adjust = Some(bhop::wishdir_fs(cmd.view_yaw, cmd.forward, cmd.side) * cmd.forward);
+                sj_active = false;
+            } else {
+                penalize_leg(bot, cur_leg, kind, now);
+                bot.sj = None;
+                bot.route.clear();
+                bot.repath_time = now;
+                sj_active = false;
+            }
+        }
+        if debug {
+            host.conprint(&cstring(&format!(
+                "rtx bot{client}: sj-entry current candidates={} pmove_steps={} selected={} adjusted={}\n",
+                work.candidates,
+                work.pmove_steps,
+                selected_for_debug.map_or(-1, |c| c.leg as i64),
+                selected_for_debug.is_some_and(|c| c.adjustment.is_some()),
+            )));
+        }
+    }
+    let sj_traversal = if sj_active {
+        effective_sj_leg.and_then(|l| graph.speed_jump_of_link(l))
+    } else {
+        None
+    };
+    let sj_takeoff = sj_traversal.map(|tr| (tr.takeoff, tr.v_req));
     // A curl speed jump carries a nonzero air-curl gain; a straight one carries 0 (keeps the slalom).
-    let sj_curl_gain = cur_leg.and_then(|l| graph.speed_jump_of_link(l)).map(|tr| tr.curl_gain).unwrap_or(0.0);
+    let sj_curl_gain = sj_traversal.map(|tr| tr.curl_gain).unwrap_or(0.0);
     let sj_curl = sj_active && sj_curl_gain > 0.0;
-    // Signed along-corridor distance from the bot to a curl's takeoff (>0 behind the lip, <0 past it):
-    // the run-up direction is the link's `from`→takeoff line. Used to trigger the leap on crossing the
+    // A chained ground-turn curl carries its full certified controller contract; the executor
+    // drives the SAME shared controller functions the build-time certifier rolled, from the same
+    // stored numbers. Fail closed on the entry envelope below.
+    let sj_gt = if sj_active { sj_traversal.and_then(|tr| tr.ground_turn) } else { None };
+    let sj_gt_phase = effective_sj_leg
+        .and_then(|leg| bot.sj.filter(|commit| commit.leg == leg))
+        .map_or_else(GroundTurnPhase::setup, |commit| commit.ground_turn_phase);
+    // Signed along-corridor distance from the bot to a curl's takeoff (>0 behind the lip, <0 past it).
+    // A profiled legacy curl stores the exact launch axis its BSP certificate proved; older/unprofiled
+    // links fall back to the emitted `from`→takeoff chord. Used to trigger the leap on crossing the
     // takeoff *line* (not a radial ball the weave can skirt into a U-turn) and to gate the run-up aim.
+    let sj_profile_axis = sj_traversal
+        .filter(|tr| {
+            tr.ground_turn.is_none()
+                && tr.curl_gain > 0.0
+                && tr.curl_entry_aim != Vec3::ZERO
+                && tr.curl_landing_aim != Vec3::ZERO
+                && tr.curl_switch_dist.abs() > f32::EPSILON
+        })
+        .map(|tr| (tr.curl_entry_aim.xy() - tr.takeoff.xy()).normalize_or_zero())
+        .filter(|axis| axis.length_squared() > f32::EPSILON);
     let sj_progress: Option<f32> = if sj_curl {
         if let (Some((takeoff, _)), Some(leg)) = (sj_takeoff, cur_leg) {
-            let dir = (takeoff.xy() - graph.cell_origin(graph.link_source(leg)).xy()).normalize_or_zero();
+            let dir = sj_profile_axis.unwrap_or_else(|| {
+                (takeoff.xy() - graph.cell_origin(graph.link_source(leg)).xy()).normalize_or_zero()
+            });
             Some((takeoff.xy() - origin.xy()).dot(dir))
         } else {
             None
@@ -803,13 +1749,17 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // jump, hook, launched air-commit), where the flight must commit to its landing and must not be
     // nudged. Built on grounded frames (the seed needs footing); the cache survives the brief airborne
     // phase of a hop (which rises well under the recenter height), so the bearing stays aware mid-hop.
-    // The slow-walk edge margin below re-reads this same grid.
-    let nf_locomotion = !on_air
-        && !sj_active
-        && !hook_active
-        && !rj_active
-        && matches!(kind, Some(LinkKind::Walk | LinkKind::Step) | None);
-    let nf_active = nf_locomotion && host.cvar_bool(c"rtx_bot_nearfield");
+    // The slow-walk edge margin below re-reads this same grid. A certified jump approach therefore
+    // keeps the sensor warm even though its separate directional channel yields below.
+    let nf_locomotion = nearfield_owns_locomotion(
+        on_air,
+        sj_active,
+        hook_active,
+        rj_active,
+        kind,
+    );
+    let (nf_active, nf_steering_active) =
+        nearfield_channels(nf_locomotion, nearfield_configured, certified_jump_approach);
     if nf_active && on_ground {
         if let Some(bsp) = bsp {
             let key = nearfield_gates(graph, gate_closed, origin).fold(0u32, |k, gi| k | (1u32 << gi.min(31)));
@@ -832,9 +1782,9 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // Drive the hop-cycle controller (see `bhop::Bhop`). On a speed jump the runway is the
     // run-up to the takeoff edge and the bearing aims straight at the landing so the leap goes
     // across the gap; otherwise steer toward the look-ahead corridor point (smoother than the 32u
-    // next cell) with as much straight-ish corridor as the route offers. `mut` so the hazard-edge
-    // brake below can null the hop and drive a reverse wish through `emit` instead.
-    let mut bhop_cmd = {
+    // next cell) with as much straight-ish corridor as the route offers. The aim-source tag travels
+    // with the command for debug-only per-frame traversal telemetry below.
+    let (bhop_cmd, mut sj_aim_source, active_sj_should_launch) = {
         let dt = frametime.clamp(0.001, 0.05);
         let accel = host.cvar(c"sv_accelerate");
         let maxspeed = host.cvar(c"sv_maxspeed");
@@ -847,23 +1797,84 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         // (race mode, when a line exists) or a *speed-scaled* corridor look-ahead — ~0.6 s of travel
         // ahead (clamped 96–448u) so a fast bot's bearing anticipates the corridor far enough to
         // start curving, rather than chasing the fixed ~2-legs `look_point` it has already overrun.
-        let bhop_look = corridor_point(graph, &bot.route, bot.route_pos, origin, (speed * 0.6).clamp(96.0, 448.0));
         let to_wp = waypoint.xy() - origin.xy();
+        // A certified two-phase curl first pursues an open-space "hug" point, then switches to a
+        // landing-side aim after crossing the stored along-axis gate.  The points live on the
+        // traversal, so this controller remains map-agnostic and executes the same profile the BSP
+        // rollout certified.  Legacy/generated curls have switch_dist=0 and keep the old target aim.
+        let sj_flight_aim = sj_traversal
+            .filter(|tr| tr.curl_switch_dist.abs() > f32::EPSILON && tr.curl_gain > 0.0)
+            .map(|tr| {
+                let axis = (tr.curl_entry_aim.xy() - tr.takeoff.xy()).normalize_or_zero();
+                let travelled = (origin.xy() - tr.takeoff.xy()).dot(axis);
+                // The launch command always uses the solved entry aim. A negative gate then means
+                // "switch on the first airborne frame", while a positive gate retains it farther
+                // into the arc.
+                if on_ground || travelled < tr.curl_switch_dist {
+                    (tr.curl_entry_aim, "curl-entry")
+                } else {
+                    (tr.curl_landing_aim, "curl-landing")
+                }
+            });
+        let mut aim_source: &'static str;
         let ahead = match race_line_ahead {
-            Some(lp) if !sj_active => lp.xy() - origin.xy(),
+            Some(lp) if !sj_active => {
+                aim_source = "race-line";
+                lp.xy() - origin.xy()
+            }
             // On a speed jump the run-up aims at the *takeoff* (follow the corridor to the lip), and
             // only once airborne does the bearing swing to the *landing* — so a curl jump (run-up and
             // leap not collinear) tracks its corridor instead of cutting across it and off the edge.
             // For a straight speed jump takeoff and target are collinear, so this is a no-op.
             _ if sj_active => {
-                let aim = match (sj_takeoff, sj_progress) {
+                let aim = match (sj_gt, sj_takeoff, sj_progress) {
+                    // Ground-turn curl: the shared controller owns both phases — runway line /
+                    // rotation point while grounded, hold-or-landing pursuit once airborne.
+                    (Some(gt), Some((takeoff, _)), _) => {
+                        if ground_turn_uses_setup_controller(sj_gt_phase) {
+                            aim_source = if gt.version == crate::navmesh::GROUND_TURN_OPTIMAL_VERSION {
+                                "gt-v3-ground"
+                            } else {
+                                "gt-v12-ground"
+                            };
+                            crate::navmesh::ground_turn_ground_aim(origin, takeoff, &gt).extend(origin.z)
+                        } else {
+                            let (aim, _) = crate::navmesh::ground_turn_air_aim(origin, &gt);
+                            aim_source = if aim == gt.hold_aim.xy() { "gt-air-hold" } else { "gt-air-land" };
+                            aim.extend(origin.z)
+                        }
+                    }
+                    // The certifier's stored axis owns every grounded frame, not merely the jump
+                    // pulse: steering at the snapped nav-source chord was the legacy contract gap
+                    // that launched ring curls tens of degrees away from the line their flight proved.
+                    (None, _, Some(_)) if on_ground && sj_profile_axis.is_some() => {
+                        let (aim, source) = sj_flight_aim.unwrap();
+                        aim_source = source;
+                        aim
+                    }
                     // Curl run-up: aim at the takeoff (follow the corridor) while still behind the lip —
                     // grounded *or* briefly airborne (a bumped or carried-airborne entry) — so it never
                     // curls toward the offset landing while still over the run-up and pulls off the edge.
-                    (Some((takeoff, _)), Some(p)) if p > bhop::LIP_REACH => takeoff,
+                    (None, Some((takeoff, _)), Some(p)) if p > bhop::LIP_REACH => {
+                        aim_source = "takeoff";
+                        takeoff
+                    }
                     // Straight speed jump on the ground: aim at the takeoff (collinear → no-op vs landing).
-                    (Some((takeoff, _)), None) if on_ground => takeoff,
-                    _ => waypoint,
+                    (None, Some((takeoff, _)), None) if on_ground => {
+                        aim_source = "takeoff";
+                        takeoff
+                    }
+                    // At the lip and throughout the flight, execute a rollout-certified two-stage
+                    // pursuit instead of homing straight onto the nav-cell centre.
+                    _ if sj_flight_aim.is_some() => {
+                        let (aim, source) = sj_flight_aim.unwrap();
+                        aim_source = source;
+                        aim
+                    }
+                    _ => {
+                        aim_source = "waypoint";
+                        waypoint
+                    }
                 };
                 aim.xy() - origin.xy()
             }
@@ -875,12 +1886,14 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             // Past the grid the chord passes — the route out there is trusted; the veto fires only on a
             // drop the near-field actually sees, so open corridors keep the full anticipatory look-ahead.
             _ => {
-                let look_clear = bot
-                    .near
-                    .as_ref()
-                    .filter(|_| nf_active)
-                    .is_none_or(|nf| nf.chord_open(origin, bhop_look));
-                if look_clear { bhop_look.xy() - origin.xy() } else { to_wp }
+                aim_source = "bhop-look";
+                bhop_look_direction(
+                    bot.near.as_ref(),
+                    nf_active,
+                    origin,
+                    bhop_look,
+                    to_wp,
+                )
             }
         };
         let dir = if ahead.length() > 8.0 { ahead } else { to_wp };
@@ -888,8 +1901,9 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         // (bhop or zigzag) holds the walkable line — e.g. tracking up a staircase — instead of weaving
         // straight off the edge toward the raw xy goal. `nf_active` already excludes committed jumps,
         // and a speed jump takes the `sj_active` branch above (so a gap leap still commits to its
-        // landing). Inert on open ground, where the near-field push is zero.
-        let dir = match bot.near.as_ref().filter(|_| nf_active).and_then(|nf| nf.steer_push(origin)) {
+        // landing). `nf_steering_active` additionally yields the contiguous certified approach.
+        // Inert on open ground, where the near-field push is zero.
+        let dir = match bot.near.as_ref().filter(|_| nf_steering_active).and_then(|nf| nf.steer_push(origin)) {
             Some(push) => {
                 let bent = dir.normalize_or_zero() + push.xy() * NEARFIELD_BHOP_WEIGHT;
                 if bent.length() > 1e-3 { bent * dir.length() } else { dir }
@@ -897,11 +1911,27 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             None => dir,
         };
         let bearing = yaw_of(dir);
-        let bhop_runway = match (sj_takeoff, sj_progress) {
+        let sj_should_launch = sj_gt.map(|gt| {
+            if gt.version == crate::navmesh::GROUND_TURN_OPTIMAL_VERSION {
+                crate::navmesh::ground_turn_should_launch_optimal(origin, v_xy, on_ground, &gt)
+            } else {
+                crate::navmesh::ground_turn_should_launch(origin, v_xy, on_ground, &gt)
+            }
+        });
+        let bhop_runway = match (sj_gt, sj_takeoff, sj_progress) {
+            // Ground-turn curl: the leap fires on the certified yaw/box gate, not on crossing a
+            // takeoff line — synthesize the "past the lip" signal from the shared gate check.
+            (Some(_), _, _) => {
+                if sj_should_launch == Some(true) {
+                    -1.0
+                } else {
+                    bhop::LIP_REACH + 64.0
+                }
+            }
             // Curl: signed along-corridor distance to the takeoff (past-lip goes negative → leap).
-            (_, Some(p)) => p,
+            (None, _, Some(p)) => p,
             // Straight speed jump: radial distance to the takeoff edge (collinear run-up).
-            (Some((takeoff, _)), None) if sj_active => (takeoff.xy() - origin.xy()).length(),
+            (None, Some((takeoff, _)), None) if sj_active => (takeoff.xy() - origin.xy()).length(),
             _ => runway_dist,
         };
         // Forward wall probe: how far the bot can fly straight ahead before a wall — one hull trace
@@ -923,7 +1953,8 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             _ => f32::INFINITY,
         };
         let phase_was = bot.bhop.phase;
-        let cmd = bot.bhop.step(
+        let launch_vetoes_before = bot.bhop.launch_vetoes;
+        let mut cmd = bot.bhop.step(
             &bhop::Input {
                 v_xy,
                 on_ground,
@@ -940,15 +1971,27 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 // jumps, which need a run-up the ground circle-strafe builds. A straight speed jump keeps
                 // the pre-existing hop-chain takeoff — its air-strafe runway can exceed the ~490 prestrafe
                 // ceiling, which the hold-to-lip regime would cap it below. So gate on the curl flag.
-                takeoff_speed: match sj_takeoff {
-                    Some((_, v_req)) if sj_active && sj_curl_gain > 0.0 => v_req,
+                takeoff_speed: match (sj_takeoff, sj_gt) {
+                    (Some(_), Some(gt)) if gt.blended_runway => gt.hold_speed,
+                    (Some((_, v_req)), _) if sj_active && sj_curl_gain > 0.0 => v_req,
                     _ => 0.0,
                 },
                 // Curl only jumps flagged as curls (straight speed jumps keep the slalom untouched). The
                 // cvar, when set, overrides the link's baked gain for live tuning of the curl arc.
-                curl_gain: if sj_active && sj_curl_gain > 0.0 {
+                // A ground-turn curl uses its certified launch gain on the (grounded) leap frame and
+                // its certified air gain thereafter — never the tuning cvar; the contract is the law.
+                curl_gain: if let Some(gt) = sj_gt {
+                    if on_ground { gt.launch_gain } else { gt.air_gain }
+                } else if sj_active && sj_curl_gain > 0.0 {
                     let cv = host.cvar(c"rtx_jump_curl_gain");
                     if cv > 0.0 { cv } else { sj_curl_gain }
+                } else {
+                    0.0
+                },
+                // Only an emitted nonzero profile carries a launch-yaw certificate. Missing
+                // profile data is the legacy behavior exactly: no tightened weave and no veto.
+                launch_yaw_tol: if sj_profile_axis.is_some() {
+                    crate::navmesh::CURL_PSI_TOL
                 } else {
                     0.0
                 },
@@ -957,8 +2000,178 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             },
             &env,
         );
+        if bot.bhop.launch_vetoes > launch_vetoes_before {
+            if let (Some(leg), Some(profile_axis)) = (effective_sj_leg, sj_profile_axis) {
+                let per_link_count = if let Some(commit) = bot.sj.as_mut().filter(|commit| commit.leg == leg) {
+                    commit.launch_vetoes += 1;
+                    commit.launch_vetoes
+                } else {
+                    1
+                };
+                if debug {
+                    host.conprint(&cstring(&format!(
+                        "rtx bot{client}: sj-launch-veto link={leg} count={per_link_count} speed={speed:.1} velocity_yaw={:.1} certified_yaw={:.1} tol={:.1} runway={bhop_runway:.1}\n",
+                        yaw_of(v_xy),
+                        yaw_of(profile_axis),
+                        crate::navmesh::CURL_PSI_TOL,
+                    )));
+                }
+            }
+        }
+        // A certified ground turn is an executable controller contract, not merely guidance data.
+        // Override the generic hop-cycle command with the exact same single-sourced ticks used by
+        // the BSP rollout; the hop state machine above still owns commit, jump-pulse and watchdogs.
+        if let (Some(gt), Some((takeoff, _))) = (sj_gt, sj_takeoff) {
+            // Optimal-sweep (v3) contracts reproduce ground_turn_rolls_optimal_tol: the
+            // single-sided sweep on the ground, launch aimed along the stored launch_yaw.
+            // v1/v2 weave contracts keep the bearing-follow ground law and runway bearing. An
+            // unknown version is never interpreted as a legacy controller.
+            let supported = matches!(
+                gt.version,
+                crate::navmesh::GROUND_TURN_VERSION
+                    | crate::navmesh::RUNWAY_TURN_VERSION
+                    | crate::navmesh::GROUND_TURN_OPTIMAL_VERSION
+            );
+            let optimal = gt.version == crate::navmesh::GROUND_TURN_OPTIMAL_VERSION;
+            let mut setup_abort = !supported;
+            if supported {
+                match ground_turn_driver_input(sj_gt_phase, cmd) {
+                    GroundTurnDriverInput::Setup(generic) => {
+                        cmd = Some(if generic.jump {
+                            aim_source = "gt-launch";
+                            let launch_bearing = if optimal { gt.launch_yaw } else { bearing };
+                            crate::navmesh::ground_turn_launch_cmd(
+                                v_xy,
+                                launch_bearing,
+                                &gt,
+                                env.accel,
+                                env.maxspeed,
+                                env.dt,
+                            )
+                        } else if optimal {
+                            crate::navmesh::ground_turn_ground_cmd_optimal(
+                                v_xy,
+                                &gt,
+                                env.accel,
+                                env.maxspeed,
+                                env.dt,
+                            )
+                        } else {
+                            bot.bhop.ground_turn_ground_cmd(
+                                origin,
+                                v_xy,
+                                takeoff,
+                                &gt,
+                                env.accel,
+                                env.maxspeed,
+                                env.dt,
+                            )
+                        });
+
+                        let GroundTurnPhase::Setup { airborne_streak, .. } = sj_gt_phase else {
+                            unreachable!();
+                        };
+                        if cmd.is_some_and(|ground_turn_cmd| ground_turn_cmd.jump) {
+                            let latched = effective_sj_leg.is_some_and(|leg| {
+                                bot.sj
+                                    .as_mut()
+                                    .filter(|commit| commit.leg == leg)
+                                    .is_some_and(|commit| commit.ground_turn_launch_emitted(true))
+                            });
+                            setup_abort = !latched;
+                        } else if let (Some(bsp), Some(leg), Some(ground_turn_cmd)) =
+                            (bsp, effective_sj_leg, cmd)
+                        {
+                            // Current fake-client physics uses integer msec; the netclient uses its
+                            // measured packet dt. Only the frame-proven SERVERONLY scheduler can
+                            // mint a future pair, and Commit must retain that exact pair throughout
+                            // every airborne setup frame until physical re-landing.
+                            let move_dt = if host.is_client() {
+                                env.dt
+                            } else {
+                                msec as f32 / 1000.0
+                            };
+                            let future_clock = frame_clock.fixed_setup_clock(env.dt, move_dt);
+                            let clock_valid = bot
+                                .sj
+                                .filter(|commit| commit.leg == leg)
+                                .is_some_and(|commit| {
+                                    commit.ground_turn_setup_clock_valid(
+                                        ground_turn_entry.on_ground,
+                                        future_clock,
+                                    )
+                                });
+                            if !clock_valid {
+                                setup_abort = true;
+                            } else {
+                                match graph.ground_turn_setup_continuation(
+                                    bsp,
+                                    leg,
+                                    ground_turn_entry,
+                                    ground_turn_cmd,
+                                    bot.bhop.ground_turn_sigma(),
+                                    airborne_streak,
+                                    move_dt,
+                                    future_clock,
+                                    &ground_turn_pmove(),
+                                ) {
+                                    crate::navmesh::GroundTurnSetupContinuation::Continue {
+                                        state,
+                                        airborne_streak,
+                                    } => {
+                                        let continued = bot
+                                            .sj
+                                            .as_mut()
+                                            .filter(|commit| commit.leg == leg)
+                                            .is_some_and(|commit| {
+                                                commit.continue_ground_turn_setup(
+                                                    airborne_streak,
+                                                    state.on_ground,
+                                                    future_clock,
+                                                )
+                                            });
+                                        setup_abort = !continued;
+                                    }
+                                    crate::navmesh::GroundTurnSetupContinuation::NotGroundTurn
+                                    | crate::navmesh::GroundTurnSetupContinuation::Abort => {
+                                        setup_abort = true;
+                                    }
+                                }
+                            }
+                        } else {
+                            setup_abort = true;
+                        }
+                    }
+                    GroundTurnDriverInput::Launched => {
+                        cmd = Some(crate::navmesh::ground_turn_air_cmd(
+                            origin,
+                            v_xy,
+                            &gt,
+                            env.accel,
+                            env.maxspeed,
+                            env.dt,
+                        ));
+                    }
+                    GroundTurnDriverInput::Abort => {
+                        cmd = None;
+                        setup_abort = true;
+                    }
+                }
+            }
+            if setup_abort {
+                gt_entry_adjust = Some(abort_ground_turn_setup(
+                    bot,
+                    effective_sj_leg,
+                    v_xy,
+                    now,
+                ));
+                aim_source = "gt-setup-abort";
+                cmd = None;
+                sj_active = false;
+            }
+        }
         // A phase transition is the interesting diagnostic moment — why a run started or ended.
-        if bot.bhop.phase != phase_was && host.cvar_bool(c"rtx_bot_debug") {
+        if bot.bhop.phase != phase_was && debug {
             let why = if bot.bhop.phase == bhop::Phase::Off {
                 format!(" ({})", bot.bhop.off_reason)
             } else {
@@ -969,9 +2182,16 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 bot.bhop.phase,
             )));
         }
-        cmd
+        (cmd, aim_source, sj_should_launch)
     };
-    let bhop_active = bhop_cmd.is_some();
+    // Route-kind churn can leave the bhop state in Hop even after a banded run reaches a JumpGap.
+    // Suppress that stale output: otherwise `emit` replaces this function's world-space gap wish.
+    let mut bhop_cmd = gap_owned_bhop(kind, bhop_cmd);
+    let mut bhop_active = bhop_cmd.is_some();
+    if gt_entry_adjust.is_some() {
+        bhop_cmd = None;
+        bhop_active = false;
+    }
 
     // Steering: face the waypoint and run toward it.
     let to_wp = waypoint.xy() - origin.xy();
@@ -1130,17 +2350,59 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         };
         turn.min(ledge)
     };
-    // Edge margin: on a grounded walk/step (or final-approach) leg while NOT bhopping, steer the
-    // slow-walk wish away from a wall or drop beside the line of travel — the inner edge of an
-    // open-cored spiral, a catwalk lip, a doorframe — instead of drifting into it while homing on the
-    // next cell centre (which sits on the grid, up to a hull-width from the true edge). Bhop's own
-    // bearing was made near-field-aware above, so this stays gated to the non-bhop walk.
-    //
-    // With `rtx_bot_nearfield` on, this reads the fine (8u) near-field clearance grid ensured before
-    // the bhop block (see `nearfield`): wall-aware, self-cancelling through doorways/thin beams. When
-    // the grid is off, absent, or the bot's been shoved off its own field, it falls back to the
-    // drop-only `hazard::edge_bias` probe (Walk/Step only, as before — a final-approach `None` leg got
-    // no push in that path historically).
+    // Edge margin: on a grounded Walk/Step leg, steer away from a one-sided drop beside the line of
+    // travel — the inner edge of an open-cored spiral, a catwalk lip — instead of drifting off it while
+    // homing on the next cell centre (which sits on the grid, up to a hull-width from the true edge).
+    // Probed along actual velocity when we're moving, else the waypoint bearing. Self-cancelling on
+    // open floor and on a thin beam with drops both sides (there it holds the centre). A grounded
+    // bhop command is deliberately included: if its retained slalom reaches a one-sided floor edge,
+    // suppress that frame's bhop output so this correction actually reaches pmove. Airborne hops and
+    // explicit speed-/rocket-jump/hook traversals continue to own their arcs.
+    let (raw_edge_push, edge_wall_clear) = if on_ground
+        && !sj_active
+        && !hook_engaged
+        && !rj_engaged
+        && matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
+        && dist > ARRIVE_RADIUS
+    {
+        bsp.map_or((Vec3::ZERO, f32::INFINITY), |bsp| {
+            let feet = origin - Vec3::new(0.0, 0.0, ORIGIN_TO_FEET);
+            let travel = if speed > 40.0 { v_xy.normalize_or_zero() } else { to_wp.normalize_or_zero() };
+            let travel3 = Vec3::new(travel.x, travel.y, 0.0);
+            let edge = crate::hazard::edge_bias(&|p| bsp.is_solid(p), feet, travel3);
+            // Probe one unit below the standing plane. At the bad corner the top is open (the bot
+            // is just leaving it), while the vertical face it will hit is immediately below. A
+            // level trace therefore misses the face; this sub-floor trace sees its horizontal
+            // normal. Flat floor may report `start_solid`, so only a horizontal impact plane counts.
+            let sub = origin - Vec3::new(0.0, 0.0, 1.0);
+            let wall = bsp.hull1_trace(sub, sub + travel3 * EDGE_BHOP_WALL_CLEAR);
+            let clear = if wall.plane_normal.xy().length_squared() > 0.5 {
+                wall.fraction * EDGE_BHOP_WALL_CLEAR
+            } else {
+                f32::INFINITY
+            };
+            (edge, clear)
+        })
+    } else {
+        (Vec3::ZERO, f32::INFINITY)
+    };
+    // The physical compound is the authority here, not the next slalom wish, command pulse, or a
+    // fixed speed threshold. On repeated live failures the bhop command/phase changed across the
+    // last two grounded frames while 371–383 ups of retained momentum still crossed the same lip.
+    // Probe every grounded ordinary frame, then override only an actually active hop controller.
+    let bhop_edge_recovery = bot.bhop.phase != bhop::Phase::Off
+        && bhop_faces_compound_corner(edge_wall_clear, raw_edge_push.xy());
+    if bhop_edge_recovery {
+        bhop_cmd = None;
+        bhop_active = false;
+    }
+    // Near-field flavor of the edge margin: on a grounded walk/step (or final-approach) leg while NOT
+    // bhopping. With `rtx_bot_nearfield` on, this reads the fine (8u) near-field clearance grid
+    // ensured before the bhop block (see `nearfield`): wall-aware, self-cancelling through doorways/
+    // thin beams. When the grid is off, absent, or the bot's been shoved off its own field, it falls
+    // back to the drop-only `hazard::edge_bias` probe above (Walk/Step only, as before). A
+    // compound-corner bhop recovery frame applies the raw probe push directly — the hop was just
+    // cancelled, so the correction must reach pmove this frame.
     let nf_ground = on_ground
         && !on_air
         && bot.bhop.phase == bhop::Phase::Off
@@ -1149,19 +2411,25 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         && !hook_engaged
         && !rj_engaged
         && dist > ARRIVE_RADIUS;
+    let near_push = (nf_ground && nf_steering_active).then(|| bot.near.as_ref()?.steer_push(origin)).flatten();
     let edge_push = if nf_ground {
-        let near_push = nf_active.then(|| bot.near.as_ref()?.steer_push(origin)).flatten();
-        near_push.unwrap_or_else(|| {
-            // No field → today's drop-only probe, which only runs on a real Walk/Step leg.
-            if matches!(kind, Some(LinkKind::Walk | LinkKind::Step)) {
-                bsp.map_or(Vec3::ZERO, |bsp| {
-                    let feet = origin - Vec3::new(0.0, 0.0, ORIGIN_TO_FEET);
-                    let travel = if speed > 40.0 { v_xy.normalize_or_zero() } else { to_wp.normalize_or_zero() };
-                    crate::hazard::edge_bias(&|p| bsp.is_solid(p), feet, Vec3::new(travel.x, travel.y, 0.0))
-                })
-            } else {
-                Vec3::ZERO
-            }
+        near_push.unwrap_or(raw_edge_push)
+    } else if bhop_edge_recovery {
+        raw_edge_push
+    } else {
+        Vec3::ZERO
+    };
+    // Solid-wall counterpart to `edge_push`: on ordinary grounded movement, lean away from the
+    // nearer corridor wall before the hull grazes it. This is deliberately inactive for every
+    // traversal and for the hop cycle, whose certified/airborne steering owns its own line — and
+    // skipped when the near-field grid owned the frame (its push is already wall-aware).
+    let wall_push = if nf_ground
+        && near_push.is_none()
+        && matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
+    {
+        bsp.map_or(Vec3::ZERO, |bsp| {
+            let (left, right) = corridor_side_reaches(bsp, origin, to_wp);
+            wall_center_bias(to_wp, left, right).extend(0.0)
         })
     } else {
         Vec3::ZERO
@@ -1175,7 +2443,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // Off on the final approach (home straight on the target) and whenever the chord isn't clear.
     let heading = {
         let want_glide = nf_ground
-            && nf_active
+            && nf_steering_active
             && host.cvar_bool(c"rtx_bot_glide")
             && matches!(kind, Some(LinkKind::Walk | LinkKind::Step));
         let glide = want_glide.then_some(bot.near.as_ref()).flatten().and_then(|nf| {
@@ -1188,7 +2456,10 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     let close_enough = final_leg && polite && dist <= POLITE_DIST;
     if !close_enough {
         let (fwd, right, _) = angle_vectors(angles);
-        let dir = (Vec3::new(heading.x, heading.y, 0.0).normalize_or_zero() + edge_push * EDGE_BIAS_WEIGHT).normalize_or_zero();
+        let dir = (Vec3::new(heading.x, heading.y, 0.0).normalize_or_zero()
+            + edge_push * EDGE_BIAS_WEIGHT
+            + wall_push * WALL_CENTER_WEIGHT)
+            .normalize_or_zero();
         forward = (fwd.dot(dir) * MOVE_SPEED * wish_scale) as i32;
         side = (right.dot(dir) * MOVE_SPEED * wish_scale) as i32;
     }
@@ -1208,16 +2479,38 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         let g = host.cvar(c"rtx_jump_curl_gain");
         if g > 0.0 { g } else { bhop::AIR_CORRECT_GAIN_DEFAULT }
     };
-    // Run-up gate: on a plain jump leg, hold the takeoff jump until the bot carries speed *toward the
-    // waypoint* (`jump_runup · maxspeed`), so it leaves the lip moving instead of jumping from a
-    // standstill and air-accelerating into a stub arc. Escapes at the lip and when disabled keep it from
-    // wedging; `force_jump` (the stuck detector) and the bhop controller bypass it too.
+    let jump_gravity = {
+        let g = host.cvar(c"sv_gravity");
+        if g > 0.0 { g } else { 800.0 }
+    };
+    // A JumpGap was certified from its source centre with a velocity aimed at its target. Preserve
+    // both parts of that contract live: total speed in an unrelated direction is not useful reach.
+    let jump_prep = cur_leg
+        .filter(|&leg| graph.link_kind(leg) == LinkKind::JumpGap)
+        .map(|leg| {
+            jump_takeoff_prep(
+                origin,
+                graph.cell_origin(graph.link_source(leg)),
+                graph.cell_origin(graph.link_target(leg)),
+                v_xy,
+                jump_gravity,
+                jump_maxspeed,
+                jump_runup,
+            )
+        });
+    // Double-jump keeps the directional run-up gate (speed carried *toward the waypoint*, with the
+    // at-the-lip escape); its second vertical impulse has a different flight-time solve. JumpGap uses
+    // the stricter projected-speed preparation above.
     let runup_ok = jump_runup_ok(v_xy, to_wp, dist, jump_runup, jump_maxspeed);
-    if on_ground
-        && (force_jump
-            || bhop_cmd.is_some_and(|c| c.jump)
-            || (matches!(kind, Some(LinkKind::JumpGap | LinkKind::DoubleJump)) && runup_ok))
-    {
+    let traversal_jump = matches!(kind, Some(LinkKind::JumpGap | LinkKind::DoubleJump));
+    let traversal_ready = match kind {
+        Some(LinkKind::JumpGap) => jump_prep.is_some_and(|(ready, _)| ready),
+        Some(LinkKind::DoubleJump) => runup_ok,
+        _ => true,
+    };
+    let bhop_jump = bhop_cmd.is_some_and(|c| c.jump) && ordinary_bhop_jump_fits(kind, runway_dist, speed);
+    let wants_jump = force_jump || bhop_jump || traversal_jump;
+    if on_ground && wants_jump && (!traversal_jump || traversal_ready) {
         buttons |= BUTTON_JUMP;
     }
     // Mid-air (double) jump: rtx grants one air jump per air travel. On a double-jump leg, spend it
@@ -1276,6 +2569,16 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // below can't change where the bot goes, and combat can steer independently of its aim.
     let (nf, nr, _) = angle_vectors(angles);
     let mut move_world = nf * forward as f32 + nr * side as f32;
+
+    // Grounded JumpGap setup owns the feet through the launch frame. On the DM3 ring-side RA entrance
+    // this counter-steers the westbound stair momentum before accelerating south across the gap;
+    // without it +jump carries the bot into the x wall and leaves no southward reach. `bhop_cmd` was
+    // suppressed above, so `emit` cannot shadow this world-space wish after a carried-speed handoff.
+    if on_ground {
+        if let Some((_, wish)) = jump_prep {
+            move_world = Vec3::new(wish.x, wish.y, 0.0) * MOVE_SPEED;
+        }
+    }
 
     // Unified air steering (always on): a yaw-synced air-strafe wish toward a landing point, in
     // **world space** so the wish actually turns the velocity — a straight wish the 30-ups air-accel
@@ -1345,13 +2648,11 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         }
     }
 
-    // Ledge brake: a grounded bot on a Walk/Step leg whose *velocity* has drifted well off the corridor
-    // to its waypoint (an overshot corner — e.g. run straight at a stair side) and is one stride from
-    // running off the floor: kill the wish and thrust backward to stop before the lip. After the
-    // navmesh's `ground_along` fix an *aligned* Walk/Step leg always has floor under it, so a drop
-    // along velocity is unintended; and balancing along a thin wall-top keeps velocity aligned to the
-    // waypoints, so the misalignment gate keeps this dead there. Dead too while airborne, bhopping,
-    // speed-/rocket-jumping, or hooking — those own their motion (and the hook/rj overrides below win).
+    // Ledge brake: a grounded bot on a Walk/Step leg brakes either when its speed-scaled bhop curve
+    // loses floor or when its *velocity* has drifted well off the local corridor and is one stride
+    // from a ledge. The former catches a fast corner cut before takeoff; the latter remains the local
+    // overshoot backstop. Both are dead while airborne or on an explicit traversal — those own their
+    // motion (and the hook/rj overrides below win).
     if let Some(bsp) = bsp {
         let braking = on_ground
             && !on_air
@@ -1367,8 +2668,11 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             let aligned = vdir.dot(to_wp.normalize_or_zero()) >= LEDGE_ALIGN_COS;
             let vdir3 = Vec3::new(vdir.x, vdir.y, 0.0);
             let feet = origin - Vec3::new(0.0, 0.0, ORIGIN_TO_FEET);
-            if !aligned && crate::hazard::ledge_ahead(&|p| bsp.is_solid(p), feet, vdir3) {
+            if ordinary_bhop_floor_risk
+                || (!aligned && crate::hazard::ledge_ahead(&|p| bsp.is_solid(p), feet, vdir3))
+            {
                 move_world = -vdir3 * MOVE_SPEED;
+                buttons &= !BUTTON_JUMP;
             }
         }
     }
@@ -1409,12 +2713,45 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         }
     }
 
+    // Apply the exact contract-entry adjustment after every generic movement override and lock out
+    // overlays below. Its full post-tick traversal was witnessed before the commit was marked checked.
+    if let Some(adjust) = gt_entry_adjust {
+        move_world = adjust.extend(0.0);
+        buttons &= !BUTTON_JUMP;
+        sj_aim_source = "entry-adjust";
+    }
+
+    // Debug-only, per-frame SpeedJump contract trace. Keep both the controller's final jump request
+    // and the pending button: later safety/driver overrides can intentionally differ from it.
+    if debug {
+        if let Some(leg) = effective_sj_leg.filter(|&leg| graph.link_kind(leg) == LinkKind::SpeedJump) {
+            let gt = graph.speed_jump_of_link(leg).and_then(|tr| tr.ground_turn);
+            let should_launch = active_sj_should_launch.or_else(|| {
+                gt.map(|gt| {
+                    if gt.version == crate::navmesh::GROUND_TURN_OPTIMAL_VERSION {
+                        crate::navmesh::ground_turn_should_launch_optimal(origin, v_xy, on_ground, &gt)
+                    } else {
+                        crate::navmesh::ground_turn_should_launch(origin, v_xy, on_ground, &gt)
+                    }
+                })
+            });
+            let gt_version = gt.map_or_else(|| "none".to_owned(), |gt| gt.version.to_string());
+            let should_launch = should_launch.map_or("none", |launch| if launch { "true" } else { "false" });
+            host.conprint(&cstring(&format!(
+                "rtx bot{client}: sj-frame leg={leg} sj_gt-version={gt_version} should_launch={should_launch} cmd.jump={} pending_jump={} aim-source={sj_aim_source}\n",
+                bhop_cmd.is_some_and(|cmd| cmd.jump),
+                buttons & BUTTON_JUMP != 0,
+            )));
+        }
+    }
+
     // Bundle the frame's decisions into one command for the combat/grenade overlays to mutate.
     let cmd = BotCmd { look, move_world, buttons, impulse, shot: None };
 
     // Traversal-critical legs lock out the combat/grenade overlays: `engage` owns movement and
     // clears +jump, which cancels the planner's route if done mid gap/double/speed jump.
-    let traversal_lock = hook_lock
+    let traversal_lock = gt_entry_adjust.is_some()
+        || hook_lock
         || rj_lock
         || on_air
         || matches!(kind, Some(LinkKind::JumpGap | LinkKind::DoubleJump | LinkKind::SpeedJump));
@@ -1425,6 +2762,225 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prospective_ground_turn_clock_requires_the_exact_server_schedule() {
+        // Exercise the production clock chain rather than handing equal clocks to the final helper:
+        // maxfps -> scheduled_dt -> clamped bhop Env dt -> integer SetBotCMD msec. At 60 Hz the
+        // profiler's exact historical 1000/maxfps budget differs by one ulp and must stay separate.
+        let maxfps = 60.0;
+        let budget_ms = prof::budget_ms(maxfps);
+        let frametime = prof::scheduled_dt(maxfps);
+        assert_eq!(budget_ms.to_bits(), (1000.0f32 / maxfps).to_bits());
+        assert_ne!(budget_ms.to_bits(), (frametime * 1000.0).to_bits());
+        let env = bhop::Env { dt: frametime.clamp(0.001, 0.05), accel: 10.0, maxspeed: 320.0 };
+        let msec = ((frametime * 1000.0) as i32).clamp(1, 100);
+        let observed = BotFrameClock::observe(
+            BotFrameScheduleClaim::ClaimedFixed,
+            maxfps,
+            frametime,
+        );
+        let fixed = observed
+            .fixed_setup_clock(env.dt, msec as f32 / 1000.0)
+            .expect("the claimed frame exactly matches the scheduled maxfps quantum");
+        assert_eq!(fixed.controller_dt().to_bits(), env.dt.to_bits());
+        assert_eq!(fixed.move_dt().to_bits(), (msec as f32 / 1000.0).to_bits());
+
+        let variable = BotFrameClock::observe(
+            BotFrameScheduleClaim::Unclaimed,
+            maxfps,
+            frametime,
+        );
+        assert!(
+            variable.fixed_setup_clock(env.dt, msec as f32 / 1000.0).is_none(),
+            "normal-frame and netclient pacing cannot promise future intervals",
+        );
+    }
+
+    #[test]
+    fn mismatched_fixed_schedule_claim_withholds_without_panicking() {
+        let maxfps = 77.0;
+        let frametime = prof::scheduled_dt(maxfps);
+        let move_dt = ((frametime * 1000.0) as i32).clamp(1, 100) as f32 / 1000.0;
+        let admitted = BotFrameClock::observe(
+            BotFrameScheduleClaim::ClaimedFixed,
+            maxfps,
+            frametime,
+        )
+        .fixed_setup_clock(frametime, move_dt)
+        .unwrap();
+        let mut commit = Commit::new(7, 1.0, true);
+        assert!(commit.continue_ground_turn_setup(1, false, Some(admitted)));
+
+        let mismatch = std::panic::catch_unwind(|| {
+            BotFrameClock::observe(
+                BotFrameScheduleClaim::ClaimedFixed,
+                maxfps,
+                frametime.next_up(),
+            )
+            .fixed_setup_clock(frametime.next_up(), move_dt)
+        })
+        .expect("a false fixed-schedule claim must never panic the bot driver");
+        assert!(mismatch.is_none(), "the mismatched frame must withhold its clock witness");
+        assert!(
+            !commit.ground_turn_setup_clock_valid(false, mismatch),
+            "an airborne setup episode must turn a withheld witness into Abort",
+        );
+    }
+
+    #[test]
+    fn ground_turn_setup_clock_persists_until_physical_relanding() {
+        let admitted = crate::navmesh::GroundTurnSetupClock::from_verified_schedule(
+            1.0 / 77.0,
+            12.0 / 1000.0,
+        )
+        .unwrap();
+        let changed = crate::navmesh::GroundTurnSetupClock::from_verified_schedule(
+            (1.0 / 77.0f32).next_up(),
+            12.0 / 1000.0,
+        )
+        .unwrap();
+        let mut commit = Commit::new(7, 1.0, true);
+
+        assert!(commit.ground_turn_setup_clock_valid(true, Some(admitted)));
+        assert!(commit.continue_ground_turn_setup(1, false, Some(admitted)));
+        assert!(commit.ground_turn_setup_clock_valid(false, Some(admitted)));
+        assert!(!commit.ground_turn_setup_clock_valid(false, None));
+        assert!(!commit.ground_turn_setup_clock_valid(false, Some(changed)));
+        assert!(commit.continue_ground_turn_setup(0, true, None));
+        assert_eq!(commit.ground_turn_phase, GroundTurnPhase::setup());
+    }
+
+    #[test]
+    fn ground_turn_setup_phase_survives_a_transient_airborne_frame() {
+        assert!(
+            ground_turn_uses_setup_controller(GroundTurnPhase::Setup {
+                airborne_streak: 1,
+                clock: None,
+            }),
+            "an airborne nonjump setup frame must keep the certified setup controller",
+        );
+    }
+
+    #[test]
+    fn ground_turn_phase_latches_only_on_an_emitted_jump() {
+        let mut commit = Commit::new(7, 1.0, true);
+        let clock = crate::navmesh::GroundTurnSetupClock::from_verified_schedule(
+            1.0 / 77.0,
+            12.0 / 1000.0,
+        )
+        .unwrap();
+        assert!(commit.continue_ground_turn_setup(1, false, Some(clock)));
+        assert!(!commit.ground_turn_launch_emitted(false));
+        assert_eq!(
+            commit.ground_turn_phase,
+            GroundTurnPhase::Setup { airborne_streak: 1, clock: Some(clock) }
+        );
+        assert!(ground_turn_uses_setup_controller(commit.ground_turn_phase));
+
+        assert!(commit.ground_turn_launch_emitted(true));
+        assert_eq!(commit.ground_turn_phase, GroundTurnPhase::Launched);
+        assert!(!ground_turn_uses_setup_controller(commit.ground_turn_phase));
+        assert!(
+            !commit.continue_ground_turn_setup(0, true, None),
+            "a later contact must not reset a launched contract to setup"
+        );
+    }
+
+    #[test]
+    fn ground_turn_driver_cannot_bypass_the_contract_when_generic_bhop_is_absent() {
+        assert!(matches!(
+            ground_turn_driver_input(GroundTurnPhase::setup(), None),
+            GroundTurnDriverInput::Abort
+        ));
+        assert!(matches!(
+            ground_turn_driver_input(GroundTurnPhase::Launched, None),
+            GroundTurnDriverInput::Launched
+        ));
+    }
+
+    #[test]
+    fn unsafe_ground_turn_setup_aborts_before_the_stale_command_can_escape() {
+        let mut bot = BotState::default();
+        bot.route = vec![17];
+        bot.sj = Some(Commit::new(17, 1.0, true));
+        let velocity = Vec2::new(300.0, -120.0);
+
+        let wish = abort_ground_turn_setup(&mut bot, Some(17), velocity, 9.0);
+        assert!(bot.sj.is_none());
+        assert!(bot.route.is_empty());
+        assert_eq!(bot.repath_time, 9.0);
+        assert!(bot.failed_links.iter().any(|&(leg, until, strikes)| {
+            leg == 17 && until > 9.0 && strikes == 1
+        }));
+        assert!(wish.dot(velocity) < 0.0, "same-frame output must counter the unsafe carry");
+    }
+
+    #[test]
+    fn ground_turn_profile_retarget_resets_setup_without_erasing_history() {
+        let mut commit = Commit::new(7, 12.5, false);
+        commit.launch_vetoes = 4;
+        assert!(commit.ground_turn_launch_emitted(true));
+
+        commit.retarget_ground_turn(9, true);
+        assert_eq!(commit.leg, 9);
+        assert_eq!(commit.since, 12.5);
+        assert_eq!(commit.launch_vetoes, 4);
+        assert!(commit.entry_checked);
+        assert_eq!(commit.ground_turn_phase, GroundTurnPhase::setup());
+    }
+
+    #[test]
+    fn ground_turn_selection_skips_a_cheaper_unwitnessed_profile() {
+        let candidates = [
+            GroundTurnEntryCandidate {
+                leg: 11,
+                cost: 0.5,
+                adjustment: None,
+                accepted: false,
+                pmove_steps: 5,
+            },
+            GroundTurnEntryCandidate {
+                leg: 12,
+                cost: 0.8,
+                adjustment: None,
+                accepted: true,
+                pmove_steps: 7,
+            },
+        ];
+        let (selected, work) = select_ground_turn_entry(candidates);
+        assert_eq!(selected.map(|candidate| candidate.leg), Some(12));
+        assert_eq!(work, GroundTurnEntryWork { candidates: 2, pmove_steps: 12 });
+    }
+
+    #[test]
+    fn predecessor_entry_rejection_is_one_shot_but_no_candidate_defers() {
+        assert!(matches!(
+            ground_turn_predecessor_selection(None, GroundTurnEntryWork { candidates: 1, pmove_steps: 7 }),
+            GroundTurnPredecessorSelection::Abort
+        ));
+        assert!(matches!(
+            ground_turn_predecessor_selection(None, GroundTurnEntryWork::default()),
+            GroundTurnPredecessorSelection::Defer
+        ));
+        assert!(predecessor_adjustments_complete(2, 2));
+        assert!(
+            !predecessor_adjustments_complete(2, 1),
+            "a skipped direct-compatible profile must prevent another profile's rejection from aborting"
+        );
+
+        let accepted = GroundTurnEntryCandidate {
+            leg: 12,
+            cost: 0.8,
+            adjustment: Some(bhop::Cmd { view_yaw: 0.0, forward: 1.0, side: 0.0, jump: false }),
+            accepted: true,
+            pmove_steps: 7,
+        };
+        assert!(matches!(
+            ground_turn_predecessor_selection(Some(accepted), GroundTurnEntryWork { candidates: 1, pmove_steps: 7 }),
+            GroundTurnPredecessorSelection::Commit(candidate) if candidate.leg == accepted.leg
+        ));
+    }
 
     #[test]
     fn jump_runup_gate_wants_speed_toward_the_waypoint() {
@@ -1439,5 +2995,612 @@ mod tests {
         assert!(!jump_runup_ok(Vec2::new(0.0, 300.0), fwd, 200.0, 0.5, 320.0));
         // Gate disabled → always allowed (today's behavior).
         assert!(jump_runup_ok(Vec2::ZERO, fwd, 200.0, 0.0, 320.0));
+    }
+
+    #[test]
+    fn rebase_drift_does_not_end_bhop_sustain_on_an_ascent() {
+        assert!(bhop_sustain_policy(true, true, true));
+        assert!(!bhop_sustain_policy(false, true, true));
+    }
+
+    #[test]
+    fn rebase_drift_does_not_end_zigzag_on_a_ledge_cell() {
+        assert!(zigzag_policy(true, true, true));
+        assert!(!zigzag_policy(false, true, true));
+    }
+
+    #[test]
+    fn certified_jump_approach_scans_the_contiguous_ground_contract() {
+        let mut speed_jump = Vec::new();
+        for i in 0..8 {
+            speed_jump.push(ApproachLeg {
+                kind: if i % 2 == 0 { LinkKind::Walk } else { LinkKind::Step },
+                source: i,
+                target: i + 1,
+                speed_jump_certified: false,
+            });
+        }
+        speed_jump.push(ApproachLeg {
+            kind: LinkKind::SpeedJump,
+            source: 8,
+            target: 9,
+            speed_jump_certified: true,
+        });
+        assert!(certified_jump_approach(speed_jump));
+
+        assert!(certified_jump_approach([
+            ApproachLeg {
+                kind: LinkKind::Step,
+                source: 0,
+                target: 1,
+                speed_jump_certified: false,
+            },
+            ApproachLeg {
+                kind: LinkKind::JumpGap,
+                source: 1,
+                target: 2,
+                speed_jump_certified: false,
+            },
+        ]));
+    }
+
+    #[test]
+    fn certified_jump_approach_fails_closed_off_the_ground_contract() {
+        assert!(!certified_jump_approach([
+            ApproachLeg {
+                kind: LinkKind::Walk,
+                source: 0,
+                target: 1,
+                speed_jump_certified: false,
+            },
+            ApproachLeg {
+                kind: LinkKind::Step,
+                source: 1,
+                target: 2,
+                speed_jump_certified: false,
+            },
+        ]));
+        assert!(!certified_jump_approach([
+            ApproachLeg {
+                kind: LinkKind::Walk,
+                source: 0,
+                target: 1,
+                speed_jump_certified: false,
+            },
+            ApproachLeg {
+                kind: LinkKind::Drop,
+                source: 1,
+                target: 2,
+                speed_jump_certified: false,
+            },
+            ApproachLeg {
+                kind: LinkKind::JumpGap,
+                source: 2,
+                target: 3,
+                speed_jump_certified: false,
+            },
+        ]));
+        assert!(!certified_jump_approach([
+            ApproachLeg {
+                kind: LinkKind::Walk,
+                source: 0,
+                target: 1,
+                speed_jump_certified: false,
+            },
+            ApproachLeg {
+                kind: LinkKind::JumpGap,
+                source: 7,
+                target: 8,
+                speed_jump_certified: false,
+            },
+        ]));
+        assert!(!certified_jump_approach([
+            ApproachLeg {
+                kind: LinkKind::Walk,
+                source: 0,
+                target: 1,
+                speed_jump_certified: false,
+            },
+            ApproachLeg {
+                kind: LinkKind::SpeedJump,
+                source: 1,
+                target: 2,
+                speed_jump_certified: false,
+            },
+        ]));
+    }
+
+    #[test]
+    fn jump_approach_yields_steering_but_keeps_nearfield_sensing() {
+        assert_eq!(nearfield_channels(true, true, true), (true, false));
+        assert_eq!(nearfield_channels(true, true, false), (true, true));
+        assert_eq!(nearfield_channels(true, false, true), (false, false));
+    }
+
+    #[test]
+    fn jump_approach_keeps_the_protective_bhop_chord() {
+        let origin = Vec3::new(0.0, 0.0, 1.0);
+        let solid = |p: Vec3| p.y >= -16.0 && p.z <= 0.0;
+        let near = nearfield::NearField::build(&solid, &|_| false, origin, &[], 0);
+        let blocked_look = Vec3::new(48.0, -80.0, 1.0);
+        let to_wp = Vec2::new(64.0, 0.0);
+        let (sensor_active, steering_active) = nearfield_channels(true, true, true);
+        assert!(!steering_active, "the approach must still yield vector steering");
+
+        assert_eq!(
+            bhop_look_direction(
+                Some(&near),
+                sensor_active,
+                origin,
+                blocked_look,
+                to_wp,
+            ),
+            to_wp,
+            "a yielded jump approach must still reject a blocked far chord",
+        );
+    }
+
+    #[test]
+    fn bhop_chord_controls_preserve_open_and_absent_sensor_behavior() {
+        let origin = Vec3::new(0.0, 0.0, 1.0);
+        let solid = |p: Vec3| p.y >= -16.0 && p.z <= 0.0;
+        let near = nearfield::NearField::build(&solid, &|_| false, origin, &[], 0);
+        let open_look = Vec3::new(64.0, 0.0, 1.0);
+        let blocked_look = Vec3::new(48.0, -80.0, 1.0);
+        let to_wp = Vec2::new(0.0, 64.0);
+
+        assert_eq!(
+            bhop_look_direction(Some(&near), true, origin, open_look, to_wp),
+            open_look.xy() - origin.xy(),
+        );
+        assert_eq!(
+            bhop_look_direction(None, false, origin, blocked_look, to_wp),
+            blocked_look.xy() - origin.xy(),
+        );
+        assert_eq!(
+            bhop_look_direction(Some(&near), false, origin, blocked_look, to_wp),
+            blocked_look.xy() - origin.xy(),
+            "a cached field must stay inert while its sensor channel is inactive",
+        );
+        assert_eq!(
+            bhop_look_direction(Some(&near), true, origin, blocked_look, to_wp),
+            to_wp,
+        );
+    }
+
+    #[test]
+    fn terrain_stops_return_when_nearfield_steering_is_unavailable() {
+        assert!(!terrain_policy(true, true, false));
+        assert!(terrain_policy(true, true, true));
+        assert!(terrain_policy(true, false, false));
+        assert!(!terrain_policy(false, false, true));
+    }
+
+    #[test]
+    fn corridor_width_gates_bhop_and_biases_away_from_the_nearer_wall() {
+        assert!(bhop_side_open(48.0, 48.0));
+        assert!(!bhop_side_open(47.9, 64.0));
+        assert!(!bhop_side_open(64.0, 47.9));
+
+        let travel = Vec2::X;
+        let left_close = wall_center_bias(travel, 4.0, 64.0);
+        let right_close = wall_center_bias(travel, 64.0, 4.0);
+        assert!(left_close.y < 0.0, "left wall must push toward route-right: {left_close:?}");
+        assert!(right_close.y > 0.0, "right wall must push toward route-left: {right_close:?}");
+        assert_eq!(wall_center_bias(travel, 64.0, 64.0), Vec2::ZERO);
+        assert_eq!(wall_center_bias(travel, 8.0, 8.0), Vec2::ZERO);
+    }
+
+    #[test]
+    fn planned_speed_band_still_stops_before_an_imminent_non_ground_leg() {
+        // The failed live route landed at ~433 ups with only one 32u Walk left before JumpGap 9778.
+        // A planner band may preserve speed, but must not launch a ~356u flight into that turn/wall.
+        assert!(!bhop_carry_fits(32.0, 433.0));
+        assert!(bhop_carry_fits(400.0, 433.0));
+    }
+
+    #[test]
+    fn ordinary_bhop_cannot_launch_a_stale_pulse_into_the_upper_dm3_bend() {
+        // Observed takeoff: 371 ups with only 99u before runway()'s 45-degree bend stop. The full
+        // 315u hop footprint cannot fit, even if the bhop phase still carries a jump pulse.
+        assert!(!ordinary_bhop_jump_fits(Some(LinkKind::Walk), 99.4, 371.4));
+        assert!(ordinary_bhop_jump_fits(Some(LinkKind::Walk), 330.0, 371.4));
+        assert!(ordinary_bhop_jump_fits(Some(LinkKind::JumpGap), 0.0, 371.4));
+    }
+
+    #[test]
+    fn edge_recovery_requires_the_physical_compound_corner() {
+        // The edge alone is not enough: an open spiral ledge must preserve the hop. The recorded
+        // upper corner combines that edge with a vertical face along the retained velocity.
+        let away = Vec2::new(0.6586, -0.7525);
+        assert!(bhop_faces_compound_corner(17.2, away));
+        assert!(!bhop_faces_compound_corner(17.2, Vec2::ZERO));
+        assert!(
+            !bhop_faces_compound_corner(f32::INFINITY, away),
+            "an open ledge must not pay a corner-wall recovery penalty",
+        );
+    }
+
+    #[test]
+    fn ordinary_bhop_floor_forecast_catches_a_fast_corner_cut() {
+        let origin = Vec3::ZERO;
+        let velocity = Vec2::new(0.0, -430.0);
+        let corridor = Vec2::new(1.0, 0.6);
+        let horizon = velocity.length() * bhop::T_HOP;
+
+        assert!(ordinary_bhop_floor_supported_by(
+            origin,
+            velocity,
+            corridor,
+            horizon,
+            |_, _| true,
+        ));
+        assert!(!ordinary_bhop_floor_supported_by(
+            origin,
+            velocity,
+            corridor,
+            horizon,
+            |probe, _| probe.x < 128.0,
+        ));
+    }
+
+    #[test]
+    fn ordinary_bhop_floor_forecast_respects_the_ground_runway_horizon() {
+        let mut furthest = 0.0f32;
+        let mut last_drop = 0.0f32;
+        assert!(ordinary_bhop_floor_supported_by(
+            Vec3::ZERO,
+            Vec2::new(320.0, 0.0),
+            Vec2::X,
+            64.0,
+            |probe, max_drop| {
+                furthest = furthest.max(probe.x);
+                last_drop = max_drop;
+                probe.x <= 64.01
+            },
+        ));
+        assert!(furthest <= 64.01, "floor forecast escaped ordinary runway: {furthest}");
+        assert!(last_drop >= 8.0 + 3.0 * STEP_HEIGHT);
+    }
+
+    #[test]
+    fn rising_walk_waits_for_the_physical_dm3_ramp_height() {
+        let target = Vec3::new(256.0, -832.0, 32.0);
+        assert!(!ordinary_leg_arrived(
+            Vec3::new(242.0, -833.0, 24.03125),
+            target,
+            Vec2::new(268.0, -123.0),
+            ARRIVE_RADIUS,
+            false,
+            true,
+        ));
+        assert!(ordinary_leg_arrived(
+            Vec3::new(242.0, -833.0, 32.03125),
+            target,
+            Vec2::new(268.0, -123.0),
+            ARRIVE_RADIUS,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn route_arrival_does_not_skip_the_upper_dm3_jump_source() {
+        let upper = Vec3::new(96.0, -576.0, 296.0);
+        // The failed live run was already inside the 24u XY arrival ball while still standing on
+        // the adjacent 280-high stair. It must remain on that Step leg until pmove actually steps up.
+        assert!(!ordinary_leg_arrived(
+            Vec3::new(115.15, -568.36, 280.0),
+            upper,
+            Vec2::new(-278.59, -35.03),
+            ARRIVE_RADIUS,
+            false,
+            true,
+        ));
+        assert!(ordinary_leg_arrived(
+            Vec3::new(111.0, -568.0, 296.03125),
+            upper,
+            Vec2::new(-278.59, -35.03),
+            ARRIVE_RADIUS,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn airborne_bhop_ordinary_leg_keeps_xy_overshoot_progression() {
+        // Ordinary route progression runs while an uncommitted bhop is airborne. Its height can be
+        // far from the cell floor, but a just-overshot waypoint must still advance by the legacy
+        // velocity-dot fast path instead of becoming permanently stuck behind the bot.
+        assert!(ordinary_leg_arrived(
+            Vec3::new(70.0, 0.0, 160.0),
+            Vec3::new(32.0, 0.0, 0.0),
+            Vec2::new(400.0, 0.0),
+            ARRIVE_RADIUS,
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn swimming_ordinary_leg_keeps_xy_arrival_progression() {
+        // Water routes freely change Z while crossing ordinary cell centres. Only a launch-floor
+        // handoff requests the level check; a normal swimming leg remains XY-arrived.
+        assert!(ordinary_leg_arrived(
+            Vec3::new(8.0, 0.0, 96.0),
+            Vec3::ZERO,
+            Vec2::new(120.0, 0.0),
+            ARRIVE_RADIUS,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn dm3_bridge_sng_jumpgap_rejects_maxspeed_overshoot_and_accepts_center_arc() {
+        let gravity = 800.0;
+        let maxspeed = 320.0;
+        let airtime = 2.0 * JUMP_VZ / gravity;
+        let source = Vec3::new(-544.0, 800.0, 120.0);
+        let target = Vec3::new(-544.0, 672.0, 120.0);
+        let dir = (target.xy() - source.xy()).normalize();
+        let center_speed = (target.xy() - source.xy()).length() / airtime;
+
+        let (center_ready, _) =
+            jump_takeoff_prep(source, source, target, dir * center_speed, gravity, maxspeed, 0.0);
+        assert!(center_ready, "the exact descending-root centre arc must be launchable");
+
+        let (maxspeed_ready, maxspeed_wish) =
+            jump_takeoff_prep(source, source, target, dir * maxspeed, gravity, maxspeed, 0.0);
+        assert!(
+            !maxspeed_ready,
+            "maxspeed travels {:.1}u beyond a 128u target, more than the {:.1}u hull half-width",
+            maxspeed * airtime - 128.0,
+            VEC_HULL_MAX.x,
+        );
+        assert_eq!(
+            maxspeed_wish,
+            Vec2::ZERO,
+            "overspeed approach must coast monotonically under ground friction",
+        );
+    }
+
+    #[test]
+    fn max_reach_flat_jumpgap_keeps_maxspeed_launch() {
+        let gravity = 800.0;
+        let maxspeed = 320.0;
+        let airtime = 2.0 * JUMP_VZ / gravity;
+        let source = Vec3::ZERO;
+        // At the physical reach limit the target centre is one player-hull half-width before the
+        // descending-root centre. The trailing hull edge is exactly over the target at touchdown.
+        let reach = maxspeed * airtime - VEC_HULL_MAX.x;
+        let target = Vec3::new(reach, 0.0, 0.0);
+        let dir = (target.xy() - source.xy()).normalize();
+
+        let (ready, wish) =
+            jump_takeoff_prep(source, source, target, dir * maxspeed, gravity, maxspeed, 0.0);
+        assert!(ready, "the physics-derived max-reach launch must remain executable");
+        assert!(wish.dot(dir) > 0.999);
+    }
+
+    #[test]
+    fn dm3_ring_ra_takeoff_brakes_the_observed_backwards_velocity() {
+        let source = Vec3::new(96.0, -576.0, 296.0);
+        let target = Vec3::new(128.0, -672.0, 328.0);
+        let velocity = Vec2::new(-278.59, -35.03);
+        let (ready, wish) = jump_takeoff_prep(source, source, target, velocity, 800.0, 320.0, 0.0);
+
+        assert!(!ready, "sideways/backwards total speed must not launch a gap jump");
+        assert!(wish.dot(velocity.normalize()) < -0.99, "must counter-steer away from the x wall: {wish:?}");
+        let required = jump_required_speed(source, target, 800.0);
+        let airtime = jump_airtime(source, target, 800.0).expect("reachable jump");
+        let projected = velocity.dot((target.xy() - source.xy()).normalize());
+        assert!(
+            (required * airtime - (target.xy() - source.xy()).length()).abs() < 0.001,
+            "requirement must be the exact descending-root centre arc: {required}",
+        );
+        assert!(projected < 0.0, "the recorded takeoff was not moving toward RA: {projected}");
+    }
+
+    #[test]
+    fn dm3_ring_ra_takeoff_accepts_aligned_ballistic_speed() {
+        let source = Vec3::new(96.0, -576.0, 296.0);
+        let target = Vec3::new(128.0, -672.0, 328.0);
+        let dir = (target.xy() - source.xy()).normalize();
+        let (ready, wish) = jump_takeoff_prep(source, source, target, dir * 210.0, 800.0, 320.0, 0.0);
+
+        assert!(ready, "an aligned takeoff above the solved requirement must launch");
+        assert!(wish.dot(dir) > 0.999);
+    }
+
+    #[test]
+    fn dm3_lower_ra_jump_waits_for_its_certified_source_line() {
+        let source = Vec3::new(192.0, -704.0, -16.0);
+        let target = Vec3::new(224.0, -832.0, 24.0);
+        let dir = (target.xy() - source.xy()).normalize();
+        let side = Vec2::new(-dir.y, dir.x);
+        // The observed wall-hit launch was both behind the source plane and west of its line.
+        let origin = (source.xy() - dir * 8.0 - side * 12.0).extend(source.z);
+        let (ready, wish) = jump_takeoff_prep(origin, source, target, dir * 320.0, 800.0, 320.0, 0.0);
+
+        assert!(!ready, "an offset pre-source arrival must not launch");
+        assert!(wish.dot(side) > 0.0, "setup wish must converge back onto the launch line: {wish:?}");
+        assert!(wish.dot(dir) > 0.0, "setup wish must keep progressing toward the gap: {wish:?}");
+    }
+
+    #[test]
+    fn dm3_lower_ra_jump_brakes_observed_outward_cross_track_momentum() {
+        let source = Vec3::new(192.0, -704.0, -16.0);
+        let target = Vec3::new(224.0, -832.0, 24.0);
+        let origin = Vec3::new(199.64, -698.32, -15.97);
+        let velocity = Vec2::new(124.8, -315.5);
+        let dir = (target.xy() - source.xy()).normalize();
+        let rel = origin.xy() - source.xy();
+        let cross = rel - dir * rel.dot(dir);
+        assert!(velocity.dot(cross) > 0.0, "recorded velocity must be leaving the line");
+
+        let (ready, wish) = jump_takeoff_prep(origin, source, target, velocity, 800.0, 320.0, 0.0);
+        assert!(!ready, "an outward, offset arrival must not launch");
+        assert!(wish.dot(cross) < -0.99 * cross.length(), "wish must drive directly back to the line: {wish:?}");
+    }
+
+    #[test]
+    fn dm3_lower_ra_jump_bleeds_the_observed_overspeed_wall_launch() {
+        let source = Vec3::new(192.0, -704.0, -16.0);
+        let target = Vec3::new(224.0, -832.0, 24.0);
+        // Velocity from the first airborne observation of the otherwise successful strict trial
+        // that touched the east lip. Apply it to the certified source because the launch gate runs
+        // on the preceding grounded snapshot; the later airborne position has already consumed
+        // part of the flight and is not a second takeoff state.
+        let velocity = Vec2::new(47.37983, -337.39536);
+        let (ready, wish) = jump_takeoff_prep(source, source, target, velocity, 800.0, 320.0, 0.0);
+
+        assert!(!ready, "a stock gap must not inherit the 339-ups wall-launch envelope");
+        assert_eq!(wish, Vec2::ZERO, "overspeed setup must coast under friction: {wish:?}");
+    }
+
+    #[test]
+    fn dm3_lower_ra_jump_keeps_the_observed_clean_takeoff() {
+        let source = Vec3::new(192.0, -704.0, -16.0);
+        let target = Vec3::new(224.0, -832.0, 24.0);
+        // Velocity from the first airborne observation of a zero-contact 12.36s pickup on the same
+        // graph/link, projected from the certified source as the preceding grounded snapshot.
+        let velocity = Vec2::new(87.16784, -302.0417);
+        let dir = (target.xy() - source.xy()).normalize();
+        let (ready, wish) = jump_takeoff_prep(source, source, target, velocity, 800.0, 320.0, 0.0);
+
+        assert!(ready, "the 314-ups zero-contact takeoff must remain inside the stock envelope");
+        assert!(wish.dot(dir) > 0.999, "clean takeoff must keep the certified heading: {wish:?}");
+    }
+
+    /// Optional stock-DM3 proof that the two observed high-speed corner departures expose a
+    /// one-sided floor edge to the live hull oracle. This binds the generic correction to the real
+    /// geometry without shipping id's BSP in the crate.
+    #[test]
+    fn dm3_observed_corner_drift_has_one_sided_edge_bias() {
+        let Ok(path) = std::env::var("RTX_TEST_BSP") else {
+            return;
+        };
+        if !path.to_ascii_lowercase().contains("dm3") {
+            return;
+        }
+        let bytes = std::fs::read(path).expect("read dm3 bsp");
+        let bsp = Bsp::parse(&bytes).expect("parse dm3 bsp");
+        for (origin, velocity) in [
+            (Vec3::new(291.09, -821.52, 264.03), Vec2::new(303.8, 265.9)),
+            (Vec3::new(288.99, -820.21, 264.03), Vec2::new(304.4, 239.6)),
+            (Vec3::new(294.45447, -821.085, 264.03125), Vec2::new(308.2631, 227.69398)),
+            (Vec3::new(411.80, -819.43, 48.03), Vec2::new(365.0, 189.3)),
+        ] {
+            let feet = origin - Vec3::new(0.0, 0.0, ORIGIN_TO_FEET);
+            let travel = velocity.normalize_or_zero();
+            let bias = crate::hazard::edge_bias(
+                &|p| bsp.is_solid(p),
+                feet,
+                Vec3::new(travel.x, travel.y, 0.0),
+            );
+            assert_ne!(bias, Vec3::ZERO, "observed DM3 corner must expose one unsafe side at {origin:?}");
+            let travel3 = Vec3::new(travel.x, travel.y, 0.0);
+            let sub = origin - Vec3::new(0.0, 0.0, 1.0);
+            let wall = bsp.hull1_trace(sub, sub + travel3 * EDGE_BHOP_WALL_CLEAR);
+            let wall_clear = if wall.plane_normal.xy().length_squared() > 0.5 {
+                wall.fraction * EDGE_BHOP_WALL_CLEAR
+            } else {
+                f32::INFINITY
+            };
+            assert!(
+                wall_clear < EDGE_BHOP_WALL_CLEAR * 0.99,
+                "observed corner at {origin:?} must also face a near wall: {wall_clear}",
+            );
+        }
+
+    }
+
+    /// Optional stock-DM3 binding for the ring-exit failure. The route corridor itself remains on
+    /// the z=56 floor, but a full ordinary hop from the high-speed turn cuts across unsupported
+    /// space; the live hull forecast must therefore force a grounded carve instead of another hop.
+    #[test]
+    fn dm3_ring_exit_rejects_the_ordinary_bhop_corner_cut() {
+        let Ok(path) = std::env::var("RTX_TEST_BSP") else {
+            return;
+        };
+        if !path.to_ascii_lowercase().contains("dm3") {
+            return;
+        }
+        let bytes = std::fs::read(path).expect("read dm3 bsp");
+        let bsp = Bsp::parse(&bytes).expect("parse dm3 bsp");
+        let origin = Vec3::new(426.8, 142.1, 56.03125);
+        let velocity = Vec2::new(44.8, -421.8);
+        let corridor = Vec2::new(704.0, 320.0) - origin.xy();
+        assert!(!ordinary_bhop_floor_supported(
+            &bsp,
+            origin,
+            velocity,
+            corridor,
+            velocity.length() * bhop::T_HOP,
+        ));
+    }
+
+    #[test]
+    fn jumpgap_suppresses_a_carried_bhop_command() {
+        let carried = bhop::Cmd {
+            view_yaw: 180.0,
+            forward: MOVE_SPEED,
+            side: MOVE_SPEED,
+            jump: true,
+        };
+        assert!(gap_owned_bhop(Some(LinkKind::JumpGap), Some(carried)).is_none());
+
+        let ordinary = bhop::Cmd {
+            view_yaw: 180.0,
+            forward: MOVE_SPEED,
+            side: MOVE_SPEED,
+            jump: true,
+        };
+        assert!(gap_owned_bhop(Some(LinkKind::Walk), Some(ordinary)).is_some());
+    }
+
+    #[test]
+    fn terminal_retry_blocks_periodic_repick_until_the_alternate_leg_starts() {
+        let mut bot = BotState::default();
+        bot.goal.set_item(17);
+        bot.goal.item_cell = 4;
+        bot.goal.next_pick = 1.0;
+        bot.goal.terminal_arrival = Some(TerminalArrival {
+            item: EntId(17),
+            cell: 4,
+            at: 2.0,
+        });
+        bot.route = vec![1, 2];
+        bot.goal_cell = Some(4);
+
+        consume_terminal_retry(&mut bot, 17, 9, 10.0);
+
+        assert_eq!(bot.goal.item_cell, 9);
+        assert_eq!(bot.goal.terminal_retried_item, Some(EntId(17)));
+        assert!(bot.goal.terminal_arrival.is_none());
+        assert_eq!(bot.goal.next_pick, 10.0 + GOAL_SELECT_INTERVAL);
+        assert!(bot.route.is_empty());
+        assert_eq!(bot.goal_cell, None);
+        assert_eq!(bot.repath_time, 10.0);
+    }
+
+    #[test]
+    fn timed_return_arrival_preserves_unspawned_item_goal_after_grace() {
+        let mut bot = BotState::default();
+        let item = EntId(17);
+        let terminal = 4;
+        bot.goal.set_item(item.0);
+        bot.goal.item_cell = terminal;
+        bot.goal.terminal_arrival = Some(TerminalArrival { item, cell: terminal, at: 1.0 });
+
+        let now = 1.0 + TERMINAL_TAKE_GRACE;
+        let changed = update_item_terminal(&mut bot, true, Solid::Not, terminal, Some(9), now);
+
+        assert!(!changed, "an unspawned item is a wait, not a failed take");
+        assert_eq!(bot.goal.item, item.0);
+        assert_eq!(bot.goal.item_cell, terminal);
+        assert_eq!(bot.goal.terminal_retried_item, None);
+        assert!(!bot.is_avoided(item.0, now));
     }
 }

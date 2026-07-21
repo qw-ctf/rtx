@@ -30,6 +30,13 @@ mod sidetable;
 mod splice;
 
 pub use geom::arc_point;
+pub use jumps::{
+    ground_turn_air_aim, ground_turn_air_cmd, ground_turn_entry_adjust_cmd, ground_turn_entry_ok,
+    ground_turn_ground_aim, ground_turn_ground_cmd, ground_turn_ground_cmd_optimal, ground_turn_launch_cmd,
+    ground_turn_should_launch, ground_turn_should_launch_optimal, yaw360_of, GroundTurnLiveRollout,
+    GroundTurnSetupClock, GroundTurnSetupContinuation, GROUND_TURN_OPTIMAL_VERSION,
+    GROUND_TURN_SETUP_AIRBORNE_TICK_CAP, GROUND_TURN_VERSION, RUNWAY_TURN_VERSION,
+};
 use geom::*;
 pub use hook::arc_land;
 use hook::{hook_cost, march_to_solid, perturb_ok, HOOK_PITCHES};
@@ -37,7 +44,7 @@ use hook::{hook_cost, march_to_solid, perturb_ok, HOOK_PITCHES};
 use hook::{simulate_arc, ArcResult};
 pub use physics::{
     attainable_speed, band_of, bhop_k, prestrafe_delivered_from, BAND_EDGES, BAND_FLOOR, BAND_V_MAX, BHOP_EFF,
-    CURL_V_HOLD_TOL, DOUBLE_ARC_PEAK, JUMP_APEX, MAX_SPEED, NBANDS,
+    CURL_PSI_TOL, CURL_V_HOLD_TOL, DOUBLE_ARC_PEAK, JUMP_APEX, MAX_SPEED, NBANDS,
 };
 pub use lod::{CoarseCosts, Corridor};
 use lod::Lod;
@@ -290,6 +297,10 @@ pub struct SpeedJumpTraversal {
     /// Flight time of the leap (s), so the banded planner can price a hot entry (the runway term
     /// shrinks with carried speed while the airtime is fixed).
     pub airtime: f32,
+    /// Minimum certified horizontal landing speed. Populated by curl
+    /// traversals whose full cadence/contact envelope was rolled; zero means
+    /// that no landing-speed claim exists and the planner must use `v_req`.
+    pub landing_speed_lo: f32,
     /// A **chained** speed jump: it has no self-contained runway (the `from` cell *is* the ledge),
     /// so it is only traversable when the planner proves the entry band already carries `v_req`
     /// (see [`NavGraph::find_path_banded`]). Unbanded queries price it away via [`NavGraph::link_extra`].
@@ -299,6 +310,91 @@ pub struct SpeedJumpTraversal {
     /// runtime flies it with the hop slalom, unchanged. `> 0` = curl: once airborne the controller homes
     /// the velocity onto the landing with [`air_correct`](crate) at this rate — one smooth pursuit arc.
     pub curl_gain: f32,
+    /// Optional first pursuit point for a two-phase curl. `curl_switch_dist == 0` disables the
+    /// profile and preserves the original single-target curl. A signed distance permits a profile
+    /// to use the entry aim only for the launch frame and switch immediately once airborne. When enabled, the runtime pursues
+    /// this point until it has travelled `curl_switch_dist` units from `takeoff` along the
+    /// takeoff→entry-aim axis, then pursues `curl_landing_aim` for the remainder of the flight.
+    /// Keeping the solved points on the traversal makes the BSP certificate and live executor use
+    /// the same geometry without map-specific branches in the controller.
+    pub curl_entry_aim: Vec3,
+    pub curl_switch_dist: f32,
+    pub curl_landing_aim: Vec3,
+    /// A **chained ground-turn curl**: the leap cannot be flown from a local run-up at all — it
+    /// needs carried entry speed (the link is `chained`) *and* a grounded rotation before the jump
+    /// (the launch heading is not the corridor heading, and rotating in the air after a lip launch
+    /// provably cannot close the flight-time budget). `Some` carries the complete certified
+    /// controller contract; `None` = every other speed jump, unchanged. See [`GroundTurnCurl`].
+    pub ground_turn: Option<GroundTurnCurl>,
+}
+
+/// The self-contained, versioned contract for one chained ground-turn curl (see
+/// [`SpeedJumpTraversal::ground_turn`]). Both the build-time certifier and the live executor drive
+/// the same version-selected controller functions from exactly these numbers, so what was proven
+/// offline is what flies. Fail-closed: the executor
+/// checks the live entry state against the stored envelope and abandons the leg (replans) when
+/// outside it, instead of improvising over the lip.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GroundTurnCurl {
+    /// Contract version; bump on any semantic change to the controller or envelope fields.
+    pub version: u16,
+    /// Ground steering waypoint held while farther than `turn_dist` from the takeoff point: keeps
+    /// the run (a stepped runway is fine — step-ups resolve as `stepped`, not wall contact) on the
+    /// certified corridor line.
+    pub runway_aim: Vec3,
+    /// Self-contained runway-turn policy. When true, ground steering blends
+    /// continuously from `runway_yaw` to `launch_yaw`, holds
+    /// `hold_speed`, and launches at `lip_reach`; false preserves the
+    /// original chained switch-at-distance controller.
+    pub blended_runway: bool,
+    pub runway_yaw: f32,
+    pub lip_reach: f32,
+    pub hold_speed: f32,
+    /// Distance from the takeoff point at which ground steering switches from `runway_aim` to
+    /// rotating the carried velocity toward `launch_yaw`.
+    pub turn_dist: f32,
+    /// Launch heading in degrees, [0,360) (atan2 convention, west = 180).
+    pub launch_yaw: f32,
+    /// Grounded velocity-yaw gate in degrees, [0,360): the jump fires on the first grounded tick
+    /// inside the takeoff box at/above this yaw and at/above `box_min.z`.
+    pub yaw_min: f32,
+    /// Takeoff box: the jump may fire anywhere inside this XY AABB once the yaw gate is met;
+    /// `box_min.z` doubles as the minimum launch height (must be on the takeoff platform).
+    pub box_min: Vec3,
+    pub box_max: Vec3,
+    /// Launch-frame air-steer gain toward `hold_aim`.
+    pub launch_gain: f32,
+    /// Air phase A pursues `hold_aim` until the flight crosses the gate plane
+    /// (`dot(origin - gate_point, gate_normal) < 0`), then pursues `landing_aim` at `air_gain`.
+    /// A gate plane placed at the takeoff makes the curl immediate (phase A never runs).
+    pub hold_aim: Vec3,
+    pub gate_point: Vec3,
+    pub gate_normal: Vec3,
+    pub air_gain: f32,
+    pub landing_aim: Vec3,
+    /// Certified entry envelope at the link source (grounded arrival): horizontal speed and
+    /// velocity yaw360 ranges. Outside ⇒ the executor must NOT commit the leg.
+    pub entry_speed_lo: f32,
+    pub entry_speed_hi: f32,
+    pub entry_yaw_lo: f32,
+    pub entry_yaw_hi: f32,
+    /// Minimum horizontal landing speed observed across the certified envelope — the carry the
+    /// banded planner may credit downstream of this link.
+    pub landing_speed_lo: f32,
+    /// Certified landing heading (degrees, [0,360), centre envelope corner) — the direction the
+    /// carried speed actually points after the curl, which the banded planner's corner cone must
+    /// use instead of the from→to chord (the flight rotates far off the chord by design).
+    pub landing_yaw: f32,
+}
+
+/// Is `yaw` (degrees, [0,360)) inside the wrap-aware envelope `[lo, hi]` (also [0,360); `lo > hi`
+/// means the envelope crosses 0)?
+pub fn yaw_in_envelope(yaw: f32, lo: f32, hi: f32) -> bool {
+    if lo <= hi {
+        yaw >= lo && yaw <= hi
+    } else {
+        yaw >= lo || yaw <= hi
+    }
 }
 
 /// Extra travel-time cost charged to a link whose gate is currently shut. Large enough that the
@@ -587,8 +683,30 @@ impl NavGraph {
                 out
             })
             .collect();
+        // A short near-apex rise can have a very narrow *slow* speed window: geometrically
+        // reachable, but an ordinary runner reaches its front face before gaining the target
+        // height. Preserve such links when they are the only way onto a ledge (the runtime will
+        // eventually carry their solved speed envelope), but prune them when this same build has
+        // already found a max-speed-safe takeoff farther back to the exact target cell. This removes
+        // a wall-hit shortcut without disconnecting deliberate slow hop-ups such as DM3 MH.
+        let mut has_hot_jump_to = vec![false; self.cells.len()];
+        for link in per_cell.iter().flatten().filter(|l| l.kind == LinkKind::JumpGap) {
+            let a = self.cells[link.from as usize].origin;
+            let b = self.cells[link.to as usize].origin;
+            if b.z > a.z && ballistic_clear_at_speed(bsp, a, b, MAX_SPEED) {
+                has_hot_jump_to[link.to as usize] = true;
+            }
+        }
         for link in per_cell.into_iter().flatten() {
-            self.push_link(link);
+            let a = self.cells[link.from as usize].origin;
+            let b = self.cells[link.to as usize].origin;
+            let redundant_knife_edge = link.kind == LinkKind::JumpGap
+                && b.z > a.z
+                && has_hot_jump_to[link.to as usize]
+                && !ballistic_clear_at_speed(bsp, a, b, MAX_SPEED);
+            if !redundant_knife_edge {
+                self.push_link(link);
+            }
         }
     }
 
@@ -992,6 +1110,17 @@ impl NavGraph {
                     .speed_jump_of_link(li)
                     .map(|t| (t.v_req, t.airtime, t.chained, t.curl_gain))
                     .unwrap_or((MAX_SPEED, 0.0, false, 0.0));
+                // A chained ground-turn curl carries its own certified entry envelope — the proof
+                // the generic `SJ_MARGIN` exists to approximate — and its stored cost covers the
+                // whole leg (run-up, rotation, flight) end-to-end. Gate on the envelope floor and
+                // exit at the certified minimum landing speed; the runtime executor re-checks the
+                // same envelope fail-closed before committing.
+                if let Some(gt) = self.speed_jump_of_link(li).and_then(|t| t.ground_turn) {
+                    if v_in < gt.entry_speed_lo {
+                        return None;
+                    }
+                    return Some((link.cost.max(floor_cost), band_of(gt.landing_speed_lo)));
+                }
                 // A curl speed jump was certified end-to-end at build time — the rollout solver measured
                 // a run-up that the ground circle-strafe genuinely delivers (which the conservative
                 // air-strafe recompute below has no term for and badly under-credits). So trust its
@@ -1000,7 +1129,12 @@ impl NavGraph {
                 // equilibrium regardless of how fast the bot arrived — crediting `v_in` would plan a
                 // downstream chained jump off a band the runtime can't actually carry through the curl.
                 if curl_gain > 0.0 && !chained {
-                    return Some((link.cost.max(floor_cost), band_of(v_req)));
+                    let landing = self
+                        .speed_jump_of_link(li)
+                        .map(|t| t.landing_speed_lo)
+                        .filter(|&v| v.is_finite() && v > 0.0)
+                        .unwrap_or(v_req);
+                    return Some((link.cost.max(floor_cost), band_of(landing)));
                 }
                 // A chained jump has no runway: traversable only if the entry band already carries it.
                 if chained && v_in < v_req * SJ_MARGIN {
@@ -1305,6 +1439,160 @@ impl NavGraph {
         let r = self.rocket_jumps.push(traversal);
         self.push_link(link);
         self.rocket_jumps.tag(self.links.len() - 1, r);
+    }
+
+    /// Hand-plant a rocket-jump link post-build (harness / bring-up): run the real two-phase RJ
+    /// ballistics from the cell nearest `from` onto a landing cell near `tgt`, unconstrained by the
+    /// automatic generator's search caps — `RJ_RANGE_XY` / `RJ_MIN_RISE..=RJ_MAX_RISE` and the
+    /// useful-apex rule bound the map-wide candidate *spray*, not physics, and a curated plant has
+    /// already decided the jump is wanted. Certification is NOT relaxed: the shot must simulate
+    /// clean on both hulls, resolve to a standable landing cell within the standard tolerance
+    /// (`RJ_LAND_XY`/`RJ_LAND_Z`), apex past it by `RJ_APEX_MARGIN`, and survive the same
+    /// perturbation check as a generated link. The yaw sweeps ±20° around the straight-line
+    /// bearing so an off-axis opening (e.g. a window) the 8-octant search never aims at can still
+    /// be threaded. The cheapest surviving arc is inserted; the runtime flies a planted link
+    /// exactly like a generated one. Works on a graph built with rocket-jump generation off.
+    /// Not used by the automatic build.
+    pub fn plant_rocket_jump(
+        &mut self,
+        bsp: &Bsp,
+        from: Vec3,
+        tgt: Vec3,
+        params: RocketJumpParams,
+    ) -> Result<u32, String> {
+        /// How far the resolved landing cell may sit from the requested `tgt` and still count as
+        /// "the target": a few grid columns of slack, since the caller aims at a ledge, not a cell.
+        const TGT_XY: f32 = 96.0;
+        const TGT_Z: f32 = 64.0;
+        let from_cell = self.nearest(from).ok_or("no cell near from")?;
+        let a = self.cells[from_cell as usize].origin;
+        if bsp.is_liquid_at(a) {
+            return Err("submerged takeoff: can't jump to start the rocket jump".into());
+        }
+        let is_solid = |p: Vec3| bsp.is_solid(p);
+        let rocket_solid = |p: Vec3| bsp.is_point_solid(p);
+        // Fire opposite the travel direction, like the generator.
+        let to_xy = tgt.xy() - a.xy();
+        if to_xy.length() < 1.0 {
+            return Err("tgt is directly above from; no bearing to fire against".into());
+        }
+        let base_yaw = to_xy.y.atan2(to_xy.x).to_degrees() + 180.0;
+        let mut best: Option<(f32, Link, RocketJumpTraversal)> = None;
+        let mut clean = 0u32;
+        let mut best_miss = f32::INFINITY;
+        // Full-circle yaw sweep, 15° steps: a curated plant is a one-shot solve, so unlike the
+        // map-wide generator we can afford to try every wall — the blast's push direction is set by
+        // which surface the rocket finds, and the geometry that reaches an off-axis target is often
+        // a wall far from the straight-line bearing.
+        for yaw_step in 0..24 {
+            let yaw_off = yaw_step as f32 * 15.0 - 180.0;
+            for pitch in RJ_PITCHES {
+                for delay in RJ_DELAYS {
+                    let angles = Vec3::new(pitch, base_yaw + yaw_off, 0.0);
+                    let Some(s) =
+                        simulate_rocket_jump(is_solid, rocket_solid, a, angles, delay, params)
+                    else {
+                        continue;
+                    };
+                    clean += 1;
+                    best_miss = best_miss.min((s.land - tgt).length());
+                    // Harness diagnostics for a failing plant: where does every clean arc land?
+                    if std::env::var_os("RTX_PLANT_RJ_DEBUG").is_some() {
+                        eprintln!(
+                            "planrj arc: yaw_off {yaw_off} pitch {pitch} delay {delay} -> land \
+                             {:.0} {:.0} {:.0} (miss {:.0}u, apex {:.0})",
+                            s.land.x,
+                            s.land.y,
+                            s.land.z,
+                            (s.land - tgt).length(),
+                            s.pos_blast.z + s.v0.z.max(0.0).powi(2) / (2.0 * params.gravity),
+                        );
+                    }
+                    let Some(to) = self.nearest_within(s.land, RJ_LAND_XY, RJ_LAND_Z) else {
+                        continue;
+                    };
+                    if to == from_cell {
+                        continue;
+                    }
+                    let b = self.cells[to as usize].origin;
+                    if (b.xy() - tgt.xy()).length() > TGT_XY || (b.z - tgt.z).abs() > TGT_Z {
+                        continue;
+                    }
+                    let apex = s.pos_blast.z + s.v0.z.max(0.0).powi(2) / (2.0 * params.gravity);
+                    if apex >= b.z + RJ_APEX_MARGIN
+                        && rj_perturb_ok(is_solid, rocket_solid, a, angles, delay, params, b)
+                    {
+                        let cost = rocket_jump_cost(s.t_blast, s.airtime, s.vz_land, s.self_damage);
+                        if best.as_ref().is_none_or(|(bc, _, _)| cost < *bc) {
+                            let link = Link { from: from_cell, to, kind: LinkKind::RocketJump, cost };
+                            let tr = RocketJumpTraversal {
+                                fire_angles: angles,
+                                fire_delay: delay,
+                                blast: s.blast,
+                                pos_blast: s.pos_blast,
+                                v0: s.v0,
+                                land: s.land,
+                                airtime: s.airtime,
+                                self_damage: s.self_damage,
+                            };
+                            best = Some((cost, link, tr));
+                        }
+                    }
+                }
+            }
+        }
+        let Some((_, link, tr)) = best else {
+            return Err(format!(
+                "no certifiable arc: {clean} clean simulations, best landing miss {best_miss:.0}u \
+                 from tgt {:.0} {:.0} {:.0}",
+                tgt.x, tgt.y, tgt.z
+            ));
+        };
+        self.push_rocket_jump(link, tr);
+        Ok((self.links.len() - 1) as u32)
+    }
+
+    /// Hand-plant a rocket-jump link with caller-supplied fire parameters and NO offline
+    /// certification — the bring-up primitive for lift-assisted rocket jumps, which the static
+    /// solver cannot certify: a rising `func_plat` adds launch velocity that exists only at
+    /// runtime (see the pentlift→window refutation in `tests/plant_rocket_jump_dm3.rs`). The
+    /// traversal is synthesized — the runtime flies jump+fire with exactly these angles and delay
+    /// and reports the real outcome through the standard rj telemetry, so certification happens
+    /// live, by trial. Harness-only; never emitted by the automatic build.
+    pub fn plant_rocket_jump_raw(
+        &mut self,
+        from: Vec3,
+        tgt: Vec3,
+        fire_angles: Vec3,
+        fire_delay: f32,
+        airtime: f32,
+        self_damage: f32,
+    ) -> Result<u32, String> {
+        let from_cell = self.nearest(from).ok_or("no cell near from")?;
+        let to_cell = self.nearest(tgt).ok_or("no cell near tgt")?;
+        if from_cell == to_cell {
+            return Err("from and tgt resolve to the same cell".into());
+        }
+        let a = self.cells[from_cell as usize].origin;
+        let b = self.cells[to_cell as usize].origin;
+        // Price the stated flight like a certified link (exact pricing is irrelevant for a
+        // puppet-flown drill leg; it just has to be finite and honest about the health cost).
+        let cost = rocket_jump_cost(fire_delay, airtime, 0.0, self_damage);
+        let tr = RocketJumpTraversal {
+            fire_angles,
+            fire_delay,
+            blast: a,
+            pos_blast: a,
+            v0: Vec3::ZERO,
+            land: b,
+            airtime,
+            self_damage,
+        };
+        self.push_rocket_jump(
+            Link { from: from_cell, to: to_cell, kind: LinkKind::RocketJump, cost },
+            tr,
+        );
+        Ok((self.links.len() - 1) as u32)
     }
 
     /// Append a free-standing cell (not from the column carve) and index it. Used for plat
@@ -1773,6 +2061,42 @@ mod tests {
         assert!(!g.cells.is_empty(), "no cells carved");
         assert!(!g.links.is_empty(), "no links built");
 
+        // DM3 regression: the two adjacent +40u hop-ups at the lower-RA lip are geometrically
+        // reachable only in unusually narrow slow-speed windows. Because the same target has a
+        // max-speed-safe takeoff farther back, those redundant wall-hit choices are pruned. A slow
+        // hop-up that is the only route to MH must remain, as must the final jump onto RA.
+        if std::path::Path::new(&path).file_stem().is_some_and(|s| s.eq_ignore_ascii_case("dm3")) {
+            let direct_jump = |from: Vec3, to: Vec3| {
+                let Some(a) = g.nearest(from) else { return false };
+                let Some(b) = g.nearest(to) else { return false };
+                (g.cell_origin(a) - from).length() < 0.1
+                    && (g.cell_origin(b) - to).length() < 0.1
+                    && g.adjacency[a as usize]
+                        .iter()
+                        .any(|&li| g.link_target(li) == b && g.link_kind(li) == LinkKind::JumpGap)
+            };
+            assert!(
+                !direct_jump(Vec3::new(192.0, -800.0, -16.0), Vec3::new(224.0, -832.0, 24.0)),
+                "unsafe diagonal lower-RA hop-up survived hot-entry certification"
+            );
+            assert!(
+                !direct_jump(Vec3::new(224.0, -800.0, -16.0), Vec3::new(224.0, -832.0, 24.0)),
+                "unsafe straight lower-RA hop-up survived hot-entry certification"
+            );
+            assert!(
+                direct_jump(Vec3::new(192.0, -704.0, -16.0), Vec3::new(224.0, -832.0, 24.0)),
+                "safe lower-RA run-jump was removed"
+            );
+            assert!(
+                direct_jump(Vec3::new(96.0, -576.0, 296.0), Vec3::new(128.0, -672.0, 328.0)),
+                "final jump onto RA was removed"
+            );
+            assert!(
+                direct_jump(Vec3::new(-512.0, 288.0, 144.0), Vec3::new(-576.0, 256.0, 176.0)),
+                "non-redundant slow MH ascent was removed"
+            );
+        }
+
         // Largest connected component via union-find over (undirected) links.
         let mut parent: Vec<u32> = (0..g.cells.len() as u32).collect();
         fn find(p: &mut [u32], mut x: u32) -> u32 {
@@ -2204,6 +2528,9 @@ mod tests {
                 mix(&mut h, t.airtime.to_bits() as u64);
                 mix(&mut h, t.chained as u64);
                 mix(&mut h, t.curl_gain.to_bits() as u64);
+                mix_vec3(&mut h, t.curl_entry_aim);
+                mix(&mut h, t.curl_switch_dist.to_bits() as u64);
+                mix_vec3(&mut h, t.curl_landing_aim);
             }
             for &x in g.rocket_jumps.idx_raw() {
                 mix(&mut h, x as u32 as u64);
@@ -2806,7 +3133,7 @@ mod tests {
     fn banded_graph(
         origins: &[Vec3],
         links: &[(CellId, CellId, LinkKind, f32)],
-        sjs: &[(usize, f32, f32, bool, f32)],
+        sjs: &[(usize, f32, f32, bool, f32, f32)],
     ) -> NavGraph {
         let cells = origins
             .iter()
@@ -2822,8 +3149,19 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut speed_jumps = SideTable::default();
-        for &(li, v_req, airtime, chained, curl_gain) in sjs {
-            let s = speed_jumps.push(SpeedJumpTraversal { takeoff: origins[links[li].from as usize], v_req, airtime, chained, curl_gain });
+        for &(li, v_req, airtime, chained, curl_gain, landing_speed_lo) in sjs {
+            let s = speed_jumps.push(SpeedJumpTraversal {
+                takeoff: origins[links[li].from as usize],
+                v_req,
+                airtime,
+                landing_speed_lo,
+                chained,
+                curl_gain,
+                curl_entry_aim: Vec3::ZERO,
+                curl_switch_dist: 0.0,
+                curl_landing_aim: Vec3::ZERO,
+                ground_turn: None,
+            });
             speed_jumps.tag(li, s);
         }
         let mut g = NavGraph::test_graph(cells, links);
@@ -2855,7 +3193,7 @@ mod tests {
             let g = banded_graph(
                 &origins,
                 &[(0, 1, kind, 3.0)],
-                if kind == LinkKind::SpeedJump { &[(0, 350.0, 0.7, false, 0.0)] } else { &[] },
+                if kind == LinkKind::SpeedJump { &[(0, 350.0, 0.7, false, 0.0, 0.0)] } else { &[] },
             );
             let horiz = (origins[1].xy() - origins[0].xy()).length();
             for band in 0..NBANDS as u8 {
@@ -2905,7 +3243,7 @@ mod tests {
                 (2, 3, LinkKind::Walk, 0.625),
                 (3, 4, LinkKind::SpeedJump, 1.7),
             ],
-            &[(1, 350.0, 0.7, true, 0.0), (3, 350.0, 0.7, true, 0.0)],
+            &[(1, 350.0, 0.7, true, 0.0, 0.0), (3, 350.0, 0.7, true, 0.0, 0.0)],
         );
         // Speed-unaware: the chained legs are priced away, so C is effectively unreachable.
         let flood = g.costs_from(0, &LinkCosts::default());
@@ -2933,12 +3271,26 @@ mod tests {
             (0, 2, LinkKind::JumpGap, 1.3),   // detour leg 1
             (2, 1, LinkKind::JumpGap, 1.3),   // detour leg 2
         ];
-        let curl = banded_graph(&origins, &links, &[(0, 391.0, 0.68, false, 12.0)]);
+        let curl = banded_graph(&origins, &links, &[(0, 391.0, 0.68, false, 12.0, 0.0)]);
         let route = curl.find_path_banded(0, 1, MAX_SPEED, &LinkCosts::default()).expect("route exists");
         assert_eq!(route.links, vec![0], "the certified curl must be taken over the detour");
-        let straight = banded_graph(&origins, &links, &[(0, 391.0, 0.68, false, 0.0)]);
+        let straight = banded_graph(&origins, &links, &[(0, 391.0, 0.68, false, 0.0, 0.0)]);
         let route2 = straight.find_path_banded(0, 1, MAX_SPEED, &LinkCosts::default()).expect("route exists");
         assert_eq!(route2.links, vec![1, 2], "a straight speed jump is repriced high; the detour wins");
+    }
+
+    #[test]
+    fn banded_plain_curl_credits_only_certified_landing_floor() {
+        let origins = [Vec3::ZERO, Vec3::new(416.0, -192.0, 48.0)];
+        let links = [(0, 1, LinkKind::SpeedJump, 1.5)];
+        let certified = banded_graph(&origins, &links, &[(0, 391.0, 0.68, false, 8.0, 479.4)]);
+        let (_, certified_exit) = certified.banded_step(0, 0).expect("certified curl");
+        assert_eq!(certified_exit, band_of(479.4));
+
+        let unproven = banded_graph(&origins, &links, &[(0, 391.0, 0.68, false, 8.0, 0.0)]);
+        let (_, fallback_exit) = unproven.banded_step(0, 0).expect("legacy curl fallback");
+        assert_eq!(fallback_exit, band_of(391.0));
+        assert!(certified_exit > fallback_exit, "unproven carry must not be credited");
     }
 
     /// Carried speed only survives a corner within the heading cone: a straight approach reaches a
@@ -2949,7 +3301,7 @@ mod tests {
             [Vec3::ZERO, Vec3::new(2000.0, 0.0, 0.0), Vec3::new(to_x, to_y, 0.0)]
         };
         let links = [(0, 1, LinkKind::Walk, 6.25), (1, 2, LinkKind::SpeedJump, 1.7)];
-        let sj = [(1usize, 350.0, 0.7, true, 0.0)];
+        let sj = [(1usize, 350.0, 0.7, true, 0.0, 0.0)];
         // Straight: R→M→C all along +x — the carried band satisfies the chained jump.
         let straight = banded_graph(&long_walk(2300.0, 0.0), &links, &sj);
         assert!(

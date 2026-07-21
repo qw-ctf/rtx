@@ -143,7 +143,17 @@ pub(super) fn bot_target(cvar_want: i32, humans: i32, cfg: crate::mode::team::Ma
 fn queue_add_bot(game: &mut GameState, index: i32) {
     // Build the name from latin-1 bytes, not `cstring` (which is UTF-8): `bot_display_name` carries
     // high-half conchars, and the engine stores the `CString`'s bytes verbatim into the netname.
-    let display = bot_display_name(bot_name(index));
+    // `rtx_bot_label` (when set) names bots after their experiment/route: a comma-separated
+    // list assigns per-index labels ("a,b,c"); indices past the list fall back to the rotation.
+    let mut label_buf = [0u8; 256];
+    let label = game.host.cvar_string(c"rtx_bot_label", &mut label_buf);
+    let label = label
+        .split(',')
+        .nth(index as usize)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| bot_name(index));
+    let display = bot_display_name(label);
     let name = CString::new(crate::text::latin1_bytes(&display)).unwrap_or_default();
     let (bottom, top) = bot_colors(index);
     game.pending_roster = Some(RosterOp::Add { name, bottom, top });
