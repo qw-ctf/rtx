@@ -1094,10 +1094,16 @@ impl RtxMcp {
 impl ServerHandler for RtxMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "RTX QuakeWorld bot inspection and movement-tuning bridge. Attach to an existing match \
-             with server_connect, or launch an isolated harness with server_start. Use status and \
-             bot_route for strategy inspection; list_rj_links/list_curl_links and the test tools for \
-             movement work. Link ids are not stable across server_restart or `map` changes.",
+            "RTX QuakeWorld bot control, inspection, and movement-tuning bridge over the game's \
+             TCP control channel. Attach to a running match with server_connect, or launch an \
+             isolated harness with server_start; configure it with set_cvars, then match_start \
+             locks the roster and waits until the match is live. To verify a movement change, run \
+             corridor_test and read its drift / peak-speed / reverse-frame report. To study team \
+             play, poll status for match state, each bot's goal/stack/route, and the oracle's plan \
+             and evaluation counters; bot_route and inspect_cell explain a bot's path and the nav \
+             links around a cell. For rocket-jump work use list_rj_links / test_links (curl links: \
+             list_curl_links). Link ids are not stable across server_restart or a `map` change — \
+             re-list after either.",
         )
     }
 }
