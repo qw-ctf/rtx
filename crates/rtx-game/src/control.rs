@@ -32,8 +32,9 @@ use std::sync::{Arc, Mutex};
 
 use glam::{Vec3, Vec3Swizzles};
 
+use crate::bot::goals::is_goal_classname;
 use crate::bot::state::{ControlOrder, HookState, RjOutcome, RjState, RjTelemetry};
-use crate::defs::{Bits, Flags, Items, Weapon};
+use crate::defs::{Bits, Flags, Items, Solid, Weapon};
 use crate::entity::EntId;
 use crate::game::{cstring, GameState, MAX_EDICTS};
 use crate::math::wrap180;
@@ -222,6 +223,9 @@ enum ControlCmd {
     Status,
     MatchStart,
     Links,
+    /// List the map's bot-goal items (armor/health/weapons/ammo/powerups): entity origin, whether
+    /// it's currently on the floor, and the nearest navmesh cell (the standable `goto` target).
+    Items,
     Prep {
         bot: u32,
         health: f32,
@@ -340,6 +344,7 @@ fn parse_line(line: &str) -> Result<(i64, ControlCmd), String> {
         "status" => ControlCmd::Status,
         "match_start" => ControlCmd::MatchStart,
         "links" => ControlCmd::Links,
+        "items" => ControlCmd::Items,
         "prep" => {
             let mut t = rest.split_whitespace();
             let bot = parse_u32(t.next(), "bot")?;
@@ -507,6 +512,7 @@ fn exec_cmd(game: &mut GameState, id: i64, cmd: ControlCmd) {
             Ok("{\"queued\":true}".to_string())
         }
         ControlCmd::Links => links_json(game),
+        ControlCmd::Items => items_json(game),
         ControlCmd::Prep { bot, health, rockets } => do_prep(game, bot, health, rockets),
         ControlCmd::Teleport { bot, pos } => do_teleport(game, bot, pos),
         ControlCmd::Goto { bot, pos } => do_goto(game, bot, pos),
@@ -1081,6 +1087,38 @@ fn cell_json(game: &GameState, pos: Vec3) -> Result<String, String> {
         jvec3(g.cell_origin(cell)),
         jstr(&format!("{:?}", g.cell_hazard(cell)))
     ))
+}
+
+/// List the map's bot-goal items (armor, health, weapons, ammo, powerups), so a caller can find a
+/// pickup without spelunking the bsp entity lump. Each item reports its entity origin, whether it's
+/// currently on the floor to be taken (`available`), and the nearest navmesh cell — the standable
+/// point to `goto`, since the entity origin itself floats above the floor and isn't a nav cell.
+fn items_json(game: &GameState) -> Result<String, String> {
+    let g = game.nav.graph.as_ref().ok_or("navmesh not ready")?;
+    let mut out = String::new();
+    for (id, ent) in game.entities.live() {
+        let Some(classname) = ent.classname() else {
+            continue;
+        };
+        if !is_goal_classname(classname) {
+            continue;
+        }
+        let nav = match g.nearest(ent.v.origin) {
+            Some(cell) => format!("{{\"cell\":{cell},\"origin\":{}}}", jvec3(g.cell_origin(cell))),
+            None => "null".to_string(),
+        };
+        if !out.is_empty() {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"ent\":{},\"classname\":{},\"origin\":{},\"available\":{},\"nav\":{nav}}}",
+            id.0,
+            jstr(classname),
+            jvec3(ent.v.origin),
+            ent.v.solid == Solid::Trigger,
+        ));
+    }
+    Ok(format!("{{\"items\":[{out}]}}"))
 }
 
 /// Dump a bot's current route: `route_pos` and each leg (index, kind, source→target).

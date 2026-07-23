@@ -26,7 +26,8 @@ Prefer the `rtx-mcp` MCP server (registered in the repo-root `.mcp.json`) over h
 mvdsv when you need to run or observe bots live:
 
 - `server_connect` attaches to a running server; `server_start` launches an isolated harness
-  (see `playground/` above for what it needs, and its `install_module` flag).
+  (see `playground/` above for what it needs, and its `install_module` flag). `list_maps` shows
+  what you can load — loose `.bsp` plus maps inside the paks (so stock maps like `dm3` show up).
 - Configure with `set_cvars`, then `match_start` — it locks the roster and waits until the
   match is live (retrying only while the server stays in settled warmup).
 - Verify a movement change with `corridor_test`: it reports drift, peak speed, and reverse
@@ -34,7 +35,9 @@ mvdsv when you need to run or observe bots live:
   below for known-good start/end points).
 - Study play with `status` (match state, and each bot's team, stack, inventory, item goal,
   posture, enemy, route head, plus the oracle's plan and evaluation counters); `bot_route`
-  expands a full route and `inspect_cell` explains the nav links around a cell.
+  expands a full route and `inspect_cell` explains the nav links around a cell. `items` lists the
+  map's pickups with each one's nearest standable nav cell — the `goto` target (an item's own
+  origin floats above the floor, so `goto` it and the bot stalls under the pickup).
 - Rocket-jump work: `list_rj_links` / `test_links`; curl links: `list_curl_links`.
 
 Link ids are not stable across `server_restart` or a `map` change — re-list after either. The

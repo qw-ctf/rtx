@@ -577,6 +577,65 @@ fn install_module(repo: &std::path::Path, install: bool) -> Result<Option<String
     }
 }
 
+/// The map names inside a Quake `.pak` — its directory lists files, and stock maps like `dm3` live
+/// there as `maps/<name>.bsp` rather than as loose files. Best-effort: an unreadable or non-`PACK`
+/// file contributes nothing rather than failing the whole listing.
+fn pak_map_names(path: &std::path::Path) -> Vec<String> {
+    let Ok(data) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    // PAK header: "PACK", then i32 directory offset and i32 directory length; each 64-byte entry is
+    // a 56-byte NUL-padded name followed by i32 file offset and length.
+    if data.len() < 12 || &data[..4] != b"PACK" {
+        return Vec::new();
+    }
+    let rd = |o: usize| i32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]) as usize;
+    let (dirofs, dirlen) = (rd(4), rd(8));
+    let mut names = Vec::new();
+    for i in 0..dirlen / 64 {
+        let off = dirofs + i * 64;
+        if off + 64 > data.len() {
+            break;
+        }
+        let end = data[off..off + 56].iter().position(|&b| b == 0).unwrap_or(56);
+        let name = String::from_utf8_lossy(&data[off..off + end]).to_ascii_lowercase();
+        if let Some(stem) = name.strip_prefix("maps/").and_then(|n| n.strip_suffix(".bsp")) {
+            names.push(stem.to_string());
+        }
+    }
+    names
+}
+
+/// Every map mvdsv could load from `playground/` — loose `.bsp` under `qw/maps` and `id1/maps`, plus
+/// `maps/*.bsp` inside the `.pak`s in `qw/` and `id1/` — deduped, lowercased, sorted, and narrowed to
+/// names containing `filter` (case-insensitive; empty matches all). Always a JSON array.
+fn collect_maps(repo: &std::path::Path, filter: Option<&str>) -> Value {
+    let mut names = std::collections::BTreeSet::new();
+    for sub in ["playground/qw/maps", "playground/id1/maps"] {
+        if let Ok(dir) = std::fs::read_dir(repo.join(sub)) {
+            for path in dir.flatten().map(|e| e.path()) {
+                if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("bsp")) {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        names.insert(stem.to_ascii_lowercase());
+                    }
+                }
+            }
+        }
+    }
+    for sub in ["playground/qw", "playground/id1"] {
+        if let Ok(dir) = std::fs::read_dir(repo.join(sub)) {
+            for path in dir.flatten().map(|e| e.path()) {
+                if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("pak")) {
+                    names.extend(pak_map_names(&path));
+                }
+            }
+        }
+    }
+    let needle = filter.unwrap_or("").to_ascii_lowercase();
+    let list: Vec<&String> = names.iter().filter(|n| n.contains(&needle)).collect();
+    json!(list)
+}
+
 /// Write the self-contained harness config into `playground/qw/rjtest.cfg`. Self-contained (server
 /// cvars + rtx cvars + `map`) so it works whether or not mvdsv auto-execs `server.cfg` first — the
 /// last `set`/`map` wins either way. One bot, alone, pacifist, the control port open, dm/no-match so
@@ -658,6 +717,12 @@ struct StartArgs {
 struct ConnectArgs {
     /// Existing rtx control port (default 27950).
     port: Option<u16>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct MapsArgs {
+    /// Case-insensitive substring; only map names containing it are returned. Omit or empty for all.
+    filter: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -839,11 +904,31 @@ impl RtxMcp {
     }
 
     #[tool(
+        description = "List the maps mvdsv can load from playground/ — loose `.bsp` under qw/maps and \
+        id1/maps plus `maps/*.bsp` inside the pak files, so stock maps like dm3 that live in a pak \
+        show up too. Optional `filter` keeps only names containing that substring (case-insensitive). \
+        Needs no running server; always returns a list."
+    )]
+    async fn list_maps(&self, Parameters(a): Parameters<MapsArgs>) -> Result<CallToolResult, McpError> {
+        finish(Ok(collect_maps(&self.inner.repo, a.filter.as_deref())))
+    }
+
+    #[tool(
         description = "Server and strategy status: map/navmesh, match format/phase/scores/roster, \
         and each bot's team, stack, inventory, posture, perceived enemy, item plan, and route head."
     )]
     async fn status(&self) -> Result<CallToolResult, McpError> {
         finish(self.req("status", SHORT).await)
+    }
+
+    #[tool(
+        description = "List the map's bot-goal items (armor, health, weapons, ammo, powerups): each \
+        with its entity origin, whether it's currently available, and the nearest navmesh cell — the \
+        standable point to `goto`, since an item's own origin floats above the floor. Saves deriving \
+        pickup locations from the bsp."
+    )]
+    async fn items(&self) -> Result<CallToolResult, McpError> {
+        finish(self.req("items", SHORT).await)
     }
 
     #[tool(description = "Read a live server cvar as both its exact string and numeric value.")]
