@@ -61,6 +61,9 @@ const GOTO_FINISH_CORRIDOR: f32 = 96.0;
 /// "unreachable even after diverting", the signal a rocket-jump *source* cell can't be stood on.
 const STALL_EPS: f32 = 16.0;
 const STALL_SECS: f32 = 4.0;
+/// Altitude gain that counts as goto progress (resets the stall clock) — a spiral climbs toward a
+/// target above while its XY distance plateaus. Mirrors the bot's own route watchdog `CLIMB_EPS`.
+const GOTO_CLIMB_EPS: f32 = 8.0;
 /// A FlyLink attempt gives up after this long with no touchdown (see `poll_fly`).
 const FLY_TIMEOUT: f32 = 8.0;
 
@@ -409,6 +412,7 @@ fn do_goto(game: &mut GameState, bot: u32, pos: Vec3) -> Result<Resp, String> {
     b.puppet.traj.clear();
     b.puppet.order = Some(ControlOrder::Goto { target: pos });
     b.puppet.best_dist = f32::INFINITY;
+    b.puppet.best_z = f32::NEG_INFINITY;
     b.puppet.best_since = now;
     Ok(Resp::Goto { bot, target: a3(pos) })
 }
@@ -1170,13 +1174,18 @@ fn poll_goto(game: &mut GameState, e: EntId, bot: u32, target: Vec3, now: f32) {
         );
         return;
     }
-    let (best_dist, best_since) = {
+    let (best_dist, best_since, best_z) = {
         let p = &game.entities[e].bot.puppet;
-        (p.best_dist, p.best_since)
+        (p.best_dist, p.best_since, p.best_z)
     };
-    if dxy < best_dist - STALL_EPS {
+    // A climb toward a target above (a spiral staircase) holds XY distance near-constant while
+    // ascending correctly, so gaining altitude counts as progress and keeps the stall clock from
+    // false-tripping on the only way up — mirrors the bot's own route watchdog.
+    let climbed = origin.z > best_z + GOTO_CLIMB_EPS;
+    if dxy < best_dist - STALL_EPS || climbed {
         let p = &mut game.entities[e].bot.puppet;
-        p.best_dist = dxy;
+        p.best_dist = dxy.min(p.best_dist);
+        p.best_z = p.best_z.max(origin.z);
         p.best_since = now;
     } else if now - best_since > STALL_SECS {
         let traj = traj_rows(&std::mem::take(&mut game.entities[e].bot.puppet.traj));

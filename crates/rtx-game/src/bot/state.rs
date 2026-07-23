@@ -553,6 +553,10 @@ pub struct Puppet {
     /// when it last improved. No improvement for a while ⇒ the target is (currently) inaccessible.
     pub best_dist: f32,
     pub best_since: f32,
+    /// Highest altitude the goto seeker has reached — a vertical climb (a spiral to a target above)
+    /// holds XY distance near-constant while ascending correctly, so a rise counts as progress and
+    /// resets the stall clock. Rebased to `-inf` when the goto order is (re)issued.
+    pub best_z: f32,
     /// Per-frame flight trace of a rocket-jump attempt: `(time, origin, velocity)` sampled each frame
     /// (post-move) while a RocketJump order is active, so the harness can compare the *actual* arc to
     /// the offline solve's prediction. Capped and cleared when the attempt's result is emitted.

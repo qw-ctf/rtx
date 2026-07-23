@@ -139,6 +139,34 @@ fn jump_runup_ok(v_xy: Vec2, to_wp: Vec2, dist: f32, frac: f32, maxspeed: f32) -
     v_xy.dot(to_wp.normalize_or_zero()) >= frac * maxspeed
 }
 
+/// How many legs ahead the winding gate looks, and the total heading change (degrees) over them that
+/// counts as "too tight to hop". A straight corridor reads ~0; a spiral staircase's curved treads
+/// read tens of degrees per leg.
+const WINDING_LOOKAHEAD: usize = 4;
+const WINDING_LIMIT: f32 = 60.0;
+
+/// Total absolute heading change (degrees) of the route over the next [`WINDING_LOOKAHEAD`] legs,
+/// measured from `origin` through each leg's target cell. Drives the drop from a bhop to a precise
+/// walk before a tight bend the hop would overshoot (a spiral staircase, a hairpin).
+fn route_turn(graph: &NavGraph, route: &[u32], pos: usize, origin: Vec3) -> f32 {
+    let mut prev = origin.xy();
+    let mut last_dir: Option<Vec2> = None;
+    let mut total = 0.0f32;
+    for &leg in route.iter().skip(pos).take(WINDING_LOOKAHEAD) {
+        let tgt = graph.cell_origin(graph.link_target(leg)).xy();
+        let dir = (tgt - prev).normalize_or_zero();
+        if dir == Vec2::ZERO {
+            continue;
+        }
+        if let Some(prev_dir) = last_dir {
+            total += prev_dir.dot(dir).clamp(-1.0, 1.0).acos();
+        }
+        last_dir = Some(dir);
+        prev = tgt;
+    }
+    total.to_degrees()
+}
+
 pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> SteerOut {
     let SteerCtx {
         s,
@@ -786,12 +814,19 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     };
     let ascent_ahead =
         cur_leg.is_some_and(&leg_ascends) || bot.route.get(bot.route_pos + 1).is_some_and(|&l| leg_ascends(l));
-    let carry =
-        (planned_band >= 1 || bot.route_bands.get(bot.route_pos + 1).copied().unwrap_or(0) >= 1) && !ascent_ahead;
+    // A tightly winding corridor just ahead (the flat, curved treads of a spiral staircase between its
+    // risers, or a hairpin): a hop at full speed overshoots the bend and weaves off the narrow path,
+    // so drop to the walk — its near-field glide tracks the curve. `ascent_ahead` alone misses this,
+    // since the winding legs are flat (no riser); the curvature gate catches them.
+    let winding_ahead = route_turn(graph, &bot.route, bot.route_pos, origin) > WINDING_LIMIT;
+    let carry = (planned_band >= 1 || bot.route_bands.get(bot.route_pos + 1).copied().unwrap_or(0) >= 1)
+        && !ascent_ahead
+        && !winding_ahead;
     let bhop_entry = !final_leg
         && matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
         && (goal_dist > 300.0 || planned_band >= 1)
         && runway_dist >= bhop::RUNWAY_ENGAGE
+        && !winding_ahead
         // Run up first: don't start the hop cycle from a standstill — accelerate on the ground until
         // we're actually moving, then leap into the circle-jump (a human never hops from a stop).
         && speed >= bhop::RUN_UP_SPEED;
@@ -802,7 +837,8 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // hopping and weave off the treads. Drop to the walk, whose near-field glide tracks the steps.
     let bhop_sustain = matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
         && (goal_dist > 150.0 || planned_band >= 1)
-        && !ascent_ahead;
+        && !ascent_ahead
+        && !winding_ahead;
     // Ground zigzag: a corridor too short for a hop ([`bhop::RUNWAY_ENGAGE`]) but straight and long
     // enough ([`bhop::ZIGZAG_ENGAGE`]) to gain speed from the circle-strafe alone. The controller
     // hands off to the hop cycle if `bhop_entry` opens up mid-run, and `bhop_veto` (which includes
