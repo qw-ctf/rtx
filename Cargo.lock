@@ -2643,6 +2643,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtx-demo-tool"
+version = "0.1.0"
+dependencies = [
+ "binrw",
+ "glam",
+ "rtx-proto",
+]
+
+[[package]]
 name = "rtx-game"
 version = "0.1.0"
 dependencies = [
@@ -2679,15 +2688,6 @@ name = "rtx-proto"
 version = "0.1.0"
 dependencies = [
  "glam",
-]
-
-[[package]]
-name = "rtx-qwd-parse"
-version = "0.1.0"
-dependencies = [
- "binrw",
- "glam",
- "rtx-proto",
 ]
 
 [[package]]

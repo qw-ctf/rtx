@@ -1,20 +1,78 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `qwd-dump` — dump position, velocity, and usercmd fields from QuakeWorld `.qwd` demos as CSV.
+//! `qwd` — inspect QuakeWorld `.qwd` demos. Two subcommands:
 //!
-//! A Rust port of the repo's old `qwd_dump.py`, on top of [`rtx_qwd_parse`]. Two modes:
-//! *combined* (default) emits one row per `svc_playerinfo`, pairing it with the matching usercmd —
-//! the frame's own if the server echoed one, else the nearest `dem_cmd` for the local player;
-//! *raw* (`--raw`) emits the `dem_cmd` and `svc_playerinfo` events interleaved by time, plus a
-//! leading `movevars` row.
+//! - `qwd dump` writes position, velocity, and usercmd fields as CSV (the old `qwd_dump.py`
+//!   output): *combined* rows (one per `svc_playerinfo`, paired with its usercmd) by default, or
+//!   `--raw` events interleaved by time with a leading `movevars` row.
+//! - `qwd analyze` prints a per-player movement report — duration, speed, climb, path length, and
+//!   an optional down-sampled waypoint table.
 
 use std::borrow::Cow;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use rtx_demo_tool::analysis::{self, Motion};
+use rtx_demo_tool::{parse_demo, Demo, DemoCmd, Frame};
 use rtx_proto::svc::{self, MoveVars, Usercmd};
-use rtx_qwd_parse::{parse_demo, Demo, DemoCmd, Frame};
+
+const USAGE: &str = "\
+usage: qwd <command> [options] [FILE...]
+
+Inspect QuakeWorld .qwd demos. With no FILE, reads *.qwd in the current directory.
+
+commands:
+  dump      write position/velocity/usercmd fields as CSV
+  analyze   print a per-player movement report
+
+dump options:
+  --raw           emit raw dem_cmd and playerinfo events (plus a movevars row)
+  --player N      restrict to one player slot; defaults to the local player
+  --all-players   include every svc_playerinfo player
+  --no-header     omit the CSV header
+
+analyze options:
+  --player N      one player slot; defaults to the local player
+  --all-players   report every player
+  --waypoints N   also print N evenly-spaced trajectory waypoints (default: none)
+
+  -h, --help      show this help
+";
+
+fn main() -> ExitCode {
+    let mut argv = std::env::args().skip(1);
+    match argv.next().as_deref() {
+        Some("dump") => run_dump(argv),
+        Some("analyze") => run_analyze(argv),
+        None | Some("-h") | Some("--help") => {
+            print!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+        Some(other) => {
+            eprintln!("qwd: unknown command {other:?} (try `qwd --help`)");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Resolve the file list: the given paths, or `*.qwd` in the current directory.
+fn resolve_paths(files: Vec<PathBuf>) -> Vec<PathBuf> {
+    if !files.is_empty() {
+        return files;
+    }
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(".")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("qwd")))
+        .collect();
+    paths.sort();
+    paths
+}
+
+// ── dump ──────────────────────────────────────────────────────────────────────────────────────
 
 /// The combined-mode columns (also the body of every raw row).
 const HEADER: &[&str] = &[
@@ -78,25 +136,53 @@ struct ResolvedCmd {
     cmd: Usercmd,
 }
 
-fn main() -> ExitCode {
-    let args = match Args::parse(std::env::args().skip(1)) {
-        Ok(args) => args,
-        Err(msg) => {
-            eprintln!("qwd-dump: {msg}");
-            return ExitCode::from(2);
-        }
+/// Parsed `qwd dump` options.
+struct DumpArgs {
+    files: Vec<PathBuf>,
+    raw: bool,
+    player: Option<u8>,
+    all_players: bool,
+    no_header: bool,
+    help: bool,
+}
+
+fn run_dump(argv: impl Iterator<Item = String>) -> ExitCode {
+    let mut a = DumpArgs {
+        files: Vec::new(),
+        raw: false,
+        player: None,
+        all_players: false,
+        no_header: false,
+        help: false,
     };
-    if args.help {
+    let mut it = argv;
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--raw" => a.raw = true,
+            "--all-players" => a.all_players = true,
+            "--no-header" => a.no_header = true,
+            "-h" | "--help" => a.help = true,
+            "--player" => match it.next().and_then(|v| v.parse().ok()) {
+                Some(p) => a.player = Some(p),
+                None => return usage_err("--player needs a slot number"),
+            },
+            _ if arg.starts_with("--player=") => match arg["--player=".len()..].parse() {
+                Ok(p) => a.player = Some(p),
+                Err(_) => return usage_err("--player needs a slot number"),
+            },
+            "--" => a.files.extend(it.by_ref().map(PathBuf::from)),
+            _ if arg.starts_with('-') && arg != "-" => return usage_err(&format!("unknown option {arg}")),
+            _ => a.files.push(PathBuf::from(arg)),
+        }
+    }
+    if a.help {
         print!("{USAGE}");
         return ExitCode::SUCCESS;
     }
 
-    let paths = match args.files.is_empty() {
-        true => default_paths(),
-        false => args.files.clone(),
-    };
+    let paths = resolve_paths(a.files);
     if paths.is_empty() {
-        eprintln!("qwd-dump: no .qwd files found");
+        eprintln!("qwd: no .qwd files found");
         return ExitCode::FAILURE;
     }
 
@@ -104,8 +190,8 @@ fn main() -> ExitCode {
     let mut out = BufWriter::new(stdout.lock());
     let mut had_error = false;
 
-    if !args.no_header {
-        let header: Vec<&str> = if args.raw {
+    if !a.no_header {
+        let header: Vec<&str> = if a.raw {
             std::iter::once("event")
                 .chain(HEADER.iter().copied())
                 .chain(MOVEVAR_FIELDS.iter().copied())
@@ -122,20 +208,20 @@ fn main() -> ExitCode {
         let demo = match parse_demo(path) {
             Ok(demo) => demo,
             Err(e) => {
-                eprintln!("qwd-dump: {}: {e}", path.display());
+                eprintln!("qwd: {}: {e}", path.display());
                 had_error = true;
                 continue;
             }
         };
         for w in &demo.warnings {
-            eprintln!("qwd-dump: {}: {w}", path.display());
+            eprintln!("qwd: {}: {w}", path.display());
             had_error = true;
         }
 
-        let rows = if args.raw {
-            raw_rows(&demo, args.player, args.all_players)
+        let rows = if a.raw {
+            raw_rows(&demo, a.player, a.all_players)
         } else {
-            combined_rows(&demo, args.player, args.all_players)
+            combined_rows(&demo, a.player, a.all_players)
         };
         for row in rows {
             let cells: Vec<&str> = row.iter().map(String::as_str).collect();
@@ -150,11 +236,7 @@ fn main() -> ExitCode {
     }
 
     let _ = out.flush();
-    if had_error {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    }
+    exit_code(had_error)
 }
 
 /// Which player's frames to emit: an explicit slot, the local player, or all of them (`None`).
@@ -335,11 +417,6 @@ fn movevar_cells(mv: &MoveVars) -> Vec<String> {
     .collect()
 }
 
-fn basename(path: &Path) -> String {
-    path.file_name()
-        .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
-}
-
 /// Format a float to at most six decimals, trailing zeros (and a bare point) trimmed — matching the
 /// old tool's `fmt_float`, so the CSVs stay comparable.
 fn fmt_float(v: f32) -> String {
@@ -376,76 +453,156 @@ fn csv_escape(s: &str) -> Cow<'_, str> {
     }
 }
 
-/// `*.qwd` in the current directory, sorted — the default when no files are named.
-fn default_paths() -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(".")
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("qwd")))
-        .collect();
-    paths.sort();
-    paths
-}
+// ── analyze ───────────────────────────────────────────────────────────────────────────────────
 
-const USAGE: &str = "\
-usage: qwd-dump [--raw] [--player N | --all-players] [--no-header] [FILE...]
-
-Dump position, velocity, and usercmd fields from QuakeWorld .qwd demos as CSV.
-With no FILE, reads *.qwd in the current directory.
-
-  --raw           emit raw dem_cmd and playerinfo events (plus a movevars row) instead
-                  of combined rows
-  --player N      restrict output to one player slot; defaults to the local player
-  --all-players   include every svc_playerinfo player
-  --no-header     omit the CSV header
-  -h, --help      show this help
-";
-
-/// Parsed command line.
-struct Args {
+/// Parsed `qwd analyze` options.
+struct AnalyzeArgs {
     files: Vec<PathBuf>,
-    raw: bool,
     player: Option<u8>,
     all_players: bool,
-    no_header: bool,
+    waypoints: usize,
     help: bool,
 }
 
-impl Args {
-    fn parse(argv: impl Iterator<Item = String>) -> std::result::Result<Args, String> {
-        let mut args = Args {
-            files: Vec::new(),
-            raw: false,
-            player: None,
-            all_players: false,
-            no_header: false,
-            help: false,
+fn run_analyze(argv: impl Iterator<Item = String>) -> ExitCode {
+    let mut a = AnalyzeArgs {
+        files: Vec::new(),
+        player: None,
+        all_players: false,
+        waypoints: 0,
+        help: false,
+    };
+    let mut it = argv;
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--all-players" => a.all_players = true,
+            "-h" | "--help" => a.help = true,
+            "--player" => match it.next().and_then(|v| v.parse().ok()) {
+                Some(p) => a.player = Some(p),
+                None => return usage_err("--player needs a slot number"),
+            },
+            _ if arg.starts_with("--player=") => match arg["--player=".len()..].parse() {
+                Ok(p) => a.player = Some(p),
+                Err(_) => return usage_err("--player needs a slot number"),
+            },
+            "--waypoints" => match it.next().and_then(|v| v.parse().ok()) {
+                Some(n) => a.waypoints = n,
+                None => return usage_err("--waypoints needs a count"),
+            },
+            _ if arg.starts_with("--waypoints=") => match arg["--waypoints=".len()..].parse() {
+                Ok(n) => a.waypoints = n,
+                Err(_) => return usage_err("--waypoints needs a count"),
+            },
+            "--" => a.files.extend(it.by_ref().map(PathBuf::from)),
+            _ if arg.starts_with('-') && arg != "-" => return usage_err(&format!("unknown option {arg}")),
+            _ => a.files.push(PathBuf::from(arg)),
+        }
+    }
+    if a.help {
+        print!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
+
+    let paths = resolve_paths(a.files);
+    if paths.is_empty() {
+        eprintln!("qwd: no .qwd files found");
+        return ExitCode::FAILURE;
+    }
+
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+    let mut had_error = false;
+
+    for path in &paths {
+        let demo = match parse_demo(path) {
+            Ok(demo) => demo,
+            Err(e) => {
+                eprintln!("qwd: {}: {e}", path.display());
+                had_error = true;
+                continue;
+            }
         };
-        let mut it = argv.peekable();
-        while let Some(arg) = it.next() {
-            match arg.as_str() {
-                "--raw" => args.raw = true,
-                "--all-players" => args.all_players = true,
-                "--no-header" => args.no_header = true,
-                "-h" | "--help" => args.help = true,
-                "--player" => {
-                    let v = it.next().ok_or("--player needs a value")?;
-                    args.player = Some(parse_player(&v)?);
-                }
-                _ if arg.starts_with("--player=") => {
-                    args.player = Some(parse_player(&arg["--player=".len()..])?);
-                }
-                "--" => args.files.extend(it.by_ref().map(PathBuf::from)),
-                _ if arg.starts_with('-') && arg != "-" => return Err(format!("unknown option {arg}")),
-                _ => args.files.push(PathBuf::from(arg)),
+        for w in &demo.warnings {
+            eprintln!("qwd: {}: {w}", path.display());
+            had_error = true;
+        }
+
+        let players = if a.all_players {
+            analysis::players(&demo)
+        } else {
+            vec![a.player.or(demo.local_player).unwrap_or(0)]
+        };
+        let _ = writeln!(out, "{}", basename(&demo.path));
+        for p in players {
+            if report_player(&mut out, &demo, p, a.waypoints).is_err() {
+                return exit_code(had_error);
             }
         }
-        Ok(args)
     }
+
+    let _ = out.flush();
+    exit_code(had_error)
 }
 
-fn parse_player(s: &str) -> std::result::Result<u8, String> {
-    s.parse::<u8>().map_err(|_| format!("invalid --player value {s:?}"))
+/// Print one player's movement report: the summary block, then an optional waypoint table.
+fn report_player(out: &mut impl Write, demo: &Demo, player: u8, waypoints: usize) -> io::Result<()> {
+    let track = analysis::track(demo, player);
+    let s = track.summary();
+    if s.frames == 0 {
+        return writeln!(out, "  player {player}: no frames");
+    }
+    writeln!(out, "  player {player}: {} frames over {:.2}s", s.frames, s.duration)?;
+    writeln!(
+        out,
+        "    start ({:.0}, {:.0}, {:.0})  ->  end ({:.0}, {:.0}, {:.0})   climb {:+.0}",
+        s.start.x, s.start.y, s.start.z, s.end.x, s.end.y, s.end.z, s.height_gain,
+    )?;
+    writeln!(
+        out,
+        "    horizontal speed: peak {:.0}  mean {:.0} ups   path {:.0}u   z {:.0}..{:.0}",
+        s.peak_speed, s.mean_speed, s.path_length, s.min_z, s.max_z,
+    )?;
+    if waypoints >= 2 {
+        writeln!(out, "    waypoints (t  x  y  z  hspeed  vspeed):")?;
+        let t0 = track.motions.first().map_or(0.0, |m| m.time);
+        for Motion {
+            time,
+            origin,
+            horizontal_speed,
+            vertical_speed,
+        } in track.waypoints(waypoints)
+        {
+            writeln!(
+                out,
+                "      {:6.2}  {:6.0} {:6.0} {:6.0}   {:5.0}  {:+5.0}",
+                time - t0,
+                origin.x,
+                origin.y,
+                origin.z,
+                horizontal_speed,
+                vertical_speed,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+// ── shared ────────────────────────────────────────────────────────────────────────────────────
+
+fn basename(path: &Path) -> String {
+    path.file_name()
+        .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
+}
+
+fn usage_err(msg: &str) -> ExitCode {
+    eprintln!("qwd: {msg}");
+    ExitCode::from(2)
+}
+
+fn exit_code(had_error: bool) -> ExitCode {
+    if had_error {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }

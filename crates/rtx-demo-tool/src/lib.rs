@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `rtx-qwd-parse` — read QuakeWorld `.qwd` demo files for their movement data.
+//! `rtx-demo-tool` — read and analyze QuakeWorld demo files (`.qwd` today).
 //!
 //! A `.qwd` is a flat log of timestamped records: the local client's own `dem_cmd` inputs, the
 //! `dem_read` server→client packets it received, and `dem_set` bookkeeping. The records are the
@@ -8,9 +8,10 @@
 //! messages inside it are decoded by [`rtx_proto::svc`], the same codec the live client speaks.
 //! So the split is clean: [`binrw`] reads the fixed demo framing here, `rtx-proto` reads the wire.
 //!
-//! A Rust port of the repo's old `qwd_dump.py`. The `qwd-dump` binary reproduces its CSV; this
-//! library is the reusable half — [`parse_demo`] hands back the per-frame [`Frame`]s and the local
-//! player's [`DemoCmd`]s, and the caller decides what to do with them.
+//! [`parse_demo`] hands back the per-frame [`Frame`]s and the local player's [`DemoCmd`]s; the
+//! [`analysis`] module turns those into per-player motion [`Track`](analysis::Track)s (position and
+//! speed over time) with summary stats. The `qwd` binary is the CLI over both: `qwd dump` emits the
+//! CSV the old `qwd_dump.py` did, `qwd analyze` prints a movement report.
 
 use std::io::{Cursor, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -19,6 +20,10 @@ use binrw::{BinRead, BinReaderExt};
 use glam::Vec3;
 use rtx_proto::protocol::ProtoState;
 use rtx_proto::svc::{self, MoveVars, PlayerInfo, SvcEvent, Usercmd};
+
+pub mod analysis;
+
+pub use analysis::{Motion, Summary, Track};
 
 /// Demo record kinds (`dem_*`), the one-byte tag after each record's float timestamp.
 mod dem {
