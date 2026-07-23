@@ -1,0 +1,17 @@
+[package]
+name = "rtx-qwd-parse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "rtx_qwd_parse"
+
+# The demo container is binrw-declarative framing; the messages *inside* each `dem_read` block are a
+# recorded server→client packet, so `rtx-proto`'s svc parser decodes them — this crate never
+# reimplements the wire protocol.
+[dependencies]
+rtx-proto.workspace = true
+binrw.workspace = true
+glam.workspace = true
