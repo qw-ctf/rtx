@@ -3,9 +3,12 @@
 An MCP (stdio) server that lets Claude Code drive rtx bots through scripted rocket-jump tests and
 tune the driver knobs, without hand-flying bots in a live server.
 
-```
-Claude Code ──MCP stdio──▶ rtx-mcp ──TCP 127.0.0.1:port──▶ control.rs in librtx.dylib
-                             └─ spawns/kills playground/mvdsv (+exec rjtest.cfg)
+```mermaid
+flowchart LR
+  cc["Claude Code"] -->|MCP stdio| mcp["rtx-mcp"]
+  mcp -->|"TCP 127.0.0.1:port"| ctl["control.rs<br/>(in librtx.dylib)"]
+  mcp -.->|"spawns / kills,<br/>exec rjtest.cfg"| mvdsv["playground/mvdsv"]
+  mvdsv -. loads .-> ctl
 ```
 
 ## Pieces
