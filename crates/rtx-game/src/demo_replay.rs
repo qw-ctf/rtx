@@ -417,6 +417,8 @@ fn bot_matches_or_beats_human() {
                     dt: DT,
                     accel: p.accel,
                     maxspeed: p.maxspeed,
+                    friction: p.friction,
+                    stopspeed: p.stopspeed,
                     profile: crate::bot::human_profile::HumanMovementProfile::legacy(),
                 };
                 let mut pos = Vec3::ZERO;

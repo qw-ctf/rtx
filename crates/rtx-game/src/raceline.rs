@@ -170,6 +170,8 @@ pub fn rollout(bsp: &Bsp, line: &RaceLine, nodes: &[RaceRouteNode], pm: &PmParam
         dt: DT,
         accel: pm.accel,
         maxspeed: pm.maxspeed,
+        friction: pm.friction,
+        stopspeed: pm.stopspeed,
         profile: crate::bot::human_profile::HumanMovementProfile::legacy(),
     };
     let start_dir = (line.points[1].pos - line.points[0].pos).xy().normalize_or_zero();

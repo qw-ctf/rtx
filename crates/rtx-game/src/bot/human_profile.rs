@@ -19,12 +19,42 @@ pub(crate) struct HumanMovementProfile {
     pub lobe_deadband: f32,
     pub error_gain: f32,
     pub zigzag_band_cap: f32,
+    /// Reverse at three fixed phases of each hop instead of heading-error hysteresis.
+    pub phase_locked_flips: bool,
 }
 
 impl HumanMovementProfile {
-    /// Reviewed strict-v2 baseline. Values are deliberately bounded and remain independent of
-    /// any individual player's trace; update this table only from an offline calibration report.
+    /// Reviewed strict-v2-compatible baseline. Values deliberately preserve the established
+    /// movement behavior while remaining bounded and independent of any individual player's trace;
+    /// update this table only from an aggregate offline calibration report.
     pub(crate) const fn calibrated() -> Self {
+        Self {
+            // A sustained straightaway has already passed the route/open-space gates. Enter on the
+            // first eligible frame so the finite runway is spent accelerating, not waiting.
+            engage_delay: 0.0,
+            // Accepted QWD movement samples put ordinary sustained travel around 420–625 ups;
+            // launch at the lower-middle of that band instead of the old 450 ups baseline.
+            prestrafe_target: 475.0,
+            prestrafe_max_t: 1.2,
+            prestrafe_min_runway: 512.0,
+            launch_min_frac: 1.0,
+            wall_hold_frac: 0.7,
+            hop_margin: 64.0,
+            // Dedicated 600+ ups QWD bunny runs use full-magnitude, near-perpendicular pure-side
+            // commands on 98–100% of moving samples. Request the physical maximum air-turn rate;
+            // `strafe_rate` still clamps this to what the current speed/tick can deliver.
+            omega_base: 720.0,
+            // Max-gain strafes curve harder than the prior gentle lobes. The high-speed phase
+            // scheduler makes three reversals per hop; this remains the fallback/error scale.
+            lobe_deadband: 29.0,
+            error_gain: 6.0,
+            zigzag_band_cap: 15.0,
+            phase_locked_flips: true,
+        }
+    }
+
+    /// Legacy policy values, retained for deterministic A/B comparisons.
+    pub(crate) const fn legacy() -> Self {
         Self {
             engage_delay: 0.15,
             prestrafe_target: 450.0,
@@ -37,12 +67,8 @@ impl HumanMovementProfile {
             lobe_deadband: 34.0,
             error_gain: 6.0,
             zigzag_band_cap: 15.0,
+            phase_locked_flips: false,
         }
-    }
-
-    /// Legacy policy values, retained for deterministic A/B comparisons.
-    pub(crate) const fn legacy() -> Self {
-        Self::calibrated()
     }
 
     pub(crate) fn safe(self) -> Self {
@@ -58,6 +84,24 @@ impl HumanMovementProfile {
             lobe_deadband: self.lobe_deadband.clamp(1.0, 90.0),
             error_gain: self.error_gain.clamp(0.0, 30.0),
             zigzag_band_cap: self.zigzag_band_cap.clamp(0.0, 45.0),
+            phase_locked_flips: self.phase_locked_flips,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HumanMovementProfile;
+
+    #[test]
+    fn legacy_profile_is_a_real_ab_baseline() {
+        let calibrated = HumanMovementProfile::calibrated();
+        let legacy = HumanMovementProfile::legacy();
+        assert_ne!(legacy, calibrated);
+        assert!(!legacy.phase_locked_flips);
+        assert!(calibrated.phase_locked_flips);
+        assert_eq!(legacy.prestrafe_target, 450.0);
+        assert_eq!(legacy.omega_base, 140.0);
+        assert_eq!(legacy.lobe_deadband, 34.0);
     }
 }

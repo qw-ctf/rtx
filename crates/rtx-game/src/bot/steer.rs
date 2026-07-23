@@ -960,10 +960,14 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         let dt = frametime.clamp(0.001, 0.05);
         let accel = host.cvar(c"sv_accelerate");
         let maxspeed = host.cvar(c"sv_maxspeed");
+        let friction = host.cvar(c"sv_friction");
+        let stopspeed = host.cvar(c"sv_stopspeed");
         let env = bhop::Env {
             dt,
             accel: if accel > 0.0 { accel } else { 10.0 },
             maxspeed: if maxspeed > 0.0 { maxspeed } else { 320.0 },
+            friction: if friction > 0.0 { friction } else { 4.0 },
+            stopspeed: if stopspeed > 0.0 { stopspeed } else { 100.0 },
             profile: crate::bot::human_profile::HumanMovementProfile::calibrated().safe(),
         };
         // A committed speed jump aims at its gap; otherwise steer toward the racing-line look-ahead
