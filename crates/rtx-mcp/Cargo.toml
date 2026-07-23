@@ -19,3 +19,7 @@ rmcp = { version = "2.2", features = ["server", "macros", "transport-io"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The typed control-protocol schema + msgpack codec shared with the game (`rtx-ctlproto`); the MCP
+# decodes typed replies and re-serialises them as JSON for Claude.
+rtx-ctlproto = { workspace = true }
+rmp-serde = { workspace = true }

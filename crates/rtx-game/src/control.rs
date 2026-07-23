@@ -10,27 +10,30 @@
 //!
 //! ## Threading
 //! The engine drives this module single-threaded from the frame calls, so every `GameState` mutation
-//! stays on that thread. The socket work is pushed to background threads that only shuttle raw
-//! `String` lines through `mpsc` channels — the exact shape as the navmesh build worker
+//! stays on that thread. The socket work is pushed to background threads that only shuttle raw wire
+//! frames through `mpsc` channels — the exact shape as the navmesh build worker
 //! ([`crate::nav_build`]): a listener thread accepts connections, a per-connection reader thread feeds
-//! inbound lines to [`ControlState::lines_rx`], and a writer thread drains outbound JSON to the
-//! current client. Commands are parsed and executed, and events emitted, entirely inside
+//! inbound request frames to [`ControlState::requests_rx`], and a writer thread drains outbound frames
+//! to the current client. Requests are decoded and executed, and events emitted, entirely inside
 //! [`frame_begin`]/[`frame_end`] under the frame's `&mut GameState`. No lock is ever held over game
 //! state; the only shared state between threads is the raw socket and the channels.
 //!
 //! ## Protocol
-//! Inbound: newline-delimited text, `<id> <verb> [args…]`, `id` a caller-chosen integer echoed back.
-//! Outbound: newline-delimited hand-emitted JSON (the game crate stays dependency-free). A reply is
-//! `{"id":N,"ok":true,"data":{…}}` / `{"id":N,"ok":false,"error":"…"}`; an unsolicited lifecycle
-//! event is `{"ev":"arrived"|"goto_stall"|"rj_result",…}`. A single outbound channel gives total
-//! ordering; the client demuxes on the presence of `id` vs `ev`.
+//! Framed [msgpack] of the typed [`rtx_ctlproto`] schema (`[u32 LE len][payload]`). Inbound is a
+//! [`Request`] (`id` + [`Cmd`]); outbound is a [`Msg`] — a `Reply { id, Result<Resp, String> }`
+//! correlated to the request, or an async [`Event`] (`arrived` / `goto_stall` / `rj_result` /
+//! `fly_result`). A single outbound channel gives total ordering; the client demuxes on the `Msg`
+//! variant. The MCP re-serialises the typed values as JSON for Claude.
+//!
+//! [msgpack]: https://msgpack.org/
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use glam::{Vec3, Vec3Swizzles};
+use rtx_ctlproto::{self as proto, Cmd, Event, Msg, Request, Resp};
 
 use crate::bot::goals::is_goal_classname;
 use crate::bot::state::{ControlOrder, HookState, RjOutcome, RjState, RjTelemetry};
@@ -65,10 +68,12 @@ const FLY_TIMEOUT: f32 = 8.0;
 pub(crate) struct ControlState {
     /// Whether the listener has been (attempted to be) bound. Set once, so a bind is tried at most once.
     started: bool,
-    /// Inbound command lines from the current connection (drained each frame in [`frame_begin`]).
-    lines_rx: Option<Receiver<String>>,
-    /// Outbound JSON lines (replies + events). The writer thread owns the receiving half.
-    events_tx: Option<Sender<String>>,
+    /// Inbound raw request frames from the current connection (decoded and drained each frame in
+    /// [`frame_begin`]). Kept as bytes, not decoded [`Request`]s, so a malformed frame is answered with
+    /// an error reply on the engine thread rather than silently dropped by the reader thread.
+    requests_rx: Option<Receiver<Vec<u8>>>,
+    /// Outbound encoded [`Msg`] frames (replies + events). The writer thread owns the receiving half.
+    out_tx: Option<Sender<Vec<u8>>>,
 }
 
 /// Frame prologue: lazily bind the listener once the port cvar is set, then drain and execute every
@@ -81,12 +86,15 @@ pub(crate) fn frame_begin(game: &mut GameState) {
             start_listener(game, p as u16);
         }
     }
-    let lines: Vec<String> = match game.control.lines_rx.as_ref() {
+    let frames: Vec<Vec<u8>> = match game.control.requests_rx.as_ref() {
         Some(rx) => rx.try_iter().collect(),
         None => return,
     };
-    for line in lines {
-        exec_line(game, &line);
+    for frame in frames {
+        match proto::decode::<Request>(&frame) {
+            Ok(req) => exec_request(game, req),
+            Err(e) => reply(game, 0, Err(format!("bad request frame: {e}"))),
+        }
     }
 }
 
@@ -94,7 +102,7 @@ pub(crate) fn frame_begin(game: &mut GameState) {
 /// frame (arrival / stall for a goto, the terminal telemetry for a rocket jump). Runs after
 /// `run_bots` so it sees the post-frame bot state the driver just wrote.
 pub(crate) fn frame_end(game: &mut GameState) {
-    if game.control.events_tx.is_none() {
+    if game.control.out_tx.is_none() {
         return; // channel never came up — nothing to emit
     }
     let now = game.time();
@@ -152,23 +160,23 @@ fn start_listener(game: &mut GameState, port: u16) {
             return;
         }
     };
-    let (lines_tx, lines_rx) = std::sync::mpsc::channel::<String>();
-    let (events_tx, events_rx) = std::sync::mpsc::channel::<String>();
+    let (requests_tx, requests_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (out_tx, out_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     // The single write-half slot the writer thread drains and the listener thread replaces on each new
-    // connection. `Option` so a dropped client leaves it empty and outbound lines are simply discarded.
+    // connection. `Option` so a dropped client leaves it empty and outbound frames are simply discarded.
     let slot: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
     let wslot = slot.clone();
-    std::thread::spawn(move || writer_loop(events_rx, wslot));
-    std::thread::spawn(move || listener_loop(listener, lines_tx, slot));
-    game.control.lines_rx = Some(lines_rx);
-    game.control.events_tx = Some(events_tx);
+    std::thread::spawn(move || writer_loop(out_rx, wslot));
+    std::thread::spawn(move || listener_loop(listener, requests_tx, slot));
+    game.control.requests_rx = Some(requests_rx);
+    game.control.out_tx = Some(out_tx);
     game.host
         .conprint(&cstring(&format!("rtx: control: listening on 127.0.0.1:{port}\n")));
 }
 
 /// Accept loop: each new connection replaces the write-half slot (one client at a time — a fresh
-/// connection supersedes a stale one) and gets its own reader thread feeding inbound lines.
-fn listener_loop(listener: TcpListener, lines_tx: Sender<String>, slot: Arc<Mutex<Option<TcpStream>>>) {
+/// connection supersedes a stale one) and gets its own reader thread feeding inbound request frames.
+fn listener_loop(listener: TcpListener, requests_tx: Sender<Vec<u8>>, slot: Arc<Mutex<Option<TcpStream>>>) {
     for stream in listener.incoming().flatten() {
         let _ = stream.set_nodelay(true);
         if let Ok(wr) = stream.try_clone() {
@@ -176,30 +184,31 @@ fn listener_loop(listener: TcpListener, lines_tx: Sender<String>, slot: Arc<Mute
                 *g = Some(wr);
             }
         }
-        let tx = lines_tx.clone();
+        let tx = requests_tx.clone();
         std::thread::spawn(move || {
-            for line in BufReader::new(stream).lines() {
-                match line {
-                    Ok(l) => {
-                        if tx.send(l).is_err() {
+            let mut stream = stream;
+            loop {
+                match proto::read_frame(&mut stream) {
+                    Ok(Some(frame)) => {
+                        if tx.send(frame).is_err() {
                             break; // game side gone
                         }
                     }
-                    Err(_) => break, // connection dropped
+                    Ok(None) | Err(_) => break, // clean EOF or connection dropped
                 }
             }
         });
     }
 }
 
-/// Writer loop: drain outbound JSON lines to the current client. With no client connected the line is
-/// dropped (the backpressure policy — events are low-rate and a reconnecting client resyncs via
-/// `status`); a write error clears the slot until a new connection lands.
-fn writer_loop(events_rx: Receiver<String>, slot: Arc<Mutex<Option<TcpStream>>>) {
-    while let Ok(line) = events_rx.recv() {
+/// Writer loop: drain outbound msgpack frames to the current client. With no client connected the
+/// frame is dropped (the backpressure policy — events are low-rate and a reconnecting client resyncs
+/// via `status`); a write error clears the slot until a new connection lands.
+fn writer_loop(out_rx: Receiver<Vec<u8>>, slot: Arc<Mutex<Option<TcpStream>>>) {
+    while let Ok(frame) = out_rx.recv() {
         let Ok(mut g) = slot.lock() else { continue };
         if let Some(stream) = g.as_mut() {
-            if stream.write_all(line.as_bytes()).is_err() || stream.write_all(b"\n").is_err() {
+            if stream.write_all(&frame).is_err() {
                 *g = None;
             } else {
                 let _ = stream.flush();
@@ -208,303 +217,17 @@ fn writer_loop(events_rx: Receiver<String>, slot: Arc<Mutex<Option<TcpStream>>>)
     }
 }
 
-/// Queue one outbound JSON line (reply or event). A no-op when the channel is down.
-fn send(game: &GameState, line: String) {
-    if let Some(tx) = game.control.events_tx.as_ref() {
-        let _ = tx.send(line);
+/// Queue one outbound [`Msg`] (reply or event), encoded to a wire frame. A no-op when the channel is
+/// down.
+fn send_msg(game: &GameState, msg: Msg) {
+    if let Some(tx) = game.control.out_tx.as_ref() {
+        let _ = tx.send(proto::to_frame(&msg));
     }
 }
 
-// --- inbound command grammar (pure parse, unit-tested) ---
-
-/// One parsed control command (see the module protocol docs). The wire `id` is threaded separately.
-#[derive(Debug, PartialEq)]
-enum ControlCmd {
-    Status,
-    MatchStart,
-    Links,
-    /// List the map's bot-goal items (armor/health/weapons/ammo/powerups): entity origin, whether
-    /// it's currently on the floor, and the nearest navmesh cell (the standable `goto` target).
-    Items,
-    Prep {
-        bot: u32,
-        health: f32,
-        rockets: f32,
-    },
-    Teleport {
-        bot: u32,
-        pos: Vec3,
-    },
-    Goto {
-        bot: u32,
-        pos: Vec3,
-    },
-    Rj {
-        bot: u32,
-        link: u32,
-    },
-    /// Fly a non-RJ link (e.g. a planted speed/curl jump) via the normal steer/bhop path. Reports a
-    /// `fly_result` with the takeoff speed and landing measurement.
-    Fly {
-        bot: u32,
-        link: u32,
-    },
-    Hold {
-        bot: u32,
-    },
-    Stop {
-        bot: u32,
-    },
-    Set {
-        name: String,
-        value: String,
-    },
-    Get {
-        name: String,
-    },
-    Cmd {
-        raw: String,
-    },
-    /// Inspect the navmesh cell nearest a world point: its origin and every link in/out, by kind.
-    Cell {
-        pos: Vec3,
-    },
-    /// Dump a bot's current A* route: each leg's index, kind, source and target.
-    Route {
-        bot: u32,
-    },
-    /// Dump a bot's `rtx_bot_debug` audit ring buffer — the last `lines` diagnostic lines,
-    /// oldest-first (default 200). The trace is captured full-rate in memory (no console spam); this
-    /// reads it back. See [`crate::bot::state::Audit`].
-    Audit {
-        bot: u32,
-        lines: usize,
-    },
-    /// List every generated curl link (a SpeedJump with `curl_gain > 0`): index, from, takeoff, target,
-    /// v_req, gain — for verifying which gaps the build's curl certifier covered.
-    Curls,
-    /// Probe the build-time curl certifier from `takeoff` along `psi0`° with the speed `runway` delivers,
-    /// onto `tgt`: reports predicted takeoff speed, whether the envelope certifies, and per-gain landings.
-    Probe {
-        takeoff: Vec3,
-        tgt: Vec3,
-        psi0: f32,
-        runway: f32,
-    },
-    /// Search (offline pmove sim, live BSP) for a speed-curl jump from a source to a target world
-    /// point — the M2 curl-jump solver, validated live. Returns the best (v0, launch heading, gain).
-    Curl {
-        src: Vec3,
-        tgt: Vec3,
-    },
-    /// Hand-plant a `SpeedJump` link (harness bring-up): a self-contained speed jump from the cell
-    /// nearest `from` (the run-up start), taking off at `takeoff` (the lip), to the cell nearest `tgt`,
-    /// requiring `v_req` ups at the lip. Lets us fly the takeoff regime before the generator emits it.
-    PlanLink {
-        from: Vec3,
-        takeoff: Vec3,
-        tgt: Vec3,
-        v_req: f32,
-    },
-}
-
-/// Split the first whitespace-delimited token off `s`, returning `(token, rest)` with `rest` trimmed
-/// of leading whitespace. `("", "")` for an all-whitespace input.
-fn split_first(s: &str) -> (&str, &str) {
-    let s = s.trim_start();
-    match s.find(char::is_whitespace) {
-        Some(i) => (&s[..i], s[i..].trim_start()),
-        None => (s, ""),
-    }
-}
-
-fn parse_u32(tok: Option<&str>, what: &str) -> Result<u32, String> {
-    tok.ok_or_else(|| format!("missing {what}"))?
-        .parse::<u32>()
-        .map_err(|_| format!("bad {what}"))
-}
-
-fn parse_f32(tok: Option<&str>, what: &str) -> Result<f32, String> {
-    tok.ok_or_else(|| format!("missing {what}"))?
-        .parse::<f32>()
-        .map_err(|_| format!("bad {what}"))
-}
-
-fn parse_bot_vec3(rest: &str) -> Result<(u32, Vec3), String> {
-    let mut t = rest.split_whitespace();
-    let bot = parse_u32(t.next(), "bot")?;
-    let x = parse_f32(t.next(), "x")?;
-    let y = parse_f32(t.next(), "y")?;
-    let z = parse_f32(t.next(), "z")?;
-    Ok((bot, Vec3::new(x, y, z)))
-}
-
-/// Parse one inbound line into `(id, command)`. Pure — no game state — so it unit-tests standalone.
-fn parse_line(line: &str) -> Result<(i64, ControlCmd), String> {
-    let (id_tok, r1) = split_first(line.trim());
-    if id_tok.is_empty() {
-        return Err("empty line".into());
-    }
-    let id: i64 = id_tok.parse().map_err(|_| format!("bad id '{id_tok}'"))?;
-    let (verb, rest) = split_first(r1);
-    let cmd = match verb {
-        "status" => ControlCmd::Status,
-        "match_start" => ControlCmd::MatchStart,
-        "links" => ControlCmd::Links,
-        "items" => ControlCmd::Items,
-        "prep" => {
-            let mut t = rest.split_whitespace();
-            let bot = parse_u32(t.next(), "bot")?;
-            let health = t
-                .next()
-                .map(|s| s.parse::<f32>())
-                .transpose()
-                .map_err(|_| "bad health")?
-                .unwrap_or(100.0);
-            let rockets = t
-                .next()
-                .map(|s| s.parse::<f32>())
-                .transpose()
-                .map_err(|_| "bad rockets")?
-                .unwrap_or(10.0);
-            ControlCmd::Prep { bot, health, rockets }
-        }
-        "teleport" => {
-            let (bot, pos) = parse_bot_vec3(rest)?;
-            ControlCmd::Teleport { bot, pos }
-        }
-        "goto" => {
-            let (bot, pos) = parse_bot_vec3(rest)?;
-            ControlCmd::Goto { bot, pos }
-        }
-        "rj" => {
-            let mut t = rest.split_whitespace();
-            let bot = parse_u32(t.next(), "bot")?;
-            let link = parse_u32(t.next(), "link")?;
-            ControlCmd::Rj { bot, link }
-        }
-        "fly" => {
-            let mut t = rest.split_whitespace();
-            let bot = parse_u32(t.next(), "bot")?;
-            let link = parse_u32(t.next(), "link")?;
-            ControlCmd::Fly { bot, link }
-        }
-        "hold" => ControlCmd::Hold {
-            bot: parse_u32(rest.split_whitespace().next(), "bot")?,
-        },
-        "stop" => ControlCmd::Stop {
-            bot: parse_u32(rest.split_whitespace().next(), "bot")?,
-        },
-        "set" => {
-            let (name, value) = split_first(rest);
-            if name.is_empty() {
-                return Err("set: missing cvar".into());
-            }
-            ControlCmd::Set {
-                name: name.to_string(),
-                value: value.to_string(),
-            }
-        }
-        "get" => {
-            let (name, _) = split_first(rest);
-            if name.is_empty() {
-                return Err("get: missing cvar".into());
-            }
-            ControlCmd::Get { name: name.to_string() }
-        }
-        "cmd" => {
-            if rest.is_empty() {
-                return Err("cmd: missing command".into());
-            }
-            ControlCmd::Cmd { raw: rest.to_string() }
-        }
-        "cell" => {
-            let mut t = rest.split_whitespace();
-            let x = parse_f32(t.next(), "x")?;
-            let y = parse_f32(t.next(), "y")?;
-            let z = parse_f32(t.next(), "z")?;
-            ControlCmd::Cell {
-                pos: Vec3::new(x, y, z),
-            }
-        }
-        "route" => ControlCmd::Route {
-            bot: parse_u32(rest.split_whitespace().next(), "bot")?,
-        },
-        "audit" => {
-            let mut t = rest.split_whitespace();
-            let bot = parse_u32(t.next(), "bot")?;
-            let lines = t
-                .next()
-                .map(|s| s.parse::<usize>())
-                .transpose()
-                .map_err(|_| "bad lines")?
-                .unwrap_or(200);
-            ControlCmd::Audit { bot, lines }
-        }
-        "curls" => ControlCmd::Curls,
-        "probe" => {
-            let mut t = rest.split_whitespace();
-            let takeoff = Vec3::new(
-                parse_f32(t.next(), "ox")?,
-                parse_f32(t.next(), "oy")?,
-                parse_f32(t.next(), "oz")?,
-            );
-            let tgt = Vec3::new(
-                parse_f32(t.next(), "tx")?,
-                parse_f32(t.next(), "ty")?,
-                parse_f32(t.next(), "tz")?,
-            );
-            let psi0 = parse_f32(t.next(), "psi0")?;
-            let runway = parse_f32(t.next(), "runway")?;
-            ControlCmd::Probe {
-                takeoff,
-                tgt,
-                psi0,
-                runway,
-            }
-        }
-        "curl" => {
-            let mut t = rest.split_whitespace();
-            let src = Vec3::new(
-                parse_f32(t.next(), "sx")?,
-                parse_f32(t.next(), "sy")?,
-                parse_f32(t.next(), "sz")?,
-            );
-            let tgt = Vec3::new(
-                parse_f32(t.next(), "tx")?,
-                parse_f32(t.next(), "ty")?,
-                parse_f32(t.next(), "tz")?,
-            );
-            ControlCmd::Curl { src, tgt }
-        }
-        "planlink" => {
-            let mut t = rest.split_whitespace();
-            let from = Vec3::new(
-                parse_f32(t.next(), "fx")?,
-                parse_f32(t.next(), "fy")?,
-                parse_f32(t.next(), "fz")?,
-            );
-            let takeoff = Vec3::new(
-                parse_f32(t.next(), "ox")?,
-                parse_f32(t.next(), "oy")?,
-                parse_f32(t.next(), "oz")?,
-            );
-            let tgt = Vec3::new(
-                parse_f32(t.next(), "tx")?,
-                parse_f32(t.next(), "ty")?,
-                parse_f32(t.next(), "tz")?,
-            );
-            let v_req = parse_f32(t.next(), "v_req")?;
-            ControlCmd::PlanLink {
-                from,
-                takeoff,
-                tgt,
-                v_req,
-            }
-        }
-        other => return Err(format!("unknown verb '{other}'")),
-    };
-    Ok((id, cmd))
+/// Queue one async lifecycle [`Event`].
+fn send_event(game: &GameState, ev: Event) {
+    send_msg(game, Msg::Event(ev));
 }
 
 /// Whether a cvar name is safe to splice into a `set` localcmd (guards the console tokenizer): a
@@ -515,65 +238,64 @@ fn valid_cvar_name(name: &str) -> bool {
 
 // --- command execution (engine thread, &mut GameState) ---
 
-fn exec_line(game: &mut GameState, line: &str) {
-    match parse_line(line) {
-        Ok((id, cmd)) => exec_cmd(game, id, cmd),
-        Err(e) => reply_err(game, 0, &e),
-    }
+/// A wire position (`[x, y, z]`) as a `glam::Vec3`.
+fn v3(a: proto::Vec3) -> Vec3 {
+    Vec3::from_array(a)
 }
 
-fn exec_cmd(game: &mut GameState, id: i64, cmd: ControlCmd) {
-    let result: Result<String, String> = match cmd {
-        ControlCmd::Status => Ok(status_json(game)),
-        ControlCmd::MatchStart => {
+/// A `glam::Vec3` as a wire position (`[x, y, z]`).
+fn a3(v: Vec3) -> proto::Vec3 {
+    v.to_array()
+}
+
+/// Execute one decoded request on the engine thread and send its typed reply.
+fn exec_request(game: &mut GameState, req: Request) {
+    let Request { id, cmd } = req;
+    let result: Result<Resp, String> = match cmd {
+        Cmd::Status => Ok(Resp::Status(Box::new(status_resp(game)))),
+        Cmd::MatchStart => {
             crate::mode::team::start_match(game);
-            Ok("{\"queued\":true}".to_string())
+            Ok(Resp::Queued)
         }
-        ControlCmd::Links => links_json(game),
-        ControlCmd::Items => items_json(game),
-        ControlCmd::Prep { bot, health, rockets } => do_prep(game, bot, health, rockets),
-        ControlCmd::Teleport { bot, pos } => do_teleport(game, bot, pos),
-        ControlCmd::Goto { bot, pos } => do_goto(game, bot, pos),
-        ControlCmd::Rj { bot, link } => do_rj(game, bot, link),
-        ControlCmd::Fly { bot, link } => do_fly(game, bot, link),
-        ControlCmd::Hold { bot } => do_order(game, bot, ControlOrder::Hold),
-        ControlCmd::Stop { bot } => do_stop(game, bot),
-        ControlCmd::Set { name, value } => do_set(game, &name, &value),
-        ControlCmd::Get { name } => do_get(game, &name),
-        ControlCmd::Cmd { raw } => {
+        Cmd::Links => links_resp(game).map(Resp::Links),
+        Cmd::Items => items_resp(game).map(Resp::Items),
+        Cmd::Prep { bot, health, rockets } => do_prep(game, bot, health, rockets),
+        Cmd::Teleport { bot, pos } => do_teleport(game, bot, v3(pos)),
+        Cmd::Goto { bot, pos } => do_goto(game, bot, v3(pos)),
+        Cmd::Rj { bot, link } => do_rj(game, bot, link),
+        Cmd::Fly { bot, link } => do_fly(game, bot, link),
+        Cmd::Hold { bot } => do_order(game, bot, ControlOrder::Hold),
+        Cmd::Stop { bot } => do_stop(game, bot),
+        Cmd::Set { name, value } => do_set(game, &name, &value),
+        Cmd::Get { name } => do_get(game, &name),
+        Cmd::RunCmd { raw } => {
             game.host.localcmd(&raw);
-            Ok("{\"queued\":true}".to_string())
+            Ok(Resp::Queued)
         }
-        ControlCmd::Cell { pos } => cell_json(game, pos),
-        ControlCmd::Route { bot } => route_json(game, bot),
-        ControlCmd::Audit { bot, lines } => audit_json(game, bot, lines),
-        ControlCmd::Curls => curls_json(game),
-        ControlCmd::Probe {
+        Cmd::Cell { pos } => cell_resp(game, v3(pos)).map(Resp::Cell),
+        Cmd::Route { bot } => route_resp(game, bot).map(Resp::Route),
+        Cmd::Audit { bot, lines } => audit_resp(game, bot, lines as usize).map(Resp::Audit),
+        Cmd::Curls => curls_resp(game).map(Resp::Curls),
+        Cmd::Probe {
             takeoff,
             tgt,
             psi0,
             runway,
-        } => probe_json(game, takeoff, tgt, psi0, runway),
-        ControlCmd::Curl { src, tgt } => curl_json(game, src, tgt),
-        ControlCmd::PlanLink {
+        } => probe_resp(game, v3(takeoff), v3(tgt), psi0, runway).map(Resp::Probe),
+        Cmd::Curl { src, tgt } => curl_resp(game, v3(src), v3(tgt)).map(Resp::Curl),
+        Cmd::PlanLink {
             from,
             takeoff,
             tgt,
             v_req,
-        } => plant_link_json(game, from, takeoff, tgt, v_req),
+        } => plant_link_resp(game, v3(from), v3(takeoff), v3(tgt), v_req).map(Resp::PlanLink),
     };
-    match result {
-        Ok(data) => reply_ok(game, id, &data),
-        Err(e) => reply_err(game, id, &e),
-    }
+    reply(game, id, result);
 }
 
-fn reply_ok(game: &GameState, id: i64, data: &str) {
-    send(game, format!("{{\"id\":{id},\"ok\":true,\"data\":{data}}}"));
-}
-
-fn reply_err(game: &GameState, id: i64, msg: &str) {
-    send(game, format!("{{\"id\":{id},\"ok\":false,\"error\":{}}}", jstr(msg)));
+/// Send the typed reply for request `id`.
+fn reply(game: &GameState, id: i64, result: Result<Resp, String>) {
+    send_msg(game, Msg::Reply { id, result });
 }
 
 /// Validate that `bot` names a live rtx bot's client slot.
@@ -590,7 +312,7 @@ fn valid_bot(game: &GameState, bot: u32) -> Result<EntId, String> {
 
 /// Make a bot fit to rocket-jump: full-ish health, the RL selected with rockets, no quad, off cooldown.
 /// Writing the entvars directly is the established way to set a loadout (mirrors the mode spawn kits).
-fn do_prep(game: &mut GameState, bot: u32, health: f32, rockets: f32) -> Result<String, String> {
+fn do_prep(game: &mut GameState, bot: u32, health: f32, rockets: f32) -> Result<Resp, String> {
     let e = valid_bot(game, bot)?;
     if !game.entities[e].is_alive() {
         return Err(format!("bot {bot} not alive"));
@@ -605,16 +327,12 @@ fn do_prep(game: &mut GameState, bot: u32, health: f32, rockets: f32) -> Result<
     game.entities[e].combat.super_damage_finished = 0.0; // clear quad — a self-rocket under quad is lethal
     game.entities[e].combat.attack_finished = 0.0; // off cooldown, so the fire isn't swallowed
     game.w_set_current_ammo(e); // sync currentammo/ammo-type bits to the RL
-    Ok(format!(
-        "{{\"bot\":{bot},\"health\":{},\"rockets\":{}}}",
-        jnum(health),
-        jnum(rockets)
-    ))
+    Ok(Resp::Prep { bot, health, rockets })
 }
 
 /// Place a bot at `pos` (feet on the ground it names), zero its momentum, and reset all navigation
 /// commitments so nothing stale (a mid-flight route/jump) survives the jump. `+1z` avoids startsolid.
-fn do_teleport(game: &mut GameState, bot: u32, pos: Vec3) -> Result<String, String> {
+fn do_teleport(game: &mut GameState, bot: u32, pos: Vec3) -> Result<Resp, String> {
     let e = valid_bot(game, bot)?;
     let now = game.time();
     let at = pos + Vec3::new(0.0, 0.0, 1.0);
@@ -624,10 +342,10 @@ fn do_teleport(game: &mut GameState, bot: u32, pos: Vec3) -> Result<String, Stri
     // Park the bot after placing it — otherwise, with no order, it would roam autonomously and arrive
     // at a subsequent rocket jump with residual velocity, contaminating the standstill measurement.
     game.entities[e].bot.puppet.order = Some(ControlOrder::Hold);
-    Ok(format!(
-        "{{\"bot\":{bot},\"origin\":{}}}",
-        jvec3(game.entities[e].v.origin)
-    ))
+    Ok(Resp::Teleport {
+        bot,
+        origin: a3(game.entities[e].v.origin),
+    })
 }
 
 /// Clear every route/traversal commitment and seed the watchdogs at `at` (so the 200u teleport
@@ -647,7 +365,7 @@ fn reset_nav_state(bot: &mut crate::bot::state::BotState, at: Vec3, now: f32) {
     bot.repath_time = now;
 }
 
-fn do_goto(game: &mut GameState, bot: u32, pos: Vec3) -> Result<String, String> {
+fn do_goto(game: &mut GameState, bot: u32, pos: Vec3) -> Result<Resp, String> {
     let e = valid_bot(game, bot)?;
     let now = game.time();
     let b = &mut game.entities[e].bot;
@@ -658,10 +376,10 @@ fn do_goto(game: &mut GameState, bot: u32, pos: Vec3) -> Result<String, String> 
     b.puppet.order = Some(ControlOrder::Goto { target: pos });
     b.puppet.best_dist = f32::INFINITY;
     b.puppet.best_since = now;
-    Ok(format!("{{\"bot\":{bot},\"target\":{}}}", jvec3(pos)))
+    Ok(Resp::Goto { bot, target: a3(pos) })
 }
 
-fn do_rj(game: &mut GameState, bot: u32, link: u32) -> Result<String, String> {
+fn do_rj(game: &mut GameState, bot: u32, link: u32) -> Result<Resp, String> {
     let e = valid_bot(game, bot)?;
     let now = game.time();
     {
@@ -683,10 +401,10 @@ fn do_rj(game: &mut GameState, bot: u32, link: u32) -> Result<String, String> {
     b.repath_time = now;
     b.puppet.traj.clear(); // fresh flight trace
     b.puppet.order = Some(ControlOrder::RocketJump { link });
-    Ok(format!("{{\"bot\":{bot},\"link\":{link}}}"))
+    Ok(Resp::Rj { bot, link })
 }
 
-fn do_fly(game: &mut GameState, bot: u32, link: u32) -> Result<String, String> {
+fn do_fly(game: &mut GameState, bot: u32, link: u32) -> Result<Resp, String> {
     let e = valid_bot(game, bot)?;
     let now = game.time();
     {
@@ -706,10 +424,10 @@ fn do_fly(game: &mut GameState, bot: u32, link: u32) -> Result<String, String> {
     b.puppet.fly_takeoff_speed = 0.0;
     b.puppet.best_since = now; // FlyLink stall clock (poll_fly gives up after FLY_TIMEOUT)
     b.puppet.order = Some(ControlOrder::FlyLink { link });
-    Ok(format!("{{\"bot\":{bot},\"link\":{link}}}"))
+    Ok(Resp::Fly { bot, link })
 }
 
-fn do_order(game: &mut GameState, bot: u32, order: ControlOrder) -> Result<String, String> {
+fn do_order(game: &mut GameState, bot: u32, order: ControlOrder) -> Result<Resp, String> {
     let e = valid_bot(game, bot)?;
     if order == ControlOrder::Hold {
         let at = game.entities[e].v.origin;
@@ -718,10 +436,10 @@ fn do_order(game: &mut GameState, bot: u32, order: ControlOrder) -> Result<Strin
         reset_nav_state(&mut game.entities[e].bot, at, now);
     }
     game.entities[e].bot.puppet.order = Some(order);
-    Ok(format!("{{\"bot\":{bot}}}"))
+    Ok(Resp::Ack { bot })
 }
 
-fn do_stop(game: &mut GameState, bot: u32) -> Result<String, String> {
+fn do_stop(game: &mut GameState, bot: u32) -> Result<Resp, String> {
     let e = valid_bot(game, bot)?;
     let now = game.time();
     let b = &mut game.entities[e].bot;
@@ -729,10 +447,10 @@ fn do_stop(game: &mut GameState, bot: u32) -> Result<String, String> {
     b.rj = RjState::default();
     b.route.clear();
     b.repath_time = now;
-    Ok(format!("{{\"bot\":{bot}}}"))
+    Ok(Resp::Ack { bot })
 }
 
-fn do_set(game: &mut GameState, name: &str, value: &str) -> Result<String, String> {
+fn do_set(game: &mut GameState, name: &str, value: &str) -> Result<Resp, String> {
     if !valid_cvar_name(name) {
         return Err(format!("bad cvar name '{name}'"));
     }
@@ -745,10 +463,13 @@ fn do_set(game: &mut GameState, name: &str, value: &str) -> Result<String, Strin
     } else {
         game.host.localcmd(&format!("set {name} \"{value}\""));
     }
-    Ok(format!("{{\"name\":{},\"value\":{}}}", jstr(name), jstr(value)))
+    Ok(Resp::Set {
+        name: name.to_string(),
+        value: value.to_string(),
+    })
 }
 
-fn do_get(game: &mut GameState, name: &str) -> Result<String, String> {
+fn do_get(game: &mut GameState, name: &str) -> Result<Resp, String> {
     if !valid_cvar_name(name) {
         return Err(format!("bad cvar name '{name}'"));
     }
@@ -756,12 +477,11 @@ fn do_get(game: &mut GameState, name: &str) -> Result<String, String> {
     let mut buf = [0u8; 128];
     let s = game.host.cvar_string(&cname, &mut buf).to_string();
     let f = game.host.cvar(&cname);
-    Ok(format!(
-        "{{\"name\":{},\"string\":{},\"value\":{}}}",
-        jstr(name),
-        jstr(&s),
-        jnum(f)
-    ))
+    Ok(Resp::Get {
+        name: name.to_string(),
+        string: s,
+        value: f,
+    })
 }
 
 // --- status / links snapshots ---
@@ -779,41 +499,35 @@ fn match_phase_name(phase: crate::mode::MatchPhase) -> &'static str {
 /// classname + location; enemy/teammate references also benefit from the display name. Keeping the
 /// reference nullable makes the `0` sentinel explicit to MCP clients instead of exposing a fake
 /// world entity.
-fn entity_ref_json(game: &GameState, id: u32) -> String {
+fn ent_ref(game: &GameState, id: u32) -> Option<proto::EntRef> {
     if id == 0 {
-        return "null".to_string();
+        return None;
     }
-    let Some(ent) = game.entities.get(id as usize).filter(|e| e.in_use) else {
-        return "null".to_string();
-    };
-    format!(
-        "{{\"ent\":{id},\"name\":{},\"classname\":{},\"origin\":{},\"solid\":{}}}",
-        jstr(&game.netname_of(EntId(id))),
-        jstr(ent.classname().unwrap_or("")),
-        jvec3(ent.v.origin),
-        jstr(&format!("{:?}", ent.v.solid)),
-    )
+    let ent = game.entities.get(id as usize).filter(|e| e.in_use)?;
+    Some(proto::EntRef {
+        ent: id,
+        name: game.netname_of(EntId(id)),
+        classname: ent.classname().unwrap_or("").to_string(),
+        origin: a3(ent.v.origin),
+        solid: format!("{:?}", ent.v.solid),
+    })
 }
 
-fn route_head_json(game: &GameState, e: EntId) -> String {
+fn route_head(game: &GameState, e: EntId) -> proto::RouteHead {
     let b = &game.entities[e].bot;
-    let Some(g) = game.nav.graph.as_ref() else {
-        return format!("{{\"pos\":{},\"len\":{},\"next\":null}}", b.route_pos, b.route.len());
-    };
-    let next = b.route.get(b.route_pos).map_or_else(
-        || "null".to_string(),
-        |&link| {
-            format!(
-                "{{\"link\":{link},\"kind\":{},\"target\":{}}}",
-                jstr(kind_name(g.link_kind(link))),
-                jvec3(g.cell_origin(g.link_target(link))),
-            )
-        },
-    );
-    format!("{{\"pos\":{},\"len\":{},\"next\":{next}}}", b.route_pos, b.route.len())
+    let pos = b.route_pos as u32;
+    let len = b.route.len() as u32;
+    let next = game.nav.graph.as_ref().and_then(|g| {
+        b.route.get(b.route_pos).map(|&link| proto::RouteNext {
+            link,
+            kind: kind_name(g.link_kind(link)).to_string(),
+            target: a3(g.cell_origin(g.link_target(link))),
+        })
+    });
+    proto::RouteHead { pos, len, next }
 }
 
-fn match_json(game: &GameState) -> String {
+fn match_info(game: &GameState) -> proto::MatchInfo {
     let cfg = game.team_match.config;
     let mut scores = Vec::with_capacity(cfg.teams);
     for team in 1..=cfg.teams {
@@ -823,232 +537,202 @@ fn match_json(game: &GameState) -> String {
             .filter(|e| e.is_player() && e.in_use && e.mode_p.team as usize == team)
             .map(|e| e.v.frags as i32)
             .sum::<i32>();
-        scores.push(score.to_string());
+        scores.push(score);
     }
-    let mut roster = String::new();
-    for (name, team) in &game.team_match.roster {
-        if !roster.is_empty() {
-            roster.push(',');
-        }
-        roster.push_str(&format!("{{\"name\":{},\"team\":{team}}}", jstr(name)));
+    let roster = game
+        .team_match
+        .roster
+        .iter()
+        .map(|(name, team)| proto::RosterEntry {
+            name: name.clone(),
+            team: *team as u32,
+        })
+        .collect();
+    proto::MatchInfo {
+        mode: game.mode.name().to_string(),
+        format: crate::mode::team::format_label(cfg),
+        phase: match_phase_name(game.team_match.phase).to_string(),
+        teams: cfg.teams as u32,
+        size: cfg.size as u32,
+        teamplay: game.level.teamplay as i32,
+        timelimit: game.level.timelimit as f32,
+        fraglimit: game.level.fraglimit as f32,
+        live_until: game.team_match.live_until,
+        scores,
+        roster,
     }
-    format!(
-        "{{\"mode\":{},\"format\":{},\"phase\":{},\"teams\":{},\"size\":{},\"teamplay\":{},\"timelimit\":{},\"fraglimit\":{},\"live_until\":{},\"scores\":[{}],\"roster\":[{roster}]}}",
-        jstr(game.mode.name()),
-        jstr(&crate::mode::team::format_label(cfg)),
-        jstr(match_phase_name(game.team_match.phase)),
-        cfg.teams,
-        cfg.size,
-        game.level.teamplay,
-        game.level.timelimit,
-        game.level.fraglimit,
-        jnum(game.team_match.live_until),
-        scores.join(","),
-    )
 }
 
-fn status_json(game: &GameState) -> String {
+fn status_resp(game: &GameState) -> proto::StatusResp {
     let (navmesh, cells, links, rj_links) = match game.nav.graph.as_ref() {
-        Some(g) => ("ready", g.cells.len(), g.links.len(), g.summary().rocket_jump),
+        Some(g) => (
+            "ready",
+            g.cells.len() as u32,
+            g.links.len() as u32,
+            g.summary().rocket_jump as u32,
+        ),
         None if game.nav.pending.is_some() => ("building", 0, 0, 0),
         None => ("none", 0, 0, 0),
     };
     let maxclients = game.host.cvar(c"maxclients").max(0.0) as u32;
-    let mut bots = String::new();
+    let mut bots = Vec::new();
     for i in 1..=maxclients {
         let ent = &game.entities[EntId(i)];
         if !ent.bot.is_bot || !ent.in_use {
             continue;
         }
-        if !bots.is_empty() {
-            bots.push(',');
-        }
         let b = &ent.bot;
-        bots.push_str(&format!(
-            "{{\"ent\":{i},\"client\":{},\"name\":{},\"team\":{},\"team_name\":{},\"frags\":{},\"origin\":{},\"health\":{},\"armor\":{},\"armor_type\":{},\"weapon\":{},\"items\":{},\"ammo\":{{\"shells\":{},\"nails\":{},\"rockets\":{},\"cells\":{}}},\"on_ground\":{},\"alive\":{},\"order\":{},\"posture\":{},\"known_enemy\":{},\"goal\":{{\"item\":{},\"commit\":{},\"since\":{},\"next_item\":{},\"hold_item\":{},\"hold_for\":{}}},\"route\":{},\"rj_phase\":{},\"speed\":{},\"bhop\":{},\"bhop_peak\":{}}}",
-            b.client,
-            jstr(&game.netname_of(EntId(i))),
-            ent.mode_p.team,
-            jstr(&game.team_of(EntId(i))),
-            jnum(ent.v.frags),
-            jvec3(ent.v.origin),
-            jnum(ent.v.health),
-            jnum(ent.v.armorvalue),
-            jnum(ent.v.armortype),
-            jstr(&format!("{:?}", ent.v.weapon)),
-            jstr(&format!("{:?}", Items::from_f32(ent.v.items))),
-            jnum(ent.v.ammo_shells),
-            jnum(ent.v.ammo_nails),
-            jnum(ent.v.ammo_rockets),
-            jnum(ent.v.ammo_cells),
-            ent.v.flags.has(Flags::ONGROUND),
-            ent.is_alive(),
-            jstr(order_name(b.puppet.order)),
-            jstr(&format!("{:?}", b.posture)),
-            entity_ref_json(game, b.percept.known_enemy),
-            entity_ref_json(game, b.goal.item),
-            jstr(&format!("{:?}", b.goal.commit)),
-            jnum(b.goal.since),
-            entity_ref_json(game, b.goal.next_item),
-            entity_ref_json(game, b.goal.hold_item),
-            entity_ref_json(game, b.goal.hold_for),
-            route_head_json(game, EntId(i)),
-            jstr(&format!("{:?}", b.rj.phase)),
-            jnum(ent.v.velocity.xy().length()),
-            jstr(&format!("{:?}", b.bhop.phase)),
-            jnum(b.bhop.peak),
-        ));
+        bots.push(proto::BotStatus {
+            ent: i,
+            client: b.client,
+            name: game.netname_of(EntId(i)),
+            team: ent.mode_p.team as i32,
+            team_name: game.team_of(EntId(i)),
+            frags: ent.v.frags as i32,
+            origin: a3(ent.v.origin),
+            health: ent.v.health,
+            armor: ent.v.armorvalue,
+            armor_type: ent.v.armortype,
+            weapon: format!("{:?}", ent.v.weapon),
+            items: format!("{:?}", Items::from_f32(ent.v.items)),
+            ammo: proto::Ammo {
+                shells: ent.v.ammo_shells as i32,
+                nails: ent.v.ammo_nails as i32,
+                rockets: ent.v.ammo_rockets as i32,
+                cells: ent.v.ammo_cells as i32,
+            },
+            on_ground: ent.v.flags.has(Flags::ONGROUND),
+            alive: ent.is_alive(),
+            order: order_name(b.puppet.order).to_string(),
+            posture: format!("{:?}", b.posture),
+            known_enemy: ent_ref(game, b.percept.known_enemy),
+            goal: proto::BotGoal {
+                item: ent_ref(game, b.goal.item),
+                commit: format!("{:?}", b.goal.commit),
+                since: b.goal.since,
+                next_item: ent_ref(game, b.goal.next_item),
+                hold_item: ent_ref(game, b.goal.hold_item),
+                hold_for: ent_ref(game, b.goal.hold_for),
+            },
+            route: route_head(game, EntId(i)),
+            rj_phase: format!("{:?}", b.rj.phase),
+            speed: ent.v.velocity.xy().length(),
+            bhop: format!("{:?}", b.bhop.phase),
+            bhop_peak: b.bhop.peak,
+        });
     }
-    let oracle = oracle_json(game);
-    format!(
-        "{{\"map\":{},\"time\":{},\"navmesh\":{},\"cells\":{cells},\"links\":{links},\"rj_links\":{rj_links},\"match\":{},\"oracle\":{oracle},\"bots\":[{bots}]}}",
-        jstr(&game.level.mapname),
-        jnum(game.time()),
-        jstr(navmesh),
-        match_json(game),
-    )
+    proto::StatusResp {
+        map: game.level.mapname.clone(),
+        time: game.time(),
+        navmesh: navmesh.to_string(),
+        cells,
+        links,
+        rj_links,
+        match_: match_info(game),
+        oracle: oracle_info(game),
+        bots,
+    }
 }
 
-fn oracle_json(game: &GameState) -> String {
-    let eval = game.oracle.eval_summary();
-    let episode_eval = game.oracle.eval_episode_summary();
-    let comms = game.oracle.communication_summary();
-    let mut by_kind = String::new();
-    let mut episodes_by_kind = String::new();
+/// Map an oracle [`crate::bot::oracle::EvalSummary`] to the wire counts (identical fields).
+fn eval_counts(s: crate::bot::oracle::EvalSummary) -> proto::EvalCounts {
+    proto::EvalCounts {
+        treated: s.treated,
+        treated_success: s.treated_success,
+        controls: s.controls,
+        control_success: s.control_success,
+        applied: s.applied,
+        invalidated: s.invalidated,
+        pending: s.pending,
+    }
+}
+
+fn oracle_info(game: &GameState) -> proto::OracleInfo {
+    let mut by_kind = Vec::new();
+    let mut ep_by_kind = Vec::new();
     for kind in crate::bot::oracle::NUGGET_KINDS {
-        if !by_kind.is_empty() {
-            by_kind.push(',');
-        }
-        let summary = game.oracle.eval_summary_for(kind);
-        by_kind.push_str(&format!(
-            "{}:{{\"treated\":{},\"treated_success\":{},\"controls\":{},\"control_success\":{},\"applied\":{},\"invalidated\":{},\"pending\":{}}}",
-            jstr(&format!("{:?}", kind)),
-            summary.treated,
-            summary.treated_success,
-            summary.controls,
-            summary.control_success,
-            summary.applied,
-            summary.invalidated,
-            summary.pending,
-        ));
-        if !episodes_by_kind.is_empty() {
-            episodes_by_kind.push(',');
-        }
-        let summary = game.oracle.eval_episode_summary_for(kind);
-        episodes_by_kind.push_str(&format!(
-            "{}:{{\"treated\":{},\"treated_success\":{},\"controls\":{},\"control_success\":{},\"applied\":{},\"invalidated\":{},\"pending\":{}}}",
-            jstr(&format!("{:?}", kind)),
-            summary.treated,
-            summary.treated_success,
-            summary.controls,
-            summary.control_success,
-            summary.applied,
-            summary.invalidated,
-            summary.pending,
-        ));
+        let label = format!("{:?}", kind);
+        by_kind.push((label.clone(), eval_counts(game.oracle.eval_summary_for(kind))));
+        ep_by_kind.push((label, eval_counts(game.oracle.eval_episode_summary_for(kind))));
     }
-    let episode_eval_json = format!(
-        "{{\"treated\":{},\"treated_success\":{},\"controls\":{},\"control_success\":{},\"applied\":{},\"invalidated\":{},\"pending\":{},\"by_kind\":{{{episodes_by_kind}}}}}",
-        episode_eval.treated,
-        episode_eval.treated_success,
-        episode_eval.controls,
-        episode_eval.control_success,
-        episode_eval.applied,
-        episode_eval.invalidated,
-        episode_eval.pending,
-    );
-    let eval_json = format!(
-        "{{\"treated\":{},\"treated_success\":{},\"controls\":{},\"control_success\":{},\"applied\":{},\"invalidated\":{},\"pending\":{},\"by_kind\":{{{by_kind}}},\"episodes\":{episode_eval_json}}}",
-        eval.treated,
-        eval.treated_success,
-        eval.controls,
-        eval.control_success,
-        eval.applied,
-        eval.invalidated,
-        eval.pending,
-    );
-    let plan = game.oracle.last_plan().map_or_else(
-        || "null".to_string(),
-        |plan| {
-            let mut teams = String::new();
-            for team in &plan.teams {
-                if !teams.is_empty() {
-                    teams.push(',');
-                }
-                let mut nuggets = String::new();
-                for nugget in &team.nuggets {
-                    if !nuggets.is_empty() {
-                        nuggets.push(',');
-                    }
-                    nuggets.push_str(&format!(
-                        "{{\"recipient\":{},\"kind\":{},\"target_cell\":{},\"subject\":{},\"confidence\":{},\"decision_at\":{},\"evidence_at\":{},\"expires_at\":{}}}",
-                        nugget.recipient,
-                        jstr(&format!("{:?}", nugget.kind)),
-                        nugget.target_cell,
-                        nugget.subject,
-                        jnum(nugget.confidence),
-                        jnum(nugget.decision_at),
-                        jnum(nugget.evidence_at),
-                        jnum(nugget.expires_at),
-                    ));
-                }
-                teams.push_str(&format!(
-                    "{{\"team\":{},\"mode\":{},\"control\":{},\"nuggets\":[{nuggets}]}}",
-                    team.team,
-                    jstr(&format!("{:?}", team.mode)),
-                    jstr(&format!("{:?}", team.control)),
-                ));
-            }
-            format!(
-                "{{\"generation\":{},\"at\":{},\"teams\":[{teams}]}}",
-                plan.generation,
-                jnum(plan.at),
-            )
+    let eval = proto::Eval {
+        counts: eval_counts(game.oracle.eval_summary()),
+        by_kind,
+        episodes: proto::EpisodeEval {
+            counts: eval_counts(game.oracle.eval_episode_summary()),
+            by_kind: ep_by_kind,
         },
-    );
-    format!(
-        "{{\"running\":{},\"epoch\":{},\"last_output\":{},\"plan\":{plan},\"communication\":{{\"proposed\":{},\"communicated\":{},\"refreshed\":{},\"suppressed\":{},\"superseded\":{},\"arm_clears\":{}}},\"eval\":{eval_json}}}",
-        game.oracle.running(),
-        game.oracle.epoch(),
-        jnum(game.oracle.last_output()),
-        comms.proposed,
-        comms.communicated,
-        comms.refreshed,
-        comms.suppressed,
-        comms.superseded,
-        comms.arm_clears,
-    )
+    };
+    let comms = game.oracle.communication_summary();
+    let communication = proto::Communication {
+        proposed: comms.proposed,
+        communicated: comms.communicated,
+        refreshed: comms.refreshed,
+        suppressed: comms.suppressed,
+        superseded: comms.superseded,
+        arm_clears: comms.arm_clears,
+    };
+    let plan = game.oracle.last_plan().map(|plan| proto::Plan {
+        generation: plan.generation as u64,
+        at: plan.at,
+        teams: plan
+            .teams
+            .iter()
+            .map(|team| proto::PlanTeam {
+                team: team.team as u32,
+                mode: format!("{:?}", team.mode),
+                control: format!("{:?}", team.control),
+                nuggets: team
+                    .nuggets
+                    .iter()
+                    .map(|n| proto::Nugget {
+                        recipient: n.recipient as i32,
+                        kind: format!("{:?}", n.kind),
+                        target_cell: n.target_cell as u32,
+                        subject: n.subject as i32,
+                        confidence: n.confidence,
+                        decision_at: n.decision_at,
+                        evidence_at: n.evidence_at,
+                        expires_at: n.expires_at,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    });
+    proto::OracleInfo {
+        running: game.oracle.running(),
+        epoch: game.oracle.epoch() as u64,
+        last_output: game.oracle.last_output(),
+        plan,
+        communication,
+        eval,
+    }
 }
 
-fn links_json(game: &GameState) -> Result<String, String> {
+fn links_resp(game: &GameState) -> Result<Vec<proto::RjLink>, String> {
     let g = game.nav.graph.as_ref().ok_or("navmesh not ready")?;
-    let mut items = String::new();
+    let mut links = Vec::new();
     for li in 0..g.links.len() as u32 {
         if g.link_kind(li) != LinkKind::RocketJump {
             continue;
         }
         let Some(tr) = g.rocket_jump_of_link(li) else { continue };
-        let src = g.cell_origin(g.link_source(li));
-        let tgt = g.cell_origin(g.link_target(li));
-        if !items.is_empty() {
-            items.push(',');
-        }
-        items.push_str(&format!(
-            "{{\"link\":{li},\"src\":{},\"tgt\":{},\"fire_pitch\":{},\"fire_yaw\":{},\"fire_delay\":{},\"airtime\":{},\"self_damage\":{},\"v0\":{},\"blast\":{},\"pos_blast\":{},\"land\":{}}}",
-            jvec3(src),
-            jvec3(tgt),
-            jnum(tr.fire_angles.x),
-            jnum(tr.fire_angles.y),
-            jnum(tr.fire_delay),
-            jnum(tr.airtime),
-            jnum(tr.self_damage),
-            jvec3(tr.v0),
-            jvec3(tr.blast),
-            jvec3(tr.pos_blast),
-            jvec3(tr.land),
-        ));
+        links.push(proto::RjLink {
+            link: li,
+            src: a3(g.cell_origin(g.link_source(li))),
+            tgt: a3(g.cell_origin(g.link_target(li))),
+            fire_pitch: tr.fire_angles.x,
+            fire_yaw: tr.fire_angles.y,
+            fire_delay: tr.fire_delay,
+            airtime: tr.airtime,
+            self_damage: tr.self_damage,
+            v0: a3(tr.v0),
+            blast: a3(tr.blast),
+            pos_blast: a3(tr.pos_blast),
+            land: a3(tr.land),
+        });
     }
-    Ok(format!("{{\"links\":[{items}]}}"))
+    Ok(links)
 }
 
 /// Human-readable name for a link kind, for the `cell` inspector.
@@ -1070,51 +754,50 @@ fn kind_name(k: LinkKind) -> &'static str {
 /// Inspect the navmesh cell nearest `pos`: its origin plus every link leaving and entering it (index,
 /// kind, other endpoint). The diagnostic for "why can't the bot reach here" — an unreachable ledge
 /// has no incoming jump/speed-jump link.
-fn cell_json(game: &GameState, pos: Vec3) -> Result<String, String> {
+fn cell_resp(game: &GameState, pos: Vec3) -> Result<proto::CellResp, String> {
     let g = game.nav.graph.as_ref().ok_or("navmesh not ready")?;
     let cell = g.nearest(pos).ok_or("no navmesh cell near that point")?;
-    let mut out = String::new();
-    let mut inc = String::new();
+    let mut out = Vec::new();
+    let mut incoming = Vec::new();
     for li in 0..g.links.len() as u32 {
         if g.link_source(li) == cell {
-            let e = if out.is_empty() { "" } else { "," };
             // `cost` is the static travel time only. What a hazard link *really* costs the planner is
             // `hazard_hp` valued against the asking bot's strength, so report the health and let the
             // caller price it — reporting seconds here would mean picking a bot to price it for.
-            out.push_str(&format!(
-                "{e}{{\"link\":{li},\"kind\":{},\"to\":{},\"cost\":{:.2},\"tgt_hazard\":{},\"hazard_hp\":{:.2},\"water_extra\":{:.2}}}",
-                jstr(kind_name(g.link_kind(li))),
-                jvec3(g.cell_origin(g.link_target(li))),
-                g.link_cost(li),
-                jstr(&format!("{:?}", g.cell_hazard(g.link_target(li)))),
-                g.link_hazard_hp(li),
-                g.link_water_extra(li),
-            ));
+            out.push(proto::CellLinkOut {
+                link: li,
+                kind: kind_name(g.link_kind(li)).to_string(),
+                to: a3(g.cell_origin(g.link_target(li))),
+                cost: g.link_cost(li),
+                tgt_hazard: format!("{:?}", g.cell_hazard(g.link_target(li))),
+                hazard_hp: g.link_hazard_hp(li),
+                water_extra: g.link_water_extra(li),
+            });
         }
         if g.link_target(li) == cell {
-            let e = if inc.is_empty() { "" } else { "," };
-            inc.push_str(&format!(
-                "{e}{{\"link\":{li},\"kind\":{},\"from\":{}}}",
-                jstr(kind_name(g.link_kind(li))),
-                jvec3(g.cell_origin(g.link_source(li)))
-            ));
+            incoming.push(proto::CellLinkIn {
+                link: li,
+                kind: kind_name(g.link_kind(li)).to_string(),
+                from: a3(g.cell_origin(g.link_source(li))),
+            });
         }
     }
-    Ok(format!(
-        "{{\"cell\":{},\"origin\":{},\"hazard\":{},\"out\":[{out}],\"in\":[{inc}]}}",
+    Ok(proto::CellResp {
         cell,
-        jvec3(g.cell_origin(cell)),
-        jstr(&format!("{:?}", g.cell_hazard(cell)))
-    ))
+        origin: a3(g.cell_origin(cell)),
+        hazard: format!("{:?}", g.cell_hazard(cell)),
+        out,
+        incoming,
+    })
 }
 
 /// List the map's bot-goal items (armor, health, weapons, ammo, powerups), so a caller can find a
 /// pickup without spelunking the bsp entity lump. Each item reports its entity origin, whether it's
 /// currently on the floor to be taken (`available`), and the nearest navmesh cell — the standable
 /// point to `goto`, since the entity origin itself floats above the floor and isn't a nav cell.
-fn items_json(game: &GameState) -> Result<String, String> {
+fn items_resp(game: &GameState) -> Result<Vec<proto::ItemInfo>, String> {
     let g = game.nav.graph.as_ref().ok_or("navmesh not ready")?;
-    let mut out = String::new();
+    let mut out = Vec::new();
     for (id, ent) in game.entities.live() {
         let Some(classname) = ent.classname() else {
             continue;
@@ -1122,104 +805,64 @@ fn items_json(game: &GameState) -> Result<String, String> {
         if !is_goal_classname(classname) {
             continue;
         }
-        let nav = match g.nearest(ent.v.origin) {
-            Some(cell) => format!("{{\"cell\":{cell},\"origin\":{}}}", jvec3(g.cell_origin(cell))),
-            None => "null".to_string(),
-        };
-        if !out.is_empty() {
-            out.push(',');
-        }
-        out.push_str(&format!(
-            "{{\"ent\":{},\"classname\":{},\"origin\":{},\"available\":{},\"nav\":{nav}}}",
-            id.0,
-            jstr(classname),
-            jvec3(ent.v.origin),
-            ent.v.solid == Solid::Trigger,
-        ));
+        let nav = g.nearest(ent.v.origin).map(|cell| proto::NavCell {
+            cell,
+            origin: a3(g.cell_origin(cell)),
+        });
+        out.push(proto::ItemInfo {
+            ent: id.0,
+            classname: classname.to_string(),
+            origin: a3(ent.v.origin),
+            available: ent.v.solid == Solid::Trigger,
+            nav,
+        });
     }
-    Ok(format!("{{\"items\":[{out}]}}"))
+    Ok(out)
 }
 
 /// Dump a bot's current route: `route_pos` and each leg (index, kind, source→target).
-fn route_json(game: &GameState, bot: u32) -> Result<String, String> {
+fn route_resp(game: &GameState, bot: u32) -> Result<proto::RouteResp, String> {
     let e = valid_bot(game, bot)?;
     let g = game.nav.graph.as_ref().ok_or("navmesh not ready")?;
     let b = &game.entities[e].bot;
-    let mut legs = String::new();
-    for (i, &leg) in b.route.iter().enumerate() {
-        if !legs.is_empty() {
-            legs.push(',');
-        }
-        legs.push_str(&format!(
-            "{{\"i\":{i},\"link\":{leg},\"kind\":{},\"src\":{},\"tgt\":{}}}",
-            jstr(kind_name(g.link_kind(leg))),
-            jvec3(g.cell_origin(g.link_source(leg))),
-            jvec3(g.cell_origin(g.link_target(leg))),
-        ));
-    }
-    Ok(format!(
-        "{{\"bot\":{bot},\"route_pos\":{},\"origin\":{},\"legs\":[{legs}]}}",
-        b.route_pos,
-        jvec3(game.entities[e].v.origin),
-    ))
+    let legs = b
+        .route
+        .iter()
+        .enumerate()
+        .map(|(i, &leg)| proto::RouteLeg {
+            i: i as u32,
+            link: leg,
+            kind: kind_name(g.link_kind(leg)).to_string(),
+            src: a3(g.cell_origin(g.link_source(leg))),
+            tgt: a3(g.cell_origin(g.link_target(leg))),
+        })
+        .collect();
+    Ok(proto::RouteResp {
+        bot,
+        route_pos: b.route_pos as u32,
+        origin: a3(game.entities[e].v.origin),
+        legs,
+    })
 }
 
 /// Dump a bot's `rtx_bot_debug` audit ring: the last `lines` per-frame sensor snapshots, oldest-first.
-/// Empty when `rtx_bot_debug` has been off (nothing was captured).
-fn audit_json(game: &GameState, bot: u32, lines: usize) -> Result<String, String> {
-    use rtx_auditlog::flags as af;
+/// The frames are already the wire schema, so this just tails the ring. Empty when `rtx_bot_debug`
+/// has been off (nothing was captured).
+fn audit_resp(game: &GameState, bot: u32, lines: usize) -> Result<proto::AuditResp, String> {
     let e = valid_bot(game, bot)?;
     let frames = game.entities[e].bot.audit.tail(lines);
-    let mut arr = String::new();
-    for f in &frames {
-        if !arr.is_empty() {
-            arr.push(',');
-        }
-        arr.push_str(&format!(
-            "{{\"t\":{:.2},\"origin\":{},\"vel\":{},\"speed\":{:.0},\"peak\":{:.0},\"bhop\":{},\"hops\":{},\"flips\":{},\"off\":{},\"hook\":{},\"rj\":{},\"route_pos\":{},\"route_len\":{},\"band\":{},\"fwd\":{},\"side\":{},\"posture\":{},\"commit\":{},\"goal_ent\":{},\"goal_cell\":{},\"goal_dist\":{:.0},\"goal_dz\":{:.0},\"gate\":{},\"enemy\":{},\"aware\":{},\"on_ground\":{},\"on_item\":{},\"attack\":{},\"jump\":{},\"pen\":{}}}",
-            f.t,
-            jvec3(Vec3::from_array(f.origin)),
-            jvec3(Vec3::from_array(f.vel)),
-            f.speed,
-            f.peak,
-            jstr(&format!("{:?}", f.bhop)),
-            f.hops,
-            f.flips,
-            jstr(f.off_reason.as_str()),
-            jstr(&format!("{:?}", f.hook)),
-            jstr(&format!("{:?}", f.rj)),
-            f.route_pos,
-            f.route_len,
-            f.band,
-            f.forward,
-            f.side,
-            jstr(&format!("{:?}", f.posture)),
-            jstr(&format!("{:?}", f.commit)),
-            f.goal_ent,
-            f.goal_cell,
-            f.goal_dist,
-            f.goal_dz,
-            f.gate,
-            (f.flags & af::ENEMY) != 0,
-            (f.flags & af::AWARE) != 0,
-            (f.flags & af::ON_GROUND) != 0,
-            (f.flags & af::ON_ITEM) != 0,
-            (f.flags & af::ATTACK) != 0,
-            (f.flags & af::JUMP) != 0,
-            f.pen,
-        ));
-    }
-    Ok(format!(
-        "{{\"bot\":{bot},\"count\":{},\"frames\":[{arr}]}}",
-        frames.len()
-    ))
+    Ok(proto::AuditResp {
+        bot,
+        count: frames.len() as u32,
+        frames,
+    })
 }
 
 /// Search the offline pmove sim (against the live BSP) for a speed-curl jump from `src` to `tgt`: a
 /// held-strafe air-curl from a run-up-built takeoff speed. Grid-searches takeoff speed `v0`, launch
 /// heading `psi0`, and turn gain, returning the lowest-speed curl that lands within tolerance — the
 /// M2 solver, exercised live. Mirrors the human demo (build speed, one leap, gentle held-strafe sweep).
-fn curl_json(game: &GameState, src: Vec3, tgt: Vec3) -> Result<String, String> {
+fn curl_resp(game: &GameState, src: Vec3, tgt: Vec3) -> Result<proto::CurlResp, String> {
     use crate::bot::bhop;
     use crate::math::{wrap180, yaw_of};
     use crate::pmove_sim::{pm_step, PmParams, PmState};
@@ -1293,18 +936,26 @@ fn curl_json(game: &GameState, src: Vec3, tgt: Vec3) -> Result<String, String> {
             }
         }
     }
-    match best {
-        Some((v0, psi0, gain, miss, land)) => Ok(format!(
-            "{{\"found\":true,\"v0\":{},\"psi0\":{},\"chord\":{},\"gain\":{},\"miss_xy\":{},\"land\":{}}}",
-            jnum(v0),
-            jnum(psi0),
-            jnum(chord),
-            jnum(gain),
-            jnum(miss),
-            jvec3(land)
-        )),
-        None => Ok(format!("{{\"found\":false,\"chord\":{}}}", jnum(chord))),
-    }
+    Ok(match best {
+        Some((v0, psi0, gain, miss, land)) => proto::CurlResp {
+            found: true,
+            chord,
+            v0,
+            psi0,
+            gain,
+            miss_xy: miss,
+            land: a3(land),
+        },
+        None => proto::CurlResp {
+            found: false,
+            chord,
+            v0: 0.0,
+            psi0: 0.0,
+            gain: 0.0,
+            miss_xy: 0.0,
+            land: [0.0; 3],
+        },
+    })
 }
 
 /// Hand-plant a self-contained `SpeedJump` link into the live graph for takeoff-regime bring-up: the
@@ -1312,7 +963,13 @@ fn curl_json(game: &GameState, src: Vec3, tgt: Vec3) -> Result<String, String> {
 /// cell nearest `tgt`, requiring `v_req` ups at the lip. The runtime flies a planted link exactly like
 /// a generated one, so a subsequent `goto <tgt>` exercises the committed-prestrafe takeoff on the real
 /// corridor. Returns the new link index and the resolved cell origins so the caller can verify routing.
-fn plant_link_json(game: &mut GameState, from: Vec3, takeoff: Vec3, tgt: Vec3, v_req: f32) -> Result<String, String> {
+fn plant_link_resp(
+    game: &mut GameState,
+    from: Vec3,
+    takeoff: Vec3,
+    tgt: Vec3,
+    v_req: f32,
+) -> Result<proto::PlanLinkResp, String> {
     use crate::navmesh::SpeedJumpTraversal;
     let gravity = {
         let g = game.host.cvar(c"sv_gravity");
@@ -1364,14 +1021,21 @@ fn plant_link_json(game: &mut GameState, from: Vec3, takeoff: Vec3, tgt: Vec3, v
     // reachable on the pre-plant graph instead of pathing over it.
     g.rebuild_derived();
     let (fo, to) = (g.cell_origin(from_cell), g.cell_origin(to_cell));
-    Ok(format!(
-        "{{\"link\":{li},\"from_cell\":{from_cell},\"to_cell\":{to_cell},\"from\":{},\"tgt\":{},\"takeoff\":{},\"v_req\":{},\"airtime\":{},\"cost\":{}}}",
-        jvec3(fo), jvec3(to), jvec3(takeoff), jnum(v_req), jnum(airtime), jnum(cost),
-    ))
+    Ok(proto::PlanLinkResp {
+        link: li,
+        from_cell,
+        to_cell,
+        from: a3(fo),
+        tgt: a3(to),
+        takeoff: a3(takeoff),
+        v_req,
+        airtime,
+        cost,
+    })
 }
 
-/// Probe the build-time curl certifier — see `ControlCmd::Probe`.
-fn probe_json(game: &GameState, takeoff: Vec3, tgt: Vec3, psi0: f32, runway: f32) -> Result<String, String> {
+/// Probe the build-time curl certifier — see [`Cmd::Probe`].
+fn probe_resp(game: &GameState, takeoff: Vec3, tgt: Vec3, psi0: f32, runway: f32) -> Result<proto::ProbeResp, String> {
     let bsp = game.nav.bsp.as_ref().ok_or("no bsp")?;
     let g = game.nav.graph.as_ref().ok_or("navmesh not ready")?;
     let cv = |n: &std::ffi::CStr, d: f32| {
@@ -1391,34 +1055,28 @@ fn probe_json(game: &GameState, takeoff: Vec3, tgt: Vec3, psi0: f32, runway: f32
         curl: true,
     };
     let probe = g.curl_probe(bsp, takeoff, tgt, psi0, runway, params);
-    let mut d = String::new();
-    for (gain, land) in probe.landings {
-        if !d.is_empty() {
-            d.push(',');
-        }
-        let miss = (land.truncate() - tgt.truncate()).length();
-        d.push_str(&format!(
-            "{{\"gain\":{},\"land\":{},\"miss_xy\":{},\"miss_z\":{}}}",
-            jnum(gain),
-            jvec3(land),
-            jnum(miss),
-            jnum((land.z - tgt.z).abs())
-        ));
-    }
-    let cert_s = match probe.certified {
-        Some((v_req, gain)) => format!("{{\"v_req\":{},\"gain\":{}}}", jnum(v_req), jnum(gain)),
-        None => "null".to_string(),
-    };
-    Ok(format!(
-        "{{\"v_deliver\":{},\"certified\":{cert_s},\"gains\":[{d}]}}",
-        jnum(probe.v_deliver)
-    ))
+    let gains = probe
+        .landings
+        .iter()
+        .map(|&(gain, land)| proto::ProbeGain {
+            gain,
+            land: a3(land),
+            miss_xy: (land.truncate() - tgt.truncate()).length(),
+            miss_z: (land.z - tgt.z).abs(),
+        })
+        .collect();
+    let certified = probe.certified.map(|(v_req, gain)| proto::Cert { v_req, gain });
+    Ok(proto::ProbeResp {
+        v_deliver: probe.v_deliver,
+        certified,
+        gains,
+    })
 }
 
 /// List every generated curl link (SpeedJump with `curl_gain > 0`).
-fn curls_json(game: &GameState) -> Result<String, String> {
+fn curls_resp(game: &GameState) -> Result<Vec<proto::CurlLink>, String> {
     let g = game.nav.graph.as_ref().ok_or("navmesh not ready")?;
-    let mut items = String::new();
+    let mut curls = Vec::new();
     for li in 0..g.links.len() as u32 {
         if g.link_kind(li) != LinkKind::SpeedJump {
             continue;
@@ -1427,19 +1085,16 @@ fn curls_json(game: &GameState) -> Result<String, String> {
         if tr.curl_gain <= 0.0 {
             continue;
         }
-        if !items.is_empty() {
-            items.push(',');
-        }
-        items.push_str(&format!(
-            "{{\"link\":{li},\"from\":{},\"takeoff\":{},\"tgt\":{},\"v_req\":{},\"gain\":{}}}",
-            jvec3(g.cell_origin(g.link_source(li))),
-            jvec3(tr.takeoff),
-            jvec3(g.cell_origin(g.link_target(li))),
-            jnum(tr.v_req),
-            jnum(tr.curl_gain),
-        ));
+        curls.push(proto::CurlLink {
+            link: li,
+            from: a3(g.cell_origin(g.link_source(li))),
+            takeoff: a3(tr.takeoff),
+            tgt: a3(g.cell_origin(g.link_target(li))),
+            v_req: tr.v_req,
+            gain: tr.curl_gain,
+        });
     }
-    Ok(format!("{{\"curls\":[{items}]}}"))
+    Ok(curls)
 }
 
 fn order_name(o: Option<ControlOrder>) -> &'static str {
@@ -1460,7 +1115,7 @@ fn poll_goto(game: &mut GameState, e: EntId, bot: u32, target: Vec3, now: f32) {
     let dz = (origin.z - target.z).abs();
     let crossed_finish = goto_crossed_finish(&game.entities[e].bot.puppet.traj, origin, target);
     if (dxy <= GOTO_ARRIVE_XY || crossed_finish) && dz <= GOTO_ARRIVE_Z {
-        let traj = traj_json(&std::mem::take(&mut game.entities[e].bot.puppet.traj));
+        let traj = traj_rows(&std::mem::take(&mut game.entities[e].bot.puppet.traj));
         // A goto commonly ends while the bot is airborne and carrying several hundred ups. Merely
         // swapping the order to Hold leaves the active hop controller, route, and momentum intact for
         // another frame; on a finish-line target that is enough to cross trigger_changelevel, and on
@@ -1468,12 +1123,16 @@ fn poll_goto(game: &mut GameState, e: EntId, bot: u32, target: Vec3, now: f32) {
         // Finish the puppet order atomically: stop the body and discard every navigation commitment
         // before the next bot frame observes Hold.
         finish_goto_hold(game, e, origin, now);
-        send(
+        send_event(
             game,
-            format!(
-            "{{\"ev\":\"arrived\",\"bot\":{bot},\"t\":{},\"origin\":{},\"target\":{},\"dist\":{},\"traj\":[{traj}]}}",
-            jnum(now), jvec3(origin), jvec3(target), jnum(dxy),
-        ),
+            Event::Arrived {
+                bot,
+                t: now,
+                origin: a3(origin),
+                target: a3(target),
+                dist: dxy,
+                traj,
+            },
         );
         return;
     }
@@ -1486,12 +1145,21 @@ fn poll_goto(game: &mut GameState, e: EntId, bot: u32, target: Vec3, now: f32) {
         p.best_dist = dxy;
         p.best_since = now;
     } else if now - best_since > STALL_SECS {
-        let traj = traj_json(&std::mem::take(&mut game.entities[e].bot.puppet.traj));
+        let traj = traj_rows(&std::mem::take(&mut game.entities[e].bot.puppet.traj));
         finish_goto_hold(game, e, origin, now);
-        send(game, format!(
-            "{{\"ev\":\"goto_stall\",\"bot\":{bot},\"t\":{},\"origin\":{},\"target\":{},\"dist\":{},\"best\":{},\"secs\":{},\"traj\":[{traj}]}}",
-            jnum(now), jvec3(origin), jvec3(target), jnum(dxy), jnum(best_dist), jnum(STALL_SECS),
-        ));
+        send_event(
+            game,
+            Event::GotoStall {
+                bot,
+                t: now,
+                origin: a3(origin),
+                target: a3(target),
+                dist: dxy,
+                best: best_dist,
+                secs: STALL_SECS,
+                traj,
+            },
+        );
     }
 }
 
@@ -1517,25 +1185,11 @@ fn finish_goto_hold(game: &mut GameState, e: EntId, at: Vec3, now: f32) {
     game.entities[e].bot.puppet.order = Some(ControlOrder::Hold);
 }
 
-/// Serialize a flight/goto trace as `[t, x,y,z, vx,vy,vz]` rows.
-fn traj_json(traj: &[(f32, Vec3, Vec3)]) -> String {
-    let mut s = String::new();
-    for (ts, o, v) in traj {
-        if !s.is_empty() {
-            s.push(',');
-        }
-        s.push_str(&format!(
-            "[{},{},{},{},{},{},{}]",
-            jnum(*ts),
-            jnum(o.x),
-            jnum(o.y),
-            jnum(o.z),
-            jnum(v.x),
-            jnum(v.y),
-            jnum(v.z)
-        ));
-    }
-    s
+/// A flight/goto trace as `[t, x, y, z, vx, vy, vz]` rows.
+fn traj_rows(traj: &[(f32, Vec3, Vec3)]) -> Vec<proto::TrajRow> {
+    traj.iter()
+        .map(|&(t, o, v)| [t, o.x, o.y, o.z, v.x, v.y, v.z])
+        .collect()
 }
 
 fn poll_rj(game: &mut GameState, e: EntId, bot: u32, link: u32, now: f32) {
@@ -1559,8 +1213,8 @@ fn poll_rj(game: &mut GameState, e: EntId, bot: u32, link: u32, now: f32) {
     let _ = now;
     game.entities[e].bot.rj.fails = 0;
     game.entities[e].bot.puppet.order = Some(ControlOrder::Hold);
-    let json = rj_result_json(bot, link, &telem, outcome, v0, blast, pos_blast, &traj);
-    send(game, json);
+    let result = rj_result(bot, link, &telem, outcome, v0, blast, pos_blast, &traj);
+    send_event(game, Event::RjResult(Box::new(result)));
 }
 
 /// Watch a FlyLink attempt: capture the horizontal speed at the speed-jump takeoff (the first airborne
@@ -1576,13 +1230,21 @@ fn poll_fly(game: &mut GameState, e: EntId, bot: u32, link: u32, now: f32) {
         game.entities[e].bot.puppet.order = Some(ControlOrder::Hold);
         game.entities[e].bot.rj.fails = 0;
         let _ = std::mem::take(&mut game.entities[e].bot.puppet.traj);
-        send(
+        send_event(
             game,
-            format!(
-                "{{\"ev\":\"fly_result\",\"bot\":{bot},\"link\":{link},\"on_target\":false,\"timeout\":true,\
-             \"land\":{},\"miss_xy\":9999,\"miss_z\":9999,\"takeoff_speed\":0,\"peak\":0,\"traj\":[]}}",
-                jvec3(origin),
-            ),
+            Event::FlyResult(proto::FlyResult {
+                bot,
+                link,
+                on_target: false,
+                timeout: true,
+                land: a3(origin),
+                target: [0.0; 3],
+                miss_xy: 9999.0,
+                miss_z: 9999.0,
+                takeoff_speed: 0.0,
+                peak: 0.0,
+                traj: Vec::new(),
+            }),
         );
         return;
     }
@@ -1619,24 +1281,26 @@ fn poll_fly(game: &mut GameState, e: EntId, bot: u32, link: u32, now: f32) {
     game.entities[e].bot.puppet.order = Some(ControlOrder::Hold);
     game.entities[e].bot.rj.fails = 0;
     let _ = now;
-    send(
+    send_event(
         game,
-        format!(
-            "{{\"ev\":\"fly_result\",\"bot\":{bot},\"link\":{link},\"on_target\":{on_target},\"land\":{},\
-         \"target\":{},\"miss_xy\":{},\"miss_z\":{},\"takeoff_speed\":{},\"peak\":{},\"traj\":[{}]}}",
-            jvec3(origin),
-            jvec3(target),
-            jnum(miss_xy),
-            jnum(miss_z),
-            jnum(takeoff_speed),
-            jnum(peak),
-            traj_json(&traj),
-        ),
+        Event::FlyResult(proto::FlyResult {
+            bot,
+            link,
+            on_target,
+            timeout: false,
+            land: a3(origin),
+            target: a3(target),
+            miss_xy,
+            miss_z,
+            takeoff_speed,
+            peak,
+            traj: traj_rows(&traj),
+        }),
     );
 }
 
-#[allow(clippy::too_many_arguments)] // one JSON event's worth of measured + solved fields
-fn rj_result_json(
+#[allow(clippy::too_many_arguments)] // one event's worth of measured + solved fields
+fn rj_result(
     bot: u32,
     link: u32,
     t: &RjTelemetry,
@@ -1645,9 +1309,9 @@ fn rj_result_json(
     blast: Vec3,
     pos_blast: Vec3,
     traj: &[(f32, Vec3, Vec3)],
-) -> String {
+) -> proto::RjResult {
     // Terminal name + (for a touchdown/overrun) the landing measurement vs the target cell.
-    let (name, land) = match outcome {
+    let (name, land_pt) = match outcome {
         RjOutcome::Landed {
             on_target,
             origin,
@@ -1660,113 +1324,52 @@ fn rj_result_json(
         RjOutcome::EnemyAbort => ("enemy_abort", None),
         RjOutcome::LegVanished => ("leg_vanished", None),
     };
-    let press = match t.press {
-        Some(p) => format!(
-            "{{\"t\":{},\"origin\":{},\"view\":[{},{}],\"aim_err\":{},\"stance_off_xy\":{}}}",
-            jnum(p.t),
-            jvec3(p.origin),
-            jnum(p.view.x),
-            jnum(p.view.y),
-            jnum(p.aim_err),
-            jnum((p.origin.xy() - t.src.xy()).length()),
-        ),
-        None => "null".to_string(),
-    };
-    let fire = match t.fire {
-        Some(f) => format!(
-            "{{\"t\":{},\"delay\":{},\"origin\":{},\"view\":[{},{}],\"pitch_err\":{},\"yaw_err\":{}}}",
-            jnum(f.t),
-            jnum(f.actual_delay),
-            jvec3(f.origin),
-            jnum(f.view.x),
-            jnum(f.view.y),
-            jnum(f.view.x - (t.solved_angles.x + t.pitch_bias)),
-            jnum(wrap180(f.view.y - t.solved_angles.y)),
-        ),
-        None => "null".to_string(),
-    };
-    let land = match land {
-        Some((o, ft)) => format!(
-            "{{\"t\":{},\"origin\":{},\"miss_xy\":{},\"miss_z\":{}}}",
-            jnum(ft),
-            jvec3(o),
-            jnum((o.xy() - t.tgt.xy()).length()),
-            jnum((o.z - t.tgt.z).abs()),
-        ),
-        None => "null".to_string(),
-    };
-    // The flight trace: one [t, x,y,z, vx,vy,vz] per frame from stance through landing.
-    let mut trace = String::new();
-    for (ts, o, v) in traj {
-        if !trace.is_empty() {
-            trace.push(',');
-        }
-        trace.push_str(&format!(
-            "[{},{},{},{},{},{},{}]",
-            jnum(*ts),
-            jnum(o.x),
-            jnum(o.y),
-            jnum(o.z),
-            jnum(v.x),
-            jnum(v.y),
-            jnum(v.z)
-        ));
+    let press = t.press.map(|p| proto::RjPress {
+        t: p.t,
+        origin: a3(p.origin),
+        view: [p.view.x, p.view.y],
+        aim_err: p.aim_err,
+        stance_off_xy: (p.origin.xy() - t.src.xy()).length(),
+    });
+    let fire = t.fire.map(|f| proto::RjFire {
+        t: f.t,
+        delay: f.actual_delay,
+        origin: a3(f.origin),
+        view: [f.view.x, f.view.y],
+        pitch_err: f.view.x - (t.solved_angles.x + t.pitch_bias),
+        yaw_err: wrap180(f.view.y - t.solved_angles.y),
+    });
+    let land = land_pt.map(|(o, ft)| proto::RjLand {
+        t: ft,
+        origin: a3(o),
+        miss_xy: (o.xy() - t.tgt.xy()).length(),
+        miss_z: (o.z - t.tgt.z).abs(),
+    });
+    proto::RjResult {
+        bot,
+        link,
+        outcome: name.to_string(),
+        src: a3(t.src),
+        tgt: a3(t.tgt),
+        solved: proto::RjSolved {
+            pitch: t.solved_angles.x,
+            yaw: t.solved_angles.y,
+            delay: t.solved_delay,
+            airtime: t.airtime,
+            self_damage: t.self_damage,
+            v0: a3(v0),
+            blast: a3(blast),
+            pos_blast: a3(pos_blast),
+        },
+        bias: proto::RjBias {
+            delay: t.delay_bias,
+            pitch: t.pitch_bias,
+        },
+        press,
+        fire,
+        land,
+        traj: traj_rows(traj),
     }
-    format!(
-        "{{\"ev\":\"rj_result\",\"bot\":{bot},\"link\":{link},\"outcome\":{},\"src\":{},\"tgt\":{},\
-         \"solved\":{{\"pitch\":{},\"yaw\":{},\"delay\":{},\"airtime\":{},\"self_damage\":{},\
-         \"v0\":{},\"blast\":{},\"pos_blast\":{}}},\
-         \"bias\":{{\"delay\":{},\"pitch\":{}}},\"press\":{press},\"fire\":{fire},\"land\":{land},\
-         \"traj\":[{trace}]}}",
-        jstr(name),
-        jvec3(t.src),
-        jvec3(t.tgt),
-        jnum(t.solved_angles.x),
-        jnum(t.solved_angles.y),
-        jnum(t.solved_delay),
-        jnum(t.airtime),
-        jnum(t.self_damage),
-        jvec3(v0),
-        jvec3(blast),
-        jvec3(pos_blast),
-        jnum(t.delay_bias),
-        jnum(t.pitch_bias),
-    )
-}
-
-// --- tiny JSON emitters (no serde: the game crate stays dependency-free) ---
-
-/// A finite `f32` as a JSON number (shortest round-trip form); non-finite → `null`.
-fn jnum(x: f32) -> String {
-    if x.is_finite() {
-        format!("{x}")
-    } else {
-        "null".to_string()
-    }
-}
-
-/// A `Vec3` as a JSON `[x,y,z]` array.
-fn jvec3(v: Vec3) -> String {
-    format!("[{},{},{}]", jnum(v.x), jnum(v.y), jnum(v.z))
-}
-
-/// A `&str` as a quoted, escaped JSON string.
-fn jstr(s: &str) -> String {
-    let mut o = String::with_capacity(s.len() + 2);
-    o.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => o.push_str("\\\""),
-            '\\' => o.push_str("\\\\"),
-            '\n' => o.push_str("\\n"),
-            '\r' => o.push_str("\\r"),
-            '\t' => o.push_str("\\t"),
-            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
-            c => o.push(c),
-        }
-    }
-    o.push('"');
-    o
 }
 
 #[cfg(test)]
@@ -1783,123 +1386,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_simple_verbs() {
-        assert_eq!(parse_line("7 status").unwrap(), (7, ControlCmd::Status));
-        assert_eq!(parse_line("8 match_start").unwrap(), (8, ControlCmd::MatchStart));
-        assert_eq!(parse_line("  12   links  ").unwrap(), (12, ControlCmd::Links));
-        assert_eq!(parse_line("3 hold 1").unwrap(), (3, ControlCmd::Hold { bot: 1 }));
-        assert_eq!(parse_line("4 stop 2").unwrap(), (4, ControlCmd::Stop { bot: 2 }));
-    }
-
-    #[test]
-    fn parses_vectors_and_links() {
-        assert_eq!(
-            parse_line("1 teleport 1 10 -20.5 300").unwrap(),
-            (
-                1,
-                ControlCmd::Teleport {
-                    bot: 1,
-                    pos: Vec3::new(10.0, -20.5, 300.0)
-                }
-            )
-        );
-        assert_eq!(
-            parse_line("2 goto 1 0 0 0").unwrap(),
-            (
-                2,
-                ControlCmd::Goto {
-                    bot: 1,
-                    pos: Vec3::ZERO
-                }
-            )
-        );
-        assert_eq!(
-            parse_line("9 rj 1 412").unwrap(),
-            (9, ControlCmd::Rj { bot: 1, link: 412 })
-        );
-    }
-
-    #[test]
-    fn parses_prep_defaults_and_overrides() {
-        assert_eq!(
-            parse_line("1 prep 1").unwrap(),
-            (
-                1,
-                ControlCmd::Prep {
-                    bot: 1,
-                    health: 100.0,
-                    rockets: 10.0
-                }
-            )
-        );
-        assert_eq!(
-            parse_line("1 prep 1 50 3").unwrap(),
-            (
-                1,
-                ControlCmd::Prep {
-                    bot: 1,
-                    health: 50.0,
-                    rockets: 3.0
-                }
-            )
-        );
-    }
-
-    #[test]
-    fn set_and_cmd_take_rest_of_line() {
-        assert_eq!(
-            parse_line("5 set rtx_rj_delay_bias 0.05").unwrap(),
-            (
-                5,
-                ControlCmd::Set {
-                    name: "rtx_rj_delay_bias".into(),
-                    value: "0.05".into()
-                }
-            )
-        );
-        assert_eq!(
-            parse_line("6 get rtx_rj_stance").unwrap(),
-            (
-                6,
-                ControlCmd::Get {
-                    name: "rtx_rj_stance".into()
-                }
-            )
-        );
-        assert_eq!(
-            parse_line("8 cmd map bravado").unwrap(),
-            (
-                8,
-                ControlCmd::Cmd {
-                    raw: "map bravado".into()
-                }
-            )
-        );
-    }
-
-    #[test]
-    fn rejects_malformed() {
-        assert!(parse_line("").is_err());
-        assert!(parse_line("notanumber status").is_err());
-        assert!(parse_line("1 bogusverb").is_err());
-        assert!(parse_line("1 rj 1").is_err()); // missing link
-        assert!(parse_line("1 teleport 1 0 0").is_err()); // missing z
-        assert!(parse_line("1 set").is_err()); // missing cvar
-    }
-
-    #[test]
     fn cvar_name_guard() {
         assert!(valid_cvar_name("rtx_rj_stance"));
         assert!(!valid_cvar_name("rtx; quit"));
         assert!(!valid_cvar_name(""));
         assert!(!valid_cvar_name("foo bar"));
-    }
-
-    #[test]
-    fn json_helpers_escape_and_format() {
-        assert_eq!(jnum(16.0), "16");
-        assert_eq!(jnum(f32::NAN), "null");
-        assert_eq!(jvec3(Vec3::new(1.0, 2.0, 3.0)), "[1,2,3]");
-        assert_eq!(jstr("a\"b\\c"), "\"a\\\"b\\\\c\"");
     }
 }

@@ -12,9 +12,10 @@
 //! Claude Code ──MCP stdio──▶ this bin ──TCP 127.0.0.1:port──▶ control.rs in librtx.dylib
 //!                              └─ spawns/kills playground/mvdsv (+exec rjtest.cfg)
 //!
-//! The control protocol is line-based: we send `<id> <verb> args…` and demux replies (`{"id":…}`)
-//! from unsolicited events (`{"ev":…}`) on the one inbound stream — a reply resolves its request's
-//! `oneshot`; an event fans out on a `broadcast` that the goto/rocket_jump tools await.
+//! The control protocol is framed msgpack of the typed [`rtx_ctlproto`] schema: we send a
+//! [`Request`] (`id` + [`Cmd`]) and demux [`Msg`] frames on the one inbound stream — a `Reply`
+//! resolves its request's `oneshot` (its typed [`Resp`] re-serialised to JSON for Claude); an
+//! [`Event`] fans out on a `broadcast` that the goto/rocket_jump tools await.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::BufRead;
@@ -29,9 +30,10 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
 use rmcp::transport::stdio;
 use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt};
+use rtx_ctlproto::{self as proto, Cmd, Event, Msg, Request, Resp};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, oneshot, Mutex as TokioMutex};
@@ -57,9 +59,55 @@ fn repo_root() -> PathBuf {
 /// share it), the pending-reply map keyed by request id, and a broadcast of unsolicited events.
 struct ControlConn {
     writer: TokioMutex<OwnedWriteHalf>,
-    pending: Arc<StdMutex<HashMap<i64, oneshot::Sender<Value>>>>,
+    pending: Arc<StdMutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>,
     events: broadcast::Sender<Value>,
     next_id: AtomicI64,
+}
+
+/// Read one length-prefixed (`[u32 LE len][payload]`) wire frame, or `None` at a clean end of stream.
+async fn read_frame_async(r: &mut (impl AsyncReadExt + Unpin)) -> std::io::Result<Option<Vec<u8>>> {
+    let mut len = [0u8; 4];
+    match r.read_exact(&mut len).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let n = u32::from_le_bytes(len) as usize;
+    let mut body = vec![0u8; n];
+    r.read_exact(&mut body).await?;
+    Ok(Some(body))
+}
+
+/// Unwrap a typed [`Resp`] to the JSON value handed to callers: the enum's inner payload (so a reply
+/// reads like its old `data` object/array), with the unit `Queued` mapped to `{"queued": true}`.
+fn resp_to_value(resp: Resp) -> Value {
+    if matches!(resp, Resp::Queued) {
+        return json!({ "queued": true });
+    }
+    match serde_json::to_value(&resp).unwrap_or(Value::Null) {
+        Value::Object(map) if map.len() == 1 => map.into_iter().next().map(|(_, v)| v).unwrap_or(Value::Null),
+        other => other,
+    }
+}
+
+/// Convert a typed [`Event`] to a JSON value tagged with an `ev` string (so the tool-side event
+/// filters — which match on `ev` + `bot` — keep working).
+fn event_to_value(ev: Event) -> Value {
+    let Value::Object(map) = serde_json::to_value(&ev).unwrap_or(Value::Null) else {
+        return Value::Null;
+    };
+    let Some((variant, Value::Object(mut fields))) = map.into_iter().next() else {
+        return Value::Null;
+    };
+    let name = match variant.as_str() {
+        "Arrived" => "arrived",
+        "GotoStall" => "goto_stall",
+        "RjResult" => "rj_result",
+        "FlyResult" => "fly_result",
+        other => other,
+    };
+    fields.insert("ev".to_string(), Value::String(name.to_string()));
+    Value::Object(fields)
 }
 
 impl ControlConn {
@@ -67,8 +115,9 @@ impl ControlConn {
     async fn connect(port: u16) -> std::io::Result<Arc<Self>> {
         let stream = TcpStream::connect(("127.0.0.1", port)).await?;
         let _ = stream.set_nodelay(true);
-        let (read, write) = stream.into_split();
-        let pending: Arc<StdMutex<HashMap<i64, oneshot::Sender<Value>>>> = Arc::new(StdMutex::new(HashMap::new()));
+        let (mut read, write) = stream.into_split();
+        let pending: Arc<StdMutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>> =
+            Arc::new(StdMutex::new(HashMap::new()));
         let (events, _) = broadcast::channel(256);
         let conn = Arc::new(ControlConn {
             writer: TokioMutex::new(write),
@@ -77,51 +126,42 @@ impl ControlConn {
             next_id: AtomicI64::new(1),
         });
         tokio::spawn(async move {
-            let mut lines = TokioBufReader::new(read).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            while let Ok(Some(frame)) = read_frame_async(&mut read).await {
+                let Ok(msg) = proto::decode::<Msg>(&frame) else {
                     continue;
                 };
-                if let Some(id) = v.get("id").and_then(Value::as_i64) {
-                    if let Some(tx) = pending.lock().unwrap().remove(&id) {
-                        let _ = tx.send(v);
+                match msg {
+                    Msg::Reply { id, result } => {
+                        if let Some(tx) = pending.lock().unwrap().remove(&id) {
+                            let _ = tx.send(result.map(resp_to_value));
+                        }
                     }
-                } else if v.get("ev").is_some() {
-                    let _ = events.send(v); // ignore "no subscribers"
+                    Msg::Event(ev) => {
+                        let _ = events.send(event_to_value(ev)); // ignore "no subscribers"
+                    }
                 }
             }
         });
         Ok(conn)
     }
 
-    /// Send `<id> verb` and await its id-tagged reply. Returns the reply's `data` on `ok`, else the
-    /// reported error string.
-    async fn request(&self, verb: &str, timeout: Duration) -> Result<Value, String> {
+    /// Send a [`Cmd`] as a framed request and await its id-tagged reply — the reply's payload value on
+    /// success, else the reported error string.
+    async fn request(&self, cmd: Cmd, timeout: Duration) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
+        let frame = proto::to_frame(&Request { id, cmd });
         {
             let mut w = self.writer.lock().await;
-            w.write_all(format!("{id} {verb}\n").as_bytes())
-                .await
-                .map_err(|e| e.to_string())?;
+            w.write_all(&frame).await.map_err(|e| e.to_string())?;
             w.flush().await.map_err(|e| e.to_string())?;
         }
         match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(reply)) => {
-                if reply.get("ok").and_then(Value::as_bool) == Some(true) {
-                    Ok(reply.get("data").cloned().unwrap_or(Value::Null))
-                } else {
-                    Err(reply
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown error")
-                        .to_string())
-                }
-            }
+            Ok(Ok(result)) => result,
             _ => {
                 self.pending.lock().unwrap().remove(&id);
-                Err(format!("timeout waiting for reply to '{verb}'"))
+                Err("timeout waiting for reply".to_string())
             }
         }
     }
@@ -198,8 +238,8 @@ impl RtxMcp {
             .ok_or_else(|| "not connected — call server_start or server_connect first".to_string())
     }
 
-    async fn req(&self, verb: &str, timeout: Duration) -> Result<Value, String> {
-        self.conn().await?.request(verb, timeout).await
+    async fn req(&self, cmd: Cmd, timeout: Duration) -> Result<Value, String> {
+        self.conn().await?.request(cmd, timeout).await
     }
 
     /// Resolve the target bot: the given `ent`, or the first live bot reported by `status`.
@@ -207,7 +247,7 @@ impl RtxMcp {
         if let Some(b) = bot {
             return Ok(b);
         }
-        let st = self.req("status", SHORT).await?;
+        let st = self.req(Cmd::Status, SHORT).await?;
         st.get("bots")
             .and_then(Value::as_array)
             .and_then(|a| a.first())
@@ -222,8 +262,9 @@ impl RtxMcp {
         if let Some(cached) = self.inner.links.lock().unwrap().clone() {
             return Ok(cached);
         }
-        let data = self.req("links", SHORT).await?;
-        let arr = data.get("links").and_then(Value::as_array).cloned().unwrap_or_default();
+        let data = self.req(Cmd::Links, SHORT).await?;
+        // `Resp::Links` decodes to a bare JSON array of link objects.
+        let arr = data.as_array().cloned().unwrap_or_default();
         *self.inner.links.lock().unwrap() = Some(arr.clone());
         Ok(arr)
     }
@@ -284,7 +325,7 @@ impl RtxMcp {
         // Wait for the navmesh to finish building and a bot to spawn.
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            if let Ok(st) = self.req("status", SHORT).await {
+            if let Ok(st) = self.req(Cmd::Status, SHORT).await {
                 let ready = st.get("navmesh").and_then(Value::as_str) == Some("ready");
                 let has_bot = st.get("bots").and_then(Value::as_array).is_some_and(|a| !a.is_empty());
                 if ready && has_bot {
@@ -295,8 +336,8 @@ impl RtxMcp {
                     let bot = st["bots"][0]["ent"]
                         .as_u64()
                         .ok_or_else(|| "ready status had no bot ent".to_string())? as u32;
-                    self.req(&format!("hold {bot}"), SHORT).await?;
-                    let mut status = self.req("status", SHORT).await?;
+                    self.req(Cmd::Hold { bot }, SHORT).await?;
+                    let mut status = self.req(Cmd::Status, SHORT).await?;
                     // Report which build is live, so a caller who just rebuilt can confirm it took.
                     if let (Some(obj), Some(from)) = (status.as_object_mut(), &staged) {
                         obj.insert("module".into(), json!(from));
@@ -324,7 +365,7 @@ impl RtxMcp {
             .await
             .map_err(|e| format!("could not connect to 127.0.0.1:{port}: {e}"))?;
         *self.inner.conn.lock().await = Some(conn);
-        self.req("status", SHORT).await
+        self.req(Cmd::Status, SHORT).await
     }
 
     fn tail_log(&self, n: usize) -> String {
@@ -345,13 +386,27 @@ impl RtxMcp {
         let src = vec3_of(entry.get("src").unwrap_or(&Value::Null))?;
         let mut out = json!({ "link": link, "bot": bot });
 
-        self.req(&format!("prep {bot}"), SHORT).await?;
+        self.req(
+            Cmd::Prep {
+                bot,
+                health: 100.0,
+                rockets: 10.0,
+            },
+            SHORT,
+        )
+        .await?;
 
         if via == "goto" {
             let conn = self.conn().await?;
             let rx = conn.events.subscribe();
-            self.req(&format!("goto {bot} {} {} {}", src[0], src[1], src[2]), SHORT)
-                .await?;
+            self.req(
+                Cmd::Goto {
+                    bot,
+                    pos: [src[0], src[1], src[2]],
+                },
+                SHORT,
+            )
+            .await?;
             let ev = conn
                 .await_event(
                     rx,
@@ -367,13 +422,19 @@ impl RtxMcp {
                 return Ok(out);
             }
         } else {
-            self.req(&format!("teleport {bot} {} {} {}", src[0], src[1], src[2]), SHORT)
-                .await?;
+            self.req(
+                Cmd::Teleport {
+                    bot,
+                    pos: [src[0], src[1], src[2]],
+                },
+                SHORT,
+            )
+            .await?;
         }
 
         let conn = self.conn().await?;
         let rx = conn.events.subscribe();
-        self.req(&format!("rj {bot} {link}"), SHORT).await?;
+        self.req(Cmd::Rj { bot, link }, SHORT).await?;
         let ev = conn
             .await_event(rx, |v| is_ev(v, "rj_result", bot), Duration::from_secs(15))
             .await?;
@@ -926,7 +987,7 @@ impl RtxMcp {
         and each bot's team, stack, inventory, posture, perceived enemy, item plan, and route head."
     )]
     async fn status(&self) -> Result<CallToolResult, McpError> {
-        finish(self.req("status", SHORT).await)
+        finish(self.req(Cmd::Status, SHORT).await)
     }
 
     #[tool(
@@ -936,17 +997,26 @@ impl RtxMcp {
         pickup locations from the bsp."
     )]
     async fn items(&self) -> Result<CallToolResult, McpError> {
-        finish(self.req("items", SHORT).await)
+        finish(self.req(Cmd::Items, SHORT).await)
     }
 
     #[tool(description = "Read a live server cvar as both its exact string and numeric value.")]
     async fn get_cvar(&self, Parameters(a): Parameters<CvarArgs>) -> Result<CallToolResult, McpError> {
-        finish(self.req(&format!("get {}", a.name), SHORT).await)
+        finish(self.req(Cmd::Get { name: a.name }, SHORT).await)
     }
 
     #[tool(description = "Set a live server cvar through the validated control protocol.")]
     async fn set_cvar(&self, Parameters(a): Parameters<SetCvarArgs>) -> Result<CallToolResult, McpError> {
-        finish(self.req(&format!("set {} {}", a.name, a.value), SHORT).await)
+        finish(
+            self.req(
+                Cmd::Set {
+                    name: a.name,
+                    value: a.value,
+                },
+                SHORT,
+            )
+            .await,
+        )
     }
 
     #[tool(
@@ -957,7 +1027,16 @@ impl RtxMcp {
         let mut results = Vec::with_capacity(a.cvars.len());
         let mut succeeded = 0usize;
         for cvar in a.cvars {
-            match self.req(&format!("set {} {}", cvar.name, cvar.value), SHORT).await {
+            match self
+                .req(
+                    Cmd::Set {
+                        name: cvar.name.clone(),
+                        value: cvar.value.clone(),
+                    },
+                    SHORT,
+                )
+                .await
+            {
                 Ok(result) => {
                     succeeded += 1;
                     results.push(json!({
@@ -991,14 +1070,14 @@ impl RtxMcp {
     async fn match_start(&self) -> Result<CallToolResult, McpError> {
         let r = async {
             self.inner.links.lock().unwrap().take();
-            self.req("match_start", SHORT).await?;
+            self.req(Cmd::MatchStart, SHORT).await?;
             let started = Instant::now();
             let mut last_start_attempt = started;
             let mut start_attempts = 1u32;
             let deadline = started + Duration::from_secs(90);
             let mut last = Value::Null;
             loop {
-                if let Ok(st) = self.req("status", SHORT).await {
+                if let Ok(st) = self.req(Cmd::Status, SHORT).await {
                     let phase = st.pointer("/match/phase").and_then(Value::as_str);
                     let nav_ready = st.get("navmesh").and_then(Value::as_str) == Some("ready");
                     let roster_len = st
@@ -1013,7 +1092,7 @@ impl RtxMcp {
                     // the control socket before the lifecycle is startable. Retry only while a settled
                     // server still reports warmup; an accepted start immediately enters reload/countdown.
                     if phase == Some("warmup") && last_start_attempt.elapsed() >= Duration::from_secs(1) {
-                        self.req("match_start", SHORT).await?;
+                        self.req(Cmd::MatchStart, SHORT).await?;
                         last_start_attempt = Instant::now();
                         start_attempts += 1;
                     }
@@ -1039,7 +1118,7 @@ impl RtxMcp {
         outgoing link kinds, costs, and hazards."
     )]
     async fn inspect_cell(&self, Parameters(a): Parameters<CellArgs>) -> Result<CallToolResult, McpError> {
-        finish(self.req(&format!("cell {} {} {}", a.x, a.y, a.z), SHORT).await)
+        finish(self.req(Cmd::Cell { pos: [a.x, a.y, a.z] }, SHORT).await)
     }
 
     #[tool(
@@ -1049,7 +1128,7 @@ impl RtxMcp {
     async fn bot_route(&self, Parameters(a): Parameters<BotArgs>) -> Result<CallToolResult, McpError> {
         let r = async {
             let bot = self.resolve_bot(a.bot).await?;
-            self.req(&format!("route {bot}"), SHORT).await
+            self.req(Cmd::Route { bot }, SHORT).await
         }
         .await;
         finish(r)
@@ -1063,8 +1142,8 @@ impl RtxMcp {
     async fn audit(&self, Parameters(a): Parameters<AuditArgs>) -> Result<CallToolResult, McpError> {
         let r = async {
             let bot = self.resolve_bot(a.bot).await?;
-            let lines = a.lines.unwrap_or(200);
-            self.req(&format!("audit {bot} {lines}"), SHORT).await
+            let lines = a.lines.unwrap_or(200) as u32;
+            self.req(Cmd::Audit { bot, lines }, SHORT).await
         }
         .await;
         finish(r)
@@ -1075,7 +1154,7 @@ impl RtxMcp {
         gain), including run-up, takeoff, target, required speed, and gain."
     )]
     async fn list_curl_links(&self) -> Result<CallToolResult, McpError> {
-        finish(self.req("curls", SHORT).await)
+        finish(self.req(Cmd::Curls, SHORT).await)
     }
 
     #[tool(description = "Tail the managed server's console output.")]
@@ -1101,7 +1180,15 @@ impl RtxMcp {
             let bot = self.resolve_bot(a.bot).await?;
             let h = a.health.unwrap_or(100.0);
             let rk = a.rockets.unwrap_or(10.0);
-            self.req(&format!("prep {bot} {h} {rk}"), SHORT).await
+            self.req(
+                Cmd::Prep {
+                    bot,
+                    health: h,
+                    rockets: rk,
+                },
+                SHORT,
+            )
+            .await
         }
         .await;
         finish(r)
@@ -1124,8 +1211,7 @@ impl RtxMcp {
             } else {
                 [a.x.unwrap_or(0.0), a.y.unwrap_or(0.0), a.z.unwrap_or(0.0)]
             };
-            self.req(&format!("teleport {bot} {} {} {}", pos[0], pos[1], pos[2]), SHORT)
-                .await
+            self.req(Cmd::Teleport { bot, pos }, SHORT).await
         }
         .await;
         finish(r)
@@ -1141,7 +1227,14 @@ impl RtxMcp {
             let timeout = Duration::from_secs_f32(a.timeout.unwrap_or(30.0));
             let conn = self.conn().await?;
             let rx = conn.events.subscribe();
-            self.req(&format!("goto {bot} {} {} {}", a.x, a.y, a.z), SHORT).await?;
+            self.req(
+                Cmd::Goto {
+                    bot,
+                    pos: [a.x, a.y, a.z],
+                },
+                SHORT,
+            )
+            .await?;
             conn.await_event(rx, |v| is_ev(v, "arrived", bot) || is_ev(v, "goto_stall", bot), timeout)
                 .await
         }
@@ -1170,11 +1263,9 @@ impl RtxMcp {
             let mut results = Vec::with_capacity(trials as usize);
             let mut all_passed = true;
             for trial in 1..=trials {
-                self.req(&format!("teleport {bot} {} {} {}", start[0], start[1], start[2]), SHORT)
-                    .await?;
+                self.req(Cmd::Teleport { bot, pos: start }, SHORT).await?;
                 let rx = conn.events.subscribe();
-                self.req(&format!("goto {bot} {} {} {}", end[0], end[1], end[2]), SHORT)
-                    .await?;
+                self.req(Cmd::Goto { bot, pos: end }, SHORT).await?;
                 let ev = conn
                     .await_event(rx, |v| is_ev(v, "arrived", bot) || is_ev(v, "goto_stall", bot), timeout)
                     .await?;
@@ -1223,7 +1314,7 @@ impl RtxMcp {
             let timeout = Duration::from_secs_f32(a.timeout.unwrap_or(15.0));
             let conn = self.conn().await?;
             let rx = conn.events.subscribe();
-            self.req(&format!("rj {bot} {}", a.link), SHORT).await?;
+            self.req(Cmd::Rj { bot, link: a.link }, SHORT).await?;
             conn.await_event(rx, |v| is_ev(v, "rj_result", bot), timeout).await
         }
         .await;
@@ -1266,7 +1357,14 @@ impl RtxMcp {
                 ("rtx_rj_pitch_bias", a.pitch_bias),
             ] {
                 if let Some(v) = val {
-                    self.req(&format!("set {name} {v}"), SHORT).await?;
+                    self.req(
+                        Cmd::Set {
+                            name: name.to_string(),
+                            value: v.to_string(),
+                        },
+                        SHORT,
+                    )
+                    .await?;
                     set.insert(name.to_string(), json!(v));
                 }
             }
@@ -1281,7 +1379,14 @@ impl RtxMcp {
         let r = async {
             let mut out = serde_json::Map::new();
             for name in KNOBS {
-                let d = self.req(&format!("get {name}"), SHORT).await?;
+                let d = self
+                    .req(
+                        Cmd::Get {
+                            name: (*name).to_string(),
+                        },
+                        SHORT,
+                    )
+                    .await?;
                 out.insert((*name).to_string(), d.get("value").cloned().unwrap_or(Value::Null));
             }
             Ok(Value::Object(out))
@@ -1298,7 +1403,7 @@ impl RtxMcp {
         if a.command.contains("map") {
             self.inner.links.lock().unwrap().take();
         }
-        finish(self.req(&format!("cmd {}", a.command), SHORT).await)
+        finish(self.req(Cmd::RunCmd { raw: a.command }, SHORT).await)
     }
 }
 

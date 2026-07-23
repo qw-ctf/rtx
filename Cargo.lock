@@ -2697,6 +2697,7 @@ dependencies = [
  "rayon",
  "reqwest",
  "rtx-auditlog",
+ "rtx-ctlproto",
  "rtx-nav",
  "rtx-proto",
 ]
@@ -2706,6 +2707,8 @@ name = "rtx-mcp"
 version = "0.1.0"
 dependencies = [
  "rmcp",
+ "rmp-serde",
+ "rtx-ctlproto",
  "serde",
  "serde_json",
  "tokio",
