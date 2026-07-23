@@ -46,12 +46,12 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
     use CvarSeed::{Bool, Float, Str};
     &[
         // Mid-air double jump, on by default (set `rtx_doublejump 0` to disable).
-        ("rtx_doublejump", Bool(true)),
+        ("rtx_doublejump", Bool(false)),
         // Bots bunnyhop (air-strafe to build speed) on open stretches; on by default.
         ("rtx_bot_bhop", Bool(true)),
         // Generate curl jumps (run-up down a corridor, air-turn onto an offset platform), certified by
         // a pmove rollout in the navmesh build. A sub-toggle of bhop (`rtx_bot_bhop 0` disables it too).
-        ("rtx_bot_curljump", Bool(false)),
+        ("rtx_bot_curljump", Bool(true)),
         // Bots ground-zigzag (circle-strafe) on straight corridors too short to hop; on by default.
         // A sub-toggle of the bhop controller — `rtx_bot_bhop 0` disables it regardless.
         ("rtx_bot_zigzag", Bool(true)),
@@ -93,16 +93,16 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // waterlevel-1 lava cell at ~1.7s.
         ("rtx_bot_hazard_k", Float(15.0)),
         // Wall jump (kick off a wall you jump into), on by default (`rtx_walljump 0` to disable).
-        ("rtx_walljump", Bool(true)),
+        ("rtx_walljump", Bool(false)),
         // Elevator jump: a rising lift boosts your jump by `lift_speed * rtx_elevator_jump`. A
         // multiplier (0 disables, 1 = add the lift's true speed, 2 = double it, …).
-        ("rtx_elevator_jump", Float(2.0)),
+        ("rtx_elevator_jump", Float(0.0)),
         // Shoot live grenades to detonate them early, on by default (`rtx_shootable_grenades 0`
         // to restore classic non-shootable grenades).
-        ("rtx_shootable_grenades", Bool(true)),
+        ("rtx_shootable_grenades", Bool(false)),
         // Grappling hook (purectf port), on by default — every player spawns with it (impulse 22
         // to select). `rtx_grapple 0` to disable.
-        ("rtx_grapple", Bool(true)),
+        ("rtx_grapple", Bool(false)),
         // Hook throw / reel-in speed multipliers (purectf's `localinfo hookspeed`/`hookpull`), each
         // scaling its base `× sv_maxspeed`. Defaults match purectf's shipped server.cfg.
         ("rtx_hook_speed", Float(1.25)),
@@ -112,7 +112,7 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // whose token is absent is removed everywhere: its map pickup (`weapon_*`) is dropped at map
         // load and it's stripped from every spawn kit (so it can never be picked up or fired).
         // Unknown tokens are ignored. `hook` composes with `rtx_grapple` (both must allow it).
-        ("rtx_weapons", Str("axe hook sg ssg ng sng gl rl lg")),
+        ("rtx_weapons", Str("axe sg ssg ng sng gl rl lg")),
         // Game mode (ruleset): `dm` (deathmatch, the default), `ra` (Rocket Arena), `midair`, or
         // `ctf`. Read live each frame. A string cvar. See `crate::mode`.
         ("rtx_mode", Str("dm")),
@@ -142,8 +142,8 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // boost (Haste is attack-rate only). Runes spawn only in CTF.
         ("rtx_runes", Float(0.0)),
         // CTF: allow voluntarily tossing your carried flag (impulse 26) / held rune (impulse 24).
-        ("rtx_ctf_tossflag", Bool(false)),
-        ("rtx_ctf_tossrune", Bool(false)),
+        ("rtx_ctf_tossflag", Bool(true)),
+        ("rtx_ctf_tossrune", Bool(true)),
         // Any mode: let players drop items for teammates — a capped ammo backpack (impulse 20) and
         // the current weapon (impulse 21), as in purectf. `0` disables both.
         ("rtx_dropitems", Bool(false)),
@@ -158,7 +158,7 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         ("rtx_bot_count", Float(0.0)),
         ("rtx_bot_skill", Float(3.0)),
         // Keep bots on the server even with no humans connected (default off).
-        ("rtx_bot_alone", Bool(false)),
+        ("rtx_bot_alone", Bool(true)),
         // Pacifist bots: in FFA, don't fight — just trail the nearest human (for experimenting).
         ("rtx_bot_pacifist", Bool(false)),
         // Greedy bots: let a fighting bot break off to grab a compelling nearby pickup (powerup, a
@@ -227,7 +227,7 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // old behavior). `rtx_bot_reaction` is the base delay (seconds) a target must stay seen
         // before the bot reacts, shortened with skill; 0 = instant. Both 0 ≈ pre-perception bots.
         ("rtx_bot_fov", Float(120.0)),
-        ("rtx_bot_reaction", Float(0.4)),
+        ("rtx_bot_reaction", Float(0.01)),
         // Ceiling on how fast a bot's view turns (deg/s) — the aim spring's angular-speed clamp, so a
         // large look-target flip (a spawn-wait scan, a goal re-pick, a flickering enemy) is a fast human
         // pan, not an instant snap or a spin. 0 = the skill-scaled default (`combat::aim_rate_cap`);
