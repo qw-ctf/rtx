@@ -2670,6 +2670,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtx-ctlproto"
+version = "0.1.0"
+dependencies = [
+ "rmp-serde",
+ "rtx-auditlog",
+ "serde",
+]
+
+[[package]]
 name = "rtx-demo-tool"
 version = "0.1.0"
 dependencies = [

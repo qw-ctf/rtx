@@ -68,7 +68,7 @@ pub enum Commit {
 /// A fixed-capacity inline string (no heap allocation), used for the short `&'static str` reason tags
 /// the game carries (e.g. why a bhop run ended). Captured by value into every frame; renders back to
 /// `&str` on inspection. Truncates silently past [`Tag::CAP`].
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tag {
     len: u8,
     buf: [u8; Tag::CAP],
@@ -115,7 +115,7 @@ impl std::fmt::Debug for Tag {
 /// handful of field writes with no allocation and no string formatting. Boolean sensor bits are packed
 /// into `flags` (see the `flags::*` masks). The record is a stable serde schema: adding fields is
 /// fine, but reorder/rename with the MCP decoder in mind.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AuditFrame {
     /// Game time of the frame (s).
     pub t: f32,
