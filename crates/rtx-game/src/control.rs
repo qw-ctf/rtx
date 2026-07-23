@@ -790,7 +790,7 @@ fn curl_json(game: &GameState, src: Vec3, tgt: Vec3) -> Result<String, String> {
             } else {
                 let v_xy = s.vel.xy();
                 let err = wrap180(yaw_of(tgt.xy() - s.origin.xy()) - yaw_of(v_xy));
-                let omega = (err.abs() * gain).min(bhop::omega_max(v_xy.length().max(1.0), amax, dt));
+                let omega = (err.abs() * gain).min(bhop::omega_gain_max(v_xy.length().max(1.0), amax, dt));
                 let st = bhop::strafe_rate(v_xy, sigma, omega, amax, dt);
                 bhop::Cmd { view_yaw: st.view_yaw, forward: st.forward, side: st.side, jump: false }
             };

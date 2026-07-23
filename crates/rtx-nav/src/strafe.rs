@@ -26,8 +26,8 @@ pub const AIR_CORRECT_GAIN_DEFAULT: f32 = AIR_CORRECT_GAIN;
 pub struct Strafe {
     /// View yaw to send (degrees).
     pub view_yaw: f32,
-    /// `forward` move component: 0 in the air (single-key strafe); the bearing-aligned share of the
-    /// wish during a ground prestrafe.
+    /// `forward` move component: the velocity-aligned share of the wish (0 for a perpendicular
+    /// max-gain strafe, positive for a gentle curl, negative for an emergency max-turn carve).
     pub forward: f32,
     /// `side` move component (± [`MOVE_SPEED`]).
     pub side: f32,
@@ -63,13 +63,48 @@ pub fn theta_star(speed: f32, a_max: f32) -> f32 {
     (u_star / speed.max(1.0)).clamp(0.0, 1.0).acos().to_degrees()
 }
 
-/// The fastest heading turn rate (deg/s) an air-strafe can sustain at `speed`: a perpendicular
-/// strafe adds `min(a_max, cap)` ups sideways per tick, rotating the velocity by `atan(that/speed)`.
-/// This is the ceiling [`strafe_rate`] clamps a requested rate to (and where it degenerates to the
-/// max-gain [`theta_star`] angle).
-pub fn omega_max(speed: f32, a_max: f32, dt: f32) -> f32 {
+/// Heading turn rate (deg/s) of the **maximum-speed-gain** air strafe at `speed`: a perpendicular
+/// wish adds `min(a_max, cap)` ups sideways per tick, rotating velocity by `atan(that/speed)`.
+/// This is deliberately not the absolute maximum turn rate; [`max_turn_strafe`] spends a little
+/// speed to turn harder when collision avoidance matters more than acceleration.
+pub fn omega_gain_max(speed: f32, a_max: f32, dt: f32) -> f32 {
     let a = a_max.min(AIR_CAP);
     (a / speed.max(1.0)).atan().to_degrees() / dt.max(1e-4)
+}
+
+/// The maximum non-reversing heading-change air command. In the normal `a_max < speed` regime, with
+/// wish projection `u` onto velocity and a full acceleration vector of length `a_max`, maximizing
+/// the resultant angle gives `u = −a_max`, or `theta = acos(−a_max/speed)`: slightly behind
+/// perpendicular. The resulting turn is `asin(a_max/speed)`, versus the max-gain
+/// `atan(min(a_max, cap)/speed)`, while speed falls only to `sqrt(speed² − a_max²)`.
+///
+/// At unusually low speed/coarse ticks (`a_max >= speed`), solve the wish projection that leaves
+/// zero forward velocity, then remain infinitesimally on its forward side. This approaches a 90°
+/// carve without ever making emergency avoidance issue a reverse/U-turn command.
+pub fn max_turn_strafe(v_xy: Vec2, sigma: f32, a_max: f32) -> Strafe {
+    let speed = v_xy.length().max(1.0);
+    let vel_yaw = yaw_of(v_xy);
+    let projection = if a_max < speed {
+        -a_max
+    } else {
+        // In the full-acceleration region, `x' = s + A·u/s = 0` at `u = -s²/A`.
+        // If that lies beyond the cap boundary, solve `s + (cap-u)·u/s = 0` instead.
+        let full_stop = -(speed * speed) / a_max.max(1e-4);
+        let cap_stop = (AIR_CAP - (AIR_CAP * AIR_CAP + 4.0 * speed * speed).sqrt()) * 0.5;
+        let stopped = if full_stop <= AIR_CAP - a_max {
+            full_stop
+        } else {
+            cap_stop
+        };
+        stopped + speed * 1e-5
+    };
+    let theta = (projection / speed).clamp(-1.0, 1.0).acos();
+    Strafe {
+        view_yaw: vel_yaw,
+        forward: MOVE_SPEED * theta.cos(),
+        side: -sigma * MOVE_SPEED * theta.sin(),
+        sigma,
+    }
 }
 
 /// An air-strafe that turns the velocity at a *chosen* rate `omega_deg` (deg/s) rather than the
@@ -77,7 +112,7 @@ pub fn omega_max(speed: f32, a_max: f32, dt: f32) -> f32 {
 /// speed the tick adds: `a_need = speed·tan(ω·dt)`. Angling the wish so its projection onto the
 /// velocity is `cap − a_need` (i.e. `θ = acos((cap − a_need)/speed)`, forward of perpendicular)
 /// delivers exactly that sideways add while the parallel component still grows the speed. When the
-/// requested rate meets or exceeds what the tick can physically deliver, fall back to the max-rate
+/// requested rate meets or exceeds what max-gain geometry can deliver, fall back to the max-gain
 /// [`theta_star`] angle (perpendicular). `sigma` is the strafe side (±1).
 ///
 /// The wish (world direction `vel_yaw + sigma·θ`) is expressed with the **view riding the velocity**
@@ -92,7 +127,10 @@ pub fn strafe_rate(v_xy: Vec2, sigma: f32, omega_deg: f32, a_max: f32, dt: f32) 
     let theta = if a_need >= cap {
         theta_star(speed, a_max)
     } else {
-        ((AIR_CAP - a_need).max(0.0) / speed).clamp(0.0, 1.0).acos().to_degrees()
+        ((AIR_CAP - a_need).max(0.0) / speed)
+            .clamp(0.0, 1.0)
+            .acos()
+            .to_degrees()
     };
     let tr = theta.to_radians();
     Strafe {
@@ -114,7 +152,7 @@ pub fn air_correct(v_xy: Vec2, bearing: f32, a_max: f32, dt: f32, gain: f32) -> 
     let speed = v_xy.length().max(1.0);
     let vel_yaw = yaw_of(v_xy);
     let err = wrap180(bearing - vel_yaw);
-    let omega = (err.abs() * gain).min(omega_max(speed, a_max, dt));
+    let omega = (err.abs() * gain).min(omega_gain_max(speed, a_max, dt));
     strafe_rate(v_xy, err.signum(), omega, a_max, dt)
 }
 
@@ -161,4 +199,85 @@ pub fn wishdir_fs(view_yaw: f32, forward: f32, side: f32) -> Vec2 {
 /// [`wishdir_fs`] for the single-key air strafe (`forward = 0`).
 pub fn wishdir_of(view_yaw: f32, side: f32) -> Vec2 {
     wishdir_fs(view_yaw, 0.0, side)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ACCEL: f32 = 10.0;
+    const MAXSPEED: f32 = 320.0;
+    const DT: f32 = 1.0 / 77.0;
+
+    #[test]
+    fn emergency_turn_is_the_one_tick_heading_maximum() {
+        for speed in [320.0f32, 450.0, 500.0, 800.0] {
+            let v = Vec2::new(speed, 0.0);
+            let a_max = air_accel_max(ACCEL, MAXSPEED, DT);
+            let cmd = max_turn_strafe(v, 1.0, a_max);
+            let result = apply_airaccel(v, wishdir_fs(cmd.view_yaw, cmd.forward, cmd.side), MAXSPEED, ACCEL, DT);
+            let best_turn = yaw_of(result);
+            let expected = (a_max / speed).asin().to_degrees();
+            assert!(
+                (best_turn - expected).abs() < 0.01,
+                "speed {speed}: {best_turn}° != {expected}°"
+            );
+
+            // Exhaustively bracket the command in wish-angle space. No ordinary forward/back/side
+            // combination may produce a larger positive heading change through the engine oracle.
+            for tenth_degree in 0..=1800 {
+                let theta = tenth_degree as f32 * 0.1;
+                let radians = theta.to_radians();
+                let wish = Vec2::new(radians.cos(), radians.sin());
+                let candidate = apply_airaccel(v, wish, MAXSPEED, ACCEL, DT);
+                assert!(
+                    yaw_of(candidate) <= best_turn + 0.001,
+                    "speed {speed}: wish {theta}° turned {}° > {best_turn}°",
+                    yaw_of(candidate)
+                );
+            }
+
+            let gain_turn = omega_gain_max(speed, a_max, DT) * DT;
+            assert!(
+                best_turn > gain_turn * 1.3,
+                "speed {speed}: {best_turn}° vs gain {gain_turn}°"
+            );
+            assert!(
+                result.length() > speed * 0.99,
+                "speed {speed}: excessive loss to {}",
+                result.length()
+            );
+        }
+    }
+
+    #[test]
+    fn emergency_turn_never_reverses_at_low_speed_or_coarse_ticks() {
+        for (speed, dt) in [(20.0f32, DT), (40.0, DT), (100.0, 0.05)] {
+            let v = Vec2::new(speed, 0.0);
+            let a_max = air_accel_max(ACCEL, MAXSPEED, dt);
+            let cmd = max_turn_strafe(v, 1.0, a_max);
+            let result = apply_airaccel(v, wishdir_fs(cmd.view_yaw, cmd.forward, cmd.side), MAXSPEED, ACCEL, dt);
+            let best_turn = yaw_of(result);
+            assert!(
+                result.dot(v) > 0.0,
+                "speed {speed}, dt {dt}: emergency reversed to {result:?}"
+            );
+            assert!(
+                (0.0..=90.0).contains(&best_turn),
+                "speed {speed}, dt {dt}: turned {best_turn}°"
+            );
+
+            for tenth_degree in 0..=1800 {
+                let theta = tenth_degree as f32 * 0.1;
+                let radians = theta.to_radians();
+                let candidate = apply_airaccel(v, Vec2::new(radians.cos(), radians.sin()), MAXSPEED, ACCEL, dt);
+                if candidate.dot(v) > 0.0 {
+                    assert!(
+                        yaw_of(candidate) <= best_turn + 0.05,
+                        "speed {speed}, dt {dt}: non-reversing wish {theta}° beat {best_turn}°"
+                    );
+                }
+            }
+        }
+    }
 }

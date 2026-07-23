@@ -19,7 +19,7 @@ pub(crate) struct HumanMovementProfile {
     pub lobe_deadband: f32,
     pub error_gain: f32,
     pub zigzag_band_cap: f32,
-    /// Reverse at three fixed phases of each hop instead of heading-error hysteresis.
+    /// Reverse three times at scheduled hop phases instead of heading-error hysteresis.
     pub phase_locked_flips: bool,
 }
 

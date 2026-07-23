@@ -51,7 +51,7 @@ const AIR_FLIP_PHASES: [f32; 3] = [8.0 / 52.0, 0.5, 44.0 / 52.0];
 /// Below this, retain heading-error reversals: their shorter transient is safer during launch.
 const PHASE_LOCK_MIN_SPEED: f32 = 600.0;
 
-/// The profile's air-lobe rate is a request, capped by [`omega_max`]. Dedicated high-speed QWD
+/// The profile's air-lobe rate is a request, capped by [`omega_gain_max`]. Dedicated high-speed QWD
 /// bunny runs put almost every moving command near perpendicular to velocity, so the calibrated
 /// profile deliberately requests that physical maximum instead of the old gentle-rate compromise.
 /// View yaw still rides the velocity in [`strafe_rate`]; changing strafe side bends the path without
@@ -109,7 +109,7 @@ pub const ZIGZAG_ENGAGE: f32 = 96.0;
 /// corridor — clamp the deadband so the S-curve stays inside the walls. Launch prestrafe (which
 /// has a long runway by construction) is left uncapped.
 
-// `air_accel_max`, `theta_star`, `omega_max`, `strafe_rate`, `air_correct`, and `AIR_CORRECT_GAIN_DEFAULT`
+// `air_accel_max`, `theta_star`, `omega_gain_max`, `strafe_rate`, `air_correct`, and `AIR_CORRECT_GAIN_DEFAULT`
 // now live in `rtx_nav::strafe` (glob-re-exported above), shared with the navmesh build's curl certifier.
 
 /// Heading deadband (degrees) for the strafe-sign weave, sized from the physics so the sign flips
@@ -138,10 +138,10 @@ fn weave_sigma(err: f32, prev_sigma: f32, band: f32) -> f32 {
     }
 }
 
-/// The **max-rate** air-strafe: aim the view so a single held strafe key puts the wish direction at
+/// The **max-gain** air-strafe: aim the view so a single held strafe key puts the wish direction at
 /// the speed-*optimal* ([`theta_star`], ~perpendicular) angle off the velocity, and weave the strafe
-/// side toward `wp_bearing`. This is [`strafe_rate`] at [`omega_max`] — maximum speed gain, maximum
-/// turn rate (hence the repeated weave). The calibrated live hop path now selects the same regime;
+/// side toward `wp_bearing`. This is [`strafe_rate`] at [`omega_gain_max`] — maximum speed gain and
+/// its corresponding turn rate. The calibrated live hop path now selects the same regime;
 /// this remains the reference primitive and speed-gain oracle used by the unit tests and navmesh
 /// speed-jump model.
 #[allow(dead_code)]
@@ -478,7 +478,7 @@ impl Bhop {
                 // Moving the middle reversal earlier by `b` changes the signed turn time by
                 // `2b·T_HOP`. Apply a finite-pmove correction to that first-order solution, capped
                 // so all four lobes remain substantial and the three-reversal gait cannot collapse.
-                let omega = omega_max(speed, a_max, dt).max(1.0);
+                let omega = omega_gain_max(speed, a_max, dt).max(1.0);
                 let bias = (err.abs() / (1.5 * omega * T_HOP)).clamp(0.0, 0.18);
                 self.air_mid_phase -= bias;
             }
@@ -506,7 +506,7 @@ impl Bhop {
     }
 
     /// One air-strafe frame at the profile's requested lobe rate, capped at the physical
-    /// [`omega_max`]. Flip the strafe side once the heading has curved past the profile deadband;
+    /// [`omega_gain_max`]. Flip the strafe side once the heading has curved past the profile deadband;
     /// the symmetric threshold makes the max-gain S-curve self-center on the route.
     fn air_strafe(&mut self, i: &Input, speed: f32, a_max: f32, dt: f32, profile: HumanMovementProfile) -> Strafe {
         let vel_yaw = yaw_of(i.v_xy);
@@ -521,7 +521,7 @@ impl Bhop {
             if err.abs() > 1.0 {
                 self.sigma = err.signum();
             }
-            return strafe_rate(i.v_xy, self.sigma, omega_max(speed, a_max, dt), a_max, dt);
+            return max_turn_strafe(i.v_xy, self.sigma, a_max);
         }
         if self.air_phase_locked {
             // Four symmetric, unequal lobes put three human/optimizer-style direction changes at
@@ -545,7 +545,7 @@ impl Bhop {
         let omega = (profile.omega_base
             + err.abs() / T_HOP
             + (err.abs() - profile.lobe_deadband).max(0.0) * profile.error_gain)
-            .min(omega_max(speed, a_max, dt));
+            .min(omega_gain_max(speed, a_max, dt));
         strafe_rate(i.v_xy, self.sigma, omega, a_max, dt)
     }
 
@@ -712,10 +712,10 @@ mod tests {
         let dt = 1.0 / 77.0;
         let a = air_accel_max(ACCEL, MAXSPEED, dt);
         for &s in &[350.0f32, 500.0, 700.0] {
-            let wmax = omega_max(s, a, dt);
+            let wmax = omega_gain_max(s, a, dt);
             for &omega in &[60.0f32, 100.0, 150.0] {
                 if omega >= wmax {
-                    continue; // beyond the physical ceiling — degenerates to max-rate, tested elsewhere
+                    continue; // beyond the gain-preserving ceiling — degenerates to max-gain
                 }
                 let v = Vec2::new(s, 0.0);
                 let cmd = strafe_rate(v, 1.0, omega, a, dt);
@@ -1110,6 +1110,29 @@ mod sim {
     }
 
     #[test]
+    fn high_speed_hop_has_exactly_three_phase_locked_reversals() {
+        for speed in [600.0, 800.0] {
+            let mut w = World::grounded(speed);
+            let mut b = Bhop::default();
+            let mut was_airborne = false;
+            for frame in 0..100 {
+                let now = frame as f32 * DT;
+                let cmd = b
+                    .step(&input(&w, 0.0, 4096.0, now), &ENV)
+                    .expect("high-speed hop owns frame");
+                pm_frame(&mut w, &cmd, false);
+                was_airborne |= !w.on_ground;
+                if was_airborne && w.on_ground {
+                    break;
+                }
+            }
+            assert!(was_airborne && w.on_ground, "{speed} ups hop never completed");
+            assert_eq!(b.hops, 1, "{speed} ups test should stop on its first landing");
+            assert_eq!(b.flips, 3, "{speed} ups hop did not use the three-reversal gait");
+        }
+    }
+
+    #[test]
     fn never_leaps_below_full_run() {
         // A human runs up before leaping. From a near-standstill, no takeoff may happen below the
         // launch floor (full maxspeed) on a long runway (via Prestrafe), a medium one, or a short one
@@ -1358,15 +1381,19 @@ mod sim {
         let mut b = Bhop::default();
         let cmd = b.step(&inp, &ENV).expect("airborne engaged");
         let wd = wishdir_fs(cmd.view_yaw, cmd.forward, cmd.side);
-        let turned = apply_airaccel(w.v, wd, ENV.maxspeed, ENV.accel, DT)
-            .y
-            .atan2(w.v.x)
-            .to_degrees();
-        let wmax = omega_max(450.0, a, DT) * DT; // max per-tick heading change
+        let v2 = apply_airaccel(w.v, wd, ENV.maxspeed, ENV.accel, DT);
+        let turned = yaw_of(v2);
+        let wmax = (a / 450.0).asin().to_degrees();
+        let gain_turn = omega_gain_max(450.0, a, DT) * DT;
         assert!(turned > 0.0, "should carve toward the +60° bearing, turned {turned}°");
+        assert!((turned - wmax).abs() < 0.02, "carve {turned}° should be ~max {wmax}°");
         assert!(
-            (turned - wmax).abs() < 0.15 * wmax + 0.05,
-            "carve {turned}° should be ~max {wmax}°"
+            turned > gain_turn * 1.3,
+            "emergency {turned}° barely beat max-gain {gain_turn}°"
+        );
+        assert!(
+            v2.length() > w.v.length() * 0.99,
+            "emergency carve discarded too much speed"
         );
     }
 
