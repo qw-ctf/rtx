@@ -686,25 +686,35 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
 
     // Path-progress watchdog: catches a bot that *is* moving (so the displacement detector above
     // stays satisfied) yet makes no headway toward the goal — orbiting a pillar, sliding along a
-    // wall, riding a mis-linked jump back and forth. If the straight-line distance to the goal hasn't
-    // improved by `PROGRESS_EPS` for `PROGRESS_STALL_TIME`, treat the current leg as failing: penalize
-    // it and re-path. Suspended while hooking / on a committed speed-jump / riding a plat (all of which
-    // legitimately hold or reverse XY progress for a while).
+    // wall, riding a mis-linked jump back and forth. The metric is *remaining route length*, not the
+    // straight-line XY distance to the goal: a helical climb (a spiral staircase whose top sits over
+    // its own core) holds a near-constant XY distance to the goal while ascending correctly, which
+    // false-tripped this watchdog into penalizing the only way up. Remaining arc-length shrinks as the
+    // bot advances legs and still plateaus on a true orbit. Off-route (final approach, no legs) it
+    // falls back to the direct goal distance. If it hasn't improved by `PROGRESS_EPS` for
+    // `PROGRESS_STALL_TIME`, treat the current leg as failing: penalize it and re-path. Suspended
+    // while hooking / on a committed speed-jump / riding a plat (all of which legitimately hold or
+    // reverse progress for a while).
+    let progress_metric = if bot.route.get(bot.route_pos).is_some() {
+        route_remaining(graph, &bot.route, bot.route_pos, origin)
+    } else {
+        goal_dist
+    };
     let plat_leg = matches!(kind, Some(LinkKind::Plat));
     if !hook_active && !rj_active && !on_sj && !on_air && !plat_leg && !vigil {
-        if progress_stalled(bot.watchdog.progress_best, bot.watchdog.progress_since, goal_dist, now) {
+        if progress_stalled(bot.watchdog.progress_best, bot.watchdog.progress_since, progress_metric, now) {
             penalize_leg(bot, cur_leg, kind, now);
             bot.route.clear();
             bot.repath_time = now;
-            bot.watchdog.progress_best = goal_dist;
+            bot.watchdog.progress_best = progress_metric;
             bot.watchdog.progress_since = now;
-        } else if goal_dist < bot.watchdog.progress_best - PROGRESS_EPS {
-            bot.watchdog.progress_best = goal_dist;
+        } else if progress_metric < bot.watchdog.progress_best - PROGRESS_EPS {
+            bot.watchdog.progress_best = progress_metric;
             bot.watchdog.progress_since = now;
         }
     } else {
         // Keep the baseline current so a stall isn't falsely flagged the instant we resume.
-        bot.watchdog.progress_best = goal_dist;
+        bot.watchdog.progress_best = progress_metric;
         bot.watchdog.progress_since = now;
     }
 

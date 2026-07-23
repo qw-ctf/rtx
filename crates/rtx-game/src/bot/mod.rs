@@ -2176,6 +2176,36 @@ fn corridor_point(graph: &NavGraph, route: &[u32], route_pos: usize, origin: Vec
     point_along(origin, ground_leg_targets(graph, route, route_pos), d)
 }
 
+/// The 3D length of the polyline `origin → each successive target`. For a route whose legs are
+/// contiguous (each leg's target is the next leg's source) this is the total remaining travel
+/// distance: the partial leg from `origin` to the current target, then every leg after it.
+fn remaining_over(origin: Vec3, targets: impl Iterator<Item = Vec3>) -> f32 {
+    let mut prev = origin;
+    let mut total = 0.0;
+    for t in targets {
+        total += (t - prev).length();
+        prev = t;
+    }
+    total
+}
+
+/// Total remaining route length (see [`remaining_over`]) over *all* legs from `route_pos`, not just
+/// the ground ones. Unlike the straight-line XY distance to the goal, this shrinks monotonically as a
+/// bot advances along a winding route — a spiral staircase whose top sits over its own core keeps a
+/// near-constant XY distance to the goal through a *correct* climb, which false-trips the progress
+/// watchdog; remaining arc-length does not, while still plateauing on a true orbit. `0.0` when the
+/// route is exhausted (the caller falls back to the direct goal distance there).
+fn route_remaining(graph: &NavGraph, route: &[u32], route_pos: usize, origin: Vec3) -> f32 {
+    remaining_over(
+        origin,
+        route
+            .get(route_pos..)
+            .unwrap_or_default()
+            .iter()
+            .map(|&leg| graph.cell_origin(graph.link_target(leg))),
+    )
+}
+
 /// A wander destination for an idle bot with nothing to chase: a random reachable navmesh cell,
 /// refreshed on arrival or every few seconds. Keeps bots moving on a human-less server instead of
 /// freezing on the spawn (the "bots stand still with no human" case).
@@ -2388,6 +2418,35 @@ mod tests {
             "clamps to the last point"
         );
         assert!((point_along(origin, pts.iter().copied(), 0.0).x - 0.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn remaining_over_shrinks_on_a_helix_the_xy_distance_hides() {
+        use std::f32::consts::TAU;
+        // A helical climb whose top sits over its own core: leg targets spiral up around the XY
+        // origin. Walking it, remaining arc-length must shrink monotonically — while the straight-line
+        // XY distance to the top does *not*, which is exactly what false-tripped the old watchdog.
+        let r = 100.0;
+        let pts: Vec<Vec3> = (0..=16)
+            .map(|i| {
+                let a = i as f32 / 4.0 * TAU; // four turns
+                Vec3::new(r * a.cos(), r * a.sin(), i as f32 * 20.0)
+            })
+            .collect();
+        let goal = *pts.last().unwrap();
+
+        let mut prev_rem = f32::INFINITY;
+        let mut xy_rose = false;
+        let mut prev_xy = (goal.xy() - pts[0].xy()).length();
+        for (i, &origin) in pts.iter().enumerate() {
+            let rem = remaining_over(origin, pts[i + 1..].iter().copied());
+            assert!(rem < prev_rem, "remaining arc-length must shrink: {rem} !< {prev_rem}");
+            prev_rem = rem;
+            let xy = (goal.xy() - origin.xy()).length();
+            xy_rose |= xy > prev_xy + 1.0; // the XY metric is non-monotonic on the way up
+            prev_xy = xy;
+        }
+        assert!(xy_rose, "the XY-to-goal distance should rise somewhere on a helix (why arc-length wins)");
     }
 
     #[test]
