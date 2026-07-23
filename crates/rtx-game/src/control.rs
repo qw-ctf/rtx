@@ -1153,7 +1153,7 @@ fn curl_json(game: &GameState, src: Vec3, tgt: Vec3) -> Result<String, String> {
     use crate::bot::bhop;
     use crate::math::{wrap180, yaw_of};
     use crate::pmove_sim::{pm_step, PmParams, PmState};
-    let bsp = game.nav.bsp.as_ref().ok_or("no bsp loaded")?;
+    let bsp = game.nav.bsp.as_deref().ok_or("no bsp loaded")?;
     let cv = |name: &std::ffi::CStr, d: f32| {
         let v = game.host.cvar(name);
         if v > 0.0 {

@@ -18,9 +18,23 @@
 
 use glam::{Vec2, Vec3, Vec3Swizzles};
 
-use crate::bsp::Bsp;
+use crate::bsp::{Bsp, HullTrace};
 use crate::qphys::{JUMP_VZ, STEP_HEIGHT};
 use crate::strafe::{apply_airaccel, apply_friction, apply_groundaccel, wishdir_fs, Cmd};
+
+/// The player clip hull a rollout traces against. [`Bsp`] is the live implementation (the map's
+/// hull 1); a rollout is generic over this so a test can substitute a synthetic hull built from an
+/// `is_solid` oracle ([`SampledHull`]) and simulate trajectories without a compiled map.
+pub trait Hull {
+    /// Trace the standing player hull from `a` to `b` — QW `hull1_trace` semantics (see [`HullTrace`]).
+    fn trace(&self, a: Vec3, b: Vec3) -> HullTrace;
+}
+
+impl Hull for Bsp {
+    fn trace(&self, a: Vec3, b: Vec3) -> HullTrace {
+        self.hull1_trace(a, b)
+    }
+}
 
 /// The map's movement cvars, snapshotted so a rollout is pure and reproducible.
 #[derive(Clone, Copy)]
@@ -63,8 +77,8 @@ const GROUND_NORMAL_Z: f32 = 0.7;
 const ONGROUND_MAX_VZ: f32 = 180.0;
 
 /// Advance one engine tick of `dt` seconds, mutating `s` in place.
-pub fn pm_step(bsp: &Bsp, s: &mut PmState, cmd: &Cmd, p: &PmParams, dt: f32) {
-    s.on_ground = categorize(bsp, s.origin, s.vel);
+pub fn pm_step(hull: &impl Hull, s: &mut PmState, cmd: &Cmd, p: &PmParams, dt: f32) {
+    s.on_ground = categorize(hull, s.origin, s.vel);
 
     // CheckJump — before friction, so a landing-frame jump skips ground friction and takes air accel.
     if !cmd.jump {
@@ -87,7 +101,7 @@ pub fn pm_step(bsp: &Bsp, s: &mut PmState, cmd: &Cmd, p: &PmParams, dt: f32) {
     if s.on_ground {
         let h = apply_groundaccel(s.vel.xy(), wishdir, wishspeed, p.accel, dt);
         // Ground movement is horizontal; the step logic owns Z.
-        let (o, v) = ground_move(bsp, s.origin, Vec3::new(h.x, h.y, 0.0), dt);
+        let (o, v) = ground_move(hull, s.origin, Vec3::new(h.x, h.y, 0.0), dt);
         s.origin = o;
         s.vel = Vec3::new(v.x, v.y, 0.0);
     } else {
@@ -95,21 +109,21 @@ pub fn pm_step(bsp: &Bsp, s: &mut PmState, cmd: &Cmd, p: &PmParams, dt: f32) {
         s.vel.x = h.x;
         s.vel.y = h.y;
         s.vel.z -= p.gravity * dt;
-        let (o, v, _) = fly_move(bsp, s.origin, s.vel, dt);
+        let (o, v, _) = fly_move(hull, s.origin, s.vel, dt);
         s.origin = o;
         s.vel = v;
     }
 
-    s.on_ground = categorize(bsp, s.origin, s.vel);
+    s.on_ground = categorize(hull, s.origin, s.vel);
 }
 
 /// Whether the player at `o` with velocity `v` is standing on ground: a short downward hull trace
 /// hits a floor-ish surface, and the player isn't rising fast (mid-jump).
-fn categorize(bsp: &Bsp, o: Vec3, v: Vec3) -> bool {
+fn categorize(hull: &impl Hull, o: Vec3, v: Vec3) -> bool {
     if v.z > ONGROUND_MAX_VZ {
         return false;
     }
-    let tr = bsp.hull1_trace(o, o - Vec3::new(0.0, 0.0, 1.0));
+    let tr = hull.trace(o, o - Vec3::new(0.0, 0.0, 1.0));
     tr.fraction < 1.0 && tr.plane_normal.z >= GROUND_NORMAL_Z
 }
 
@@ -122,7 +136,7 @@ fn clip_velocity(v: Vec3, normal: Vec3, overbounce: f32) -> Vec3 {
 /// surface clip the velocity to slide along it, accumulating planes so a crease is handled by moving
 /// along their intersection and a pocket dead-stops. Up to 4 bumps. Returns the new origin/velocity
 /// and whether anything was hit.
-fn fly_move(bsp: &Bsp, origin: Vec3, velocity: Vec3, dt: f32) -> (Vec3, Vec3, bool) {
+fn fly_move(hull: &impl Hull, origin: Vec3, velocity: Vec3, dt: f32) -> (Vec3, Vec3, bool) {
     const MAX_CLIP_PLANES: usize = 5;
     let mut o = origin;
     let mut v = velocity;
@@ -138,7 +152,7 @@ fn fly_move(bsp: &Bsp, origin: Vec3, velocity: Vec3, dt: f32) -> (Vec3, Vec3, bo
             break;
         }
         let end = o + v * time_left;
-        let tr = bsp.hull1_trace(o, end);
+        let tr = hull.trace(o, end);
         if tr.all_solid {
             return (o, Vec3::ZERO, true); // wedged in solid — give up
         }
@@ -189,16 +203,16 @@ fn fly_move(bsp: &Bsp, origin: Vec3, velocity: Vec3, dt: f32) -> (Vec3, Vec3, bo
 /// Ground move with step-up: attempt the flat slide, and independently attempt stepping up
 /// [`STEP_HEIGHT`], sliding, then settling back down — keep whichever advanced farther horizontally
 /// (QW `PM_StepSlideMove`). Lets a runner climb stairs and lips without a jump.
-fn ground_move(bsp: &Bsp, origin: Vec3, velocity: Vec3, dt: f32) -> (Vec3, Vec3) {
-    let (flat_o, flat_v, blocked) = fly_move(bsp, origin, velocity, dt);
+fn ground_move(hull: &impl Hull, origin: Vec3, velocity: Vec3, dt: f32) -> (Vec3, Vec3) {
+    let (flat_o, flat_v, blocked) = fly_move(hull, origin, velocity, dt);
     if !blocked {
         return (flat_o, flat_v);
     }
     let step = Vec3::new(0.0, 0.0, STEP_HEIGHT);
     // Step up (only as far as the hull can rise), slide, then trace back down to the floor.
-    let up = bsp.hull1_trace(origin, origin + step).endpos;
-    let (mut up_o, up_v, _) = fly_move(bsp, up, velocity, dt);
-    let down = bsp.hull1_trace(up_o, up_o - step * 2.0);
+    let up = hull.trace(origin, origin + step).endpos;
+    let (mut up_o, up_v, _) = fly_move(hull, up, velocity, dt);
+    let down = hull.trace(up_o, up_o - step * 2.0);
     if down.plane_normal.z >= GROUND_NORMAL_Z || down.fraction < 1.0 {
         up_o = down.endpos;
     }
