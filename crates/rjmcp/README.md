@@ -38,6 +38,14 @@ Every tool takes an optional `bot` (defaults to the first live bot). Reachabilit
 (no progress ~4 s) surface as `goto_stall` — the signal that a rocket-jump *source* cell can't be
 stood on.
 
+For live strategy work, `server_connect` attaches without taking ownership of an existing server.
+`status` reports match state plus each bot's team, stack, inventory, item goal, posture, enemy, and
+route head; `bot_route` expands the full route and `inspect_cell` explains its nearby nav links.
+`get_cvar`/`set_cvar` provide validated setup access; `set_cvars` accepts an ordered list of
+`{"name":"…","value":"…"}` assignments and returns every individual result. `match_start` locks
+the current roster and waits through the reload until the timed match, navmesh, and rostered bots
+are all ready.
+
 ## The config quirk it exposes
 
 On a fresh boot the first map's navmesh builds with **rocket jumps gated off** (`rjump 0`): the

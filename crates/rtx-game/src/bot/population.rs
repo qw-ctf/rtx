@@ -40,6 +40,23 @@ pub fn manage_population(game: &mut GameState) {
     // In a structured match, cap the fill to the empty seats during warmup and freeze the roster once
     // the match is under way — see `bot_target`.
     let in_warmup = matches!(game.team_match.phase, crate::mode::MatchPhase::Warmup);
+    if game.team_match.config.teams >= 2 && game.team_match.config.size >= 1 && !in_warmup {
+        let active: Vec<String> = (1..=maxclients as u32)
+            .map(EntId)
+            .filter(|&e| game.entities[e].bot.is_bot)
+            .map(|e| game.netname_of(e))
+            .collect();
+        let missing = game.team_match.bot_roster.iter().enumerate()
+            .find(|(_, name)| !active.contains(name))
+            .map(|(index, name)| (index as i32, name.clone()));
+        if let Some((index, name)) = missing {
+            game.ensure_navmesh();
+            if game.nav.is_loaded() {
+                queue_add_named_bot(game, &name, index);
+            }
+        }
+        return;
+    }
     let want = match bot_target(want, humans, game.team_match.config, in_warmup) {
         Some(w) => w,
         None => return, // structured match live — don't add or trim (would bench noise / drop a rostered bot)
@@ -145,6 +162,14 @@ fn queue_add_bot(game: &mut GameState, index: i32) {
     // high-half conchars, and the engine stores the `CString`'s bytes verbatim into the netname.
     let display = bot_display_name(bot_name(index));
     let name = CString::new(crate::text::latin1_bytes(&display)).unwrap_or_default();
+    let (bottom, top) = bot_colors(index);
+    game.pending_roster = Some(RosterOp::Add { name, bottom, top });
+}
+
+/// Recreate a fake client dropped by mvdsv's match-start map reload with its exact locked name, so
+/// team assignment recognizes it as a roster member rather than benching a newly numbered bot.
+fn queue_add_named_bot(game: &mut GameState, display: &str, index: i32) {
+    let name = CString::new(crate::text::latin1_bytes(display)).unwrap_or_default();
     let (bottom, top) = bot_colors(index);
     game.pending_roster = Some(RosterOp::Add { name, bottom, top });
 }

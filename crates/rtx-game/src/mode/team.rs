@@ -83,6 +83,9 @@ pub(crate) struct MatchState {
     /// The roster locked at match start: `(netname, team)`. Used to reattach a reconnecting player
     /// (and to restore teams after the start-reload clears per-entity state).
     pub roster: Vec<(String, u8)>,
+    /// Bot netnames from the locked roster. Unlike network clients, mvdsv drops fake clients on the
+    /// start reload, so population management uses this list to recreate only the rostered bots.
+    pub bot_roster: Vec<String>,
     /// Set by the `start` command right before the reload; consumed once in `worldspawn` to arm the
     /// countdown. Distinguishes a match-start reload (preserve state) from any other map change
     /// (fresh warmup).
@@ -331,6 +334,7 @@ pub(crate) fn tick_lifecycle(g: &mut GameState) {
                     };
                     g.team_match.phase = MatchPhase::Warmup;
                     g.team_match.roster.clear();
+                    g.team_match.bot_roster.clear();
                     for e in benched_players {
                         g.put_client_in_server(e);
                     }
@@ -487,6 +491,12 @@ pub(crate) fn start_match(g: &mut GameState) {
         }
         r
     };
+    g.team_match.bot_roster = players(g)
+        .into_iter()
+        .filter(|&e| g.entities[e].bot.is_bot)
+        .map(|e| g.netname_of(e))
+        .filter(|name| roster.iter().any(|(roster_name, _)| roster_name == name))
+        .collect();
     g.team_match.roster = roster;
     g.team_match.resuming = true;
     g.broadcast(PrintLevel::High, "Match starting — reloading map…\n");

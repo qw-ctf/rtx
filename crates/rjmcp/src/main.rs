@@ -193,7 +193,7 @@ impl RjTune {
             .lock()
             .await
             .clone()
-            .ok_or_else(|| "server not started — call server_start first".to_string())
+            .ok_or_else(|| "not connected — call server_start or server_connect first".to_string())
     }
 
     async fn req(&self, verb: &str, timeout: Duration) -> Result<Value, String> {
@@ -289,7 +289,15 @@ impl RjTune {
                 let ready = st.get("navmesh").and_then(Value::as_str) == Some("ready");
                 let has_bot = st.get("bots").and_then(Value::as_array).is_some_and(|a| !a.is_empty());
                 if ready && has_bot {
-                    return Ok(st);
+                    // Park the harness bot before returning control to the caller. On a race/test map
+                    // an autonomous bot can otherwise reach trigger_changelevel while the caller is
+                    // inspecting the first status response, leaving every subsequent trial frozen in
+                    // intermission. `hold` also clears the bot's live route/bhop momentum server-side.
+                    let bot = st["bots"][0]["ent"]
+                        .as_u64()
+                        .ok_or_else(|| "ready status had no bot ent".to_string())? as u32;
+                    self.req(&format!("hold {bot}"), SHORT).await?;
+                    return self.req("status", SHORT).await;
                 }
             }
             if Instant::now() >= deadline {
@@ -300,6 +308,19 @@ impl RjTune {
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+    }
+
+    /// Attach to a server that is already running the rtx control channel. Unlike `server_start`,
+    /// this never writes a config or owns/kills the mvdsv process; it is the safe entry point for a
+    /// long-lived match server shared with a client or another development session.
+    async fn op_connect(&self, port: u16) -> Result<Value, String> {
+        *self.inner.conn.lock().await = None;
+        self.inner.links.lock().unwrap().take();
+        let conn = ControlConn::connect(port)
+            .await
+            .map_err(|e| format!("could not connect to 127.0.0.1:{port}: {e}"))?;
+        *self.inner.conn.lock().await = Some(conn);
+        self.req("status", SHORT).await
     }
 
     fn tail_log(&self, n: usize) -> String {
@@ -422,6 +443,81 @@ fn vec3_of(v: &Value) -> Result<[f32; 3], String> {
     ])
 }
 
+/// Reduce a control-channel goto trajectory to the invariants a directed-corridor run cares about.
+/// Rows are `[t,x,y,z,vx,vy,vz]`; low-speed frames are excluded from heading metrics so the initial
+/// acceleration tick cannot manufacture an arbitrary yaw.
+fn corridor_metrics(ev: &Value, start: [f32; 3], end: [f32; 3]) -> Result<Value, String> {
+    let traj = ev.get("traj").and_then(Value::as_array).ok_or("goto event had no trajectory")?;
+    let dx = end[0] - start[0];
+    let dy = end[1] - start[1];
+    let len = dx.hypot(dy);
+    if len < 1.0 {
+        return Err("corridor start and end need distinct XY positions".to_string());
+    }
+    let (fx, fy) = (dx / len, dy / len);
+    let (rx, ry) = (-fy, fx);
+    let mut first_t = None::<f32>;
+    let mut last_t = None::<f32>;
+    let mut peak = 0.0f32;
+    let mut max_cross = 0.0f32;
+    let mut max_heading = 0.0f32;
+    let mut max_yaw_step = 0.0f32;
+    let mut reverse_frames = 0u32;
+    let mut max_z = start[2];
+    let mut peak_progress = 0.0f32;
+    let mut progress_speeds = [0.0f32; 21];
+    let mut prev_heading = None::<(f32, f32)>;
+    for row in traj {
+        let a = row.as_array().ok_or("trajectory row was not an array")?;
+        if a.len() != 7 {
+            return Err("trajectory row did not have 7 values".to_string());
+        }
+        let n = |i: usize| a[i].as_f64().unwrap_or(0.0) as f32;
+        let (t, x, y, z, vx, vy) = (n(0), n(1), n(2), n(3), n(4), n(5));
+        first_t.get_or_insert(t);
+        last_t = Some(t);
+        max_z = max_z.max(z);
+        max_cross = max_cross.max(((x - start[0]) * rx + (y - start[1]) * ry).abs());
+        let speed = vx.hypot(vy);
+        let progress = ((x - start[0]) * fx + (y - start[1]) * fy) / len;
+        let progress_bin = (progress.clamp(0.0, 1.0) * 20.0).floor() as usize;
+        progress_speeds[progress_bin] = progress_speeds[progress_bin].max(speed);
+        if speed > peak {
+            peak = speed;
+            peak_progress = progress;
+        }
+        if speed >= 100.0 {
+            let heading = (vx / speed, vy / speed);
+            let forward = vx * fx + vy * fy;
+            max_heading = max_heading.max((heading.0 * fx + heading.1 * fy).clamp(-1.0, 1.0).acos().to_degrees());
+            if forward < 0.0 {
+                reverse_frames += 1;
+            }
+            if let Some(prev) = prev_heading {
+                max_yaw_step = max_yaw_step
+                    .max((prev.0 * heading.0 + prev.1 * heading.1).clamp(-1.0, 1.0).acos().to_degrees());
+            }
+            prev_heading = Some(heading);
+        }
+    }
+    let elapsed = last_t.zip(first_t).map_or(0.0, |(last, first)| last - first);
+    Ok(json!({
+        "event": ev.get("ev").and_then(Value::as_str).unwrap_or("unknown"),
+        "elapsed": elapsed,
+        "samples": traj.len(),
+        "peak_speed": peak,
+        "peak_progress": peak_progress,
+        "progress_speeds": progress_speeds,
+        "max_cross_track": max_cross,
+        "max_heading_error": max_heading,
+        "max_yaw_step": max_yaw_step,
+        "reverse_frames": reverse_frames,
+        "hopped": max_z > start[2] + 10.0,
+        "arrival": ev.get("origin").cloned().unwrap_or(Value::Null),
+        "distance": ev.get("dist").cloned().unwrap_or(Value::Null),
+    }))
+}
+
 /// Write the self-contained harness config into `playground/qw/rjtest.cfg`. Self-contained (server
 /// cvars + rtx cvars + `map`) so it works whether or not mvdsv auto-execs `server.cfg` first — the
 /// last `set`/`map` wins either way. One bot, alone, pacifist, the control port open, dm/no-match so
@@ -436,6 +532,8 @@ fn write_config(repo: &std::path::Path, map: &str, port: u16, skill: f32) -> Res
         "// generated by rjmcp — the rocket-jump tuning harness\n\
          sv_progtype 1\n\
          deathmatch 1\n\
+         timelimit 0\n\
+         fraglimit 0\n\
          maxclients 8\n\
          maxspectators 4\n\
          set rtx_mode dm\n\
@@ -492,6 +590,12 @@ struct StartArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ConnectArgs {
+    /// Existing rtx control port (default 27950).
+    port: Option<u16>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct LogArgs {
     /// How many trailing log lines to return (default 50).
     lines: Option<usize>,
@@ -524,6 +628,27 @@ struct GotoArgs {
     y: f32,
     z: f32,
     /// Seconds to await arrival/stall (default 30).
+    timeout: Option<f32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CorridorArgs {
+    bot: Option<u32>,
+    start_x: f32,
+    start_y: f32,
+    start_z: f32,
+    end_x: f32,
+    end_y: f32,
+    end_z: f32,
+    /// Number of fresh teleport-and-run trials (default 3, maximum 20).
+    trials: Option<u32>,
+    /// Largest allowed perpendicular displacement from the directed centerline (default 64u).
+    max_cross_track: Option<f32>,
+    /// Largest allowed velocity-heading error from the directed path (default 60 degrees).
+    max_heading_error: Option<f32>,
+    /// Smallest acceptable peak horizontal speed (default 500 ups).
+    min_peak_speed: Option<f32>,
+    /// Seconds to await each arrival/stall (default 30).
     timeout: Option<f32>,
 }
 
@@ -571,10 +696,50 @@ struct ConsoleArgs {
     command: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CvarArgs {
+    /// Cvar name. The game-side control protocol restricts this to letters, digits, and underscore.
+    name: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SetCvarArgs {
+    /// Cvar name. The game-side control protocol validates it before applying the value.
+    name: String,
+    /// Exact string value to assign.
+    value: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SetCvarsArgs {
+    /// Ordered cvar assignments. Each entry is validated independently by the game-side control
+    /// protocol, and all entries are attempted even if one fails.
+    cvars: Vec<SetCvarArgs>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BotArgs {
+    /// Bot entity id (default: the first live bot).
+    bot: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CellArgs {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
 // --- tools ------------------------------------------------------------------------------------
 
 #[tool_router]
 impl RjTune {
+    #[tool(description = "Attach to an already-running mvdsv rtx control port without starting, \
+        reconfiguring, or taking ownership of the server.")]
+    async fn server_connect(&self, Parameters(a): Parameters<ConnectArgs>) -> Result<CallToolResult, McpError> {
+        finish(self.op_connect(a.port.unwrap_or(DEFAULT_PORT)).await)
+    }
+
     #[tool(description = "Launch mvdsv with the harness config (1 bot, control port open), wait until \
         the navmesh is built and a bot has spawned, and return the server status.")]
     async fn server_start(&self, Parameters(a): Parameters<StartArgs>) -> Result<CallToolResult, McpError> {
@@ -597,10 +762,122 @@ impl RjTune {
         finish(self.op_start(map, port, skill).await)
     }
 
-    #[tool(description = "Server status: map, level time, navmesh readiness, cell/link/rj-link counts, \
-        and each bot (ent, origin, health, current puppet order, rocket-jump phase).")]
+    #[tool(description = "Server and strategy status: map/navmesh, match format/phase/scores/roster, \
+        and each bot's team, stack, inventory, posture, perceived enemy, item plan, and route head.")]
     async fn status(&self) -> Result<CallToolResult, McpError> {
         finish(self.req("status", SHORT).await)
+    }
+
+    #[tool(description = "Read a live server cvar as both its exact string and numeric value.")]
+    async fn get_cvar(&self, Parameters(a): Parameters<CvarArgs>) -> Result<CallToolResult, McpError> {
+        finish(self.req(&format!("get {}", a.name), SHORT).await)
+    }
+
+    #[tool(description = "Set a live server cvar through the validated control protocol.")]
+    async fn set_cvar(&self, Parameters(a): Parameters<SetCvarArgs>) -> Result<CallToolResult, McpError> {
+        finish(self.req(&format!("set {} {}", a.name, a.value), SHORT).await)
+    }
+
+    #[tool(description = "Set an ordered list of live server cvars in one tool call. Every pair is \
+        attempted and the result or error for each assignment is returned in input order.")]
+    async fn set_cvars(&self, Parameters(a): Parameters<SetCvarsArgs>) -> Result<CallToolResult, McpError> {
+        let mut results = Vec::with_capacity(a.cvars.len());
+        let mut succeeded = 0usize;
+        for cvar in a.cvars {
+            match self.req(&format!("set {} {}", cvar.name, cvar.value), SHORT).await {
+                Ok(result) => {
+                    succeeded += 1;
+                    results.push(json!({
+                        "name": cvar.name,
+                        "value": cvar.value,
+                        "ok": true,
+                        "result": result,
+                    }));
+                }
+                Err(error) => results.push(json!({
+                    "name": cvar.name,
+                    "value": cvar.value,
+                    "ok": false,
+                    "error": error,
+                })),
+            }
+        }
+        finish(Ok(json!({
+            "ok": succeeded == results.len(),
+            "succeeded": succeeded,
+            "failed": results.len() - succeeded,
+            "results": results,
+        })))
+    }
+
+    #[tool(description = "Lock the current structured team roster, reload the map, run the countdown, \
+        and return once the match is live with its navmesh and bots ready. Fails if the requested \
+        format does not have enough players.")]
+    async fn match_start(&self) -> Result<CallToolResult, McpError> {
+        let r = async {
+            self.inner.links.lock().unwrap().take();
+            self.req("match_start", SHORT).await?;
+            let started = Instant::now();
+            let mut last_start_attempt = started;
+            let mut start_attempts = 1u32;
+            let deadline = started + Duration::from_secs(90);
+            let mut last = Value::Null;
+            loop {
+                if let Ok(st) = self.req("status", SHORT).await {
+                    let phase = st.pointer("/match/phase").and_then(Value::as_str);
+                    let nav_ready = st.get("navmesh").and_then(Value::as_str) == Some("ready");
+                    let roster_len = st.pointer("/match/roster").and_then(Value::as_array)
+                        .map_or(0, Vec::len);
+                    let bots_len = st.get("bots").and_then(Value::as_array).map_or(0, Vec::len);
+                    if phase == Some("live") && nav_ready && roster_len > 0 && bots_len >= roster_len {
+                        return Ok(st);
+                    }
+                    // A request made on the exact result-pause/warmup boundary can be acknowledged by
+                    // the control socket before the lifecycle is startable. Retry only while a settled
+                    // server still reports warmup; an accepted start immediately enters reload/countdown.
+                    if phase == Some("warmup") && last_start_attempt.elapsed() >= Duration::from_secs(1) {
+                        self.req("match_start", SHORT).await?;
+                        last_start_attempt = Instant::now();
+                        start_attempts += 1;
+                    }
+                    if phase == Some("warmup") && started.elapsed() > Duration::from_secs(30) {
+                        return Err(format!(
+                            "match stayed in warmup after {start_attempts} start attempts (is the roster full?): {st}"
+                        ));
+                    }
+                    last = st;
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!("match did not become ready within 90s; last status: {last}"));
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
+        .await;
+        finish(r)
+    }
+
+    #[tool(description = "Inspect the navmesh cell nearest a world point, including incoming and \
+        outgoing link kinds, costs, and hazards.")]
+    async fn inspect_cell(&self, Parameters(a): Parameters<CellArgs>) -> Result<CallToolResult, McpError> {
+        finish(self.req(&format!("cell {} {} {}", a.x, a.y, a.z), SHORT).await)
+    }
+
+    #[tool(description = "Dump a live bot's complete planned route as navmesh link ids, kinds, and \
+        source/target world positions.")]
+    async fn bot_route(&self, Parameters(a): Parameters<BotArgs>) -> Result<CallToolResult, McpError> {
+        let r = async {
+            let bot = self.resolve_bot(a.bot).await?;
+            self.req(&format!("route {bot}"), SHORT).await
+        }
+        .await;
+        finish(r)
+    }
+
+    #[tool(description = "List generated curl-jump links (speed-jump links with a certified curl \
+        gain), including run-up, takeoff, target, required speed, and gain.")]
+    async fn list_curl_links(&self) -> Result<CallToolResult, McpError> {
+        finish(self.req("curls", SHORT).await)
     }
 
     #[tool(description = "Tail the managed server's console output.")]
@@ -660,6 +937,75 @@ impl RjTune {
             self.req(&format!("goto {bot} {} {} {}", a.x, a.y, a.z), SHORT).await?;
             conn.await_event(rx, |v| is_ev(v, "arrived", bot) || is_ev(v, "goto_stall", bot), timeout)
                 .await
+        }
+        .await;
+        finish(r)
+    }
+
+    #[tool(description = "Repeatedly run the normal bot pathfinder/bhop controller down one directed \
+        corridor. Each trial teleports to the same start and reports elapsed time, peak speed, maximum \
+        cross-track drift, heading error, per-frame yaw step, reverse frames, and whether it hopped. \
+        The aggregate passes only when every trial arrives quickly without leaving the requested \
+        movement envelope; this is a path-following test, not a benchmark-only movement mode.")]
+    async fn corridor_test(&self, Parameters(a): Parameters<CorridorArgs>) -> Result<CallToolResult, McpError> {
+        let r = async {
+            let bot = self.resolve_bot(a.bot).await?;
+            let start = [a.start_x, a.start_y, a.start_z];
+            let end = [a.end_x, a.end_y, a.end_z];
+            let trials = a.trials.unwrap_or(3).clamp(1, 20);
+            let cross_limit = a.max_cross_track.unwrap_or(64.0).max(0.0);
+            let heading_limit = a.max_heading_error.unwrap_or(60.0).clamp(0.0, 180.0);
+            let peak_floor = a.min_peak_speed.unwrap_or(500.0).max(0.0);
+            let timeout = Duration::from_secs_f32(a.timeout.unwrap_or(30.0).clamp(1.0, 120.0));
+            let conn = self.conn().await?;
+            let mut results = Vec::with_capacity(trials as usize);
+            let mut all_passed = true;
+            for trial in 1..=trials {
+                self.req(
+                    &format!("teleport {bot} {} {} {}", start[0], start[1], start[2]),
+                    SHORT,
+                )
+                .await?;
+                let rx = conn.events.subscribe();
+                self.req(&format!("goto {bot} {} {} {}", end[0], end[1], end[2]), SHORT)
+                    .await?;
+                let ev = conn
+                    .await_event(
+                        rx,
+                        |v| is_ev(v, "arrived", bot) || is_ev(v, "goto_stall", bot),
+                        timeout,
+                    )
+                    .await?;
+                let mut m = corridor_metrics(&ev, start, end)?;
+                let passed = m["event"] == "arrived"
+                    && m["hopped"].as_bool() == Some(true)
+                    && m["reverse_frames"].as_u64() == Some(0)
+                    && m["max_cross_track"].as_f64().unwrap_or(f64::INFINITY) <= cross_limit as f64
+                    && m["max_heading_error"].as_f64().unwrap_or(f64::INFINITY) <= heading_limit as f64
+                    && m["max_yaw_step"].as_f64().unwrap_or(f64::INFINITY) <= 45.0
+                    && m["peak_speed"].as_f64().unwrap_or(0.0) >= peak_floor as f64;
+                m["trial"] = json!(trial);
+                m["passed"] = json!(passed);
+                all_passed &= passed;
+                results.push(m);
+                if ev.get("ev").and_then(Value::as_str) != Some("arrived") {
+                    break; // a stall may have crossed a map exit; don't call later frozen trials valid
+                }
+            }
+            Ok(json!({
+                "passed": all_passed && results.len() == trials as usize,
+                "limits": {
+                    "max_cross_track": cross_limit,
+                    "max_heading_error": heading_limit,
+                    "max_yaw_step": 45.0,
+                    "min_peak_speed": peak_floor,
+                    "reverse_frames": 0,
+                    "hopped": true,
+                },
+                "start": start,
+                "end": end,
+                "trials": results,
+            }))
         }
         .await;
         finish(r)
@@ -748,10 +1094,38 @@ impl RjTune {
 impl ServerHandler for RjTune {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Rocket-jump tuning harness for the rtx QuakeWorld bots. Typical loop: server_start → \
-             list_rj_links → test_links (baseline) → set_knobs → test_links (compare). Link ids are \
-             not stable across server_restart or `map` changes — re-list after either.",
+            "RTX QuakeWorld bot inspection and movement-tuning bridge. Attach to an existing match \
+             with server_connect, or launch an isolated harness with server_start. Use status and \
+             bot_route for strategy inspection; list_rj_links/list_curl_links and the test tools for \
+             movement work. Link ids are not stable across server_restart or `map` changes.",
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corridor_metrics_measure_drift_and_reverse_motion() {
+        let ev = json!({
+            "ev": "arrived",
+            "origin": [214.0, 2990.0, 24.0],
+            "dist": 10.2,
+            "traj": [
+                [1.0, 224.0, 1440.0, 24.0, 0.0, 320.0, 0.0],
+                [1.1, 194.0, 1500.0, 48.0, -100.0, 500.0, 100.0],
+                [1.2, 214.0, 2990.0, 24.0, 0.0, -120.0, 0.0]
+            ]
+        });
+        let m = corridor_metrics(&ev, [224.0, 1440.0, 24.0], [224.0, 2992.0, 24.0]).unwrap();
+        assert_eq!(m["event"], "arrived");
+        assert!((m["elapsed"].as_f64().unwrap() - 0.2).abs() < 1e-4);
+        assert_eq!(m["samples"], 3);
+        assert_eq!(m["max_cross_track"], 30.0);
+        assert_eq!(m["reverse_frames"], 1);
+        assert_eq!(m["hopped"], true);
+        assert!(m["max_heading_error"].as_f64().unwrap() > 170.0);
     }
 }
 

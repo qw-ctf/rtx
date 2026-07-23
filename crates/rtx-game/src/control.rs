@@ -40,9 +40,14 @@ use crate::math::wrap180;
 use crate::navmesh::LinkKind;
 
 /// A goto is "arrived" once within this XY radius of the target (matches the bot's own arrival gate)
-/// and within [`GOTO_ARRIVE_Z`] in Z. A radius policy, not a cell match — cell borders flap.
+/// or after a bounded finish-plane crossing, and within [`GOTO_ARRIVE_Z`] in Z. This stays independent
+/// of navmesh cell borders, which flap at high speed.
 const GOTO_ARRIVE_XY: f32 = 24.0;
 const GOTO_ARRIVE_Z: f32 = 48.0;
+/// A fast directed run can cross the target plane between samples while one slalom lobe is outside
+/// the radial arrival ball. Accept that crossing inside the same bounded corridor used for fast
+/// route waypoints, so the control order stops at the finish instead of commanding a recovery turn.
+const GOTO_FINISH_CORRIDOR: f32 = 96.0;
 /// Goto stall: if the straight-line XY distance to the target hasn't improved by [`STALL_EPS`] for
 /// [`STALL_SECS`], the source is (currently) inaccessible. The window sits above the bot's own 2.5 s
 /// progress watchdog, so it gets one penalize-and-divert attempt first — a stall then means
@@ -103,7 +108,10 @@ pub(crate) fn frame_end(game: &mut GameState) {
             Some(ControlOrder::Goto { target }) => {
                 let (origin, vel) = (game.entities[e].v.origin, game.entities[e].v.velocity);
                 let traj = &mut game.entities[e].bot.puppet.traj;
-                if traj.len() < 400 {
+                // Long flat-corridor benchmarks need roughly 7–10 seconds to expose the 800+ ups
+                // regime. Keep their complete velocity trace; the old 400-row cap truncated the
+                // final acceleration and made the reported peak systematically too low.
+                if traj.len() < 1200 {
                     traj.push((now, origin, vel));
                 }
                 poll_goto(game, e, i, target, now);
@@ -211,6 +219,7 @@ fn send(game: &GameState, line: String) {
 #[derive(Debug, PartialEq)]
 enum ControlCmd {
     Status,
+    MatchStart,
     Links,
     Prep { bot: u32, health: f32, rockets: f32 },
     Teleport { bot: u32, pos: Vec3 },
@@ -284,6 +293,7 @@ fn parse_line(line: &str) -> Result<(i64, ControlCmd), String> {
     let (verb, rest) = split_first(r1);
     let cmd = match verb {
         "status" => ControlCmd::Status,
+        "match_start" => ControlCmd::MatchStart,
         "links" => ControlCmd::Links,
         "prep" => {
             let mut t = rest.split_whitespace();
@@ -388,6 +398,10 @@ fn exec_line(game: &mut GameState, line: &str) {
 fn exec_cmd(game: &mut GameState, id: i64, cmd: ControlCmd) {
     let result: Result<String, String> = match cmd {
         ControlCmd::Status => Ok(status_json(game)),
+        ControlCmd::MatchStart => {
+            crate::mode::team::start_match(game);
+            Ok("{\"queued\":true}".to_string())
+        }
         ControlCmd::Links => links_json(game),
         ControlCmd::Prep { bot, health, rockets } => do_prep(game, bot, health, rockets),
         ControlCmd::Teleport { bot, pos } => do_teleport(game, bot, pos),
@@ -555,6 +569,12 @@ fn do_fly(game: &mut GameState, bot: u32, link: u32) -> Result<String, String> {
 
 fn do_order(game: &mut GameState, bot: u32, order: ControlOrder) -> Result<String, String> {
     let e = valid_bot(game, bot)?;
+    if order == ControlOrder::Hold {
+        let at = game.entities[e].v.origin;
+        let now = game.time();
+        game.entities[e].v.velocity = Vec3::ZERO;
+        reset_nav_state(&mut game.entities[e].bot, at, now);
+    }
     game.entities[e].bot.puppet.order = Some(order);
     Ok(format!("{{\"bot\":{bot}}}"))
 }
@@ -604,6 +624,87 @@ fn do_get(game: &mut GameState, name: &str) -> Result<String, String> {
 
 // --- status / links snapshots ---
 
+fn match_phase_name(phase: crate::mode::MatchPhase) -> &'static str {
+    match phase {
+        crate::mode::MatchPhase::Warmup => "warmup",
+        crate::mode::MatchPhase::Countdown { .. } => "countdown",
+        crate::mode::MatchPhase::Live => "live",
+        crate::mode::MatchPhase::Ended { .. } => "ended",
+    }
+}
+
+/// A compact reference to a live entity carried by strategy telemetry. Item goals need the
+/// classname + location; enemy/teammate references also benefit from the display name. Keeping the
+/// reference nullable makes the `0` sentinel explicit to MCP clients instead of exposing a fake
+/// world entity.
+fn entity_ref_json(game: &GameState, id: u32) -> String {
+    if id == 0 {
+        return "null".to_string();
+    }
+    let Some(ent) = game.entities.get(id as usize).filter(|e| e.in_use) else {
+        return "null".to_string();
+    };
+    format!(
+        "{{\"ent\":{id},\"name\":{},\"classname\":{},\"origin\":{},\"solid\":{}}}",
+        jstr(&game.netname_of(EntId(id))),
+        jstr(ent.classname().unwrap_or("")),
+        jvec3(ent.v.origin),
+        jstr(&format!("{:?}", ent.v.solid)),
+    )
+}
+
+fn route_head_json(game: &GameState, e: EntId) -> String {
+    let b = &game.entities[e].bot;
+    let Some(g) = game.nav.graph.as_ref() else {
+        return format!("{{\"pos\":{},\"len\":{},\"next\":null}}", b.route_pos, b.route.len());
+    };
+    let next = b.route.get(b.route_pos).map_or_else(
+        || "null".to_string(),
+        |&link| {
+            format!(
+                "{{\"link\":{link},\"kind\":{},\"target\":{}}}",
+                jstr(kind_name(g.link_kind(link))),
+                jvec3(g.cell_origin(g.link_target(link))),
+            )
+        },
+    );
+    format!("{{\"pos\":{},\"len\":{},\"next\":{next}}}", b.route_pos, b.route.len())
+}
+
+fn match_json(game: &GameState) -> String {
+    let cfg = game.team_match.config;
+    let mut scores = Vec::with_capacity(cfg.teams);
+    for team in 1..=cfg.teams {
+        let score = game
+            .entities
+            .iter()
+            .filter(|e| e.is_player() && e.in_use && e.mode_p.team as usize == team)
+            .map(|e| e.v.frags as i32)
+            .sum::<i32>();
+        scores.push(score.to_string());
+    }
+    let mut roster = String::new();
+    for (name, team) in &game.team_match.roster {
+        if !roster.is_empty() {
+            roster.push(',');
+        }
+        roster.push_str(&format!("{{\"name\":{},\"team\":{team}}}", jstr(name)));
+    }
+    format!(
+        "{{\"mode\":{},\"format\":{},\"phase\":{},\"teams\":{},\"size\":{},\"teamplay\":{},\"timelimit\":{},\"fraglimit\":{},\"live_until\":{},\"scores\":[{}],\"roster\":[{roster}]}}",
+        jstr(game.mode.name()),
+        jstr(&crate::mode::team::format_label(cfg)),
+        jstr(match_phase_name(game.team_match.phase)),
+        cfg.teams,
+        cfg.size,
+        game.level.teamplay,
+        game.level.timelimit,
+        game.level.fraglimit,
+        jnum(game.team_match.live_until),
+        scores.join(","),
+    )
+}
+
 fn status_json(game: &GameState) -> String {
     let (navmesh, cells, links, rj_links) = match game.nav.graph.as_ref() {
         Some(g) => ("ready", g.cells.len(), g.links.len(), g.summary().rocket_jump),
@@ -620,25 +721,48 @@ fn status_json(game: &GameState) -> String {
         if !bots.is_empty() {
             bots.push(',');
         }
+        let b = &ent.bot;
         bots.push_str(&format!(
-            "{{\"ent\":{i},\"client\":{},\"origin\":{},\"health\":{},\"on_ground\":{},\"alive\":{},\"order\":{},\"rj_phase\":{},\"speed\":{},\"bhop\":{},\"bhop_peak\":{}}}",
-            ent.bot.client,
+            "{{\"ent\":{i},\"client\":{},\"name\":{},\"team\":{},\"team_name\":{},\"frags\":{},\"origin\":{},\"health\":{},\"armor\":{},\"armor_type\":{},\"weapon\":{},\"items\":{},\"ammo\":{{\"shells\":{},\"nails\":{},\"rockets\":{},\"cells\":{}}},\"on_ground\":{},\"alive\":{},\"order\":{},\"posture\":{},\"known_enemy\":{},\"goal\":{{\"item\":{},\"commit\":{},\"since\":{},\"next_item\":{},\"hold_item\":{},\"hold_for\":{}}},\"route\":{},\"rj_phase\":{},\"speed\":{},\"bhop\":{},\"bhop_peak\":{}}}",
+            b.client,
+            jstr(&game.netname_of(EntId(i))),
+            ent.mode_p.team,
+            jstr(&game.team_of(EntId(i))),
+            jnum(ent.v.frags),
             jvec3(ent.v.origin),
             jnum(ent.v.health),
+            jnum(ent.v.armorvalue),
+            jnum(ent.v.armortype),
+            jstr(&format!("{:?}", ent.v.weapon)),
+            jstr(&format!("{:?}", Items::from_f32(ent.v.items))),
+            jnum(ent.v.ammo_shells),
+            jnum(ent.v.ammo_nails),
+            jnum(ent.v.ammo_rockets),
+            jnum(ent.v.ammo_cells),
             ent.v.flags.has(Flags::ONGROUND),
             ent.is_alive(),
-            jstr(order_name(ent.bot.puppet.order)),
-            jstr(&format!("{:?}", ent.bot.rj.phase)),
+            jstr(order_name(b.puppet.order)),
+            jstr(&format!("{:?}", b.posture)),
+            entity_ref_json(game, b.percept.known_enemy),
+            entity_ref_json(game, b.goal.item),
+            jstr(&format!("{:?}", b.goal.commit)),
+            jnum(b.goal.since),
+            entity_ref_json(game, b.goal.next_item),
+            entity_ref_json(game, b.goal.hold_item),
+            entity_ref_json(game, b.goal.hold_for),
+            route_head_json(game, EntId(i)),
+            jstr(&format!("{:?}", b.rj.phase)),
             jnum(ent.v.velocity.xy().length()),
-            jstr(&format!("{:?}", ent.bot.bhop.phase)),
-            jnum(ent.bot.bhop.peak),
+            jstr(&format!("{:?}", b.bhop.phase)),
+            jnum(b.bhop.peak),
         ));
     }
     format!(
-        "{{\"map\":{},\"time\":{},\"navmesh\":{},\"cells\":{cells},\"links\":{links},\"rj_links\":{rj_links},\"bots\":[{bots}]}}",
+        "{{\"map\":{},\"time\":{},\"navmesh\":{},\"cells\":{cells},\"links\":{links},\"rj_links\":{rj_links},\"match\":{},\"bots\":[{bots}]}}",
         jstr(&game.level.mapname),
         jnum(game.time()),
         jstr(navmesh),
+        match_json(game),
     )
 }
 
@@ -950,9 +1074,16 @@ fn poll_goto(game: &mut GameState, e: EntId, bot: u32, target: Vec3, now: f32) {
     let origin = game.entities[e].v.origin;
     let dxy = (origin.xy() - target.xy()).length();
     let dz = (origin.z - target.z).abs();
-    if dxy <= GOTO_ARRIVE_XY && dz <= GOTO_ARRIVE_Z {
-        game.entities[e].bot.puppet.order = Some(ControlOrder::Hold);
+    let crossed_finish = goto_crossed_finish(&game.entities[e].bot.puppet.traj, origin, target);
+    if (dxy <= GOTO_ARRIVE_XY || crossed_finish) && dz <= GOTO_ARRIVE_Z {
         let traj = traj_json(&std::mem::take(&mut game.entities[e].bot.puppet.traj));
+        // A goto commonly ends while the bot is airborne and carrying several hundred ups. Merely
+        // swapping the order to Hold leaves the active hop controller, route, and momentum intact for
+        // another frame; on a finish-line target that is enough to cross trigger_changelevel, and on
+        // an ordinary target it can produce a sharp stale-route turn after the reported arrival.
+        // Finish the puppet order atomically: stop the body and discard every navigation commitment
+        // before the next bot frame observes Hold.
+        finish_goto_hold(game, e, origin, now);
         send(game, format!(
             "{{\"ev\":\"arrived\",\"bot\":{bot},\"t\":{},\"origin\":{},\"target\":{},\"dist\":{},\"traj\":[{traj}]}}",
             jnum(now), jvec3(origin), jvec3(target), jnum(dxy),
@@ -968,13 +1099,35 @@ fn poll_goto(game: &mut GameState, e: EntId, bot: u32, target: Vec3, now: f32) {
         p.best_dist = dxy;
         p.best_since = now;
     } else if now - best_since > STALL_SECS {
-        game.entities[e].bot.puppet.order = Some(ControlOrder::Hold);
         let traj = traj_json(&std::mem::take(&mut game.entities[e].bot.puppet.traj));
+        finish_goto_hold(game, e, origin, now);
         send(game, format!(
             "{{\"ev\":\"goto_stall\",\"bot\":{bot},\"t\":{},\"origin\":{},\"target\":{},\"dist\":{},\"best\":{},\"secs\":{},\"traj\":[{traj}]}}",
             jnum(now), jvec3(origin), jvec3(target), jnum(dxy), jnum(best_dist), jnum(STALL_SECS),
         ));
     }
+}
+
+fn goto_crossed_finish(traj: &[(f32, Vec3, Vec3)], origin: Vec3, target: Vec3) -> bool {
+    let Some((_, start, _)) = traj.first() else {
+        return false;
+    };
+    let along = (target.xy() - start.xy()).normalize_or_zero();
+    if along == glam::Vec2::ZERO {
+        return false;
+    }
+    let past = origin.xy() - target.xy();
+    if past.dot(along) < 0.0 {
+        return false;
+    }
+    (past - along * past.dot(along)).length() <= GOTO_FINISH_CORRIDOR
+}
+
+/// Stop a completed puppet goto without letting its route or bhop state leak into the Hold order.
+fn finish_goto_hold(game: &mut GameState, e: EntId, at: Vec3, now: f32) {
+    game.entities[e].v.velocity = Vec3::ZERO;
+    reset_nav_state(&mut game.entities[e].bot, at, now);
+    game.entities[e].bot.puppet.order = Some(ControlOrder::Hold);
 }
 
 /// Serialize a flight/goto trace as `[t, x,y,z, vx,vy,vz]` rows.
@@ -1206,8 +1359,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fast_goto_crossing_stops_inside_bounded_finish_corridor() {
+        let traj = vec![(0.0, Vec3::new(224.0, 1440.0, 24.0), Vec3::ZERO)];
+        let target = Vec3::new(224.0, 2992.0, 24.0);
+        assert!(goto_crossed_finish(&traj, Vec3::new(280.0, 3008.0, 48.0), target));
+        assert!(!goto_crossed_finish(&traj, Vec3::new(330.0, 3008.0, 48.0), target));
+        assert!(!goto_crossed_finish(&traj, Vec3::new(224.0, 2970.0, 48.0), target));
+    }
+
+    #[test]
     fn parses_simple_verbs() {
         assert_eq!(parse_line("7 status").unwrap(), (7, ControlCmd::Status));
+        assert_eq!(parse_line("8 match_start").unwrap(), (8, ControlCmd::MatchStart));
         assert_eq!(parse_line("  12   links  ").unwrap(), (12, ControlCmd::Links));
         assert_eq!(parse_line("3 hold 1").unwrap(), (3, ControlCmd::Hold { bot: 1 }));
         assert_eq!(parse_line("4 stop 2").unwrap(), (4, ControlCmd::Stop { bot: 2 }));
