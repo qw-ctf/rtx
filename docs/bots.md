@@ -251,6 +251,47 @@ CTF teams split into stable **attack, midfield, and defense** roles: attackers c
 major items, midfielders control powerups/runes and crossings, defenders spread around the base,
 and escorts peel for the carrier.
 
+### Team-strategy oracle (experimental)
+
+`rtx_bot_oracle 1` adds one slow reasoning loop per team. The main game thread publishes an owned
+snapshot at 4 Hz; a joined worker builds reset/rearm assignments, observed major-item timings,
+cover positions, regroup calls, and likely-route intercepts at 1 Hz. It reads only teammate truth
+and evidence that side could have seen or heard. CTF snapshots and plans use the same framework but
+remain **shadow-only** for now; only team deathmatch receives advice.
+
+The 1 Hz pass is a reasoning cadence, not a radio cadence. An unchanged recommendation refreshes one
+persistent inbox instruction and acknowledgement instead of being presented as a new call every
+second. If a bot rejects or finishes that instruction, the same evidence and destination are quiet
+for four seconds; a changed destination can be communicated immediately. New evidence first cancels
+the old decision, but if replanning confirms the same action it resumes silently instead of becoming
+another radio call. A local rejection retains its cooldown even when confirming evidence arrives.
+Status reports proposed, communicated, refreshed, suppressed, and superseded calls separately.
+
+An intercept is uncertainty-aware rather than a claim that the oracle knows where an enemy is going.
+It ranks up to three plausible item destinations from the observed stack, arsenal, ammo use, item
+availability, and travel time, then considers both the shortest route and a topologically distinct
+cluster route when one is reasonably competitive. Probability mass accumulates at shared crossings;
+the call requires enough supported mass and an arrival advantage. A bot already assigned to rearm,
+prepare, or cover is not double-booked. Evaluation credits interception only when that bot damages the
+predicted enemy in the called crossing's nav cluster.
+
+Every nugget carries `decision_at`, the `evidence_at` horizon it used, its subject, confidence, and
+expiry. The main thread compares those stamps with that team's current evidence both before delivery
+and while the nugget is in a bot's inbox. A newer enemy weapon/health pickup, sighting, shot, hit, or
+death cancels the stale advice. Advice is soft: visible combat, urgent recovery, hard mode goals,
+handoffs, and committed jumps all win. Positional advice only redirects idle/search movement, while
+rearm and preparation advice seeds an ordinary, non-locking item goal.
+
+For experiments, `rtx_bot_oracle_eval 1` retains outcome trials. Setting
+`rtx_bot_oracle_holdout 0.5` assigns an entire team's 15-second episode to advice or shadow control,
+so treated and untreated rates can be compared without splitting teammates across conditions. The
+evaluator counts the same concrete outcomes in both arms: assigned pickup, intercept damage, covered
+team pickup, or actual regroup proximity; it separately reports applied and invalidated advice.
+Pending outcomes close at the 15-second boundary, and crossing between treatment and control clears
+that team's inbox immediately so advice cannot leak into its shadow episode.
+`rtx status` exposes the current plan with both timestamps and aggregate evaluation counters, and
+`rtx_bot_oracle_debug 1` prints a compact two-second summary.
+
 ## Modes and the brain
 
 The mode can redirect the brain without touching it. In **Rocket Arena** bots **fight** — they

@@ -757,12 +757,124 @@ fn status_json(game: &GameState) -> String {
             jnum(b.bhop.peak),
         ));
     }
+    let oracle = oracle_json(game);
     format!(
-        "{{\"map\":{},\"time\":{},\"navmesh\":{},\"cells\":{cells},\"links\":{links},\"rj_links\":{rj_links},\"match\":{},\"bots\":[{bots}]}}",
+        "{{\"map\":{},\"time\":{},\"navmesh\":{},\"cells\":{cells},\"links\":{links},\"rj_links\":{rj_links},\"match\":{},\"oracle\":{oracle},\"bots\":[{bots}]}}",
         jstr(&game.level.mapname),
         jnum(game.time()),
         jstr(navmesh),
         match_json(game),
+    )
+}
+
+fn oracle_json(game: &GameState) -> String {
+    let eval = game.oracle.eval_summary();
+    let episode_eval = game.oracle.eval_episode_summary();
+    let comms = game.oracle.communication_summary();
+    let mut by_kind = String::new();
+    let mut episodes_by_kind = String::new();
+    for kind in crate::bot::oracle::NUGGET_KINDS {
+        if !by_kind.is_empty() {
+            by_kind.push(',');
+        }
+        let summary = game.oracle.eval_summary_for(kind);
+        by_kind.push_str(&format!(
+            "{}:{{\"treated\":{},\"treated_success\":{},\"controls\":{},\"control_success\":{},\"applied\":{},\"invalidated\":{},\"pending\":{}}}",
+            jstr(&format!("{:?}", kind)),
+            summary.treated,
+            summary.treated_success,
+            summary.controls,
+            summary.control_success,
+            summary.applied,
+            summary.invalidated,
+            summary.pending,
+        ));
+        if !episodes_by_kind.is_empty() {
+            episodes_by_kind.push(',');
+        }
+        let summary = game.oracle.eval_episode_summary_for(kind);
+        episodes_by_kind.push_str(&format!(
+            "{}:{{\"treated\":{},\"treated_success\":{},\"controls\":{},\"control_success\":{},\"applied\":{},\"invalidated\":{},\"pending\":{}}}",
+            jstr(&format!("{:?}", kind)),
+            summary.treated,
+            summary.treated_success,
+            summary.controls,
+            summary.control_success,
+            summary.applied,
+            summary.invalidated,
+            summary.pending,
+        ));
+    }
+    let episode_eval_json = format!(
+        "{{\"treated\":{},\"treated_success\":{},\"controls\":{},\"control_success\":{},\"applied\":{},\"invalidated\":{},\"pending\":{},\"by_kind\":{{{episodes_by_kind}}}}}",
+        episode_eval.treated,
+        episode_eval.treated_success,
+        episode_eval.controls,
+        episode_eval.control_success,
+        episode_eval.applied,
+        episode_eval.invalidated,
+        episode_eval.pending,
+    );
+    let eval_json = format!(
+        "{{\"treated\":{},\"treated_success\":{},\"controls\":{},\"control_success\":{},\"applied\":{},\"invalidated\":{},\"pending\":{},\"by_kind\":{{{by_kind}}},\"episodes\":{episode_eval_json}}}",
+        eval.treated,
+        eval.treated_success,
+        eval.controls,
+        eval.control_success,
+        eval.applied,
+        eval.invalidated,
+        eval.pending,
+    );
+    let plan = game.oracle.last_plan().map_or_else(
+        || "null".to_string(),
+        |plan| {
+            let mut teams = String::new();
+            for team in &plan.teams {
+                if !teams.is_empty() {
+                    teams.push(',');
+                }
+                let mut nuggets = String::new();
+                for nugget in &team.nuggets {
+                    if !nuggets.is_empty() {
+                        nuggets.push(',');
+                    }
+                    nuggets.push_str(&format!(
+                        "{{\"recipient\":{},\"kind\":{},\"target_cell\":{},\"subject\":{},\"confidence\":{},\"decision_at\":{},\"evidence_at\":{},\"expires_at\":{}}}",
+                        nugget.recipient,
+                        jstr(&format!("{:?}", nugget.kind)),
+                        nugget.target_cell,
+                        nugget.subject,
+                        jnum(nugget.confidence),
+                        jnum(nugget.decision_at),
+                        jnum(nugget.evidence_at),
+                        jnum(nugget.expires_at),
+                    ));
+                }
+                teams.push_str(&format!(
+                    "{{\"team\":{},\"mode\":{},\"control\":{},\"nuggets\":[{nuggets}]}}",
+                    team.team,
+                    jstr(&format!("{:?}", team.mode)),
+                    jstr(&format!("{:?}", team.control)),
+                ));
+            }
+            format!(
+                "{{\"generation\":{},\"at\":{},\"teams\":[{teams}]}}",
+                plan.generation,
+                jnum(plan.at),
+            )
+        },
+    );
+    format!(
+        "{{\"running\":{},\"epoch\":{},\"last_output\":{},\"plan\":{plan},\"communication\":{{\"proposed\":{},\"communicated\":{},\"refreshed\":{},\"suppressed\":{},\"superseded\":{},\"arm_clears\":{}}},\"eval\":{eval_json}}}",
+        game.oracle.running(),
+        game.oracle.epoch(),
+        jnum(game.oracle.last_output()),
+        comms.proposed,
+        comms.communicated,
+        comms.refreshed,
+        comms.suppressed,
+        comms.superseded,
+        comms.arm_clears,
     )
 }
 
@@ -962,7 +1074,8 @@ fn plant_link_json(game: &mut GameState, from: Vec3, takeoff: Vec3, tgt: Vec3, v
         let g = game.host.cvar(c"sv_gravity");
         if g > 0.0 { g } else { 800.0 }
     };
-    let g = game.nav.graph.as_mut().ok_or("navmesh not ready")?;
+    let graph = game.nav.graph.as_mut().ok_or("navmesh not ready")?;
+    let g = std::sync::Arc::get_mut(graph).ok_or("navmesh is shared with the team oracle")?;
     let from_cell = g.nearest(from).ok_or("no cell near from")?;
     let to_cell = g.nearest(tgt).ok_or("no cell near tgt")?;
     let dz = g.cell_origin(to_cell).z - takeoff.z;

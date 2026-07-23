@@ -477,6 +477,19 @@ In a team composition, coordination is always on (it is the *inferred enemy* mod
 CTF role assignment (attack / midfield / defense, escorts peeling for a carrier) is a mode concern
 — see [game modes](modes.md).
 
+The opt-in team oracle (`bot/oracle.rs`) adds a slower layer above these reflexes. The game thread
+copies observation-gated snapshots and events into an overwrite mailbox; a worker owns its backend
+state and the immutable `Arc<NavGraph>`, and returns addressed, expiring nuggets through another
+overwrite slot. It never holds an entity or host reference, never blocks a bot frame, and is joined
+before unload. Map, mode, and roster changes advance an epoch that invalidates queued work.
+
+Freshness is an explicit data dependency, not just a TTL. A nugget records when the worker decided
+and the newest evidence time behind its subject. Per-team revision clocks reject worker output or
+remove inbox advice when that team's evidence is newer. The authoritative outcome evaluator is
+main-thread-only and never feeds facts back into planning; randomized whole-team holdout episodes
+make its treated/control success rates a usable read on whether the advice is helping. CTF exercises
+snapshot and planning construction but deliberately skips inbox delivery.
+
 ## Movement execution
 
 Turning a route into a usercmd is the job of `bot/steer.rs` and the driver modules it calls. Steer

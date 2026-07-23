@@ -59,6 +59,9 @@ pub struct BotState {
     /// Strategic fight posture derived from relative effective strength/firepower. Recovery owns
     /// movement toward a useful item; Hold/Press leave full movement to combat.
     pub posture: CombatPosture,
+    /// Expiring, timestamped team-strategy advice. The oracle worker never touches this directly;
+    /// the main bot frame validates and delivers addressed nuggets.
+    pub oracle: crate::bot::oracle::OracleInbox,
     /// Audience-wander state (a round mode's stands). See [`Wander`].
     pub wander: Wander,
     /// Anti-drown surface target: the air spot the nearest-breathable flood picked, with a short TTL

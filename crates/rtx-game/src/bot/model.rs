@@ -327,10 +327,7 @@ impl GameState {
     /// The set of pools with a plausible witness to an event at `pos`: any live bot on that pool's
     /// side within [`WITNESS_RADIUS`]. One pass over the client slots — events (shots, pickups) are
     /// rare, not per-frame. Empty when opponent modeling is off.
-    pub(crate) fn witness_pools(&self, pos: Vec3) -> u16 {
-        if !self.host.cvar_bool(c"rtx_bot_model") {
-            return 0;
-        }
+    pub(crate) fn evidence_pools(&self, pos: Vec3) -> u16 {
         let maxclients = self.host().cvar(c"maxclients") as u32;
         let mut mask = 0u16;
         for e in (1..=maxclients).map(EntId) {
@@ -352,6 +349,17 @@ impl GameState {
             }
         }
         mask
+    }
+
+    /// Opponent-model wrapper around the shared honest witness classification. The team oracle uses
+    /// [`Self::evidence_pools`] independently, so turning point estimates off does not also erase its
+    /// event stream.
+    pub(crate) fn witness_pools(&self, pos: Vec3) -> u16 {
+        if self.host.cvar_bool(c"rtx_bot_model") {
+            self.evidence_pools(pos)
+        } else {
+            0
+        }
     }
 
     /// What `observer`'s pool believes about `target` right now (drift applied to health). `None` when
@@ -383,10 +391,14 @@ impl GameState {
     /// Hook: `attacker` dealt `damage` (pre-armor) to `targ`. The attacker's whole side learns it —
     /// they saw the hit land — so this updates the attacker's pool directly, not by earshot.
     pub(crate) fn model_note_damage(&mut self, attacker: EntId, targ: EntId, damage: f32) {
-        if !self.host.cvar_bool(c"rtx_bot_model") || attacker == targ {
+        if attacker == targ {
             return;
         }
         if !self.entities[attacker].is_player() || !self.entities[targ].is_player() {
+            return;
+        }
+        crate::bot::oracle::note_damage(self, attacker, targ, damage);
+        if !self.host.cvar_bool(c"rtx_bot_model") {
             return;
         }
         if let Some(pool) = self.observer_pool(attacker) {
@@ -412,15 +424,20 @@ impl GameState {
 
     /// Hook: `firer` started a weapon fire. Every pool with a bot in earshot learns which weapon.
     pub(crate) fn model_note_weapon_fire(&mut self, firer: EntId) {
-        if !self.host.cvar_bool(c"rtx_bot_model") {
-            return;
-        }
         let Some(bit) = weapon_fire_bit(self.entities[firer].v.weapon) else {
             return;
         };
         let org = self.entities[firer].v.origin;
         let now = self.time();
-        let mask = self.witness_pools(org);
+        let mut evidence_mask = self.evidence_pools(org);
+        if let Some(pool) = self.observer_pool(firer) {
+            evidence_mask |= 1 << pool;
+        }
+        crate::bot::oracle::note_weapon_fire(self, firer, self.entities[firer].v.weapon, evidence_mask, now);
+        if !self.host.cvar_bool(c"rtx_bot_model") {
+            return;
+        }
+        let mask = evidence_mask;
         for pool in iter_pools(mask) {
             self.opponents.note_weapon(pool, firer, bit, now);
         }
@@ -428,11 +445,12 @@ impl GameState {
 
     /// Hook: `picker` collected an item. Every pool with a bot in earshot of the pickup learns it.
     pub(crate) fn model_note_pickup(&mut self, picker: EntId, kind: PickupKind) {
+        let now = self.time();
+        crate::bot::oracle::note_player_pickup(self, picker, now);
         if !self.host.cvar_bool(c"rtx_bot_model") {
             return;
         }
         let org = self.entities[picker].v.origin;
-        let now = self.time();
         let mask = self.witness_pools(org);
         for pool in iter_pools(mask) {
             self.opponents.note_pickup(pool, picker, kind, now);
@@ -461,13 +479,14 @@ impl GameState {
 
     /// Hook: `target` died or respawned — wipe its entry back to the spawn kit in every pool.
     pub(crate) fn model_reset_target(&mut self, target: EntId) {
-        if !self.host.cvar_bool(c"rtx_bot_model") {
-            return;
-        }
         if !self.entities[target].is_player() {
             return;
         }
         let now = self.time();
+        crate::bot::oracle::note_death(self, target, now);
+        if !self.host.cvar_bool(c"rtx_bot_model") {
+            return;
+        }
         self.opponents.reset_target(target, now);
     }
 }

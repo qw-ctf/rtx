@@ -467,6 +467,7 @@ impl GameState {
         // The cvar-buffer borrows (`mode_name`/`match_alias`) are read-only above and `next`/`cfg`
         // are `Copy`, so we're free to take `&mut self` now.
         if next.name() != self.mode.name() {
+            self.oracle.bump_epoch();
             self.mode = next;
             self.arena = ArenaState::default();
             self.team_match = MatchState {
@@ -482,6 +483,7 @@ impl GameState {
             self.opponents = crate::bot::model::OpponentModel::new(crate::bot::model::baseline_for_mode(next.name()));
             host.conprint(&cstring(&format!("rtx: game mode = {}\n", next.name())));
         } else if cfg != self.team_match.config {
+            self.oracle.bump_epoch();
             self.team_match = MatchState {
                 config: cfg,
                 ..Default::default()

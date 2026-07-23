@@ -102,9 +102,8 @@ impl GameState {
     /// `None` means it isn't coming back on a timer (deathmatch 2, or a megahealth, which rots
     /// rather than respawns).
     ///
-    /// Only a client ever has to ask — inside the server the handlers know — but the answer belongs
-    /// here regardless, next to the code it has to agree with.
-    #[cfg(feature = "netclient")]
+    /// Mirrors and the team oracle both ask this helper: the former reconstructs remote state, while
+    /// the latter timestamps only pickups its side could honestly witness.
     pub(crate) fn respawn_delay_of(&self, classname: &str) -> Option<f32> {
         let dm = self.level.deathmatch;
         match classname {
@@ -196,6 +195,7 @@ impl GameState {
             // Megahealth: rot back down later, no normal respawn.
             self.entities[other].v.items = self.entities[other].v.items.with(Items::SUPERHEALTH);
             self.pickup_hide(e);
+            self.bot_item_taken(e, other, time);
             if self.level.deathmatch != 4 {
                 let ent = &mut self.entities[e];
                 ent.v.nextthink = time + 5.0;

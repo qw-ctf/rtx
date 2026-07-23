@@ -240,6 +240,13 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // unconditional in a team composition; this switch controls only the inferred enemy model.
         // 0 = the old estimate-free behavior.
         ("rtx_bot_model", Bool(true)),
+        // Slow team-level reasoning. The worker observes only owned, observation-gated snapshots and
+        // publishes expiring advice; off by default while its value is measured on recorded matches.
+        ("rtx_bot_oracle", Bool(false)),
+        ("rtx_bot_oracle_debug", Bool(false)),
+        ("rtx_bot_oracle_eval", Bool(false)),
+        // Fraction of complete team-plan episodes retained as shadow controls during evaluation.
+        ("rtx_bot_oracle_holdout", Float(0.0)),
     ]
 };
 

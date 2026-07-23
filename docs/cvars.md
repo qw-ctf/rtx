@@ -65,6 +65,10 @@ Covered in depth in [the bots](bots.md).
 | `rtx_bot_fov` | `120` | View cone (full angle, degrees) a bot can see targets in; widened with skill. `0` = 360°. |
 | `rtx_bot_reaction` | `0.4` | Base reaction delay (seconds) before acting on a newly seen target; shortened with skill. `0` = instant. |
 | `rtx_bot_model` | `1` | Opponent modeling: shared observation-gated hypotheses of enemy stack/arsenal. `0` = estimate-free. |
+| `rtx_bot_oracle` | `0` | Threaded team-strategy oracle. Opt-in while its advice is evaluated. |
+| `rtx_bot_oracle_debug` | `0` | Throttled evidence, plan, and inbox diagnostics. |
+| `rtx_bot_oracle_eval` | `0` | Retain treated/control outcome trials; counters are exposed by `rtx status`. |
+| `rtx_bot_oracle_holdout` | `0` | Fraction of whole-team 15 s episodes withheld as randomized shadow controls (`0.5` for experiments; active only with evaluation). |
 | `rtx_bot_stack` | `1` | Resource discipline: steeper valuation below the bare-spawn stack, RA/mega cycling, ammo panic. |
 | `rtx_bot_magnet` | `1` | Waypoint magnetism: bend the steering waypoint through a desirable item just off the route. |
 | `rtx_bot_turnrate` | `0` | Ceiling on how fast a bot's view turns (deg/s) — the aim spring's angular-speed clamp, so a big look-flip pans like a human. `0` = skill-scaled default; `>0` overrides for tuning. |

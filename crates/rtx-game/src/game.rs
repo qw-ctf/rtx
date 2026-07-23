@@ -151,6 +151,9 @@ pub struct GameState {
     /// `GAME_SHUTDOWN` so its workers are joined before the engine unloads us. Both embodiments share
     /// it — the netclient owns a `GameState` too and drives the same `run_bots`.
     pub(crate) bot_pool: bot::par::BotPool,
+    /// Slow team-strategy worker. Inert unless `rtx_bot_oracle` is enabled; explicitly joined at
+    /// shutdown so no worker can outlive the dynamically loaded game module.
+    pub(crate) oracle: bot::oracle::OracleRuntime,
     /// A population change the bot manager wants applied this frame (add or remove one bot),
     /// deferred out of the frame. `add_bot`/`remove_bot` make the engine run our
     /// `ClientConnect`/`PutClientInServer`/`ClientDisconnect` *synchronously and re-entrantly*; if
@@ -246,6 +249,7 @@ impl GameState {
             normal_bot_drive_logged: false,
             bot_prof: bot::prof::BotProf::default(),
             bot_pool: bot::par::BotPool::default(),
+            oracle: bot::oracle::OracleRuntime::default(),
             pending_roster: None,
             dyn_assets: DynAssets::default(),
             control: crate::control::ControlState::default(),
@@ -263,6 +267,7 @@ impl GameState {
             GameCommand::LoadEntities => self.load_entities(),
             GameCommand::StartFrame => self.start_frame(arg0, arg1),
             GameCommand::Shutdown => {
+                self.oracle.shutdown();
                 // Join the bot pool's workers before the engine unloads us — dropping the pool only
                 // signals them (see `bot::par`). Idempotent and a no-op when the pool was never built.
                 self.bot_pool.shutdown();
@@ -681,6 +686,7 @@ impl GameState {
         self.level.skill = self.host.cvar(c"skill") as i32;
         // Fresh map: drop any prior navmesh so it's rebuilt lazily when bots are next wanted,
         // and the previous map's race routes with it.
+        self.oracle.bump_epoch();
         self.nav = navmesh::NavState::default();
         self.race = race::RaceState::default();
 
@@ -872,4 +878,3 @@ impl GameState {
 pub(crate) fn cstring(s: &str) -> CString {
     CString::new(s.replace('\0', "")).unwrap_or_default()
 }
-

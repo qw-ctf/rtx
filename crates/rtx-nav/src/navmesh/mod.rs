@@ -1585,7 +1585,7 @@ pub struct NavState {
     /// queries (sky/liquid tests, world traces) have geometry to read.
     pub bsp: Option<Arc<Bsp>>,
     /// The built navigation graph. `None` until [`NavGraph::build`] runs (bots stay disabled).
-    pub graph: Option<NavGraph>,
+    pub graph: Option<Arc<NavGraph>>,
     /// Whether a build has been kicked off for this map (so a failed BSP read doesn't retry every
     /// frame). Reset when a new map loads.
     pub attempted: bool,

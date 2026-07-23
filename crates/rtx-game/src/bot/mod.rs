@@ -23,6 +23,7 @@ pub(crate) mod goals;
 mod grenade;
 mod hook;
 pub(crate) mod model;
+pub(crate) mod oracle;
 pub(crate) mod par;
 pub(crate) mod perception;
 mod population;
@@ -321,6 +322,7 @@ pub fn run_bots(game: &mut GameState) {
     // per bot (mvdsv's `SV_RunBots` runs `SV_ProgStartFrame(true)` before its client loop), so this
     // one bracket is already the whole squad's think time — see `prof`.
     let host = *game.host();
+    oracle::frame_begin(game);
     // Reconcile the goal-selection worker pool to `rtx_bot_par` (builds it on first enable). Cheap
     // when already in the wanted state; the floods themselves are dispatched from `best_item_plan`.
     game.bot_pool.ensure(&host);
@@ -349,6 +351,8 @@ pub fn run_bots(game: &mut GameState) {
             }
         }
     }
+
+    oracle::frame_end(game);
 
     if profiling {
         game.bot_prof.add_frame(frame.stop(), bots, budget);
@@ -630,6 +634,92 @@ fn hard_mode_objective(intent: Option<BotIntent>) -> bool {
     matches!(intent, Some(BotIntent::Move(_) | BotIntent::Spectate { .. }))
 }
 
+fn reject_oracle_advice(game: &mut GameState, e: EntId, nugget: oracle::OracleNugget, now: f32) {
+    game.entities[e].bot.oracle.discard(nugget, now);
+    game.oracle.invalidate_trial(nugget, now);
+}
+
+/// Admit one current oracle nugget into the ordinary objective layer. The caller has already run
+/// perception and urgent recovery; this helper refuses hard mode goals, committed traversal, and
+/// handoff holds. Item advice is deliberately an uncommitted goal, so visible combat can still own
+/// movement. Positional advice only redirects idle/search movement, never a visible engagement.
+fn apply_oracle_advice(
+    game: &mut GameState,
+    e: EntId,
+    now: f32,
+    intent: Option<BotIntent>,
+    combat_last_seen: Option<Vec3>,
+    traversal_committed: bool,
+    holding: bool,
+) -> Option<Vec3> {
+    if traversal_committed
+        || holding
+        || hard_mode_objective(intent)
+        || game.entities[e].bot.goal.commit != GoalCommit::None
+    {
+        return None;
+    }
+    let nugget = game.entities[e].bot.oracle.best(now)?;
+    let Some(graph) = game.nav.graph.as_ref() else {
+        return None;
+    };
+    if nugget.target_cell as usize >= graph.cells.len() {
+        reject_oracle_advice(game, e, nugget, now);
+        return None;
+    }
+
+    match nugget.kind {
+        oracle::NuggetKind::Rearm | oracle::NuggetKind::PrepareItem => {
+            let item = EntId(nugget.subject);
+            if item.0 == 0 || item.0 as usize >= game.entities.len() {
+                reject_oracle_advice(game, e, nugget, now);
+                return None;
+            }
+            let armed = (game.entities[e].v.items.has(Items::ROCKET_LAUNCHER)
+                && game.entities[e].v.ammo_rockets >= 1.0)
+                || (game.entities[e].v.items.has(Items::LIGHTNING)
+                    && game.entities[e].v.ammo_cells >= 1.0);
+            if nugget.kind == oracle::NuggetKind::Rearm && armed
+                || !game.item_goal_valid(e, item, now)
+            {
+                reject_oracle_advice(game, e, nugget, now);
+                return None;
+            }
+            let goal = &mut game.entities[e].bot.goal;
+            if goal.item != item.0 {
+                goal.since = now;
+            }
+            goal.item = item.0;
+            goal.item_cell = nugget.target_cell;
+            goal.next_item = 0;
+            goal.next_commit = GoalCommit::None;
+            goal.next_pick = nugget.expires_at;
+            game.entities[e].bot.oracle.mark_applied(nugget);
+            game.oracle.mark_applied(nugget, now);
+            None
+        }
+        oracle::NuggetKind::Regroup
+        | oracle::NuggetKind::CoverArea
+        | oracle::NuggetKind::Intercept => {
+            let visible_fight = matches!(intent, Some(BotIntent::Fight(_)))
+                && combat_last_seen.is_none();
+            if visible_fight || matches!(intent, Some(BotIntent::Advance(_))) {
+                return None;
+            }
+            let target = graph.cell_origin(nugget.target_cell);
+            let goal = &mut game.entities[e].bot.goal;
+            goal.item = 0;
+            goal.next_item = 0;
+            goal.commit = GoalCommit::None;
+            goal.next_commit = GoalCommit::None;
+            goal.next_pick = nugget.expires_at;
+            game.entities[e].bot.oracle.mark_applied(nugget);
+            game.oracle.mark_applied(nugget, now);
+            Some(target)
+        }
+    }
+}
+
 fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, client: i32) -> Objective {
     let host = *game.host();
     // Hook invariant net: if we're mid-hook but no longer hold the grapple (a mode loadout stripped
@@ -858,6 +948,15 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         now,
         intent.is_none() && game.entities[e].bot.goal.commit == GoalCommit::None,
     );
+    let oracle_target = apply_oracle_advice(
+        game,
+        e,
+        now,
+        intent,
+        combat_last_seen,
+        traversal_committed,
+        holding,
+    );
     if holding {
         // `update_handoff_hold` set `goal_item` to the held weapon — nothing else to pick this frame.
     } else if game.entities[e].bot.goal.commit != GoalCommit::None {
@@ -1016,6 +1115,9 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // mode's target, the chosen item, or the nearest human.
     let (target_origin, item_cell) = match intent {
         Some(BotIntent::Fight(_)) if chasing => vigil.unwrap_or(goal_item_org),
+        Some(BotIntent::Fight(_)) if oracle_target.is_some() && combat_last_seen.is_some() => {
+            (oracle_target.unwrap(), None)
+        }
         // Visible → the enemy's live origin (combat owns aim on sight); aware-but-unseen → the
         // last-seen spot, so the bot searches where they went instead of tracking through walls.
         Some(BotIntent::Fight(en)) => (combat_last_seen.unwrap_or(game.entities[en].v.origin), None),
@@ -1025,6 +1127,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         // Spectate navigates exactly like Move; the watched fighter only redirects the eyes (below).
         Some(BotIntent::Spectate { goal, .. }) => (goal, None),
         None if chasing => vigil.unwrap_or(goal_item_org),
+        None if oracle_target.is_some() => (oracle_target.unwrap(), None),
         None => {
             polite = true; // following / roaming: no need to stand on the exact spot
             if let Some(spot) = mode.bot_idle_roam(game, e) {
@@ -1672,6 +1775,7 @@ impl GameState {
     /// live item so the timed-departure selector, rather than a stale standing goal, decides when to
     /// return. The picker is briefly avoid-listed even when the touch was incidental to its route.
     pub(crate) fn bot_item_taken(&mut self, item: EntId, picker: EntId, now: f32) {
+        oracle::note_item_taken(self, item, picker, now);
         let maxclients = self.host().cvar(c"maxclients") as u32;
         for client in (1..=maxclients).map(EntId) {
             if self.entities[client].bot.is_bot {

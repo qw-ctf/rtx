@@ -271,7 +271,7 @@ impl GameState {
             lreach,
         ));
         self.host.dprint(&msg);
-        self.nav.graph = Some(graph);
+        self.nav.graph = Some(std::sync::Arc::new(graph));
         self.nav.goals = goals;
     }
 
