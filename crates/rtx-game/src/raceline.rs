@@ -166,7 +166,12 @@ pub fn rollout(bsp: &Bsp, line: &RaceLine, nodes: &[RaceRouteNode], pm: &PmParam
         return RolloutResult { time: 0.0, finished: false, fell: false, reached: 0 };
     }
     let floor = line.points.iter().map(|p| p.pos.z).fold(f32::INFINITY, f32::min);
-    let env = Env { dt: DT, accel: pm.accel, maxspeed: pm.maxspeed };
+    let env = Env {
+        dt: DT,
+        accel: pm.accel,
+        maxspeed: pm.maxspeed,
+        profile: crate::bot::human_profile::HumanMovementProfile::legacy(),
+    };
     let start_dir = (line.points[1].pos - line.points[0].pos).xy().normalize_or_zero();
     let mut st = PmState {
         origin: line.points[0].pos,

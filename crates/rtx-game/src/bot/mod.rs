@@ -17,6 +17,7 @@
 use glam::{Vec2, Vec3, Vec3Swizzles};
 
 pub(crate) mod bhop;
+pub(crate) mod human_profile;
 mod combat;
 pub(crate) mod goals;
 mod grenade;

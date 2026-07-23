@@ -19,6 +19,7 @@
 
 use glam::Vec2;
 
+use super::human_profile::HumanMovementProfile;
 use crate::math::{wrap180, yaw_of};
 // The band the takeoff regime holds a curl's solved speed within — single-sourced from the certifier,
 // which proves the landing across exactly this band.
@@ -46,31 +47,24 @@ const FLIPS_PER_HOP: f32 = 3.0;
 /// per hop inside any sane deadband — the "shake." Turning at `OMEGA_BASE` instead needs the wish
 /// angled a few degrees forward of perpendicular (see [`strafe_rate`]), which still gains speed but
 /// carves one wide lobe per hop.
-const OMEGA_BASE: f32 = 140.0;
 /// How far (deg) the heading curves past the bearing before the lobe flips back — the slalom
 /// amplitude. The flip is symmetric (fires the same ±[`LOBE_DEADBAND`] either side), so the S stays
 /// centered on the bearing. With the engine's fixed full-height hop (~0.675 s airborne), one lobe
 /// per hop needs an amplitude near `OMEGA_BASE · T_HOP / 2`; sizing it there keeps the gait to ~one
 /// flip per hop (smooth, not the shake) *and* maximizes speed gain. The cost is a wider lateral
 /// sweep (~±55u), which the live navmesh gates by only bunnyhopping open-enough routes.
-const LOBE_DEADBAND: f32 = 34.0;
 /// Extra air turn rate per degree of heading error *beyond* the lobe band (deg/s per deg): inside the
 /// band the smooth slalom is untouched, but once the heading runs off-line — a corridor bend, or a
 /// wall to carve around — the turn ramps to the physical maximum within ~25° of excess error.
-const ERR_GAIN: f32 = 6.0;
 
 /// How long the entry conditions must hold before engaging, so a momentary straightaway doesn't
 /// stutter the gait. Applies only to the initial engage; disengage decisions happen on landings.
 /// Kept short — the runway is *consumed* while waiting (~32u per 0.1s at walk speed), so a long
 /// delay quietly raises the effective entry bar well past [`RUNWAY_ENGAGE`].
-const ENGAGE_DELAY: f32 = 0.15;
 /// Prestrafe launches into the first hop at this speed — just under the ground-friction
 /// equilibrium (~490), so it's reachable quickly and the jump leaves before gains flatten.
-const PRESTRAFE_TARGET: f32 = 450.0;
 /// Give up circling and just jump if the target speed hasn't arrived by then (shoved, uphill…).
-const PRESTRAFE_MAX_T: f32 = 1.2;
 /// Only bother prestrafing with this much corridor ahead; shorter → hop immediately.
-const PRESTRAFE_MIN_RUNWAY: f32 = 512.0;
 /// Takeoff regime: how close (units, run-up remaining) the takeoff edge must be before a committed
 /// high-speed jump leaps. The bot keeps the ground circle-strafe until it's within this of the lip,
 /// then jumps *once* — so the takeoff point stays where the link was certified. Kept small (a couple
@@ -93,17 +87,14 @@ pub const RUN_UP_SPEED: f32 = 280.0;
 /// keeps circle-strafing on the ground until it's at full run speed rather than leaping slow. Below
 /// ~maxspeed, ground accel (~40 ups/tick toward the wish) far outgains the 30-ups air cap, so a slow
 /// leap is strictly worse than one more ground stride.
-const LAUNCH_MIN_FRAC: f32 = 1.0;
 /// Don't leap unless a hop's flight (`speed·T_HOP`) fits this fraction of the forward clear distance
 /// (`Input.clear`): a bot flying at a wall is better off carving on the ground (which turns far
 /// faster than air) and re-launching once it's aimed down open corridor — the land-carve-rejump a
 /// human does at a bend, instead of face-planting the wall mid-arc.
-const WALL_HOLD_FRAC: f32 = 0.7;
 /// Airborne, if the wall is nearer than this many seconds of flight, abandon the slalom lobe and
 /// carve toward the bearing (the open corridor) at the full physical turn rate.
 const WALL_PANIC_T: f32 = 0.3;
 /// Slack beyond the current hop's flight distance when deciding whether another hop fits.
-const HOP_MARGIN: f32 = 64.0;
 
 /// Minimum corridor (≈3 grid cells) to bother with a ground zigzag: too short for a hop
 /// ([`RUNWAY_ENGAGE`]) but long and straight enough to profit from the circle-strafe. The caller
@@ -113,7 +104,6 @@ pub const ZIGZAG_ENGAGE: f32 = 96.0;
 /// ~55° near the friction equilibrium, and an uncapped serpentine sweeps too wide for a 3-cell
 /// corridor — clamp the deadband so the S-curve stays inside the walls. Launch prestrafe (which
 /// has a long runway by construction) is left uncapped.
-const ZIGZAG_BAND_CAP: f32 = 15.0;
 
 // `air_accel_max`, `theta_star`, `omega_max`, `strafe_rate`, `air_correct`, and `AIR_CORRECT_GAIN_DEFAULT`
 // now live in `rtx_nav::strafe` (glob-re-exported above), shared with the navmesh build's curl certifier.
@@ -184,7 +174,12 @@ pub fn prestrafe(v_xy: Vec2, bearing: f32, prev_sigma: f32, a_g: f32, maxspeed: 
     // bearing to build base speed. Also avoids steering off a garbage yaw from a ~zero velocity.
     let u_star = (maxspeed - a_g).max(0.0);
     if speed <= u_star.max(60.0) {
-        return Strafe { view_yaw: bearing, forward: MOVE_SPEED, side: 0.0, sigma: prev_sigma };
+        return Strafe {
+            view_yaw: bearing,
+            forward: MOVE_SPEED,
+            side: 0.0,
+            sigma: prev_sigma,
+        };
     }
     let vel_yaw = yaw_of(v_xy);
     let err = wrap180(bearing - vel_yaw);
@@ -227,6 +222,7 @@ pub struct Env {
     pub accel: f32,
     /// `sv_maxspeed`.
     pub maxspeed: f32,
+    pub profile: HumanMovementProfile,
 }
 
 /// One frame of world state + policy verdicts from the caller (`bot.rs` owns everything that needs
@@ -319,13 +315,13 @@ impl Bhop {
                 if self.eligible_since == 0.0 {
                     self.eligible_since = i.now;
                 }
-                i.now - self.eligible_since >= ENGAGE_DELAY
+                i.now - self.eligible_since >= env.profile.engage_delay
             } else {
                 self.eligible_since = 0.0;
                 false
             };
             if engage {
-                self.engage(i, env.maxspeed);
+                self.engage(i, env.maxspeed, env.profile);
             } else if i.zigzag && i.on_ground {
                 // No hop yet, but a short straight corridor is worth a ground circle-strafe.
                 self.enter_zigzag(i);
@@ -342,7 +338,7 @@ impl Bhop {
             // A real runway opened (or a SpeedJump leg committed): promote to the hop cycle,
             // carrying the speed we built — `engage` picks Prestrafe vs Hop by speed/runway.
             if i.eligible || i.committed {
-                self.engage(i, env.maxspeed);
+                self.engage(i, env.maxspeed, env.profile);
             } else if !i.zigzag {
                 // Corridor bent or ran out (`runway()` stops at bends), so corners exit cleanly.
                 self.disengage("zigzag");
@@ -350,9 +346,14 @@ impl Bhop {
             } else if !i.on_ground {
                 // Tolerate the 1–2 airborne frames pmove yields stepping down a Step leg: hold the
                 // bearing rather than applying ground math mid-air or disengaging.
-                return Some(Cmd { view_yaw: i.bearing, forward: MOVE_SPEED, side: 0.0, jump: false });
+                return Some(Cmd {
+                    view_yaw: i.bearing,
+                    forward: MOVE_SPEED,
+                    side: 0.0,
+                    jump: false,
+                });
             } else {
-                return Some(self.ground_cmd(i, a_g, env.maxspeed, ZIGZAG_BAND_CAP));
+                return Some(self.ground_cmd(i, a_g, env.maxspeed, env.profile.zigzag_band_cap));
             }
         }
 
@@ -365,9 +366,9 @@ impl Bhop {
                 !i.on_ground || i.runway < LIP_REACH
             } else {
                 !i.on_ground
-                    || speed >= PRESTRAFE_TARGET
-                    || i.now - self.phase_start > PRESTRAFE_MAX_T
-                    || i.runway < speed * T_HOP * 2.0 + HOP_MARGIN // keep room to actually hop
+                    || speed >= env.profile.prestrafe_target
+                    || i.now - self.phase_start > env.profile.prestrafe_max_t
+                    || i.runway < speed * T_HOP * 2.0 + env.profile.hop_margin // keep room to actually hop
             };
             if !launch {
                 // `takeoff_cmd` holds a curl's solved speed; a plain prestrafe (takeoff_speed 0) builds.
@@ -376,29 +377,43 @@ impl Bhop {
             self.phase = Phase::Hop;
             self.phase_start = i.now;
         }
-        self.hop_cmd(i, speed, a_max, a_g, env.maxspeed, env.dt)
+        self.hop_cmd(i, speed, a_max, a_g, env.maxspeed, env.dt, env.profile)
     }
 
     /// The hop loop: air-strafe while airborne; on a landing frame decide whether another hop
     /// fits, and if so take off again with a strafe+jump cmd (full air-accel gain — see module
     /// docs on `PM_CheckJump` running before `PM_Friction`).
-    fn hop_cmd(&mut self, i: &Input, speed: f32, a_max: f32, a_g: f32, maxspeed: f32, dt: f32) -> Option<Cmd> {
+    fn hop_cmd(
+        &mut self,
+        i: &Input,
+        speed: f32,
+        a_max: f32,
+        a_g: f32,
+        maxspeed: f32,
+        dt: f32,
+        profile: HumanMovementProfile,
+    ) -> Option<Cmd> {
         if !i.on_ground {
             self.jump_prev = false; // airborne releases the button, re-arming PM_CheckJump
-            // A committed speed jump is a single leap onto a fixed landing: curl the velocity smoothly
-            // onto the bearing with `air_correct` (pursuit guidance), not the hop slalom (whose lobe
-            // flips scatter the landing point). The bearing already tracks the target once airborne.
+                                    // A committed speed jump is a single leap onto a fixed landing: curl the velocity smoothly
+                                    // onto the bearing with `air_correct` (pursuit guidance), not the hop slalom (whose lobe
+                                    // flips scatter the landing point). The bearing already tracks the target once airborne.
             let s = if i.committed && i.takeoff_speed > 0.0 && i.curl_gain > 0.0 {
                 air_correct(i.v_xy, i.bearing, a_max, dt, i.curl_gain)
             } else {
-                self.air_strafe(i, speed, a_max, dt)
+                self.air_strafe(i, speed, a_max, dt, profile)
             };
-            return Some(Cmd { view_yaw: s.view_yaw, forward: s.forward, side: s.side, jump: false });
+            return Some(Cmd {
+                view_yaw: s.view_yaw,
+                forward: s.forward,
+                side: s.side,
+                jump: false,
+            });
         }
         // Landing (or first) ground frame — the only place a run ends by policy. A planned carry
         // keeps the chain alive across leg-kind churn even where the per-landing runway arithmetic
         // would give up (the planner already proved speed belongs here).
-        let keep_hopping = i.committed || i.carry || (i.sustain && i.runway >= speed * T_HOP + HOP_MARGIN);
+        let keep_hopping = i.committed || i.carry || (i.sustain && i.runway >= speed * T_HOP + profile.hop_margin);
         if !keep_hopping {
             self.disengage(if i.sustain { "runway" } else { "leg" });
             return None;
@@ -416,7 +431,10 @@ impl Bhop {
                 // Hold the solved takeoff speed to the lip (coast above the band, build below).
                 return Some(self.takeoff_cmd(i, a_g, maxspeed));
             }
-        } else if i.hold_jump || speed < LAUNCH_MIN_FRAC * maxspeed || i.clear < speed * T_HOP * WALL_HOLD_FRAC {
+        } else if i.hold_jump
+            || speed < profile.launch_min_frac * maxspeed
+            || i.clear < speed * T_HOP * profile.wall_hold_frac
+        {
             return Some(self.ground_cmd(i, a_g, maxspeed, f32::INFINITY));
         }
         let jump = !self.jump_prev;
@@ -426,10 +444,20 @@ impl Bhop {
             // A curl leaps straight down the corridor — the certifier's tick-0 is a bearing-forward wish,
             // so don't spend the launch frame on a slalom lobe that skews the takeoff heading.
             if sj_takeoff {
-                return Some(Cmd { view_yaw: i.bearing, forward: MOVE_SPEED, side: 0.0, jump: true });
+                return Some(Cmd {
+                    view_yaw: i.bearing,
+                    forward: MOVE_SPEED,
+                    side: 0.0,
+                    jump: true,
+                });
             }
-            let s = self.air_strafe(i, speed, a_max, dt);
-            Some(Cmd { view_yaw: s.view_yaw, forward: s.forward, side: s.side, jump: true })
+            let s = self.air_strafe(i, speed, a_max, dt, profile);
+            Some(Cmd {
+                view_yaw: s.view_yaw,
+                forward: s.forward,
+                side: s.side,
+                jump: true,
+            })
         } else {
             // The pulse-release frame after a press that didn't take: still gain on the ground.
             Some(self.ground_cmd(i, a_g, maxspeed, f32::INFINITY))
@@ -441,7 +469,7 @@ impl Bhop {
     /// and flip the strafe side once the heading has curved [`LOBE_DEADBAND`] past the bearing. The
     /// flip is symmetric — same threshold either side — so the S self-centers on the bearing; sized
     /// so a lobe runs about a hop, i.e. one flip per hop, the smooth gait rather than the shake.
-    fn air_strafe(&mut self, i: &Input, speed: f32, a_max: f32, dt: f32) -> Strafe {
+    fn air_strafe(&mut self, i: &Input, speed: f32, a_max: f32, dt: f32, profile: HumanMovementProfile) -> Strafe {
         let vel_yaw = yaw_of(i.v_xy);
         let err = wrap180(i.bearing - vel_yaw);
         if self.sigma == 0.0 {
@@ -456,14 +484,16 @@ impl Bhop {
             }
             return strafe_rate(i.v_xy, self.sigma, omega_max(speed, a_max, dt), a_max, dt);
         }
-        if err * self.sigma < -LOBE_DEADBAND {
+        if err * self.sigma < -profile.lobe_deadband {
             self.sigma = -self.sigma;
             self.flips += 1;
         }
         // Base rate + a gentle within-hop correction, plus a steep ramp once the error runs past the
         // lobe band (a bend or a wall to carve) — up to what the tick can deliver (`omega_max` falls
         // with speed). Inside the band the extra term is zero, so the smooth slalom is unchanged.
-        let omega = (OMEGA_BASE + err.abs() / T_HOP + (err.abs() - LOBE_DEADBAND).max(0.0) * ERR_GAIN)
+        let omega = (profile.omega_base
+            + err.abs() / T_HOP
+            + (err.abs() - profile.lobe_deadband).max(0.0) * profile.error_gain)
             .min(omega_max(speed, a_max, dt));
         strafe_rate(i.v_xy, self.sigma, omega, a_max, dt)
     }
@@ -478,7 +508,12 @@ impl Bhop {
     fn takeoff_cmd(&mut self, i: &Input, a_g: f32, maxspeed: f32) -> Cmd {
         if i.takeoff_speed > 0.0 && i.v_xy.length() > i.takeoff_speed * (1.0 + CURL_V_HOLD_TOL) {
             self.jump_prev = false;
-            return Cmd { view_yaw: i.bearing, forward: MOVE_SPEED, side: 0.0, jump: false };
+            return Cmd {
+                view_yaw: i.bearing,
+                forward: MOVE_SPEED,
+                side: 0.0,
+                jump: false,
+            };
         }
         self.ground_cmd(i, a_g, maxspeed, f32::INFINITY)
     }
@@ -488,7 +523,12 @@ impl Bhop {
     fn ground_cmd(&mut self, i: &Input, a_g: f32, maxspeed: f32, band_cap: f32) -> Cmd {
         self.jump_prev = false;
         let s = self.weave(prestrafe(i.v_xy, i.bearing, self.sigma, a_g, maxspeed, band_cap));
-        Cmd { view_yaw: s.view_yaw, forward: s.forward, side: s.side, jump: false }
+        Cmd {
+            view_yaw: s.view_yaw,
+            forward: s.forward,
+            side: s.side,
+            jump: false,
+        }
     }
 
     /// Record a strafe's sign into the sticky state, counting flips for telemetry.
@@ -500,7 +540,7 @@ impl Bhop {
         s
     }
 
-    fn engage(&mut self, i: &Input, maxspeed: f32) {
+    fn engage(&mut self, i: &Input, maxspeed: f32, profile: HumanMovementProfile) {
         let speed = i.v_xy.length();
         // Prestrafe only from a genuine standing-ish start with runway to spare. If the planner
         // routed a carry here and we're already at speed, skip straight to the hop cycle — grounding
@@ -513,8 +553,8 @@ impl Bhop {
         let sj_build = i.committed && i.takeoff_speed > 0.0 && speed < i.takeoff_speed;
         self.phase = if i.on_ground
             && !hot_carry
-            && speed < PRESTRAFE_TARGET
-            && (i.runway > PRESTRAFE_MIN_RUNWAY || sj_build)
+            && speed < profile.prestrafe_target
+            && (i.runway > profile.prestrafe_min_runway || sj_build)
         {
             Phase::Prestrafe
         } else {
@@ -610,7 +650,10 @@ mod tests {
                 let v2 = apply_airaccel(v, wishdir_fs(cmd.view_yaw, cmd.forward, cmd.side), MAXSPEED, ACCEL, dt);
                 let turned = yaw_of(v2);
                 let want = omega * dt;
-                assert!((turned - want).abs() <= 0.1 * want + 0.02, "s={s} ω={omega}: turned {turned}° want {want}°");
+                assert!(
+                    (turned - want).abs() <= 0.1 * want + 0.02,
+                    "s={s} ω={omega}: turned {turned}° want {want}°"
+                );
                 assert!(v2.length() > s, "s={s} ω={omega}: no speed gain {s} -> {}", v2.length());
             }
         }
@@ -624,7 +667,11 @@ mod tests {
         let a_g = air_accel_max(ACCEL, MAXSPEED, dt);
         let v = Vec2::new(400.0, 0.0); // vel_yaw = 0, above u* ≈ 278
         let s = prestrafe(v, 20.0, 1.0, a_g, MAXSPEED, f32::INFINITY);
-        assert!(s.view_yaw.abs() < 0.01, "view should ride the velocity (0°), got {}", s.view_yaw);
+        assert!(
+            s.view_yaw.abs() < 0.01,
+            "view should ride the velocity (0°), got {}",
+            s.view_yaw
+        );
         let theta_g = ((MAXSPEED - a_g).max(0.0) / 400.0).clamp(0.0, 1.0).acos().to_degrees();
         let wd = wishdir_fs(s.view_yaw, s.forward, s.side);
         let wish_yaw = yaw_of(wd);
@@ -635,7 +682,10 @@ mod tests {
         );
         // Below u* it's a plain run-up: eyes on the bearing, no strafe.
         let s2 = prestrafe(Vec2::new(150.0, 0.0), 20.0, 1.0, a_g, MAXSPEED, f32::INFINITY);
-        assert!((s2.view_yaw - 20.0).abs() < 0.01 && s2.side == 0.0, "below u* should run straight at the bearing");
+        assert!(
+            (s2.view_yaw - 20.0).abs() < 0.01 && s2.side == 0.0,
+            "below u* should run straight at the bearing"
+        );
     }
 
     #[test]
@@ -719,7 +769,11 @@ mod tests {
             vel = apply_airaccel(vel, wishdir_of(s.view_yaw, s.side), MAX_SPEED, ACCEL, dt);
         }
         let planned = BHOP_EFF * attainable_speed(MAX_SPEED, 800.0, k);
-        assert!(vel.length() >= planned, "controller {} slower than planned {planned}", vel.length());
+        assert!(
+            vel.length() >= planned,
+            "controller {} slower than planned {planned}",
+            vel.length()
+        );
     }
 }
 
@@ -732,7 +786,12 @@ mod sim {
     use super::*;
 
     const DT: f32 = 1.0 / 77.0;
-    const ENV: Env = Env { dt: DT, accel: 10.0, maxspeed: 320.0 };
+    const ENV: Env = Env {
+        dt: DT,
+        accel: 10.0,
+        maxspeed: 320.0,
+        profile: HumanMovementProfile::calibrated(),
+    };
     const JUMP_VZ: f32 = 270.0;
     const GRAVITY: f32 = 800.0;
     const FRICTION: f32 = 4.0;
@@ -750,7 +809,14 @@ mod sim {
 
     impl World {
         fn grounded(speed: f32) -> Self {
-            World { pos: Vec2::ZERO, z: 0.0, vz: 0.0, v: Vec2::new(speed, 0.0), on_ground: true, jump_held: false }
+            World {
+                pos: Vec2::ZERO,
+                z: 0.0,
+                vz: 0.0,
+                v: Vec2::new(speed, 0.0),
+                on_ground: true,
+                jump_held: false,
+            }
         }
     }
 
@@ -807,7 +873,12 @@ mod sim {
 
     /// While the controller is Off, the bot runs at the bearing through the normal steering path.
     fn run_cmd(bearing: f32) -> Cmd {
-        Cmd { view_yaw: bearing, forward: MOVE_SPEED, side: 0.0, jump: false }
+        Cmd {
+            view_yaw: bearing,
+            forward: MOVE_SPEED,
+            side: 0.0,
+            jump: false,
+        }
     }
 
     /// An input with `eligible`/`zigzag`/`on_ground` under test control (the default `input` fixes
@@ -856,7 +927,12 @@ mod sim {
         }
         let launch = launch_speed.expect("never launched from prestrafe");
         assert!(launch >= 420.0, "launched at only {launch} ups");
-        assert!(w.v.length() >= 550.0, "only {} ups after 10s (peak {})", w.v.length(), b.peak);
+        assert!(
+            w.v.length() >= 550.0,
+            "only {} ups after 10s (peak {})",
+            w.v.length(),
+            b.peak
+        );
         // Average over a couple of weave periods: the slalom lobe is wide (±LOBE_DEADBAND), so a
         // short window catches a lobe peak, not the centered mean.
         let heading = mean_heading(&trace[trace.len() - 154..]);
@@ -864,7 +940,12 @@ mod sim {
         assert!(b.hops >= 3, "only {} hops in 10s", b.hops);
         // The smooth slalom carves ~one lobe per hop — a decisive drop from the old ~3-flip weave.
         let flips_per_hop = b.flips as f32 / b.hops as f32;
-        assert!((0.5..=2.0).contains(&flips_per_hop), "{} flips over {} hops (want smooth ~1/hop)", b.flips, b.hops);
+        assert!(
+            (0.5..=2.0).contains(&flips_per_hop),
+            "{} flips over {} hops (want smooth ~1/hop)",
+            b.flips,
+            b.hops
+        );
     }
 
     #[test]
@@ -873,7 +954,7 @@ mod sim {
         // launch floor (full maxspeed) on a long runway (via Prestrafe), a medium one, or a short one
         // (the 256–512u direct-to-Hop band Daniel saw hopping slow) — the bot builds speed on the
         // ground to ≥ maxspeed first, then leaps.
-        let floor = LAUNCH_MIN_FRAC * ENV.maxspeed;
+        let floor = ENV.profile.launch_min_frac * ENV.maxspeed;
         for &(runway, min_takeoff) in &[(4096.0f32, 420.0f32), (400.0, 319.0), (300.0, 319.0)] {
             let mut w = World::grounded(100.0);
             let mut b = Bhop::default();
@@ -882,13 +963,20 @@ mod sim {
                 let now = f as f32 * DT;
                 let cmd = b.step(&input(&w, 0.0, runway, now), &ENV).unwrap_or(run_cmd(0.0));
                 if cmd.jump {
-                    assert!(w.v.length() >= floor - 1.0, "leaped at {} ups (runway {runway})", w.v.length());
+                    assert!(
+                        w.v.length() >= floor - 1.0,
+                        "leaped at {} ups (runway {runway})",
+                        w.v.length()
+                    );
                     first_jump.get_or_insert(w.v.length());
                 }
                 pm_frame(&mut w, &cmd, false);
             }
             let fj = first_jump.expect("never took off");
-            assert!(fj >= min_takeoff, "first takeoff at {fj} ups (runway {runway}), want ≥ {min_takeoff}");
+            assert!(
+                fj >= min_takeoff,
+                "first takeoff at {fj} ups (runway {runway}), want ≥ {min_takeoff}"
+            );
         }
     }
 
@@ -930,7 +1018,10 @@ mod sim {
             pm_frame(&mut w, &cmd, false);
         }
         let (spd, rw) = takeoff.expect("never took off");
-        assert!(spd >= 400.0, "took off at {spd} ups on the short runway, want ≥ 400 (build to ~v_req)");
+        assert!(
+            spd >= 400.0,
+            "took off at {spd} ups on the short runway, want ≥ 400 (build to ~v_req)"
+        );
         assert!(rw < LIP_REACH + 8.0, "leaped {rw}u short of the lip, want at the edge");
     }
 
@@ -975,7 +1066,10 @@ mod sim {
             }
             let (spd, rw) = takeoff.expect("never took off");
             let band = V_STAR * CURL_V_HOLD_TOL * 2.0; // the hold ripple may span the band either side
-            assert!((spd - V_STAR).abs() <= band, "entry {entry}: took off at {spd} ups, want {V_STAR} ±{band}");
+            assert!(
+                (spd - V_STAR).abs() <= band,
+                "entry {entry}: took off at {spd} ups, want {V_STAR} ±{band}"
+            );
             assert!(rw < LIP_REACH + 8.0, "entry {entry}: leaped {rw}u short of the lip");
         }
     }
@@ -1015,7 +1109,10 @@ mod sim {
             }
             pm_frame(&mut w, &cmd, false);
         }
-        assert!(leaped, "a committed curl past the lip (negative runway) must leap, not hold");
+        assert!(
+            leaped,
+            "a committed curl past the lip (negative runway) must leap, not hold"
+        );
     }
 
     #[test]
@@ -1036,7 +1133,9 @@ mod sim {
         w.vz = 0.0;
         w.on_ground = true;
         w.jump_held = false;
-        let cmd = b.step(&input(&w, 0.0, 4096.0, 40.0 * DT), &ENV).expect("stays engaged after the bump");
+        let cmd = b
+            .step(&input(&w, 0.0, 4096.0, 40.0 * DT), &ENV)
+            .expect("stays engaged after the bump");
         assert!(!cmd.jump, "leaped at 250 ups after a bump");
         // Drive forward: it rebuilds on the ground and only re-jumps past the floor.
         let mut rejump = None;
@@ -1049,7 +1148,10 @@ mod sim {
             pm_frame(&mut w, &cmd, false);
         }
         let rj = rejump.expect("never re-jumped");
-        assert!(rj >= 0.95 * ENV.maxspeed - 1.0, "re-jumped at {rj} ups (below the floor)");
+        assert!(
+            rj >= 0.95 * ENV.maxspeed - 1.0,
+            "re-jumped at {rj} ups (below the floor)"
+        );
     }
 
     #[test]
@@ -1070,7 +1172,10 @@ mod sim {
         w.jump_held = false;
         let mut inp = input(&w, 0.0, 4096.0, 30.0 * DT);
         inp.clear = 50.0; // wall 50u ahead; a hop's flight would be ~310u
-        assert!(!b.step(&inp, &ENV).expect("engaged").jump, "leaped toward a wall 50u away");
+        assert!(
+            !b.step(&inp, &ENV).expect("engaged").jump,
+            "leaped toward a wall 50u away"
+        );
     }
 
     #[test]
@@ -1078,17 +1183,30 @@ mod sim {
         // Airborne, flying at a near wall, heading 60° off the bearing: drop the slalom and carve
         // toward the bearing at the full physical turn rate (not the gentle lobe rate).
         let a = air_accel_max(ENV.accel, ENV.maxspeed, DT);
-        let w = World { pos: Vec2::ZERO, z: 60.0, vz: 0.0, v: Vec2::new(450.0, 0.0), on_ground: false, jump_held: true };
+        let w = World {
+            pos: Vec2::ZERO,
+            z: 60.0,
+            vz: 0.0,
+            v: Vec2::new(450.0, 0.0),
+            on_ground: false,
+            jump_held: true,
+        };
         let mut inp = input(&w, 60.0, 4096.0, 0.0); // bearing +60° from the +x velocity
         inp.committed = true; // engage immediately, no hysteresis
         inp.clear = 30.0; // wall within WALL_PANIC_T (450·0.3 = 135u)
         let mut b = Bhop::default();
         let cmd = b.step(&inp, &ENV).expect("airborne engaged");
         let wd = wishdir_fs(cmd.view_yaw, cmd.forward, cmd.side);
-        let turned = apply_airaccel(w.v, wd, ENV.maxspeed, ENV.accel, DT).y.atan2(w.v.x).to_degrees();
+        let turned = apply_airaccel(w.v, wd, ENV.maxspeed, ENV.accel, DT)
+            .y
+            .atan2(w.v.x)
+            .to_degrees();
         let wmax = omega_max(450.0, a, DT) * DT; // max per-tick heading change
         assert!(turned > 0.0, "should carve toward the +60° bearing, turned {turned}°");
-        assert!((turned - wmax).abs() < 0.15 * wmax + 0.05, "carve {turned}° should be ~max {wmax}°");
+        assert!(
+            (turned - wmax).abs() < 0.15 * wmax + 0.05,
+            "carve {turned}° should be ~max {wmax}°"
+        );
     }
 
     #[test]
@@ -1105,7 +1223,9 @@ mod sim {
             let now = f as f32 * DT;
             let bearing = (now / 2.7 * 80.0).min(80.0); // 80° over ~4 hops
             let was_air = !w.on_ground;
-            let cmd = b.step(&input(&w, bearing, 4096.0, now), &ENV).unwrap_or(run_cmd(bearing));
+            let cmd = b
+                .step(&input(&w, bearing, 4096.0, now), &ENV)
+                .unwrap_or(run_cmd(bearing));
             pm_frame(&mut w, &cmd, false);
             let hd = yaw_of(w.v);
             if was_air && !w.on_ground {
@@ -1113,13 +1233,20 @@ mod sim {
             }
             prev_hd = hd;
         }
-        assert!(w.v.length() >= 468.0, "curved chain gained too little: {} ups", w.v.length());
+        assert!(
+            w.v.length() >= 468.0,
+            "curved chain gained too little: {} ups",
+            w.v.length()
+        );
         assert!(b.hops >= 4, "only {} hops in the chain", b.hops);
         let flips_per_hop = b.flips as f32 / b.hops as f32;
         assert!(flips_per_hop <= 2.0, "{flips_per_hop} flips/hop — not the smooth gait");
         air_rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let median = air_rates[air_rates.len() / 2];
-        assert!((80.0..=280.0).contains(&median), "median air-strafe yaw rate {median} °/s off human band");
+        assert!(
+            (80.0..=280.0).contains(&median),
+            "median air-strafe yaw rate {median} °/s off human band"
+        );
     }
 
     #[test]
@@ -1130,7 +1257,9 @@ mod sim {
         for f in 0..539 {
             let now = f as f32 * DT;
             let bearing = if now < 3.0 { 0.0 } else { 30.0 };
-            let cmd = b.step(&input(&w, bearing, 4096.0, now), &ENV).unwrap_or(run_cmd(bearing));
+            let cmd = b
+                .step(&input(&w, bearing, 4096.0, now), &ENV)
+                .unwrap_or(run_cmd(bearing));
             pm_frame(&mut w, &cmd, false);
             trace.push(w.v);
         }
@@ -1230,7 +1359,11 @@ mod sim {
             }
         }
         assert!(at_1s >= 440.0, "only {at_1s} ups after 1s of prestrafe");
-        assert!(v.length() < 520.0, "prestrafe equilibrium implausibly high: {}", v.length());
+        assert!(
+            v.length() < 520.0,
+            "prestrafe equilibrium implausibly high: {}",
+            v.length()
+        );
     }
 
     #[test]
@@ -1250,8 +1383,15 @@ mod sim {
             pm_frame(&mut w, &cmd, false);
             max_lat = max_lat.max(w.pos.y.abs());
         }
-        assert!(w.v.length() >= 430.0, "zigzag only reached {} ups in 1.5s", w.v.length());
-        assert!(max_lat <= 96.0, "zigzag swept {max_lat}u off the corridor centerline (band cap failed)");
+        assert!(
+            w.v.length() >= 430.0,
+            "zigzag only reached {} ups in 1.5s",
+            w.v.length()
+        );
+        assert!(
+            max_lat <= 96.0,
+            "zigzag swept {max_lat}u off the corridor centerline (band cap failed)"
+        );
     }
 
     #[test]
@@ -1281,7 +1421,11 @@ mod sim {
         }
         assert!(saw_zigzag, "never entered the zigzag phase");
         assert_eq!(b.phase, Phase::Hop, "never handed off to the hop cycle: {:?}", b.phase);
-        assert!(w.v.length() >= 430.0, "lost speed across the handoff: {} ups", w.v.length());
+        assert!(
+            w.v.length() >= 430.0,
+            "lost speed across the handoff: {} ups",
+            w.v.length()
+        );
     }
 
     #[test]

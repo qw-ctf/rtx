@@ -413,7 +413,12 @@ fn bot_matches_or_beats_human() {
                 let v_start = frame_vel(&frames, a).xy().length();
                 let v_human_end = frame_vel(&frames, b).xy().length();
 
-                let env = Env { dt: DT, accel: p.accel, maxspeed: p.maxspeed };
+                let env = Env {
+                    dt: DT,
+                    accel: p.accel,
+                    maxspeed: p.maxspeed,
+                    profile: crate::bot::human_profile::HumanMovementProfile::legacy(),
+                };
                 let mut pos = Vec3::ZERO;
                 let mut vel = Vec3::new(v_start, 0.0, 0.0); // start along +x at the human's speed
                 let (mut on_ground, mut jump_held) = (true, false);
