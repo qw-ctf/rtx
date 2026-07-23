@@ -14,7 +14,7 @@ Part of the [rtx manual](../README.md)
 | `rtx-proto` | The QuakeWorld wire protocol as a pure codec — sizebuf, info strings, checksums, netchan, the out-of-band handshake, svc parser and clc builder — with an `nq/` sibling doing the same for NetQuake. No IO, no threads. |
 | `rtx-client` | The [network client](netclient.md) front door: parses argv and hands off to `rtx-game`'s `netclient` module (built with the `netclient` feature). |
 | `navview` | A minimal wgpu/winit viewer for the navmesh: renders the BSP world plus the colored nav links. Load a `.bsp` via argv or drag-and-drop. |
-| `rjmcp` | An MCP (stdio) server bridging Claude Code to the game's TCP control channel, managing a local server process for rocket-jump tuning. See [its README](../crates/rjmcp/README.md). |
+| `rtx-mcp` | An MCP (stdio) server bridging Claude Code to the game's TCP control channel, managing a local server process for live bot control and rocket-jump tuning. See [its README](../crates/rtx-mcp/README.md). |
 
 `cargo build` builds the default members — `rtx-nav`, `rtx-proto`, `rtx-game`. The viewer, the
 MCP bridge, and the network client are deliberately excluded and built explicitly with `-p`.
@@ -39,7 +39,7 @@ The rest, each on demand:
 ```sh
 cargo build --release -p rtx-client    # the network client
 cargo run -p navview -- <map.bsp>      # the navmesh viewer
-cargo run -p rjmcp --quiet             # the MCP bridge (normally launched via .mcp.json)
+cargo run -p rtx-mcp --quiet           # the MCP bridge (normally launched via .mcp.json)
 ```
 
 The `netclient` cargo feature on `rtx-game` is default-off and purely additive: it adds the
@@ -78,7 +78,7 @@ a harness can drive precise, repeatable bot situations against a live server. `0
 binds nothing. Implementation: `crates/rtx-game/src/control.rs`.
 
 The rocket-jump tuning loop built on top of it — an MCP server that Claude Code drives, plus the
-`rtx_rj_*` knobs it turns — is documented in [`crates/rjmcp/README.md`](../crates/rjmcp/README.md).
+`rtx_rj_*` knobs it turns — is documented in [`crates/rtx-mcp/README.md`](../crates/rtx-mcp/README.md).
 
 ## Profiling the bot brain
 

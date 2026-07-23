@@ -2,14 +2,14 @@
 # game module's TCP control channel and manages the local mvdsv process. Kept out of the workspace
 # default build (like navview) so plain `cargo build`/CI never pull the rmcp/tokio tree.
 [package]
-name = "rjmcp"
+name = "rtx-mcp"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 publish = false
 
 [[bin]]
-name = "rjmcp"
+name = "rtx-mcp"
 path = "src/main.rs"
 
 [dependencies]

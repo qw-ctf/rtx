@@ -1,9 +1,9 @@
 {
   "mcpServers": {
-    "rjtune": {
+    "rtx-mcp": {
       "type": "stdio",
       "command": "cargo",
-      "args": ["run", "-p", "rjmcp", "--quiet"]
+      "args": ["run", "-p", "rtx-mcp", "--quiet"]
     }
   }
 }

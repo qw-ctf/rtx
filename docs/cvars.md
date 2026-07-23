@@ -116,7 +116,7 @@ Debug and harness knobs — safe to ignore on a play server. See
 
 The `rtx_rj_*` and `rtx_jump_*` knobs are read live each frame and default to the constants they
 replace, so behaviour is unchanged until one is set — they exist for the
-[rocket-jump tuning harness](../crates/rjmcp/README.md).
+[rtx-mcp harness](../crates/rtx-mcp/README.md).
 
 ---
 

@@ -1,10 +1,10 @@
-# rjmcp — the rocket-jump tuning harness
+# rtx-mcp — the rtx bot control and tuning harness
 
 An MCP (stdio) server that lets Claude Code drive rtx bots through scripted rocket-jump tests and
 tune the driver knobs, without hand-flying bots in a live server.
 
 ```
-Claude Code ──MCP stdio──▶ rjmcp ──TCP 127.0.0.1:port──▶ control.rs in librtx.dylib
+Claude Code ──MCP stdio──▶ rtx-mcp ──TCP 127.0.0.1:port──▶ control.rs in librtx.dylib
                              └─ spawns/kills playground/mvdsv (+exec rjtest.cfg)
 ```
 
@@ -18,11 +18,11 @@ Claude Code ──MCP stdio──▶ rjmcp ──TCP 127.0.0.1:port──▶ con
   `liftoff_timeout`, `ballistic_slack`, and the two solve biases `delay_bias` (added to the fire
   delay) and `pitch_bias` (added to the fire pitch). Defaults mirror the driver constants, so an
   untouched server is unchanged.
-- **This bridge** (`crates/rjmcp`): manages mvdsv, connects to the control port, exposes MCP tools.
+- **This bridge** (`crates/rtx-mcp`): manages mvdsv, connects to the control port, exposes MCP tools.
 
 ## Use
 
-Registered in the repo-root `.mcp.json` as `rjtune`. After a Claude Code session restart (or
+Registered in the repo-root `.mcp.json` as `rtx-mcp`. After a Claude Code session restart (or
 `/mcp`), approve it, then:
 
 1. `server_start(map="aerowalk")` — launches mvdsv with the harness config (1 bot, control port

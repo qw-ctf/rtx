@@ -45,7 +45,7 @@ a question:
 | `crates/rtx-proto/` | QuakeWorld + NetQuake wire protocols as pure codecs. |
 | `crates/rtx-client/` | The thin front-door binary that parses argv and calls `netclient::run`. |
 | `crates/navview/` | A wgpu/winit 3D viewer for the generated navmesh. |
-| `crates/rjmcp/` | An MCP bridge onto the control channel, for live rocket-jump tuning. |
+| `crates/rtx-mcp/` | An MCP bridge onto the control channel, for live bot control and rocket-jump tuning. |
 
 The split between `rtx-game` and `rtx-nav` is the load-bearing one. `rtx-nav` sees only the parsed
 BSP and pure physics; it knows nothing about entities, items, or clients. That purity is what lets

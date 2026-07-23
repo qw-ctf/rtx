@@ -80,7 +80,7 @@ cargo build --release -p rtx-client
 | `rtx-proto` | the QuakeWorld and NetQuake wire protocols as pure codecs |
 | `rtx-client` | the bots as standalone network clients |
 | `navview` | a 3D viewer for the generated navmesh |
-| `rjmcp` | an MCP bridge for driving live bot-tuning sessions |
+| `rtx-mcp` | an MCP bridge for driving live bot-tuning sessions |
 
 ## License
 

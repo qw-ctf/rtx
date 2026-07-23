@@ -2601,16 +2601,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rjmcp"
-version = "0.1.0"
-dependencies = [
- "rmcp",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "rmcp"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2663,6 +2653,16 @@ dependencies = [
  "reqwest",
  "rtx-nav",
  "rtx-proto",
+]
+
+[[package]]
+name = "rtx-mcp"
+version = "0.1.0"
+dependencies = [
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
