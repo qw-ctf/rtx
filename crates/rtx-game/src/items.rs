@@ -128,8 +128,9 @@ impl GameState {
     /// Schedule an item respawn (`SUB_regen`) after `delay`, then fire targets.
     fn pickup_finish(&mut self, e: EntId, other: EntId, delay: Option<f32>) {
         self.pickup_hide(e);
+        let time = self.time();
+        self.bot_item_taken(e, other, time);
         if let Some(delay) = delay {
-            let time = self.time();
             let ent = &mut self.entities[e];
             ent.v.nextthink = time + delay;
             ent.think = Think::SubRegen;

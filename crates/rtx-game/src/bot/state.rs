@@ -129,6 +129,33 @@ impl BotState {
         self.goal.avoid_items.iter().any(|&(it, until)| it == item && now < until)
     }
 
+    /// An item this bot was planning around has just left the floor. Drop a stale current/next
+    /// reference immediately; if it was the first leg, preserve the already-planned continuation.
+    /// The picker also gets a short avoid entry so an incidental touch cannot be selected straight
+    /// back while the authoritative respawn state is settling.
+    pub(crate) fn item_taken(&mut self, item: u32, now: f32, picked_by_me: bool, avoid_for: f32) {
+        if picked_by_me {
+            self.mark_avoid(item, now + avoid_for);
+        }
+        if self.goal.item == item {
+            if self.goal.next_item != 0 {
+                (self.goal.item, self.goal.item_cell, self.goal.commit) =
+                    (self.goal.next_item, self.goal.next_cell, self.goal.next_commit);
+                self.goal.since = now;
+            } else {
+                self.goal.item = 0;
+                self.goal.item_cell = 0;
+                self.goal.commit = GoalCommit::None;
+            }
+            (self.goal.next_item, self.goal.next_cell, self.goal.next_commit) =
+                (0, 0, GoalCommit::None);
+            self.goal.next_pick = now;
+        } else if self.goal.next_item == item {
+            (self.goal.next_item, self.goal.next_cell, self.goal.next_commit) =
+                (0, 0, GoalCommit::None);
+        }
+    }
+
     /// Shared failure tail for the hook / rocket-jump leg drivers (see [`Driver`]): bump the driver's
     /// consecutive-fail count and force a repath; after two failures in a row, abandon a chased goal
     /// item — drop the route, briefly avoid-list the item, and re-select next frame. The
@@ -608,4 +635,44 @@ pub enum HookPhase {
     Reel,
     /// Released: riding the parabola with no input until it lands.
     Ballistic,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn taken_goal_promotes_its_continuation_and_avoids_for_the_picker() {
+        let mut bot = BotState::default();
+        bot.goal.item = 10;
+        bot.goal.item_cell = 100;
+        bot.goal.commit = GoalCommit::Pickup;
+        bot.goal.next_item = 20;
+        bot.goal.next_cell = 200;
+        bot.goal.next_commit = GoalCommit::Powerup;
+
+        bot.item_taken(10, 5.0, true, 3.0);
+
+        assert_eq!((bot.goal.item, bot.goal.item_cell), (20, 200));
+        assert_eq!(bot.goal.commit, GoalCommit::Powerup);
+        assert_eq!(bot.goal.next_item, 0);
+        assert!(bot.is_avoided(10, 7.9));
+        assert!(!bot.is_avoided(10, 8.0));
+    }
+
+    #[test]
+    fn teammate_taking_a_watched_item_releases_the_stale_goal() {
+        let mut bot = BotState::default();
+        bot.goal.item = 10;
+        bot.goal.item_cell = 100;
+        bot.goal.commit = GoalCommit::Pickup;
+
+        bot.item_taken(10, 5.0, false, 3.0);
+
+        assert_eq!(bot.goal.item, 0);
+        assert_eq!(bot.goal.item_cell, 0);
+        assert_eq!(bot.goal.commit, GoalCommit::None);
+        assert_eq!(bot.goal.next_pick, 5.0);
+        assert!(!bot.is_avoided(10, 5.0));
+    }
 }

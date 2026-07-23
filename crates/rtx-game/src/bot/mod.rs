@@ -407,10 +407,6 @@ fn bot_pickup_items(game: &mut GameState, e: EntId) {
         })
         .collect();
     let now = game.time();
-    let goal_item = game.entities[e].bot.goal.item;
-    let next_item = game.entities[e].bot.goal.next_item;
-    let next_cell = game.entities[e].bot.goal.next_cell;
-    let next_commit = game.entities[e].bot.goal.next_commit;
     let hold_item = game.entities[e].bot.goal.hold_item;
     let holding = hold_item != 0 && now < game.entities[e].bot.goal.hold_until;
     for item in hits {
@@ -424,9 +420,15 @@ fn bot_pickup_items(game: &mut GameState, e: EntId) {
             // Just collected our goal item — briefly avoid it so an instant-respawn pickup (or a
             // weapons-stay trigger that lingers solid) can't recapture the goal slot the same second;
             // the slot frees up for the next-best pickup instead of re-fixating in place.
-            if item.0 == goal_item {
+            // Hidden map items are cleared for every watcher by `bot_item_taken`, called from the
+            // authoritative pickup handler. This local tail remains for pickups that do not hide via
+            // `pickup_finish` (weapons-stay, backpacks, flags and runes).
+            if item.0 == game.entities[e].bot.goal.item {
                 let b = &mut game.entities[e].bot;
                 b.mark_avoid(item.0, now + PICKUP_AVOID_TIME);
+                let next_item = b.goal.next_item;
+                let next_cell = b.goal.next_cell;
+                let next_commit = b.goal.next_commit;
                 if next_item != 0 {
                     (b.goal.item, b.goal.item_cell, b.goal.commit) = (next_item, next_cell, next_commit);
                     b.goal.since = now;
@@ -809,10 +811,10 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // during a ballistic traversal whose route/view already have an indivisible owner.
     let urgent_allowed = matches!(intent, None | Some(BotIntent::Fight(_) | BotIntent::Advance(_)))
         && !traversal_committed;
-    // A timed powerup commitment normally freezes item selection, but a known respawn wait is spare
-    // route time: use it to collect a nearby health/armor/weapon only when the complete two-leg path
-    // still preserves the powerup arrival. Keep the powerup as a completion-critical continuation,
-    // so touching the bridge item immediately resumes the quad/pent run.
+    // A timed powerup commitment normally freezes item selection, but nearby preparation is useful:
+    // on a live opening Quad, pick up an effectively on-route weapon/armor first; during a respawn
+    // wait, spend only route slack. Keep the powerup as a completion-critical continuation, so
+    // touching the bridge item immediately resumes the quad/pent run.
     if urgent_allowed
         && game.entities[e].bot.goal.commit == GoalCommit::Powerup
         && now >= game.entities[e].bot.goal.next_urgent
@@ -1666,6 +1668,20 @@ impl LinkPricing {
 }
 
 impl GameState {
+    /// An authoritative map pickup disappeared. Release every bot still planning around that old
+    /// live item so the timed-departure selector, rather than a stale standing goal, decides when to
+    /// return. The picker is briefly avoid-listed even when the touch was incidental to its route.
+    pub(crate) fn bot_item_taken(&mut self, item: EntId, picker: EntId, now: f32) {
+        let maxclients = self.host().cvar(c"maxclients") as u32;
+        for client in (1..=maxclients).map(EntId) {
+            if self.entities[client].bot.is_bot {
+                self.entities[client]
+                    .bot
+                    .item_taken(item.0, now, client == picker, PICKUP_AVOID_TIME);
+            }
+        }
+    }
+
     /// Gather bot `e`'s live A* pricing (see [`LinkPricing`]) — closed gates, its failed-link
     /// surcharges (expired entries dropped), and its rocket-jump fitness gate.
     pub(crate) fn bot_link_pricing(&self, e: EntId, now: f32) -> LinkPricing {
