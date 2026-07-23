@@ -21,6 +21,7 @@ netclient = ["dep:rtx-proto", "dep:reqwest"]
 
 [dependencies]
 rtx-nav.workspace = true
+rtx-auditlog.workspace = true
 rtx-proto = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 binrw.workspace = true

@@ -732,6 +732,14 @@ struct LogArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct AuditArgs {
+    /// Bot entity id (default: the first live bot).
+    bot: Option<u32>,
+    /// How many trailing trace lines to return (default 200).
+    lines: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct PrepArgs {
     /// Bot ent id (default: the first live bot).
     bot: Option<u32>,
@@ -1042,6 +1050,21 @@ impl RtxMcp {
         let r = async {
             let bot = self.resolve_bot(a.bot).await?;
             self.req(&format!("route {bot}"), SHORT).await
+        }
+        .await;
+        finish(r)
+    }
+
+    #[tool(
+        description = "Dump a bot's rtx_bot_debug audit ring buffer: the last N per-frame diagnostic \
+        lines (goal/gate/bhop/hop-phase trace), captured full-rate in memory with no console spam. \
+        Set `rtx_bot_debug 1` first; buffer size is `rtx_bot_auditlog` MB (default 10)."
+    )]
+    async fn audit(&self, Parameters(a): Parameters<AuditArgs>) -> Result<CallToolResult, McpError> {
+        let r = async {
+            let bot = self.resolve_bot(a.bot).await?;
+            let lines = a.lines.unwrap_or(200);
+            self.req(&format!("audit {bot} {lines}"), SHORT).await
         }
         .await;
         finish(r)

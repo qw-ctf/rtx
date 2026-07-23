@@ -273,6 +273,13 @@ enum ControlCmd {
     Route {
         bot: u32,
     },
+    /// Dump a bot's `rtx_bot_debug` audit ring buffer — the last `lines` diagnostic lines,
+    /// oldest-first (default 200). The trace is captured full-rate in memory (no console spam); this
+    /// reads it back. See [`crate::bot::state::Audit`].
+    Audit {
+        bot: u32,
+        lines: usize,
+    },
     /// List every generated curl link (a SpeedJump with `curl_gain > 0`): index, from, takeoff, target,
     /// v_req, gain — for verifying which gaps the build's curl certifier covered.
     Curls,
@@ -423,6 +430,17 @@ fn parse_line(line: &str) -> Result<(i64, ControlCmd), String> {
         "route" => ControlCmd::Route {
             bot: parse_u32(rest.split_whitespace().next(), "bot")?,
         },
+        "audit" => {
+            let mut t = rest.split_whitespace();
+            let bot = parse_u32(t.next(), "bot")?;
+            let lines = t
+                .next()
+                .map(|s| s.parse::<usize>())
+                .transpose()
+                .map_err(|_| "bad lines")?
+                .unwrap_or(200);
+            ControlCmd::Audit { bot, lines }
+        }
         "curls" => ControlCmd::Curls,
         "probe" => {
             let mut t = rest.split_whitespace();
@@ -528,6 +546,7 @@ fn exec_cmd(game: &mut GameState, id: i64, cmd: ControlCmd) {
         }
         ControlCmd::Cell { pos } => cell_json(game, pos),
         ControlCmd::Route { bot } => route_json(game, bot),
+        ControlCmd::Audit { bot, lines } => audit_json(game, bot, lines),
         ControlCmd::Curls => curls_json(game),
         ControlCmd::Probe {
             takeoff,
@@ -1142,6 +1161,57 @@ fn route_json(game: &GameState, bot: u32) -> Result<String, String> {
         "{{\"bot\":{bot},\"route_pos\":{},\"origin\":{},\"legs\":[{legs}]}}",
         b.route_pos,
         jvec3(game.entities[e].v.origin),
+    ))
+}
+
+/// Dump a bot's `rtx_bot_debug` audit ring: the last `lines` per-frame sensor snapshots, oldest-first.
+/// Empty when `rtx_bot_debug` has been off (nothing was captured).
+fn audit_json(game: &GameState, bot: u32, lines: usize) -> Result<String, String> {
+    use rtx_auditlog::flags as af;
+    let e = valid_bot(game, bot)?;
+    let frames = game.entities[e].bot.audit.tail(lines);
+    let mut arr = String::new();
+    for f in &frames {
+        if !arr.is_empty() {
+            arr.push(',');
+        }
+        arr.push_str(&format!(
+            "{{\"t\":{:.2},\"origin\":{},\"vel\":{},\"speed\":{:.0},\"peak\":{:.0},\"bhop\":{},\"hops\":{},\"flips\":{},\"off\":{},\"hook\":{},\"rj\":{},\"route_pos\":{},\"route_len\":{},\"band\":{},\"fwd\":{},\"side\":{},\"posture\":{},\"commit\":{},\"goal_ent\":{},\"goal_cell\":{},\"goal_dist\":{:.0},\"goal_dz\":{:.0},\"gate\":{},\"enemy\":{},\"aware\":{},\"on_ground\":{},\"on_item\":{},\"attack\":{},\"jump\":{},\"pen\":{}}}",
+            f.t,
+            jvec3(Vec3::from_array(f.origin)),
+            jvec3(Vec3::from_array(f.vel)),
+            f.speed,
+            f.peak,
+            jstr(&format!("{:?}", f.bhop)),
+            f.hops,
+            f.flips,
+            jstr(f.off_reason.as_str()),
+            jstr(&format!("{:?}", f.hook)),
+            jstr(&format!("{:?}", f.rj)),
+            f.route_pos,
+            f.route_len,
+            f.band,
+            f.forward,
+            f.side,
+            jstr(&format!("{:?}", f.posture)),
+            jstr(&format!("{:?}", f.commit)),
+            f.goal_ent,
+            f.goal_cell,
+            f.goal_dist,
+            f.goal_dz,
+            f.gate,
+            (f.flags & af::ENEMY) != 0,
+            (f.flags & af::AWARE) != 0,
+            (f.flags & af::ON_GROUND) != 0,
+            (f.flags & af::ON_ITEM) != 0,
+            (f.flags & af::ATTACK) != 0,
+            (f.flags & af::JUMP) != 0,
+            f.pen,
+        ));
+    }
+    Ok(format!(
+        "{{\"bot\":{bot},\"count\":{},\"frames\":[{arr}]}}",
+        frames.len()
     ))
 }
 

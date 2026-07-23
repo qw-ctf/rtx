@@ -47,6 +47,10 @@ pub struct BotState {
     pub repath_time: f32,
     /// The route-progress watchdogs — three ways a bot notices it isn't getting anywhere.
     pub watchdog: Watchdog,
+    /// Per-bot flight recorder (`rtx_bot_debug`): a fixed, once-allocated ring of compact per-frame
+    /// [`rtx_auditlog::AuditFrame`] sensor snapshots, dumped on demand via the control channel's
+    /// `audit` verb instead of flooding the server console. Budget is `rtx_bot_auditlog` MB.
+    pub audit: rtx_auditlog::Audit,
     /// Per-frame toggle, flipped each tick, used to *pulse* buttons that QW only acts on at a
     /// press edge (the respawn key, which needs a release between presses).
     pub pulse: bool,

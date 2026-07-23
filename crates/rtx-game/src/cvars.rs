@@ -176,8 +176,13 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // major "must-cycle" pickups, and panic for ammo when a bot's firepower is about to collapse.
         // Off = the leaner ktx-parity valuation (a topped-up bot ignores items until a true need). On.
         ("rtx_bot_stack", Bool(true)),
-        // Per-bot goal/pickup diagnostics to the server console (off by default).
+        // Per-bot goal/pickup diagnostics (off by default). When on, high-rate trace lines go to the
+        // per-bot audit ring buffer (dumped via the control channel's `audit` verb), not the console —
+        // a per-frame `conprint` floods the console and drops packets. See [`crate::bot::state::Audit`].
         ("rtx_bot_debug", Bool(false)),
+        // Per-bot audit ring-buffer budget, in MB (the `rtx_bot_debug` trace store). Oldest lines are
+        // evicted once a bot's buffer exceeds this; only allocated while `rtx_bot_debug` is on.
+        ("rtx_bot_auditlog", Float(10.0)),
         // Bot evaluation profiler: seconds between server-console reports of what the bot brain costs
         // per bot frame (p95, worst, and the head-room left against the `maxfps` slice the engine
         // allots it). On by default — it's console-only, three lines per report, and the timing is a

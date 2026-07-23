@@ -1165,7 +1165,6 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             }
             _ => f32::INFINITY,
         };
-        let phase_was = bot.bhop.phase;
         let cmd = bot.bhop.step(
             &bhop::Input {
                 v_xy,
@@ -1208,18 +1207,6 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             },
             &env,
         );
-        // A phase transition is the interesting diagnostic moment — why a run started or ended.
-        if bot.bhop.phase != phase_was && host.cvar_bool(c"rtx_bot_debug") {
-            let why = if bot.bhop.phase == bhop::Phase::Off {
-                format!(" ({})", bot.bhop.off_reason)
-            } else {
-                String::new()
-            };
-            host.conprint(&cstring(&format!(
-                "rtx bot{client}: bhop {phase_was:?}->{:?}{why} spd={speed:.0} runway={bhop_runway:.0}\n",
-                bot.bhop.phase,
-            )));
-        }
         cmd
     };
     let bhop_active = bhop_cmd.is_some();

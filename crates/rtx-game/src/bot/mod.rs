@@ -47,7 +47,7 @@ use crate::bot::state::{
 };
 use crate::defs::{Bits, DeadFlag, Flags, Items, Solid, TakeDamage, Weapon, BUTTON_ATTACK, BUTTON_JUMP, VEC_VIEW_OFS};
 use crate::entity::{EntId, Entity, Touch};
-use crate::game::{cstring, GameState};
+use crate::game::GameState;
 use crate::math::{angle_vectors, wrap180, yaw_of};
 use crate::mode::BotIntent;
 use crate::navmesh::{CellId, HazardPrice, LinkCosts, LinkKind, NavGraph};
@@ -512,6 +512,130 @@ struct Objective {
 /// Resolve what this bot pursues this frame: reconcile a stale hook, ask the mode for an intent
 /// (or the pacifist override), (re)pick an item goal on a slow cadence, and settle on the world
 /// target to steer toward. Runs while `&mut game` is free — before the navmesh borrow.
+/// Per-bot audit ring-buffer byte budget resolved from `rtx_bot_auditlog` (MB). Passed to
+/// [`rtx_auditlog::Audit::push`] so a live cvar change resizes the ring on the next frame.
+pub(crate) fn audit_cap(host: &crate::host::HostApi) -> usize {
+    (host.cvar(c"rtx_bot_auditlog").max(0.0) * (1024.0 * 1024.0)) as usize
+}
+
+// Map the bot's internal phase/posture/commit enums to the audit schema's mirror enums. The `match`es
+// are exhaustive, so adding a game variant is a compile error here until the schema mirror gains one.
+fn ax_bhop(p: bhop::Phase) -> rtx_auditlog::Bhop {
+    match p {
+        bhop::Phase::Off => rtx_auditlog::Bhop::Off,
+        bhop::Phase::Prestrafe => rtx_auditlog::Bhop::Prestrafe,
+        bhop::Phase::Hop => rtx_auditlog::Bhop::Hop,
+        bhop::Phase::Zigzag => rtx_auditlog::Bhop::Zigzag,
+    }
+}
+fn ax_hook(p: state::HookPhase) -> rtx_auditlog::Hook {
+    match p {
+        state::HookPhase::Idle => rtx_auditlog::Hook::Idle,
+        state::HookPhase::Aim => rtx_auditlog::Hook::Aim,
+        state::HookPhase::Flight => rtx_auditlog::Hook::Flight,
+        state::HookPhase::Reel => rtx_auditlog::Hook::Reel,
+        state::HookPhase::Ballistic => rtx_auditlog::Hook::Ballistic,
+    }
+}
+fn ax_rj(p: state::RjPhase) -> rtx_auditlog::Rj {
+    match p {
+        state::RjPhase::Idle => rtx_auditlog::Rj::Idle,
+        state::RjPhase::Stance => rtx_auditlog::Rj::Stance,
+        state::RjPhase::Rise => rtx_auditlog::Rj::Rise,
+        state::RjPhase::Ballistic => rtx_auditlog::Rj::Ballistic,
+    }
+}
+fn ax_posture(p: state::CombatPosture) -> rtx_auditlog::Posture {
+    match p {
+        state::CombatPosture::Recover => rtx_auditlog::Posture::Recover,
+        state::CombatPosture::Hold => rtx_auditlog::Posture::Hold,
+        state::CombatPosture::Press => rtx_auditlog::Posture::Press,
+    }
+}
+fn ax_commit(p: state::GoalCommit) -> rtx_auditlog::Commit {
+    match p {
+        state::GoalCommit::None => rtx_auditlog::Commit::None,
+        state::GoalCommit::Pickup => rtx_auditlog::Commit::Pickup,
+        state::GoalCommit::Powerup => rtx_auditlog::Commit::Powerup,
+    }
+}
+
+/// Capture one bot frame's sensor snapshot for the per-bot audit ring (`rtx_bot_debug`). Reads only —
+/// a handful of field copies, no allocation, no formatting — so it is cheap to run every frame. The
+/// caller pushes the returned frame under the `rtx_bot_debug` gate.
+#[allow(clippy::too_many_arguments)]
+fn capture_frame(
+    game: &GameState,
+    e: EntId,
+    now: f32,
+    origin: Vec3,
+    speed: f32,
+    forward: i32,
+    side: i32,
+    buttons: i32,
+    has_enemy: bool,
+    watch: u32,
+) -> rtx_auditlog::AuditFrame {
+    use rtx_auditlog::flags as af;
+    let ent = &game.entities[e];
+    let b = &ent.bot;
+    // Item-goal geometry: distance to the item and its cell's height under the item origin.
+    let (goal_dist, goal_dz, on_item_now) = if b.goal.item != 0 {
+        let it = &game.entities[EntId(b.goal.item)];
+        let dz = game
+            .nav
+            .graph
+            .as_ref()
+            .map_or(0.0, |g| g.cell_origin(b.goal.item_cell).z - it.v.origin.z);
+        let oi = it.v.solid == Solid::Trigger && on_item(origin, it.v.origin);
+        ((it.v.origin - origin).length(), dz, oi)
+    } else {
+        (0.0, 0.0, false)
+    };
+    let aware = b.percept.known_enemy != 0 && now < b.percept.known_until;
+    let pen = b.failed_links.iter().filter(|&&(_, until, _)| until > now).count() as u16;
+    let mut flags = 0u16;
+    flags |= af::ENEMY * has_enemy as u16;
+    flags |= af::ON_GROUND * ent.v.flags.has(Flags::ONGROUND) as u16;
+    flags |= af::IN_WATER * (ent.v.waterlevel > 0.0) as u16;
+    flags |= af::ON_ITEM * on_item_now as u16;
+    flags |= af::OWN_LG * ent.v.items.has(Items::LIGHTNING) as u16;
+    flags |= af::AWARE * aware as u16;
+    flags |= af::ATTACK * ((buttons & BUTTON_ATTACK) != 0) as u16;
+    flags |= af::JUMP * ((buttons & BUTTON_JUMP) != 0) as u16;
+    let bpos = b.route_pos;
+    rtx_auditlog::AuditFrame {
+        t: now,
+        origin: origin.to_array(),
+        vel: ent.v.velocity.to_array(),
+        speed,
+        peak: b.bhop.peak,
+        flags,
+        bhop: ax_bhop(b.bhop.phase),
+        hops: b.bhop.hops as u16,
+        flips: b.bhop.flips as u16,
+        off_reason: rtx_auditlog::Tag::new(b.bhop.off_reason),
+        hook: ax_hook(b.hook.phase),
+        rj: ax_rj(b.rj.phase),
+        route_len: b.route.len() as u16,
+        route_pos: bpos as u16,
+        band: b.route_bands.get(bpos).copied().unwrap_or(0) as i16,
+        forward: forward as i16,
+        side: side as i16,
+        posture: ax_posture(b.posture),
+        commit: ax_commit(b.goal.commit),
+        goal_ent: b.goal.item,
+        goal_cell: b.goal.item_cell as i32,
+        goal_dist,
+        goal_dz,
+        gate: b.gate.errand.map_or(-1, |er| er.index as i32),
+        known_enemy: b.percept.known_enemy,
+        pen,
+        magnet: b.goal.magnet_item,
+        watch,
+    }
+}
+
 /// The immutable per-frame snapshot of a bot's edict — read once so the later `&mut bot` /
 /// `&mut nav` borrows in `run_bot` don't have to re-borrow the entity to read it (the grapple
 /// fields are set in the previous frame's PlayerPreThink, so they're stable across this frame).
@@ -749,7 +873,7 @@ fn apply_oracle_advice(
     }
 }
 
-fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, client: i32) -> Objective {
+fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3) -> Objective {
     let host = *game.host();
     // Hook invariant net: if we're mid-hook but no longer hold the grapple (a mode loadout stripped
     // it, e.g. Rocket Arena), abandon the traversal cleanly — release any live hook and reset the
@@ -1058,76 +1182,6 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         None
     };
 
-    // Opt-in diagnostics (`rtx_bot_debug 1`): one throttled line per bot — what it wants, how far,
-    // whether it's standing on that item, and whether it owns the LG. Pinpoints pickup-vs-desire.
-    if host.cvar_bool(c"rtx_bot_debug") && now >= game.entities[e].bot.repath_time {
-        let gi = game.entities[e].bot.goal.item;
-        let (goal, dist, overlap) = if gi != 0 {
-            let it = &game.entities[EntId(gi)];
-            let on = it.v.solid == Solid::Trigger && on_item(origin, it.v.origin);
-            let name = it
-                .classname()
-                .unwrap_or(if it.touch == Touch::Backpack { "backpack" } else { "?" });
-            (name, (it.v.origin - origin).length(), on)
-        } else {
-            ("human", 0.0, false)
-        };
-        let own_lg = game.entities[e].v.items.has(Items::LIGHTNING) as i32;
-        let b = &game.entities[e].bot;
-        // Loop-free-nav telemetry: live failed-link penalties and whether the target is currently
-        // perceived (aware of / in memory), so a stuck/looping bot's divert can be watched live.
-        let pen = b.failed_links.iter().filter(|&&(_, until, _)| until > now).count();
-        let aware = (b.percept.known_enemy != 0 && now < b.percept.known_until) as i32;
-        let hold = b.goal.hold_item;
-        // Opponent-model telemetry: this bot's current hypothesis of the enemy it's aware of — the
-        // estimated health/armor stack and believed arsenal bits — so the shared read can be watched
-        // converge and reset live. Blank (`est=-`) when there's no belief / modeling is off.
-        let est = if b.percept.known_enemy != 0 && now < b.percept.known_until {
-            game.opponent_est(e, EntId(b.percept.known_enemy), now)
-        } else {
-            None
-        };
-        let est = est.map_or_else(
-            || "-".to_string(),
-            |o| format!("H{:.0}/A{:.0} ars={:03x}", o.health, o.armor_value, o.items as u32),
-        );
-        let vig = vigil.is_some() as i32;
-        // Goal-cell aliasing telemetry: the resolved nav cell of the goal item and its height under the
-        // item origin. A large negative `gdz` means the goal resolved to a floor cell *below* the item
-        // (a ledge/pedestal item aliased to the ground under it) — the item is uncollectable from there
-        // (`on_item` gates |dz| ≤ 48), so the bot parks/waits for something it can't reach.
-        let (gcell, gdz) = if gi != 0 {
-            let ic = b.goal.item_cell;
-            let dz = game
-                .nav
-                .graph
-                .as_ref()
-                .map_or(0.0, |g| g.cell_origin(ic).z - game.entities[EntId(gi)].v.origin.z);
-            (ic as i64, dz)
-        } else {
-            (-1, 0.0)
-        };
-        // Arena spectating: which fighter (edict) this bot is watching, `0` = none.
-        let wat = if let Some(BotIntent::Spectate { watch, .. }) = intent {
-            watch.0
-        } else {
-            0
-        };
-        let commit = b.goal.commit;
-        let posture = b.posture;
-        let mag = b.goal.magnet_item;
-        // Arena role (F=fighter, A=audience), so a live read shows who's dueling vs spectating.
-        let role = match game.entities[e].mode_p.arena.role {
-            crate::mode::ArenaRole::Fighter => 'F',
-            crate::mode::ArenaRole::Audience => 'A',
-        };
-        let msg = cstring(&format!(
-            "rtx bot{client}: role={role} want={goal} dist={dist:.0} gcell={gcell} gdz={gdz:.0} on_item={overlap} ownLG={own_lg} cells={:.0} pen={pen} aware={aware} est={est} hold={hold} mag={mag} commit={commit:?} posture={posture:?} vig={vig} watch={wat}\n",
-            game.entities[e].v.ammo_cells,
-        ));
-        host.conprint(&msg); // conprint always shows; dprint needs `developer 1`
-    }
-
     // The mode's intent (fight an enemy / roam to a spot), if any, and whether we're on an item.
     let enemy = if let Some(BotIntent::Fight(en)) = intent {
         Some(en)
@@ -1409,26 +1463,24 @@ fn emit(
         game.reset_grapple(h);
     }
 
-    // Combat/gate diagnostics: what the bot is chasing and whether it's stuck at a gate. Enable
-    // with `rtx_bot_debug 1` (conprint shows without `developer`).
+    // Per-frame flight recorder (`rtx_bot_debug`): capture this bot's full sensor/decision snapshot
+    // into its audit ring instead of `conprint`ing a line (which floods the console and drops
+    // packets). Dump it with the control channel's `audit` verb. See [`rtx_auditlog`].
     if host.cvar_bool(c"rtx_bot_debug") {
-        let gate = game.entities[e].bot.gate.errand.map(|er| er.index);
-        let route = game.entities[e].bot.route.len();
-        let hph = game.entities[e].bot.hook.phase;
-        let rjph = game.entities[e].bot.rj.phase;
-        let bpos = game.entities[e].bot.route_pos;
-        let band = game.entities[e].bot.route_bands.get(bpos).copied().unwrap_or(0);
-        let bh = &game.entities[e].bot.bhop;
-        host.conprint(&cstring(&format!(
-            "rtx bot{client}: enemy={} gate={gate:?} hook={hph:?} rj={rjph:?} bhop={:?} hops={} flips={} peak={:.0} \
-             spd={speed:.0} route={route} band={band} fwd={forward} side={side} atk={}\n",
+        let origin = game.entities[e].v.origin; // post-move origin for this frame's snapshot
+        let frame = capture_frame(
+            game,
+            e,
+            now,
+            origin,
+            speed,
+            forward,
+            side,
+            buttons,
             enemy.is_some(),
-            bh.phase,
-            bh.hops,
-            bh.flips,
-            bh.peak,
-            (buttons & BUTTON_ATTACK) != 0,
-        )));
+            0, // spectate-watch target: not plumbed to `emit`; reserved in the schema
+        );
+        game.entities[e].bot.audit.push(frame, audit_cap(&host));
     }
 
     host.set_bot_cmd(client, msec, view, forward, side, 0, buttons, impulse);
@@ -1556,7 +1608,7 @@ fn run_bot(game: &mut GameState, e: EntId) {
     // silently drop a goal flood we'd already paid for.
     let profiling = game.bot_prof.profiling();
     let t = prof::Timer::start(profiling);
-    let mut o = resolve_objective(game, e, now, origin, client);
+    let mut o = resolve_objective(game, e, now, origin);
     game.bot_prof.add_phase(prof::Phase::Objective, t.stop());
     // The spine and prologue read a few fields; `steer` re-destructures the rest from `o` via `SteerCtx`.
     let Objective {
