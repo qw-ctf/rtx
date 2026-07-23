@@ -23,8 +23,8 @@ use crate::qphys::{JUMP_VZ, STEP_HEIGHT};
 use crate::strafe::{apply_airaccel, apply_friction, apply_groundaccel, wishdir_fs, Cmd};
 
 /// The player clip hull a rollout traces against. [`Bsp`] is the live implementation (the map's
-/// hull 1); a rollout is generic over this so a test can substitute a synthetic hull built from an
-/// `is_solid` oracle ([`SampledHull`]) and simulate trajectories without a compiled map.
+/// hull 1); a rollout is generic over this so a test can substitute a synthetic hull built from a
+/// floor-height oracle ([`HeightHull`]) and simulate trajectories without a compiled map.
 pub trait Hull {
     /// Trace the standing player hull from `a` to `b` — QW `hull1_trace` semantics (see [`HullTrace`]).
     fn trace(&self, a: Vec3, b: Vec3) -> HullTrace;

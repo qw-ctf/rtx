@@ -284,6 +284,12 @@ pub struct Input {
     /// [`air_correct`] at this rate (a single smooth pursuit curl onto the landing) rather than the hop
     /// slalom. `> 0` selects the curl (a speed jump is one leap, not a chain); `≤ 0` keeps the slalom.
     pub curl_gain: f32,
+    /// Predictive hop-plan pursuit gain (`> 0` = guided). Set by the steering layer when a
+    /// [`hopsim`](crate::bot::hopsim) plan is live: fly *this* chain of hops as `air_correct` pursuits
+    /// toward `bearing` (the plan's aim), no slalom, and leap straight down the bearing at takeoff — so
+    /// the flown policy matches the rollout the planner certified. Unlike `curl_gain` (a single
+    /// committed leap) this drives a *chain*: each landing takes another guided hop while `carry` holds.
+    pub guide_gain: f32,
     /// Free flight distance straight ahead along the velocity (units), from a forward hull trace —
     /// how far the bot could fly before hitting a wall. `f32::INFINITY` = unknown/open (the default
     /// off the live path). Gates leaping at a wall and drives the mid-air carve; see [`Bhop::step`].
@@ -423,8 +429,18 @@ impl Bhop {
                                     // A committed speed jump is a single leap onto a fixed landing: curl the velocity smoothly
                                     // onto the bearing with `air_correct` (pursuit guidance), not the hop slalom (whose lobe
                                     // flips scatter the landing point). The bearing already tracks the target once airborne.
-            let s = if i.committed && i.takeoff_speed > 0.0 && i.curl_gain > 0.0 {
-                air_correct(i.v_xy, i.bearing, a_max, dt, i.curl_gain)
+                                    // Guided pursuit — a committed curl leap (`curl_gain`) or a predictive hop-plan chain
+                                    // (`guide_gain`, the steering layer's live plan): home the velocity onto the bearing with
+                                    // `air_correct`, no slalom (whose lobe flips would scatter the landing off the plan).
+            let guide = if i.guide_gain > 0.0 {
+                i.guide_gain
+            } else if i.committed && i.takeoff_speed > 0.0 {
+                i.curl_gain
+            } else {
+                0.0
+            };
+            let s = if guide > 0.0 {
+                air_correct(i.v_xy, i.bearing, a_max, dt, guide)
             } else {
                 self.air_strafe(i, speed, a_max, dt, profile)
             };
@@ -482,9 +498,10 @@ impl Bhop {
                 let bias = (err.abs() / (1.5 * omega * T_HOP)).clamp(0.0, 0.18);
                 self.air_mid_phase -= bias;
             }
-            // A curl leaps straight down the corridor — the certifier's tick-0 is a bearing-forward wish,
-            // so don't spend the launch frame on a slalom lobe that skews the takeoff heading.
-            if sj_takeoff {
+            // A curl or a guided hop leaps straight down the bearing — the rollout's tick-0 is a
+            // bearing-forward wish, so don't spend the launch frame on a slalom lobe that would skew the
+            // takeoff heading away from the certified arc.
+            if sj_takeoff || i.guide_gain > 0.0 {
                 return Some(Cmd {
                     view_yaw: i.bearing,
                     forward: MOVE_SPEED,
@@ -984,6 +1001,7 @@ mod sim {
             hold_jump: false,
             takeoff_speed: 0.0,
             curl_gain: 0.0,
+            guide_gain: 0.0,
             clear: f32::INFINITY,
             now,
         }
@@ -1017,6 +1035,7 @@ mod sim {
             hold_jump: false,
             takeoff_speed: 0.0,
             curl_gain: 0.0,
+            guide_gain: 0.0,
             clear: f32::INFINITY,
             now,
         }
@@ -1192,6 +1211,7 @@ mod sim {
                 hold_jump: false,
                 takeoff_speed: V_REQ,
                 curl_gain: 0.0,
+                guide_gain: 0.0,
                 clear: f32::INFINITY,
                 now,
             };
@@ -1239,6 +1259,7 @@ mod sim {
                     hold_jump: false,
                     takeoff_speed: V_STAR,
                     curl_gain: 12.0,
+                    guide_gain: 0.0,
                     clear: f32::INFINITY,
                     now,
                 };
@@ -1283,6 +1304,7 @@ mod sim {
                 hold_jump: false,
                 takeoff_speed: 415.0,
                 curl_gain: 12.0,
+                guide_gain: 0.0,
                 clear: f32::INFINITY,
                 now,
             };

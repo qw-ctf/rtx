@@ -235,6 +235,7 @@ pub fn rollout(bsp: &Bsp, line: &RaceLine, nodes: &[RaceRouteNode], pm: &PmParam
             // hold-to-lip branch would misfire. `hold_jump` above already gates the leap by target_speed.
             takeoff_speed: 0.0,
             curl_gain: 0.0, // racing-line speed jumps are straight; keep the slalom the line was tuned with
+            guide_gain: 0.0, // the offline racing line drives the slalom, not a runtime hop plan
             clear: f32::INFINITY, // the offline line is already collision-clean; no runtime wall probe
             now: t,
         };

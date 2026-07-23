@@ -58,17 +58,20 @@ pub enum HopRollout {
 pub fn roll_hop(hull: &impl Hull, mut st: PmState, aim: Vec3, gain: f32, p: &PmParams) -> HopRollout {
     let amax = air_accel_max(p.accel, p.maxspeed, DT);
     let takeoff_z = st.origin.z;
-    let launch_yaw = yaw_of(st.vel.xy());
     for tick in 0..MAX_TICKS {
+        // The controller's guided policy: leap straight down the aim bearing on tick 0, then pursue
+        // it with `air_correct` — recomputed each tick as the origin advances, so prediction matches
+        // what the live controller (fed `bearing = yaw(aim − origin)` per frame) will fly.
+        let bearing = yaw_of(aim.xy() - st.origin.xy());
         let cmd = if tick == 0 {
             Cmd {
-                view_yaw: launch_yaw,
+                view_yaw: bearing,
                 forward: MOVE_SPEED,
                 side: 0.0,
                 jump: true,
             }
         } else {
-            let s = air_correct(st.vel.xy(), yaw_of(aim.xy() - st.origin.xy()), amax, DT, gain);
+            let s = air_correct(st.vel.xy(), bearing, amax, DT, gain);
             Cmd {
                 view_yaw: s.view_yaw,
                 forward: s.forward,

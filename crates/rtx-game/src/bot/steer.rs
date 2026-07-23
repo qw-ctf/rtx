@@ -702,7 +702,12 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     };
     let plat_leg = matches!(kind, Some(LinkKind::Plat));
     if !hook_active && !rj_active && !on_sj && !on_air && !plat_leg && !vigil {
-        if progress_stalled(bot.watchdog.progress_best, bot.watchdog.progress_since, progress_metric, now) {
+        if progress_stalled(
+            bot.watchdog.progress_best,
+            bot.watchdog.progress_since,
+            progress_metric,
+            now,
+        ) {
             penalize_leg(bot, cur_leg, kind, now);
             bot.route.clear();
             bot.repath_time = now;
@@ -1116,6 +1121,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 } else {
                     0.0
                 },
+                guide_gain: 0.0, // set by the predictive hop planner once ledge-mode is wired (next stage)
                 clear,
                 now,
             },

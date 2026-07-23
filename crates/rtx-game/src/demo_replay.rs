@@ -532,6 +532,7 @@ fn bot_matches_or_beats_human() {
                         hold_jump: false,
                         takeoff_speed: 0.0, // gait bench, not a speed-jump takeoff
                         curl_gain: 0.0,
+                        guide_gain: 0.0,
                         clear: f32::INFINITY, // flat-plane gait bench — no walls
                         now: t,
                     };
