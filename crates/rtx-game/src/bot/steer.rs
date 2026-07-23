@@ -393,8 +393,10 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         bot.gate.corridor_gates = corridor.as_ref().map_or_else(Vec::new, |c| c.far_gates.clone());
         bot.repath_time = now + REPATH_INTERVAL;
         // Restart the progress watchdog against the new route (INFINITY ⇒ the first frame records the
-        // real starting distance rather than reading as an instant stall on an old baseline).
+        // real starting distance rather than reading as an instant stall on an old baseline); rebase
+        // the climb baseline to here so a stale high-water mark from a previous route can't suppress it.
         bot.watchdog.progress_best = f32::INFINITY;
+        bot.watchdog.climb_best = origin.z;
         bot.watchdog.progress_since = now;
     }
     // If we've fallen off the planned route (missed a jump, got shoved), re-localize next.
@@ -702,7 +704,18 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     };
     let plat_leg = matches!(kind, Some(LinkKind::Plat));
     if !hook_active && !rj_active && !on_sj && !on_air && !plat_leg && !vigil {
-        if progress_stalled(
+        // Gaining altitude is progress too. A helical staircase ascends correctly while its horizontal
+        // orbit holds `route_remaining` near-constant, so a landing on a higher floor must reset the
+        // stall timer or the watchdog penalizes and clears the only way up. Gate on `on_ground` so a
+        // bhop's mid-air apex — which is *not* a floor gain — can't fake a climb.
+        let climbed = on_ground && origin.z > bot.watchdog.climb_best + CLIMB_EPS;
+        if progress_metric < bot.watchdog.progress_best - PROGRESS_EPS || climbed {
+            bot.watchdog.progress_best = progress_metric.min(bot.watchdog.progress_best);
+            if on_ground {
+                bot.watchdog.climb_best = bot.watchdog.climb_best.max(origin.z);
+            }
+            bot.watchdog.progress_since = now;
+        } else if progress_stalled(
             bot.watchdog.progress_best,
             bot.watchdog.progress_since,
             progress_metric,
@@ -712,14 +725,13 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             bot.route.clear();
             bot.repath_time = now;
             bot.watchdog.progress_best = progress_metric;
-            bot.watchdog.progress_since = now;
-        } else if progress_metric < bot.watchdog.progress_best - PROGRESS_EPS {
-            bot.watchdog.progress_best = progress_metric;
+            bot.watchdog.climb_best = origin.z;
             bot.watchdog.progress_since = now;
         }
     } else {
-        // Keep the baseline current so a stall isn't falsely flagged the instant we resume.
+        // Keep the baselines current so a stall isn't falsely flagged the instant we resume.
         bot.watchdog.progress_best = progress_metric;
+        bot.watchdog.climb_best = origin.z;
         bot.watchdog.progress_since = now;
     }
 

@@ -291,6 +291,9 @@ const PENALTY_TTL: f32 = 8.0;
 /// can't see (e.g. orbiting a pillar at full speed) — penalize the leg and re-path.
 const PROGRESS_STALL_TIME: f32 = 2.5;
 const PROGRESS_EPS: f32 = 32.0;
+/// Altitude gain (on a landing) that counts as fresh progress for the watchdog — half a 16u stair
+/// step. Climbing a spiral resets the stall timer this way even while route-remaining plateaus.
+const CLIMB_EPS: f32 = 8.0;
 
 /// One bot's accumulated frame command: what navigation proposes and the combat/grenade overlays
 /// mutate in turn, before the aim spring and view projection in `run_bot` turn it into the final

@@ -592,6 +592,10 @@ pub struct Watchdog {
     /// way the displacement stuck-detector can't see (orbiting, wall-sliding) — penalize and re-path.
     pub progress_best: f32,
     pub progress_since: f32,
+    /// Highest floor altitude reached on the current route (landings only). Gaining altitude counts as
+    /// progress even when `progress_best` plateaus — so a spiral-staircase climb, whose horizontal
+    /// orbit holds route-remaining near-constant, doesn't false-trip the progress watchdog.
+    pub climb_best: f32,
     /// Origin on the previous bot frame, to detect a teleport (a large instant jump) and re-path
     /// from the landing spot.
     pub last_origin: Vec3,
