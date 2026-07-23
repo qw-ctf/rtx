@@ -13,8 +13,10 @@
 //! stays on that thread. The socket work is pushed to background threads that only shuttle raw wire
 //! frames through `mpsc` channels — the exact shape as the navmesh build worker
 //! ([`crate::nav_build`]): a listener thread accepts connections, a per-connection reader thread feeds
-//! inbound request frames to [`ControlState::requests_rx`], and a writer thread drains outbound frames
-//! to the current client. Requests are decoded and executed, and events emitted, entirely inside
+//! inbound request frames (tagged with a connection id) to [`ControlState::requests_rx`], and a writer
+//! thread drains outbound frames to their targets — a reply to the client that asked, an event to all
+//! connected clients (so the MCP bridge and the navview viewer can attach at once). Requests are
+//! decoded and executed, and events emitted, entirely inside
 //! [`frame_begin`]/[`frame_end`] under the frame's `&mut GameState`. No lock is ever held over game
 //! state; the only shared state between threads is the raw socket and the channels.
 //!
@@ -27,6 +29,7 @@
 //!
 //! [msgpack]: https://msgpack.org/
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::sync::mpsc::{Receiver, Sender};
@@ -68,12 +71,20 @@ const FLY_TIMEOUT: f32 = 8.0;
 pub(crate) struct ControlState {
     /// Whether the listener has been (attempted to be) bound. Set once, so a bind is tried at most once.
     started: bool,
-    /// Inbound raw request frames from the current connection (decoded and drained each frame in
-    /// [`frame_begin`]). Kept as bytes, not decoded [`Request`]s, so a malformed frame is answered with
-    /// an error reply on the engine thread rather than silently dropped by the reader thread.
-    requests_rx: Option<Receiver<Vec<u8>>>,
-    /// Outbound encoded [`Msg`] frames (replies + events). The writer thread owns the receiving half.
-    out_tx: Option<Sender<Vec<u8>>>,
+    /// Inbound raw request frames tagged with the connection id they arrived on (decoded and drained
+    /// each frame in [`frame_begin`]). Kept as bytes, not decoded [`Request`]s, so a malformed frame is
+    /// answered with an error reply on the engine thread rather than silently dropped by the reader
+    /// thread. The connection id routes the reply back to the client that asked.
+    requests_rx: Option<Receiver<(u64, Vec<u8>)>>,
+    /// Outbound encoded [`Msg`] frames plus their delivery target. The writer thread owns the receiving
+    /// half and the client table.
+    out_tx: Option<Sender<(Target, Vec<u8>)>>,
+}
+
+/// Where an outbound frame goes: a reply to the one client that asked, or an event broadcast to all.
+enum Target {
+    One(u64),
+    All,
 }
 
 /// Frame prologue: lazily bind the listener once the port cvar is set, then drain and execute every
@@ -86,14 +97,14 @@ pub(crate) fn frame_begin(game: &mut GameState) {
             start_listener(game, p as u16);
         }
     }
-    let frames: Vec<Vec<u8>> = match game.control.requests_rx.as_ref() {
+    let frames: Vec<(u64, Vec<u8>)> = match game.control.requests_rx.as_ref() {
         Some(rx) => rx.try_iter().collect(),
         None => return,
     };
-    for frame in frames {
+    for (conn, frame) in frames {
         match proto::decode::<Request>(&frame) {
-            Ok(req) => exec_request(game, req),
-            Err(e) => reply(game, 0, Err(format!("bad request frame: {e}"))),
+            Ok(req) => exec_request(game, conn, req),
+            Err(e) => reply(game, conn, 0, Err(format!("bad request frame: {e}"))),
         }
     }
 }
@@ -160,74 +171,97 @@ fn start_listener(game: &mut GameState, port: u16) {
             return;
         }
     };
-    let (requests_tx, requests_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    let (out_tx, out_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    // The single write-half slot the writer thread drains and the listener thread replaces on each new
-    // connection. `Option` so a dropped client leaves it empty and outbound frames are simply discarded.
-    let slot: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
-    let wslot = slot.clone();
-    std::thread::spawn(move || writer_loop(out_rx, wslot));
-    std::thread::spawn(move || listener_loop(listener, requests_tx, slot));
+    let (requests_tx, requests_rx) = std::sync::mpsc::channel::<(u64, Vec<u8>)>();
+    let (out_tx, out_rx) = std::sync::mpsc::channel::<(Target, Vec<u8>)>();
+    // The live client table (write halves keyed by connection id), shared by the writer thread and the
+    // per-connection reader threads. Multiple clients attach at once — e.g. the MCP bridge and the
+    // navview viewer — with replies routed by id and events broadcast to all.
+    let clients: Arc<Mutex<HashMap<u64, TcpStream>>> = Arc::new(Mutex::new(HashMap::new()));
+    let wclients = clients.clone();
+    std::thread::spawn(move || writer_loop(out_rx, wclients));
+    std::thread::spawn(move || listener_loop(listener, requests_tx, clients));
     game.control.requests_rx = Some(requests_rx);
     game.control.out_tx = Some(out_tx);
     game.host
         .conprint(&cstring(&format!("rtx: control: listening on 127.0.0.1:{port}\n")));
 }
 
-/// Accept loop: each new connection replaces the write-half slot (one client at a time — a fresh
-/// connection supersedes a stale one) and gets its own reader thread feeding inbound request frames.
-fn listener_loop(listener: TcpListener, requests_tx: Sender<Vec<u8>>, slot: Arc<Mutex<Option<TcpStream>>>) {
+/// Accept loop: each connection gets a unique id, a write half in the shared client table, and its own
+/// reader thread tagging inbound frames with that id. The reader removes the client on disconnect.
+fn listener_loop(
+    listener: TcpListener,
+    requests_tx: Sender<(u64, Vec<u8>)>,
+    clients: Arc<Mutex<HashMap<u64, TcpStream>>>,
+) {
+    let mut next_id: u64 = 0;
     for stream in listener.incoming().flatten() {
         let _ = stream.set_nodelay(true);
+        let id = next_id;
+        next_id += 1;
         if let Ok(wr) = stream.try_clone() {
-            if let Ok(mut g) = slot.lock() {
-                *g = Some(wr);
+            if let Ok(mut m) = clients.lock() {
+                m.insert(id, wr);
             }
         }
         let tx = requests_tx.clone();
+        let clients = clients.clone();
         std::thread::spawn(move || {
             let mut stream = stream;
             loop {
                 match proto::read_frame(&mut stream) {
                     Ok(Some(frame)) => {
-                        if tx.send(frame).is_err() {
+                        if tx.send((id, frame)).is_err() {
                             break; // game side gone
                         }
                     }
                     Ok(None) | Err(_) => break, // clean EOF or connection dropped
                 }
             }
+            if let Ok(mut m) = clients.lock() {
+                m.remove(&id); // drop this client's write half
+            }
         });
     }
 }
 
-/// Writer loop: drain outbound msgpack frames to the current client. With no client connected the
-/// frame is dropped (the backpressure policy — events are low-rate and a reconnecting client resyncs
-/// via `status`); a write error clears the slot until a new connection lands.
-fn writer_loop(out_rx: Receiver<Vec<u8>>, slot: Arc<Mutex<Option<TcpStream>>>) {
-    while let Ok(frame) = out_rx.recv() {
-        let Ok(mut g) = slot.lock() else { continue };
-        if let Some(stream) = g.as_mut() {
-            if stream.write_all(&frame).is_err() {
-                *g = None;
-            } else {
-                let _ = stream.flush();
+/// Writer loop: drain outbound msgpack frames to their targets. A reply goes to the one client that
+/// asked; an event broadcasts to every connected client. A write error drops that client from the
+/// table (a reconnecting client resyncs via `status`).
+fn writer_loop(out_rx: Receiver<(Target, Vec<u8>)>, clients: Arc<Mutex<HashMap<u64, TcpStream>>>) {
+    while let Ok((target, frame)) = out_rx.recv() {
+        let Ok(mut m) = clients.lock() else { continue };
+        match target {
+            Target::One(id) => {
+                if let Some(stream) = m.get_mut(&id) {
+                    if stream.write_all(&frame).is_err() {
+                        m.remove(&id);
+                    } else {
+                        let _ = stream.flush();
+                    }
+                }
+            }
+            Target::All => {
+                m.retain(|_, stream| {
+                    stream
+                        .write_all(&frame)
+                        .map(|_| stream.flush().is_ok())
+                        .unwrap_or(false)
+                });
             }
         }
     }
 }
 
-/// Queue one outbound [`Msg`] (reply or event), encoded to a wire frame. A no-op when the channel is
-/// down.
-fn send_msg(game: &GameState, msg: Msg) {
+/// Queue one outbound [`Msg`] to a target, encoded to a wire frame. A no-op when the channel is down.
+fn send_to(game: &GameState, target: Target, msg: Msg) {
     if let Some(tx) = game.control.out_tx.as_ref() {
-        let _ = tx.send(proto::to_frame(&msg));
+        let _ = tx.send((target, proto::to_frame(&msg)));
     }
 }
 
-/// Queue one async lifecycle [`Event`].
+/// Queue one async lifecycle [`Event`] to every connected client.
 fn send_event(game: &GameState, ev: Event) {
-    send_msg(game, Msg::Event(ev));
+    send_to(game, Target::All, Msg::Event(ev));
 }
 
 /// Whether a cvar name is safe to splice into a `set` localcmd (guards the console tokenizer): a
@@ -248,8 +282,8 @@ fn a3(v: Vec3) -> proto::Vec3 {
     v.to_array()
 }
 
-/// Execute one decoded request on the engine thread and send its typed reply.
-fn exec_request(game: &mut GameState, req: Request) {
+/// Execute one decoded request on the engine thread and send its typed reply back to connection `conn`.
+fn exec_request(game: &mut GameState, conn: u64, req: Request) {
     let Request { id, cmd } = req;
     let result: Result<Resp, String> = match cmd {
         Cmd::Status => Ok(Resp::Status(Box::new(status_resp(game)))),
@@ -290,12 +324,12 @@ fn exec_request(game: &mut GameState, req: Request) {
             v_req,
         } => plant_link_resp(game, v3(from), v3(takeoff), v3(tgt), v_req).map(Resp::PlanLink),
     };
-    reply(game, id, result);
+    reply(game, conn, id, result);
 }
 
-/// Send the typed reply for request `id`.
-fn reply(game: &GameState, id: i64, result: Result<Resp, String>) {
-    send_msg(game, Msg::Reply { id, result });
+/// Send the typed reply for request `id` back to the connection that issued it.
+fn reply(game: &GameState, conn: u64, id: i64, result: Result<Resp, String>) {
+    send_to(game, Target::One(conn), Msg::Reply { id, result });
 }
 
 /// Validate that `bot` names a live rtx bot's client slot.
