@@ -818,11 +818,17 @@ mod tests {
     #[test]
     fn stale_backpack_slot_is_neutralized_by_clear() {
         // A slot as it looked on the previous map: a live, touchable backpack trigger.
-        let mut slot = Entity { in_use: true, ..Default::default() };
+        let mut slot = Entity {
+            in_use: true,
+            ..Default::default()
+        };
         slot.set_touch(Touch::Backpack);
         slot.v.solid = Solid::Trigger;
         slot.v.origin = glam::Vec3::new(128.0, -64.0, 24.0);
-        assert!(slot.touch == Touch::Backpack && slot.v.solid == Solid::Trigger, "sanity: matches the sweep");
+        assert!(
+            slot.touch == Touch::Backpack && slot.v.solid == Solid::Trigger,
+            "sanity: matches the sweep"
+        );
 
         // The map-load `GAME_CLEAR_EDICT` clear.
         slot = Entity::default();

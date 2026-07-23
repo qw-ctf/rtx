@@ -176,7 +176,9 @@ pub fn parse(argv: &[String]) -> Result<Config, String> {
                 i += 2;
             }
             "--bots" => {
-                c.bots = need(i, "--bots")?.parse().map_err(|_| "--bots wants a number".to_string())?;
+                c.bots = need(i, "--bots")?
+                    .parse()
+                    .map_err(|_| "--bots wants a number".to_string())?;
                 i += 2;
             }
             "--name" => {
@@ -192,11 +194,15 @@ pub fn parse(argv: &[String]) -> Result<Config, String> {
                 i += 2;
             }
             "--skill" => {
-                c.skill = need(i, "--skill")?.parse().map_err(|_| "--skill wants a number".to_string())?;
+                c.skill = need(i, "--skill")?
+                    .parse()
+                    .map_err(|_| "--skill wants a number".to_string())?;
                 i += 2;
             }
             "--colors" => {
-                let top = need(i, "--colors")?.parse().map_err(|_| "--colors wants two numbers".to_string())?;
+                let top = need(i, "--colors")?
+                    .parse()
+                    .map_err(|_| "--colors wants two numbers".to_string())?;
                 let bottom = argv
                     .get(i + 2)
                     .ok_or("--colors wants two numbers")?
@@ -206,7 +212,11 @@ pub fn parse(argv: &[String]) -> Result<Config, String> {
                 i += 3;
             }
             "--soak" => {
-                c.soak = Some(need(i, "--soak")?.parse().map_err(|_| "--soak wants seconds".to_string())?);
+                c.soak = Some(
+                    need(i, "--soak")?
+                        .parse()
+                        .map_err(|_| "--soak wants seconds".to_string())?,
+                );
                 i += 2;
             }
             "--wiretap" => {
@@ -351,16 +361,21 @@ mod tests {
             bind x "+forward"         // a command we can't run — ignored, not an error
             exec more.cfg
         "#;
-        assert_eq!(parse_cfg(cfg), vec![
-            CfgLine::Set("rtx_bot_curljump".into(), "1".into()),
-            CfgLine::Set("rtx_bot_skill".into(), "7".into()),
-            CfgLine::Set("rtx_bot_count".into(), "4".into()),
-            CfgLine::Set("hostname".into(), "My Bots".into()),
-            CfgLine::Exec("more.cfg".into()),
-        ]);
+        assert_eq!(
+            parse_cfg(cfg),
+            vec![
+                CfgLine::Set("rtx_bot_curljump".into(), "1".into()),
+                CfgLine::Set("rtx_bot_skill".into(), "7".into()),
+                CfgLine::Set("rtx_bot_count".into(), "4".into()),
+                CfgLine::Set("hostname".into(), "My Bots".into()),
+                CfgLine::Exec("more.cfg".into()),
+            ]
+        );
         // `bind x "+forward"` is three tokens and not a `set`, so it's dropped — a spurious cvar
         // named `bind` would be harmless, but three-token commands don't even become one.
-        assert!(!parse_cfg("bind x \"+forward\"").iter().any(|l| matches!(l, CfgLine::Set(n, _) if n == "bind")));
+        assert!(!parse_cfg("bind x \"+forward\"")
+            .iter()
+            .any(|l| matches!(l, CfgLine::Set(n, _) if n == "bind")));
         // A comment-only or blank cfg yields nothing.
         assert!(parse_cfg("// just a note\n\n   \n").is_empty());
     }
@@ -368,7 +383,15 @@ mod tests {
     /// The common case, and the defaults that ride along with it.
     #[test]
     fn parses_a_typical_command_line() {
-        let c = parse(&args(&["--server", "127.0.0.1:27500", "--basedir", "/q", "--bots", "2"])).unwrap();
+        let c = parse(&args(&[
+            "--server",
+            "127.0.0.1:27500",
+            "--basedir",
+            "/q",
+            "--bots",
+            "2",
+        ]))
+        .unwrap();
         assert_eq!(c.server, "127.0.0.1:27500".parse::<SocketAddr>().unwrap());
         assert_eq!(c.basedir, PathBuf::from("/q"));
         assert_eq!(c.bots, 2);
@@ -398,7 +421,15 @@ mod tests {
         assert_eq!(c.game, "id1");
 
         // Defaults yield to explicit values.
-        let c = parse(&args(&["--proto", "nq", "--server", "127.0.0.1:12345", "--game", "rogue"])).unwrap();
+        let c = parse(&args(&[
+            "--proto",
+            "nq",
+            "--server",
+            "127.0.0.1:12345",
+            "--game",
+            "rogue",
+        ]))
+        .unwrap();
         assert_eq!(c.server.port(), 12345);
         assert_eq!(c.game, "rogue");
 
@@ -411,17 +442,44 @@ mod tests {
     /// A bad protocol name is a sentence, not a panic.
     #[test]
     fn rejects_unknown_protocol() {
-        assert!(parse(&args(&["--server", "x", "--proto", "dp"])).unwrap_err().contains("qw` or `nq"));
+        assert!(parse(&args(&["--server", "x", "--proto", "dp"]))
+            .unwrap_err()
+            .contains("qw` or `nq"));
     }
 
     /// Every flag, so a rename or a mis-stepped index shows up here rather than at a LAN party.
     #[test]
     fn parses_every_option() {
         let c = parse(&args(&[
-            "--server", "127.0.0.1", "--basedir", "/q", "--bots", "4", "--name", "botto", "--team",
-            "red", "--skin", "base", "--colors", "4", "11", "--skill", "7", "--spectate",
-            "--no-auto-ready", "--soak", "600", "--wiretap", "/tmp/fix", "+set", "rtx_bot_bhop", "0",
-            "+set", "rtx_mode", "ctf",
+            "--server",
+            "127.0.0.1",
+            "--basedir",
+            "/q",
+            "--bots",
+            "4",
+            "--name",
+            "botto",
+            "--team",
+            "red",
+            "--skin",
+            "base",
+            "--colors",
+            "4",
+            "11",
+            "--skill",
+            "7",
+            "--spectate",
+            "--no-auto-ready",
+            "--soak",
+            "600",
+            "--wiretap",
+            "/tmp/fix",
+            "+set",
+            "rtx_bot_bhop",
+            "0",
+            "+set",
+            "rtx_mode",
+            "ctf",
         ]))
         .unwrap();
         assert_eq!(c.bots, 4);
@@ -446,14 +504,22 @@ mod tests {
     /// Bad input gets a sentence, not a panic and not a stack trace.
     #[test]
     fn rejects_bad_input_with_a_message() {
-        assert!(parse(&args(&["--basedir", "/q"])).unwrap_err().contains("--server is required"));
+        assert!(parse(&args(&["--basedir", "/q"]))
+            .unwrap_err()
+            .contains("--server is required"));
         assert!(parse(&args(&["--server"])).unwrap_err().contains("needs a value"));
-        assert!(parse(&args(&["--server", "127.0.0.1", "--bots", "x"])).unwrap_err().contains("number"));
-        assert!(parse(&args(&["--server", "127.0.0.1", "--bots", "0"])).unwrap_err().contains("at least 1"));
+        assert!(parse(&args(&["--server", "127.0.0.1", "--bots", "x"]))
+            .unwrap_err()
+            .contains("number"));
+        assert!(parse(&args(&["--server", "127.0.0.1", "--bots", "0"]))
+            .unwrap_err()
+            .contains("at least 1"));
         assert!(parse(&args(&["--nonsense"])).unwrap_err().contains("unknown option"));
         assert!(parse(&args(&["--help"])).unwrap_err().contains("usage:"));
         assert!(parse(&args(&["--server", "no such host.invalid"])).is_err());
         // `--colors` takes two, and saying so beats silently reading the next flag as a number.
-        assert!(parse(&args(&["--server", "127.0.0.1", "--colors", "4"])).unwrap_err().contains("two numbers"));
+        assert!(parse(&args(&["--server", "127.0.0.1", "--colors", "4"]))
+            .unwrap_err()
+            .contains("two numbers"));
     }
 }

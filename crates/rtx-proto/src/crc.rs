@@ -33,7 +33,11 @@ const TABLE: [u16; 256] = {
         let mut crc = (i as u16) << 8;
         let mut j = 0;
         while j < 8 {
-            crc = if crc & 0x8000 != 0 { (crc << 1) ^ 0x1021 } else { crc << 1 };
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
             j += 1;
         }
         table[i] = crc;
@@ -169,6 +173,9 @@ mod tests {
     #[test]
     fn sequence_byte_truncates_long_payloads() {
         let long = [0xabu8; 200];
-        assert_eq!(block_sequence_crc_byte(&long, 7), block_sequence_crc_byte(&long[..60], 7));
+        assert_eq!(
+            block_sequence_crc_byte(&long, 7),
+            block_sequence_crc_byte(&long[..60], 7)
+        );
     }
 }

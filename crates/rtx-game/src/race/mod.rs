@@ -185,7 +185,8 @@ impl GameState {
         let (starts, markers) = self.collect_race_markers();
         let (routes, warnings) = routes_from_markers(&starts, &markers);
         for w in &warnings {
-            self.host.conprint(&cstring(&format!("rtx: race: {}: {w}\n", self.level.mapname)));
+            self.host
+                .conprint(&cstring(&format!("rtx: race: {}: {w}\n", self.level.mapname)));
         }
         let from_entities = routes.len().min(MAX_ROUTES.saturating_sub(self.race.routes.len()));
         if from_entities < routes.len() {
@@ -439,7 +440,10 @@ race_set_teleport_flags_by_name odd RACEFLAG_BOGUS
             2
         );
         // Bad weapon mode value.
-        assert_eq!(line_of("race_route_add_start\nrace_set_route_weapon_mode raceWeaponMaybe\n"), 2);
+        assert_eq!(
+            line_of("race_route_add_start\nrace_set_route_weapon_mode raceWeaponMaybe\n"),
+            2
+        );
     }
 
     #[test]
@@ -652,7 +656,11 @@ race_set_teleport_flags_by_name odd RACEFLAG_BOGUS
 
     fn vec3_of(s: &str) -> Vec3 {
         let mut p = s.split_whitespace().map(|t| t.parse().unwrap_or(0.0));
-        Vec3::new(p.next().unwrap_or(0.0), p.next().unwrap_or(0.0), p.next().unwrap_or(0.0))
+        Vec3::new(
+            p.next().unwrap_or(0.0),
+            p.next().unwrap_or(0.0),
+            p.next().unwrap_or(0.0),
+        )
     }
 
     /// Submodel `n`'s world-space bounds from the models lump (64-byte records, bounds first).
@@ -675,8 +683,12 @@ race_set_teleport_flags_by_name odd RACEFLAG_BOGUS
             size: field(b, "size").map(vec3_of).unwrap_or_default(),
             target: field(b, "target").map(Into::into),
             targetname: field(b, "targetname").map(Into::into),
-            pitch: field(b, "race_route_start_pitch").and_then(|v| v.parse().ok()).unwrap_or(0.0),
-            yaw: field(b, "race_route_start_yaw").and_then(|v| v.parse().ok()).unwrap_or(0.0),
+            pitch: field(b, "race_route_start_pitch")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0),
+            yaw: field(b, "race_route_start_yaw")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0),
         };
         let starts: Vec<RaceStartInfo> = blocks
             .iter()
@@ -685,9 +697,15 @@ race_set_teleport_flags_by_name odd RACEFLAG_BOGUS
                 marker: info(b),
                 name: field(b, "race_route_name").unwrap_or("").to_owned(),
                 desc: field(b, "race_route_description").unwrap_or("").to_owned(),
-                timeout: field(b, "race_route_timeout").and_then(|v| v.parse().ok()).unwrap_or(0.0),
-                weapon_mode: field(b, "race_route_weapon_mode").and_then(|v| v.parse().ok()).unwrap_or(0),
-                falsestart_mode: field(b, "race_route_falsestart_mode").and_then(|v| v.parse().ok()).unwrap_or(0),
+                timeout: field(b, "race_route_timeout")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0.0),
+                weapon_mode: field(b, "race_route_weapon_mode")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0),
+                falsestart_mode: field(b, "race_route_falsestart_mode")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0),
             })
             .collect();
         let markers: Vec<RaceMarkerInfo> = blocks
@@ -715,7 +733,11 @@ race_set_teleport_flags_by_name odd RACEFLAG_BOGUS
                 if field(dest, "classname") == Some("info_teleport_destination") {
                     origin.z += 27.0;
                 }
-                Some(crate::navmesh::TeleportInfo { tmin, tmax, dest: origin })
+                Some(crate::navmesh::TeleportInfo {
+                    tmin,
+                    tmax,
+                    dest: origin,
+                })
             })
             .collect()
     }
@@ -817,7 +839,9 @@ race_set_teleport_flags_by_name odd RACEFLAG_BOGUS
                     }
                     match graph.find_path_banded(a, b, carry, &costs) {
                         Some(r) => carry = crate::navmesh::BAND_FLOOR[r.end_band as usize],
-                        None if banded.starts_with("PASS") => banded = format!("FAIL at leg {} (no banded path)", i + 1),
+                        None if banded.starts_with("PASS") => {
+                            banded = format!("FAIL at leg {} (no banded path)", i + 1)
+                        }
                         None => {}
                     }
                 }
@@ -827,11 +851,20 @@ race_set_teleport_flags_by_name odd RACEFLAG_BOGUS
                 } else {
                     legs_fail += 1;
                 }
-                assert!(!up || bp, "{name} route {ri}: unbanded PASS but banded FAIL — banding lost a route");
-                eprintln!("{name}: route {ri} \"{}\": unbanded {unbanded} | banded {banded}", route.name);
+                assert!(
+                    !up || bp,
+                    "{name} route {ri}: unbanded PASS but banded FAIL — banding lost a route"
+                );
+                eprintln!(
+                    "{name}: route {ri} \"{}\": unbanded {unbanded} | banded {banded}",
+                    route.name
+                );
             }
         }
         eprintln!("--- {maps_with_routes} maps with routes: {legs_pass} routes PASS (banded), {legs_fail} FAIL ---");
-        assert!(maps_with_routes > 0, "no routes found on any map — wrong RTX_TEST_MAPS/RTX_TEST_ROUTES?");
+        assert!(
+            maps_with_routes > 0,
+            "no routes found on any map — wrong RTX_TEST_MAPS/RTX_TEST_ROUTES?"
+        );
     }
 }

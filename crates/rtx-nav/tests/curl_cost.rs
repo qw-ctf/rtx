@@ -3,7 +3,14 @@ use rtx_nav::bsp::Bsp;
 use rtx_nav::navmesh::{build_navmesh, SpeedJumpParams};
 
 fn params(curl: bool) -> SpeedJumpParams {
-    SpeedJumpParams { gravity: 800.0, accel: 10.0, maxspeed: 320.0, friction: 4.0, stopspeed: 100.0, curl }
+    SpeedJumpParams {
+        gravity: 800.0,
+        accel: 10.0,
+        maxspeed: 320.0,
+        friction: 4.0,
+        stopspeed: 100.0,
+        curl,
+    }
 }
 
 #[test]

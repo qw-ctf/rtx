@@ -173,17 +173,15 @@ pub fn parse(proto: &mut NqProtoState, data: &[u8]) -> Result<Vec<SvcEvent>, Par
 
 /// Parse one non-fast-update message. `None` means "recognised but carries no event" (a skybox
 /// name, a `bf` flash — parsed for its bytes, then dropped).
-fn parse_one(
-    proto: &mut NqProtoState,
-    r: &mut Reader,
-    cmd: u8,
-    offset: usize,
-) -> Result<Option<SvcEvent>, ParseError> {
+fn parse_one(proto: &mut NqProtoState, r: &mut Reader, cmd: u8, offset: usize) -> Result<Option<SvcEvent>, ParseError> {
     let ev = match cmd {
         op::BAD => return Err(ParseError::Bad { offset }),
         op::NOP => SvcEvent::Nop,
         op::DISCONNECT => SvcEvent::Disconnect,
-        op::UPDATESTAT => SvcEvent::UpdateStat { stat: r.u8()?, value: r.i32()? },
+        op::UPDATESTAT => SvcEvent::UpdateStat {
+            stat: r.u8()?,
+            value: r.i32()?,
+        },
         op::VERSION => {
             // The version is authoritative from serverinfo; a later svc_version just re-states it.
             r.i32()?;
@@ -193,36 +191,72 @@ fn parse_one(
         op::SOUND => read_sound(proto, r)?,
         op::TIME => SvcEvent::Time(r.f32()?),
         // NetQuake's svc_print carries no level byte; treat server prints as high priority.
-        op::PRINT => SvcEvent::Print { level: PRINT_HIGH, text: r.string()? },
+        op::PRINT => SvcEvent::Print {
+            level: PRINT_HIGH,
+            text: r.string()?,
+        },
         // A 0x01-prefixed stufftext is a binary ProQuake message whose args are NUL-free by design,
         // so reading it as a string consumes exactly its bytes; the session ignores the \x01 text.
         op::STUFFTEXT => SvcEvent::StuffText(r.string()?),
-        op::SETANGLE => SvcEvent::SetAngle { kind: None, angles: proto.angle3(r)? },
+        op::SETANGLE => SvcEvent::SetAngle {
+            kind: None,
+            angles: proto.angle3(r)?,
+        },
         op::SERVERINFO => read_serverinfo(proto, r)?,
-        op::LIGHTSTYLE => SvcEvent::LightStyle { index: r.u8()?, pattern: r.string()? },
-        op::UPDATENAME => SvcEvent::UpdateName { player: r.u8()?, name: r.string()? },
-        op::UPDATEFRAGS => SvcEvent::UpdateFrags { player: r.u8()?, frags: r.i16()? },
+        op::LIGHTSTYLE => SvcEvent::LightStyle {
+            index: r.u8()?,
+            pattern: r.string()?,
+        },
+        op::UPDATENAME => SvcEvent::UpdateName {
+            player: r.u8()?,
+            name: r.string()?,
+        },
+        op::UPDATEFRAGS => SvcEvent::UpdateFrags {
+            player: r.u8()?,
+            frags: r.i16()?,
+        },
         op::CLIENTDATA => SvcEvent::ClientData(Box::new(read_clientdata(proto, r)?)),
         op::STOPSOUND => {
             let w = r.u16()?;
-            SvcEvent::StopSound { entity: w >> 3, channel: (w & 7) as u8 }
+            SvcEvent::StopSound {
+                entity: w >> 3,
+                channel: (w & 7) as u8,
+            }
         }
-        op::UPDATECOLORS => SvcEvent::UpdateColors { player: r.u8()?, colors: r.u8()? },
+        op::UPDATECOLORS => SvcEvent::UpdateColors {
+            player: r.u8()?,
+            colors: r.u8()?,
+        },
         op::PARTICLE => {
             let origin = proto.coord3(r)?;
             // Direction is three signed bytes in 1/16-unit steps.
             let dir = Vec3::new(r.i8()? as f32 / 16.0, r.i8()? as f32 / 16.0, r.i8()? as f32 / 16.0);
-            SvcEvent::Particle { origin, dir, count: r.u8()?, color: r.u8()? }
+            SvcEvent::Particle {
+                origin,
+                dir,
+                count: r.u8()?,
+                color: r.u8()?,
+            }
         }
-        op::DAMAGE => SvcEvent::Damage { armor: r.u8()?, blood: r.u8()?, from: proto.coord3(r)? },
+        op::DAMAGE => SvcEvent::Damage {
+            armor: r.u8()?,
+            blood: r.u8()?,
+            from: proto.coord3(r)?,
+        },
         op::SPAWNSTATIC => SvcEvent::SpawnStatic(read_baseline(proto, r, 1)?),
         op::SPAWNBASELINE => {
             let entity = r.u16()?;
-            SvcEvent::SpawnBaseline { entity, baseline: read_baseline(proto, r, 1)? }
+            SvcEvent::SpawnBaseline {
+                entity,
+                baseline: read_baseline(proto, r, 1)?,
+            }
         }
         op::SPAWNBASELINE2 => {
             let entity = r.u16()?;
-            SvcEvent::SpawnBaseline { entity, baseline: read_baseline(proto, r, 2)? }
+            SvcEvent::SpawnBaseline {
+                entity,
+                baseline: read_baseline(proto, r, 2)?,
+            }
         }
         op::SPAWNSTATIC2 => SvcEvent::SpawnStatic(read_baseline(proto, r, 2)?),
         op::TEMP_ENTITY => read_temp_entity(proto, r)?,
@@ -244,7 +278,10 @@ fn parse_one(
             attenuation: r.u8()?,
         },
         // NetQuake's svc_intermission carries no camera position (the client freezes the view).
-        op::INTERMISSION => SvcEvent::Intermission { origin: Vec3::ZERO, angles: Vec3::ZERO },
+        op::INTERMISSION => SvcEvent::Intermission {
+            origin: Vec3::ZERO,
+            angles: Vec3::ZERO,
+        },
         op::FINALE => SvcEvent::Finale(r.string()?),
         // A cutscene is an intermission with text; the session treats it the same.
         op::CUTSCENE => SvcEvent::Finale(r.string()?),
@@ -271,11 +308,7 @@ fn parse_one(
 }
 
 /// A NetQuake fast entity update. `first_bits` is the low seven bits from the opcode byte.
-fn read_delta_entity(
-    proto: &NqProtoState,
-    r: &mut Reader,
-    first_bits: u32,
-) -> Result<EntityDelta, ParseError> {
+fn read_delta_entity(proto: &NqProtoState, r: &mut Reader, first_bits: u32) -> Result<EntityDelta, ParseError> {
     let mut bits = first_bits;
     if bits & u::MOREBITS != 0 {
         bits |= (r.u8()? as u32) << 8;
@@ -292,7 +325,11 @@ fn read_delta_entity(
     }
 
     let mut d = EntityDelta {
-        number: if bits & u::LONGENTITY != 0 { r.u16()? } else { r.u8()? as u16 },
+        number: if bits & u::LONGENTITY != 0 {
+            r.u16()?
+        } else {
+            r.u8()? as u16
+        },
         ..Default::default()
     };
 
@@ -419,7 +456,11 @@ fn read_clientdata(proto: &NqProtoState, r: &mut Reader) -> Result<ClientData, P
     let _ = proto; // widths don't reach clientdata (velocity is char*16, punch is char)
 
     let mut cd = ClientData {
-        viewheight: if bits & su::VIEWHEIGHT != 0 { r.i8()? as i16 } else { DEFAULT_VIEWHEIGHT },
+        viewheight: if bits & su::VIEWHEIGHT != 0 {
+            r.i8()? as i16
+        } else {
+            DEFAULT_VIEWHEIGHT
+        },
         ..Default::default()
     };
     if bits & su::IDEALPITCH != 0 {
@@ -492,8 +533,16 @@ fn read_clientdata(proto: &NqProtoState, r: &mut Reader) -> Result<ClientData, P
 /// flagged form with optional large model/frame/alpha/scale.
 fn read_baseline(proto: &NqProtoState, r: &mut Reader, version: u8) -> Result<Baseline, ParseError> {
     let bits = if version == 2 { r.u8()? } else { 0 };
-    let modelindex = if bits & b::LARGEMODEL != 0 { r.u16()? } else { r.u8()? as u16 };
-    let frame = if bits & b::LARGEFRAME != 0 { r.u16()? } else { r.u8()? as u16 };
+    let modelindex = if bits & b::LARGEMODEL != 0 {
+        r.u16()?
+    } else {
+        r.u8()? as u16
+    };
+    let frame = if bits & b::LARGEFRAME != 0 {
+        r.u16()?
+    } else {
+        r.u8()? as u16
+    };
     let colormap = r.u8()?;
     let skinnum = r.u8()?;
     let mut origin = Vec3::ZERO;
@@ -508,15 +557,29 @@ fn read_baseline(proto: &NqProtoState, r: &mut Reader, version: u8) -> Result<Ba
     if bits & b::SCALE != 0 {
         r.u8()?; // scale, unused
     }
-    Ok(Baseline { modelindex, frame, colormap, skinnum, origin, angles })
+    Ok(Baseline {
+        modelindex,
+        frame,
+        colormap,
+        skinnum,
+        origin,
+        angles,
+    })
 }
 
 /// `svc_sound` — a sound started somewhere. Emits the shared [`SvcEvent::Sound`].
 fn read_sound(proto: &NqProtoState, r: &mut Reader) -> Result<SvcEvent, ParseError> {
     let mask = r.u8()?;
-    let volume = if mask & snd::VOLUME != 0 { r.u8()? } else { DEFAULT_SOUND_VOLUME };
-    let attenuation =
-        if mask & snd::ATTENUATION != 0 { r.u8()? as f32 / 64.0 } else { DEFAULT_SOUND_ATTENUATION };
+    let volume = if mask & snd::VOLUME != 0 {
+        r.u8()?
+    } else {
+        DEFAULT_SOUND_VOLUME
+    };
+    let attenuation = if mask & snd::ATTENUATION != 0 {
+        r.u8()? as f32 / 64.0
+    } else {
+        DEFAULT_SOUND_ATTENUATION
+    };
     let (entity, channel) = if mask & snd::LARGEENTITY != 0 {
         (r.u16()?, r.u8()?)
     } else {
@@ -525,7 +588,11 @@ fn read_sound(proto: &NqProtoState, r: &mut Reader) -> Result<SvcEvent, ParseErr
         let w = r.u16()?;
         (w >> 3, (w & 7) as u8)
     };
-    let sound = if mask & snd::LARGESOUND != 0 { r.u16()? } else { r.u8()? as u16 };
+    let sound = if mask & snd::LARGESOUND != 0 {
+        r.u16()?
+    } else {
+        r.u8()? as u16
+    };
     Ok(SvcEvent::Sound {
         entity,
         channel,
@@ -542,7 +609,10 @@ fn read_temp_entity(proto: &NqProtoState, r: &mut Reader) -> Result<SvcEvent, Pa
     use TempEntityKind::*;
     let raw = r.u8()?;
     let point = |kind, r: &mut Reader| -> Result<SvcEvent, ParseError> {
-        Ok(SvcEvent::TempEntity(TempEntity::Point { kind, origin: proto.coord3(r)? }))
+        Ok(SvcEvent::TempEntity(TempEntity::Point {
+            kind,
+            origin: proto.coord3(r)?,
+        }))
     };
     let te = match raw {
         0 => return point(Spike, r),
@@ -562,11 +632,17 @@ fn read_temp_entity(proto: &NqProtoState, r: &mut Reader) -> Result<SvcEvent, Pa
             let origin = proto.coord3(r)?;
             r.u8()?; // colour start
             r.u8()?; // colour length
-            TempEntity::Point { kind: Explosion2, origin }
+            TempEntity::Point {
+                kind: Explosion2,
+                origin,
+            }
         }
         13 => read_beam(proto, r, GrappleBeam)?,
         other => {
-            return Err(ParseError::UnknownSvc { svc: other, offset: r.pos() - 1 });
+            return Err(ParseError::UnknownSvc {
+                svc: other,
+                offset: r.pos() - 1,
+            });
         }
     };
     Ok(SvcEvent::TempEntity(te))
@@ -577,7 +653,12 @@ fn read_beam(proto: &NqProtoState, r: &mut Reader, kind: TempEntityKind) -> Resu
     let entity = r.u16()?;
     let start = proto.coord3(r)?;
     let end = proto.coord3(r)?;
-    Ok(TempEntity::Beam { kind, entity, start, end })
+    Ok(TempEntity::Beam {
+        kind,
+        entity,
+        start,
+        end,
+    })
 }
 
 #[cfg(test)]
@@ -604,7 +685,9 @@ mod tests {
 
         let mut proto = NqProtoState::new();
         let evs = parse(&mut proto, &w.into_vec()).unwrap();
-        let SvcEvent::NqServerData(sd) = &evs[0] else { panic!("{evs:?}") };
+        let SvcEvent::NqServerData(sd) = &evs[0] else {
+            panic!("{evs:?}")
+        };
         assert_eq!(sd.protocol, NETQUAKE);
         assert_eq!(sd.maxclients, 8);
         assert_eq!(sd.gametype, 1);
@@ -646,7 +729,9 @@ mod tests {
 
         let mut proto = NqProtoState::new();
         let evs = parse(&mut proto, &w.into_vec()).unwrap();
-        let SvcEvent::EntityUpdate(d) = &evs[0] else { panic!("{evs:?}") };
+        let SvcEvent::EntityUpdate(d) = &evs[0] else {
+            panic!("{evs:?}")
+        };
         assert_eq!(d.number, 42);
         assert_eq!(d.origin[0], Some(8.0));
         assert_eq!(d.origin[1], None); // store resolves from baseline
@@ -662,13 +747,15 @@ mod tests {
         w.u8(u::SIGNAL | u::MOREBITS as u8 | u::FRAME as u8);
         w.u8((u::MODEL >> 8) as u8); // second bit-byte: U_MODEL
         w.u8(7); // entity
-        // Wire order follows CL_ParseUpdate: model precedes frame.
+                 // Wire order follows CL_ParseUpdate: model precedes frame.
         w.u8(9); // model
         w.u8(5); // frame
 
         let mut proto = NqProtoState::new();
         let evs = parse(&mut proto, &w.into_vec()).unwrap();
-        let SvcEvent::EntityUpdate(d) = &evs[0] else { panic!("{evs:?}") };
+        let SvcEvent::EntityUpdate(d) = &evs[0] else {
+            panic!("{evs:?}")
+        };
         assert_eq!(d.number, 7);
         assert_eq!(d.frame, Some(5));
         assert_eq!(d.model, Some(9));
@@ -697,7 +784,9 @@ mod tests {
 
         let mut proto = NqProtoState::new();
         let evs = parse(&mut proto, &w.into_vec()).unwrap();
-        let SvcEvent::ClientData(cd) = &evs[0] else { panic!("{evs:?}") };
+        let SvcEvent::ClientData(cd) = &evs[0] else {
+            panic!("{evs:?}")
+        };
         assert_eq!(cd.health, 87);
         assert_eq!(cd.armor, 50);
         assert_eq!(cd.weapon_model, 8);
@@ -725,7 +814,10 @@ mod tests {
         let evs = parse(&mut proto, &w.into_vec()).unwrap();
         assert!(matches!(
             evs[0],
-            SvcEvent::TempEntity(TempEntity::Point { kind: TempEntityKind::Gunshot, .. })
+            SvcEvent::TempEntity(TempEntity::Point {
+                kind: TempEntityKind::Gunshot,
+                ..
+            })
         ));
         assert_eq!(evs[1], SvcEvent::Nop, "gunshot consumed exactly 6 bytes");
 
@@ -742,7 +834,10 @@ mod tests {
         let evs = parse(&mut NqProtoState::new(), &w.into_vec()).unwrap();
         assert!(matches!(
             evs[0],
-            SvcEvent::TempEntity(TempEntity::Point { kind: TempEntityKind::Explosion2, .. })
+            SvcEvent::TempEntity(TempEntity::Point {
+                kind: TempEntityKind::Explosion2,
+                ..
+            })
         ));
         assert_eq!(evs[1], SvcEvent::Nop);
 
@@ -761,7 +856,11 @@ mod tests {
         let evs = parse(&mut NqProtoState::new(), &w.into_vec()).unwrap();
         assert!(matches!(
             evs[0],
-            SvcEvent::TempEntity(TempEntity::Beam { kind: TempEntityKind::GrappleBeam, entity: 3, .. })
+            SvcEvent::TempEntity(TempEntity::Beam {
+                kind: TempEntityKind::GrappleBeam,
+                entity: 3,
+                ..
+            })
         ));
         assert_eq!(evs[1], SvcEvent::Nop);
     }
@@ -780,7 +879,16 @@ mod tests {
         w.i16(16);
         w.i16(24);
         let evs = parse(&mut NqProtoState::new(), &w.into_vec()).unwrap();
-        let SvcEvent::Sound { entity, channel, sound, volume, .. } = evs[0] else { panic!("{evs:?}") };
+        let SvcEvent::Sound {
+            entity,
+            channel,
+            sound,
+            volume,
+            ..
+        } = evs[0]
+        else {
+            panic!("{evs:?}")
+        };
         assert_eq!((entity, channel, sound, volume), (12, 1, 40, 200));
 
         // The entity is 13 bits, not 10: a high-numbered entity must not alias onto a low player
@@ -794,7 +902,9 @@ mod tests {
         w.i16(0);
         w.i16(0);
         let evs = parse(&mut NqProtoState::new(), &w.into_vec()).unwrap();
-        let SvcEvent::Sound { entity, .. } = evs[0] else { panic!("{evs:?}") };
+        let SvcEvent::Sound { entity, .. } = evs[0] else {
+            panic!("{evs:?}")
+        };
         assert_eq!(entity, 2000, "entity must not be masked to 10 bits");
     }
 

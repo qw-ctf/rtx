@@ -179,11 +179,7 @@ pub(crate) fn hazard_below(
 /// Find the best hazard to shove an enemy (at `e_feet`) into: probe a ring of directions/distances,
 /// classify each by what lies below (liquids via `contents`, drops via `is_solid`), and require a
 /// clear horizontal path to it (a railing/wall between blocks the shove). Pure over the two oracles.
-pub fn find_hazard(
-    is_solid: &impl Fn(Vec3) -> bool,
-    contents: &impl Fn(Vec3) -> i32,
-    e_feet: Vec3,
-) -> Option<Hazard> {
+pub fn find_hazard(is_solid: &impl Fn(Vec3) -> bool, contents: &impl Fn(Vec3) -> i32, e_feet: Vec3) -> Option<Hazard> {
     let mut best: Option<Hazard> = None;
     for (dx, dy) in HAZARD_DIRS {
         let dir = Vec3::new(dx, dy, 0.0);
@@ -241,12 +237,7 @@ pub fn hazard_ahead(
 /// stride or two — the same probe geometry as [`hazard_ahead`], but reporting swimmable water rather
 /// than lethal hazards. The combat guard uses it to prefer dry footing: water is slow and exposed,
 /// so a bot picks a dry candidate move over a wet one when both are safe.
-pub fn water_ahead(
-    is_solid: &impl Fn(Vec3) -> bool,
-    contents: &impl Fn(Vec3) -> i32,
-    feet: Vec3,
-    dir: Vec3,
-) -> bool {
+pub fn water_ahead(is_solid: &impl Fn(Vec3) -> bool, contents: &impl Fn(Vec3) -> i32, feet: Vec3, dir: Vec3) -> bool {
     HAZARD_AHEAD_DISTS.iter().any(|&d| {
         let p = feet + dir * d + Vec3::new(0.0, 0.0, 8.0);
         // A wall ahead isn't water — normal collision handles it (mirrors `hazard_ahead`).
@@ -406,7 +397,13 @@ mod tests {
         };
         assert!(hazard_below(&never_solid, &water, Vec3::new(0.0, 0.0, 24.0)).is_none());
         // And a bot standing at its edge is not warned away from swimmable water.
-        assert!(hazard_ahead(&never_solid, &water, Vec3::new(0.0, 0.0, 24.0), Vec3::new(1.0, 0.0, 0.0)).is_none());
+        assert!(hazard_ahead(
+            &never_solid,
+            &water,
+            Vec3::new(0.0, 0.0, 24.0),
+            Vec3::new(1.0, 0.0, 0.0)
+        )
+        .is_none());
     }
 
     #[test]
@@ -532,7 +529,10 @@ mod tests {
                 CONTENTS_EMPTY
             }
         };
-        assert_eq!(hazard_below(&solid, &film, Vec3::new(72.0, 0.0, 8.0)), Some(HazardKind::Slime));
+        assert_eq!(
+            hazard_below(&solid, &film, Vec3::new(72.0, 0.0, 8.0)),
+            Some(HazardKind::Slime)
+        );
     }
 
     #[test]

@@ -49,7 +49,12 @@ struct DownloadProgress {
 
 impl DownloadProgress {
     fn new(label: String, started: Instant) -> Self {
-        DownloadProgress { label, started, received: 0, next_percent: 5 }
+        DownloadProgress {
+            label,
+            started,
+            received: 0,
+            next_percent: 5,
+        }
     }
 
     fn add(&mut self, bytes: u64, percent: u8, source: &str, now: Instant) {
@@ -163,7 +168,8 @@ impl DownloadPaths {
     }
 
     fn install(&self, mut file: File) -> Result<PathBuf, String> {
-        file.flush().map_err(|e| format!("can't flush {}: {e}", self.temporary.display()))?;
+        file.flush()
+            .map_err(|e| format!("can't flush {}: {e}", self.temporary.display()))?;
         file.seek(SeekFrom::Start(0))
             .map_err(|e| format!("can't seek {}: {e}", self.temporary.display()))?;
         let mut header = [0u8; 4];
@@ -259,12 +265,7 @@ struct ChunkedState {
 impl ServerDownload {
     /// Prepare to receive `maps/<map>.bsp`. `cookie` must be non-zero so FTE can echo it in OOB
     /// replies and stale packets from an earlier transfer cannot be mistaken for this file.
-    pub(crate) fn new(
-        basedir: PathBuf,
-        gamedir: &str,
-        map: &str,
-        cookie: u32,
-    ) -> Result<Self, String> {
+    pub(crate) fn new(basedir: PathBuf, gamedir: &str, map: &str, cookie: u32) -> Result<Self, String> {
         if cookie == 0 {
             return Err("chunked download cookie must be non-zero".to_string());
         }
@@ -299,7 +300,9 @@ impl ServerDownload {
         }
         if matches!(self.state, ServerState::Awaiting) {
             self.file = Some(self.paths.create()?);
-            self.state = ServerState::Legacy(LegacyState { request: LegacyRequest::None });
+            self.state = ServerState::Legacy(LegacyState {
+                request: LegacyRequest::None,
+            });
         }
         let ServerState::Legacy(active) = &mut self.state else {
             return Err("legacy block arrived during a different download method".to_string());
@@ -333,9 +336,7 @@ impl ServerDownload {
             ServerState::Legacy(active) => match active.request {
                 LegacyRequest::None => true,
                 LegacyRequest::Queued => false,
-                LegacyRequest::Sent(sequence) => {
-                    reliable_acked && acknowledged.wrapping_sub(sequence) < (1 << 30)
-                }
+                LegacyRequest::Sent(sequence) => reliable_acked && acknowledged.wrapping_sub(sequence) < (1 << 30),
             },
             _ => false,
         }
@@ -349,7 +350,10 @@ impl ServerDownload {
 
     /// Called when the netchan promotes its queued reliable bytes into this outgoing packet.
     pub(crate) fn mark_legacy_request_sent(&mut self, sequence: u32) {
-        if let ServerState::Legacy(LegacyState { request: request @ LegacyRequest::Queued }) = &mut self.state {
+        if let ServerState::Legacy(LegacyState {
+            request: request @ LegacyRequest::Queued,
+        }) = &mut self.state
+        {
             *request = LegacyRequest::Sent(sequence);
         }
     }
@@ -369,9 +373,11 @@ impl ServerDownload {
             return Err("server offered an empty map".to_string());
         }
         let chunks = size.div_ceil(DOWNLOAD_CHUNK_SIZE as u64);
-        let chunks = u32::try_from(chunks).map_err(|_| format!("map is too large for FTE chunk numbers: {size} bytes"))?;
+        let chunks =
+            u32::try_from(chunks).map_err(|_| format!("map is too large for FTE chunk numbers: {size} bytes"))?;
         let file = self.paths.create()?;
-        file.set_len(size).map_err(|e| format!("can't size {}: {e}", self.paths.temporary.display()))?;
+        file.set_len(size)
+            .map_err(|e| format!("can't size {}: {e}", self.paths.temporary.display()))?;
         self.file = Some(file);
         self.state = ServerState::Chunked(ChunkedState {
             size,
@@ -411,7 +417,10 @@ impl ServerDownload {
             return Err(format!("chunk {chunk} lies beyond {} bytes", active.size));
         }
         let len = (active.size - offset).min(DOWNLOAD_CHUNK_SIZE as u64) as usize;
-        let file = self.file.as_mut().ok_or_else(|| "chunked download has no temporary file".to_string())?;
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| "chunked download has no temporary file".to_string())?;
         file.seek(SeekFrom::Start(offset))
             .and_then(|_| file.write_all(&data[..len]))
             .map_err(|e| format!("can't write {} at {offset}: {e}", self.paths.temporary.display()))?;
@@ -442,7 +451,9 @@ impl ServerDownload {
     /// How many new chunk commands this tick may carry. The scheduler begins with one request per
     /// tick, accelerates by one for every useful reply, and backs off slightly when requests expire.
     pub(crate) fn request_budget(&mut self, now: Instant, acknowledged: u32, rtt: f32) -> usize {
-        let ServerState::Chunked(active) = &mut self.state else { return 0 };
+        let ServerState::Chunked(active) = &mut self.state else {
+            return 0;
+        };
         let retry_after = Duration::from_secs_f32(if rtt.is_finite() { (rtt * 4.0).max(1.0) } else { 1.0 });
         let expired = active.ranges.expire(acknowledged, now, retry_after);
         if expired > 0 {
@@ -461,22 +472,31 @@ impl ServerDownload {
     }
 
     pub(crate) fn next_missing_chunk(&self) -> Option<u32> {
-        let ServerState::Chunked(active) = &self.state else { return None };
+        let ServerState::Chunked(active) = &self.state else {
+            return None;
+        };
         active.ranges.next_missing()
     }
 
     pub(crate) fn mark_requested(&mut self, chunk: u32, sequence: u32, now: Instant) -> bool {
-        let ServerState::Chunked(active) = &mut self.state else { return false };
+        let ServerState::Chunked(active) = &mut self.state else {
+            return false;
+        };
         active.ranges.mark_requested(chunk, sequence, now)
     }
 
     pub(crate) fn percent(&self) -> u8 {
-        let ServerState::Chunked(active) = &self.state else { return 0 };
+        let ServerState::Chunked(active) = &self.state else {
+            return 0;
+        };
         ((active.received_bytes.saturating_mul(100) / active.size).min(99)) as u8
     }
 
     fn finish(&mut self) -> Result<PathBuf, String> {
-        let file = self.file.take().ok_or_else(|| "download completed without a file".to_string())?;
+        let file = self
+            .file
+            .take()
+            .ok_or_else(|| "download completed without a file".to_string())?;
         let result = self.paths.install(file);
         self.state = ServerState::Complete;
         result
@@ -512,7 +532,11 @@ struct RangeContainer {
 impl RangeContainer {
     fn new(chunks: u32) -> Self {
         RangeContainer {
-            ranges: vec![Range { start: 0, end: chunks, state: RangeState::Missing }],
+            ranges: vec![Range {
+                start: 0,
+                end: chunks,
+                state: RangeState::Missing,
+            }],
         }
     }
 
@@ -532,13 +556,18 @@ impl RangeContainer {
     }
 
     fn next_missing(&self) -> Option<u32> {
-        self.ranges.iter().find(|r| matches!(r.state, RangeState::Missing)).map(|r| r.start)
+        self.ranges
+            .iter()
+            .find(|r| matches!(r.state, RangeState::Missing))
+            .map(|r| r.start)
     }
 
     fn mark_requested(&mut self, chunk: u32, sequence: u32, now: Instant) -> bool {
-        let Some(i) = self.ranges.iter().position(|r| {
-            matches!(r.state, RangeState::Missing) && r.start <= chunk && chunk < r.end
-        }) else {
+        let Some(i) = self
+            .ranges
+            .iter()
+            .position(|r| matches!(r.state, RangeState::Missing) && r.start <= chunk && chunk < r.end)
+        else {
             return false;
         };
         let original = self.ranges[i];
@@ -553,7 +582,10 @@ impl RangeContainer {
         }
         replacement.push(pending);
         if chunk + 1 < original.end {
-            replacement.push(Range { start: chunk + 1, ..original });
+            replacement.push(Range {
+                start: chunk + 1,
+                ..original
+            });
         }
         self.ranges.splice(i..=i, replacement);
         true
@@ -569,7 +601,10 @@ impl RangeContainer {
             replacement.push(Range { end: chunk, ..original });
         }
         if chunk + 1 < original.end {
-            replacement.push(Range { start: chunk + 1, ..original });
+            replacement.push(Range {
+                start: chunk + 1,
+                ..original
+            });
         }
         self.ranges.splice(i..=i, replacement);
         self.merge_missing();
@@ -579,7 +614,9 @@ impl RangeContainer {
     fn expire(&mut self, acknowledged: u32, now: Instant, retry_after: Duration) -> usize {
         let mut expired = 0;
         for range in &mut self.ranges {
-            let RangeState::Pending { sequence, sent_at } = range.state else { continue };
+            let RangeState::Pending { sequence, sent_at } = range.state else {
+                continue;
+            };
             let ack_distance = acknowledged.wrapping_sub(sequence);
             let ack_passed = (RETRY_ACK_DISTANCE..(1 << 30)).contains(&ack_distance);
             if ack_passed || now.duration_since(sent_at) >= retry_after {
@@ -618,7 +655,8 @@ fn fetch_http(basedir: &Path, gamedir: &str, map: &str) -> Result<PathBuf, Strin
         return Err(format!("{url} did not return a Quake BSP (got {} bytes)", bytes.len()));
     }
     let mut file = paths.create()?;
-    file.write_all(&bytes).map_err(|e| format!("can't write {}: {e}", paths.temporary.display()))?;
+    file.write_all(&bytes)
+        .map_err(|e| format!("can't write {}: {e}", paths.temporary.display()))?;
     paths.install(file)
 }
 
@@ -708,7 +746,10 @@ mod tests {
     #[test]
     fn unsafe_map_names_never_escape_the_gamedir() {
         for name in ["", "../config", "a/../../config", "/absolute", "a\\b", "C:drive"] {
-            assert!(DownloadPaths::new(Path::new("/tmp/unused"), "qw", name).is_err(), "{name:?}");
+            assert!(
+                DownloadPaths::new(Path::new("/tmp/unused"), "qw", name).is_err(),
+                "{name:?}"
+            );
         }
         assert!(DownloadPaths::new(Path::new("/tmp/unused"), "qw", "race/route1").is_ok());
     }
@@ -726,7 +767,10 @@ mod tests {
 
         assert_eq!(ranges.expire(20, now, Duration::from_secs(10)), 1);
         assert_eq!(ranges.next_missing(), Some(0));
-        assert!(ranges.complete(0), "a reply after expiry still carves the merged missing span");
+        assert!(
+            ranges.complete(0),
+            "a reply after expiry still carves the merged missing span"
+        );
         for chunk in [4, 2, 3] {
             assert!(ranges.complete(chunk));
         }
@@ -738,13 +782,17 @@ mod tests {
         let root = temp_root();
         let now = Instant::now();
         let mut dl = ServerDownload::new(root.clone(), "qw", "wide", 1).unwrap();
-        dl.begin_chunked("maps/wide.bsp", 200 * DOWNLOAD_CHUNK_SIZE as u64, now).unwrap();
+        dl.begin_chunked("maps/wide.bsp", 200 * DOWNLOAD_CHUNK_SIZE as u64, now)
+            .unwrap();
         for sequence in 1..=MAX_IN_FLIGHT as u32 {
             let chunk = dl.next_missing_chunk().unwrap();
             assert!(dl.mark_requested(chunk, sequence, now));
         }
         assert_eq!(dl.request_budget(now, 0, 0.01), 0, "window is full");
-        assert!(dl.request_budget(now, 100, 0.01) > 0, "advanced ack recycles unanswered chunks");
+        assert!(
+            dl.request_budget(now, 100, 0.01) > 0,
+            "advanced ack recycles unanswered chunks"
+        );
         drop(dl);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -764,7 +812,10 @@ mod tests {
             chunk[..end - start].copy_from_slice(&bytes[start..end]);
         }
         assert!(dl.receive_chunk(2, &chunks[2]).unwrap().is_none());
-        assert!(dl.receive_chunk(3, &chunks[2]).is_err(), "the advertised size bounds chunk ids");
+        assert!(
+            dl.receive_chunk(3, &chunks[2]).is_err(),
+            "the advertised size bounds chunk ids"
+        );
         assert!(dl.receive_chunk(0, &chunks[0]).unwrap().is_none());
         let path = dl.receive_chunk(1, &chunks[1]).unwrap().unwrap();
         assert_eq!(std::fs::read(path).unwrap(), bytes);
@@ -778,10 +829,19 @@ mod tests {
         let mut dl = ServerDownload::new(root.clone(), "qw", "legacy", 1).unwrap();
         assert!(dl.receive_legacy(&bytes[..768], 51).unwrap().is_none());
         dl.mark_legacy_request_queued();
-        assert!(!dl.legacy_reply_ready(16, true), "a replay before nextdl is sent is not a new block");
+        assert!(
+            !dl.legacy_reply_ready(16, true),
+            "a replay before nextdl is sent is not a new block"
+        );
         dl.mark_legacy_request_sent(17);
-        assert!(!dl.legacy_reply_ready(16, true), "nor is a replay before the nextdl packet is acknowledged");
-        assert!(!dl.legacy_reply_ready(18, false), "a later packet is insufficient without the reliable ack bit");
+        assert!(
+            !dl.legacy_reply_ready(16, true),
+            "nor is a replay before the nextdl packet is acknowledged"
+        );
+        assert!(
+            !dl.legacy_reply_ready(18, false),
+            "a later packet is insufficient without the reliable ack bit"
+        );
         assert!(dl.legacy_reply_ready(17, true));
         let path = dl.receive_legacy(&bytes[768..], 100).unwrap().unwrap();
         assert_eq!(std::fs::read(path).unwrap(), bytes);

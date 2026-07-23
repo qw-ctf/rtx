@@ -114,7 +114,10 @@ pub fn parse_route_file(text: &str) -> Result<RouteFile, RouteFileError> {
                 if args.len() != 2 {
                     return err(
                         line,
-                        format!("race_set_route_weapon_mode: expected 1 argument, found {}", args.len() - 1),
+                        format!(
+                            "race_set_route_weapon_mode: expected 1 argument, found {}",
+                            args.len() - 1
+                        ),
                     );
                 }
                 route.weapon = match args[1].as_str() {
@@ -128,19 +131,28 @@ pub fn parse_route_file(text: &str) -> Result<RouteFile, RouteFileError> {
             }
             "race_set_route_falsestart_mode" => {
                 let Some(route) = current.as_mut() else {
-                    return err(line, "race_set_route_falsestart_mode outside of route definition".into());
+                    return err(
+                        line,
+                        "race_set_route_falsestart_mode outside of route definition".into(),
+                    );
                 };
                 if args.len() != 2 {
                     return err(
                         line,
-                        format!("race_set_route_falsestart_mode: expected 1 argument, found {}", args.len() - 1),
+                        format!(
+                            "race_set_route_falsestart_mode: expected 1 argument, found {}",
+                            args.len() - 1
+                        ),
                     );
                 }
                 route.falsestart = match args[1].as_str() {
                     "raceFalseStartNo" => RaceFalseStartMode::No,
                     "raceFalseStartYes" => RaceFalseStartMode::Yes,
                     other => {
-                        return err(line, format!("race_set_route_falsestart_mode: invalid argument {other}"));
+                        return err(
+                            line,
+                            format!("race_set_route_falsestart_mode: invalid argument {other}"),
+                        );
                     }
                 };
             }
@@ -166,7 +178,10 @@ pub fn parse_route_file(text: &str) -> Result<RouteFile, RouteFileError> {
                 if args.len() != 3 {
                     return err(
                         line,
-                        format!("race_set_teleport_flags_by_name: expected 2 arguments, found {}", args.len() - 1),
+                        format!(
+                            "race_set_teleport_flags_by_name: expected 2 arguments, found {}",
+                            args.len() - 1
+                        ),
                     );
                 }
                 // Unknown flag names are silently ignored, as in ktx.

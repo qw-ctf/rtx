@@ -134,7 +134,11 @@ mod tests {
             let mut m = bsp.clone();
             let off = (base + skipped as u32 * 4) as usize;
             m[off] ^= 0xff;
-            assert_eq!(raw_checksum2(&m).unwrap(), baseline, "lump {skipped} should be excluded");
+            assert_eq!(
+                raw_checksum2(&m).unwrap(),
+                baseline,
+                "lump {skipped} should be excluded"
+            );
         }
 
         // Planes (1) and clipnodes (9) are geometry — they must count.
@@ -142,7 +146,11 @@ mod tests {
             let mut m = bsp.clone();
             let off = (base + counted as u32 * 4) as usize;
             m[off] ^= 0xff;
-            assert_ne!(raw_checksum2(&m).unwrap(), baseline, "lump {counted} should be included");
+            assert_ne!(
+                raw_checksum2(&m).unwrap(),
+                baseline,
+                "lump {counted} should be included"
+            );
         }
     }
 
@@ -213,7 +221,10 @@ mod tests {
                  (0x{gpl:08x}) — checksum2 is wrong, or this is a third variant of the map",
                 raw as u32
             );
-            assert_eq!(sum as u32, original, "{name}: translation should land on the id original");
+            assert_eq!(
+                sum as u32, original,
+                "{name}: translation should land on the id original"
+            );
         }
     }
 }

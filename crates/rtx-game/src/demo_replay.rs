@@ -23,8 +23,8 @@
 use glam::{Vec2, Vec3, Vec3Swizzles};
 
 use crate::bot::bhop::{self, apply_airaccel, apply_friction, apply_groundaccel, wishdir_fs, Bhop, Env};
-use crate::math::yaw_of;
 use crate::bsp::Bsp;
+use crate::math::yaw_of;
 use crate::pmove_sim::{pm_step, PmParams, PmState};
 use rtx_nav::qphys::JUMP_VZ;
 
@@ -34,7 +34,15 @@ use rtx_nav::qphys::JUMP_VZ;
 /// weave walks off the edge — safe weaving inside a corridor is a live-navigation concern (the bot
 /// knows corridor widths from the navmesh), not a property of the speed gait, which is what this
 /// isolates. Seeded from the demo's real start speed and movevars, it stays honest to the demo.
-fn flat_step(pos: &mut Vec3, vel: &mut Vec3, on_ground: &mut bool, jump_held: &mut bool, cmd: &bhop::Cmd, p: &PmParams, dt: f32) {
+fn flat_step(
+    pos: &mut Vec3,
+    vel: &mut Vec3,
+    on_ground: &mut bool,
+    jump_held: &mut bool,
+    cmd: &bhop::Cmd,
+    p: &PmParams,
+    dt: f32,
+) {
     if !cmd.jump {
         *jump_held = false;
     } else if *on_ground && !*jump_held {
@@ -103,7 +111,12 @@ struct Frame {
 
 impl Frame {
     fn cmd(&self) -> bhop::Cmd {
-        bhop::Cmd { view_yaw: self.view_yaw, forward: self.forward, side: self.side, jump: self.buttons & 2 != 0 }
+        bhop::Cmd {
+            view_yaw: self.view_yaw,
+            forward: self.forward,
+            side: self.side,
+            jump: self.buttons & 2 != 0,
+        }
     }
 }
 
@@ -119,12 +132,24 @@ fn load_demo(path: &str) -> Demo {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let mut lines = text.lines();
     let header: Vec<&str> = lines.next().expect("empty csv").split(',').collect();
-    let col = |name: &str| header.iter().position(|h| *h == name).unwrap_or_else(|| panic!("no column {name}"));
+    let col = |name: &str| {
+        header
+            .iter()
+            .position(|h| *h == name)
+            .unwrap_or_else(|| panic!("no column {name}"))
+    };
     let (c_event, c_time) = (col("event"), col("time"));
     let (cx, cy, cz) = (col("x"), col("y"), col("z"));
     let (c_vp, c_vx, c_vy, c_vz) = (col("velocity_present"), col("vx"), col("vy"), col("vz"));
     let (c_fwd, c_side, c_btn, c_yaw) = (col("forwardmove"), col("sidemove"), col("buttons"), col("yaw"));
-    let mv_cols = ["mv_gravity", "mv_stopspeed", "mv_maxspeed", "mv_accelerate", "mv_friction"].map(col);
+    let mv_cols = [
+        "mv_gravity",
+        "mv_stopspeed",
+        "mv_maxspeed",
+        "mv_accelerate",
+        "mv_friction",
+    ]
+    .map(col);
 
     let mut movevars = None;
     // Pair playerinfo (state) with the dem_cmd (input) that shares its timestamp.
@@ -171,9 +196,20 @@ fn load_demo(path: &str) -> Demo {
         let Some(j) = nearest_cmd(&cmds, time) else { continue };
         let (_, view_yaw, _, buttons) = cmds[j];
         let (forward, side) = cmd_fs[j];
-        frames.push(Frame { time, origin, vel, view_yaw, forward, side, buttons });
+        frames.push(Frame {
+            time,
+            origin,
+            vel,
+            view_yaw,
+            forward,
+            side,
+            buttons,
+        });
     }
-    Demo { movevars: movevars.expect("no movevars row"), frames }
+    Demo {
+        movevars: movevars.expect("no movevars row"),
+        frames,
+    }
 }
 
 /// Index of the dem_cmd whose timestamp is closest to `time` (within 2 ms), or `None`.
@@ -241,16 +277,44 @@ struct Seg {
 /// and away from water (dm3/dm4 hop routes are dry).
 fn segments() -> Vec<Seg> {
     vec![
-        Seg { map: "dm3", csv: "curl_mid", t0: 321.8, t1: 327.5, kind: SegKind::Bhop },
-        Seg { map: "dm4", csv: "dm4jump", t0: 392.6, t1: 396.9, kind: SegKind::Bhop },
-        Seg { map: "dm3", csv: "bridge_rl", t0: 276.6, t1: 284.4, kind: SegKind::Bhop },
-        Seg { map: "dm3", csv: "rl_jump", t0: 349.66, t1: 350.75, kind: SegKind::RjBallistic },
+        Seg {
+            map: "dm3",
+            csv: "curl_mid",
+            t0: 321.8,
+            t1: 327.5,
+            kind: SegKind::Bhop,
+        },
+        Seg {
+            map: "dm4",
+            csv: "dm4jump",
+            t0: 392.6,
+            t1: 396.9,
+            kind: SegKind::Bhop,
+        },
+        Seg {
+            map: "dm3",
+            csv: "bridge_rl",
+            t0: 276.6,
+            t1: 284.4,
+            kind: SegKind::Bhop,
+        },
+        Seg {
+            map: "dm3",
+            csv: "rl_jump",
+            t0: 349.66,
+            t1: 350.75,
+            kind: SegKind::RjBallistic,
+        },
     ]
 }
 
 /// Frames of a demo within `[t0, t1]`.
 fn window(frames: &[Frame], t0: f32, t1: f32) -> Vec<Frame> {
-    frames.iter().copied().filter(|f| f.time >= t0 && f.time <= t1).collect()
+    frames
+        .iter()
+        .copied()
+        .filter(|f| f.time >= t0 && f.time <= t1)
+        .collect()
 }
 
 /// The longest straight-ish fast corridor inside `frames`: the widest `[a, b]` whose every point
@@ -326,7 +390,12 @@ fn replay_tracks_recorded_origins() {
                 continue;
             }
             let vel = frame_vel(fr, i);
-            let mut st = PmState { origin: fr[i].origin, vel, on_ground: false, jump_held: false };
+            let mut st = PmState {
+                origin: fr[i].origin,
+                vel,
+                on_ground: false,
+                jump_held: false,
+            };
             pm_step(&bsp, &mut st, &fr[i].cmd(), &p, dt);
             let pos_err = (st.origin - fr[i + 1].origin).length();
             let airborne = vel.z.abs() > 20.0 || fr[i].origin.z + 1.0 < st.origin.z;
@@ -350,16 +419,30 @@ fn replay_tracks_recorded_origins() {
         );
         // Observed p95s are ~0.1u position / ~1 ups velocity — essentially the demo's 1/8-unit
         // coordinate quantization. These bounds leave headroom but still flag any real regression.
-        assert!(air_p95 < 1.0, "{csv}: airborne 1-step position error p95 {air_p95:.2}u too high");
-        assert!(air_v95 < 8.0, "{csv}: airborne 1-step velocity error p95 {air_v95:.1}ups too high");
-        assert!(gnd_p95 < 1.0, "{csv}: ground 1-step position error p95 {gnd_p95:.2}u too high");
+        assert!(
+            air_p95 < 1.0,
+            "{csv}: airborne 1-step position error p95 {air_p95:.2}u too high"
+        );
+        assert!(
+            air_v95 < 8.0,
+            "{csv}: airborne 1-step velocity error p95 {air_v95:.1}ups too high"
+        );
+        assert!(
+            gnd_p95 < 1.0,
+            "{csv}: ground 1-step position error p95 {gnd_p95:.2}u too high"
+        );
 
         // Pass B — short-horizon drift: free-run ~0.25s windows, compare the endpoint.
         let mut drift = Vec::new();
         let mut i = 0;
         while i < fr.len() {
             let vel = frame_vel(fr, i);
-            let mut st = PmState { origin: fr[i].origin, vel, on_ground: false, jump_held: false };
+            let mut st = PmState {
+                origin: fr[i].origin,
+                vel,
+                on_ground: false,
+                jump_held: false,
+            };
             let mut j = i;
             while j + 1 < fr.len() && fr[j + 1].time - fr[i].time < 0.25 {
                 let dt = fr[j + 1].time - fr[j].time;
@@ -376,7 +459,10 @@ fn replay_tracks_recorded_origins() {
         }
         let med = pct(&mut drift.clone(), 0.5);
         let max = drift.iter().cloned().fold(0.0, f32::max);
-        eprintln!("{csv}: 0.25s-window drift median={med:.1}u max={max:.1}u (n={})", drift.len());
+        eprintln!(
+            "{csv}: 0.25s-window drift median={med:.1}u max={max:.1}u (n={})",
+            drift.len()
+        );
         assert!(med < 3.0, "{csv}: window drift median {med:.1}u too high");
         assert!(max < 16.0, "{csv}: window drift max {max:.1}u too high");
     }
@@ -460,12 +546,15 @@ fn bot_matches_or_beats_human() {
                 }
                 let bot_dist = pos.x; // net advance along the corridor axis
                 let v_bot_end = vel.xy().length();
-                let fph = if bh.hops > 0 { bh.flips as f32 / bh.hops as f32 } else { 0.0 };
+                let fph = if bh.hops > 0 {
+                    bh.flips as f32 / bh.hops as f32
+                } else {
+                    0.0
+                };
                 eprintln!(
                     "{}: {human_dt:.2}s window — bot went {bot_dist:.0}u vs human {human_dist:.0}u, end speed \
                      bot {v_bot_end:.0} vs human {v_human_end:.0} (start {v_start:.0}, hops {}, {fph:.1} flips/hop)",
-                    seg.csv,
-                    bh.hops
+                    seg.csv, bh.hops
                 );
                 // Primary claim: the bot's flat-ground gait ends at least as fast as the human did
                 // over the same span from the same start speed — it moves at least as well. (The
@@ -506,7 +595,12 @@ fn bot_matches_or_beats_human() {
                     let to = (land.xy() - st.origin.xy()).normalize_or_zero();
                     let bearing = yaw_of(to);
                     let s = bhop::air_correct(st.vel.xy(), bearing, a_max, DT, bhop::AIR_CORRECT_GAIN_DEFAULT);
-                    let cmd = bhop::Cmd { view_yaw: s.view_yaw, forward: s.forward, side: s.side, jump: false };
+                    let cmd = bhop::Cmd {
+                        view_yaw: s.view_yaw,
+                        forward: s.forward,
+                        side: s.side,
+                        jump: false,
+                    };
                     pm_step(&bsp, &mut st, &cmd, &p, DT);
                     t += DT;
                     if st.on_ground && t > 0.1 {
@@ -521,7 +615,11 @@ fn bot_matches_or_beats_human() {
                     seg.csv
                 );
                 assert!(miss < 48.0, "{}: RJ landing missed by {miss:.0}u", seg.csv);
-                assert!(landed <= human_time * 1.15 + 0.1, "{}: RJ arc took {landed:.2}s vs {human_time:.2}s", seg.csv);
+                assert!(
+                    landed <= human_time * 1.15 + 0.1,
+                    "{}: RJ arc took {landed:.2}s vs {human_time:.2}s",
+                    seg.csv
+                );
             }
         }
     }

@@ -192,14 +192,7 @@ fn teamkill_message(death: DeathType, victim: &str, attacker: &str, r: f32) -> (
 }
 
 /// Full message for a normal player-vs-player kill.
-fn frag_message(
-    death: DeathType,
-    victim: &str,
-    attacker: &str,
-    gibbed: bool,
-    quad: bool,
-    r: f32,
-) -> String {
+fn frag_message(death: DeathType, victim: &str, attacker: &str, gibbed: bool, quad: bool, r: f32) -> String {
     match death {
         DeathType::Telefrag => format!("{victim} was telefragged by {attacker}\n"),
         DeathType::Squish => format!("{attacker} squishes {victim}\n"),
@@ -314,16 +307,40 @@ mod tests {
 
     #[test]
     fn self_kill_strings() {
-        assert_eq!(self_kill_string(DeathType::Grenade, WATER, 0.0), " tries to put the pin back in\n");
-        assert_eq!(self_kill_string(DeathType::Rocket, WATER, 0.1), " discovers blast radius\n");
-        assert_eq!(self_kill_string(DeathType::Rocket, WATER, 0.9), " becomes bored with life\n");
+        assert_eq!(
+            self_kill_string(DeathType::Grenade, WATER, 0.0),
+            " tries to put the pin back in\n"
+        );
+        assert_eq!(
+            self_kill_string(DeathType::Rocket, WATER, 0.1),
+            " discovers blast radius\n"
+        );
+        assert_eq!(
+            self_kill_string(DeathType::Rocket, WATER, 0.9),
+            " becomes bored with life\n"
+        );
         assert_eq!(self_kill_string(DeathType::Squish, WATER, 0.0), " was squished\n");
-        assert_eq!(self_kill_string(DeathType::Discharge, SLIME, 0.0), " discharges into the slime\n");
-        assert_eq!(self_kill_string(DeathType::Discharge, LAVA, 0.0), " discharges into the lava\n");
-        assert_eq!(self_kill_string(DeathType::Discharge, WATER, 0.1), " heats up the water\n");
-        assert_eq!(self_kill_string(DeathType::Discharge, WATER, 0.9), " discharges into the water\n");
+        assert_eq!(
+            self_kill_string(DeathType::Discharge, SLIME, 0.0),
+            " discharges into the slime\n"
+        );
+        assert_eq!(
+            self_kill_string(DeathType::Discharge, LAVA, 0.0),
+            " discharges into the lava\n"
+        );
+        assert_eq!(
+            self_kill_string(DeathType::Discharge, WATER, 0.1),
+            " heats up the water\n"
+        );
+        assert_eq!(
+            self_kill_string(DeathType::Discharge, WATER, 0.9),
+            " discharges into the water\n"
+        );
         assert_eq!(self_kill_string(DeathType::Suicide, WATER, 0.0), " suicides\n");
-        assert_eq!(self_kill_string(DeathType::Fall, WATER, 0.0), " somehow becomes bored with life\n");
+        assert_eq!(
+            self_kill_string(DeathType::Fall, WATER, 0.0),
+            " somehow becomes bored with life\n"
+        );
     }
 
     #[test]
@@ -336,42 +353,135 @@ mod tests {
             teamkill_message(DeathType::Squish, "V", "A", 0.0),
             ("A squished a teammate\n".to_string(), true)
         );
-        assert_eq!(teamkill_message(DeathType::Rocket, "V", "A", 0.1).0, "A checks his glasses\n");
-        assert_eq!(teamkill_message(DeathType::Rocket, "V", "A", 0.3).0, "A loses another friend\n");
-        assert_eq!(teamkill_message(DeathType::Rocket, "V", "A", 0.6).0, "A gets a frag for the other team\n");
-        assert_eq!(teamkill_message(DeathType::Rocket, "V", "A", 0.9).0, "A mows down a teammate\n");
+        assert_eq!(
+            teamkill_message(DeathType::Rocket, "V", "A", 0.1).0,
+            "A checks his glasses\n"
+        );
+        assert_eq!(
+            teamkill_message(DeathType::Rocket, "V", "A", 0.3).0,
+            "A loses another friend\n"
+        );
+        assert_eq!(
+            teamkill_message(DeathType::Rocket, "V", "A", 0.6).0,
+            "A gets a frag for the other team\n"
+        );
+        assert_eq!(
+            teamkill_message(DeathType::Rocket, "V", "A", 0.9).0,
+            "A mows down a teammate\n"
+        );
     }
 
     #[test]
     fn frag_strings() {
-        assert_eq!(frag_message(DeathType::Telefrag, "V", "A", false, false, 0.0), "V was telefragged by A\n");
-        assert_eq!(frag_message(DeathType::Squish, "V", "A", false, false, 0.0), "A squishes V\n");
-        assert_eq!(frag_message(DeathType::Nailgun, "V", "A", false, false, 0.1), "V was body pierced by A\n");
-        assert_eq!(frag_message(DeathType::Nailgun, "V", "A", false, false, 0.9), "V was nailed by A\n");
-        assert_eq!(frag_message(DeathType::SuperNailgun, "V", "A", false, false, 0.1), "V was punctured by A\n");
-        assert_eq!(frag_message(DeathType::SuperNailgun, "V", "A", false, false, 0.4), "V was perforated by A\n");
-        assert_eq!(frag_message(DeathType::SuperNailgun, "V", "A", false, false, 0.9), "V was ventilated by A\n");
-        assert_eq!(frag_message(DeathType::SuperNailgun, "V", "A", true, false, 0.0), "V was straw-cuttered by A\n");
-        assert_eq!(frag_message(DeathType::Grenade, "V", "A", false, false, 0.0), "V eats A's pineapple\n");
-        assert_eq!(frag_message(DeathType::Grenade, "V", "A", true, false, 0.0), "V was gibbed by A's grenade\n");
-        assert_eq!(frag_message(DeathType::Rocket, "V", "A", false, false, 0.0), "V rides A's rocket\n");
-        assert_eq!(frag_message(DeathType::Rocket, "V", "A", true, false, 0.0), "V was gibbed by A's rocket\n");
-        assert_eq!(frag_message(DeathType::Rocket, "V", "A", true, true, 0.1), "V was brutalized by A's quad rocket\n");
-        assert_eq!(frag_message(DeathType::Rocket, "V", "A", true, true, 0.4), "V was smeared by A's quad rocket\n");
-        assert_eq!(frag_message(DeathType::Rocket, "V", "A", true, true, 0.9), "A rips V a new one\n");
+        assert_eq!(
+            frag_message(DeathType::Telefrag, "V", "A", false, false, 0.0),
+            "V was telefragged by A\n"
+        );
+        assert_eq!(
+            frag_message(DeathType::Squish, "V", "A", false, false, 0.0),
+            "A squishes V\n"
+        );
+        assert_eq!(
+            frag_message(DeathType::Nailgun, "V", "A", false, false, 0.1),
+            "V was body pierced by A\n"
+        );
+        assert_eq!(
+            frag_message(DeathType::Nailgun, "V", "A", false, false, 0.9),
+            "V was nailed by A\n"
+        );
+        assert_eq!(
+            frag_message(DeathType::SuperNailgun, "V", "A", false, false, 0.1),
+            "V was punctured by A\n"
+        );
+        assert_eq!(
+            frag_message(DeathType::SuperNailgun, "V", "A", false, false, 0.4),
+            "V was perforated by A\n"
+        );
+        assert_eq!(
+            frag_message(DeathType::SuperNailgun, "V", "A", false, false, 0.9),
+            "V was ventilated by A\n"
+        );
+        assert_eq!(
+            frag_message(DeathType::SuperNailgun, "V", "A", true, false, 0.0),
+            "V was straw-cuttered by A\n"
+        );
+        assert_eq!(
+            frag_message(DeathType::Grenade, "V", "A", false, false, 0.0),
+            "V eats A's pineapple\n"
+        );
+        assert_eq!(
+            frag_message(DeathType::Grenade, "V", "A", true, false, 0.0),
+            "V was gibbed by A's grenade\n"
+        );
+        assert_eq!(
+            frag_message(DeathType::Rocket, "V", "A", false, false, 0.0),
+            "V rides A's rocket\n"
+        );
+        assert_eq!(
+            frag_message(DeathType::Rocket, "V", "A", true, false, 0.0),
+            "V was gibbed by A's rocket\n"
+        );
+        assert_eq!(
+            frag_message(DeathType::Rocket, "V", "A", true, true, 0.1),
+            "V was brutalized by A's quad rocket\n"
+        );
+        assert_eq!(
+            frag_message(DeathType::Rocket, "V", "A", true, true, 0.4),
+            "V was smeared by A's quad rocket\n"
+        );
+        assert_eq!(
+            frag_message(DeathType::Rocket, "V", "A", true, true, 0.9),
+            "A rips V a new one\n"
+        );
         // Quad but not gibbed still rides the plain rocket line.
-        assert_eq!(frag_message(DeathType::Rocket, "V", "A", false, true, 0.0), "V rides A's rocket\n");
-        assert_eq!(frag_message(DeathType::Axe, "V", "A", false, false, 0.0), "V was ax-murdered by A\n");
-        assert_eq!(frag_message(DeathType::Hook, "V", "A", false, false, 0.0), "V was hooked by A\n");
-        assert_eq!(frag_message(DeathType::Shotgun, "V", "A", false, false, 0.0), "V chewed on A's boomstick\n");
-        assert_eq!(frag_message(DeathType::Shotgun, "V", "A", true, false, 0.0), "V was lead poisoned by A\n");
-        assert_eq!(frag_message(DeathType::SuperShotgun, "V", "A", false, false, 0.0), "V ate 2 loads of A's buckshot\n");
-        assert_eq!(frag_message(DeathType::SuperShotgun, "V", "A", false, true, 0.0), "V ate 8 loads of A's buckshot\n");
-        assert_eq!(frag_message(DeathType::LightningBeam, "V", "A", false, false, 0.0), "V accepts A's shaft\n");
-        assert_eq!(frag_message(DeathType::LightningBeam, "V", "A", true, false, 0.0), "V gets a natural disaster from A\n");
-        assert_eq!(frag_message(DeathType::Discharge, "V", "A", false, false, 0.1), "V drains A's batteries\n");
-        assert_eq!(frag_message(DeathType::Discharge, "V", "A", false, false, 0.9), "V accepts A's discharge\n");
-        assert_eq!(frag_message(DeathType::None, "V", "A", false, false, 0.0), "V killed by A ?\n");
+        assert_eq!(
+            frag_message(DeathType::Rocket, "V", "A", false, true, 0.0),
+            "V rides A's rocket\n"
+        );
+        assert_eq!(
+            frag_message(DeathType::Axe, "V", "A", false, false, 0.0),
+            "V was ax-murdered by A\n"
+        );
+        assert_eq!(
+            frag_message(DeathType::Hook, "V", "A", false, false, 0.0),
+            "V was hooked by A\n"
+        );
+        assert_eq!(
+            frag_message(DeathType::Shotgun, "V", "A", false, false, 0.0),
+            "V chewed on A's boomstick\n"
+        );
+        assert_eq!(
+            frag_message(DeathType::Shotgun, "V", "A", true, false, 0.0),
+            "V was lead poisoned by A\n"
+        );
+        assert_eq!(
+            frag_message(DeathType::SuperShotgun, "V", "A", false, false, 0.0),
+            "V ate 2 loads of A's buckshot\n"
+        );
+        assert_eq!(
+            frag_message(DeathType::SuperShotgun, "V", "A", false, true, 0.0),
+            "V ate 8 loads of A's buckshot\n"
+        );
+        assert_eq!(
+            frag_message(DeathType::LightningBeam, "V", "A", false, false, 0.0),
+            "V accepts A's shaft\n"
+        );
+        assert_eq!(
+            frag_message(DeathType::LightningBeam, "V", "A", true, false, 0.0),
+            "V gets a natural disaster from A\n"
+        );
+        assert_eq!(
+            frag_message(DeathType::Discharge, "V", "A", false, false, 0.1),
+            "V drains A's batteries\n"
+        );
+        assert_eq!(
+            frag_message(DeathType::Discharge, "V", "A", false, false, 0.9),
+            "V accepts A's discharge\n"
+        );
+        assert_eq!(
+            frag_message(DeathType::None, "V", "A", false, false, 0.0),
+            "V killed by A ?\n"
+        );
     }
 
     #[test]
@@ -381,14 +491,29 @@ mod tests {
         assert_eq!(world_death_string(DeathType::Fall, 0.0, 0.9), " fell to his death\n");
         assert_eq!(world_death_string(DeathType::Nailgun, 0.0, 0.0), " was spiked\n");
         assert_eq!(world_death_string(DeathType::SuperNailgun, 0.0, 0.0), " was spiked\n");
-        assert_eq!(world_death_string(DeathType::Changelevel, 0.0, 0.0), " tried to leave\n");
+        assert_eq!(
+            world_death_string(DeathType::Changelevel, 0.0, 0.0),
+            " tried to leave\n"
+        );
         assert_eq!(world_death_string(DeathType::Squish, 0.0, 0.0), " was squished\n");
-        assert_eq!(world_death_string(DeathType::Water, 0.0, 0.1), " sleeps with the fishes\n");
+        assert_eq!(
+            world_death_string(DeathType::Water, 0.0, 0.1),
+            " sleeps with the fishes\n"
+        );
         assert_eq!(world_death_string(DeathType::Water, 0.0, 0.9), " sucks it down\n");
-        assert_eq!(world_death_string(DeathType::Slime, 0.0, 0.1), " gulped a load of slime\n");
-        assert_eq!(world_death_string(DeathType::Slime, 0.0, 0.9), " can't exist on slime alone\n");
+        assert_eq!(
+            world_death_string(DeathType::Slime, 0.0, 0.1),
+            " gulped a load of slime\n"
+        );
+        assert_eq!(
+            world_death_string(DeathType::Slime, 0.0, 0.9),
+            " can't exist on slime alone\n"
+        );
         assert_eq!(world_death_string(DeathType::Lava, 0.0, 0.1), " turned into hot slag\n");
-        assert_eq!(world_death_string(DeathType::Lava, 0.0, 0.9), " visits the Volcano God\n");
+        assert_eq!(
+            world_death_string(DeathType::Lava, 0.0, 0.9),
+            " visits the Volcano God\n"
+        );
         assert_eq!(world_death_string(DeathType::Lava, -20.0, 0.0), " burst into flames\n");
         assert_eq!(world_death_string(DeathType::TriggerHurt, 0.0, 0.0), " died\n");
     }

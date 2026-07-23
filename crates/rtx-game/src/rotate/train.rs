@@ -6,11 +6,11 @@
 
 use glam::Vec3;
 
-use crate::math::normalize_angles;
 use crate::assets::Sound;
 use crate::defs::*;
 use crate::entity::{EntId, RotPhase, Think, Use};
 use crate::game::GameState;
+use crate::math::normalize_angles;
 
 impl GameState {
     pub(crate) fn spawn_func_rotate_train(&mut self, e: EntId) -> bool {

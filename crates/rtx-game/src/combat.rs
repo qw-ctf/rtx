@@ -125,8 +125,7 @@ impl GameState {
         // player damage — the same hard gate Rocket Arena applies to its audience. Guard the
         // attacker check to player attackers so world hits (fall/lava/drowning) aren't blocked.
         if self.entities[targ].is_player() {
-            let att_benched = self.entities[attacker].is_player()
-                && crate::mode::team::benched(self, attacker);
+            let att_benched = self.entities[attacker].is_player() && crate::mode::team::benched(self, attacker);
             if att_benched || crate::mode::team::benched(self, targ) {
                 return;
             }
@@ -297,9 +296,7 @@ impl GameState {
 
     /// Whether `a` and `b` are both players sharing a netname (rocket-jump self-boost case).
     fn same_player_netname(&self, a: EntId, b: EntId) -> bool {
-        self.entities[a].is_player()
-            && self.entities[b].is_player()
-            && self.netname_of(a) == self.netname_of(b)
+        self.entities[a].is_player() && self.entities[b].is_player() && self.netname_of(a) == self.netname_of(b)
     }
 
     /// Whether teamplay rules make `attacker`'s damage to `targ` a no-op.

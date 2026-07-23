@@ -77,7 +77,10 @@ impl Pak {
             // scan from the end would find it.
             entries.insert(name.to_ascii_lowercase(), (offset as u32, length as u32));
         }
-        Some(Pak { path: path.to_path_buf(), entries })
+        Some(Pak {
+            path: path.to_path_buf(),
+            entries,
+        })
     }
 
     /// Read one file out of the pak.
@@ -154,10 +157,11 @@ mod tests {
     #[test]
     fn reads_a_paks_directory_and_its_files() {
         let d = tmp("read");
-        let p = write(&d, "pak0.pak", &make_pak(&[
-            ("maps/dm4.bsp", b"the bad place"),
-            ("progs/player.mdl", b"IDPO"),
-        ]));
+        let p = write(
+            &d,
+            "pak0.pak",
+            &make_pak(&[("maps/dm4.bsp", b"the bad place"), ("progs/player.mdl", b"IDPO")]),
+        );
 
         let pak = Pak::open(&p).expect("a pak");
         assert_eq!(pak.read("maps/dm4.bsp").as_deref(), Some(&b"the bad place"[..]));

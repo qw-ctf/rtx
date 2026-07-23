@@ -20,9 +20,7 @@
 use glam::{Vec3, Vec3Swizzles};
 
 use crate::arsenal::AmmoKind;
-use crate::defs::{
-    Bits, Items, Solid, RUNE_HASTE, RUNE_MASK, RUNE_REGEN, RUNE_RESISTANCE, RUNE_STRENGTH,
-};
+use crate::defs::{Bits, Items, Solid, RUNE_HASTE, RUNE_MASK, RUNE_REGEN, RUNE_RESISTANCE, RUNE_STRENGTH};
 use crate::entity::{EntId, Think, Touch};
 use crate::game::GameState;
 use crate::navmesh::{CellId, LinkCosts, NavGraph, CLOSED_GATE_PENALTY};
@@ -407,12 +405,7 @@ fn hold_continues(
     mate_has_weapon: bool,
     enemy_contesting: bool,
 ) -> bool {
-    now < hold_until
-        && item_on_floor
-        && mate_alive
-        && mate_powered
-        && !mate_has_weapon
-        && !enemy_contesting
+    now < hold_until && item_on_floor && mate_alive && mate_powered && !mate_has_weapon && !enemy_contesting
 }
 
 /// The `Items` bit a weapon pickup grants (to check whether the bot already owns it).
@@ -513,8 +506,16 @@ fn firepower(items: f32, shells: f32, nails: f32, rockets: f32, cells: f32) -> f
 fn estimated_stats(est: crate::bot::model::OpponentEstimate, weapons_stay: bool, stack: bool) -> Stats {
     let has = |bit: Items| est.items.has(bit);
     let shells = if has(Items::SUPER_SHOTGUN) { 20.0 } else { 10.0 };
-    let nails = if has(Items::NAILGUN) || has(Items::SUPER_NAILGUN) { 50.0 } else { 0.0 };
-    let rockets = if has(Items::GRENADE_LAUNCHER) || has(Items::ROCKET_LAUNCHER) { 10.0 } else { 0.0 };
+    let nails = if has(Items::NAILGUN) || has(Items::SUPER_NAILGUN) {
+        50.0
+    } else {
+        0.0
+    };
+    let rockets = if has(Items::GRENADE_LAUNCHER) || has(Items::ROCKET_LAUNCHER) {
+        10.0
+    } else {
+        0.0
+    };
     let cells = if has(Items::LIGHTNING) { 30.0 } else { 0.0 };
     let strength = total_strength(est.health, est.armor_value, est.armor_type);
     Stats {
@@ -656,7 +657,9 @@ fn ammo_desire(s: &Stats, a: AmmoKind) -> f32 {
         }
         AmmoKind::Cells => {
             if s.cells < 100.0 {
-                ((50.0 - s.cells) * 0.2).max(2.5).max(dry(s.items.has(Items::LIGHTNING)))
+                ((50.0 - s.cells) * 0.2)
+                    .max(2.5)
+                    .max(dry(s.items.has(Items::LIGHTNING)))
             } else {
                 0.0
             }
@@ -853,10 +856,7 @@ impl GameState {
         // RA/mega use a need-and-distance owner rather than a soft claim discount. A stacked bot
         // that selected RA first must release it when a newly hurt teammate becomes the better use
         // of the pickup; otherwise both keep the same live goal until one touches it.
-        if tier == Horizon::Major
-            && my_team != 0
-            && self.major_item_owned_by_teammate(bot_e, my_team, item, cat, now)
-        {
+        if tier == Horizon::Major && my_team != 0 && self.major_item_owned_by_teammate(bot_e, my_team, item, cat, now) {
             return false;
         }
         // A goal respawning within its own tier's horizon is still a valid standing goal (arrive early
@@ -866,8 +866,8 @@ impl GameState {
             Horizon::Major => MAJOR_LOOKAHEAD,
             Horizon::Ordinary => LOOKAHEAD,
         };
-        let reachable_soon = ent.v.solid == Solid::Trigger
-            || (matches!(ent.think, Think::SubRegen) && ent.v.nextthink - now < horizon);
+        let reachable_soon =
+            ent.v.solid == Solid::Trigger || (matches!(ent.think, Think::SubRegen) && ent.v.nextthink - now < horizon);
         if !reachable_soon {
             return false;
         }
@@ -896,7 +896,8 @@ impl GameState {
     /// wanted (`contains_major`) — holding them is map control, worth breaking a fight for. An ordinary
     /// first leg is allowed only when the bounded plan proves it bridges to one of those.
     pub(crate) fn select_major_item(&self, bot_e: EntId) -> Option<ItemPlan> {
-        self.best_item_plan(bot_e).filter(|p| p.contains_powerup || p.contains_major)
+        self.best_item_plan(bot_e)
+            .filter(|p| p.contains_powerup || p.contains_major)
     }
 
     /// Pick a spawned, nearby health/armor recovery or timed powerup that must be completed before
@@ -948,10 +949,9 @@ impl GameState {
             .into_iter()
             .filter_map(|(item, cell, desire, commit)| {
                 let t = travel[cell as usize];
-                (t.is_finite() && t <= LOCAL_PICKUP_TRAVEL)
-                    .then_some((item, cell, commit, desire / (t + 0.25)))
+                (t.is_finite() && t <= LOCAL_PICKUP_TRAVEL).then_some((item, cell, commit, desire / (t + 0.25)))
             })
-            .max_by(|a, b| a.3.total_cmp(&b.3).then_with(|| b.0.0.cmp(&a.0.0)))
+            .max_by(|a, b| a.3.total_cmp(&b.3).then_with(|| b.0 .0.cmp(&a.0 .0)))
             .map(|(item, cell, commit, _)| (item, cell, commit))
     }
 
@@ -1040,9 +1040,7 @@ impl GameState {
             }
             let item = EntId(idx);
             let ent = &self.entities[item];
-            if ent.v.solid != Solid::Trigger
-                || (ent.v.origin - origin).length() > LOCAL_PICKUP_RADIUS
-            {
+            if ent.v.solid != Solid::Trigger || (ent.v.origin - origin).length() > LOCAL_PICKUP_RADIUS {
                 continue;
             }
             let Some(cat) = ent.classname().and_then(category) else {
@@ -1074,9 +1072,8 @@ impl GameState {
             .take(PLAN_PRIMARY_LIMIT)
             .find_map(|(item, cell, _desire, first_leg)| {
                 let second_leg = PlanCosts::single(graph, cell, &link_costs, lod).cost_to(powerup_cell);
-                (second_leg.is_finite()
-                    && powerup_bridge_arrives_in_time(direct, first_leg + second_leg, respawn_wait))
-                .then_some((item, cell))
+                (second_leg.is_finite() && powerup_bridge_arrives_in_time(direct, first_leg + second_leg, respawn_wait))
+                    .then_some((item, cell))
             })
     }
 
@@ -1163,7 +1160,7 @@ impl GameState {
                 };
                 Some((item, cell, desire * claim / (t + 0.5)))
             })
-            .max_by(|a, b| a.2.total_cmp(&b.2).then_with(|| b.0.0.cmp(&a.0.0)))
+            .max_by(|a, b| a.2.total_cmp(&b.2).then_with(|| b.0 .0.cmp(&a.0 .0)))
             .map(|(item, cell, _)| (item, cell))
     }
 
@@ -1196,23 +1193,15 @@ impl GameState {
     /// nearby stacked denial bot, while a tiny need advantage does not pull somebody across the map.
     /// A teammate committed to a different powerup is excluded so reserving Quad cannot leave RA
     /// ownerless. The edict-id tie break makes every sequential bot frame reach the same answer.
-    fn major_item_owned_by_teammate(
-        &self,
-        bot_e: EntId,
-        my_team: u8,
-        item: EntId,
-        cat: Category,
-        now: f32,
-    ) -> bool {
+    fn major_item_owned_by_teammate(&self, bot_e: EntId, my_team: u8, item: EntId, cat: Category, now: f32) -> bool {
         let point = self.entities[item].v.origin;
         let maxclients = self.host().cvar(c"maxclients") as u32;
         let candidates: Vec<(EntId, f32)> = (1..=maxclients)
             .map(EntId)
             .filter_map(|t| {
                 let e = &self.entities[t];
-                let available = t == bot_e
-                    || e.bot.goal.commit != super::state::GoalCommit::Powerup
-                    || e.bot.goal.item == item.0;
+                let available =
+                    t == bot_e || e.bot.goal.commit != super::state::GoalCommit::Powerup || e.bot.goal.item == item.0;
                 (e.bot.is_bot && e.v.health > 0.0 && e.mode_p.team == my_team && available).then(|| {
                     let stats = self.bot_stats(t);
                     let desire = self.desire_with_floors(t, &stats, item, cat, self.deny_active(t), now);
@@ -1235,9 +1224,7 @@ impl GameState {
             e.is_player()
                 && e.v.health > 0.0
                 && enemy_of(my_team, e.mode_p.team)
-                && self
-                    .opponent_est(bot_e, t, now)
-                    .is_some_and(|est| est.items.has(bit))
+                && self.opponent_est(bot_e, t, now).is_some_and(|est| est.items.has(bit))
         })
     }
 
@@ -1280,9 +1267,7 @@ impl GameState {
             }
             // Mega/RA detected independent of the stack cvar (`true`): denial is a modeling feature, not
             // resource discipline, so it holds even when the leaner valuation is selected.
-            Category::Health | Category::Armor { .. }
-                if self.horizon_of(item, cat, true) == Horizon::Major =>
-            {
+            Category::Health | Category::Armor { .. } if self.horizon_of(item, cat, true) == Horizon::Major => {
                 desire = desire.max(DENIAL_DESIRE);
             }
             _ => {}
@@ -1297,9 +1282,7 @@ impl GameState {
     /// `bot_pickup_items` suppresses the grab). Team modes only, gated by `rtx_bot_model` +
     /// `rtx_bot_model`; a non-idle bot (one with a fight or a move objective) never holds.
     pub(crate) fn update_handoff_hold(&mut self, e: EntId, now: f32, idle: bool) -> bool {
-        let enabled = idle
-            && self.entities[e].mode_p.team != 0
-            && self.host().cvar_bool(c"rtx_bot_model");
+        let enabled = idle && self.entities[e].mode_p.team != 0 && self.host().cvar_bool(c"rtx_bot_model");
         if !enabled {
             self.clear_hold(e);
             return false;
@@ -1363,16 +1346,14 @@ impl GameState {
         let mate = EntId(self.entities[e].bot.goal.hold_for);
         let m = &self.entities[mate];
         let mate_alive = mate.0 != 0 && m.is_player() && m.v.health > 0.0;
-        let mate_powered =
-            m.combat.super_damage_finished > now || m.combat.invincible_finished > now;
+        let mate_powered = m.combat.super_damage_finished > now || m.combat.invincible_finished > now;
         let mate_has_weapon = m.v.items.has(weapon_bit(w));
         // Contest: a perceived, living enemy near the weapon means "take it rather than leave it".
         let known = self.entities[e].bot.percept.known_enemy;
         let enemy_contesting = known != 0 && now < self.entities[e].bot.percept.known_until && {
             let ent = &self.entities[EntId(known)];
             ent.v.health > 0.0
-                && (ent.v.origin - it.v.origin).length_squared()
-                    < HOLD_CONTEST_RANGE * HOLD_CONTEST_RANGE
+                && (ent.v.origin - it.v.origin).length_squared() < HOLD_CONTEST_RANGE * HOLD_CONTEST_RANGE
         };
         hold_continues(
             now,
@@ -1646,9 +1627,7 @@ impl GameState {
                 continue;
             };
             let travel = costs.cost_to(cell);
-            if !travel.is_finite()
-                || (self.team_match.live_until > now && now + travel >= self.team_match.live_until)
-            {
+            if !travel.is_finite() || (self.team_match.live_until > now && now + travel >= self.team_match.live_until) {
                 continue;
             }
             let enemy_eta = enemy_context.as_ref().and_then(|(_, enemy_costs, _)| {
@@ -1663,7 +1642,14 @@ impl GameState {
                     continue;
                 }
             }
-            consider(EntId(i as u32), cell, desire, travel, claim_mult(i as u32), Horizon::Powerup);
+            consider(
+                EntId(i as u32),
+                cell,
+                desire,
+                travel,
+                claim_mult(i as u32),
+                Horizon::Powerup,
+            );
         }
 
         // Live backpacks aren't in the static catalog (they spawn on death / a teammate's toss and
@@ -1700,13 +1686,24 @@ impl GameState {
         // used (`base` == `pricing.costs(0)`, still valid — `LinkCosts` is `Copy`). Coarse: a cheap
         // abstract Dijkstra each. Exact: the mutually-independent floods, fanned out in one ordered
         // batch across the worker pool. `leg_costs[pi]` is primary `pi`'s costs.
-        let primaries: Vec<ItemCandidate> =
-            candidates.iter().filter(|c| c.one_score > 0.0).take(PLAN_PRIMARY_LIMIT).copied().collect();
+        let primaries: Vec<ItemCandidate> = candidates
+            .iter()
+            .filter(|c| c.one_score > 0.0)
+            .take(PLAN_PRIMARY_LIMIT)
+            .copied()
+            .collect();
         let leg_costs: Vec<PlanCosts> = if lod {
-            primaries.iter().map(|c| PlanCosts::Coarse(graph.coarse_costs(c.cell, &base, true))).collect()
+            primaries
+                .iter()
+                .map(|c| PlanCosts::Coarse(graph.coarse_costs(c.cell, &base, true)))
+                .collect()
         } else {
             let source_cells: Vec<CellId> = primaries.iter().map(|c| c.cell).collect();
-            self.bot_pool.flood_batch(graph, &source_cells, &base).into_iter().map(PlanCosts::Exact).collect()
+            self.bot_pool
+                .flood_batch(graph, &source_cells, &base)
+                .into_iter()
+                .map(PlanCosts::Exact)
+                .collect()
         };
         let mut best: Option<(ItemCandidate, Option<ItemCandidate>, f32)> = None;
         for (pi, &first) in primaries.iter().enumerate() {
@@ -1797,7 +1794,7 @@ impl GameState {
 fn reservation_owner(candidates: &[(EntId, f32)]) -> Option<EntId> {
     candidates
         .iter()
-        .min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.0.cmp(&b.0.0)))
+        .min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0 .0.cmp(&b.0 .0)))
         .map(|&(e, _)| e)
 }
 
@@ -1811,7 +1808,7 @@ fn strategic_owner_score(desire: f32, distance: f32) -> f32 {
 fn strategic_reservation_owner(candidates: &[(EntId, f32)]) -> Option<EntId> {
     candidates
         .iter()
-        .max_by(|a, b| a.1.total_cmp(&b.1).then_with(|| b.0.0.cmp(&a.0.0)))
+        .max_by(|a, b| a.1.total_cmp(&b.1).then_with(|| b.0 .0.cmp(&a.0 .0)))
         .map(|&(e, _)| e)
 }
 
@@ -1922,7 +1919,10 @@ mod tests {
         assert!(weak_far > stacked_near, "real recovery need should beat nearby denial");
 
         let tiny_need_far = strategic_owner_score(31.0, 640.0);
-        assert!(tiny_need_far < stacked_near, "a marginal need must not pull a bot across the map");
+        assert!(
+            tiny_need_far < stacked_near,
+            "a marginal need must not pull a bot across the map"
+        );
 
         let tied = [(EntId(7), 10.0), (EntId(3), 10.0)];
         assert_eq!(strategic_reservation_owner(&tied), Some(EntId(3)));
@@ -1976,7 +1976,10 @@ mod tests {
         let quad = item_score(207.0, 20.0, Horizon::Powerup).unwrap();
         let health = item_score(50.0, 1.0, Horizon::Ordinary).unwrap();
         let armor = item_score(80.0, 3.0, Horizon::Ordinary).unwrap();
-        assert!(quad > health && quad > armor, "quad {quad} vs health {health}, armor {armor}");
+        assert!(
+            quad > health && quad > armor,
+            "quad {quad} vs health {health}, armor {armor}"
+        );
         // An ordinary item past LOOKAHEAD is dropped; a powerup at the same t is still a candidate.
         assert!(item_score(200.0, 12.0, Horizon::Ordinary).is_none());
         assert!(item_score(200.0, 12.0, Horizon::Powerup).is_some());
@@ -2040,7 +2043,12 @@ mod tests {
         // RL nearly dry (fp 16): rocket boxes clear the combat bar.
         assert!(ammo_desire(&stats(Items::ROCKET_LAUNCHER, 2.0, 0.0, 16.0, true), AmmoKind::Rockets) >= bar);
         // RL well-fed (fp 100): only the ordinary top-off, no panic.
-        assert!(ammo_desire(&stats(Items::ROCKET_LAUNCHER, 15.0, 0.0, 100.0, true), AmmoKind::Rockets) < bar);
+        assert!(
+            ammo_desire(
+                &stats(Items::ROCKET_LAUNCHER, 15.0, 0.0, 100.0, true),
+                AmmoKind::Rockets
+            ) < bar
+        );
         // Owns RL but LG-fed (fp 100 from cells): low rockets don't panic — the firepower gate self-solves.
         let lg_fed = stats(Items::LIGHTNING | Items::ROCKET_LAUNCHER, 2.0, 100.0, 100.0, true);
         assert!(ammo_desire(&lg_fed, AmmoKind::Rockets) < bar);
@@ -2123,7 +2131,7 @@ mod tests {
         assert_eq!(stack_pressure(80.0), 1.25);
         assert_eq!(stack_pressure(40.0), STACK_PRESSURE_MAX); // 100/40 = 2.5, at the cap
         assert_eq!(stack_pressure(10.0), STACK_PRESSURE_MAX); // clamped, not runaway
-        // Monotonic: a thinner stack is never valued less.
+                                                              // Monotonic: a thinner stack is never valued less.
         assert!(stack_pressure(70.0) > stack_pressure(90.0));
     }
 
@@ -2162,7 +2170,7 @@ mod tests {
         assert!(defer_powerup_to_teammate(true, 100.0, None)); // claimed
         assert!(defer_powerup_to_teammate(false, 1000.0, Some(500.0))); // mate at 0.5× my dist
         assert!(defer_powerup_to_teammate(false, 1000.0, Some(900.0))); // mate at 0.9× my dist
-        // A farther teammate or no teammate leaves this bot as the powerup owner.
+                                                                        // A farther teammate or no teammate leaves this bot as the powerup owner.
         assert!(!defer_powerup_to_teammate(false, 1000.0, Some(1100.0)));
         assert!(!defer_powerup_to_teammate(false, 1000.0, None));
     }

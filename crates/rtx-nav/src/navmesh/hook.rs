@@ -7,8 +7,7 @@
 use glam::{Vec3, Vec3Swizzles};
 
 use super::{
-    HookParams, FALL_DAMAGE_SPEED, HOOK_LAND_XY, HOOK_LAND_Z, HOOK_MAX_AIRTIME, HOOK_OVERHEAD, HOOK_SAMPLE,
-    HOOK_SIM_DT,
+    HookParams, FALL_DAMAGE_SPEED, HOOK_LAND_XY, HOOK_LAND_Z, HOOK_MAX_AIRTIME, HOOK_OVERHEAD, HOOK_SAMPLE, HOOK_SIM_DT,
 };
 use crate::bsp::Bsp;
 
@@ -103,7 +102,15 @@ pub(super) fn march_to_solid(is_solid: impl Fn(Vec3) -> bool, from: Vec3, dir: V
 /// target (not merely "somewhere standable") rejects fp-fragile grazing arcs whose landing swings
 /// wildly with a hair of input change — which is exactly what keeps the runtime re-solve honest and
 /// stops a bot being flung off-target when its reel timing is slightly off.
-pub(super) fn perturb_ok(bsp: &Bsp, stick: Vec3, rdir: Vec3, release_dist: f32, rope: f32, params: HookParams, b: Vec3) -> bool {
+pub(super) fn perturb_ok(
+    bsp: &Bsp,
+    stick: Vec3,
+    rdir: Vec3,
+    release_dist: f32,
+    rope: f32,
+    params: HookParams,
+    b: Vec3,
+) -> bool {
     let variants = [
         (release_dist, params.pull * 0.9),
         (release_dist, params.pull * 1.1),
@@ -148,7 +155,10 @@ mod tests {
         let solid = |p: Vec3| p.z <= 0.0 || (p.x >= 64.0 && p.z <= 200.0);
         // Launched up-and-toward the wall: apexes at x=25, then meets the face at z~91 descending.
         let arc = simulate_arc(solid, Vec3::new(0.0, 0.0, 100.0), Vec3::new(200.0, 0.0, 100.0), 800.0);
-        assert!(matches!(arc, ArcResult::Blocked), "wall strike must not certify as a landing");
+        assert!(
+            matches!(arc, ArcResult::Blocked),
+            "wall strike must not certify as a landing"
+        );
     }
 
     /// The same descent with the wall removed lands on the floor beneath — the classifier rejects
@@ -157,6 +167,9 @@ mod tests {
     fn descending_onto_floor_still_lands() {
         let solid = |p: Vec3| p.z <= 0.0;
         let arc = simulate_arc(solid, Vec3::new(0.0, 0.0, 100.0), Vec3::new(200.0, 0.0, 100.0), 800.0);
-        assert!(matches!(arc, ArcResult::Land { .. }), "a plain floor landing must still certify");
+        assert!(
+            matches!(arc, ArcResult::Land { .. }),
+            "a plain floor landing must still certify"
+        );
     }
 }

@@ -363,7 +363,11 @@ impl ClientHost for NetHost {
         // needs to find the map on disk (the navmesh, most of all) follows from this one answer.
         if key == "modelname" {
             let m = self.mapname.borrow();
-            return if m.is_empty() { fill(buf, "") } else { fill(buf, &format!("maps/{m}.bsp")) };
+            return if m.is_empty() {
+                fill(buf, "")
+            } else {
+                fill(buf, &format!("maps/{m}.bsp"))
+            };
         }
         let info = self.serverinfo.borrow();
         fill(buf, info.get(&key).unwrap_or(""))
@@ -567,8 +571,16 @@ mod tests {
         assert_eq!(
             toks,
             vec![
-                "{", "classname", "info_player_deathmatch", "origin", "544 288 32", "}",
-                "{", "classname", "item_health", "}",
+                "{",
+                "classname",
+                "info_player_deathmatch",
+                "origin",
+                "544 288 32",
+                "}",
+                "{",
+                "classname",
+                "item_health",
+                "}",
             ]
         );
     }
@@ -632,7 +644,12 @@ mod tests {
         assert_eq!(h.alloc_ent(), SHADOW_TOP);
         assert_eq!(h.alloc_ent(), SHADOW_TOP - 1);
         assert_eq!(h.alloc_ent(), SHADOW_TOP - 2);
-        const { assert!(SHADOW_TOP > 1000, "shadow slots must stay clear of server entity numbers") };
+        const {
+            assert!(
+                SHADOW_TOP > 1000,
+                "shadow slots must stay clear of server entity numbers"
+            )
+        };
 
         // Running out yields the world entity rather than an out-of-range slot — the same answer a
         // full server gives.

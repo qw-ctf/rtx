@@ -17,10 +17,10 @@ use crate::entity::{Die, EntId, Think, Touch};
 use crate::game::GameState;
 use crate::obituary::DeathType;
 
-mod select;
-mod shootable_grenade;
 mod hitscan;
 pub(crate) mod projectiles;
+mod select;
+mod shootable_grenade;
 
 /// QuakeC `crandom` — a float in `[-1, 1)`.
 fn crandom(game: &mut GameState) -> f32 {
@@ -93,7 +93,6 @@ impl GameState {
         self.write_coords(MsgDest::Multicast, org);
         self.host.multicast(org, Multicast::Pvs);
     }
-
 
     // --- weapon selection & frame loop ---
 

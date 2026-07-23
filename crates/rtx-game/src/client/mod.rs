@@ -15,8 +15,8 @@ use crate::bot;
 use crate::defs::*;
 use crate::entity::{CombatState, Die, EntId, Pain, SpawnState};
 use crate::game::GameState;
-use crate::obituary::DeathType;
 use crate::mode::ModePlayer;
+use crate::obituary::DeathType;
 
 pub(crate) mod movement;
 mod spawn_select;

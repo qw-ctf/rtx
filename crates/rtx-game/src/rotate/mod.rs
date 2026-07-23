@@ -592,5 +592,4 @@ impl GameState {
         self.entities[e].think = Think::None;
         self.rotate_targets_final(e);
     }
-
 }

@@ -85,11 +85,11 @@ use std::io;
 use std::time::{Duration, Instant};
 
 pub use config::{parse as parse_args, Config, Protocol, USAGE};
-use rtx_proto::info::UserinfoBuilder;
-use rtx_proto::svc::SvcEvent;
 use frames::EntityState;
 use mirror::{Mirror, Squad, WorldMirror};
 use nq_session::NqSession;
+use rtx_proto::info::UserinfoBuilder;
+use rtx_proto::svc::SvcEvent;
 use session::{Session, Signon};
 
 use crate::entity::EntId;
@@ -156,7 +156,15 @@ impl AnySession {
         }
     }
 
-    fn send_move(&mut self, angles: glam::Vec3, forward: i32, side: i32, up: i32, buttons: u8, impulse: u8) -> io::Result<()> {
+    fn send_move(
+        &mut self,
+        angles: glam::Vec3,
+        forward: i32,
+        side: i32,
+        up: i32,
+        buttons: u8,
+        impulse: u8,
+    ) -> io::Result<()> {
         match self {
             AnySession::Qw(s) => s.send_move(angles, forward, side, up, buttons, impulse),
             AnySession::Nq(s) => s.send_move(angles, forward, side, up, buttons, impulse),
@@ -337,7 +345,10 @@ impl Client {
         // A cfg of cvar settings — the client's `server.cfg`. `--config` names one; otherwise
         // `<basedir>/rtx.cfg` if it's there, so a bot can be tuned by dropping a file next to its
         // maps, the way the server is tuned by its own cfg.
-        let cfg = config.config_file.clone().unwrap_or_else(|| config.basedir.join("rtx.cfg"));
+        let cfg = config
+            .config_file
+            .clone()
+            .unwrap_or_else(|| config.basedir.join("rtx.cfg"));
         exec_cfg(host, &cfg, 0);
         // The trick-movement repertoire — rocket jumps, bunnyhop/strafe, curl jumps — is left on for
         // NetQuake too: these are real NetQuake maneuvers (the whole of Quake Done Quick is built on
@@ -521,7 +532,9 @@ impl Client {
         for i in 0..self.bots.len() {
             let players = self.bots[i].session.nq_players();
             if !players.is_empty() {
-                self.bots[i].mirror.write_players_nq(&mut self.game, &mut self.world, &squad, &players);
+                self.bots[i]
+                    .mirror
+                    .write_players_nq(&mut self.game, &mut self.world, &squad, &players);
             }
         }
 
@@ -622,7 +635,8 @@ impl Client {
                     if c.buttons & rtx_proto::clc::button::ATTACK as i32 != 0 {
                         self.game.client_note_own_fire(e);
                     }
-                    bot.session.send_move(c.angles, c.forward, c.side, c.up, c.buttons as u8, c.impulse as u8)?;
+                    bot.session
+                        .send_move(c.angles, c.forward, c.side, c.up, c.buttons as u8, c.impulse as u8)?;
                 }
                 None => bot.session.send_idle()?,
             }
@@ -643,7 +657,10 @@ impl Client {
     /// stopped — and hand it to the bots as the state of a game that has just started. `servercount`
     /// is the server's own incarnation number and changes every time.
     fn rebuild_world_if_map_changed(&mut self) {
-        let Some(here) = self.lead().map(|b| (b.session.mapname().to_string(), b.session.servercount())) else {
+        let Some(here) = self
+            .lead()
+            .map(|b| (b.session.mapname().to_string(), b.session.servercount()))
+        else {
             return;
         };
         // Not just "is the name set" but "is the map actually loaded": the session names the map at
@@ -873,7 +890,10 @@ impl Client {
     /// particular bot* is per-bot. Following the lead rather than bot 0 keeps the log running when
     /// bot 0 is the one that got dropped.
     fn observe(&mut self, index: usize, ev: &SvcEvent) {
-        let lead = self.bots.iter().position(|b| b.session.signon() != Signon::Disconnected);
+        let lead = self
+            .bots
+            .iter()
+            .position(|b| b.session.signon() != Signon::Disconnected);
         match ev {
             SvcEvent::ServerData(sd) => eprintln!(
                 "rtx-client: [{index}] joined {} on {:?} as slot {}{}",
@@ -964,8 +984,16 @@ mod tests {
     #[test]
     fn forces_the_tunables_a_client_must() {
         let mut client = Client::new(Config { skill: 7.0, ..config() });
-        assert_eq!(client.game().host().cvar(c"rtx_grapple"), 0.0, "no hook: its state isn't on the wire");
-        assert_eq!(client.game().host().cvar(c"rtx_bot_model"), 1.0, "estimates are the data source");
+        assert_eq!(
+            client.game().host().cvar(c"rtx_grapple"),
+            0.0,
+            "no hook: its state isn't on the wire"
+        );
+        assert_eq!(
+            client.game().host().cvar(c"rtx_bot_model"),
+            1.0,
+            "estimates are the data source"
+        );
         assert_eq!(client.game().host().cvar(c"rtx_bot_skill"), 7.0);
 
         let mut client = Client::new(Config {
@@ -986,15 +1014,30 @@ mod tests {
         let mut squad = Client::new(Config { bots: 3, ..config() });
         squad.connect().expect("bind");
         let names: Vec<&str> = squad.bots.iter().map(|b| b.session.name()).collect();
-        assert!(names.iter().all(|n| n.starts_with(TAG)), "each carries the bot• tag: {names:?}");
-        assert_eq!(names.iter().collect::<std::collections::HashSet<_>>().len(), 3, "distinct: {names:?}");
+        assert!(
+            names.iter().all(|n| n.starts_with(TAG)),
+            "each carries the bot• tag: {names:?}"
+        );
+        assert_eq!(
+            names.iter().collect::<std::collections::HashSet<_>>().len(),
+            3,
+            "distinct: {names:?}"
+        );
 
-        let mut named = Client::new(Config { bots: 2, name: Some("botto".into()), ..config() });
+        let mut named = Client::new(Config {
+            bots: 2,
+            name: Some("botto".into()),
+            ..config()
+        });
         named.connect().expect("bind");
         assert_eq!(named.bots[0].session.name(), format!("{TAG}botto1"));
         assert_eq!(named.bots[1].session.name(), format!("{TAG}botto2"));
 
-        let mut solo = Client::new(Config { bots: 1, name: Some("botto".into()), ..config() });
+        let mut solo = Client::new(Config {
+            bots: 1,
+            name: Some("botto".into()),
+            ..config()
+        });
         solo.connect().expect("bind");
         assert_eq!(solo.bots[0].session.name(), format!("{TAG}botto"));
     }

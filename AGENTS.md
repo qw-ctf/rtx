@@ -23,5 +23,5 @@ bridge lives in `crates/rtx-mcp/`; see its [README](crates/rtx-mcp/README.md).
 - Default `cargo build` / `cargo test` cover only the game module, its nav core, and the wire
   codec. Build the MCP, viewer, and client explicitly: `-p rtx-mcp` / `-p navview` /
   `-p rtx-client`.
-- Do **not** run `cargo fmt` — the crate is hand-wrapped narrower than rustfmt's width, so a
-  format pass churns the whole tree.
+- Run `cargo fmt` before committing — the tree is rustfmt-clean, with `rustfmt.toml` pinning
+  `max_width = 120`.

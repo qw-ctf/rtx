@@ -219,13 +219,20 @@ mod tests {
         let player_floor = |p: Vec3| p.z <= 0.0;
         let rocket_floor = |p: Vec3| p.z <= -24.0;
         let a = Vec3::new(0.0, 0.0, 24.0); // standing origin a hull-height above the floor
-        let params = RocketJumpParams { gravity: 800.0, rj_extra: 0.0 };
+        let params = RocketJumpParams {
+            gravity: 800.0,
+            rj_extra: 0.0,
+        };
         let s = simulate_rocket_jump(player_floor, rocket_floor, a, Vec3::new(80.0, 0.0, 0.0), 0.05, params)
             .expect("vertical rocket jump should solve over a flat floor");
         assert!((s.t_blast - 0.12).abs() < 0.04, "t_blast {} not ~0.12", s.t_blast);
         // Blast on the real floor (24u lower) sits further from the player box, so self-damage is a
         // touch below the old hull-1 figure (~50): the honest health cost.
-        assert!((38.0..=52.0).contains(&s.self_damage), "self_damage {} not ~44", s.self_damage);
+        assert!(
+            (38.0..=52.0).contains(&s.self_damage),
+            "self_damage {} not ~44",
+            s.self_damage
+        );
         // Post-blast apex above the launch, from the continuation velocity.
         let apex = s.pos_blast.z + s.v0.z * s.v0.z / (2.0 * params.gravity) - a.z;
         assert!((150.0..=340.0).contains(&apex), "apex {apex} outside the RJ envelope");
@@ -240,14 +247,21 @@ mod tests {
     fn rj_self_damage_matches_combat() {
         let floor = |p: Vec3| p.z <= 0.0;
         let a = Vec3::new(0.0, 0.0, 24.0);
-        let params = RocketJumpParams { gravity: 800.0, rj_extra: 0.0 };
+        let params = RocketJumpParams {
+            gravity: 800.0,
+            rj_extra: 0.0,
+        };
         for delay in [0.05f32, 0.15, 0.25] {
             // The falloff→self_damage identity holds for any blast geometry, so a single floor for both
             // oracles suffices here (the hull distinction is exercised by rocket_jump_two_phase_solution).
             if let Some(s) = simulate_rocket_jump(floor, floor, a, Vec3::new(80.0, 0.0, 0.0), delay, params) {
                 let d = (s.blast - (s.pos_blast + Vec3::new(0.0, 0.0, PLAYER_CENTER_Z))).length();
                 let game = (120.0 - 0.5 * d).max(0.0) * 0.5;
-                assert!((s.self_damage - game).abs() < 1e-3, "self_damage {} != game {game}", s.self_damage);
+                assert!(
+                    (s.self_damage - game).abs() < 1e-3,
+                    "self_damage {} != game {game}",
+                    s.self_damage
+                );
             }
         }
     }
@@ -260,7 +274,10 @@ mod tests {
         // it only for a precise delay; a slightly later fire falls into the pit.
         let world = |p: Vec3| p.z <= 0.0 && !(180.0..260.0).contains(&p.x);
         let a = Vec3::new(0.0, 0.0, 24.0);
-        let params = RocketJumpParams { gravity: 800.0, rj_extra: 0.0 };
+        let params = RocketJumpParams {
+            gravity: 800.0,
+            rj_extra: 0.0,
+        };
         // Find any nominal solve, then confirm perturb is stricter than a bare solve near a pit edge.
         if let Some(s) = simulate_rocket_jump(world, world, a, Vec3::new(60.0, 0.0, 0.0), 0.15, params) {
             if (170.0..280.0).contains(&s.land.x) {

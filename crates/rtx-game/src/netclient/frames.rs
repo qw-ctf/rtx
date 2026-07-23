@@ -194,7 +194,7 @@ impl Frames {
         }
     }
 
-/// Remember a baseline that arrived as an entity *delta* rather than a fixed record.
+    /// Remember a baseline that arrived as an entity *delta* rather than a fixed record.
     ///
     /// `svc_spawnbaseline2` is the FTE form, and it reuses the entity-delta encoding: it says only
     /// what differs from nothing. Folding it onto an empty baseline gets the same thing the vanilla
@@ -226,7 +226,7 @@ impl Frames {
         self.set_baseline(number, b);
     }
 
-        /// The frame to ask the server to delta against, given the sequence of the packet we're about
+    /// The frame to ask the server to delta against, given the sequence of the packet we're about
     /// to send. `None` asks for a full update.
     ///
     /// It takes `outgoing` because a base expires: the server's ring is [`UPDATE_BACKUP`] deep too,
@@ -338,7 +338,10 @@ mod tests {
     use super::*;
 
     fn delta(number: u16) -> EntityDelta {
-        EntityDelta { number, ..Default::default() }
+        EntityDelta {
+            number,
+            ..Default::default()
+        }
     }
 
     fn at(number: u16, x: f32) -> EntityDelta {
@@ -420,7 +423,11 @@ mod tests {
         assert_eq!(e.number, 42);
         assert_eq!(e.model, 17, "from the baseline");
         assert_eq!(e.skin, 3);
-        assert_eq!(e.origin, Vec3::new(99.0, 20.0, 30.0), "x from the delta, y/z from the baseline");
+        assert_eq!(
+            e.origin,
+            Vec3::new(99.0, 20.0, 30.0),
+            "x from the delta, y/z from the baseline"
+        );
     }
 
     /// Removal takes the entity out of the new snapshot and doesn't disturb its neighbours.
@@ -478,7 +485,11 @@ mod tests {
     fn an_ancient_base_is_refused() {
         let mut f = Frames::default();
         f.apply(1, 1, None, &[at(3, 1.0)]);
-        assert_eq!(f.apply(400, 400, Some(1), &[]), Applied::Stale, "frame 1 is 399 frames old");
+        assert_eq!(
+            f.apply(400, 400, Some(1), &[]),
+            Applied::Stale,
+            "frame 1 is 399 frames old"
+        );
         assert_eq!(origins(&f), vec![(3, 1.0)]);
 
         // The boundary: 62 frames back is still nameable, 63 is not (UPDATE_BACKUP - 1).
@@ -510,7 +521,11 @@ mod tests {
         // is correct.
         assert_eq!(f.delta_sequence(258), Some(1), "we ask for 257, spelled `1`");
         assert_eq!(f.apply(258, 258, Some(1), &[]), Applied::Ok);
-        assert_eq!(origins(&f), vec![(3, 257.0)], "resolved to 257, not to the frame it replaced");
+        assert_eq!(
+            origins(&f),
+            vec![(3, 257.0)],
+            "resolved to 257, not to the frame it replaced"
+        );
     }
 
     /// A base expires on the send side too: the server's ring is the same 64 frames deep, so once
@@ -548,7 +563,11 @@ mod tests {
         for seq in 2..=70 {
             assert_eq!(f.apply(seq, seq, None, &[at(3, seq as f32)]), Applied::Ok);
         }
-        assert_eq!(f.apply(71, 71, Some(1), &[]), Applied::Stale, "1 was evicted by 65 — same slot");
+        assert_eq!(
+            f.apply(71, 71, Some(1), &[]),
+            Applied::Stale,
+            "1 was evicted by 65 — same slot"
+        );
 
         // 65 itself is still there and still usable: eviction is per slot, not wholesale.
         f.apply(72, 72, None, &[at(3, 72.0)]);
@@ -557,10 +576,18 @@ mod tests {
         // Every sequence still in the ring resolves to itself, and nothing evicted resolves at all.
         for seq in 74..=200u32 {
             f.apply(seq, seq, None, &[at(3, seq as f32)]);
-            assert_eq!(f.apply(seq + 1, seq + 1, Some(seq as u8), &[]), Applied::Ok, "{seq} should resolve");
+            assert_eq!(
+                f.apply(seq + 1, seq + 1, Some(seq as u8), &[]),
+                Applied::Ok,
+                "{seq} should resolve"
+            );
             // 64 back is the oldest live frame; 65 back has been evicted by the wrap.
             let evicted = (seq - 65) as u8;
-            assert_eq!(f.apply(seq + 2, seq + 2, Some(evicted), &[]), Applied::Stale, "{evicted} is gone");
+            assert_eq!(
+                f.apply(seq + 2, seq + 2, Some(evicted), &[]),
+                Applied::Stale,
+                "{evicted} is gone"
+            );
             f.apply(seq + 3, seq + 3, None, &[at(3, seq as f32)]); // re-establish after the stale
         }
     }
@@ -572,7 +599,10 @@ mod tests {
         f.apply(1, 1, None, &[at(3, 0.0), at(4, 1000.0)]);
         for seq in 2..200u32 {
             // Entity 3 moves every frame; entity 4 is never mentioned again.
-            assert_eq!(f.apply(seq, seq, Some((seq - 1) as u8), &[at(3, seq as f32)]), Applied::Ok);
+            assert_eq!(
+                f.apply(seq, seq, Some((seq - 1) as u8), &[at(3, seq as f32)]),
+                Applied::Ok
+            );
         }
         assert_eq!(origins(&f), vec![(3, 199.0), (4, 1000.0)]);
     }
@@ -582,7 +612,13 @@ mod tests {
     #[test]
     fn clear_forgets_the_level() {
         let mut f = Frames::default();
-        f.set_baseline(5, Baseline { modelindex: 9, ..Default::default() });
+        f.set_baseline(
+            5,
+            Baseline {
+                modelindex: 9,
+                ..Default::default()
+            },
+        );
         f.apply(1, 1, None, &[at(5, 1.0)]);
 
         f.clear();
@@ -606,4 +642,3 @@ mod tests {
         assert!(nums.windows(2).all(|w| w[0] < w[1]));
     }
 }
-

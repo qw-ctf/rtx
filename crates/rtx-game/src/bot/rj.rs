@@ -165,11 +165,8 @@ pub(crate) fn drive_rj(graph: &NavGraph, bot: &mut BotState, c: RjCtx) -> RjDriv
                     // Fitness pre-check on arrival: the bot's state can change between plan and here,
                     // so verify it can still afford the specific leg's blast before committing.
                     let effective = effective_self_damage(tr.self_damage, armortype, armorvalue);
-                    let fit = has_rl
-                        && ammo_rockets >= 1.0
-                        && weapons_hot
-                        && !quad
-                        && health > effective + RJ_HEALTH_MARGIN;
+                    let fit =
+                        has_rl && ammo_rockets >= 1.0 && weapons_hot && !quad && health > effective + RJ_HEALTH_MARGIN;
                     if !fit {
                         // Record enough for the harness to see *which* leg was unfit before we bail.
                         bot.rj.telem.link = leg;
@@ -208,7 +205,11 @@ pub(crate) fn drive_rj(graph: &NavGraph, bot: &mut BotState, c: RjCtx) -> RjDriv
                             stand = true;
                             // Ready to jump once the RL is in hand, on the ground, off cooldown (else the
                             // mid-air +attack is swallowed), and no enemy has appeared.
-                            if weapon == Weapon::RocketLauncher && on_ground && now >= attack_finished && enemy.is_none() {
+                            if weapon == Weapon::RocketLauncher
+                                && on_ground
+                                && now >= attack_finished
+                                && enemy.is_none()
+                            {
                                 jump_ready = true; // the jump presses post-spring, once the aim settles
                             }
                         } else {
@@ -227,7 +228,7 @@ pub(crate) fn drive_rj(graph: &NavGraph, bot: &mut BotState, c: RjCtx) -> RjDriv
                             failed = true; // the jump was swallowed — never left the ground
                         } else if now - bot.rj.jump_time >= tr.fire_delay + k.delay_bias {
                             fire = true; // fire this frame (aim already held since Stance)
-                            // The post-spring view sent with +attack is filled in by `emit`.
+                                         // The post-spring view sent with +attack is filled in by `emit`.
                             bot.rj.telem.fire = Some(RjFire {
                                 t: now,
                                 actual_delay: now - bot.rj.jump_time,
@@ -249,7 +250,11 @@ pub(crate) fn drive_rj(graph: &NavGraph, bot: &mut BotState, c: RjCtx) -> RjDriv
                                 if on_target {
                                     bot.rj.fails = 0;
                                 }
-                                bot.rj.telem.outcome = Some(RjOutcome::Landed { on_target, origin, t: now });
+                                bot.rj.telem.outcome = Some(RjOutcome::Landed {
+                                    on_target,
+                                    origin,
+                                    t: now,
+                                });
                                 bot.route_pos += 1; // clear the leg; repath from the landing
                                 bot.rj.phase = RjPhase::Idle;
                                 bot.repath_time = now;
@@ -312,14 +317,26 @@ mod tests {
         // Healthy, armed, no quad → fit.
         assert_eq!(rocket_jump_extra(&vars(rl, 5.0, 100.0, 0.0, 0.0), 0.0, 1.0), 0.0);
         // No launcher → unfit.
-        assert_eq!(rocket_jump_extra(&vars(Items::empty(), 5.0, 100.0, 0.0, 0.0), 0.0, 1.0), RJ_UNFIT_PENALTY);
+        assert_eq!(
+            rocket_jump_extra(&vars(Items::empty(), 5.0, 100.0, 0.0, 0.0), 0.0, 1.0),
+            RJ_UNFIT_PENALTY
+        );
         // No rocket → unfit.
-        assert_eq!(rocket_jump_extra(&vars(rl, 0.0, 100.0, 0.0, 0.0), 0.0, 1.0), RJ_UNFIT_PENALTY);
+        assert_eq!(
+            rocket_jump_extra(&vars(rl, 0.0, 100.0, 0.0, 0.0), 0.0, 1.0),
+            RJ_UNFIT_PENALTY
+        );
         // Too little health unarmored (needs > 60 + 25 = 85) → 80 unfit, 90 fit.
-        assert_eq!(rocket_jump_extra(&vars(rl, 5.0, 80.0, 0.0, 0.0), 0.0, 1.0), RJ_UNFIT_PENALTY);
+        assert_eq!(
+            rocket_jump_extra(&vars(rl, 5.0, 80.0, 0.0, 0.0), 0.0, 1.0),
+            RJ_UNFIT_PENALTY
+        );
         assert_eq!(rocket_jump_extra(&vars(rl, 5.0, 90.0, 0.0, 0.0), 0.0, 1.0), 0.0);
         // Quad running → unfit even when otherwise healthy.
-        assert_eq!(rocket_jump_extra(&vars(rl, 5.0, 100.0, 0.0, 0.0), 5.0, 1.0), RJ_UNFIT_PENALTY);
+        assert_eq!(
+            rocket_jump_extra(&vars(rl, 5.0, 100.0, 0.0, 0.0), 5.0, 1.0),
+            RJ_UNFIT_PENALTY
+        );
     }
 
     #[test]
@@ -328,6 +345,9 @@ mod tests {
         // Yellow armor (0.6, plenty of value): save = ceil(0.6·60) = 36 → effective 24, bar 24+25=49.
         // So 50 health is fit, 45 is not — armor makes rocket jumps viable at lower health.
         assert_eq!(rocket_jump_extra(&vars(rl, 5.0, 50.0, 0.6, 100.0), 0.0, 1.0), 0.0);
-        assert_eq!(rocket_jump_extra(&vars(rl, 5.0, 45.0, 0.6, 100.0), 0.0, 1.0), RJ_UNFIT_PENALTY);
+        assert_eq!(
+            rocket_jump_extra(&vars(rl, 5.0, 45.0, 0.6, 100.0), 0.0, 1.0),
+            RJ_UNFIT_PENALTY
+        );
     }
 }

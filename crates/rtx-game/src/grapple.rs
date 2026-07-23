@@ -73,8 +73,7 @@ impl GameState {
         }
         self.set_model(m, Model::PROGS_STAR);
         self.set_size(m, Vec3::ZERO, Vec3::ZERO);
-        self
-            .set_origin(m, origin + v_forward * 16.0 + Vec3::new(0.0, 0.0, 16.0));
+        self.set_origin(m, origin + v_forward * 16.0 + Vec3::new(0.0, 0.0, 16.0));
 
         let p = &mut self.entities[player];
         p.grapple.hook = m.0;

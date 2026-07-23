@@ -370,12 +370,7 @@ impl GameState {
     /// scaling blood off a pellet count, a witness that lost the thread — but a live enemy has at least
     /// 1 hp by definition, and reading one as already dead (a 0 stack) is just a bad guess that would
     /// have a bot break off a kill it hasn't made. A genuinely dead target is reset elsewhere, not read.
-    pub(crate) fn opponent_est(
-        &self,
-        observer: EntId,
-        target: EntId,
-        now: f32,
-    ) -> Option<OpponentEstimate> {
+    pub(crate) fn opponent_est(&self, observer: EntId, target: EntId, now: f32) -> Option<OpponentEstimate> {
         if !self.host.cvar_bool(c"rtx_bot_model") {
             return None;
         }
@@ -460,17 +455,10 @@ impl GameState {
     /// The distance² weighting for choosing `target` from `observer`'s view under opponent modeling:
     /// [`target_bias`] fed by the shared estimate, or `1.0` when there's no belief (or modeling is
     /// off), so a caller can multiply its raw dist² unconditionally and get plain nearest when off.
-    pub(crate) fn target_dist_bias(
-        &self,
-        observer: EntId,
-        target: EntId,
-        now: f32,
-        weapons_stay: bool,
-    ) -> f32 {
+    pub(crate) fn target_dist_bias(&self, observer: EntId, target: EntId, now: f32, weapons_stay: bool) -> f32 {
         match self.opponent_est(observer, target, now) {
             Some(est) => {
-                let armed_big =
-                    est.items.has(Items::ROCKET_LAUNCHER) || est.items.has(Items::LIGHTNING);
+                let armed_big = est.items.has(Items::ROCKET_LAUNCHER) || est.items.has(Items::LIGHTNING);
                 target_bias(est_strength(&est, now), armed_big, weapons_stay)
             }
             None => 1.0,
@@ -566,7 +554,15 @@ mod tests {
         m.note_pickup(0, t, PickupKind::Mega, 1.0);
         assert_eq!(m.entry(0, t).health, 200.0);
         // Armor replaces value/type.
-        m.note_pickup(0, t, PickupKind::Armor { value: 150.0, atype: 0.6 }, 1.0);
+        m.note_pickup(
+            0,
+            t,
+            PickupKind::Armor {
+                value: 150.0,
+                atype: 0.6,
+            },
+            1.0,
+        );
         assert_eq!(m.entry(0, t).armor_value, 150.0);
         assert_eq!(m.entry(0, t).armor_type, 0.6);
         // Weapon ORs the bit; quad sets a 30 s expiry.
@@ -598,7 +594,7 @@ mod tests {
         assert_eq!(drifted_health(30.0, 0.0, 4.0), 30.0); // within DRIFT_GRACE
         assert_eq!(drifted_health(30.0, 0.0, 10.0), 40.0); // 5 s past grace · 2/s
         assert_eq!(drifted_health(30.0, 0.0, 100.0), 100.0); // capped
-        // At/above prior (incl. witnessed mega overheal) never drifts.
+                                                             // At/above prior (incl. witnessed mega overheal) never drifts.
         assert_eq!(drifted_health(100.0, 0.0, 100.0), 100.0);
         assert_eq!(drifted_health(250.0, 0.0, 100.0), 250.0);
     }
@@ -648,7 +644,10 @@ mod tests {
         m.note_weapon(0, EntId(3), Items::ROCKET_LAUNCHER, 0.0);
         m.note_weapon(2, EntId(3), Items::LIGHTNING, 0.0);
         let a = m.believed_arsenal(EntId(3));
-        assert!(a.has(Items::ROCKET_LAUNCHER) && a.has(Items::LIGHTNING), "union of both pools");
+        assert!(
+            a.has(Items::ROCKET_LAUNCHER) && a.has(Items::LIGHTNING),
+            "union of both pools"
+        );
         // A player nobody saw with a big gun stays at the baseline kit (no RL/LG believed).
         assert!(!m.believed_arsenal(EntId(4)).has(Items::ROCKET_LAUNCHER));
         // The world slot is never a target.

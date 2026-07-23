@@ -15,8 +15,8 @@
 use glam::{Vec2, Vec3, Vec3Swizzles};
 
 use crate::bot::bhop::{self, Bhop, Env};
-use crate::math::yaw_of;
 use crate::bsp::Bsp;
+use crate::math::yaw_of;
 use crate::pmove_sim::{pm_step, PmParams, PmState};
 use crate::race::{touching, RaceRouteNode};
 
@@ -152,7 +152,11 @@ pub fn decode(polyline: &[Vec3], params: &LineParams, half_width: &[f32]) -> Rac
                 pos.x += shift.x;
                 pos.y += shift.y;
             }
-            LinePoint { pos, target_speed: DEFAULT_TARGET_SPEED, technique: TECH_RUN }
+            LinePoint {
+                pos,
+                target_speed: DEFAULT_TARGET_SPEED,
+                technique: TECH_RUN,
+            }
         })
         .collect();
     RaceLine { points }
@@ -163,7 +167,12 @@ pub fn decode(polyline: &[Vec3], params: &LineParams, half_width: &[f32]) -> Rac
 /// spent) if the runner falls off or exceeds `timeout`.
 pub fn rollout(bsp: &Bsp, line: &RaceLine, nodes: &[RaceRouteNode], pm: &PmParams, timeout: f32) -> RolloutResult {
     if line.points.len() < 2 || nodes.len() < 2 {
-        return RolloutResult { time: 0.0, finished: false, fell: false, reached: 0 };
+        return RolloutResult {
+            time: 0.0,
+            finished: false,
+            fell: false,
+            reached: 0,
+        };
     }
     let floor = line.points.iter().map(|p| p.pos.z).fold(f32::INFINITY, f32::min);
     let env = Env {
@@ -243,13 +252,28 @@ pub fn rollout(bsp: &Bsp, line: &RaceLine, nodes: &[RaceRouteNode], pm: &PmParam
             reached += 1;
         }
         if reached >= nodes.len() {
-            return RolloutResult { time: t, finished: true, fell: false, reached };
+            return RolloutResult {
+                time: t,
+                finished: true,
+                fell: false,
+                reached,
+            };
         }
         if st.origin.z < floor - FELL_BELOW {
-            return RolloutResult { time: t, finished: false, fell: true, reached };
+            return RolloutResult {
+                time: t,
+                finished: false,
+                fell: true,
+                reached,
+            };
         }
     }
-    RolloutResult { time: t, finished: false, fell: false, reached }
+    RolloutResult {
+        time: t,
+        finished: false,
+        fell: false,
+        reached,
+    }
 }
 
 /// The remaining straight runway ahead of `cursor` on the line: sum segment lengths while the heading
@@ -292,7 +316,13 @@ pub fn rollout_cost(r: &RolloutResult, nodes: usize, timeout: f32) -> f32 {
 /// scores better, and adapt the step (Rechenberg-style: grow on success, shrink on failure). Seeded
 /// deterministically. `bound` clamps each gene (the corridor half-width scale). Returns the best
 /// genome and its cost. Generic over the objective so it can be unit-tested without a BSP.
-pub fn optimize<F: Fn(&LineParams) -> f32>(seed: u32, init: LineParams, iters: u32, bound: f32, eval: F) -> (LineParams, f32) {
+pub fn optimize<F: Fn(&LineParams) -> f32>(
+    seed: u32,
+    init: LineParams,
+    iters: u32,
+    bound: f32,
+    eval: F,
+) -> (LineParams, f32) {
     let mut rng = Prng::new(seed);
     let mut best = init;
     let mut best_cost = eval(&best);
@@ -394,9 +424,15 @@ mod tests {
         // A straight line along +x: a positive lateral gene shifts interior points to +y (left-hand
         // normal of +x), clamped to the corridor half-width.
         let poly = vec![Vec3::ZERO, Vec3::new(100.0, 0.0, 0.0), Vec3::new(200.0, 0.0, 0.0)];
-        let params = LineParams { lateral: vec![0.0, 999.0, 0.0] }; // huge → must clamp
+        let params = LineParams {
+            lateral: vec![0.0, 999.0, 0.0],
+        }; // huge → must clamp
         let line = decode(&poly, &params, &[0.0, 64.0, 0.0]);
-        assert!((line.points[1].pos.y - 64.0).abs() < 1e-3, "not clamped to half-width: {}", line.points[1].pos.y);
+        assert!(
+            (line.points[1].pos.y - 64.0).abs() < 1e-3,
+            "not clamped to half-width: {}",
+            line.points[1].pos.y
+        );
         assert!((line.points[1].pos.x - 100.0).abs() < 1e-3, "tangent position drifted");
         // Endpoints never move.
         assert_eq!(line.points[0].pos, Vec3::ZERO);

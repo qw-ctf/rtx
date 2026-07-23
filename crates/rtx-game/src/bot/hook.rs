@@ -9,8 +9,8 @@
 use glam::{Vec3, Vec3Swizzles};
 
 use super::{
-    ballistic_landing, HOOK_AIM_TIMEOUT, HOOK_ANCHOR_DRIFT, HOOK_BALLISTIC_SLACK, HOOK_FLIGHT_TIMEOUT,
-    HOOK_REEL_TIMEOUT, HOOK_STANCE, Landing,
+    ballistic_landing, Landing, HOOK_AIM_TIMEOUT, HOOK_ANCHOR_DRIFT, HOOK_BALLISTIC_SLACK, HOOK_FLIGHT_TIMEOUT,
+    HOOK_REEL_TIMEOUT, HOOK_STANCE,
 };
 use crate::bot::state::{BotState, Driver, HookPhase};
 use crate::defs::Weapon;

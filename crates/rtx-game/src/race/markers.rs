@@ -42,7 +42,11 @@ pub fn routes_from_markers(starts: &[RaceStartInfo], markers: &[RaceMarkerInfo])
     let mut warnings = Vec::new();
 
     for start in starts {
-        let label = if start.name.is_empty() { "(unnamed)" } else { &start.name };
+        let label = if start.name.is_empty() {
+            "(unnamed)"
+        } else {
+            &start.name
+        };
         if start.name.is_empty() || start.desc.is_empty() {
             warnings.push("route name/description not specified".into());
             continue;
@@ -77,14 +81,13 @@ pub fn routes_from_markers(starts: &[RaceStartInfo], markers: &[RaceMarkerInfo])
                 valid = false;
                 break;
             }
-            let Some(mi) = markers
-                .iter()
-                .position(|m| m.targetname.as_deref() == Some(target))
-            else {
+            let Some(mi) = markers.iter().position(|m| m.targetname.as_deref() == Some(target)) else {
                 // ktx distinguishes a dangling target (chain just ends, route kept) from a
                 // non-marker target (route skipped); having gathered only markers we can't
                 // tell them apart, so end the chain and let the ≥2-node check decide.
-                warnings.push(format!("route \"{label}\": target '{target}' matches no race_route_marker; route ends there"));
+                warnings.push(format!(
+                    "route \"{label}\": target '{target}' matches no race_route_marker; route ends there"
+                ));
                 break;
             };
             if seen.contains(&mi) {

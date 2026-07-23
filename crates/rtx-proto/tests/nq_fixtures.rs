@@ -35,14 +35,21 @@ fn server_datagrams(dir: &PathBuf) -> Vec<(String, Vec<u8>)> {
         .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with("-s2c.bin")))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with("-s2c.bin"))
+        })
         .collect();
     files.sort(); // zero-padded capture index, so lexical order is capture order
     files
         .into_iter()
         .map(|p| {
             let name = p.file_name().unwrap().to_string_lossy().into_owned();
-            (name, std::fs::read(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display())))
+            (
+                name,
+                std::fs::read(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display())),
+            )
         })
         .collect()
 }
@@ -122,7 +129,10 @@ fn replays_a_captured_nq_session() {
 
     // A capture that never reached serverinfo isn't testing the parser — it's testing an empty file.
     assert!(reached_serverinfo, "capture never delivered svc_serverinfo");
-    assert!(reached_active, "capture never delivered an entity update (never entered the game)");
+    assert!(
+        reached_active,
+        "capture never delivered an entity update (never entered the game)"
+    );
 }
 
 /// A stable name per event kind, for the census.

@@ -143,7 +143,15 @@ mod tests {
     fn two_shallow_risers_are_steppable() {
         // Two 12u risers across a 32u span: floors 0 / 12 / 24. dz = 24 sits in the JumpGap band but
         // pmove walks it — must read steppable.
-        let solid = |p: Vec3| p.z <= if p.x < 10.67 { 0.0 } else if p.x < 21.33 { 12.0 } else { 24.0 };
+        let solid = |p: Vec3| {
+            p.z <= if p.x < 10.67 {
+                0.0
+            } else if p.x < 21.33 {
+                12.0
+            } else {
+                24.0
+            }
+        };
         assert!(steppable_rise(&solid, at(0.0, 0.0), at(32.0, 24.0)));
     }
 

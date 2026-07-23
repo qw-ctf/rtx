@@ -9,9 +9,9 @@ use glam::Vec3;
 use crate::assets::Sound;
 use crate::defs::*;
 use crate::entity::{Blocked, Die, EntId, MoverPhase, Think, Touch, Use};
-use crate::subs::{NoiseSlot, Phs};
 use crate::game::GameState;
 use crate::obituary::DeathType;
+use crate::subs::{NoiseSlot, Phs};
 
 impl GameState {
     // --- think functions ---

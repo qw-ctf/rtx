@@ -79,7 +79,9 @@ impl ControlConn {
         tokio::spawn(async move {
             let mut lines = TokioBufReader::new(read).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+                let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
                 if let Some(id) = v.get("id").and_then(Value::as_i64) {
                     if let Some(tx) = pending.lock().unwrap().remove(&id) {
                         let _ = tx.send(v);
@@ -221,11 +223,7 @@ impl RtxMcp {
             return Ok(cached);
         }
         let data = self.req("links", SHORT).await?;
-        let arr = data
-            .get("links")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        let arr = data.get("links").and_then(Value::as_array).cloned().unwrap_or_default();
         *self.inner.links.lock().unwrap() = Some(arr.clone());
         Ok(arr)
     }
@@ -346,7 +344,8 @@ impl RtxMcp {
         if via == "goto" {
             let conn = self.conn().await?;
             let rx = conn.events.subscribe();
-            self.req(&format!("goto {bot} {} {} {}", src[0], src[1], src[2]), SHORT).await?;
+            self.req(&format!("goto {bot} {} {} {}", src[0], src[1], src[2]), SHORT)
+                .await?;
             let ev = conn
                 .await_event(
                     rx,
@@ -362,7 +361,8 @@ impl RtxMcp {
                 return Ok(out);
             }
         } else {
-            self.req(&format!("teleport {bot} {} {} {}", src[0], src[1], src[2]), SHORT).await?;
+            self.req(&format!("teleport {bot} {} {} {}", src[0], src[1], src[2]), SHORT)
+                .await?;
         }
 
         let conn = self.conn().await?;
@@ -447,7 +447,10 @@ fn vec3_of(v: &Value) -> Result<[f32; 3], String> {
 /// Rows are `[t,x,y,z,vx,vy,vz]`; low-speed frames are excluded from heading metrics so the initial
 /// acceleration tick cannot manufacture an arbitrary yaw.
 fn corridor_metrics(ev: &Value, start: [f32; 3], end: [f32; 3]) -> Result<Value, String> {
-    let traj = ev.get("traj").and_then(Value::as_array).ok_or("goto event had no trajectory")?;
+    let traj = ev
+        .get("traj")
+        .and_then(Value::as_array)
+        .ok_or("goto event had no trajectory")?;
     let dx = end[0] - start[0];
     let dy = end[1] - start[1];
     let len = dx.hypot(dy);
@@ -494,8 +497,12 @@ fn corridor_metrics(ev: &Value, start: [f32; 3], end: [f32; 3]) -> Result<Value,
                 reverse_frames += 1;
             }
             if let Some(prev) = prev_heading {
-                max_yaw_step = max_yaw_step
-                    .max((prev.0 * heading.0 + prev.1 * heading.1).clamp(-1.0, 1.0).acos().to_degrees());
+                max_yaw_step = max_yaw_step.max(
+                    (prev.0 * heading.0 + prev.1 * heading.1)
+                        .clamp(-1.0, 1.0)
+                        .acos()
+                        .to_degrees(),
+                );
             }
             prev_heading = Some(heading);
         }
@@ -573,7 +580,9 @@ fn spawn_drain<R: std::io::Read + Send + 'static>(r: R, log: Arc<StdMutex<VecDeq
 fn finish(r: Result<Value, String>) -> Result<CallToolResult, McpError> {
     match r {
         Ok(v) => Ok(CallToolResult::success(vec![ContentBlock::text(v.to_string())])),
-        Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(json!({ "error": e }).to_string())])),
+        Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(
+            json!({ "error": e }).to_string(),
+        )])),
     }
 }
 
@@ -734,14 +743,18 @@ struct CellArgs {
 
 #[tool_router]
 impl RtxMcp {
-    #[tool(description = "Attach to an already-running mvdsv rtx control port without starting, \
-        reconfiguring, or taking ownership of the server.")]
+    #[tool(
+        description = "Attach to an already-running mvdsv rtx control port without starting, \
+        reconfiguring, or taking ownership of the server."
+    )]
     async fn server_connect(&self, Parameters(a): Parameters<ConnectArgs>) -> Result<CallToolResult, McpError> {
         finish(self.op_connect(a.port.unwrap_or(DEFAULT_PORT)).await)
     }
 
-    #[tool(description = "Launch mvdsv with the harness config (1 bot, control port open), wait until \
-        the navmesh is built and a bot has spawned, and return the server status.")]
+    #[tool(
+        description = "Launch mvdsv with the harness config (1 bot, control port open), wait until \
+        the navmesh is built and a bot has spawned, and return the server status."
+    )]
     async fn server_start(&self, Parameters(a): Parameters<StartArgs>) -> Result<CallToolResult, McpError> {
         let map = a.map.unwrap_or_else(|| "aerowalk".to_string());
         let port = a.port.unwrap_or(DEFAULT_PORT);
@@ -762,8 +775,10 @@ impl RtxMcp {
         finish(self.op_start(map, port, skill).await)
     }
 
-    #[tool(description = "Server and strategy status: map/navmesh, match format/phase/scores/roster, \
-        and each bot's team, stack, inventory, posture, perceived enemy, item plan, and route head.")]
+    #[tool(
+        description = "Server and strategy status: map/navmesh, match format/phase/scores/roster, \
+        and each bot's team, stack, inventory, posture, perceived enemy, item plan, and route head."
+    )]
     async fn status(&self) -> Result<CallToolResult, McpError> {
         finish(self.req("status", SHORT).await)
     }
@@ -778,8 +793,10 @@ impl RtxMcp {
         finish(self.req(&format!("set {} {}", a.name, a.value), SHORT).await)
     }
 
-    #[tool(description = "Set an ordered list of live server cvars in one tool call. Every pair is \
-        attempted and the result or error for each assignment is returned in input order.")]
+    #[tool(
+        description = "Set an ordered list of live server cvars in one tool call. Every pair is \
+        attempted and the result or error for each assignment is returned in input order."
+    )]
     async fn set_cvars(&self, Parameters(a): Parameters<SetCvarsArgs>) -> Result<CallToolResult, McpError> {
         let mut results = Vec::with_capacity(a.cvars.len());
         let mut succeeded = 0usize;
@@ -810,9 +827,11 @@ impl RtxMcp {
         })))
     }
 
-    #[tool(description = "Lock the current structured team roster, reload the map, run the countdown, \
+    #[tool(
+        description = "Lock the current structured team roster, reload the map, run the countdown, \
         and return once the match is live with its navmesh and bots ready. Fails if the requested \
-        format does not have enough players.")]
+        format does not have enough players."
+    )]
     async fn match_start(&self) -> Result<CallToolResult, McpError> {
         let r = async {
             self.inner.links.lock().unwrap().take();
@@ -826,7 +845,9 @@ impl RtxMcp {
                 if let Ok(st) = self.req("status", SHORT).await {
                     let phase = st.pointer("/match/phase").and_then(Value::as_str);
                     let nav_ready = st.get("navmesh").and_then(Value::as_str) == Some("ready");
-                    let roster_len = st.pointer("/match/roster").and_then(Value::as_array)
+                    let roster_len = st
+                        .pointer("/match/roster")
+                        .and_then(Value::as_array)
                         .map_or(0, Vec::len);
                     let bots_len = st.get("bots").and_then(Value::as_array).map_or(0, Vec::len);
                     if phase == Some("live") && nav_ready && roster_len > 0 && bots_len >= roster_len {
@@ -857,14 +878,18 @@ impl RtxMcp {
         finish(r)
     }
 
-    #[tool(description = "Inspect the navmesh cell nearest a world point, including incoming and \
-        outgoing link kinds, costs, and hazards.")]
+    #[tool(
+        description = "Inspect the navmesh cell nearest a world point, including incoming and \
+        outgoing link kinds, costs, and hazards."
+    )]
     async fn inspect_cell(&self, Parameters(a): Parameters<CellArgs>) -> Result<CallToolResult, McpError> {
         finish(self.req(&format!("cell {} {} {}", a.x, a.y, a.z), SHORT).await)
     }
 
-    #[tool(description = "Dump a live bot's complete planned route as navmesh link ids, kinds, and \
-        source/target world positions.")]
+    #[tool(
+        description = "Dump a live bot's complete planned route as navmesh link ids, kinds, and \
+        source/target world positions."
+    )]
     async fn bot_route(&self, Parameters(a): Parameters<BotArgs>) -> Result<CallToolResult, McpError> {
         let r = async {
             let bot = self.resolve_bot(a.bot).await?;
@@ -874,8 +899,10 @@ impl RtxMcp {
         finish(r)
     }
 
-    #[tool(description = "List generated curl-jump links (speed-jump links with a certified curl \
-        gain), including run-up, takeoff, target, required speed, and gain.")]
+    #[tool(
+        description = "List generated curl-jump links (speed-jump links with a certified curl \
+        gain), including run-up, takeoff, target, required speed, and gain."
+    )]
     async fn list_curl_links(&self) -> Result<CallToolResult, McpError> {
         finish(self.req("curls", SHORT).await)
     }
@@ -886,14 +913,18 @@ impl RtxMcp {
         finish(Ok(json!({ "log": self.tail_log(n) })))
     }
 
-    #[tool(description = "List every rocket-jump link the navmesh generated: id, source/target world \
-        positions, and the solved fire pitch/yaw, fire delay, airtime, and self-damage.")]
+    #[tool(
+        description = "List every rocket-jump link the navmesh generated: id, source/target world \
+        positions, and the solved fire pitch/yaw, fire delay, airtime, and self-damage."
+    )]
     async fn list_rj_links(&self) -> Result<CallToolResult, McpError> {
         finish(self.links().await.map(|l| json!({ "count": l.len(), "links": l })))
     }
 
-    #[tool(description = "Make a bot fit to rocket-jump: set health, give the rocket launcher with \
-        rockets, select it, clear quad, and take it off cooldown.")]
+    #[tool(
+        description = "Make a bot fit to rocket-jump: set health, give the rocket launcher with \
+        rockets, select it, clear quad, and take it off cooldown."
+    )]
     async fn prep(&self, Parameters(a): Parameters<PrepArgs>) -> Result<CallToolResult, McpError> {
         let r = async {
             let bot = self.resolve_bot(a.bot).await?;
@@ -905,8 +936,10 @@ impl RtxMcp {
         finish(r)
     }
 
-    #[tool(description = "Teleport a bot to a world position (or, with `link`, to that rocket-jump \
-        link's source cell), zeroing momentum and resetting its navigation state.")]
+    #[tool(
+        description = "Teleport a bot to a world position (or, with `link`, to that rocket-jump \
+        link's source cell), zeroing momentum and resetting its navigation state."
+    )]
     async fn teleport(&self, Parameters(a): Parameters<TeleportArgs>) -> Result<CallToolResult, McpError> {
         let r = async {
             let bot = self.resolve_bot(a.bot).await?;
@@ -920,14 +953,17 @@ impl RtxMcp {
             } else {
                 [a.x.unwrap_or(0.0), a.y.unwrap_or(0.0), a.z.unwrap_or(0.0)]
             };
-            self.req(&format!("teleport {bot} {} {} {}", pos[0], pos[1], pos[2]), SHORT).await
+            self.req(&format!("teleport {bot} {} {} {}", pos[0], pos[1], pos[2]), SHORT)
+                .await
         }
         .await;
         finish(r)
     }
 
-    #[tool(description = "Order a bot to walk to a world position, awaiting an `arrived` or (if it \
-        makes no progress for ~4s) `goto_stall` event — the inaccessible-source signal.")]
+    #[tool(
+        description = "Order a bot to walk to a world position, awaiting an `arrived` or (if it \
+        makes no progress for ~4s) `goto_stall` event — the inaccessible-source signal."
+    )]
     async fn goto(&self, Parameters(a): Parameters<GotoArgs>) -> Result<CallToolResult, McpError> {
         let r = async {
             let bot = self.resolve_bot(a.bot).await?;
@@ -942,11 +978,13 @@ impl RtxMcp {
         finish(r)
     }
 
-    #[tool(description = "Repeatedly run the normal bot pathfinder/bhop controller down one directed \
+    #[tool(
+        description = "Repeatedly run the normal bot pathfinder/bhop controller down one directed \
         corridor. Each trial teleports to the same start and reports elapsed time, peak speed, maximum \
         cross-track drift, heading error, per-frame yaw step, reverse frames, and whether it hopped. \
         The aggregate passes only when every trial arrives quickly without leaving the requested \
-        movement envelope; this is a path-following test, not a benchmark-only movement mode.")]
+        movement envelope; this is a path-following test, not a benchmark-only movement mode."
+    )]
     async fn corridor_test(&self, Parameters(a): Parameters<CorridorArgs>) -> Result<CallToolResult, McpError> {
         let r = async {
             let bot = self.resolve_bot(a.bot).await?;
@@ -961,20 +999,13 @@ impl RtxMcp {
             let mut results = Vec::with_capacity(trials as usize);
             let mut all_passed = true;
             for trial in 1..=trials {
-                self.req(
-                    &format!("teleport {bot} {} {} {}", start[0], start[1], start[2]),
-                    SHORT,
-                )
-                .await?;
+                self.req(&format!("teleport {bot} {} {} {}", start[0], start[1], start[2]), SHORT)
+                    .await?;
                 let rx = conn.events.subscribe();
                 self.req(&format!("goto {bot} {} {} {}", end[0], end[1], end[2]), SHORT)
                     .await?;
                 let ev = conn
-                    .await_event(
-                        rx,
-                        |v| is_ev(v, "arrived", bot) || is_ev(v, "goto_stall", bot),
-                        timeout,
-                    )
+                    .await_event(rx, |v| is_ev(v, "arrived", bot) || is_ev(v, "goto_stall", bot), timeout)
                     .await?;
                 let mut m = corridor_metrics(&ev, start, end)?;
                 let passed = m["event"] == "arrived"
@@ -1011,8 +1042,10 @@ impl RtxMcp {
         finish(r)
     }
 
-    #[tool(description = "Order a bot to fly a specific rocket-jump link and await the full rj_result \
-        telemetry (stance offset, aim error, fire-timing error, landing miss, outcome).")]
+    #[tool(
+        description = "Order a bot to fly a specific rocket-jump link and await the full rj_result \
+        telemetry (stance offset, aim error, fire-timing error, landing miss, outcome)."
+    )]
     async fn rocket_jump(&self, Parameters(a): Parameters<RjArgs>) -> Result<CallToolResult, McpError> {
         let r = async {
             let bot = self.resolve_bot(a.bot).await?;
@@ -1026,23 +1059,29 @@ impl RtxMcp {
         finish(r)
     }
 
-    #[tool(description = "End-to-end test of one rocket-jump link: prep the bot, place it at the \
+    #[tool(
+        description = "End-to-end test of one rocket-jump link: prep the bot, place it at the \
         source (teleport by default, or `via: goto` to also test reachability), fire the jump, and \
-        return the telemetry.")]
+        return the telemetry."
+    )]
     async fn test_link(&self, Parameters(a): Parameters<TestLinkArgs>) -> Result<CallToolResult, McpError> {
         let via = a.via.unwrap_or_else(|| "teleport".to_string());
         finish(self.op_test_link(a.link, &via, a.bot).await)
     }
 
-    #[tool(description = "Sweep a batch of rocket-jump links (default: all on the map), returning \
-        per-link results plus a summary (outcome counts, mean landing miss).")]
+    #[tool(
+        description = "Sweep a batch of rocket-jump links (default: all on the map), returning \
+        per-link results plus a summary (outcome counts, mean landing miss)."
+    )]
     async fn test_links(&self, Parameters(a): Parameters<TestLinksArgs>) -> Result<CallToolResult, McpError> {
         let via = a.via.unwrap_or_else(|| "teleport".to_string());
         finish(self.op_test_links(a.links, &via).await)
     }
 
-    #[tool(description = "Set any of the rtx_rj_* driver knobs (stance, aim_tol, stance_timeout, \
-        liftoff_timeout, ballistic_slack, delay_bias, pitch_bias). Only the fields you pass change.")]
+    #[tool(
+        description = "Set any of the rtx_rj_* driver knobs (stance, aim_tol, stance_timeout, \
+        liftoff_timeout, ballistic_slack, delay_bias, pitch_bias). Only the fields you pass change."
+    )]
     async fn set_knobs(&self, Parameters(a): Parameters<SetKnobsArgs>) -> Result<CallToolResult, McpError> {
         let r = async {
             let mut set = serde_json::Map::new();
@@ -1080,8 +1119,10 @@ impl RtxMcp {
         finish(r)
     }
 
-    #[tool(description = "Run a raw server console command (escape hatch, e.g. \"map bravado\" or \
-        \"set sv_gravity 700\"). A command containing \"map\" invalidates the cached link list.")]
+    #[tool(
+        description = "Run a raw server console command (escape hatch, e.g. \"map bravado\" or \
+        \"set sv_gravity 700\"). A command containing \"map\" invalidates the cached link list."
+    )]
     async fn console_cmd(&self, Parameters(a): Parameters<ConsoleArgs>) -> Result<CallToolResult, McpError> {
         if a.command.contains("map") {
             self.inner.links.lock().unwrap().take();

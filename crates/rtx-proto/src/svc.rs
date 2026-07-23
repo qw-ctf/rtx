@@ -640,7 +640,10 @@ pub enum DownloadMessage {
     /// Metadata beginning a random-access transfer. Negative results are FTE's `DLERR_*` values.
     ChunkedStart { name: String, size: Result<u64, i32> },
     /// One fixed-size random-access block. This form can also arrive out of band.
-    ChunkedBlock { chunk: u32, data: Box<[u8; DOWNLOAD_CHUNK_SIZE]> },
+    ChunkedBlock {
+        chunk: u32,
+        data: Box<[u8; DOWNLOAD_CHUNK_SIZE]>,
+    },
 }
 
 /// One decoded server message.
@@ -716,11 +719,7 @@ pub enum SvcEvent {
     /// One of our own stats changed (health, ammo, items…). See `STAT_*`.
     UpdateStat { stat: u8, value: i32 },
     /// A player's userinfo (name, team, colours).
-    UpdateUserinfo {
-        player: u8,
-        userid: i32,
-        userinfo: String,
-    },
+    UpdateUserinfo { player: u8, userid: i32, userinfo: String },
     /// One key of a player's userinfo changed.
     SetInfo { player: u8, key: String, value: String },
     /// One key of the serverinfo changed.
@@ -837,12 +836,7 @@ pub fn parse(proto: &mut ProtoState, data: &[u8]) -> Result<Vec<SvcEvent>, Parse
 }
 
 /// Parse one message, having already read its opcode.
-fn parse_one(
-    proto: &mut ProtoState,
-    r: &mut Reader,
-    svc: u8,
-    offset: usize,
-) -> Result<Option<SvcEvent>, ParseError> {
+fn parse_one(proto: &mut ProtoState, r: &mut Reader, svc: u8, offset: usize) -> Result<Option<SvcEvent>, ParseError> {
     let ev = match svc {
         op::BAD => return Err(ParseError::Bad { offset }),
         op::NOP => SvcEvent::Nop,
@@ -857,7 +851,11 @@ fn parse_one(
         },
         op::SOUND => {
             let channel = r.u16()?;
-            let volume = if channel & snd::VOLUME != 0 { r.u8()? } else { DEFAULT_SOUND_VOLUME };
+            let volume = if channel & snd::VOLUME != 0 {
+                r.u8()?
+            } else {
+                DEFAULT_SOUND_VOLUME
+            };
             let attenuation = if channel & snd::ATTENUATION != 0 {
                 r.u8()? as f32 / 64.0
             } else {
@@ -874,7 +872,10 @@ fn parse_one(
         }
         op::STOPSOUND => {
             let w = r.u16()?;
-            SvcEvent::StopSound { entity: w >> 3, channel: (w & 7) as u8 }
+            SvcEvent::StopSound {
+                entity: w >> 3,
+                channel: (w & 7) as u8,
+            }
         }
         op::PRINT => SvcEvent::Print {
             level: r.u8()?,
@@ -884,8 +885,15 @@ fn parse_one(
         op::SETANGLE => {
             // Under HIGHLAGTELEPORT the server says *why*, so a client can fix up the moves
             // already in flight instead of walking the wrong way for a round-trip.
-            let kind = if proto.has_mvd1(mvd1::HIGHLAGTELEPORT) { Some(r.u8()?) } else { None };
-            SvcEvent::SetAngle { kind, angles: r.angle3()? }
+            let kind = if proto.has_mvd1(mvd1::HIGHLAGTELEPORT) {
+                Some(r.u8()?)
+            } else {
+                None
+            };
+            SvcEvent::SetAngle {
+                kind,
+                angles: r.angle3()?,
+            }
         }
         op::SERVERDATA => return parse_serverdata(proto, r).map(Some),
         op::LIGHTSTYLE => SvcEvent::LightStyle {
@@ -909,7 +917,10 @@ fn parse_one(
         },
         op::FTE_SPAWNBASELINE2 => {
             let delta = read_delta_entity(proto, r)?;
-            SvcEvent::SpawnBaselineDelta { entity: delta.number, delta }
+            SvcEvent::SpawnBaselineDelta {
+                entity: delta.number,
+                delta,
+            }
         }
         op::TEMP_ENTITY => SvcEvent::TempEntity(read_temp_entity(r)?),
         op::SETPAUSE => SvcEvent::SetPause(r.u8()? != 0),
@@ -959,7 +970,10 @@ fn parse_one(
                     } else {
                         Ok(flag as u64)
                     };
-                    SvcEvent::Download(DownloadMessage::ChunkedStart { name: r.string()?, size })
+                    SvcEvent::Download(DownloadMessage::ChunkedStart {
+                        name: r.string()?,
+                        size,
+                    })
                 } else {
                     let data: [u8; DOWNLOAD_CHUNK_SIZE] = r.bytes(DOWNLOAD_CHUNK_SIZE)?.try_into().unwrap();
                     SvcEvent::Download(DownloadMessage::ChunkedBlock {
@@ -1024,7 +1038,12 @@ fn parse_serverdata(proto: &mut ProtoState, r: &mut Reader) -> Result<SvcEvent, 
             magic::MVD1 => mvd1 = r.u32()?,
             v if v == crate::protocol::VERSION => break,
             // An unknown tag here is unrecoverable: we can't tell whether a mask follows it.
-            _ => return Err(ParseError::UnknownSvc { svc: op::SERVERDATA, offset: r.pos() }),
+            _ => {
+                return Err(ParseError::UnknownSvc {
+                    svc: op::SERVERDATA,
+                    offset: r.pos(),
+                })
+            }
         }
     }
 
@@ -1078,7 +1097,14 @@ fn read_baseline(r: &mut Reader) -> Result<Baseline, Underflow> {
         origin[i] = r.coord()?;
         angles[i] = r.angle()?;
     }
-    Ok(Baseline { modelindex, frame, colormap, skinnum, origin, angles })
+    Ok(Baseline {
+        modelindex,
+        frame,
+        colormap,
+        skinnum,
+        origin,
+        angles,
+    })
 }
 
 /// `svc_temp_entity`. The payload shape depends entirely on the kind, and there's no length —
@@ -1101,7 +1127,12 @@ fn read_temp_entity(r: &mut Reader) -> Result<TempEntity, ParseError> {
         11 => Teleport,
         12 => Blood,
         13 => LightningBlood,
-        _ => return Err(ParseError::UnknownSvc { svc: op::TEMP_ENTITY, offset: r.pos() - 1 }),
+        _ => {
+            return Err(ParseError::UnknownSvc {
+                svc: op::TEMP_ENTITY,
+                offset: r.pos() - 1,
+            })
+        }
     };
     Ok(match kind {
         Lightning1 | Lightning2 | Lightning3 => TempEntity::Beam {
@@ -1115,7 +1146,10 @@ fn read_temp_entity(r: &mut Reader) -> Result<TempEntity, ParseError> {
             count: r.u8()?,
             origin: r.coord3()?,
         },
-        _ => TempEntity::Point { kind, origin: r.coord3()? },
+        _ => TempEntity::Point {
+            kind,
+            origin: r.coord3()?,
+        },
     })
 }
 
@@ -1164,7 +1198,11 @@ fn read_resource_list(r: &mut Reader, short_start: bool) -> Result<ResourceList,
         }
         names.push(s);
     }
-    Ok(ResourceList { start, names, next: r.u8()? })
+    Ok(ResourceList {
+        start,
+        names,
+        next: r.u8()?,
+    })
 }
 
 /// `svc_playerinfo`.
@@ -1205,7 +1243,11 @@ fn read_playerinfo(proto: &ProtoState, r: &mut Reader) -> Result<PlayerInfo, Und
         }
     }
 
-    let mut modelindex = if flags & pf::MODEL != 0 { Some(r.u8()? as u16) } else { None };
+    let mut modelindex = if flags & pf::MODEL != 0 {
+        Some(r.u8()? as u16)
+    } else {
+        None
+    };
     let skinnum = if flags & pf::SKINNUM != 0 {
         let mut skin = r.u8()?;
         // The skin's top bit is stolen as a 9th model bit — but only when a model was sent.
@@ -1218,7 +1260,11 @@ fn read_playerinfo(proto: &ProtoState, r: &mut Reader) -> Result<PlayerInfo, Und
         None
     };
     let effects = if flags & pf::EFFECTS != 0 { Some(r.u8()?) } else { None };
-    let weaponframe = if flags & pf::WEAPONFRAME != 0 { Some(r.u8()?) } else { None };
+    let weaponframe = if flags & pf::WEAPONFRAME != 0 {
+        Some(r.u8()?)
+    } else {
+        None
+    };
     let alpha = if flags & pf::TRANS_Z != 0 && proto.has_fte(fte::TRANS) {
         Some(r.u8()?)
     } else {
@@ -1443,7 +1489,10 @@ mod tests {
             vec![
                 SvcEvent::Nop,
                 SvcEvent::UpdateFrags { player: 2, frags: 15 },
-                SvcEvent::Print { level: 3, text: "hello".into() },
+                SvcEvent::Print {
+                    level: 3,
+                    text: "hello".into()
+                },
                 SvcEvent::ChokeCount(4),
             ]
         );
@@ -1479,7 +1528,9 @@ mod tests {
         let mut p = vanilla();
         let evs = parse(&mut p, &w.into_vec()).unwrap();
 
-        let SvcEvent::ServerData(sd) = &evs[0] else { panic!("expected serverdata: {evs:?}") };
+        let SvcEvent::ServerData(sd) = &evs[0] else {
+            panic!("expected serverdata: {evs:?}")
+        };
         assert_eq!(sd.servercount, 1234);
         assert_eq!(sd.gamedir, "ktx");
         assert_eq!(sd.playernum, 3);
@@ -1490,7 +1541,13 @@ mod tests {
 
         // The state was adopted, and the intermission coords were read as floats.
         assert_eq!((p.coord_bytes, p.angle_bytes), (4, 2));
-        assert_eq!(evs[1], SvcEvent::Intermission { origin: Vec3::new(1.5, 2.5, 3.5), angles: Vec3::ZERO });
+        assert_eq!(
+            evs[1],
+            SvcEvent::Intermission {
+                origin: Vec3::new(1.5, 2.5, 3.5),
+                angles: Vec3::ZERO
+            }
+        );
     }
 
     /// A vanilla server sends no extension pairs at all — just the version — and the widths stay
@@ -1655,7 +1712,9 @@ mod tests {
 
         for mut p in [vanilla(), with(fte::FLOATCOORDS, 0, 0)] {
             let evs = parse(&mut p, &bytes).unwrap();
-            let SvcEvent::Nails(nails) = &evs[0] else { panic!("{evs:?}") };
+            let SvcEvent::Nails(nails) = &evs[0] else {
+                panic!("{evs:?}")
+            };
             assert_eq!(nails.len(), 1);
             assert_eq!(nails[0].origin, Vec3::new(2048.0, 2048.0, 2048.0));
             assert_eq!(nails[0].number, None);
@@ -1678,7 +1737,10 @@ mod tests {
         w.u8(op::NOP);
         let evs = parse(&mut vanilla(), &w.into_vec()).unwrap();
         let SvcEvent::Nails(nails) = &evs[0] else { panic!() };
-        assert_eq!(nails.iter().map(|n| n.number).collect::<Vec<_>>(), vec![Some(17), Some(18)]);
+        assert_eq!(
+            nails.iter().map(|n| n.number).collect::<Vec<_>>(),
+            vec![Some(17), Some(18)]
+        );
         assert_eq!(evs[1], SvcEvent::Nop);
     }
 
@@ -1697,7 +1759,9 @@ mod tests {
         w.u8(0); // frame
 
         let evs = parse(&mut vanilla(), &w.into_vec()).unwrap();
-        let SvcEvent::PlayerInfo(pi) = &evs[0] else { panic!("{evs:?}") };
+        let SvcEvent::PlayerInfo(pi) = &evs[0] else {
+            panic!("{evs:?}")
+        };
         assert!(pi.on_ground(), "bit 14 should have been remapped to bit 22");
         assert!(!pi.solid());
     }
@@ -1718,7 +1782,9 @@ mod tests {
 
         let mut p = with(fte::TRANS, 0, 0);
         let evs = parse(&mut p, &w.into_vec()).unwrap();
-        let SvcEvent::PlayerInfo(pi) = &evs[0] else { panic!("{evs:?}") };
+        let SvcEvent::PlayerInfo(pi) = &evs[0] else {
+            panic!("{evs:?}")
+        };
         assert!(pi.on_ground());
         assert!(pi.solid());
         assert!(pi.dead(), "death is on the wire — never an estimate");
@@ -1728,7 +1794,8 @@ mod tests {
     /// wrong: velocity comes *after* the usercmd, and the skin's top bit steals a model bit.
     #[test]
     fn playerinfo_field_order_and_skin_model_bit() {
-        let flags = pf::MSEC | pf::COMMAND | pf::VELOCITY1 | (pf::VELOCITY1 << 2) | pf::MODEL | pf::SKINNUM | pf::EFFECTS;
+        let flags =
+            pf::MSEC | pf::COMMAND | pf::VELOCITY1 | (pf::VELOCITY1 << 2) | pf::MODEL | pf::SKINNUM | pf::EFFECTS;
         let mut w = Writer::new();
         w.u8(op::PLAYERINFO);
         w.u8(5);
@@ -1738,7 +1805,7 @@ mod tests {
         w.i16(0);
         w.u8(3); // frame
         w.u8(13); // msec
-        // usercmd: yaw + forward, then msec
+                  // usercmd: yaw + forward, then msec
         w.u8(cm::ANGLE2 | cm::FORWARD);
         w.angle16(90.0);
         w.i16(400);
@@ -1752,7 +1819,9 @@ mod tests {
 
         let mut p = with(fte::TRANS, 0, 0);
         let evs = parse(&mut p, &w.into_vec()).unwrap();
-        let SvcEvent::PlayerInfo(pi) = &evs[0] else { panic!("{evs:?}") };
+        let SvcEvent::PlayerInfo(pi) = &evs[0] else {
+            panic!("{evs:?}")
+        };
 
         assert_eq!(pi.player, 5);
         assert_eq!(pi.origin, Vec3::new(64.0, 0.0, 0.0));
@@ -1762,7 +1831,11 @@ mod tests {
         assert!((cmd.angles.y - 90.0).abs() < 0.01, "an opponent's view yaw is knowable");
         assert_eq!(cmd.forward, 400);
         assert_eq!(cmd.msec, 13);
-        assert_eq!(pi.velocity, Vec3::new(200.0, 0.0, -50.0), "omitted components read as zero");
+        assert_eq!(
+            pi.velocity,
+            Vec3::new(200.0, 0.0, -50.0),
+            "omitted components read as zero"
+        );
         assert_eq!(pi.modelindex, Some(40 + 256), "skin bit 7 carries the 9th model bit");
         assert_eq!(pi.skinnum, Some(5), "and is stripped from the skin");
         assert_eq!(pi.effects, Some(8));
@@ -1827,7 +1900,9 @@ mod tests {
         w.i16(32 * 8);
         w.u16(0); // end of list
         let evs = parse(&mut vanilla(), &w.into_vec()).unwrap();
-        let SvcEvent::PacketEntities(pe) = &evs[0] else { panic!("{evs:?}") };
+        let SvcEvent::PacketEntities(pe) = &evs[0] else {
+            panic!("{evs:?}")
+        };
         assert_eq!(pe.delta_from, None);
         assert_eq!(pe.updates.len(), 1);
         assert_eq!(pe.updates[0].number, 12);
@@ -1840,7 +1915,9 @@ mod tests {
         w.u16(u::REMOVE as u16 | 7);
         w.u16(0);
         let evs = parse(&mut vanilla(), &w.into_vec()).unwrap();
-        let SvcEvent::PacketEntities(pe) = &evs[0] else { panic!() };
+        let SvcEvent::PacketEntities(pe) = &evs[0] else {
+            panic!()
+        };
         assert_eq!(pe.delta_from, Some(42));
         assert_eq!(pe.updates[0].number, 7);
         assert!(pe.updates[0].remove);
@@ -1867,7 +1944,9 @@ mod tests {
         w.u16(0);
 
         let evs = parse(&mut vanilla(), &w.into_vec()).unwrap();
-        let SvcEvent::PacketEntities(pe) = &evs[0] else { panic!("{evs:?}") };
+        let SvcEvent::PacketEntities(pe) = &evs[0] else {
+            panic!("{evs:?}")
+        };
         let d = &pe.updates[0];
         assert_eq!(d.number, 3);
         assert_eq!(d.model, Some(11));
@@ -1896,7 +1975,9 @@ mod tests {
         w.u16(0);
 
         let evs = parse(&mut p, &w.into_vec()).unwrap();
-        let SvcEvent::PacketEntities(pe) = &evs[0] else { panic!("{evs:?}") };
+        let SvcEvent::PacketEntities(pe) = &evs[0] else {
+            panic!("{evs:?}")
+        };
         let d = &pe.updates[0];
         assert_eq!(d.number, 5 + 512 + 1024, "both doubling bits apply");
         assert_eq!(d.model, Some(400));
@@ -1911,7 +1992,9 @@ mod tests {
         w.u8(7);
         w.u16(0);
         let evs = parse(&mut p, &w.into_vec()).unwrap();
-        let SvcEvent::PacketEntities(pe) = &evs[0] else { panic!() };
+        let SvcEvent::PacketEntities(pe) = &evs[0] else {
+            panic!()
+        };
         assert_eq!(pe.updates[0].model, Some(7 + 256));
     }
 
@@ -1931,7 +2014,9 @@ mod tests {
         w.u16(0);
 
         let evs = parse(&mut p, &w.into_vec()).unwrap();
-        let SvcEvent::PacketEntities(pe) = &evs[0] else { panic!("{evs:?}") };
+        let SvcEvent::PacketEntities(pe) = &evs[0] else {
+            panic!("{evs:?}")
+        };
         assert_eq!(pe.updates[0].colourmod, Some([10, 20, 30]));
     }
 
@@ -2109,7 +2194,10 @@ mod tests {
             evs,
             vec![
                 SvcEvent::UpdateStat { stat: 0, value: 100 },
-                SvcEvent::UpdateStat { stat: 17, value: 123456 },
+                SvcEvent::UpdateStat {
+                    stat: 17,
+                    value: 123456
+                },
             ]
         );
     }
@@ -2135,7 +2223,11 @@ mod tests {
         assert_eq!(
             evs,
             vec![
-                SvcEvent::Damage { armor: 10, blood: 25, from: Vec3::new(100.0, 0.0, 0.0) },
+                SvcEvent::Damage {
+                    armor: 10,
+                    blood: 25,
+                    from: Vec3::new(100.0, 0.0, 0.0)
+                },
                 SvcEvent::MuzzleFlash { entity: 4 },
                 SvcEvent::StuffText("cmd spawn 5\n".into()),
                 SvcEvent::CenterPrint("FIGHT".into()),
@@ -2160,7 +2252,9 @@ mod tests {
         w.i16(24 * 8);
         w.i8_as_angle(0.0);
         let evs = parse(&mut vanilla(), &w.into_vec()).unwrap();
-        let SvcEvent::SpawnBaseline { entity, baseline } = &evs[0] else { panic!("{evs:?}") };
+        let SvcEvent::SpawnBaseline { entity, baseline } = &evs[0] else {
+            panic!("{evs:?}")
+        };
         assert_eq!(*entity, 23);
         assert_eq!(baseline.modelindex, 5);
         assert_eq!(baseline.skinnum, 2);
@@ -2173,7 +2267,9 @@ mod tests {
         w.u16(u::ORIGIN1 as u16 | 31);
         w.i16(64 * 8);
         let evs = parse(&mut with(fte::SPAWNSTATIC2, 0, 0), &w.into_vec()).unwrap();
-        let SvcEvent::SpawnBaselineDelta { entity, delta } = &evs[0] else { panic!("{evs:?}") };
+        let SvcEvent::SpawnBaselineDelta { entity, delta } = &evs[0] else {
+            panic!("{evs:?}")
+        };
         assert_eq!(*entity, 31);
         assert_eq!(delta.origin[0], Some(64.0));
     }

@@ -82,7 +82,10 @@ fn transform(state: &mut [u32; 4], block: &[u8; 64]) {
     // Round 3: H(x,y,z) = x xor y xor z, with the constant 0x6ed9eba1 (sqrt 3), over a bit-reversed
     // index order.
     let hh = |a: u32, b: u32, c: u32, d: u32, x: u32, s: u32| {
-        a.wrapping_add(b ^ c ^ d).wrapping_add(x).wrapping_add(0x6ed9_eba1).rotate_left(s)
+        a.wrapping_add(b ^ c ^ d)
+            .wrapping_add(x)
+            .wrapping_add(0x6ed9_eba1)
+            .rotate_left(s)
     };
     for &i in &[0usize, 2, 1, 3] {
         a = hh(a, b, c, d, x[i], 3);
@@ -113,13 +116,20 @@ mod tests {
         assert_eq!(hex(digest(b"a")), "bde52cb31de33e46245e05fbdbd6fb24");
         assert_eq!(hex(digest(b"abc")), "a448017aaf21d8525fc10ae87aa6729d");
         assert_eq!(hex(digest(b"message digest")), "d9130a8164549fe818874806e1c7014b");
-        assert_eq!(hex(digest(b"abcdefghijklmnopqrstuvwxyz")), "d79e1c308aa5bbcdeea8ed63df412da9");
         assert_eq!(
-            hex(digest(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")),
+            hex(digest(b"abcdefghijklmnopqrstuvwxyz")),
+            "d79e1c308aa5bbcdeea8ed63df412da9"
+        );
+        assert_eq!(
+            hex(digest(
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+            )),
             "043f8582f241db351ce627e153e7f0e4"
         );
         assert_eq!(
-            hex(digest(b"12345678901234567890123456789012345678901234567890123456789012345678901234567890")),
+            hex(digest(
+                b"12345678901234567890123456789012345678901234567890123456789012345678901234567890"
+            )),
             "e33b4ddc9c38f2199c3e7b164fcc0536"
         );
     }

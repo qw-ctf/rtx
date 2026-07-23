@@ -655,8 +655,7 @@ impl GameState {
             ent.v.flags = ent.v.flags.without(Flags::ONGROUND);
             ent.v.avelocity = avel;
         }
-        self
-            .set_size(e, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
+        self.set_size(e, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
         let mut origin = self.entities[e].v.origin;
         origin.z -= 24.0;
         self.set_origin(e, origin);

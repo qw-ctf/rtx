@@ -385,11 +385,17 @@ impl NqSession {
         }
         if self.download_enabled {
             eprintln!("rtx-client: don't have maps/{}.bsp — downloading it", self.mapname);
-            self.download =
-                Some(super::download::Download::start(host.basedir(), self.gamedir.clone(), self.mapname.clone()));
+            self.download = Some(super::download::Download::start(
+                host.basedir(),
+                self.gamedir.clone(),
+                self.mapname.clone(),
+            ));
             self.signon = Signon::Downloading;
         } else {
-            eprintln!("rtx-client: can't read maps/{}.bsp (and --no-download is set)", self.mapname);
+            eprintln!(
+                "rtx-client: can't read maps/{}.bsp (and --no-download is set)",
+                self.mapname
+            );
             self.signon = Signon::Disconnected;
         }
     }
@@ -500,7 +506,11 @@ impl NqSession {
 
     /// Fold a round-trip sample into the smoothed estimate.
     fn note_rtt(&mut self, sample: f32) {
-        self.rtt = if self.rtt == 0.0 { sample } else { self.rtt * 0.9 + sample * 0.1 };
+        self.rtt = if self.rtt == 0.0 {
+            sample
+        } else {
+            self.rtt * 0.9 + sample * 0.1
+        };
     }
 }
 
@@ -596,7 +606,10 @@ mod tests {
         s.signon = Signon::Loading;
         s.frames.set_baseline(1, rtx_proto::svc::Baseline::default());
         s.handle(&SvcEvent::Time(1.0), &h);
-        let delta = rtx_proto::svc::EntityDelta { number: 1, ..Default::default() };
+        let delta = rtx_proto::svc::EntityDelta {
+            number: 1,
+            ..Default::default()
+        };
         s.handle(&SvcEvent::EntityUpdate(delta), &h);
         assert_eq!(s.signon(), Signon::Active);
     }

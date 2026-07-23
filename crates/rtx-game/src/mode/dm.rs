@@ -67,8 +67,8 @@ fn nearest_player(g: &GameState, bot: EntId) -> Option<EntId> {
             }
         })
         .map(|en| {
-            let d = (g.entities[en].v.origin - origin).length_squared()
-                * g.target_dist_bias(bot, en, now, weapons_stay);
+            let d =
+                (g.entities[en].v.origin - origin).length_squared() * g.target_dist_bias(bot, en, now, weapons_stay);
             (en, d)
         })
         .min_by(|a, b| a.1.total_cmp(&b.1))

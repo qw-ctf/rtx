@@ -267,7 +267,10 @@ where
     for<'a> <T as BinRead>::Args<'a>: Default,
 {
     if !(lump.size as usize).is_multiple_of(rec_size) {
-        eprintln!("navview: {what} lump size {} is not a multiple of {rec_size} — not this BSP version", lump.size);
+        eprintln!(
+            "navview: {what} lump size {} is not a multiple of {rec_size} — not this BSP version",
+            lump.size
+        );
         return None;
     }
     let count = lump.size as usize / rec_size;
@@ -386,7 +389,12 @@ pub fn parse_render_mesh(bytes: &[u8]) -> Option<RenderMesh> {
             // Liquid: emit flat tinted triangles into the water buffer (drawn additive, double-sided
             // — no winding fixup needed).
             let color = liquid_tint(kind);
-            fan(&loop_verts, |v| water.push(LineVertex { pos: v.to_array(), color }));
+            fan(&loop_verts, |v| {
+                water.push(LineVertex {
+                    pos: v.to_array(),
+                    color,
+                })
+            });
             continue;
         }
 
@@ -397,7 +405,11 @@ pub fn parse_render_mesh(bytes: &[u8]) -> Option<RenderMesh> {
             .get(face.plane as usize)
             .map(|p| {
                 let n = Vec3::from_array(p.normal);
-                if face.side != 0 { -n } else { n }
+                if face.side != 0 {
+                    -n
+                } else {
+                    n
+                }
             })
             .map(|n| n.normalize_or(Vec3::Z))
             .unwrap_or_else(|| newell_normal(&loop_verts));
@@ -405,14 +417,24 @@ pub fn parse_render_mesh(bytes: &[u8]) -> Option<RenderMesh> {
             loop_verts.reverse();
         }
         let n = front_n.to_array();
-        fan(&loop_verts, |v| vertices.push(MeshVertex { pos: v.to_array(), normal: n }));
+        fan(&loop_verts, |v| {
+            vertices.push(MeshVertex {
+                pos: v.to_array(),
+                normal: n,
+            })
+        });
     }
 
     if vertices.is_empty() && water.is_empty() {
         eprintln!("navview: BSP parsed but produced no world faces");
         return None;
     }
-    Some(RenderMesh { vertices, water, mins, maxs })
+    Some(RenderMesh {
+        vertices,
+        water,
+        mins,
+        maxs,
+    })
 }
 
 /// Fan-triangulate a vertex loop, calling `emit` for each of the `(v0, v[i], v[i+1])` corners.
@@ -461,7 +483,10 @@ pub const LINK_KINDS: [LinkKind; NUM_LINK_KINDS] = [
 
 /// Index of a kind within [`LINK_KINDS`] — the slot of its visibility flag.
 pub fn kind_index(kind: LinkKind) -> usize {
-    LINK_KINDS.iter().position(|&k| k == kind).expect("every LinkKind is in LINK_KINDS")
+    LINK_KINDS
+        .iter()
+        .position(|&k| k == kind)
+        .expect("every LinkKind is in LINK_KINDS")
 }
 
 /// Human-readable label for a link kind (the checkbox text).
@@ -492,7 +517,7 @@ pub fn link_color(kind: LinkKind) -> [f32; 3] {
         LinkKind::Plat => [0.20, 0.90, 0.90],       // cyan (needs live entities; not built offline)
         LinkKind::Teleport => [0.25, 0.45, 1.00],   // blue (needs live entities)
         LinkKind::Hook => [0.60, 0.30, 1.00],       // purple
-        LinkKind::RocketJump => [1.00, 1.00, 1.00],  // white
+        LinkKind::RocketJump => [1.00, 1.00, 1.00], // white
     }
 }
 
@@ -527,11 +552,15 @@ pub fn nav_lines(graph: &NavGraph, visible: &[bool; NUM_LINK_KINDS]) -> Vec<Line
             LinkKind::JumpGap => arc_pts(a, b, JUMP_APEX),
             LinkKind::DoubleJump => arc_pts(a, b, DOUBLE_ARC_PEAK),
             LinkKind::SpeedJump => match graph.speed_jump_of_link(li) {
-                Some(sj) => std::iter::once(a).chain(ballistic_pts(sj.takeoff, b, sj.airtime)).collect(),
+                Some(sj) => std::iter::once(a)
+                    .chain(ballistic_pts(sj.takeoff, b, sj.airtime))
+                    .collect(),
                 None => vec![a, b],
             },
             LinkKind::RocketJump => match graph.rocket_jump_of_link(li) {
-                Some(rj) => std::iter::once(a).chain(launch_pts(rj.pos_blast, rj.v0, rj.airtime)).collect(),
+                Some(rj) => std::iter::once(a)
+                    .chain(launch_pts(rj.pos_blast, rj.v0, rj.airtime))
+                    .collect(),
                 None => vec![a, b],
             },
             _ => vec![a, b],
@@ -570,8 +599,16 @@ pub fn nav_surface(graph: &NavGraph, bsp: &Bsp) -> Vec<LineVertex> {
                 if !supported {
                     continue;
                 }
-                let corner = |dx: f32, dy: f32| LineVertex { pos: [cx + dx * hs, cy + dy * hs, z], color };
-                let (a, b, c, d) = (corner(-1.0, -1.0), corner(1.0, -1.0), corner(1.0, 1.0), corner(-1.0, 1.0));
+                let corner = |dx: f32, dy: f32| LineVertex {
+                    pos: [cx + dx * hs, cy + dy * hs, z],
+                    color,
+                };
+                let (a, b, c, d) = (
+                    corner(-1.0, -1.0),
+                    corner(1.0, -1.0),
+                    corner(1.0, 1.0),
+                    corner(-1.0, 1.0),
+                );
                 out.extend_from_slice(&[a, b, c, a, c, d]);
             }
         }
@@ -611,8 +648,16 @@ pub fn nav_clusters(graph: &NavGraph, bsp: &Bsp) -> Vec<LineVertex> {
                 if !supported {
                     continue;
                 }
-                let corner = |dx: f32, dy: f32| LineVertex { pos: [cx + dx * hs, cy + dy * hs, z], color };
-                let (a, b, c, d) = (corner(-1.0, -1.0), corner(1.0, -1.0), corner(1.0, 1.0), corner(-1.0, 1.0));
+                let corner = |dx: f32, dy: f32| LineVertex {
+                    pos: [cx + dx * hs, cy + dy * hs, z],
+                    color,
+                };
+                let (a, b, c, d) = (
+                    corner(-1.0, -1.0),
+                    corner(1.0, -1.0),
+                    corner(1.0, 1.0),
+                    corner(-1.0, 1.0),
+                );
                 out.extend_from_slice(&[a, b, c, a, c, d]);
             }
         }
@@ -636,15 +681,23 @@ fn push_gradient(out: &mut Vec<LineVertex>, path: &[Vec3], color: [f32; 3]) {
         let c0 = shade(acc / total);
         acc += w[0].distance(w[1]);
         let c1 = shade(acc / total);
-        out.push(LineVertex { pos: w[0].to_array(), color: c0 });
-        out.push(LineVertex { pos: w[1].to_array(), color: c1 });
+        out.push(LineVertex {
+            pos: w[0].to_array(),
+            color: c0,
+        });
+        out.push(LineVertex {
+            pos: w[1].to_array(),
+            color: c1,
+        });
     }
 }
 
 /// Sample the shared jump parabola (`rtx_nav::navmesh::arc_point`) — the exact curve the build
 /// cleared — into `ARC_SEGMENTS + 1` points.
 fn arc_pts(a: Vec3, b: Vec3, apex: f32) -> Vec<Vec3> {
-    (0..=ARC_SEGMENTS).map(|i| arc_point(a, b, apex, i as f32 / ARC_SEGMENTS as f32)).collect()
+    (0..=ARC_SEGMENTS)
+        .map(|i| arc_point(a, b, apex, i as f32 / ARC_SEGMENTS as f32))
+        .collect()
 }
 
 /// A gravity parabola from `a` to `b` over airtime `t_land`: xy is linear, z fits both endpoints with
@@ -734,12 +787,19 @@ mod tests {
                 stopspeed: 100.0,
                 curl: true,
             }),
-            Some(RocketJumpParams { gravity: 800.0, rj_extra: 0.0 }),
+            Some(RocketJumpParams {
+                gravity: 800.0,
+                rj_extra: 0.0,
+            }),
         );
 
         // No jump-type link may take off from a submerged cell — you can't jump underwater.
-        let jump_kinds =
-            [LinkKind::JumpGap, LinkKind::DoubleJump, LinkKind::SpeedJump, LinkKind::RocketJump];
+        let jump_kinds = [
+            LinkKind::JumpGap,
+            LinkKind::DoubleJump,
+            LinkKind::SpeedJump,
+            LinkKind::RocketJump,
+        ];
         let submerged = graph.cells.iter().filter(|c| bsp.is_liquid_at(c.origin)).count();
         for link in &graph.links {
             if jump_kinds.contains(&link.kind) {
@@ -772,16 +832,31 @@ mod tests {
 
         let surface = nav_surface(&graph, &bsp);
         // Each cell emits 0..=SURF_SUB² supported sub-quads, 6 verts (2 triangles) each.
-        assert!(surface.len().is_multiple_of(6), "surface verts are 2-triangle sub-quads");
-        assert!(!surface.is_empty(), "a real map has standable footprint under its cells");
+        assert!(
+            surface.len().is_multiple_of(6),
+            "surface verts are 2-triangle sub-quads"
+        );
+        assert!(
+            !surface.is_empty(),
+            "a real map has standable footprint under its cells"
+        );
         let max = graph.cells.len() * (SURF_SUB * SURF_SUB) as usize * 6;
-        assert!(surface.len() <= max, "surface can't exceed a full SURF_SUB² tiling per cell");
-        assert!(surface.iter().all(|v| v.color == link_color(LinkKind::Walk)), "surface tiles are Walk-green");
+        assert!(
+            surface.len() <= max,
+            "surface can't exceed a full SURF_SUB² tiling per cell"
+        );
+        assert!(
+            surface.iter().all(|v| v.color == link_color(LinkKind::Walk)),
+            "surface tiles are Walk-green"
+        );
 
         let all_visible = [true; NUM_LINK_KINDS];
         let lines = nav_lines(&graph, &all_visible);
         assert!(lines.len().is_multiple_of(2), "lines are LineList pairs");
-        assert!(!lines.is_empty(), "a real map should have non-Walk links (steps/jumps/drops)");
+        assert!(
+            !lines.is_empty(),
+            "a real map should have non-Walk links (steps/jumps/drops)"
+        );
         assert!(
             !lines.iter().any(|v| v.color == link_color(LinkKind::Walk)),
             "Walk links must be excluded from the line overlay (they are the surface)"
@@ -789,7 +864,16 @@ mod tests {
 
         // Hiding a kind removes exactly its lines; hiding all leaves nothing.
         let none_visible = [false; NUM_LINK_KINDS];
-        assert!(nav_lines(&graph, &none_visible).is_empty(), "no kinds visible → no lines");
-        eprintln!("{}: {} cells → {} surface verts, {} line verts", path, graph.cells.len(), surface.len(), lines.len());
+        assert!(
+            nav_lines(&graph, &none_visible).is_empty(),
+            "no kinds visible → no lines"
+        );
+        eprintln!(
+            "{}: {} cells → {} surface verts, {} line verts",
+            path,
+            graph.cells.len(),
+            surface.len(),
+            lines.len()
+        );
     }
 }

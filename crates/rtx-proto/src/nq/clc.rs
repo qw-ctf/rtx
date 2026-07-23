@@ -87,7 +87,11 @@ mod tests {
     /// 1 + 4 + 3 + 6 + 1 + 1 = 16 bytes, and the echoed time round-trips.
     #[test]
     fn move_uses_8bit_angles_on_plain_proto15() {
-        let p = NqProtoState { version: NETQUAKE, flags: 0, proquake_angles: false };
+        let p = NqProtoState {
+            version: NETQUAKE,
+            flags: 0,
+            proquake_angles: false,
+        };
         let pkt = write_move(&p, 1.5, Vec3::new(0.0, 90.0, 0.0), 400, 0, 0, button::ATTACK, 7);
         assert_eq!(pkt.len(), 16);
         let mut r = Reader::new(&pkt);
@@ -108,7 +112,11 @@ mod tests {
     /// With ProQuake agreed, the same move uses 16-bit angles, growing the packet by three bytes.
     #[test]
     fn move_uses_16bit_angles_with_proquake() {
-        let p = NqProtoState { version: NETQUAKE, flags: 0, proquake_angles: true };
+        let p = NqProtoState {
+            version: NETQUAKE,
+            flags: 0,
+            proquake_angles: true,
+        };
         let pkt = write_move(&p, 0.0, Vec3::new(0.0, 90.0, 0.0), 0, 0, 0, 0, 0);
         assert_eq!(pkt.len(), 19); // 16 + 3 for the wider angles
     }
@@ -116,7 +124,10 @@ mod tests {
     /// The reliable helpers are single-purpose and tiny, but the opcode bytes must be exact.
     #[test]
     fn stringcmd_and_control_bytes() {
-        assert_eq!(write_stringcmd("begin"), [op::STRINGCMD, b'b', b'e', b'g', b'i', b'n', 0]);
+        assert_eq!(
+            write_stringcmd("begin"),
+            [op::STRINGCMD, b'b', b'e', b'g', b'i', b'n', 0]
+        );
         assert_eq!(write_nop(), [op::NOP]);
         assert_eq!(write_disconnect(), [op::DISCONNECT]);
     }

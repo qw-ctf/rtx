@@ -34,7 +34,13 @@ pub struct PmParams {
 
 impl Default for PmParams {
     fn default() -> Self {
-        PmParams { gravity: 800.0, accel: 10.0, friction: 4.0, stopspeed: 100.0, maxspeed: 320.0 }
+        PmParams {
+            gravity: 800.0,
+            accel: 10.0,
+            friction: 4.0,
+            stopspeed: 100.0,
+            maxspeed: 320.0,
+        }
     }
 }
 

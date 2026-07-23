@@ -28,7 +28,10 @@ pub(crate) struct ModeChoice {
 
 impl ModeChoice {
     fn new(mode: &'static str, composition: &str) -> ModeChoice {
-        ModeChoice { mode, composition: composition.to_string() }
+        ModeChoice {
+            mode,
+            composition: composition.to_string(),
+        }
     }
 }
 
@@ -168,7 +171,11 @@ mod tests {
 
         // Open deathmatch, both flavours of the head.
         assert_eq!(rtx("ffa"), ModeChoice::new("dm", "ffa"));
-        assert_eq!(rtx("1on1"), ModeChoice::new("dm", "ffa"), "a duel is open play — teams come via userinfo");
+        assert_eq!(
+            rtx("1on1"),
+            ModeChoice::new("dm", "ffa"),
+            "a duel is open play — teams come via userinfo"
+        );
 
         // Team deathmatch keeps its composition for `resolve_composition`.
         assert_eq!(rtx("2on2"), ModeChoice::new("dm", "2on2"));
@@ -185,7 +192,11 @@ mod tests {
         // The one ambiguity: `-ra` is rtx's arena only on an rtx server. KTX's "RA" is a winner-stays
         // duel, which the deathmatch brain plays right.
         assert_eq!(rtx("1on1-ra"), ModeChoice::new("ra", "ffa"));
-        assert_eq!(ktx("1on1-ra"), ModeChoice::new("dm", "ffa"), "KTX RA is a duel, not rtx's arena");
+        assert_eq!(
+            ktx("1on1-ra"),
+            ModeChoice::new("dm", "ffa"),
+            "KTX RA is a duel, not rtx's arena"
+        );
 
         // KTX modes we don't model get the deathmatch brain and let the server enforce the rules.
         assert_eq!(ktx("4on4-ca"), ModeChoice::new("dm", "4on4"));
@@ -223,8 +234,15 @@ mod tests {
 
         // A KTX server (ktxver, no rtxver): advertises no rtx moves → every one off.
         let ktx = movement_overrides(&info(&[("ktxver", "1.48"), ("mode", "ffa")]), never);
-        assert_eq!(get(&ktx, "rtx_doublejump").as_deref(), Some("0"), "no double jump on KTX");
-        assert!(ktx.iter().all(|(_, v)| v == "0"), "every rtx move off on a non-rtx server");
+        assert_eq!(
+            get(&ktx, "rtx_doublejump").as_deref(),
+            Some("0"),
+            "no double jump on KTX"
+        );
+        assert!(
+            ktx.iter().all(|(_, v)| v == "0"),
+            "every rtx move off on a non-rtx server"
+        );
 
         // A vanilla server (nothing advertised): same — off.
         assert!(movement_overrides(&info(&[]), never).iter().all(|(_, v)| v == "0"));
@@ -236,8 +254,16 @@ mod tests {
             never,
         );
         assert_eq!(get(&rtx, "rtx_doublejump").as_deref(), Some("1"), "advertised on → on");
-        assert_eq!(get(&rtx, "rtx_elevator_jump").as_deref(), Some("2"), "the multiplier, verbatim");
-        assert_eq!(get(&rtx, "rtx_walljump").as_deref(), Some("0"), "not advertised (server has it off) → off");
+        assert_eq!(
+            get(&rtx, "rtx_elevator_jump").as_deref(),
+            Some("2"),
+            "the multiplier, verbatim"
+        );
+        assert_eq!(
+            get(&rtx, "rtx_walljump").as_deref(),
+            Some("0"),
+            "not advertised (server has it off) → off"
+        );
 
         // The operator's `+set` is the last word — the pinned key doesn't appear.
         let pinned = |k: &str| k == "rtx_doublejump";
@@ -248,11 +274,19 @@ mod tests {
     #[test]
     fn reads_the_match_phase_like_ezquake() {
         assert_eq!(match_phase(&info(&[("status", "Standby")])), Phase::Warmup);
-        assert_eq!(match_phase(&info(&[("status", "standby")])), Phase::Warmup, "case-insensitive");
+        assert_eq!(
+            match_phase(&info(&[("status", "standby")])),
+            Phase::Warmup,
+            "case-insensitive"
+        );
         assert_eq!(match_phase(&info(&[("status", "Countdown")])), Phase::Countdown);
         assert_eq!(match_phase(&info(&[("status", "Forcestart")])), Phase::Countdown);
         assert_eq!(match_phase(&info(&[("status", "7 min left")])), Phase::Live);
         assert_eq!(match_phase(&info(&[("status", "in progress")])), Phase::Live);
-        assert_eq!(match_phase(&info(&[])), Phase::Live, "no status = open play = always live");
+        assert_eq!(
+            match_phase(&info(&[])),
+            Phase::Live,
+            "no status = open play = always live"
+        );
     }
 }

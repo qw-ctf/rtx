@@ -124,7 +124,9 @@ fn main() -> std::io::Result<()> {
     while start.elapsed() < deadline {
         // --- receive (bounded per tick, so the send phase still gets a turn under a fast stream) ---
         for _ in 0..64 {
-            let Ok((len, _from)) = sock.recv_from(&mut buf) else { break };
+            let Ok((len, _from)) = sock.recv_from(&mut buf) else {
+                break;
+            };
             let data = &buf[..len];
             if let Some(dir) = &args.out {
                 nfix += 1;
@@ -134,9 +136,19 @@ fn main() -> std::io::Result<()> {
             // Control packets (the handshake) live outside the netchan.
             if connect::is_control(data) {
                 match connect::parse_control(data) {
-                    Some(Ccrep::Accept { port, proquake, ignore_port }) if state == State::Connecting => {
+                    Some(Ccrep::Accept {
+                        port,
+                        proquake,
+                        ignore_port,
+                    }) if state == State::Connecting => {
                         proto.proquake_angles = proquake;
-                        if let Some(p) = (Ccrep::Accept { port, proquake, ignore_port }).switch_to() {
+                        if let Some(p) = (Ccrep::Accept {
+                            port,
+                            proquake,
+                            ignore_port,
+                        })
+                        .switch_to()
+                        {
                             server.set_port(p);
                             eprintln!("probe_nq: accepted; switching to data port {p}");
                         } else {
@@ -167,7 +179,10 @@ fn main() -> std::io::Result<()> {
             let events = match svc::parse(&mut proto, &payload) {
                 Ok(e) => e,
                 Err(e) => {
-                    eprintln!("\nprobe_nq: PARSE FAILED after {:.1}s: {e}", start.elapsed().as_secs_f32());
+                    eprintln!(
+                        "\nprobe_nq: PARSE FAILED after {:.1}s: {e}",
+                        start.elapsed().as_secs_f32()
+                    );
                     eprintln!("probe_nq: state={state:?} proto={proto:?}");
                     eprintln!("{}", rtx_proto::svc::hexdump(&payload));
                     std::process::exit(1);
@@ -181,9 +196,13 @@ fn main() -> std::io::Result<()> {
                         eprintln!(
                             "probe_nq: serverinfo: protocol={} flags=0x{:x} maxclients={} gametype={} \
                              map={:?}\nprobe_nq:   {} models, {} sounds",
-                            sd.protocol, sd.flags, sd.maxclients, sd.gametype,
+                            sd.protocol,
+                            sd.flags,
+                            sd.maxclients,
+                            sd.gametype,
                             sd.models.get(1).map(|s| s.as_str()).unwrap_or("?"),
-                            sd.models.len().saturating_sub(1), sd.sounds.len().saturating_sub(1),
+                            sd.models.len().saturating_sub(1),
+                            sd.sounds.len().saturating_sub(1),
                         );
                     }
                     SvcEvent::SignonNum(n) => {
@@ -279,7 +298,11 @@ fn record_c2s(args: &Args, nfix: &mut u32, data: &[u8]) -> std::io::Result<()> {
 fn report(census: &BTreeMap<&'static str, u32>, fixtures: u32, state: State) {
     eprintln!(
         "\nprobe_nq: parsed cleanly. state={state:?}{}",
-        if fixtures > 0 { format!(", {fixtures} fixtures written") } else { String::new() }
+        if fixtures > 0 {
+            format!(", {fixtures} fixtures written")
+        } else {
+            String::new()
+        }
     );
     eprintln!("probe_nq: message census:");
     let mut rows: Vec<_> = census.iter().collect();

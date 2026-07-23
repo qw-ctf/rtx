@@ -39,7 +39,13 @@ fn clear_trace(end: Vec3, ent: EntId) -> TraceResult {
 /// caller believe it can see through an unloaded world; `droptofloor` would think every item is
 /// floating and refuse to settle it. Only reachable in the netclient's transient pre-map window.
 fn no_map(start: Vec3) -> TraceResult {
-    TraceResult { allsolid: true, startsolid: true, fraction: 0.0, endpos: start, ..clear_trace(start, EntId::WORLD) }
+    TraceResult {
+        allsolid: true,
+        startsolid: true,
+        fraction: 0.0,
+        endpos: start,
+        ..clear_trace(start, EntId::WORLD)
+    }
 }
 
 /// A [`rtx_nav::bsp::HullTrace`] plus an owning entity, in `TraceResult` shape.
@@ -239,7 +245,12 @@ mod tests {
     }
 
     fn world_model() -> Model {
-        Model { mins: Vec3::splat(-4096.0), maxs: Vec3::splat(4096.0), render_head: CONTENTS_EMPTY, clip1: CONTENTS_EMPTY }
+        Model {
+            mins: Vec3::splat(-4096.0),
+            maxs: Vec3::splat(4096.0),
+            render_head: CONTENTS_EMPTY,
+            clip1: CONTENTS_EMPTY,
+        }
     }
 
     const HORIZ: Vec3 = Vec3::new(200.0, 0.0, 0.0);
@@ -269,22 +280,42 @@ mod tests {
         let e = box_ent(&mut g, 2, Vec3::new(100.0, 0.0, 0.0));
         for solid in [Solid::Trigger, Solid::Not] {
             g.entities[e].v.solid = solid;
-            assert_eq!(g.sv_trace(Vec3::ZERO, HORIZ, false, ig).fraction, 1.0, "{solid:?} must not clip");
+            assert_eq!(
+                g.sv_trace(Vec3::ZERO, HORIZ, false, ig).fraction,
+                1.0,
+                "{solid:?} must not clip"
+            );
         }
         // A freed (not in_use) solid box is likewise invisible to the trace.
         g.entities[e].v.solid = Solid::SlideBox;
         g.entities[e].in_use = false;
-        assert_eq!(g.sv_trace(Vec3::ZERO, HORIZ, false, ig).fraction, 1.0, "a freed entity must not clip");
+        assert_eq!(
+            g.sv_trace(Vec3::ZERO, HORIZ, false, ig).fraction,
+            1.0,
+            "a freed entity must not clip"
+        );
     }
 
     #[test]
     fn nomonsters_skips_boxes_but_clips_a_bsp_door() {
         let mut g = game();
         // World hull 0 is one node: a half-space wall solid at local x ≥ 0 (front), empty behind.
-        let planes = vec![Plane { normal: Vec3::new(1.0, 0.0, 0.0), dist: 0.0, kind: 0 }];
-        let nodes = vec![ClipNode { plane: 0, children: [CONTENTS_SOLID, CONTENTS_EMPTY] }];
+        let planes = vec![Plane {
+            normal: Vec3::new(1.0, 0.0, 0.0),
+            dist: 0.0,
+            kind: 0,
+        }];
+        let nodes = vec![ClipNode {
+            plane: 0,
+            children: [CONTENTS_SOLID, CONTENTS_EMPTY],
+        }];
         // models[0] world = open air; models[1] the door submodel = that wall, rooted at node 0.
-        let door_model = Model { mins: Vec3::splat(-64.0), maxs: Vec3::splat(64.0), render_head: 0, clip1: 0 };
+        let door_model = Model {
+            mins: Vec3::splat(-64.0),
+            maxs: Vec3::splat(64.0),
+            render_head: 0,
+            clip1: 0,
+        };
         let bsp = Bsp::synthetic(planes, nodes, CONTENTS_EMPTY, vec![world_model(), door_model]);
         g.nav.bsp = Some(Arc::new(bsp));
 
@@ -302,7 +333,11 @@ mod tests {
         // nomonsters skips the box player but still clips the door — at world x ≈ 50.
         let tr = g.sv_trace(Vec3::ZERO, HORIZ, true, ig);
         assert_eq!(tr.ent, door, "nomonsters keeps clipping a brush door");
-        assert!((tr.endpos.x - 50.0).abs() < 0.5, "door impact offset by its origin: {:?}", tr.endpos);
+        assert!(
+            (tr.endpos.x - 50.0).abs() < 0.5,
+            "door impact offset by its origin: {:?}",
+            tr.endpos
+        );
 
         // Without nomonsters the nearer box player (front face at x = 14) wins instead.
         let tr = g.sv_trace(Vec3::ZERO, HORIZ, false, ig);
@@ -321,7 +356,7 @@ mod tests {
         g.entities[rocket].v.origin = Vec3::new(100.0, 0.0, 0.0);
         g.entities[rocket].v.mins = Vec3::ZERO;
         g.entities[rocket].v.maxs = Vec3::ZERO; // zero size → a point
-        // The sized shooter's trace passes straight through the point projectile.
+                                                // The sized shooter's trace passes straight through the point projectile.
         let tr = g.sv_trace(Vec3::ZERO, HORIZ, false, shooter);
         assert_eq!(tr.fraction, 1.0, "a sized shooter never hits a zero-size touch");
     }
@@ -335,17 +370,29 @@ mod tests {
 
         // The shooter's own missile doesn't clip it.
         g.entities[missile].set_owner(shooter);
-        assert_eq!(g.sv_trace(Vec3::ZERO, HORIZ, false, shooter).fraction, 1.0, "own missile skipped");
+        assert_eq!(
+            g.sv_trace(Vec3::ZERO, HORIZ, false, shooter).fraction,
+            1.0,
+            "own missile skipped"
+        );
 
         // The other direction: a trace by the missile doesn't clip its owner (the shooter) either —
         // put the shooter in the path to prove it.
         g.entities[shooter].v.origin = Vec3::new(100.0, 0.0, 0.0);
         g.entities[missile].v.origin = Vec3::new(-50.0, 0.0, 0.0);
-        assert_eq!(g.sv_trace(Vec3::ZERO, HORIZ, false, missile).fraction, 1.0, "owner skipped");
+        assert_eq!(
+            g.sv_trace(Vec3::ZERO, HORIZ, false, missile).fraction,
+            1.0,
+            "owner skipped"
+        );
 
         // The owner==0 → world quirk: an ownerless solid, traced with ignore=WORLD, is skipped.
         g.entities[shooter].set_owner(EntId::WORLD); // raw 0
-        assert_eq!(g.sv_trace(Vec3::ZERO, HORIZ, false, EntId::WORLD).fraction, 1.0, "ownerless + ignore=world skipped");
+        assert_eq!(
+            g.sv_trace(Vec3::ZERO, HORIZ, false, EntId::WORLD).fraction,
+            1.0,
+            "ownerless + ignore=world skipped"
+        );
     }
 
     #[test]
@@ -358,7 +405,10 @@ mod tests {
         box_ent(&mut g, 1, Vec3::ZERO); // start point (0,0,0) is inside this box
         let near = box_ent(&mut g, 2, Vec3::new(60.0, 0.0, 0.0));
         let tr = g.sv_trace(Vec3::ZERO, HORIZ, false, ig);
-        assert!(tr.startsolid, "starting inside a box flags startsolid, kept across candidates");
+        assert!(
+            tr.startsolid,
+            "starting inside a box flags startsolid, kept across candidates"
+        );
         assert_eq!(tr.ent, near, "the nearest impact still wins the whole trace");
     }
 }

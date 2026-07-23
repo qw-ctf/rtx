@@ -30,7 +30,11 @@ use gpu::Gpu;
 /// Delivered from the background navmesh-build thread back to the event loop. The BSP is parsed on
 /// the main thread and shared into the worker, so it rides back alongside the finished graph.
 enum UserEvent {
-    NavBuilt { generation: u64, bsp: Arc<Bsp>, graph: NavGraph },
+    NavBuilt {
+        generation: u64,
+        bsp: Arc<Bsp>,
+        graph: NavGraph,
+    },
 }
 
 /// A noclip fly camera: a position plus yaw/pitch look angles (Quake Z-up, right-handed).
@@ -64,7 +68,11 @@ impl FlyCamera {
 
 impl Default for FlyCamera {
     fn default() -> Self {
-        FlyCamera { pos: Vec3::new(-256.0, 0.0, 128.0), yaw: 0.0, pitch: -0.3 }
+        FlyCamera {
+            pos: Vec3::new(-256.0, 0.0, 128.0),
+            yaw: 0.0,
+            pitch: -0.3,
+        }
     }
 }
 
@@ -122,7 +130,9 @@ impl App {
     /// Regenerate and upload the navmesh overlay (filled walkable surface + colored link lines) from
     /// the current graph and path-type visibility. Cheap enough to redo on every toggle change.
     fn rebuild_overlay(&mut self) {
-        let (Some(gpu), Some((bsp, graph))) = (self.gpu.as_mut(), self.nav.as_ref()) else { return };
+        let (Some(gpu), Some((bsp, graph))) = (self.gpu.as_mut(), self.nav.as_ref()) else {
+            return;
+        };
         if !self.visible[geom::kind_index(rtx_nav::navmesh::LinkKind::Walk)] {
             gpu.set_surface(&[]);
         } else if self.clusters {
@@ -149,7 +159,10 @@ impl App {
         let mut visible = self.visible;
         let mut clusters = self.clusters;
         let full = ctx.run_ui(raw_input, |ui| build_panel(ui, &mut visible, &mut clusters));
-        self.egui_state.as_mut().unwrap().handle_platform_output(&window, full.platform_output);
+        self.egui_state
+            .as_mut()
+            .unwrap()
+            .handle_platform_output(&window, full.platform_output);
 
         if visible != self.visible || clusters != self.clusters {
             self.visible = visible;
@@ -172,7 +185,10 @@ impl App {
     /// Load a BSP: show its grey geometry immediately, then build the navmesh on a worker thread.
     fn load(&mut self, path: &Path) {
         let Some(gpu) = self.gpu.as_mut() else { return };
-        let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
 
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
@@ -224,7 +240,10 @@ impl App {
                     stopspeed: 100.0,
                     curl: true,
                 }),
-                Some(RocketJumpParams { gravity: 800.0, rj_extra: 0.0 }),
+                Some(RocketJumpParams {
+                    gravity: 800.0,
+                    rj_extra: 0.0,
+                }),
             );
             let _ = proxy.send_event(UserEvent::NavBuilt { generation, bsp, graph });
         });
@@ -260,7 +279,9 @@ impl App {
         w.set_cursor_visible(!on);
         if on {
             // Locked is ideal but unsupported on some platforms — fall back to Confined.
-            let _ = w.set_cursor_grab(CursorGrabMode::Locked).or_else(|_| w.set_cursor_grab(CursorGrabMode::Confined));
+            let _ = w
+                .set_cursor_grab(CursorGrabMode::Locked)
+                .or_else(|_| w.set_cursor_grab(CursorGrabMode::Confined));
         } else {
             let _ = w.set_cursor_grab(CursorGrabMode::None);
         }
@@ -313,7 +334,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::DroppedFile(path) => self.load(&path),
             WindowEvent::RedrawRequested => self.draw(),
-            WindowEvent::MouseInput { state, button: MouseButton::Right, .. } => {
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Right,
+                ..
+            } => {
                 self.set_looking(state == ElementState::Pressed);
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -374,7 +399,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
         // Poll (drive continuous movement) only while a move key is held; otherwise idle in Wait.
-        el.set_control_flow(if self.keys.is_empty() { ControlFlow::Wait } else { ControlFlow::Poll });
+        el.set_control_flow(if self.keys.is_empty() {
+            ControlFlow::Wait
+        } else {
+            ControlFlow::Poll
+        });
     }
 }
 

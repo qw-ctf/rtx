@@ -146,7 +146,12 @@ fn main() -> std::io::Result<()> {
 
             if oob::is_oob(data) {
                 match oob::parse(data) {
-                    Some(oob::Oob::Challenge { challenge, fte, fte2, mvd1 }) if state == State::Challenge => {
+                    Some(oob::Oob::Challenge {
+                        challenge,
+                        fte,
+                        fte2,
+                        mvd1,
+                    }) if state == State::Challenge => {
                         let n = oob::Negotiated::intersect(fte, fte2, mvd1);
                         eprintln!(
                             "probe: challenge {challenge}; server offers fte=0x{fte:x} fte2=0x{fte2:x} \
@@ -197,10 +202,21 @@ fn main() -> std::io::Result<()> {
                             "probe: serverdata: gamedir={} map={:?} playernum={} spectator={} \
                              count={}\nprobe:   negotiated fte=0x{:x} fte2=0x{:x} mvd1=0x{:x} → coord={}B angle={}B\n\
                              probe:   movevars: gravity={} maxspeed={} accel={} airaccel={} friction={}",
-                            sd.gamedir, sd.levelname, sd.playernum, sd.spectator, sd.servercount,
-                            sd.fte, sd.fte2, sd.mvd1, proto.coord_bytes, proto.angle_bytes,
-                            sd.movevars.gravity, sd.movevars.maxspeed, sd.movevars.accelerate,
-                            sd.movevars.airaccelerate, sd.movevars.friction,
+                            sd.gamedir,
+                            sd.levelname,
+                            sd.playernum,
+                            sd.spectator,
+                            sd.servercount,
+                            sd.fte,
+                            sd.fte2,
+                            sd.mvd1,
+                            proto.coord_bytes,
+                            proto.angle_bytes,
+                            sd.movevars.gravity,
+                            sd.movevars.maxspeed,
+                            sd.movevars.accelerate,
+                            sd.movevars.airaccelerate,
+                            sd.movevars.friction,
                         );
                         servercount = sd.servercount;
                         gamedir = sd.gamedir.clone();
@@ -244,11 +260,13 @@ fn main() -> std::io::Result<()> {
                                 modellist.len(),
                                 modellist.first().map(|s| s.as_str()).unwrap_or("?"),
                                 checksum as u32,
-                                if checksum == 0 { "  (no basedir — server may refuse)" } else { "" }
+                                if checksum == 0 {
+                                    "  (no basedir — server may refuse)"
+                                } else {
+                                    ""
+                                }
                             );
-                            chan.queue_reliable(&clc::write_stringcmd(&format!(
-                                "prespawn {servercount} 0 {checksum}"
-                            )));
+                            chan.queue_reliable(&clc::write_stringcmd(&format!("prespawn {servercount} 0 {checksum}")));
                         }
                     }
                     SvcEvent::StuffText(t) => {
@@ -318,7 +336,12 @@ fn main() -> std::io::Result<()> {
                 // A spectator still has to send moves, or the server times us out.
                 let cmd = clc::make_usercmd(25, glam::Vec3::ZERO, 0, 0, 0, 0, 0);
                 clc::write_move(
-                    &clc::Move { oldest: cmd, previous: cmd, current: cmd, loss: 0 },
+                    &clc::Move {
+                        oldest: cmd,
+                        previous: cmd,
+                        current: cmd,
+                        loss: 0,
+                    },
                     chan.outgoing_sequence,
                     delta_ack,
                 )
@@ -372,8 +395,16 @@ fn report(
     state: State,
     delta_mismatch: u32,
 ) {
-    eprintln!("\nprobe: parsed cleanly. state={state:?}, {} sounds, {} models{}", sounds.len(), models.len(),
-        if fixtures > 0 { format!(", {fixtures} fixtures written") } else { String::new() });
+    eprintln!(
+        "\nprobe: parsed cleanly. state={state:?}, {} sounds, {} models{}",
+        sounds.len(),
+        models.len(),
+        if fixtures > 0 {
+            format!(", {fixtures} fixtures written")
+        } else {
+            String::new()
+        }
+    );
     if delta_mismatch > 0 {
         eprintln!("probe: {delta_mismatch} delta updates referenced a frame we hadn't acked");
     }

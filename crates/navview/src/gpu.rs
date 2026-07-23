@@ -292,7 +292,12 @@ impl Gpu {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.08, g: 0.09, b: 0.10, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.08,
+                            g: 0.09,
+                            b: 0.10,
+                            a: 1.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -342,7 +347,10 @@ impl Gpu {
                         view: &view,
                         resolve_target: None,
                         depth_slice: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
                     })],
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
@@ -356,7 +364,8 @@ impl Gpu {
             self.egui_renderer.free_texture(id);
         }
 
-        self.queue.submit(egui_cmds.into_iter().chain(std::iter::once(encoder.finish())));
+        self.queue
+            .submit(egui_cmds.into_iter().chain(std::iter::once(encoder.finish())));
         frame.present();
     }
 }
@@ -365,7 +374,11 @@ fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
     device
         .create_texture(&wgpu::TextureDescriptor {
             label: Some("depth"),
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -391,8 +404,7 @@ fn make_pipeline(
     stride: u64,
 ) -> wgpu::RenderPipeline {
     // Both vertex formats are two vec3s (pos, normal|color) → the same attribute layout.
-    const ATTRS: [wgpu::VertexAttribute; 2] =
-        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+    const ATTRS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("navview pipeline"),
         layout: Some(layout),

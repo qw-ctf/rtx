@@ -45,7 +45,10 @@ impl GameState {
         // (kicking off a wall we're moving into) takes priority over the once-per-air-travel double
         // jump. If neither mid-air jump fires, bail without the jump-release/sound below (the ground
         // jump's own impulse is the engine's pmove job).
-        if !self.try_elevator_jump(e) && !flags.has(Flags::ONGROUND) && !self.try_wall_jump(e) && !self.try_double_jump(e)
+        if !self.try_elevator_jump(e)
+            && !flags.has(Flags::ONGROUND)
+            && !self.try_wall_jump(e)
+            && !self.try_double_jump(e)
         {
             return;
         }
@@ -281,7 +284,12 @@ impl GameState {
         let time = self.time();
         let (waterlevel, watertype, dmgtime, radsuit) = {
             let ent = &self.entities[e];
-            (ent.v.waterlevel, ent.v.watertype, ent.combat.dmgtime, ent.combat.radsuit_finished)
+            (
+                ent.v.waterlevel,
+                ent.v.watertype,
+                ent.combat.dmgtime,
+                ent.combat.radsuit_finished,
+            )
         };
         if watertype.is(Content::Lava) && dmgtime < time {
             self.entities[e].combat.dmgtime = if radsuit > time { time + 1.0 } else { time + 0.2 };

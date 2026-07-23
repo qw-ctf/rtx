@@ -458,7 +458,9 @@ impl GameState {
             } else if next.name() == "ctf" {
                 if let Some(p) = team::parse_match_alias(match_alias) {
                     if p.teams != 2 {
-                        host.conprint(&cstring("rtx: CTF is always 2 teams — clamping the format to 2 sides.\n"));
+                        host.conprint(&cstring(
+                            "rtx: CTF is always 2 teams — clamping the format to 2 sides.\n",
+                        ));
                     }
                 }
             }

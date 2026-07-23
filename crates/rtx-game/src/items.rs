@@ -541,8 +541,7 @@ impl GameState {
             it.think = Think::SubRemove;
         }
         self.set_model(item, model);
-        self
-            .set_size(item, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
+        self.set_size(item, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
         item
     }
 
@@ -722,8 +721,7 @@ impl GameState {
         self.entities[e].set_touch(Touch::ItemArmor);
         self.set_item_model(e, Model::PROGS_ARMOR);
         self.entities[e].v.skin = skin;
-        self
-            .set_size(e, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
+        self.set_size(e, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
         self.start_item(e);
         true
     }
@@ -750,8 +748,7 @@ impl GameState {
         self.set_item_model(e, model);
         self.entities[e].set_touch(Touch::ItemWeapon);
         self.entities[e].netname = Some(spec.pickup_name.into());
-        self
-            .set_size(e, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
+        self.set_size(e, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
         self.start_item(e);
         true
     }
@@ -807,8 +804,7 @@ impl GameState {
             ent.v.items = item_bit.as_f32();
             ent.v.effects = ent.v.effects.with(effect);
         }
-        self
-            .set_size(e, Vec3::new(-16.0, -16.0, -24.0), Vec3::new(16.0, 16.0, 32.0));
+        self.set_size(e, Vec3::new(-16.0, -16.0, -24.0), Vec3::new(16.0, 16.0, 32.0));
         self.start_item(e);
         true
     }

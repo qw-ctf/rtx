@@ -199,7 +199,8 @@ mod tests {
             self.acked = w1 & !(1 << 31);
             if has_reliable != 0 {
                 self.seen_reliable_bit ^= 1;
-                self.received.push(pkt[HEADER_BYTES..HEADER_BYTES + reliable_len].to_vec());
+                self.received
+                    .push(pkt[HEADER_BYTES..HEADER_BYTES + reliable_len].to_vec());
             }
         }
 
@@ -316,14 +317,22 @@ mod tests {
 
         c.queue_reliable(b"prespawn");
         let lost = c.transmit(b"");
-        assert_eq!(lost[0..4], (1u32 | 1 << 31).to_le_bytes(), "sent as packet 1, reliable bit set");
+        assert_eq!(
+            lost[0..4],
+            (1u32 | 1 << 31).to_le_bytes(),
+            "sent as packet 1, reliable bit set"
+        );
 
         // The packet never arrives. The server acks later packets of ours, still echoing the
         // *stale* reliable bit (0) — that mismatch is what tells us it was lost.
         s.acked = 2;
         c.process(&s.send());
         let held = c.transmit(b"");
-        assert_eq!(held[0..4], 2u32.to_le_bytes(), "no resend yet — ack hasn't passed the mark");
+        assert_eq!(
+            held[0..4],
+            2u32.to_le_bytes(),
+            "no resend yet — ack hasn't passed the mark"
+        );
 
         s.acked = 4;
         c.process(&s.send());
@@ -385,7 +394,11 @@ mod tests {
         c.queue_reliable(b"reliable");
         let huge = vec![0xaa; MAX_MSGLEN];
         let pkt = c.transmit(&huge);
-        assert_eq!(pkt.len(), HEADER_BYTES + 8, "reliable kept, oversized unreliable dropped");
+        assert_eq!(
+            pkt.len(),
+            HEADER_BYTES + 8,
+            "reliable kept, oversized unreliable dropped"
+        );
         assert_eq!(&pkt[HEADER_BYTES..], b"reliable");
 
         let pkt = c.transmit(b"small");

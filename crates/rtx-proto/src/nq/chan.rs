@@ -214,7 +214,12 @@ impl NqChan {
         let len = remaining.min(RELIABLE_FRAGMENT);
         let seq = self.send_seq;
         self.send_seq += 1;
-        self.active = Some(Active { seq, off: self.cur_off, len, eom: len == remaining });
+        self.active = Some(Active {
+            seq,
+            off: self.cur_off,
+            len,
+            eom: len == remaining,
+        });
         self.active_sent = false;
     }
 

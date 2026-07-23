@@ -60,7 +60,15 @@ const MAX_MOVE: i32 = 127 * 4;
 /// a bot that aims with full precision and sends 16-bit is aiming somewhere slightly different from
 /// where it thinks. Moves go through [`quantize_move`], so what we send is what a real client could
 /// have sent.
-pub fn make_usercmd(msec: u8, angles: glam::Vec3, forward: i16, side: i16, up: i16, buttons: u8, impulse: u8) -> Usercmd {
+pub fn make_usercmd(
+    msec: u8,
+    angles: glam::Vec3,
+    forward: i16,
+    side: i16,
+    up: i16,
+    buttons: u8,
+    impulse: u8,
+) -> Usercmd {
     Usercmd {
         msec: msec.min(MAX_MSEC),
         angles: glam::Vec3::new(
@@ -277,7 +285,15 @@ mod tests {
     #[test]
     fn delta_usercmd_round_trips() {
         let from = cmd(13, 90.0, 0, 0);
-        let to = make_usercmd(14, Vec3::new(-10.0, 95.0, 0.0), 400, -200, 100, button::ATTACK | button::JUMP, 7);
+        let to = make_usercmd(
+            14,
+            Vec3::new(-10.0, 95.0, 0.0),
+            400,
+            -200,
+            100,
+            button::ATTACK | button::JUMP,
+            7,
+        );
 
         let mut w = Writer::new();
         let bits = write_delta_usercmd(&mut w, &from, &to);
@@ -378,10 +394,7 @@ mod tests {
         assert_eq!(write_stringcmd("new"), vec![op::STRINGCMD, b'n', b'e', b'w', 0]);
         let pkt = write_stringcmd("prespawn 5 0 12345");
         assert_eq!(pkt[0], op::STRINGCMD);
-        assert_eq!(
-            Reader::new(&pkt[1..]).string().unwrap(),
-            "prespawn 5 0 12345"
-        );
+        assert_eq!(Reader::new(&pkt[1..]).string().unwrap(), "prespawn 5 0 12345");
     }
 
     /// A move packet must fit comfortably inside a datagram alongside the netchan header — this is
@@ -389,7 +402,12 @@ mod tests {
     #[test]
     fn move_packet_is_small() {
         let big = make_usercmd(13, Vec3::new(1.0, 2.0, 3.0), 400, 400, 400, 7, 9);
-        let m = Move { oldest: big, previous: big, current: big, loss: 100 };
+        let m = Move {
+            oldest: big,
+            previous: big,
+            current: big,
+            loss: 100,
+        };
         let pkt = write_move(&m, 1, Some(0));
         assert!(pkt.len() < 64, "{} bytes", pkt.len());
 

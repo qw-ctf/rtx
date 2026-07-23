@@ -290,9 +290,7 @@ impl GameState {
         if self.entities[e].targetname.is_some() && self.entities[e].v.nextthink < time {
             return;
         }
-        if self.entities[e].v.spawnflags.has(TeleportFlags::PLAYER_ONLY)
-            && !self.entities[other].is_player()
-        {
+        if self.entities[e].v.spawnflags.has(TeleportFlags::PLAYER_ONLY) && !self.entities[other].is_player() {
             return;
         }
         {

@@ -46,7 +46,11 @@ pub fn manage_population(game: &mut GameState) {
             .filter(|&e| game.entities[e].bot.is_bot)
             .map(|e| game.netname_of(e))
             .collect();
-        let missing = game.team_match.bot_roster.iter().enumerate()
+        let missing = game
+            .team_match
+            .bot_roster
+            .iter()
+            .enumerate()
             .find(|(_, name)| !active.contains(name))
             .map(|(index, name)| (index as i32, name.clone()));
         if let Some((index, name)) = missing {
@@ -142,7 +146,12 @@ pub(crate) unsafe fn drain_roster(game: *mut GameState) {
 /// through. A **structured** match caps the fill to the empty seats during warmup — so bots exactly
 /// top up teams×size around the humans — and returns `None` (freeze: don't add or trim) once the
 /// match is live, since a fresh bot would only be benched and a trim could drop a rostered one. Pure.
-pub(super) fn bot_target(cvar_want: i32, humans: i32, cfg: crate::mode::team::MatchConfig, in_warmup: bool) -> Option<i32> {
+pub(super) fn bot_target(
+    cvar_want: i32,
+    humans: i32,
+    cfg: crate::mode::team::MatchConfig,
+    in_warmup: bool,
+) -> Option<i32> {
     let structured = cfg.teams >= 2 && cfg.size >= 1;
     if !structured {
         return Some(cvar_want);

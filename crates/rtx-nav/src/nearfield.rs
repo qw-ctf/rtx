@@ -145,12 +145,20 @@ impl NearField {
         let center = Vec3::new(snap(origin.x), snap(origin.y), origin.z);
         // Place the corner so the bot's column (`N/2`) is *centred* on the bot — a half-cell shift, so
         // the left/right (and up/down) samples land symmetrically and symmetric obstacles truly cancel.
-        let corner = Vec3::new(center.x - NEAR_HALF - NEAR_RES * 0.5, center.y - NEAR_HALF - NEAR_RES * 0.5, 0.0);
+        let corner = Vec3::new(
+            center.x - NEAR_HALF - NEAR_RES * 0.5,
+            center.y - NEAR_HALF - NEAR_RES * 0.5,
+            0.0,
+        );
         let mut grid = vec![Col::Unknown; NEAR_N * NEAR_N];
 
         // Centre of column (i, j) at the given height.
         let col_center = |i: usize, j: usize, z: f32| {
-            Vec3::new(corner.x + (i as f32 + 0.5) * NEAR_RES, corner.y + (j as f32 + 0.5) * NEAR_RES, z)
+            Vec3::new(
+                corner.x + (i as f32 + 0.5) * NEAR_RES,
+                corner.y + (j as f32 + 0.5) * NEAR_RES,
+                z,
+            )
         };
 
         // Seed the bot's own column with its actual footing and flood the walkable neighbourhood.
@@ -192,7 +200,12 @@ impl NearField {
             }
         }
 
-        NearField { center, corner, gate_key, grid }
+        NearField {
+            center,
+            corner,
+            gate_key,
+            grid,
+        }
     }
 
     /// The column covering world point `p` (z ignored — the grid is 2.5D), or `None` if `p` is off
@@ -264,9 +277,9 @@ impl NearField {
         for i in 0..=steps {
             let p = a.lerp(b, i as f32 / steps as f32);
             match self.col_at(p) {
-                Some(Col::Walk(_)) => {}                   // on floor — keep scanning
-                None | Some(Col::Unknown) => return true,  // flood frontier — trust the route beyond it
-                Some(_) => return false,                   // a wall / drop / hazard lies across the line
+                Some(Col::Walk(_)) => {}                  // on floor — keep scanning
+                None | Some(Col::Unknown) => return true, // flood frontier — trust the route beyond it
+                Some(_) => return false,                  // a wall / drop / hazard lies across the line
             }
         }
         true
@@ -286,9 +299,9 @@ impl NearField {
         let mut r = NEAR_RES;
         while r <= max {
             match self.col_at(p + dir * r) {
-                Some(Col::Walk(_)) => {}                          // on floor — keep scanning ahead
-                Some(Col::Drop) | Some(Col::Hazard) => return r,  // an edge not to hop over
-                _ => return max,                                  // wall (the trace's job) / frontier
+                Some(Col::Walk(_)) => {}                         // on floor — keep scanning ahead
+                Some(Col::Drop) | Some(Col::Hazard) => return r, // an edge not to hop over
+                _ => return max,                                 // wall (the trace's job) / frontier
             }
             r += NEAR_RES;
         }
@@ -326,12 +339,7 @@ fn ramp(r: f32, margin: f32) -> f32 {
 fn blocks(c: Vec3, z: f32, blocked: &[(Vec3, Vec3)]) -> bool {
     let m = PLAYER_HALF_WIDTH;
     blocked.iter().any(|&(lo, hi)| {
-        c.x >= lo.x - m
-            && c.x <= hi.x + m
-            && c.y >= lo.y - m
-            && c.y <= hi.y + m
-            && z >= lo.z - STEP_HEIGHT
-            && z <= hi.z
+        c.x >= lo.x - m && c.x <= hi.x + m && c.y >= lo.y - m && c.y <= hi.y + m && z >= lo.z - STEP_HEIGHT && z <= hi.z
     })
 }
 
@@ -438,14 +446,26 @@ mod tests {
         let solid = |p: Vec3| p.y >= -16.0 && p.z <= 0.0;
         let nf = build(&solid);
         // Along the ledge → open (the fast bearing keeps its look-ahead).
-        assert!(nf.chord_open(EYE, Vec3::new(64.0, 0.0, 1.0)), "a chord along the ledge is open");
+        assert!(
+            nf.chord_open(EYE, Vec3::new(64.0, 0.0, 1.0)),
+            "a chord along the ledge is open"
+        );
         // Angling across the drop → vetoed (the spiral look-ahead that cuts the inner corner off the edge).
-        assert!(!nf.chord_open(EYE, Vec3::new(48.0, -80.0, 1.0)), "a chord across the drop is vetoed");
+        assert!(
+            !nf.chord_open(EYE, Vec3::new(48.0, -80.0, 1.0)),
+            "a chord across the drop is vetoed"
+        );
         // A long open-floor look-ahead reaches the flood frontier still clear and passes — the route
         // beyond the grid is trusted, so open corridors keep their far anticipation (no false cap).
-        assert!(nf.chord_open(EYE, Vec3::new(400.0, 0.0, 1.0)), "an open chord past the flood frontier passes");
+        assert!(
+            nf.chord_open(EYE, Vec3::new(400.0, 0.0, 1.0)),
+            "an open chord past the flood frontier passes"
+        );
         // Contrast: `chord_clear` rejects that same long chord for leaving the certified footprint.
-        assert!(!nf.chord_clear(EYE, Vec3::new(400.0, 0.0, 1.0), 8.0), "chord_clear needs the whole chord in-footprint");
+        assert!(
+            !nf.chord_clear(EYE, Vec3::new(400.0, 0.0, 1.0), 8.0),
+            "chord_clear needs the whole chord in-footprint"
+        );
     }
 
     #[test]
@@ -454,9 +474,15 @@ mod tests {
         let solid = |p: Vec3| p.y >= -16.0 && p.z <= 0.0;
         let nf = build(&solid);
         // Heading −y at the drop: reports the edge close ahead, so the bhop leap gate carves at the lip.
-        assert!(nf.edge_ahead(EYE, Vec3::new(0.0, -1.0, 0.0), 100.0) < 40.0, "reports the −y drop edge close ahead");
+        assert!(
+            nf.edge_ahead(EYE, Vec3::new(0.0, -1.0, 0.0), 100.0) < 40.0,
+            "reports the −y drop edge close ahead"
+        );
         // Heading +x along the floor: no drop, returns the cap — open ground keeps its leap distance.
-        assert!((nf.edge_ahead(EYE, Vec3::new(1.0, 0.0, 0.0), 100.0) - 100.0).abs() < 1e-3, "open floor ahead → the cap");
+        assert!(
+            (nf.edge_ahead(EYE, Vec3::new(1.0, 0.0, 0.0), 100.0) - 100.0).abs() < 1e-3,
+            "open floor ahead → the cap"
+        );
     }
 
     #[test]
@@ -551,8 +577,14 @@ mod tests {
         let push = nf.steer_push(EYE).expect("walkable");
         assert!(push.y.abs() < 0.2, "lava both sides should balance: {push:?}");
         // And a chord straight out along the walkway stays clear, but one angling into the lava fails.
-        assert!(nf.chord_clear(EYE, Vec3::new(64.0, 0.0, 1.0), 0.0), "walkway centre is clear");
-        assert!(!nf.chord_clear(EYE, Vec3::new(48.0, 48.0, 1.0), 0.0), "a chord into the lava is blocked");
+        assert!(
+            nf.chord_clear(EYE, Vec3::new(64.0, 0.0, 1.0), 0.0),
+            "walkway centre is clear"
+        );
+        assert!(
+            !nf.chord_clear(EYE, Vec3::new(48.0, 48.0, 1.0), 0.0),
+            "a chord into the lava is blocked"
+        );
     }
 
     #[test]
@@ -569,8 +601,14 @@ mod tests {
         let nf = NearField::build(&solid, &|_| false, EYE, &[], 0b10);
         assert!(nf.valid_for(EYE, 0b10), "fresh field is valid");
         assert!(nf.valid_for(Vec3::new(40.0, 0.0, 1.0), 0b10), "small move stays valid");
-        assert!(!nf.valid_for(Vec3::new(200.0, 0.0, 1.0), 0b10), "past the recenter radius");
-        assert!(!nf.valid_for(Vec3::new(0.0, 0.0, 200.0), 0b10), "a lift ride invalidates");
+        assert!(
+            !nf.valid_for(Vec3::new(200.0, 0.0, 1.0), 0b10),
+            "past the recenter radius"
+        );
+        assert!(
+            !nf.valid_for(Vec3::new(0.0, 0.0, 200.0), 0b10),
+            "a lift ride invalidates"
+        );
         assert!(!nf.valid_for(EYE, 0b11), "a nearby door changing state invalidates");
     }
 

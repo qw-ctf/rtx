@@ -96,9 +96,7 @@ impl Ccrep {
     /// Only meaningful on [`Ccrep::Accept`]; other variants yield `None`.
     pub fn switch_to(&self) -> Option<u16> {
         match self {
-            Ccrep::Accept { port, ignore_port, .. } if !ignore_port && *port != 0 => {
-                Some(*port as u16)
-            }
+            Ccrep::Accept { port, ignore_port, .. } if !ignore_port && *port != 0 => Some(*port as u16),
             _ => None,
         }
     }
@@ -139,7 +137,11 @@ pub fn parse_control(data: &[u8]) -> Option<Ccrep> {
                 return Some(Ccrep::Reject("server requires a cheat-protected protocol".into()));
             }
             let ignore_port = proquake && flags & PQF_IGNOREPORT != 0;
-            Some(Ccrep::Accept { port, proquake, ignore_port })
+            Some(Ccrep::Accept {
+                port,
+                proquake,
+                ignore_port,
+            })
         }
         CCREP_REJECT => Some(Ccrep::Reject(r.string().ok()?)),
         _ => Some(Ccrep::Other),
@@ -160,7 +162,10 @@ mod tests {
         let header = u32::from_be_bytes([pkt[0], pkt[1], pkt[2], pkt[3]]);
         assert_eq!(header & !NETFLAG_LENGTH_MASK, NETFLAG_CTL);
         assert_eq!((header & NETFLAG_LENGTH_MASK) as usize, pkt.len());
-        assert_eq!(&pkt[4..12], &[CCREQ_CONNECT, b'Q', b'U', b'A', b'K', b'E', 0, NET_PROTOCOL_VERSION]);
+        assert_eq!(
+            &pkt[4..12],
+            &[CCREQ_CONNECT, b'Q', b'U', b'A', b'K', b'E', 0, NET_PROTOCOL_VERSION]
+        );
         assert_eq!(&pkt[12..15], &[MOD_PROQUAKE, MOD_VERSION, 0]);
         assert_eq!(&pkt[15..19], &0i32.to_le_bytes()); // password
     }
@@ -178,7 +183,14 @@ mod tests {
         p.extend_from_slice(&26000i32.to_le_bytes());
         p.extend_from_slice(&[MOD_PROQUAKE, 30, PQF_IGNOREPORT]);
         let rep = parse_control(&control(&p)).unwrap();
-        assert_eq!(rep, Ccrep::Accept { port: 26000, proquake: true, ignore_port: true });
+        assert_eq!(
+            rep,
+            Ccrep::Accept {
+                port: 26000,
+                proquake: true,
+                ignore_port: true
+            }
+        );
         assert_eq!(rep.switch_to(), None);
     }
 
@@ -189,7 +201,14 @@ mod tests {
         let mut p = vec![CCREP_ACCEPT];
         p.extend_from_slice(&26001i32.to_le_bytes());
         let rep = parse_control(&control(&p)).unwrap();
-        assert_eq!(rep, Ccrep::Accept { port: 26001, proquake: false, ignore_port: false });
+        assert_eq!(
+            rep,
+            Ccrep::Accept {
+                port: 26001,
+                proquake: false,
+                ignore_port: false
+            }
+        );
         assert_eq!(rep.switch_to(), Some(26001));
     }
 
@@ -208,7 +227,10 @@ mod tests {
     fn reject_carries_reason() {
         let mut p = vec![CCREP_REJECT];
         p.extend_from_slice(b"Server is full.\0");
-        assert_eq!(parse_control(&control(&p)), Some(Ccrep::Reject("Server is full.".into())));
+        assert_eq!(
+            parse_control(&control(&p)),
+            Some(Ccrep::Reject("Server is full.".into()))
+        );
     }
 
     /// Framing guards: a length that disagrees with the datagram, non-control flags, and a truncated

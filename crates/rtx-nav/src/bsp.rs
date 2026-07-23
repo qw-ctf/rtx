@@ -74,7 +74,7 @@ struct Header {
     nodes: Lump, // lump 5 (render tree) — skip textures/vertexes/vis
     #[br(pad_before = 24)]
     clipnodes: Lump, // lump 9 — skip texinfo/faces/lighting
-    leafs: Lump, // lump 10 (render leaf contents)
+    leafs: Lump,    // lump 10 (render leaf contents)
     #[br(pad_before = 24)]
     models: Lump, // lump 14 — skip marksurfaces/edges/surfedges
 }
@@ -173,12 +173,18 @@ struct RenderNode {
 
 impl From<NodeV1> for RenderNode {
     fn from(n: NodeV1) -> Self {
-        RenderNode { plane: n.plane, children: [n.children[0] as i32, n.children[1] as i32] }
+        RenderNode {
+            plane: n.plane,
+            children: [n.children[0] as i32, n.children[1] as i32],
+        }
     }
 }
 impl From<NodeV2> for RenderNode {
     fn from(n: NodeV2) -> Self {
-        RenderNode { plane: n.plane, children: n.children }
+        RenderNode {
+            plane: n.plane,
+            children: n.children,
+        }
     }
 }
 
@@ -200,7 +206,10 @@ struct LeafV2 {
 /// (`Mod_MakeHull0`).
 fn leaf_or_node(child: i32, leaf_contents: &[i32]) -> i32 {
     if child < 0 {
-        leaf_contents.get((-1 - child) as usize).copied().unwrap_or(CONTENTS_SOLID)
+        leaf_contents
+            .get((-1 - child) as usize)
+            .copied()
+            .unwrap_or(CONTENTS_SOLID)
     } else {
         child
     }
@@ -264,9 +273,17 @@ impl Bsp {
             read_lump_stride::<NodeV1, RenderNode>(&mut c, &header.nodes, 24).ok()?
         };
         let leaf_contents: Vec<i32> = if bsp2 {
-            read_lump_stride::<LeafV2, LeafV2>(&mut c, &header.leafs, 44).ok()?.iter().map(|l| l.contents).collect()
+            read_lump_stride::<LeafV2, LeafV2>(&mut c, &header.leafs, 44)
+                .ok()?
+                .iter()
+                .map(|l| l.contents)
+                .collect()
         } else {
-            read_lump_stride::<LeafV1, LeafV1>(&mut c, &header.leafs, 28).ok()?.iter().map(|l| l.contents).collect()
+            read_lump_stride::<LeafV1, LeafV1>(&mut c, &header.leafs, 28)
+                .ok()?
+                .iter()
+                .map(|l| l.contents)
+                .collect()
         };
 
         let mut models = read_lump_stride::<Model, Model>(&mut c, &header.models, MODEL_SIZE).ok()?;
@@ -372,7 +389,10 @@ impl Bsp {
             num = node.children[usize::from(d < 0.0)];
         }
         // A negative child is leaf `-1 - num`.
-        self.leaf_contents.get((-1 - num) as usize).copied().unwrap_or(CONTENTS_SOLID)
+        self.leaf_contents
+            .get((-1 - num) as usize)
+            .copied()
+            .unwrap_or(CONTENTS_SOLID)
     }
 
     /// Whether `p` is inside a liquid volume (water / slime / lava) per the render hull. Used by the
@@ -556,7 +576,17 @@ fn recursive_hull_trace(
     let midf = p1f + (p2f - p1f) * frac;
     let mid = p1 + (p2 - p1) * frac;
     let nearside = usize::from(t1 < t2); // the side `p1` lies on
-    let check = recursive_hull_trace(planes, nodes, node.children[nearside], p1f, midf, p1, mid, trace, leafcount);
+    let check = recursive_hull_trace(
+        planes,
+        nodes,
+        node.children[nearside],
+        p1f,
+        midf,
+        p1,
+        mid,
+        trace,
+        leafcount,
+    );
     if check == Tr::Blocked {
         return check;
     }
@@ -565,7 +595,17 @@ fn recursive_hull_trace(
         return check;
     }
     let oldcheck = check;
-    let check = recursive_hull_trace(planes, nodes, node.children[1 - nearside], midf, p2f, mid, p2, trace, leafcount);
+    let check = recursive_hull_trace(
+        planes,
+        nodes,
+        node.children[1 - nearside],
+        midf,
+        p2f,
+        mid,
+        p2,
+        trace,
+        leafcount,
+    );
     if check == Tr::Empty || check == Tr::Blocked {
         return check;
     }
@@ -602,8 +642,15 @@ pub struct BoxHull {
 
 /// Build the [`BoxHull`] for the box `mins..maxs` (both in the same frame the trace endpoints use).
 pub fn box_hull(mins: Vec3, maxs: Vec3) -> BoxHull {
-    let mut planes = [Plane { normal: Vec3::ZERO, dist: 0.0, kind: 0 }; 6];
-    let mut nodes = [ClipNode { plane: 0, children: [0, 0] }; 6];
+    let mut planes = [Plane {
+        normal: Vec3::ZERO,
+        dist: 0.0,
+        kind: 0,
+    }; 6];
+    let mut nodes = [ClipNode {
+        plane: 0,
+        children: [0, 0],
+    }; 6];
     for i in 0..6 {
         let side = i & 1;
         nodes[i].plane = i as u32;
@@ -775,7 +822,11 @@ mod tests {
 
         // Impact sits DIST_EPSILON shy on the near side — a single split, no iterative back-out.
         let hit = bsp.hull1_trace(Vec3::new(0.0, 0.0, 0.0), Vec3::new(200.0, 0.0, 0.0));
-        assert!(hit.endpos.x < 100.0 && hit.endpos.x > 99.9, "endpos {} not just shy of 100", hit.endpos.x);
+        assert!(
+            hit.endpos.x < 100.0 && hit.endpos.x > 99.9,
+            "endpos {} not just shy of 100",
+            hit.endpos.x
+        );
         // The signed plane distance is oriented with the (negated) normal: normal −x, dist −100.
         assert!((hit.plane_dist - -100.0).abs() < 1e-3, "plane_dist {}", hit.plane_dist);
 
@@ -790,15 +841,27 @@ mod tests {
     #[test]
     fn hull_trace_tracks_water_leaf() {
         let bsp = Bsp {
-            planes: vec![Plane { normal: Vec3::new(1.0, 0.0, 0.0), dist: 100.0, kind: 0 }],
+            planes: vec![Plane {
+                normal: Vec3::new(1.0, 0.0, 0.0),
+                dist: 100.0,
+                kind: 0,
+            }],
             // front (x ≥ 100) SOLID; back (x < 100) WATER (-3).
-            clipnodes: vec![ClipNode { plane: 0, children: [CONTENTS_SOLID, CONTENTS_WATER] }],
+            clipnodes: vec![ClipNode {
+                plane: 0,
+                children: [CONTENTS_SOLID, CONTENTS_WATER],
+            }],
             hull1_headnode: 0,
             mins: Vec3::splat(-256.0),
             maxs: Vec3::splat(256.0),
             entities: String::new(),
             hull0_clipnodes: Vec::new(),
-            models: vec![Model { mins: Vec3::splat(-256.0), maxs: Vec3::splat(256.0), render_head: 0, clip1: 0 }],
+            models: vec![Model {
+                mins: Vec3::splat(-256.0),
+                maxs: Vec3::splat(256.0),
+                render_head: 0,
+                clip1: 0,
+            }],
             render_nodes: Vec::new(),
             leaf_contents: Vec::new(),
             render_headnode: 0,
@@ -818,8 +881,16 @@ mod tests {
         let hit = hull.trace(Vec3::new(-100.0, 0.0, 0.0), Vec3::new(100.0, 0.0, 0.0));
         // Enter at x ≈ −16 over a 200u span from x = −100 → fraction ≈ (−16 − −100)/200 = 0.42.
         assert!((hit.fraction - 0.42).abs() < 0.01, "fraction {}", hit.fraction);
-        assert!((hit.endpos.x - -16.0).abs() < 0.5 && hit.endpos.x > -16.5, "endpos {:?}", hit.endpos);
-        assert!((hit.plane_normal - Vec3::new(-1.0, 0.0, 0.0)).length() < 1e-4, "normal {:?}", hit.plane_normal);
+        assert!(
+            (hit.endpos.x - -16.0).abs() < 0.5 && hit.endpos.x > -16.5,
+            "endpos {:?}",
+            hit.endpos
+        );
+        assert!(
+            (hit.plane_normal - Vec3::new(-1.0, 0.0, 0.0)).length() < 1e-4,
+            "normal {:?}",
+            hit.plane_normal
+        );
 
         // Parallel but 50u to the side (|y| > 16): misses the box entirely.
         let miss = hull.trace(Vec3::new(-100.0, 50.0, 0.0), Vec3::new(100.0, 50.0, 0.0));
@@ -907,7 +978,10 @@ mod tests {
 
         assert!(opens > 1, "a real map has a worldspawn and then some");
         assert_eq!(opens, closes, "every block closes");
-        assert!(bsp.entities.contains("\"classname\" \"worldspawn\""), "worldspawn comes first");
+        assert!(
+            bsp.entities.contains("\"classname\" \"worldspawn\""),
+            "worldspawn comes first"
+        );
         // A deathmatch map has somewhere to spawn. This is the field the shadow world lives or dies
         // on: no spawn points means no bots.
         assert!(
@@ -941,7 +1015,10 @@ mod tests {
         // models[0] is the world, and is what the top-level fields were taken from.
         assert_eq!(bsp.submodel(0).map(|m| m.mins), Some(bsp.mins));
         assert_eq!(bsp.submodel(0).map(|m| m.clip1), Some(bsp.hull1_headnode));
-        assert!(bsp.submodel(bsp.models.len()).is_none(), "and asking past the end is None");
+        assert!(
+            bsp.submodel(bsp.models.len()).is_none(),
+            "and asking past the end is None"
+        );
 
         // Every box must come out the right way round. It's the `Mod_LoadSubmodels` spread that
         // makes that true: on disk, qbsp's shrink leaves a paper-thin brush inside-out (catalyst's
@@ -951,11 +1028,17 @@ mod tests {
         // world-bounds check below catches.
         eprintln!("{}: {} models", path, bsp.models.len());
         for (i, m) in bsp.models.iter().enumerate() {
-            assert!(m.mins.is_finite() && m.maxs.is_finite(), "submodel *{i}: {:?}..{:?}", m.mins, m.maxs);
+            assert!(
+                m.mins.is_finite() && m.maxs.is_finite(),
+                "submodel *{i}: {:?}..{:?}",
+                m.mins,
+                m.maxs
+            );
             assert!(
                 (m.maxs - m.mins).min_element() > 0.0,
                 "submodel *{i} is inside-out: {:?}..{:?} — was the load-time spread applied?",
-                m.mins, m.maxs
+                m.mins,
+                m.maxs
             );
             // Inside Quake's map limit. Note this deliberately isn't "inside the world's box":
             // `models[0]` bounds only the *world* brushes, so a submodel can legitimately sit
@@ -964,7 +1047,8 @@ mod tests {
             assert!(
                 m.mins.cmpge(Vec3::splat(-4096.0)).all() && m.maxs.cmple(Vec3::splat(4096.0)).all(),
                 "submodel *{i} {:?}..{:?} is outside the ±4096 map limit — wrong stride?",
-                m.mins, m.maxs
+                m.mins,
+                m.maxs
             );
         }
     }

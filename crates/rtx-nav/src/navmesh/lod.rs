@@ -59,7 +59,10 @@ impl PartialOrd for MinNode {
 }
 impl Ord for MinNode {
     fn cmp(&self, o: &Self) -> std::cmp::Ordering {
-        o.key.partial_cmp(&self.key).unwrap_or(std::cmp::Ordering::Equal).then(o.id.cmp(&self.id))
+        o.key
+            .partial_cmp(&self.key)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(o.id.cmp(&self.id))
     }
 }
 
@@ -155,7 +158,10 @@ struct UnionFind {
 
 impl UnionFind {
     fn new(n: usize) -> Self {
-        Self { parent: (0..n as u32).collect(), rank: vec![0; n] }
+        Self {
+            parent: (0..n as u32).collect(),
+            rank: vec![0; n],
+        }
     }
 
     fn find(&mut self, x: u32) -> u32 {
@@ -244,13 +250,22 @@ impl NavGraph {
             if cf == ct {
                 continue;
             }
-            let key = (cf, ct, rep_band(self.cells[link.from as usize].origin.z), rep_band(self.cells[link.to as usize].origin.z));
+            let key = (
+                cf,
+                ct,
+                rep_band(self.cells[link.from as usize].origin.z),
+                rep_band(self.cells[link.to as usize].origin.z),
+            );
             // Cheapest, then lowest index (deterministic).
             let cheaper = |cur: Option<&u32>| match cur {
                 None => true,
                 Some(&best) => {
                     let best_cost = self.links[best as usize].cost;
-                    if link.cost != best_cost { link.cost < best_cost } else { li < best }
+                    if link.cost != best_cost {
+                        link.cost < best_cost
+                    } else {
+                        li < best
+                    }
                 }
             };
             if cheaper(rep.get(&key)) {
@@ -275,7 +290,8 @@ impl NavGraph {
         let extra: Vec<u32> = (0..self.links.len() as u32)
             .filter(|&li| {
                 let link = self.links[li as usize];
-                cluster_of[link.from as usize] != cluster_of[link.to as usize] && lod.cell_reach[link.to as usize].is_empty()
+                cluster_of[link.from as usize] != cluster_of[link.to as usize]
+                    && lod.cell_reach[link.to as usize].is_empty()
             })
             .collect();
         if !extra.is_empty() {
@@ -305,7 +321,10 @@ impl NavGraph {
         for c in 0..n as u32 {
             if is_portal[c as usize] {
                 portal_of_cell[c as usize] = portals.len() as i32;
-                portals.push(Portal { cell: c, cluster: cluster_of[c as usize] });
+                portals.push(Portal {
+                    cell: c,
+                    cluster: cluster_of[c as usize],
+                });
             }
         }
         let mut abs_adj: Vec<Vec<AbsEdge>> = (0..portals.len()).map(|_| Vec::new()).collect();
@@ -316,7 +335,15 @@ impl NavGraph {
             let pt = portal_of_cell[link.to as usize] as u32;
             let base = link.cost + self.link_water_extra(li);
             let hazard_hp = self.link_hazard_hp(li);
-            abs_adj[pf as usize].push(AbsEdge { to: pt, base, gates, rj, chained, hazard_hp, link: li });
+            abs_adj[pf as usize].push(AbsEdge {
+                to: pt,
+                base,
+                gates,
+                rj,
+                chained,
+                hazard_hp,
+                link: li,
+            });
         }
         let mut cell_reach: Vec<Vec<PortalReach>> = (0..n).map(|_| Vec::new()).collect();
         for pi in 0..portals.len() as u32 {
@@ -324,12 +351,34 @@ impl NavGraph {
             for (cell, dist, gates, rj, chained, hazard_hp) in self.intra_reach(src, cl, cluster_of) {
                 let pc = portal_of_cell[cell as usize];
                 if pc >= 0 && cell != src {
-                    abs_adj[pi as usize].push(AbsEdge { to: pc as u32, base: dist, gates, rj, chained, hazard_hp, link: u32::MAX });
+                    abs_adj[pi as usize].push(AbsEdge {
+                        to: pc as u32,
+                        base: dist,
+                        gates,
+                        rj,
+                        chained,
+                        hazard_hp,
+                        link: u32::MAX,
+                    });
                 }
-                cell_reach[cell as usize].push(PortalReach { portal: pi, dist, gates, rj, chained, hazard_hp });
+                cell_reach[cell as usize].push(PortalReach {
+                    portal: pi,
+                    dist,
+                    gates,
+                    rj,
+                    chained,
+                    hazard_hp,
+                });
             }
         }
-        Lod { cluster_of: cluster_of.to_vec(), cluster_count, portal_of_cell, portals, abs_adj, cell_reach }
+        Lod {
+            cluster_of: cluster_of.to_vec(),
+            cluster_count,
+            portal_of_cell,
+            portals,
+            abs_adj,
+            cell_reach,
+        }
     }
 
     /// Weakly connect cells joined by a link that stays inside one block *and one storey* (grouping is
@@ -491,7 +540,14 @@ impl NavGraph {
         let Some(lod) = self.lod.as_ref() else {
             // No hierarchy (bare test graph): an exact full flood, read directly.
             let full = Some(self.costs_from(from, costs));
-            return CoarseCosts { graph: self, costs, sever_chained, full, home: HashMap::new(), abs_cost: Vec::new() };
+            return CoarseCosts {
+                graph: self,
+                costs,
+                sever_chained,
+                full,
+                home: HashMap::new(),
+                abs_cost: Vec::new(),
+            };
         };
         // Home cluster, priced by an in-cluster flood (exact for cells the shortest path reaches
         // without leaving the cluster; overestimate-safe for the rest); its cells answer `cost_to`
@@ -505,7 +561,10 @@ impl NavGraph {
             let p = lod.portal_of_cell[cell as usize];
             if p >= 0 && seed < abs_cost[p as usize] {
                 abs_cost[p as usize] = seed;
-                heap.push(MinNode { key: seed, id: p as u32 });
+                heap.push(MinNode {
+                    key: seed,
+                    id: p as u32,
+                });
             }
         }
         // Dijkstra over the abstract graph, pricing dynamic terms on each edge as it is relaxed.
@@ -514,14 +573,22 @@ impl NavGraph {
                 continue;
             }
             for e in &lod.abs_adj[p as usize] {
-                let ng = g + e.base + self.price_meta(e.gates, e.rj, e.chained, e.hazard_hp, costs, sever_chained, e.link);
+                let ng =
+                    g + e.base + self.price_meta(e.gates, e.rj, e.chained, e.hazard_hp, costs, sever_chained, e.link);
                 if ng < abs_cost[e.to as usize] {
                     abs_cost[e.to as usize] = ng;
                     heap.push(MinNode { key: ng, id: e.to });
                 }
             }
         }
-        CoarseCosts { graph: self, costs, sever_chained, full: None, home, abs_cost }
+        CoarseCosts {
+            graph: self,
+            costs,
+            sever_chained,
+            full: None,
+            home,
+            abs_cost,
+        }
     }
 
     /// The coarse corridor toward a far `goal`: an interim steer target plus the cluster window the fine
@@ -551,7 +618,10 @@ impl NavGraph {
             let p = lod.portal_of_cell[cell as usize];
             if p >= 0 && seed < abs_cost[p as usize] {
                 abs_cost[p as usize] = seed;
-                heap.push(MinNode { key: seed, id: p as u32 });
+                heap.push(MinNode {
+                    key: seed,
+                    id: p as u32,
+                });
             }
         }
         // The goal cluster's entry portals: once every one is settled its coarse cost is final (Dijkstra
@@ -647,14 +717,25 @@ impl NavGraph {
             far_gates.push(bits.trailing_zeros());
             bits &= bits - 1;
         }
-        Some(Corridor { interim: lod.portals[interim as usize].cell, allowed, far_gates })
+        Some(Corridor {
+            interim: lod.portals[interim as usize].cell,
+            allowed,
+            far_gates,
+        })
     }
 
     /// Priced Dijkstra from `from` restricted to cluster `cl`, returning the exact priced cost to every
     /// cell of the home cluster. Uses the full `link_extra` pricing (gates, hazard, …) so the home
     /// region matches the fine flood exactly; its portals seed [`coarse_costs`]'s abstract search and
     /// its cells answer [`CoarseCosts::cost_to`] directly for anything past the fine cap.
-    fn home_flood(&self, from: CellId, cl: u32, lod: &Lod, costs: &LinkCosts, sever_chained: bool) -> HashMap<CellId, f32> {
+    fn home_flood(
+        &self,
+        from: CellId,
+        cl: u32,
+        lod: &Lod,
+        costs: &LinkCosts,
+        sever_chained: bool,
+    ) -> HashMap<CellId, f32> {
         let mut dist: HashMap<CellId, f32> = HashMap::new();
         let mut heap = BinaryHeap::new();
         dist.insert(from, 0.0);
@@ -686,7 +767,16 @@ impl NavGraph {
     /// for a transit/reach hop (a multi-link intra path with no single representative); its interior
     /// links' surcharges are the accepted near-field gap — those legs sit in or near the home cluster,
     /// which the exact `home_flood` already prices in full.
-    fn price_meta(&self, gates: u32, rj: u8, chained: bool, hazard_hp: f32, costs: &LinkCosts, sever_chained: bool, link: u32) -> f32 {
+    fn price_meta(
+        &self,
+        gates: u32,
+        rj: u8,
+        chained: bool,
+        hazard_hp: f32,
+        costs: &LinkCosts,
+        sever_chained: bool,
+        link: u32,
+    ) -> f32 {
         let mut extra = 0.0;
         // Iterate only the gate bits actually set (single-digit gate counts, usually one), not every
         // gate id. Bit 31 (`SEALED_GATE`) is a "gate id ≥ 31 we can't track" marker, priced as an
@@ -780,7 +870,12 @@ impl CoarseCosts<'_> {
         }
         // Out of range (a goal cell held stale across a navmesh rebuild) reads as unreachable, never a
         // panic; `None` LOD tables likewise.
-        let reach = match self.graph.lod.as_ref().and_then(|lod| lod.cell_reach.get(cell as usize)) {
+        let reach = match self
+            .graph
+            .lod
+            .as_ref()
+            .and_then(|lod| lod.cell_reach.get(cell as usize))
+        {
             Some(r) => r,
             None => return f32::INFINITY,
         };
@@ -788,7 +883,17 @@ impl CoarseCosts<'_> {
         for r in reach {
             let via = self.abs_cost[r.portal as usize];
             if via.is_finite() {
-                let c = via + r.dist + self.graph.price_meta(r.gates, r.rj, r.chained, r.hazard_hp, self.costs, self.sever_chained, u32::MAX);
+                let c = via
+                    + r.dist
+                    + self.graph.price_meta(
+                        r.gates,
+                        r.rj,
+                        r.chained,
+                        r.hazard_hp,
+                        self.costs,
+                        self.sever_chained,
+                        u32::MAX,
+                    );
                 if c < best {
                     best = c;
                 }
@@ -842,8 +947,18 @@ mod tests {
             vec![],
             None,
             false,
-            Some(SpeedJumpParams { gravity: 800.0, accel: 10.0, maxspeed: 320.0, friction: 4.0, stopspeed: 100.0, curl: false }),
-            Some(RocketJumpParams { gravity: 800.0, rj_extra: 0.0 }),
+            Some(SpeedJumpParams {
+                gravity: 800.0,
+                accel: 10.0,
+                maxspeed: 320.0,
+                friction: 4.0,
+                stopspeed: 100.0,
+                curl: false,
+            }),
+            Some(RocketJumpParams {
+                gravity: 800.0,
+                rj_extra: 0.0,
+            }),
         );
         Some(graph)
     }
@@ -911,14 +1026,27 @@ mod tests {
 
         // §2 platform set
         let on_platform = platform_of(&graph, quad);
-        let plat_cells: Vec<u32> = (0..graph.cells.len() as u32).filter(|&c| on_platform[c as usize]).collect();
+        let plat_cells: Vec<u32> = (0..graph.cells.len() as u32)
+            .filter(|&c| on_platform[c as usize])
+            .collect();
         eprintln!("[platform] {} walk/step-connected cells", plat_cells.len());
 
         // §3 cluster census (H-A)
-        let members: Vec<u32> = (0..graph.cells.len() as u32).filter(|&c| lod.cluster_of[c as usize] == qcl).collect();
-        let zmin = members.iter().map(|&c| graph.cells[c as usize].origin.z).fold(f32::INFINITY, f32::min);
-        let zmax = members.iter().map(|&c| graph.cells[c as usize].origin.z).fold(f32::NEG_INFINITY, f32::max);
-        let pit = members.iter().filter(|&&c| graph.cells[c as usize].origin.z < qo.z - 100.0).count();
+        let members: Vec<u32> = (0..graph.cells.len() as u32)
+            .filter(|&c| lod.cluster_of[c as usize] == qcl)
+            .collect();
+        let zmin = members
+            .iter()
+            .map(|&c| graph.cells[c as usize].origin.z)
+            .fold(f32::INFINITY, f32::min);
+        let zmax = members
+            .iter()
+            .map(|&c| graph.cells[c as usize].origin.z)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let pit = members
+            .iter()
+            .filter(|&&c| graph.cells[c as usize].origin.z < qo.z - 100.0)
+            .count();
         let on_plat_in_cluster = members.iter().filter(|&&c| on_platform[c as usize]).count();
         let off_plat_same_z = members
             .iter()
@@ -941,7 +1069,11 @@ mod tests {
         eprintln!(
             "[cluster] platform spans clusters {:?}  => H-A {}",
             plat_clusters,
-            if pit > 0 || off_plat_same_z > 0 { "LIKELY (cluster spills off the plateau)" } else { "not indicated" }
+            if pit > 0 || off_plat_same_z > 0 {
+                "LIKELY (cluster spills off the plateau)"
+            } else {
+                "not indicated"
+            }
         );
         // The storey band must keep the quad's cluster on the plateau, not welded to the pit below it.
         assert!(
@@ -986,13 +1118,13 @@ mod tests {
             if cross && !kept.contains(&li) {
                 for (lj, m) in graph.links.iter().enumerate() {
                     let lj = lj as u32;
-                    if kept.contains(&lj) && lod.cluster_of[m.from as usize] == fc && lod.cluster_of[m.to as usize] == tc {
+                    if kept.contains(&lj)
+                        && lod.cluster_of[m.from as usize] == fc
+                        && lod.cluster_of[m.to as usize] == tc
+                    {
                         eprintln!(
                             "      >>> EVICTED — pair ({fc}->{tc}) rep is link {} {:?} cost={:.1} landing z {:.0}",
-                            lj,
-                            m.kind,
-                            m.cost,
-                            graph.cells[m.to as usize].origin.z
+                            lj, m.kind, m.cost, graph.cells[m.to as usize].origin.z
                         );
                     }
                 }
@@ -1006,12 +1138,7 @@ mod tests {
             let indeg = lod.abs_adj.iter().flatten().filter(|e| e.to == r.portal).count();
             eprintln!(
                 "  portal {} = cell {} (cl {}, z {:.0}) dist={:.1} inbound_abs_edges={}",
-                r.portal,
-                p.cell,
-                p.cluster,
-                graph.cells[p.cell as usize].origin.z,
-                r.dist,
-                indeg
+                r.portal, p.cell, p.cluster, graph.cells[p.cell as usize].origin.z, r.dist, indeg
             );
         }
 
@@ -1019,13 +1146,19 @@ mod tests {
         let mut sources: Vec<u32> = graph
             .links
             .iter()
-            .filter(|l| on_platform[l.to as usize] && !on_platform[l.from as usize] && !matches!(l.kind, LinkKind::Drop))
+            .filter(|l| {
+                on_platform[l.to as usize] && !on_platform[l.from as usize] && !matches!(l.kind, LinkKind::Drop)
+            })
             .map(|l| l.from)
             .collect();
         sources.sort_unstable();
         sources.dedup();
         // A few off-platform vantage points: west of the launch ledge, and the two teleport dests.
-        for p in [Vec3::new(560.0, 24.0, 288.0), Vec3::new(-664.0, 480.0, 312.0), Vec3::new(256.0, 1256.0, 164.0)] {
+        for p in [
+            Vec3::new(560.0, 24.0, 288.0),
+            Vec3::new(-664.0, 480.0, 312.0),
+            Vec3::new(256.0, 1256.0, 164.0),
+        ] {
             if let Some(c) = graph.nearest(p) {
                 if !sources.contains(&c) {
                     sources.push(c);
@@ -1055,9 +1188,17 @@ mod tests {
                 if reach && !cs.is_finite() { "   <<< reachable but INF (H-C)" } else { "" }
             );
             // The invariant the fix restores: a fine-reachable quad has a finite coarse cost.
-            assert_eq!(reach, cs.is_finite(), "src {s}: reachable={reach} but coarse-finite={} — reachable⟺finite broken", cs.is_finite());
+            assert_eq!(
+                reach,
+                cs.is_finite(),
+                "src {s}: reachable={reach} but coarse-finite={} — reachable⟺finite broken",
+                cs.is_finite()
+            );
             for r in &lod.cell_reach[quad as usize] {
-                eprintln!("      via portal {} abs_cost={:.1}", r.portal, score.abs_cost[r.portal as usize]);
+                eprintln!(
+                    "      via portal {} abs_cost={:.1}",
+                    r.portal, score.abs_cost[r.portal as usize]
+                );
             }
             match graph.corridor(s, quad, &costs, HORIZON) {
                 None => eprintln!("      corridor=None (steer directly, unrestricted)"),
@@ -1070,7 +1211,11 @@ mod tests {
                         graph.cells[c.interim as usize].origin.z,
                         win,
                         giw,
-                        if !giw { "   <<< quad cluster EXCLUDED from window (H-B)" } else { "" }
+                        if !giw {
+                            "   <<< quad cluster EXCLUDED from window (H-B)"
+                        } else {
+                            ""
+                        }
                     );
                 }
             }
@@ -1097,7 +1242,9 @@ mod tests {
                         };
                     }
                     Some(c) => {
-                        let mut route = graph.find_path_within(cur, c.interim, &costs, &c.allowed).unwrap_or_default();
+                        let mut route = graph
+                            .find_path_within(cur, c.interim, &costs, &c.allowed)
+                            .unwrap_or_default();
                         if route.is_empty() {
                             route = graph.find_path(cur, c.interim, &costs).unwrap_or_default();
                         }

@@ -145,8 +145,9 @@ fn start_listener(game: &mut GameState, port: u16) {
     let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
         Ok(l) => l,
         Err(err) => {
-            game.host
-                .conprint(&cstring(&format!("rtx: control: bind 127.0.0.1:{port} failed: {err}\n")));
+            game.host.conprint(&cstring(&format!(
+                "rtx: control: bind 127.0.0.1:{port} failed: {err}\n"
+            )));
             return;
         }
     };
@@ -221,35 +222,79 @@ enum ControlCmd {
     Status,
     MatchStart,
     Links,
-    Prep { bot: u32, health: f32, rockets: f32 },
-    Teleport { bot: u32, pos: Vec3 },
-    Goto { bot: u32, pos: Vec3 },
-    Rj { bot: u32, link: u32 },
+    Prep {
+        bot: u32,
+        health: f32,
+        rockets: f32,
+    },
+    Teleport {
+        bot: u32,
+        pos: Vec3,
+    },
+    Goto {
+        bot: u32,
+        pos: Vec3,
+    },
+    Rj {
+        bot: u32,
+        link: u32,
+    },
     /// Fly a non-RJ link (e.g. a planted speed/curl jump) via the normal steer/bhop path. Reports a
     /// `fly_result` with the takeoff speed and landing measurement.
-    Fly { bot: u32, link: u32 },
-    Hold { bot: u32 },
-    Stop { bot: u32 },
-    Set { name: String, value: String },
-    Get { name: String },
-    Cmd { raw: String },
+    Fly {
+        bot: u32,
+        link: u32,
+    },
+    Hold {
+        bot: u32,
+    },
+    Stop {
+        bot: u32,
+    },
+    Set {
+        name: String,
+        value: String,
+    },
+    Get {
+        name: String,
+    },
+    Cmd {
+        raw: String,
+    },
     /// Inspect the navmesh cell nearest a world point: its origin and every link in/out, by kind.
-    Cell { pos: Vec3 },
+    Cell {
+        pos: Vec3,
+    },
     /// Dump a bot's current A* route: each leg's index, kind, source and target.
-    Route { bot: u32 },
+    Route {
+        bot: u32,
+    },
     /// List every generated curl link (a SpeedJump with `curl_gain > 0`): index, from, takeoff, target,
     /// v_req, gain — for verifying which gaps the build's curl certifier covered.
     Curls,
     /// Probe the build-time curl certifier from `takeoff` along `psi0`° with the speed `runway` delivers,
     /// onto `tgt`: reports predicted takeoff speed, whether the envelope certifies, and per-gain landings.
-    Probe { takeoff: Vec3, tgt: Vec3, psi0: f32, runway: f32 },
+    Probe {
+        takeoff: Vec3,
+        tgt: Vec3,
+        psi0: f32,
+        runway: f32,
+    },
     /// Search (offline pmove sim, live BSP) for a speed-curl jump from a source to a target world
     /// point — the M2 curl-jump solver, validated live. Returns the best (v0, launch heading, gain).
-    Curl { src: Vec3, tgt: Vec3 },
+    Curl {
+        src: Vec3,
+        tgt: Vec3,
+    },
     /// Hand-plant a `SpeedJump` link (harness bring-up): a self-contained speed jump from the cell
     /// nearest `from` (the run-up start), taking off at `takeoff` (the lip), to the cell nearest `tgt`,
     /// requiring `v_req` ups at the lip. Lets us fly the takeoff regime before the generator emits it.
-    PlanLink { from: Vec3, takeoff: Vec3, tgt: Vec3, v_req: f32 },
+    PlanLink {
+        from: Vec3,
+        takeoff: Vec3,
+        tgt: Vec3,
+        v_req: f32,
+    },
 }
 
 /// Split the first whitespace-delimited token off `s`, returning `(token, rest)` with `rest` trimmed
@@ -298,8 +343,18 @@ fn parse_line(line: &str) -> Result<(i64, ControlCmd), String> {
         "prep" => {
             let mut t = rest.split_whitespace();
             let bot = parse_u32(t.next(), "bot")?;
-            let health = t.next().map(|s| s.parse::<f32>()).transpose().map_err(|_| "bad health")?.unwrap_or(100.0);
-            let rockets = t.next().map(|s| s.parse::<f32>()).transpose().map_err(|_| "bad rockets")?.unwrap_or(10.0);
+            let health = t
+                .next()
+                .map(|s| s.parse::<f32>())
+                .transpose()
+                .map_err(|_| "bad health")?
+                .unwrap_or(100.0);
+            let rockets = t
+                .next()
+                .map(|s| s.parse::<f32>())
+                .transpose()
+                .map_err(|_| "bad rockets")?
+                .unwrap_or(10.0);
             ControlCmd::Prep { bot, health, rockets }
         }
         "teleport" => {
@@ -322,14 +377,21 @@ fn parse_line(line: &str) -> Result<(i64, ControlCmd), String> {
             let link = parse_u32(t.next(), "link")?;
             ControlCmd::Fly { bot, link }
         }
-        "hold" => ControlCmd::Hold { bot: parse_u32(rest.split_whitespace().next(), "bot")? },
-        "stop" => ControlCmd::Stop { bot: parse_u32(rest.split_whitespace().next(), "bot")? },
+        "hold" => ControlCmd::Hold {
+            bot: parse_u32(rest.split_whitespace().next(), "bot")?,
+        },
+        "stop" => ControlCmd::Stop {
+            bot: parse_u32(rest.split_whitespace().next(), "bot")?,
+        },
         "set" => {
             let (name, value) = split_first(rest);
             if name.is_empty() {
                 return Err("set: missing cvar".into());
             }
-            ControlCmd::Set { name: name.to_string(), value: value.to_string() }
+            ControlCmd::Set {
+                name: name.to_string(),
+                value: value.to_string(),
+            }
         }
         "get" => {
             let (name, _) = split_first(rest);
@@ -349,31 +411,73 @@ fn parse_line(line: &str) -> Result<(i64, ControlCmd), String> {
             let x = parse_f32(t.next(), "x")?;
             let y = parse_f32(t.next(), "y")?;
             let z = parse_f32(t.next(), "z")?;
-            ControlCmd::Cell { pos: Vec3::new(x, y, z) }
+            ControlCmd::Cell {
+                pos: Vec3::new(x, y, z),
+            }
         }
-        "route" => ControlCmd::Route { bot: parse_u32(rest.split_whitespace().next(), "bot")? },
+        "route" => ControlCmd::Route {
+            bot: parse_u32(rest.split_whitespace().next(), "bot")?,
+        },
         "curls" => ControlCmd::Curls,
         "probe" => {
             let mut t = rest.split_whitespace();
-            let takeoff = Vec3::new(parse_f32(t.next(), "ox")?, parse_f32(t.next(), "oy")?, parse_f32(t.next(), "oz")?);
-            let tgt = Vec3::new(parse_f32(t.next(), "tx")?, parse_f32(t.next(), "ty")?, parse_f32(t.next(), "tz")?);
+            let takeoff = Vec3::new(
+                parse_f32(t.next(), "ox")?,
+                parse_f32(t.next(), "oy")?,
+                parse_f32(t.next(), "oz")?,
+            );
+            let tgt = Vec3::new(
+                parse_f32(t.next(), "tx")?,
+                parse_f32(t.next(), "ty")?,
+                parse_f32(t.next(), "tz")?,
+            );
             let psi0 = parse_f32(t.next(), "psi0")?;
             let runway = parse_f32(t.next(), "runway")?;
-            ControlCmd::Probe { takeoff, tgt, psi0, runway }
+            ControlCmd::Probe {
+                takeoff,
+                tgt,
+                psi0,
+                runway,
+            }
         }
         "curl" => {
             let mut t = rest.split_whitespace();
-            let src = Vec3::new(parse_f32(t.next(), "sx")?, parse_f32(t.next(), "sy")?, parse_f32(t.next(), "sz")?);
-            let tgt = Vec3::new(parse_f32(t.next(), "tx")?, parse_f32(t.next(), "ty")?, parse_f32(t.next(), "tz")?);
+            let src = Vec3::new(
+                parse_f32(t.next(), "sx")?,
+                parse_f32(t.next(), "sy")?,
+                parse_f32(t.next(), "sz")?,
+            );
+            let tgt = Vec3::new(
+                parse_f32(t.next(), "tx")?,
+                parse_f32(t.next(), "ty")?,
+                parse_f32(t.next(), "tz")?,
+            );
             ControlCmd::Curl { src, tgt }
         }
         "planlink" => {
             let mut t = rest.split_whitespace();
-            let from = Vec3::new(parse_f32(t.next(), "fx")?, parse_f32(t.next(), "fy")?, parse_f32(t.next(), "fz")?);
-            let takeoff = Vec3::new(parse_f32(t.next(), "ox")?, parse_f32(t.next(), "oy")?, parse_f32(t.next(), "oz")?);
-            let tgt = Vec3::new(parse_f32(t.next(), "tx")?, parse_f32(t.next(), "ty")?, parse_f32(t.next(), "tz")?);
+            let from = Vec3::new(
+                parse_f32(t.next(), "fx")?,
+                parse_f32(t.next(), "fy")?,
+                parse_f32(t.next(), "fz")?,
+            );
+            let takeoff = Vec3::new(
+                parse_f32(t.next(), "ox")?,
+                parse_f32(t.next(), "oy")?,
+                parse_f32(t.next(), "oz")?,
+            );
+            let tgt = Vec3::new(
+                parse_f32(t.next(), "tx")?,
+                parse_f32(t.next(), "ty")?,
+                parse_f32(t.next(), "tz")?,
+            );
             let v_req = parse_f32(t.next(), "v_req")?;
-            ControlCmd::PlanLink { from, takeoff, tgt, v_req }
+            ControlCmd::PlanLink {
+                from,
+                takeoff,
+                tgt,
+                v_req,
+            }
         }
         other => return Err(format!("unknown verb '{other}'")),
     };
@@ -419,9 +523,19 @@ fn exec_cmd(game: &mut GameState, id: i64, cmd: ControlCmd) {
         ControlCmd::Cell { pos } => cell_json(game, pos),
         ControlCmd::Route { bot } => route_json(game, bot),
         ControlCmd::Curls => curls_json(game),
-        ControlCmd::Probe { takeoff, tgt, psi0, runway } => probe_json(game, takeoff, tgt, psi0, runway),
+        ControlCmd::Probe {
+            takeoff,
+            tgt,
+            psi0,
+            runway,
+        } => probe_json(game, takeoff, tgt, psi0, runway),
         ControlCmd::Curl { src, tgt } => curl_json(game, src, tgt),
-        ControlCmd::PlanLink { from, takeoff, tgt, v_req } => plant_link_json(game, from, takeoff, tgt, v_req),
+        ControlCmd::PlanLink {
+            from,
+            takeoff,
+            tgt,
+            v_req,
+        } => plant_link_json(game, from, takeoff, tgt, v_req),
     };
     match result {
         Ok(data) => reply_ok(game, id, &data),
@@ -485,7 +599,10 @@ fn do_teleport(game: &mut GameState, bot: u32, pos: Vec3) -> Result<String, Stri
     // Park the bot after placing it — otherwise, with no order, it would roam autonomously and arrive
     // at a subsequent rocket jump with residual velocity, contaminating the standstill measurement.
     game.entities[e].bot.puppet.order = Some(ControlOrder::Hold);
-    Ok(format!("{{\"bot\":{bot},\"origin\":{}}}", jvec3(game.entities[e].v.origin)))
+    Ok(format!(
+        "{{\"bot\":{bot},\"origin\":{}}}",
+        jvec3(game.entities[e].v.origin)
+    ))
 }
 
 /// Clear every route/traversal commitment and seed the watchdogs at `at` (so the 200u teleport
@@ -1001,7 +1118,11 @@ fn curl_json(game: &GameState, src: Vec3, tgt: Vec3) -> Result<String, String> {
     let bsp = game.nav.bsp.as_ref().ok_or("no bsp loaded")?;
     let cv = |name: &std::ffi::CStr, d: f32| {
         let v = game.host.cvar(name);
-        if v > 0.0 { v } else { d }
+        if v > 0.0 {
+            v
+        } else {
+            d
+        }
     };
     let p = PmParams {
         gravity: cv(c"sv_gravity", 800.0),
@@ -1022,13 +1143,23 @@ fn curl_json(game: &GameState, src: Vec3, tgt: Vec3) -> Result<String, String> {
         let sigma = wrap180(yaw_of(tgt.xy() - src.xy()) - psi0).signum();
         for tick in 0..100 {
             let cmd = if tick == 0 {
-                bhop::Cmd { view_yaw: psi0, forward: 400.0, side: 0.0, jump: true }
+                bhop::Cmd {
+                    view_yaw: psi0,
+                    forward: 400.0,
+                    side: 0.0,
+                    jump: true,
+                }
             } else {
                 let v_xy = s.vel.xy();
                 let err = wrap180(yaw_of(tgt.xy() - s.origin.xy()) - yaw_of(v_xy));
                 let omega = (err.abs() * gain).min(bhop::omega_gain_max(v_xy.length().max(1.0), amax, dt));
                 let st = bhop::strafe_rate(v_xy, sigma, omega, amax, dt);
-                bhop::Cmd { view_yaw: st.view_yaw, forward: st.forward, side: st.side, jump: false }
+                bhop::Cmd {
+                    view_yaw: st.view_yaw,
+                    forward: st.forward,
+                    side: st.side,
+                    jump: false,
+                }
             };
             pm_step(bsp, &mut s, &cmd, &p, dt);
             if tick > 3 && s.on_ground {
@@ -1057,7 +1188,12 @@ fn curl_json(game: &GameState, src: Vec3, tgt: Vec3) -> Result<String, String> {
     match best {
         Some((v0, psi0, gain, miss, land)) => Ok(format!(
             "{{\"found\":true,\"v0\":{},\"psi0\":{},\"chord\":{},\"gain\":{},\"miss_xy\":{},\"land\":{}}}",
-            jnum(v0), jnum(psi0), jnum(chord), jnum(gain), jnum(miss), jvec3(land)
+            jnum(v0),
+            jnum(psi0),
+            jnum(chord),
+            jnum(gain),
+            jnum(miss),
+            jvec3(land)
         )),
         None => Ok(format!("{{\"found\":false,\"chord\":{}}}", jnum(chord))),
     }
@@ -1072,7 +1208,11 @@ fn plant_link_json(game: &mut GameState, from: Vec3, takeoff: Vec3, tgt: Vec3, v
     use crate::navmesh::SpeedJumpTraversal;
     let gravity = {
         let g = game.host.cvar(c"sv_gravity");
-        if g > 0.0 { g } else { 800.0 }
+        if g > 0.0 {
+            g
+        } else {
+            800.0
+        }
     };
     let graph = game.nav.graph.as_mut().ok_or("navmesh not ready")?;
     let g = std::sync::Arc::get_mut(graph).ok_or("navmesh is shared with the team oracle")?;
@@ -1092,14 +1232,24 @@ fn plant_link_json(game: &mut GameState, from: Vec3, takeoff: Vec3, tgt: Vec3, v
     // compute a per-link gain from the certified takeoff speed.
     let curl_gain = {
         let g = game.host.cvar(c"rtx_jump_curl_gain");
-        if g > 0.0 { g } else { 12.0 }
+        if g > 0.0 {
+            g
+        } else {
+            12.0
+        }
     };
     // Curl-link cost the banded planner now trusts (see `banded_step`): the honest run-up travel +
     // flight + a JumpGap-grade commitment (a rollout-certified envelope carries less risk than the
     // +1.0 charged to a modeled speed jump). Run-up is the `from`→lip distance at the mean build speed.
     let runup = (takeoff.xy() - g.cell_origin(from_cell).xy()).length();
     let cost = runup / 400.0 + airtime + 0.3;
-    let tr = SpeedJumpTraversal { takeoff, v_req, airtime, chained: false, curl_gain };
+    let tr = SpeedJumpTraversal {
+        takeoff,
+        v_req,
+        airtime,
+        chained: false,
+        curl_gain,
+    };
     let li = g.plant_speed_jump(from_cell, to_cell, cost, tr);
     // Refresh the reachability + LOD tables so the new link is visible to steer's O(1) reachable()
     // gate and the coarse router — otherwise a `goto` across the plant redirects to the nearest cell
@@ -1118,7 +1268,11 @@ fn probe_json(game: &GameState, takeoff: Vec3, tgt: Vec3, psi0: f32, runway: f32
     let g = game.nav.graph.as_ref().ok_or("navmesh not ready")?;
     let cv = |n: &std::ffi::CStr, d: f32| {
         let v = game.host.cvar(n);
-        if v > 0.0 { v } else { d }
+        if v > 0.0 {
+            v
+        } else {
+            d
+        }
     };
     let params = crate::navmesh::SpeedJumpParams {
         gravity: cv(c"sv_gravity", 800.0),
@@ -1135,13 +1289,22 @@ fn probe_json(game: &GameState, takeoff: Vec3, tgt: Vec3, psi0: f32, runway: f32
             d.push(',');
         }
         let miss = (land.truncate() - tgt.truncate()).length();
-        d.push_str(&format!("{{\"gain\":{},\"land\":{},\"miss_xy\":{},\"miss_z\":{}}}", jnum(gain), jvec3(land), jnum(miss), jnum((land.z - tgt.z).abs())));
+        d.push_str(&format!(
+            "{{\"gain\":{},\"land\":{},\"miss_xy\":{},\"miss_z\":{}}}",
+            jnum(gain),
+            jvec3(land),
+            jnum(miss),
+            jnum((land.z - tgt.z).abs())
+        ));
     }
     let cert_s = match probe.certified {
         Some((v_req, gain)) => format!("{{\"v_req\":{},\"gain\":{}}}", jnum(v_req), jnum(gain)),
         None => "null".to_string(),
     };
-    Ok(format!("{{\"v_deliver\":{},\"certified\":{cert_s},\"gains\":[{d}]}}", jnum(probe.v_deliver)))
+    Ok(format!(
+        "{{\"v_deliver\":{},\"certified\":{cert_s},\"gains\":[{d}]}}",
+        jnum(probe.v_deliver)
+    ))
 }
 
 /// List every generated curl link (SpeedJump with `curl_gain > 0`).
@@ -1197,10 +1360,13 @@ fn poll_goto(game: &mut GameState, e: EntId, bot: u32, target: Vec3, now: f32) {
         // Finish the puppet order atomically: stop the body and discard every navigation commitment
         // before the next bot frame observes Hold.
         finish_goto_hold(game, e, origin, now);
-        send(game, format!(
+        send(
+            game,
+            format!(
             "{{\"ev\":\"arrived\",\"bot\":{bot},\"t\":{},\"origin\":{},\"target\":{},\"dist\":{},\"traj\":[{traj}]}}",
             jnum(now), jvec3(origin), jvec3(target), jnum(dxy),
-        ));
+        ),
+        );
         return;
     }
     let (best_dist, best_since) = {
@@ -1252,7 +1418,13 @@ fn traj_json(traj: &[(f32, Vec3, Vec3)]) -> String {
         }
         s.push_str(&format!(
             "[{},{},{},{},{},{},{}]",
-            jnum(*ts), jnum(o.x), jnum(o.y), jnum(o.z), jnum(v.x), jnum(v.y), jnum(v.z)
+            jnum(*ts),
+            jnum(o.x),
+            jnum(o.y),
+            jnum(o.z),
+            jnum(v.x),
+            jnum(v.y),
+            jnum(v.z)
         ));
     }
     s
@@ -1296,18 +1468,24 @@ fn poll_fly(game: &mut GameState, e: EntId, bot: u32, link: u32, now: f32) {
         game.entities[e].bot.puppet.order = Some(ControlOrder::Hold);
         game.entities[e].bot.rj.fails = 0;
         let _ = std::mem::take(&mut game.entities[e].bot.puppet.traj);
-        send(game, format!(
-            "{{\"ev\":\"fly_result\",\"bot\":{bot},\"link\":{link},\"on_target\":false,\"timeout\":true,\
+        send(
+            game,
+            format!(
+                "{{\"ev\":\"fly_result\",\"bot\":{bot},\"link\":{link},\"on_target\":false,\"timeout\":true,\
              \"land\":{},\"miss_xy\":9999,\"miss_z\":9999,\"takeoff_speed\":0,\"peak\":0,\"traj\":[]}}",
-            jvec3(origin),
-        ));
+                jvec3(origin),
+            ),
+        );
         return;
     }
     let og = game.entities[e].v.flags.has(Flags::ONGROUND);
     let origin = game.entities[e].v.origin;
     let speed = game.entities[e].v.velocity.xy().length();
     let Some(g) = game.nav.graph.as_ref() else { return };
-    let takeoff = g.speed_jump_of_link(link).map(|t| t.takeoff).unwrap_or_else(|| g.cell_origin(g.link_source(link)));
+    let takeoff = g
+        .speed_jump_of_link(link)
+        .map(|t| t.takeoff)
+        .unwrap_or_else(|| g.cell_origin(g.link_source(link)));
     let target = g.cell_origin(g.link_target(link));
     // "Past the lip" = progress along takeoff→target is positive, so the run-up (behind the lip) and its
     // corridor hops never register as the jump's flight.
@@ -1333,12 +1511,20 @@ fn poll_fly(game: &mut GameState, e: EntId, bot: u32, link: u32, now: f32) {
     game.entities[e].bot.puppet.order = Some(ControlOrder::Hold);
     game.entities[e].bot.rj.fails = 0;
     let _ = now;
-    send(game, format!(
-        "{{\"ev\":\"fly_result\",\"bot\":{bot},\"link\":{link},\"on_target\":{on_target},\"land\":{},\
+    send(
+        game,
+        format!(
+            "{{\"ev\":\"fly_result\",\"bot\":{bot},\"link\":{link},\"on_target\":{on_target},\"land\":{},\
          \"target\":{},\"miss_xy\":{},\"miss_z\":{},\"takeoff_speed\":{},\"peak\":{},\"traj\":[{}]}}",
-        jvec3(origin), jvec3(target), jnum(miss_xy), jnum(miss_z), jnum(takeoff_speed), jnum(peak),
-        traj_json(&traj),
-    ));
+            jvec3(origin),
+            jvec3(target),
+            jnum(miss_xy),
+            jnum(miss_z),
+            jnum(takeoff_speed),
+            jnum(peak),
+            traj_json(&traj),
+        ),
+    );
 }
 
 #[allow(clippy::too_many_arguments)] // one JSON event's worth of measured + solved fields
@@ -1354,9 +1540,11 @@ fn rj_result_json(
 ) -> String {
     // Terminal name + (for a touchdown/overrun) the landing measurement vs the target cell.
     let (name, land) = match outcome {
-        RjOutcome::Landed { on_target, origin, t: ft } => {
-            (if on_target { "landed" } else { "landed_off" }, Some((origin, ft)))
-        }
+        RjOutcome::Landed {
+            on_target,
+            origin,
+            t: ft,
+        } => (if on_target { "landed" } else { "landed_off" }, Some((origin, ft))),
         RjOutcome::Overran { origin, t: ft } => ("overran", Some((origin, ft))),
         RjOutcome::StanceTimeout => ("stance_timeout", None),
         RjOutcome::LiftoffTimeout => ("liftoff_timeout", None),
@@ -1407,7 +1595,13 @@ fn rj_result_json(
         }
         trace.push_str(&format!(
             "[{},{},{},{},{},{},{}]",
-            jnum(*ts), jnum(o.x), jnum(o.y), jnum(o.z), jnum(v.x), jnum(v.y), jnum(v.z)
+            jnum(*ts),
+            jnum(o.x),
+            jnum(o.y),
+            jnum(o.z),
+            jnum(v.x),
+            jnum(v.y),
+            jnum(v.z)
         ));
     }
     format!(
@@ -1493,24 +1687,53 @@ mod tests {
     fn parses_vectors_and_links() {
         assert_eq!(
             parse_line("1 teleport 1 10 -20.5 300").unwrap(),
-            (1, ControlCmd::Teleport { bot: 1, pos: Vec3::new(10.0, -20.5, 300.0) })
+            (
+                1,
+                ControlCmd::Teleport {
+                    bot: 1,
+                    pos: Vec3::new(10.0, -20.5, 300.0)
+                }
+            )
         );
         assert_eq!(
             parse_line("2 goto 1 0 0 0").unwrap(),
-            (2, ControlCmd::Goto { bot: 1, pos: Vec3::ZERO })
+            (
+                2,
+                ControlCmd::Goto {
+                    bot: 1,
+                    pos: Vec3::ZERO
+                }
+            )
         );
-        assert_eq!(parse_line("9 rj 1 412").unwrap(), (9, ControlCmd::Rj { bot: 1, link: 412 }));
+        assert_eq!(
+            parse_line("9 rj 1 412").unwrap(),
+            (9, ControlCmd::Rj { bot: 1, link: 412 })
+        );
     }
 
     #[test]
     fn parses_prep_defaults_and_overrides() {
         assert_eq!(
             parse_line("1 prep 1").unwrap(),
-            (1, ControlCmd::Prep { bot: 1, health: 100.0, rockets: 10.0 })
+            (
+                1,
+                ControlCmd::Prep {
+                    bot: 1,
+                    health: 100.0,
+                    rockets: 10.0
+                }
+            )
         );
         assert_eq!(
             parse_line("1 prep 1 50 3").unwrap(),
-            (1, ControlCmd::Prep { bot: 1, health: 50.0, rockets: 3.0 })
+            (
+                1,
+                ControlCmd::Prep {
+                    bot: 1,
+                    health: 50.0,
+                    rockets: 3.0
+                }
+            )
         );
     }
 
@@ -1518,15 +1741,31 @@ mod tests {
     fn set_and_cmd_take_rest_of_line() {
         assert_eq!(
             parse_line("5 set rtx_rj_delay_bias 0.05").unwrap(),
-            (5, ControlCmd::Set { name: "rtx_rj_delay_bias".into(), value: "0.05".into() })
+            (
+                5,
+                ControlCmd::Set {
+                    name: "rtx_rj_delay_bias".into(),
+                    value: "0.05".into()
+                }
+            )
         );
         assert_eq!(
             parse_line("6 get rtx_rj_stance").unwrap(),
-            (6, ControlCmd::Get { name: "rtx_rj_stance".into() })
+            (
+                6,
+                ControlCmd::Get {
+                    name: "rtx_rj_stance".into()
+                }
+            )
         );
         assert_eq!(
             parse_line("8 cmd map bravado").unwrap(),
-            (8, ControlCmd::Cmd { raw: "map bravado".into() })
+            (
+                8,
+                ControlCmd::Cmd {
+                    raw: "map bravado".into()
+                }
+            )
         );
     }
 

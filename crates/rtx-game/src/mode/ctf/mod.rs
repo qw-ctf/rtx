@@ -190,7 +190,9 @@ fn ctf_frag_bonuses(g: &mut GameState, victim: EntId, attacker: EntId) {
         }
     }
     // Fragged someone who recently hurt your carrier (and you aren't the carrier yourself).
-    if g.entities[victim].mode_p.ctf.last_hurt_carrier + CARRIER_DANGER > now && g.entities[attacker].mode_p.ctf.carrying == 0 {
+    if g.entities[victim].mode_p.ctf.last_hurt_carrier + CARRIER_DANGER > now
+        && g.entities[attacker].mode_p.ctf.carrying == 0
+    {
         g.entities[attacker].v.frags += CARRIER_DANGER_PROTECT_BONUS;
         protected_carrier = true;
     }
@@ -381,9 +383,7 @@ fn ctf_bot_intent(g: &mut GameState, bot: EntId) -> Option<BotIntent> {
             // nearby duel. This is the flag equivalent of the shared critical-pickup commitment.
             if let Some(ef) = enemy_flag(g, team) {
                 let flag_org = g.entities[ef].v.origin;
-                if g.entities[ef].v.solid == Solid::Trigger
-                    && (flag_org - origin).length_squared() < 256.0 * 256.0
-                {
+                if g.entities[ef].v.solid == Solid::Trigger && (flag_org - origin).length_squared() < 256.0 * 256.0 {
                     return Some(BotIntent::Move(flag_org));
                 }
             }

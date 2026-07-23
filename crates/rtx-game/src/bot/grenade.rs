@@ -13,20 +13,16 @@
 
 use glam::{Vec3, Vec3Swizzles};
 
-use crate::bot::BotCmd;
 use crate::bot::combat::{
-    can_hit_grenade, hitscan_choice, own_explosion_safe_at, shoot_grenade, teammate_in_blast,
-    GRENADE_MIN_SHOOT,
-};
-use crate::defs::{
-    Bits, Flags, Items, MoveType, Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK,
-    VEC_VIEW_OFS,
+    can_hit_grenade, hitscan_choice, own_explosion_safe_at, shoot_grenade, teammate_in_blast, GRENADE_MIN_SHOOT,
 };
 use crate::bot::state::GrenadePhase;
+use crate::bot::BotCmd;
+use crate::defs::{Bits, Flags, Items, MoveType, Weapon, BOT_MOVE_SPEED as MOVE_SPEED, BUTTON_ATTACK, VEC_VIEW_OFS};
 use crate::entity::EntId;
-use crate::math::{angle_vectors, angles_to, elevation_of, wrap180, yaw_of};
 use crate::game::GameState;
 use crate::hazard::{find_hazard, Hazard};
+use crate::math::{angle_vectors, angles_to, elevation_of, wrap180, yaw_of};
 
 /// Impulse that selects the grenade launcher.
 pub(crate) const GL_IMPULSE: i32 = 6;
@@ -412,9 +408,7 @@ fn own_live_grenade(game: &GameState, e: EntId, origin: Vec3) -> Option<EntId> {
 
 /// Angular error (deg) between two view angles (pitch/yaw), the larger axis.
 fn aim_err(view: Vec3, want: Vec3) -> f32 {
-    wrap180(view.x - want.x)
-        .abs()
-        .max(wrap180(view.y - want.y).abs())
+    wrap180(view.x - want.x).abs().max(wrap180(view.y - want.y).abs())
 }
 
 /// Drive the grenade lob→shoot combo for one frame, overlaid after `engage` (and after the

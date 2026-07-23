@@ -133,7 +133,10 @@ fn main() -> std::io::Result<()> {
         "udptap: 127.0.0.1:{} ⇄ {}{}{}",
         args.listen,
         args.server,
-        args.out.as_ref().map(|d| format!("  → {}", d.display())).unwrap_or_default(),
+        args.out
+            .as_ref()
+            .map(|d| format!("  → {}", d.display()))
+            .unwrap_or_default(),
         if args.loss > 0 || args.dup > 0 || !args.delay.is_zero() {
             format!("  [loss {}% dup {}% delay {:?}]", args.loss, args.dup, args.delay)
         } else {
@@ -187,9 +190,17 @@ fn forward(args: &Args, rng: &mut Rng, queue: &mut VecDeque<Held>, to_server: bo
         return;
     }
     let at = Instant::now() + args.delay;
-    queue.push_back(Held { at, to_server, data: data.to_vec() });
+    queue.push_back(Held {
+        at,
+        to_server,
+        data: data.to_vec(),
+    });
     if rng.percent(args.dup) {
-        queue.push_back(Held { at, to_server, data: data.to_vec() });
+        queue.push_back(Held {
+            at,
+            to_server,
+            data: data.to_vec(),
+        });
     }
 }
 

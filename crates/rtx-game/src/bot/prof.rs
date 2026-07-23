@@ -271,7 +271,11 @@ impl BotProf {
                 self.worst_phase[Phase::Objective as usize],
                 self.worst_phase[Phase::Steer as usize],
                 self.worst_phase[Phase::Combat as usize],
-                self.worst_bots.iter().map(|b| format!("{b:.2}")).collect::<Vec<_>>().join(" "),
+                self.worst_bots
+                    .iter()
+                    .map(|b| format!("{b:.2}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
             ),
         ]
     }

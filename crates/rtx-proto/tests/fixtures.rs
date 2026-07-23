@@ -31,9 +31,9 @@ use std::path::PathBuf;
 
 use rtx_proto::info::Info;
 use rtx_proto::netchan::Netchan;
+use rtx_proto::oob;
 use rtx_proto::protocol::ProtoState;
 use rtx_proto::svc::{self, SvcEvent};
-use rtx_proto::oob;
 
 /// Every `*-s2c.bin` in the capture, in capture order — which is the order the netchan's sequence
 /// numbers assume.
@@ -42,14 +42,21 @@ fn server_datagrams(dir: &PathBuf) -> Vec<(String, Vec<u8>)> {
         .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with("-s2c.bin")))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with("-s2c.bin"))
+        })
         .collect();
     files.sort(); // zero-padded capture index, so lexical order is capture order
     files
         .into_iter()
         .map(|p| {
             let name = p.file_name().unwrap().to_string_lossy().into_owned();
-            (name, std::fs::read(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display())))
+            (
+                name,
+                std::fs::read(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display())),
+            )
         })
         .collect()
 }
@@ -195,7 +202,12 @@ fn kind(ev: &SvcEvent) -> String {
         SvcEvent::PacketEntities(pe) => {
             // Full and delta updates take different paths, and a capture that only ever saw full
             // updates hasn't tested the one that matters in a real game.
-            return if pe.delta_from.is_some() { "deltapacketentities" } else { "packetentities" }.to_string();
+            return if pe.delta_from.is_some() {
+                "deltapacketentities"
+            } else {
+                "packetentities"
+            }
+            .to_string();
         }
         SvcEvent::Nails(_) => "nails",
         SvcEvent::ModelList(_) => "modellist",

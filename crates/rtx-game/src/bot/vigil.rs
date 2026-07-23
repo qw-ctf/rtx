@@ -61,7 +61,13 @@ const GOLDEN_DEG: f32 = 137.508;
 /// advance the cruise/scan state and return the navigation target `(world point, its cell)` to steer
 /// toward this frame. `None` ⇒ not a vigil (still travelling, or the item is collectable / gone) and
 /// the caller keeps its normal target. `holding` is [`update_handoff_hold`]'s verdict.
-pub(crate) fn maybe(game: &mut GameState, e: EntId, origin: Vec3, holding: bool, now: f32) -> Option<(Vec3, Option<CellId>)> {
+pub(crate) fn maybe(
+    game: &mut GameState,
+    e: EntId,
+    origin: Vec3,
+    holding: bool,
+    now: f32,
+) -> Option<(Vec3, Option<CellId>)> {
     let item = EntId(game.entities[e].bot.goal.item);
     if item.0 == 0 {
         return None;
@@ -88,7 +94,15 @@ pub(crate) fn maybe(game: &mut GameState, e: EntId, origin: Vec3, holding: bool,
 /// Advance the cruise post and scan bearing and return the frame's navigation target. Mirrors
 /// [`roam_target`](super::roam_target)'s borrow order — draw randoms first, then borrow the graph,
 /// then write the (disjoint) bot fields.
-fn update(game: &mut GameState, e: EntId, origin: Vec3, item_org: Vec3, holding: bool, respawn_at: Option<f32>, now: f32) -> (Vec3, Option<CellId>) {
+fn update(
+    game: &mut GameState,
+    e: EntId,
+    origin: Vec3,
+    item_org: Vec3,
+    holding: bool,
+    respawn_at: Option<f32>,
+    now: f32,
+) -> (Vec3, Option<CellId>) {
     // Waiting near a known respawn *is* making progress toward the goal — keep the give-up watchdog
     // (super::resolve_objective's GOAL_GIVEUP_TIME) from abandoning a legitimate wait. A hold is
     // bounded by its own HOLD_MAX deadline, so refreshing this is safe there too.
@@ -112,7 +126,10 @@ fn update(game: &mut GameState, e: EntId, origin: Vec3, item_org: Vec3, holding:
     // Scan: sweep to a fresh bearing when the hold lapses (or on first use), else keep the last point
     // so the view settles there.
     let (new_scan, new_scan_until) = if scan == Vec3::ZERO || scan_due(scan_until, now) {
-        (pick_scan(eye, scan, r_scan), now + SCAN_HOLD_MIN + r_scanhold * SCAN_HOLD_JITTER)
+        (
+            pick_scan(eye, scan, r_scan),
+            now + SCAN_HOLD_MIN + r_scanhold * SCAN_HOLD_JITTER,
+        )
     } else {
         (scan, scan_until)
     };
@@ -124,7 +141,10 @@ fn update(game: &mut GameState, e: EntId, origin: Vec3, item_org: Vec3, holding:
         (item_org, g.nearest(item_org), Vec3::ZERO, post_until)
     } else if post != Vec3::ZERO && !post_due(post, post_until, origin, now) {
         (post, g.nearest(post), post, post_until) // keep heading to the current post
-    } else if let Some((cell, p)) = g.nearest(origin).and_then(|from| pick_post(g, from, item_org, POST_MIN, max_r, r_post)) {
+    } else if let Some((cell, p)) = g
+        .nearest(origin)
+        .and_then(|from| pick_post(g, from, item_org, POST_MIN, max_r, r_post))
+    {
         (p, Some(cell), p, now + POST_HOLD + r_hold * POST_JITTER)
     } else {
         // No trivial post anywhere in the ring — sit on the item itself. The one spot a vigil can still
@@ -254,9 +274,15 @@ mod tests {
         assert!((first - eye).xy().length() > SCAN_DIST - 1.0, "look point is far off");
         assert!((first.z - eye.z).abs() < 1e-3, "level scan");
         // Next pick steps the golden angle from the previous bearing.
-        let b0 = { let d = first - eye; yaw_of(d.xy()) };
+        let b0 = {
+            let d = first - eye;
+            yaw_of(d.xy())
+        };
         let second = pick_scan(eye, first, 0.0);
-        let b1 = { let d = second - eye; yaw_of(d.xy()) };
+        let b1 = {
+            let d = second - eye;
+            yaw_of(d.xy())
+        };
         let step = (b1 - b0).rem_euclid(360.0);
         assert!((step - GOLDEN_DEG).abs() < 0.5, "bearing advanced ~137.5°, got {step}");
     }

@@ -129,7 +129,10 @@ impl BotState {
 
     /// Whether `item` is currently on the avoid ring (an unexpired entry).
     pub fn is_avoided(&self, item: u32, now: f32) -> bool {
-        self.goal.avoid_items.iter().any(|&(it, until)| it == item && now < until)
+        self.goal
+            .avoid_items
+            .iter()
+            .any(|&(it, until)| it == item && now < until)
     }
 
     /// An item this bot was planning around has just left the floor. Drop a stale current/next
@@ -150,12 +153,10 @@ impl BotState {
                 self.goal.item_cell = 0;
                 self.goal.commit = GoalCommit::None;
             }
-            (self.goal.next_item, self.goal.next_cell, self.goal.next_commit) =
-                (0, 0, GoalCommit::None);
+            (self.goal.next_item, self.goal.next_cell, self.goal.next_commit) = (0, 0, GoalCommit::None);
             self.goal.next_pick = now;
         } else if self.goal.next_item == item {
-            (self.goal.next_item, self.goal.next_cell, self.goal.next_commit) =
-                (0, 0, GoalCommit::None);
+            (self.goal.next_item, self.goal.next_cell, self.goal.next_commit) = (0, 0, GoalCommit::None);
         }
     }
 

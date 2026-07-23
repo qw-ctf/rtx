@@ -52,8 +52,7 @@ impl GameState {
             ent.v.solid = Solid::Trigger;
         }
         self.set_model(e, model);
-        self
-            .set_size(e, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
+        self.set_size(e, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 56.0));
         let jx = -500.0 + self.random() * 1000.0;
         let jy = -500.0 + self.random() * 1000.0;
         let time = self.time();
@@ -70,9 +69,7 @@ impl GameState {
 
     /// `Touch::Rune` — pick up a rune (one per player; a held rune blocks the pickup).
     pub(crate) fn rune_touch(&mut self, rune: EntId, other: EntId) {
-        if other == self.entities[rune].owner()
-            || !self.entities[other].is_player()
-            || !self.entities[other].is_alive()
+        if other == self.entities[rune].owner() || !self.entities[other].is_player() || !self.entities[other].is_alive()
         {
             return;
         }

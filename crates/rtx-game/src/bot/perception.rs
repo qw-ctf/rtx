@@ -210,7 +210,10 @@ mod tests {
     fn reaction_shortens_with_skill_and_floors() {
         assert_eq!(reaction_time(0.0, 3.0), 0.0, "0 base is instant");
         assert_eq!(reaction_time(0.4, 0.0), 0.4, "unskilled bot pays the full delay");
-        assert!(reaction_time(0.4, 7.0) < reaction_time(0.4, 0.0), "skill shortens reaction");
+        assert!(
+            reaction_time(0.4, 7.0) < reaction_time(0.4, 0.0),
+            "skill shortens reaction"
+        );
         assert!(reaction_time(0.4, 7.0) >= 0.05, "but never below the floor");
         assert_eq!(reaction_time(0.01, 7.0), 0.05, "the floor also catches a tiny base");
     }
@@ -219,7 +222,7 @@ mod tests {
     fn hypothesis_keeps_the_bearing() {
         let listener = Vec3::new(0.0, 0.0, 0.0);
         let source = Vec3::new(600.0, 0.0, 0.0); // due +X, not on a bucket edge
-        // Sweep the random draws: the guess must always point the same general way as the source.
+                                                 // Sweep the random draws: the guess must always point the same general way as the source.
         for &r_lat in &[0.0, 0.5, 1.0] {
             for &r_dist in &[0.0, 0.5, 1.0] {
                 let g = heard_hypothesis(listener, source, r_lat, r_dist) - listener;
@@ -234,7 +237,10 @@ mod tests {
         let listener = Vec3::new(10.0, 20.0, 30.0);
         let source = Vec3::new(610.0, 20.0, 30.0); // 600u away, off a bucket multiple
         let g = heard_hypothesis(listener, source, 0.5, 0.5);
-        assert!((g - source).length() > 1.0, "a heard guess must not land on the true origin");
+        assert!(
+            (g - source).length() > 1.0,
+            "a heard guess must not land on the true origin"
+        );
     }
 
     #[test]
@@ -244,7 +250,10 @@ mod tests {
         let source = Vec3::new(800.0, 0.0, 0.0);
         for &r_dist in &[0.0, 0.5, 1.0] {
             let range = (heard_hypothesis(listener, source, 0.5, r_dist) - listener).length();
-            assert!((640.0..=896.0).contains(&range), "range {range} outside the bucket ± jitter band");
+            assert!(
+                (640.0..=896.0).contains(&range),
+                "range {range} outside the bucket ± jitter band"
+            );
         }
     }
 

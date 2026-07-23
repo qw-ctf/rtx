@@ -160,7 +160,6 @@ impl GameState {
         v.groundentity = EntId::WORLD.to_prog();
         true
     }
-
 }
 
 /// How far to shift a trace so an entity's box lines up with the hull the BSP was compiled with
@@ -184,4 +183,3 @@ fn hull_offset(mins: Vec3, maxs: Vec3) -> Vec3 {
     let _ = maxs; // the hull is chosen by width, but it's the box's mins the offset maps
     crate::defs::VEC_HULL_MIN - mins
 }
-

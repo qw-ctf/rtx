@@ -13,15 +13,14 @@
 //!
 //! [navmesh]: crate::navmesh
 
-
 use glam::{Vec2, Vec3, Vec3Swizzles};
 
 pub(crate) mod bhop;
-pub(crate) mod human_profile;
 mod combat;
 pub(crate) mod goals;
 mod grenade;
 mod hook;
+pub(crate) mod human_profile;
 pub(crate) mod model;
 pub(crate) mod oracle;
 pub(crate) mod par;
@@ -37,17 +36,15 @@ pub use population::manage_population;
 pub(crate) use population::{drain_roster, RosterOp};
 // Reused by the netclient to name its own bodies the same way the roster names qwprogs bots; the
 // qwprogs build calls these through their defining module, so the re-export is netclient-only.
-#[cfg(feature = "netclient")]
-pub(crate) use population::{bot_display_name, bot_name};
 #[cfg(test)]
 use population::bot_target;
+#[cfg(feature = "netclient")]
+pub(crate) use population::{bot_display_name, bot_name};
 
 use crate::bot::state::{
     AirCommit, BotState, CombatPosture, Commit, GoalCommit, GrenadePhase, HookPhase, RjPhase, Wander,
 };
-use crate::defs::{
-    Bits, DeadFlag, Flags, Items, Solid, TakeDamage, Weapon, BUTTON_ATTACK, BUTTON_JUMP, VEC_VIEW_OFS,
-};
+use crate::defs::{Bits, DeadFlag, Flags, Items, Solid, TakeDamage, Weapon, BUTTON_ATTACK, BUTTON_JUMP, VEC_VIEW_OFS};
 use crate::entity::{EntId, Entity, Touch};
 use crate::game::{cstring, GameState};
 use crate::math::{angle_vectors, wrap180, yaw_of};
@@ -177,7 +174,13 @@ pub(super) enum Landing {
 /// Classify a ballistic landing (see [`Landing`]). `elapsed` is time since the ballistic phase
 /// began; a touchdown only counts after a 0.1 s settle so the takeoff frame isn't read as an instant
 /// landing. `airtime_budget` is the solved airtime plus the driver's watchdog slack.
-pub(super) fn ballistic_landing(origin: Vec3, target: Vec3, on_ground: bool, elapsed: f32, airtime_budget: f32) -> Landing {
+pub(super) fn ballistic_landing(
+    origin: Vec3,
+    target: Vec3,
+    on_ground: bool,
+    elapsed: f32,
+    airtime_budget: f32,
+) -> Landing {
     if on_ground && elapsed > 0.1 {
         Landing::Down {
             on_target: (origin.xy() - target.xy()).length() <= ARRIVE_RADIUS * 2.0,
@@ -622,8 +625,39 @@ fn sense(game: &GameState, e: EntId) -> Sense {
         pitch_bias: host.cvar(c"rtx_rj_pitch_bias"),
     };
     Sense {
-        host, now, frametime, msec, origin, v_angle, client, weapon, on_ground, in_water, submerged, burning, air_left, alive, vz, air_jumped, enemy_seen_time, v_xy, speed, grapple_hook, has_grapple, hook_out, on_hook, anchor, reel_half_step,
-        attack_finished, has_rl, ammo_rockets, health, armortype, armorvalue, quad, rj_knobs,
+        host,
+        now,
+        frametime,
+        msec,
+        origin,
+        v_angle,
+        client,
+        weapon,
+        on_ground,
+        in_water,
+        submerged,
+        burning,
+        air_left,
+        alive,
+        vz,
+        air_jumped,
+        enemy_seen_time,
+        v_xy,
+        speed,
+        grapple_hook,
+        has_grapple,
+        hook_out,
+        on_hook,
+        anchor,
+        reel_half_step,
+        attack_finished,
+        has_rl,
+        ammo_rockets,
+        health,
+        armortype,
+        armorvalue,
+        quad,
+        rj_knobs,
     }
 }
 
@@ -677,11 +711,8 @@ fn apply_oracle_advice(
             }
             let armed = (game.entities[e].v.items.has(Items::ROCKET_LAUNCHER)
                 && game.entities[e].v.ammo_rockets >= 1.0)
-                || (game.entities[e].v.items.has(Items::LIGHTNING)
-                    && game.entities[e].v.ammo_cells >= 1.0);
-            if nugget.kind == oracle::NuggetKind::Rearm && armed
-                || !game.item_goal_valid(e, item, now)
-            {
+                || (game.entities[e].v.items.has(Items::LIGHTNING) && game.entities[e].v.ammo_cells >= 1.0);
+            if nugget.kind == oracle::NuggetKind::Rearm && armed || !game.item_goal_valid(e, item, now) {
                 reject_oracle_advice(game, e, nugget, now);
                 return None;
             }
@@ -698,11 +729,8 @@ fn apply_oracle_advice(
             game.oracle.mark_applied(nugget, now);
             None
         }
-        oracle::NuggetKind::Regroup
-        | oracle::NuggetKind::CoverArea
-        | oracle::NuggetKind::Intercept => {
-            let visible_fight = matches!(intent, Some(BotIntent::Fight(_)))
-                && combat_last_seen.is_none();
+        oracle::NuggetKind::Regroup | oracle::NuggetKind::CoverArea | oracle::NuggetKind::Intercept => {
+            let visible_fight = matches!(intent, Some(BotIntent::Fight(_))) && combat_last_seen.is_none();
             if visible_fight || matches!(intent, Some(BotIntent::Advance(_))) {
                 return None;
             }
@@ -773,7 +801,9 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
             }
         };
         return Objective {
-            hooking, on_sj, on_rj,
+            hooking,
+            on_sj,
+            on_rj,
             enemy: None,
             chasing: false,
             item_committed: false,
@@ -798,7 +828,12 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     let mut polite = false;
     let intent = if crate::mode::team::benched(game, e) {
         // Benched spectator (structured match, off the locked roster): stroll the stands, no fighting.
-        Some(BotIntent::Move(crate::mode::wander_point(game, e, "info_player_deathmatch", |_| None)))
+        Some(BotIntent::Move(crate::mode::wander_point(
+            game,
+            e,
+            "info_player_deathmatch",
+            |_| None,
+        )))
     } else if host.cvar_bool(c"rtx_bot_pacifist") && mode.allows_bot_pacifist_override() {
         // Global override where the mode permits it: don't fight — just tail the nearest human.
         // Race refuses this because its hard Move intent is the ordered checkpoint/finish route.
@@ -862,10 +897,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         b.goal.next_pick = now;
     }
 
-    let traversal_committed = hooking
-        || on_sj
-        || on_rj
-        || game.entities[e].bot.air.is_some();
+    let traversal_committed = hooking || on_sj || on_rj || game.entities[e].bot.air.is_some();
 
     // Strategic recovery: relative strength/firepower and critical health can make a reachable
     // health/armor/weapon pickup own movement for several seconds. A powerup plan normally wins;
@@ -876,13 +908,16 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
             let previous = game.entities[e].bot.posture;
             let (posture, recovery) = game.recovery_decision(e, en, now, previous);
             game.entities[e].bot.posture = posture;
-            let may_preempt = game.entities[e].bot.goal.commit != GoalCommit::Powerup
-                || game.entities[e].v.health <= 20.0;
+            let may_preempt =
+                game.entities[e].bot.goal.commit != GoalCommit::Powerup || game.entities[e].v.health <= 20.0;
             if may_preempt {
                 if let Some((item, cell)) = recovery {
                     let b = &mut game.entities[e].bot;
-                    let preserve = (b.goal.commit == GoalCommit::Powerup && b.goal.item != 0)
-                        .then_some((b.goal.item, b.goal.item_cell, GoalCommit::Powerup));
+                    let preserve = (b.goal.commit == GoalCommit::Powerup && b.goal.item != 0).then_some((
+                        b.goal.item,
+                        b.goal.item_cell,
+                        GoalCommit::Powerup,
+                    ));
                     if item.0 != b.goal.item {
                         b.goal.since = now;
                     }
@@ -899,8 +934,8 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
 
     // Fast local survival pass. It is independent of greed and runs while idle or fighting, but not
     // during a ballistic traversal whose route/view already have an indivisible owner.
-    let urgent_allowed = matches!(intent, None | Some(BotIntent::Fight(_) | BotIntent::Advance(_)))
-        && !traversal_committed;
+    let urgent_allowed =
+        matches!(intent, None | Some(BotIntent::Fight(_) | BotIntent::Advance(_))) && !traversal_committed;
     // A timed powerup commitment normally freezes item selection, but nearby preparation is useful:
     // on a live opening Quad, pick up an effectively on-route weapon/armor first; during a respawn
     // wait, spend only route slack. Keep the powerup as a completion-critical continuation, so
@@ -916,10 +951,8 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         b.goal.next_urgent = now + 0.2;
         if let Some((item, cell)) = pick {
             b.goal.since = now;
-            (b.goal.item, b.goal.item_cell, b.goal.commit) =
-                (item.0, cell, GoalCommit::Pickup);
-            (b.goal.next_item, b.goal.next_cell, b.goal.next_commit) =
-                (powerup.0, powerup_cell, GoalCommit::Powerup);
+            (b.goal.item, b.goal.item_cell, b.goal.commit) = (item.0, cell, GoalCommit::Pickup);
+            (b.goal.next_item, b.goal.next_cell, b.goal.next_commit) = (powerup.0, powerup_cell, GoalCommit::Powerup);
             b.goal.next_pick = now + GOAL_SELECT_INTERVAL;
         }
     }
@@ -948,15 +981,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         now,
         intent.is_none() && game.entities[e].bot.goal.commit == GoalCommit::None,
     );
-    let oracle_target = apply_oracle_advice(
-        game,
-        e,
-        now,
-        intent,
-        combat_last_seen,
-        traversal_committed,
-        holding,
-    );
+    let oracle_target = apply_oracle_advice(game, e, now, intent, combat_last_seen, traversal_committed, holding);
     if holding {
         // `update_handoff_hold` set `goal_item` to the held weapon — nothing else to pick this frame.
     } else if game.entities[e].bot.goal.commit != GoalCommit::None {
@@ -1072,13 +1097,21 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         // (`on_item` gates |dz| ≤ 48), so the bot parks/waits for something it can't reach.
         let (gcell, gdz) = if gi != 0 {
             let ic = b.goal.item_cell;
-            let dz = game.nav.graph.as_ref().map_or(0.0, |g| g.cell_origin(ic).z - game.entities[EntId(gi)].v.origin.z);
+            let dz = game
+                .nav
+                .graph
+                .as_ref()
+                .map_or(0.0, |g| g.cell_origin(ic).z - game.entities[EntId(gi)].v.origin.z);
             (ic as i64, dz)
         } else {
             (-1, 0.0)
         };
         // Arena spectating: which fighter (edict) this bot is watching, `0` = none.
-        let wat = if let Some(BotIntent::Spectate { watch, .. }) = intent { watch.0 } else { 0 };
+        let wat = if let Some(BotIntent::Spectate { watch, .. }) = intent {
+            watch.0
+        } else {
+            0
+        };
         let commit = b.goal.commit;
         let posture = b.posture;
         let mag = b.goal.magnet_item;
@@ -1187,8 +1220,7 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
         }
         let mi = game.entities[e].bot.goal.magnet_item;
         // Revalidate cheaply each frame: a magnet is good only while it's still on the floor.
-        (mi != 0 && game.entities[EntId(mi)].v.solid == Solid::Trigger)
-            .then(|| game.entities[EntId(mi)].v.origin)
+        (mi != 0 && game.entities[EntId(mi)].v.solid == Solid::Trigger).then(|| game.entities[EntId(mi)].v.origin)
     } else {
         game.entities[e].bot.goal.magnet_item = 0;
         None
@@ -1205,8 +1237,21 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3, cli
     // `surfacing`/`swim_up` are decided in `run_bot` (they need the borrowed graph + bot cell), so
     // the normal objective leaves them off — the anti-drown override flips them on when it fires.
     Objective {
-        hooking, on_sj, on_rj, enemy, chasing, item_committed, polite, target_origin, item_cell, magnet,
-        watch_point, vigil: vigil.is_some(), surfacing: false, swim_up: false, order_link: None,
+        hooking,
+        on_sj,
+        on_rj,
+        enemy,
+        chasing,
+        item_committed,
+        polite,
+        target_origin,
+        item_cell,
+        magnet,
+        watch_point,
+        vigil: vigil.is_some(),
+        surfacing: false,
+        swim_up: false,
+        order_link: None,
     }
 }
 
@@ -1236,8 +1281,23 @@ fn emit(
     rj: &rj::RjDrive,
     enemy: Option<EntId>,
 ) {
-    let Sense { host, now, frametime, v_angle, client, msec, speed, .. } = s;
-    let BotCmd { look, move_world, mut buttons, impulse, shot } = cmd;
+    let Sense {
+        host,
+        now,
+        frametime,
+        v_angle,
+        client,
+        msec,
+        speed,
+        ..
+    } = s;
+    let BotCmd {
+        look,
+        move_world,
+        mut buttons,
+        impulse,
+        shot,
+    } = cmd;
     let skill = host.cvar(c"rtx_bot_skill").clamp(0.0, 7.0);
 
     // View + move for the frame. When the bhop controller is driving, translate its usercmd into a
@@ -1250,7 +1310,10 @@ fn emit(
     let (look, move_world) = match bhop_cmd {
         Some(c) => {
             let w = bhop::wishdir_fs(c.view_yaw, c.forward, c.side);
-            (Vec3::new(look.x, c.view_yaw, 0.0), Vec3::new(w.x, w.y, 0.0) * crate::defs::BOT_MOVE_SPEED)
+            (
+                Vec3::new(look.x, c.view_yaw, 0.0),
+                Vec3::new(w.x, w.y, 0.0) * crate::defs::BOT_MOVE_SPEED,
+            )
         }
         None => (look, move_world),
     };
@@ -1264,7 +1327,11 @@ fn emit(
         // overrides the skill-scaled default when > 0.
         let cap = {
             let c = game.host().cvar(c"rtx_bot_turnrate");
-            if c > 0.0 { c } else { combat::aim_rate_cap(skill) }
+            if c > 0.0 {
+                c
+            } else {
+                combat::aim_rate_cap(skill)
+            }
         };
         let b = &mut game.entities[e].bot;
         if b.aim.angles == Vec3::ZERO {
@@ -1321,7 +1388,12 @@ fn emit(
             b.rj.jump_time = now;
             // Harness telemetry: the actual press moment, the settled view, and the residual aim
             // error against the (biased) fire angles. Inert without a puppet order consuming it.
-            b.rj.telem.press = Some(state::RjPress { t: now, origin: s.origin, view, aim_err: err });
+            b.rj.telem.press = Some(state::RjPress {
+                t: now,
+                origin: s.origin,
+                view,
+                aim_err: err,
+            });
         }
     }
     // The rocket fires this frame (the driver set `rj.fire` in Stance-timed Rise): stamp the settled
@@ -1370,13 +1442,10 @@ fn prearm_traversal(game: &mut GameState, e: EntId, now: f32, on_ground: bool) {
             return;
         };
         let b = &game.entities[e].bot;
-        b.route.get(b.route_pos).copied().map(|leg| {
-            (
-                leg,
-                graph.link_kind(leg),
-                graph.link_target(leg),
-            )
-        })
+        b.route
+            .get(b.route_pos)
+            .copied()
+            .map(|leg| (leg, graph.link_kind(leg), graph.link_target(leg)))
     };
     let Some((leg, kind, target)) = current else {
         return;
@@ -1406,7 +1475,16 @@ fn prearm_traversal(game: &mut GameState, e: EntId, now: f32, on_ground: bool) {
 fn run_bot(game: &mut GameState, e: EntId) {
     let s = sense(game, e);
     // The spine reads only these; `steer` re-destructures the full snapshot from `s` via `SteerCtx`.
-    let Sense { host, now, msec, origin, v_angle, client, alive, .. } = s;
+    let Sense {
+        host,
+        now,
+        msec,
+        origin,
+        v_angle,
+        client,
+        alive,
+        ..
+    } = s;
     // Flip the per-frame pulse used for press/release-edge buttons.
     let pulse = {
         let b = &mut game.entities[e].bot;
@@ -1480,7 +1558,12 @@ fn run_bot(game: &mut GameState, e: EntId) {
     let mut o = resolve_objective(game, e, now, origin, client);
     game.bot_prof.add_phase(prof::Phase::Objective, t.stop());
     // The spine and prologue read a few fields; `steer` re-destructures the rest from `o` via `SteerCtx`.
-    let Objective { enemy, item_cell, target_origin, .. } = o;
+    let Objective {
+        enemy,
+        item_cell,
+        target_origin,
+        ..
+    } = o;
 
     // Whether weapons may fire right now (a match-mode countdown locks them out). Read before the nav
     // borrow: a rocket jump must not jump when the engine would swallow its rocket (jump, no blast).
@@ -1579,7 +1662,14 @@ fn run_bot(game: &mut GameState, e: EntId) {
 
     let t = prof::Timer::start(profiling);
     let bot = &mut game.entities[e].bot;
-    let steer::SteerOut { mut cmd, bhop_cmd, hook, rj, traversal_lock, overlays_ok } = steer::steer(
+    let steer::SteerOut {
+        mut cmd,
+        bhop_cmd,
+        hook,
+        rj,
+        traversal_lock,
+        overlays_ok,
+    } = steer::steer(
         graph,
         bot,
         steer::SteerCtx {
@@ -1877,10 +1967,7 @@ fn progress_stalled(best: f32, since: f32, remaining: f32, now: f32) -> bool {
 
 /// Whether `p` lies within the box `[fp_min, fp_max]` grown by `margin` on every side.
 pub(crate) fn in_footprint(p: Vec2, fp_min: Vec2, fp_max: Vec2, margin: f32) -> bool {
-    p.x >= fp_min.x - margin
-        && p.x <= fp_max.x + margin
-        && p.y >= fp_min.y - margin
-        && p.y <= fp_max.y + margin
+    p.x >= fp_min.x - margin && p.x <= fp_max.x + margin && p.y >= fp_min.y - margin && p.y <= fp_max.y + margin
 }
 
 /// Where to stand while a raised plat comes down: the bot's current spot if it's already at least
@@ -1971,7 +2058,11 @@ fn penalize_leg(bot: &mut BotState, link: Option<u32>, kind: Option<LinkKind>, n
 /// `Plat` link, the very kind `penalize_leg` exempts (the ordinary watchdogs misread waiting on a
 /// lift as failure, but an 8s hold with no descent is a genuine one worth diverting from).
 fn penalize_link(bot: &mut BotState, link: u32, now: f32) {
-    if let Some(slot) = bot.failed_links.iter_mut().find(|(l, until, _)| *l == link && *until > now) {
+    if let Some(slot) = bot
+        .failed_links
+        .iter_mut()
+        .find(|(l, until, _)| *l == link && *until > now)
+    {
         slot.2 = slot.2.saturating_add(1);
         slot.1 = now + PENALTY_TTL;
         return;
@@ -2014,11 +2105,7 @@ fn button_reachable(graph: &NavGraph, from: CellId, gi: usize, costs: &LinkCosts
 /// The target points of the leading `Walk`/`Step` legs from `route_pos` (the ground corridor a
 /// bunnyhop can run), stopping at the first non-ground leg. Shared by [`runway`] and
 /// [`corridor_point`] so both trace the exact same corridor.
-fn ground_leg_targets<'a>(
-    graph: &'a NavGraph,
-    route: &'a [u32],
-    route_pos: usize,
-) -> impl Iterator<Item = Vec3> + 'a {
+fn ground_leg_targets<'a>(graph: &'a NavGraph, route: &'a [u32], route_pos: usize) -> impl Iterator<Item = Vec3> + 'a {
     route
         .get(route_pos..)
         .unwrap_or_default()
@@ -2139,7 +2226,12 @@ fn nearest_air(graph: &NavGraph, bot_cell: CellId, costs: &LinkCosts) -> Option<
 /// bounded flood — the escape targets are always close. `settled` is in nondecreasing-cost order, so
 /// the first qualifying cell is the nearest one within [`ESCAPE_FLOOD_MAX`]. Only if nothing within
 /// the bound qualifies does it pay for a whole-graph flood, so the result equals the global nearest.
-fn nearest_settled(graph: &NavGraph, bot_cell: CellId, costs: &LinkCosts, ok: impl Fn(CellId) -> bool) -> Option<CellId> {
+fn nearest_settled(
+    graph: &NavGraph,
+    bot_cell: CellId,
+    costs: &LinkCosts,
+    ok: impl Fn(CellId) -> bool,
+) -> Option<CellId> {
     let (_, settled) = graph.costs_from_within(bot_cell, costs, ESCAPE_FLOOD_MAX);
     if let Some(&c) = settled.iter().find(|&&c| ok(c)) {
         return Some(c);
@@ -2212,7 +2304,6 @@ fn nearest_human(game: &GameState, bot_e: EntId) -> Option<EntId> {
     best.map(|(e, _)| e)
 }
 
-
 /// Drop bot bookkeeping when a bot client disconnects (kicked, or removed by the manager), so
 /// a slot reused by a future human isn't mistaken for a bot.
 pub fn on_disconnect(ent: &mut Entity) {
@@ -2246,26 +2337,45 @@ mod tests {
     fn runway_over_stops_at_bends_and_ascents() {
         let origin = Vec3::ZERO;
         let flat: Vec<Vec3> = (1..=12).map(|i| Vec3::new(i as f32 * 32.0, 0.0, 0.0)).collect();
-        assert!((runway_over(origin, flat.iter().copied()) - 384.0).abs() < 1.0, "flat corridor should be full length");
+        assert!(
+            (runway_over(origin, flat.iter().copied()) - 384.0).abs() < 1.0,
+            "flat corridor should be full length"
+        );
 
         // A 90° bend after ~128u: runway stops around the last straight chord (before the turn).
         let mut bend = flat[..4].to_vec();
         bend.extend((1..=8).map(|i| Vec3::new(128.0, i as f32 * 32.0, 0.0)));
         let r = runway_over(origin, bend.iter().copied());
-        assert!((96.0..=200.0).contains(&r), "bend should stop the runway near it, got {r}");
+        assert!(
+            (96.0..=200.0).contains(&r),
+            "bend should stop the runway near it, got {r}"
+        );
 
         // Ascending staircase: 8u riser per 32u run ⇒ ~24u climb per 96u chord ⇒ stops early.
-        let stairs: Vec<Vec3> = (1..=12).map(|i| Vec3::new(i as f32 * 32.0, 0.0, i as f32 * 8.0)).collect();
-        assert!(runway_over(origin, stairs.iter().copied()) < 160.0, "should not treat stairs as runway");
+        let stairs: Vec<Vec3> = (1..=12)
+            .map(|i| Vec3::new(i as f32 * 32.0, 0.0, i as f32 * 8.0))
+            .collect();
+        assert!(
+            runway_over(origin, stairs.iter().copied()) < 160.0,
+            "should not treat stairs as runway"
+        );
 
         // Descending staircase (hopping down is fine) and a lone 16u step both stay full length.
-        let down: Vec<Vec3> = (1..=12).map(|i| Vec3::new(i as f32 * 32.0, 0.0, -(i as f32) * 8.0)).collect();
-        assert!(runway_over(origin, down.iter().copied()) > 350.0, "descending stairs should stay runway");
+        let down: Vec<Vec3> = (1..=12)
+            .map(|i| Vec3::new(i as f32 * 32.0, 0.0, -(i as f32) * 8.0))
+            .collect();
+        assert!(
+            runway_over(origin, down.iter().copied()) > 350.0,
+            "descending stairs should stay runway"
+        );
         let mut step = flat.clone();
         for p in step.iter_mut().skip(6) {
             p.z = 16.0; // a single 16u lip partway along an otherwise level corridor
         }
-        assert!(runway_over(origin, step.iter().copied()) > 350.0, "a lone step should not truncate the runway");
+        assert!(
+            runway_over(origin, step.iter().copied()) > 350.0,
+            "a lone step should not truncate the runway"
+        );
     }
 
     #[test]
@@ -2273,7 +2383,10 @@ mod tests {
         let origin = Vec3::ZERO;
         let pts: Vec<Vec3> = (1..=4).map(|i| Vec3::new(i as f32 * 100.0, 0.0, 0.0)).collect();
         assert!((point_along(origin, pts.iter().copied(), 250.0).x - 250.0).abs() < 0.5);
-        assert!((point_along(origin, pts.iter().copied(), 9999.0).x - 400.0).abs() < 0.5, "clamps to the last point");
+        assert!(
+            (point_along(origin, pts.iter().copied(), 9999.0).x - 400.0).abs() < 0.5,
+            "clamps to the last point"
+        );
         assert!((point_along(origin, pts.iter().copied(), 0.0).x - 0.0).abs() < 0.5);
     }
 
@@ -2287,7 +2400,11 @@ mod tests {
         assert_eq!(bot_target(5, 1, pickup, false), Some(5));
         // Structured warmup caps the fill to the empty seats (4 seats − 1 human = 3).
         assert_eq!(bot_target(5, 1, two_by_two, true), Some(3));
-        assert_eq!(bot_target(2, 1, two_by_two, true), Some(2), "cvar below empty seats wins");
+        assert_eq!(
+            bot_target(2, 1, two_by_two, true),
+            Some(2),
+            "cvar below empty seats wins"
+        );
         assert_eq!(bot_target(5, 4, two_by_two, true), Some(0), "humans fill every seat");
         // Structured live → freeze (no add, no trim).
         assert_eq!(bot_target(5, 1, two_by_two, false), None);
@@ -2375,7 +2492,9 @@ mod tests {
         let bytes = std::fs::read(&path).expect("read bsp");
         let bsp = Bsp::parse(&bytes).expect("parse bsp");
         let graph = NavGraph::build(&bsp);
-        let quad = graph.nearest(Vec3::new(752.0, 24.0, 288.0)).expect("no cell near the quad");
+        let quad = graph
+            .nearest(Vec3::new(752.0, 24.0, 288.0))
+            .expect("no cell near the quad");
 
         // The platform proper: the walk/step-connected plateau containing the quad cell (jump
         // links excluded, so the launch ledge across the void doesn't count as "on it").
@@ -2413,9 +2532,7 @@ mod tests {
             .links
             .iter()
             .filter(|l| {
-                on_platform[l.to as usize]
-                    && !on_platform[l.from as usize]
-                    && !matches!(l.kind, LinkKind::Drop)
+                on_platform[l.to as usize] && !on_platform[l.from as usize] && !matches!(l.kind, LinkKind::Drop)
             })
             .count();
         eprintln!(
@@ -2467,7 +2584,13 @@ mod tests {
         ] {
             assert!(bot_pickup_touch(touch), "{touch:?} should be collected manually");
         }
-        for touch in [Touch::Teleport, Touch::Hurt, Touch::ButtonTouch, Touch::Multi, Touch::PlatCenter] {
+        for touch in [
+            Touch::Teleport,
+            Touch::Hurt,
+            Touch::ButtonTouch,
+            Touch::Multi,
+            Touch::PlatCenter,
+        ] {
             assert!(!bot_pickup_touch(touch), "{touch:?} must remain engine/map-owned");
         }
     }
@@ -2500,7 +2623,10 @@ mod tests {
         for _ in 0..400 {
             (a, v) = spring_step(a, v, 170.0, omega, dt, cap);
         }
-        assert!((a - 170.0).abs() < 1.0 && v.abs() < 5.0, "converges to target: a={a} v={v}");
+        assert!(
+            (a - 170.0).abs() < 1.0 && v.abs() < 5.0,
+            "converges to target: a={a} v={v}"
+        );
     }
 
     #[test]
@@ -2510,7 +2636,10 @@ mod tests {
         // Full surcharge at the moment of use, half at half the TTL, nothing at/after expiry.
         assert!((tele_reuse_penalty(until, now) - TELEPORT_REUSE_SURCHARGE).abs() < 1e-3);
         let half = tele_reuse_penalty(until, now + TELEPORT_REUSE_TTL / 2.0);
-        assert!((half - TELEPORT_REUSE_SURCHARGE / 2.0).abs() < 1e-3, "half-life surcharge: {half}");
+        assert!(
+            (half - TELEPORT_REUSE_SURCHARGE / 2.0).abs() < 1e-3,
+            "half-life surcharge: {half}"
+        );
         assert_eq!(tele_reuse_penalty(until, until), 0.0, "expired");
         assert_eq!(tele_reuse_penalty(0.0, now), 0.0, "empty slot");
         // Orders below the closed-gate wall, so a sole-route teleport is still taken.
@@ -2532,7 +2661,12 @@ mod tests {
         // Past the window with no meaningful improvement: stalled.
         assert!(progress_stalled(100.0, 0.0, 100.0, PROGRESS_STALL_TIME + 0.1));
         // Past the window but the remaining distance dropped well below best: not stalled.
-        assert!(!progress_stalled(100.0, 0.0, 100.0 - PROGRESS_EPS - 1.0, PROGRESS_STALL_TIME + 0.1));
+        assert!(!progress_stalled(
+            100.0,
+            0.0,
+            100.0 - PROGRESS_EPS - 1.0,
+            PROGRESS_STALL_TIME + 0.1
+        ));
     }
 
     #[test]
@@ -2542,12 +2676,19 @@ mod tests {
         penalize_leg(&mut b, None, Some(LinkKind::Walk), 1.0);
         penalize_leg(&mut b, Some(3), Some(LinkKind::Plat), 1.0);
         penalize_leg(&mut b, Some(3), Some(LinkKind::Teleport), 1.0);
-        assert!(b.failed_links.iter().all(|&(_, until, _)| until == 0.0), "exempt legs recorded nothing");
+        assert!(
+            b.failed_links.iter().all(|&(_, until, _)| until == 0.0),
+            "exempt legs recorded nothing"
+        );
         // A walk leg records one strike; failing it again bumps strikes and refreshes expiry.
         penalize_leg(&mut b, Some(3), Some(LinkKind::Walk), 1.0);
         penalize_leg(&mut b, Some(3), Some(LinkKind::Walk), 2.0);
         let e = b.failed_links.iter().find(|&&(l, _, _)| l == 3).unwrap();
-        assert_eq!((e.1, e.2), (2.0 + PENALTY_TTL, 2), "same leg bumped to 2 strikes, expiry refreshed");
+        assert_eq!(
+            (e.1, e.2),
+            (2.0 + PENALTY_TTL, 2),
+            "same leg bumped to 2 strikes, expiry refreshed"
+        );
     }
 
     #[test]
@@ -2555,9 +2696,16 @@ mod tests {
         // The plat-wait timeout must strike a Plat link directly — the kind `penalize_leg` exempts.
         let mut b = BotState::default();
         penalize_leg(&mut b, Some(9), Some(LinkKind::Plat), 1.0);
-        assert!(b.failed_links.iter().all(|&(_, until, _)| until == 0.0), "penalize_leg still exempts Plat");
+        assert!(
+            b.failed_links.iter().all(|&(_, until, _)| until == 0.0),
+            "penalize_leg still exempts Plat"
+        );
         penalize_link(&mut b, 9, 1.0);
-        let e = b.failed_links.iter().find(|&&(l, _, _)| l == 9).expect("plat link recorded");
+        let e = b
+            .failed_links
+            .iter()
+            .find(|&&(l, _, _)| l == 9)
+            .expect("plat link recorded");
         assert_eq!((e.1, e.2), (1.0 + PENALTY_TTL, 1), "plat link struck once");
     }
 
@@ -2565,9 +2713,18 @@ mod tests {
     fn in_footprint_margins() {
         let (lo, hi) = (Vec2::new(-16.0, -16.0), Vec2::new(16.0, 16.0));
         assert!(in_footprint(Vec2::ZERO, lo, hi, 0.0), "centre is inside");
-        assert!(!in_footprint(Vec2::new(20.0, 0.0), lo, hi, 0.0), "20u past +X face is outside");
-        assert!(in_footprint(Vec2::new(20.0, 0.0), lo, hi, 8.0), "within an 8u margin it's inside");
-        assert!(!in_footprint(Vec2::new(25.0, 0.0), lo, hi, 8.0), "past the margin it's outside again");
+        assert!(
+            !in_footprint(Vec2::new(20.0, 0.0), lo, hi, 0.0),
+            "20u past +X face is outside"
+        );
+        assert!(
+            in_footprint(Vec2::new(20.0, 0.0), lo, hi, 8.0),
+            "within an 8u margin it's inside"
+        );
+        assert!(
+            !in_footprint(Vec2::new(25.0, 0.0), lo, hi, 8.0),
+            "past the margin it's outside again"
+        );
     }
 
     #[test]
@@ -2581,10 +2738,16 @@ mod tests {
         let out = plat_standoff(near, lo, hi);
         assert_eq!(out.x, 16.0 + PLAT_STANDOFF, "pushed past the +X face");
         assert_eq!(out.z, 24.0, "keeps the bot's own height");
-        assert!(!in_footprint(out.xy(), lo, hi, PLAT_STANDOFF - 0.01), "result clears the standoff box");
+        assert!(
+            !in_footprint(out.xy(), lo, hi, PLAT_STANDOFF - 0.01),
+            "result clears the standoff box"
+        );
         // Dead centre is degenerate (all faces equal) but must still resolve to a point outside.
         let centre = plat_standoff(Vec3::new(0.0, 0.0, 24.0), lo, hi);
-        assert!(!in_footprint(centre.xy(), lo, hi, PLAT_STANDOFF - 0.01), "centre still escapes");
+        assert!(
+            !in_footprint(centre.xy(), lo, hi, PLAT_STANDOFF - 0.01),
+            "centre still escapes"
+        );
     }
 
     #[test]
@@ -2599,9 +2762,17 @@ mod tests {
         // Behind the bot (negative projection) — never step backward for it.
         assert!(!magnet_on_corridor(origin, waypoint, Vec2::new(-10.0, 0.0)));
         // Beyond the waypoint plus one arrival radius — it belongs to a later leg.
-        assert!(!magnet_on_corridor(origin, waypoint, Vec2::new(100.0 + ARRIVE_RADIUS + 1.0, 0.0)));
+        assert!(!magnet_on_corridor(
+            origin,
+            waypoint,
+            Vec2::new(100.0 + ARRIVE_RADIUS + 1.0, 0.0)
+        ));
         // Right up to the waypoint-plus-slack it still counts.
-        assert!(magnet_on_corridor(origin, waypoint, Vec2::new(100.0 + ARRIVE_RADIUS - 1.0, 0.0)));
+        assert!(magnet_on_corridor(
+            origin,
+            waypoint,
+            Vec2::new(100.0 + ARRIVE_RADIUS - 1.0, 0.0)
+        ));
         // A degenerate zero-length leg has no corridor.
         assert!(!magnet_on_corridor(origin, origin, Vec2::new(1.0, 0.0)));
     }

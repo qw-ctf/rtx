@@ -299,7 +299,10 @@ mod tests {
         assert_eq!(spec.build().get("topcolor"), Some("13"));
 
         // A bot announces itself with the `*bot` star key.
-        let bot = UserinfoBuilder { bot: true, ..Default::default() };
+        let bot = UserinfoBuilder {
+            bot: true,
+            ..Default::default()
+        };
         assert_eq!(bot.build().get("*bot"), Some("1"));
     }
 

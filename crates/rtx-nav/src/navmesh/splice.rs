@@ -303,8 +303,18 @@ impl NavGraph {
             let horiz = (entry.xy() - from.xy()).length();
             let dz = entry.z - from.z;
             // Two-way: a bot walks in to use it, and the spot is ordinary floor to walk back off.
-            self.push_link(Link { from: c, to: id, kind: LinkKind::Walk, cost: link_cost(LinkKind::Walk, horiz, dz) });
-            self.push_link(Link { from: id, to: c, kind: LinkKind::Walk, cost: link_cost(LinkKind::Walk, horiz, -dz) });
+            self.push_link(Link {
+                from: c,
+                to: id,
+                kind: LinkKind::Walk,
+                cost: link_cost(LinkKind::Walk, horiz, dz),
+            });
+            self.push_link(Link {
+                from: id,
+                to: c,
+                kind: LinkKind::Walk,
+                cost: link_cost(LinkKind::Walk, horiz, -dz),
+            });
             return Some(id);
         }
         None
@@ -432,11 +442,23 @@ mod tests {
         let cellar = g.add_cell(Vec3::new(0.0, 0.0, -100.0)); // under the shaft floor, not in it
         g.stamp_under_plat(&plat(), 0);
 
-        assert_eq!(g.cell_under_plat(shaft), Some(0), "the lift's own resting spot is under it");
-        assert_eq!(g.cell_under_plat(lip), Some(0), "a body 8u outside the brush still blocks it");
+        assert_eq!(
+            g.cell_under_plat(shaft),
+            Some(0),
+            "the lift's own resting spot is under it"
+        );
+        assert_eq!(
+            g.cell_under_plat(lip),
+            Some(0),
+            "a body 8u outside the brush still blocks it"
+        );
         assert_eq!(g.cell_under_plat(away), None, "open floor wrongly stamped");
         assert_eq!(g.cell_under_plat(top), None, "the delivery floor must stay open ground");
-        assert_eq!(g.cell_under_plat(cellar), None, "a cell below the shaft floor is not in the way");
+        assert_eq!(
+            g.cell_under_plat(cellar),
+            None,
+            "a cell below the shaft floor is not in the way"
+        );
     }
 
     /// Routing pays to *enter* the shaft, but boarding the lift is untouched — the ride and jump-aboard

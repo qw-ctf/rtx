@@ -65,7 +65,11 @@ pub struct NqProtoState {
 impl NqProtoState {
     /// A fresh state at vanilla widths, before any `svc_serverinfo`.
     pub fn new() -> Self {
-        NqProtoState { version: NETQUAKE, flags: 0, proquake_angles: false }
+        NqProtoState {
+            version: NETQUAKE,
+            flags: 0,
+            proquake_angles: false,
+        }
     }
 
     /// Adopt the version and flags from a parsed `svc_serverinfo`. Flags are only meaningful for
@@ -153,7 +157,11 @@ mod tests {
     /// widths a stock server serves. Getting these wrong desyncs from the first entity.
     #[test]
     fn vanilla_widths() {
-        let p = NqProtoState { version: NETQUAKE, flags: 0, proquake_angles: false };
+        let p = NqProtoState {
+            version: NETQUAKE,
+            flags: 0,
+            proquake_angles: false,
+        };
         assert_eq!(read_coord(&p, &64i16.to_le_bytes()), 8.0);
         assert_eq!(read_coord(&p, &(-64i16).to_le_bytes()), -8.0);
         assert_eq!(p.angle(&mut Reader::new(&[64])).unwrap(), 90.0);
@@ -170,19 +178,34 @@ mod tests {
             proquake_angles: false,
         };
         assert_eq!(read_coord(&float_short, &123.5f32.to_le_bytes()), 123.5);
-        assert_eq!(float_short.angle(&mut Reader::new(&16384i16.to_le_bytes())).unwrap(), 90.0);
+        assert_eq!(
+            float_short.angle(&mut Reader::new(&16384i16.to_le_bytes())).unwrap(),
+            90.0
+        );
 
         // 24-bit is short-plus-byte-fraction; 32-bit is a /16 long.
-        let c24 = NqProtoState { version: RMQ, flags: prfl::BIT24COORD, proquake_angles: false };
+        let c24 = NqProtoState {
+            version: RMQ,
+            flags: prfl::BIT24COORD,
+            proquake_angles: false,
+        };
         let mut b = Vec::new();
         b.extend_from_slice(&100i16.to_le_bytes());
         b.push(128); // 128/255 ≈ 0.502
         assert!((read_coord(&c24, &b) - 100.502).abs() < 0.01);
 
-        let c32 = NqProtoState { version: RMQ, flags: prfl::INT32COORD, proquake_angles: false };
+        let c32 = NqProtoState {
+            version: RMQ,
+            flags: prfl::INT32COORD,
+            proquake_angles: false,
+        };
         assert_eq!(read_coord(&c32, &(160i32).to_le_bytes()), 10.0);
 
-        let fa = NqProtoState { version: RMQ, flags: prfl::FLOATANGLE, proquake_angles: false };
+        let fa = NqProtoState {
+            version: RMQ,
+            flags: prfl::FLOATANGLE,
+            proquake_angles: false,
+        };
         assert_eq!(fa.angle(&mut Reader::new(&270.0f32.to_le_bytes())).unwrap(), 270.0);
     }
 
@@ -202,26 +225,42 @@ mod tests {
     #[test]
     fn move_angle_width_follows_proquake_and_version() {
         // Plain 15: 8-bit, one byte on the wire.
-        let plain15 = NqProtoState { version: NETQUAKE, flags: 0, proquake_angles: false };
+        let plain15 = NqProtoState {
+            version: NETQUAKE,
+            flags: 0,
+            proquake_angles: false,
+        };
         let mut w = Writer::new();
         plain15.write_move_angle(&mut w, 90.0);
         assert_eq!(w.len(), 1);
         assert_eq!(w.as_slice()[0], 64);
 
         // 15 with ProQuake: 16-bit.
-        let pq15 = NqProtoState { version: NETQUAKE, flags: 0, proquake_angles: true };
+        let pq15 = NqProtoState {
+            version: NETQUAKE,
+            flags: 0,
+            proquake_angles: true,
+        };
         let mut w = Writer::new();
         pq15.write_move_angle(&mut w, 90.0);
         assert_eq!(w.len(), 2);
 
         // 666: 16-bit even without ProQuake.
-        let fitz = NqProtoState { version: FITZQUAKE, flags: 0, proquake_angles: false };
+        let fitz = NqProtoState {
+            version: FITZQUAKE,
+            flags: 0,
+            proquake_angles: false,
+        };
         let mut w = Writer::new();
         fitz.write_move_angle(&mut w, 90.0);
         assert_eq!(w.len(), 2);
 
         // 999 + FLOATANGLE: a raw float.
-        let rmqf = NqProtoState { version: RMQ, flags: prfl::FLOATANGLE, proquake_angles: false };
+        let rmqf = NqProtoState {
+            version: RMQ,
+            flags: prfl::FLOATANGLE,
+            proquake_angles: false,
+        };
         let mut w = Writer::new();
         rmqf.write_move_angle(&mut w, 90.0);
         assert_eq!(w.len(), 4);

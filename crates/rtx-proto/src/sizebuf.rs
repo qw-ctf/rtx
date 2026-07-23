@@ -32,7 +32,11 @@ pub struct Underflow {
 
 impl std::fmt::Display for Underflow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "message underflow at {}: wanted {} byte(s), {} left", self.at, self.want, self.have)
+        write!(
+            f,
+            "message underflow at {}: wanted {} byte(s), {} left",
+            self.at, self.want, self.have
+        )
     }
 }
 
@@ -59,7 +63,12 @@ impl<'a> Reader<'a> {
     /// A reader at vanilla widths (coord 2, angle 1) — correct before `svc_serverdata` has been
     /// parsed, and for any server that doesn't negotiate `FTE_PEXT_FLOATCOORDS`.
     pub fn new(buf: &'a [u8]) -> Self {
-        Reader { buf, pos: 0, coord_bytes: 2, angle_bytes: 1 }
+        Reader {
+            buf,
+            pos: 0,
+            coord_bytes: 2,
+            angle_bytes: 1,
+        }
     }
 
     /// A reader at the negotiated widths. This is the constructor the client uses for everything
@@ -103,7 +112,11 @@ impl<'a> Reader<'a> {
     /// Take `n` raw bytes.
     pub fn bytes(&mut self, n: usize) -> Result<&'a [u8]> {
         if self.remaining() < n {
-            return Err(Underflow { at: self.pos, want: n, have: self.remaining() });
+            return Err(Underflow {
+                at: self.pos,
+                want: n,
+                have: self.remaining(),
+            });
         }
         let out = &self.buf[self.pos..self.pos + n];
         self.pos += n;
@@ -391,7 +404,14 @@ mod tests {
         let mut r = Reader::new(&buf);
         assert_eq!(r.u8().unwrap(), 1);
         let e = r.i32().unwrap_err();
-        assert_eq!(e, Underflow { at: 1, want: 4, have: 1 });
+        assert_eq!(
+            e,
+            Underflow {
+                at: 1,
+                want: 4,
+                have: 1
+            }
+        );
     }
 
     /// The two string quirks that keep the read position honest: 255 bytes are skipped (but still

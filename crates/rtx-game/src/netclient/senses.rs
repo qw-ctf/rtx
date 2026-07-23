@@ -277,7 +277,11 @@ mod tests {
 
         // `perceive` reads exactly this to decide it heard something.
         assert!(g.entities[shooter].combat.attack_finished > g.time());
-        assert_eq!(g.entities[shooter].combat.attack_finished, 100.0 + 0.8, "the RL's own cooldown");
+        assert_eq!(
+            g.entities[shooter].combat.attack_finished,
+            100.0 + 0.8,
+            "the RL's own cooldown"
+        );
     }
 
     /// And it teaches the estimate what they're carrying — which is how a bot learns the enemy has
@@ -365,7 +369,10 @@ mod tests {
         // Holding the button down isn't a second shot — the cooldown mustn't keep resetting.
         g.globals.time = 100.4;
         g.client_note_own_fire(me);
-        assert_eq!(g.entities[me].combat.attack_finished, 100.8, "still the first shot's window");
+        assert_eq!(
+            g.entities[me].combat.attack_finished, 100.8,
+            "still the first shot's window"
+        );
 
         // Once it's elapsed, the next shot starts a new one.
         g.globals.time = 101.0;
@@ -417,7 +424,10 @@ mod tests {
 
         // The body carries no claim of ours. The mirror's placeholder stands — it means "alive",
         // which is all a client can honestly say about a stranger's health.
-        assert_eq!(g.entities[them].v.health, 100.0, "what was observed, not what was inferred");
+        assert_eq!(
+            g.entities[them].v.health, 100.0,
+            "what was observed, not what was inferred"
+        );
         assert!(g.entities[them].is_alive());
     }
 }

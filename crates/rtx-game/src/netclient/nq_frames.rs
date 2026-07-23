@@ -138,11 +138,19 @@ mod tests {
     use super::*;
 
     fn baseline_at(origin: Vec3, model: u16) -> Baseline {
-        Baseline { modelindex: model, origin, ..Default::default() }
+        Baseline {
+            modelindex: model,
+            origin,
+            ..Default::default()
+        }
     }
 
     fn delta(number: u16, origin: [Option<f32>; 3]) -> EntityDelta {
-        EntityDelta { number, origin, ..Default::default() }
+        EntityDelta {
+            number,
+            origin,
+            ..Default::default()
+        }
     }
 
     /// An update carrying only origin.x leaves y/z at the baseline — the NetQuake delta-from-baseline

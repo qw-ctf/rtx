@@ -209,12 +209,14 @@ impl Session {
         sock.set_nonblocking(true)?;
         // Each connection gets its own directory: a squad's datagrams interleave, and a capture that
         // mixes two netchans' sequences replays as gibberish.
-        let wiretap = wiretap.map(|dir| dir.join(format!("qport-{qport:04x}"))).and_then(|dir| {
-            std::fs::create_dir_all(&dir)
-                .map_err(|e| eprintln!("rtx-client: can't record to {}: {e}", dir.display()))
-                .ok()
-                .map(|()| Wiretap { dir, n: 0 })
-        });
+        let wiretap = wiretap
+            .map(|dir| dir.join(format!("qport-{qport:04x}")))
+            .and_then(|dir| {
+                std::fs::create_dir_all(&dir)
+                    .map_err(|e| eprintln!("rtx-client: can't record to {}: {e}", dir.display()))
+                    .ok()
+                    .map(|()| Wiretap { dir, n: 0 })
+            });
         let now = Instant::now();
         let s = Session {
             sock,
@@ -395,7 +397,9 @@ impl Session {
         if self.signon != Signon::Downloading {
             return;
         }
-        let Some(transfer) = self.server_download.as_mut() else { return };
+        let Some(transfer) = self.server_download.as_mut() else {
+            return;
+        };
         let outcome = match message {
             DownloadMessage::LegacyBlock { percent, data } => {
                 if !transfer.legacy_reply_ready(self.chan.incoming_acknowledged, self.chan.can_reliable()) {
@@ -403,7 +407,11 @@ impl Session {
                 } else {
                     let cookie = transfer.cookie();
                     match transfer.receive_legacy(data, *percent) {
-                        Ok(Some(path)) => DownloadOutcome::Complete { path, chunked: false, cookie },
+                        Ok(Some(path)) => DownloadOutcome::Complete {
+                            path,
+                            chunked: false,
+                            cookie,
+                        },
                         Ok(None) => DownloadOutcome::NextLegacyBlock,
                         Err(e) => DownloadOutcome::Failed(e),
                     }
@@ -424,7 +432,11 @@ impl Session {
             DownloadMessage::ChunkedBlock { chunk, data } => {
                 let cookie = transfer.cookie();
                 match transfer.receive_chunk(*chunk, data.as_ref()) {
-                    Ok(Some(path)) => DownloadOutcome::Complete { path, chunked: true, cookie },
+                    Ok(Some(path)) => DownloadOutcome::Complete {
+                        path,
+                        chunked: true,
+                        cookie,
+                    },
                     Ok(None) => DownloadOutcome::Waiting,
                     Err(e) => DownloadOutcome::Failed(e),
                 }
@@ -435,19 +447,19 @@ impl Session {
 
     /// Accept an OOB chunk only for the active transfer. The source address was checked in `poll`;
     /// the cookie separates this file from late packets belonging to an earlier one.
-    fn receive_server_chunk(
-        &mut self,
-        cookie: u32,
-        chunk: u32,
-        data: &[u8; svc::DOWNLOAD_CHUNK_SIZE],
-        host: &NetHost,
-    ) {
-        let Some(transfer) = self.server_download.as_mut() else { return };
+    fn receive_server_chunk(&mut self, cookie: u32, chunk: u32, data: &[u8; svc::DOWNLOAD_CHUNK_SIZE], host: &NetHost) {
+        let Some(transfer) = self.server_download.as_mut() else {
+            return;
+        };
         if transfer.cookie() != cookie || !transfer.is_chunked() {
             return;
         }
         let outcome = match transfer.receive_chunk(chunk, data) {
-            Ok(Some(path)) => DownloadOutcome::Complete { path, chunked: true, cookie },
+            Ok(Some(path)) => DownloadOutcome::Complete {
+                path,
+                chunked: true,
+                cookie,
+            },
             Ok(None) => DownloadOutcome::Waiting,
             Err(e) => DownloadOutcome::Failed(e),
         };
@@ -541,7 +553,9 @@ impl Session {
                 self.handle_oob(data, host);
                 continue;
             }
-            let Some(payload) = self.chan.process(data) else { continue };
+            let Some(payload) = self.chan.process(data) else {
+                continue;
+            };
             self.measure_rtt();
 
             let events = match svc::parse(&mut self.proto, payload) {
@@ -599,7 +613,12 @@ impl Session {
 
     fn handle_oob(&mut self, data: &[u8], host: &NetHost) {
         match oob::parse(data) {
-            Some(oob::Oob::Challenge { challenge, fte, fte2, mvd1 }) if self.signon == Signon::Challenge => {
+            Some(oob::Oob::Challenge {
+                challenge,
+                fte,
+                fte2,
+                mvd1,
+            }) if self.signon == Signon::Challenge => {
                 self.challenge = challenge;
                 // Narrow the server's offer to what we can parse. The server gets the last word in
                 // `svc_serverdata` — it may enable less than we ask for — so this is a request, not
@@ -615,9 +634,7 @@ impl Session {
                 self.signon = Signon::Loading;
                 self.stringcmd("new");
             }
-            Some(oob::Oob::DownloadChunk { cookie, chunk, data })
-                if self.signon == Signon::Downloading =>
-            {
+            Some(oob::Oob::DownloadChunk { cookie, chunk, data }) if self.signon == Signon::Downloading => {
                 self.receive_server_chunk(cookie, chunk, data.as_ref(), host);
             }
             Some(oob::Oob::Print(text)) => {
@@ -855,11 +872,23 @@ impl Session {
                 let reply = format!(
                     "pext 0x{:x} 0x{:x} 0x{:x} 0x{:x} 0x{:x} 0x{:x}",
                     magic::FTE,
-                    if self.proto.fte != 0 { self.proto.fte } else { protocol::FTE },
+                    if self.proto.fte != 0 {
+                        self.proto.fte
+                    } else {
+                        protocol::FTE
+                    },
                     magic::FTE2,
-                    if self.proto.fte2 != 0 { self.proto.fte2 } else { protocol::FTE2 },
+                    if self.proto.fte2 != 0 {
+                        self.proto.fte2
+                    } else {
+                        protocol::FTE2
+                    },
                     magic::MVD1,
-                    if self.proto.mvd1 != 0 { self.proto.mvd1 } else { protocol::MVD1 },
+                    if self.proto.mvd1 != 0 {
+                        self.proto.mvd1
+                    } else {
+                        protocol::MVD1
+                    },
                 );
                 self.stringcmd(&reply);
                 continue;
@@ -913,7 +942,15 @@ impl Session {
     ///
     /// The packet carries the last three moves. Two of them the server has already run; re-sending
     /// them costs a few bytes and makes a lost packet invisible instead of a hitch.
-    pub(crate) fn send_move(&mut self, angles: glam::Vec3, forward: i32, side: i32, up: i32, buttons: u8, impulse: u8) -> io::Result<()> {
+    pub(crate) fn send_move(
+        &mut self,
+        angles: glam::Vec3,
+        forward: i32,
+        side: i32,
+        up: i32,
+        buttons: u8,
+        impulse: u8,
+    ) -> io::Result<()> {
         let elapsed = self.last_move.elapsed();
         self.last_move = Instant::now();
         let msec = (elapsed.as_millis() as u32).min(clc::MAX_MSEC as u32) as u8;
@@ -952,7 +989,9 @@ impl Session {
         if self.signon != Signon::Downloading || self.chan.reliable_pending() {
             return;
         }
-        let Some(transfer) = self.server_download.as_mut() else { return };
+        let Some(transfer) = self.server_download.as_mut() else {
+            return;
+        };
         let now = Instant::now();
         let sequence = self.chan.outgoing_sequence;
         let budget = transfer.request_budget(now, self.chan.incoming_acknowledged, self.rtt);
@@ -960,7 +999,9 @@ impl Session {
 
         for _ in 0..budget {
             let Some((chunk, percent, cookie)) = self.server_download.as_ref().and_then(|transfer| {
-                transfer.next_missing_chunk().map(|chunk| (chunk, transfer.percent(), transfer.cookie()))
+                transfer
+                    .next_missing_chunk()
+                    .map(|chunk| (chunk, transfer.percent(), transfer.cookie()))
             }) else {
                 break;
             };
@@ -968,7 +1009,9 @@ impl Session {
             if payload.len() + command.len() > max_payload {
                 break;
             }
-            let Some(transfer) = self.server_download.as_mut() else { break };
+            let Some(transfer) = self.server_download.as_mut() else {
+                break;
+            };
             if transfer.mark_requested(chunk, sequence, now) {
                 payload.extend_from_slice(&command);
             }
@@ -1029,7 +1072,11 @@ impl Session {
     /// A client acts on a world that is already `rtt/2` old and whose reaction to us is another
     /// `rtt/2` away — so this isn't diagnostics, it's how far ahead a bot must aim.
     fn note_rtt(&mut self, sample: f32) {
-        self.rtt = if self.rtt == 0.0 { sample } else { self.rtt * 0.9 + sample * 0.1 };
+        self.rtt = if self.rtt == 0.0 {
+            sample
+        } else {
+            self.rtt * 0.9 + sample * 0.1
+        };
     }
 }
 
@@ -1130,12 +1177,19 @@ mod tests {
             rtx_proto::sizebuf::Reader::new(&payload[2..]).string().unwrap(),
             "nextdl 0 0 7"
         );
-        assert!(!s.chan.reliable_pending(), "chunk requests must not enter the reliable queue");
+        assert!(
+            !s.chan.reliable_pending(),
+            "chunk requests must not enter the reliable queue"
+        );
 
         let mut chunk = [0; svc::DOWNLOAD_CHUNK_SIZE];
         chunk[..bytes.len()].copy_from_slice(&bytes);
         s.receive_server_chunk(cookie + 1, 0, &chunk, &host);
-        assert_eq!(s.signon, Signon::Downloading, "a stale cookie cannot complete this file");
+        assert_eq!(
+            s.signon,
+            Signon::Downloading,
+            "a stale cookie cannot complete this file"
+        );
         assert!(s.server_download.is_some());
         assert!(!root.join("qw/maps/tiny.bsp").exists());
 
@@ -1163,11 +1217,13 @@ mod tests {
         s.signon = Signon::Downloading;
         s.gamedir = "qw".to_string();
         s.mapname = "regular".to_string();
-        s.server_download = Some(
-            super::super::download::ServerDownload::new(root.clone(), "qw", "regular", 1).unwrap(),
-        );
+        s.server_download =
+            Some(super::super::download::ServerDownload::new(root.clone(), "qw", "regular", 1).unwrap());
 
-        let first = DownloadMessage::LegacyBlock { percent: 51, data: bytes[..768].to_vec() };
+        let first = DownloadMessage::LegacyBlock {
+            percent: 51,
+            data: bytes[..768].to_vec(),
+        };
         s.handle_server_download(&first, &host);
         s.handle_server_download(&first, &host); // replay before queued nextdl has even left
 
@@ -1178,7 +1234,10 @@ mod tests {
         ack.extend_from_slice(&(request_sequence | (1 << 31)).to_le_bytes());
         assert!(s.chan.process(&ack).is_some());
         s.handle_server_download(
-            &DownloadMessage::LegacyBlock { percent: 100, data: bytes[768..].to_vec() },
+            &DownloadMessage::LegacyBlock {
+                percent: 100,
+                data: bytes[768..].to_vec(),
+            },
             &host,
         );
 
@@ -1230,7 +1289,11 @@ mod tests {
         // In the game now — and the first chunk turns up again, late.
         s.signon = Signon::Active;
         s.handle(&SvcEvent::SoundList(list(0, &["a.wav"])), &host);
-        assert_eq!(s.sounds, vec!["", "a.wav", "b.wav", "c.wav"], "the list we spent the signon building");
+        assert_eq!(
+            s.sounds,
+            vec!["", "a.wav", "b.wav", "c.wav"],
+            "the list we spent the signon building"
+        );
     }
 
     /// The continuation offset re-attaches the high bits the server's single byte can't carry.
@@ -1299,8 +1362,13 @@ mod tests {
         let sent = rtx_proto::sizebuf::Reader::new(&body[1..]).string().unwrap();
         assert_eq!(
             sent,
-            format!("pext 0x{:x} 0x8 0x{:x} 0x0 0x{:x} 0x{:x}",
-                magic::FTE, magic::FTE2, magic::MVD1, protocol::MVD1),
+            format!(
+                "pext 0x{:x} 0x8 0x{:x} 0x0 0x{:x} 0x{:x}",
+                magic::FTE,
+                magic::FTE2,
+                magic::MVD1,
+                protocol::MVD1
+            ),
             "negotiated fte (0x8) is reported, and every family appears"
         );
     }
@@ -1311,7 +1379,13 @@ mod tests {
     fn unknown_stufftext_is_ignored() {
         let mut s = session();
         let h = host();
-        for line in ["//ktx 1\n", "//tinfo 1 2 3\n", "r_skyname foo\n", "alias _cs \"say hi\"\n", "\n"] {
+        for line in [
+            "//ktx 1\n",
+            "//tinfo 1 2 3\n",
+            "r_skyname foo\n",
+            "alias _cs \"say hi\"\n",
+            "\n",
+        ] {
             s.stufftext(line, &h);
         }
         assert!(!s.chan.reliable_pending(), "nothing should have been sent back");
@@ -1330,7 +1404,10 @@ mod tests {
         s.retry_handshake(); // too soon
         s.last_oob = Instant::now() - RESEND_INTERVAL - Duration::from_millis(1);
         s.retry_handshake(); // fires
-        assert!(s.last_oob.elapsed() < Duration::from_secs(1), "the retry re-stamped the clock");
+        assert!(
+            s.last_oob.elapsed() < Duration::from_secs(1),
+            "the retry re-stamped the clock"
+        );
 
         // Once we're in, retries stop: `new` is reliable and the netchan resends it for us.
         s.signon = Signon::Loading;
@@ -1349,7 +1426,10 @@ mod tests {
         s.last_move = Instant::now() - Duration::from_millis(13);
         s.send_move(glam::Vec3::ZERO, 400, 0, 0, 0, 0).ok();
         let msec = s.cmds[2].msec;
-        assert!((12..=15).contains(&msec), "msec {msec} should track the ~13ms that really passed");
+        assert!(
+            (12..=15).contains(&msec),
+            "msec {msec} should track the ~13ms that really passed"
+        );
 
         // A long stall is clamped rather than claimed.
         s.last_move = Instant::now() - Duration::from_secs(30);
@@ -1383,7 +1463,11 @@ mod tests {
 
         // A delta from a frame we lack invalidates the chain.
         assert_eq!(s.frames.apply(8, 2, Some(200), &[]), Applied::Stale);
-        assert_eq!(s.frames.delta_sequence(3), None, "so the next move asks for a full update");
+        assert_eq!(
+            s.frames.delta_sequence(3),
+            None,
+            "so the next move asks for a full update"
+        );
     }
 
     /// A new level voids everything: baselines, snapshots and the delta chain all belonged to the
@@ -1400,7 +1484,10 @@ mod tests {
             servercount: 99,
             gamedir: "ktx".to_string(),
             playernum: 3,
-            movevars: rtx_proto::svc::MoveVars { gravity: 640.0, ..Default::default() },
+            movevars: rtx_proto::svc::MoveVars {
+                gravity: 640.0,
+                ..Default::default()
+            },
             ..Default::default()
         };
         s.handle(&SvcEvent::ServerData(Box::new(sd)), &h);

@@ -983,8 +983,7 @@ pub(crate) fn frame_begin(game: &mut GameState) {
     game.oracle.set_evaluation(wanted && evaluation);
     let epoch = game.oracle.epoch();
     let now = game.time();
-    let evaluation_live =
-        evaluation && matches!(game.team_match.phase, crate::mode::MatchPhase::Live);
+    let evaluation_live = evaluation && matches!(game.team_match.phase, crate::mode::MatchPhase::Live);
     if evaluation && !evaluation_live {
         // Freeze the live intention-to-treat sample at the match boundary. Warmup pickups and
         // damage must not turn unresolved match advice into successes or add new trials.
@@ -2172,11 +2171,9 @@ mod tests {
             expires_at: 9.0,
             ..base
         });
-        assert!(
-            inbox
-                .entries()
-                .any(|n| n.kind == NuggetKind::Regroup && n.target_cell == 99)
-        );
+        assert!(inbox
+            .entries()
+            .any(|n| n.kind == NuggetKind::Regroup && n.target_cell == 99));
         let base = inbox.entries().next().unwrap();
         inbox.push(OracleNugget {
             kind: NuggetKind::Intercept,

@@ -169,8 +169,8 @@ impl NavGraph {
     pub fn add_speed_jumps(&mut self, bsp: &Bsp, params: SpeedJumpParams, double_jump: bool) {
         let k = bhop_k(params.accel, params.maxspeed);
         self.sj_k = k; // the banded planner prices carried speed with this map's k
-        // Solve per ledge in parallel (read-only borrow); indexed `collect` keeps cell order, so the
-        // serial splice below reproduces the sequential build's link indices exactly.
+                       // Solve per ledge in parallel (read-only borrow); indexed `collect` keeps cell order, so the
+                       // serial splice below reproduces the sequential build's link indices exactly.
         let this = &*self;
         let pending: Vec<Vec<(Link, SpeedJumpTraversal)>> = (0..this.cells.len() as CellId)
             .into_par_iter()
@@ -199,7 +199,8 @@ impl NavGraph {
             // keep only the cheapest few per target (the same landing from a dozen corridors is noise the
             // planner never needs). Deterministic: iterate the indexed collect in cell order, and among
             // equal-cost keep the earliest. `CURL_TARGET_MAX` distinct sources per target land here.
-            let mut per_target: std::collections::HashMap<CellId, Vec<(Link, SpeedJumpTraversal)>> = std::collections::HashMap::new();
+            let mut per_target: std::collections::HashMap<CellId, Vec<(Link, SpeedJumpTraversal)>> =
+                std::collections::HashMap::new();
             for (link, tr) in curls.into_iter().flatten() {
                 let slot = per_target.entry(link.to).or_default();
                 slot.push((link, tr));
@@ -225,7 +226,14 @@ impl NavGraph {
     /// carrying its certified `curl_gain`, so the banded planner prices it by its stored cost and the
     /// runtime flies it with the curl controller. Its own per-cell budget, so it never evicts a straight
     /// jump.
-    fn solve_curl_jumps_from(&self, bsp: &Bsp, ledge: CellId, params: SpeedJumpParams, k: f32, out: &mut Vec<(Link, SpeedJumpTraversal)>) {
+    fn solve_curl_jumps_from(
+        &self,
+        bsp: &Bsp,
+        ledge: CellId,
+        params: SpeedJumpParams,
+        k: f32,
+        out: &mut Vec<(Link, SpeedJumpTraversal)>,
+    ) {
         let a = self.cells[ledge as usize];
         if bsp.is_liquid_at(a.origin) {
             return; // submerged takeoff: can't jump
@@ -254,12 +262,18 @@ impl NavGraph {
             }
             // The takeoff speed is the ground-prestrafe equilibrium (saturates well inside CURL_RUNUP_CAP),
             // so it's the *committed* run-up — not the full measured corridor — that a curl builds over.
-            let v_deliver = prestrafe_delivered(runway.min(CURL_RUNUP_CAP), params.accel, params.maxspeed, params.friction, params.stopspeed);
+            let v_deliver = prestrafe_delivered(
+                runway.min(CURL_RUNUP_CAP),
+                params.accel,
+                params.maxspeed,
+                params.friction,
+                params.stopspeed,
+            );
             let v_max_straight = SPEED_JUMP_V_CAP.min(BHOP_EFF * attainable_speed(MAX_SPEED, runway, k));
             let psi0 = yaw_of(Vec2::new(dgx as f32, dgy as f32)); // corridor / takeoff heading
-            // A rollout can only certify a landing it reaches inside the tick cap, so bound the target
-            // scan (and the per-target airtime) by that flight time — not the full SJ_MAX_DROP fall, which
-            // on low-gravity servers is many seconds of futile scan-and-rollout.
+                                                                  // A rollout can only certify a landing it reaches inside the tick cap, so bound the target
+                                                                  // scan (and the per-target airtime) by that flight time — not the full SJ_MAX_DROP fall, which
+                                                                  // on low-gravity servers is many seconds of futile scan-and-rollout.
             let fly_cap = CURL_MAX_TICKS as f32 * CURL_DT;
             let reach = v_deliver * fly_cap;
             let scan = ((reach / GRID).ceil() as i32).max(1);
@@ -301,11 +315,11 @@ impl NavGraph {
                 // the delivered speed matches the distance. First (latest) leap that certifies wins.
                 let t_max = (runway - CURL_MIN_RUNWAY).clamp(0.0, CURL_TAKEOFF_BACKOFF);
                 let mut solved: Option<(Vec3, Vec3, f32, f32, f32)> = None; // (takeoff, from_pt, v_req, gain, cost)
-                // The runtime takes off along the from→takeoff line, so that heading is ours to choose —
-                // and certification is sharply sensitive to it (a real lip's approach is rarely exactly on
-                // a compass axis; the dm3 curl_mid certifies at 6° off but not at 0°). Sample a few
-                // headings around the corridor axis and place the from-cell along whichever certifies, so
-                // the bot flies precisely the line that was proven.
+                                                                            // The runtime takes off along the from→takeoff line, so that heading is ours to choose —
+                                                                            // and certification is sharply sensitive to it (a real lip's approach is rarely exactly on
+                                                                            // a compass axis; the dm3 curl_mid certifies at 6° off but not at 0°). Sample a few
+                                                                            // headings around the corridor axis and place the from-cell along whichever certifies, so
+                                                                            // the bot flies precisely the line that was proven.
                 'psi: for dpsi in CURL_PSI_SAMPLES {
                     let psi = psi0 + dpsi;
                     let (sp, cp) = psi.to_radians().sin_cos();
@@ -319,13 +333,21 @@ impl NavGraph {
                             let back = (takeoff.xy() - a.origin.xy()).length();
                             // The committed run-up is capped (CURL_RUNUP_CAP) but must fit behind this takeoff.
                             let runup_len = (runway - back).min(CURL_RUNUP_CAP);
-                            let v_del = prestrafe_delivered(runup_len, params.accel, params.maxspeed, params.friction, params.stopspeed);
+                            let v_del = prestrafe_delivered(
+                                runup_len,
+                                params.accel,
+                                params.maxspeed,
+                                params.friction,
+                                params.stopspeed,
+                            );
                             // Cheap scout first — one mid-gain rollout with a generous tolerance — so the full
                             // envelope certify only runs where a landing is already near the target (else the
                             // pass is ~50× slower).
-                            let scout_ok = curl_land_point(bsp, takeoff, b.origin, v_del, psi, 10.0, &p).is_some_and(|land| {
-                                (land.xy() - b.origin.xy()).length() <= CURL_MISS_TOL * 2.5 && (land.z - b.origin.z).abs() <= CURL_Z_TOL * 2.0
-                            });
+                            let scout_ok =
+                                curl_land_point(bsp, takeoff, b.origin, v_del, psi, 10.0, &p).is_some_and(|land| {
+                                    (land.xy() - b.origin.xy()).length() <= CURL_MISS_TOL * 2.5
+                                        && (land.z - b.origin.z).abs() <= CURL_Z_TOL * 2.0
+                                });
                             if scout_ok {
                                 if let Some((v_req, gain)) = certify_curl(bsp, takeoff, b.origin, psi, v_del, &p) {
                                     // From-cell one committed run-up back *along the certified heading*, so the
@@ -353,8 +375,19 @@ impl NavGraph {
                 if start == to || self.has_direct_link(start, to) {
                     continue;
                 }
-                let link = Link { from: start, to, kind: LinkKind::SpeedJump, cost };
-                let tr = SpeedJumpTraversal { takeoff, v_req, airtime, chained: false, curl_gain: gain };
+                let link = Link {
+                    from: start,
+                    to,
+                    kind: LinkKind::SpeedJump,
+                    cost,
+                };
+                let tr = SpeedJumpTraversal {
+                    takeoff,
+                    v_req,
+                    airtime,
+                    chained: false,
+                    curl_gain: gain,
+                };
                 cands.push((horiz, link, tr)); // every certified curl; the per-cell cap trims below
             }
         }
@@ -379,8 +412,8 @@ impl NavGraph {
         }
         let mut cands: Vec<(f32, Link, SpeedJumpTraversal)> = Vec::new(); // stand-start (v_req, link, tr)
         let mut cands_chained: Vec<(f32, Link, SpeedJumpTraversal)> = Vec::new(); // chained
-        // The most speed a chained entry can ever carry into a jump (the top band's floor); a jump
-        // needing more than this is unroutable even chained, so it bounds the chained target scan.
+                                                                                  // The most speed a chained entry can ever carry into a jump (the top band's floor); a jump
+                                                                                  // needing more than this is unroutable even chained, so it bounds the chained target scan.
         let v_chain_max = BAND_FLOOR[NBANDS - 1] / SJ_MARGIN;
         for (dgx, dgy) in COMPASS {
             // Take off from a ledge edge (a runway only *helps* — a chained jump needs none).
@@ -438,8 +471,19 @@ impl NavGraph {
                     if let Some(start) = self.nearest_within(a.origin - dir * need, GRID * 1.5, STEP_HEIGHT * 3.0) {
                         if start != to {
                             let cost = runway_time(v_req * SJ_MARGIN, MAX_SPEED, k) + airtime + 1.0;
-                            let link = Link { from: start, to, kind: LinkKind::SpeedJump, cost };
-                            let tr = SpeedJumpTraversal { takeoff: a.origin, v_req, airtime, chained: false, curl_gain: 0.0 };
+                            let link = Link {
+                                from: start,
+                                to,
+                                kind: LinkKind::SpeedJump,
+                                cost,
+                            };
+                            let tr = SpeedJumpTraversal {
+                                takeoff: a.origin,
+                                v_req,
+                                airtime,
+                                chained: false,
+                                curl_gain: 0.0,
+                            };
                             if best.is_none_or(|(bv, _, _)| v_req < bv) {
                                 best = Some((v_req, link, tr));
                             }
@@ -452,8 +496,19 @@ impl NavGraph {
                 // price it away). Bounded to what the top band can carry.
                 if v_req * SJ_MARGIN <= v_chain_max {
                     let cost = airtime + 1.0;
-                    let link = Link { from: ledge, to, kind: LinkKind::SpeedJump, cost };
-                    let tr = SpeedJumpTraversal { takeoff: a.origin, v_req, airtime, chained: true, curl_gain: 0.0 };
+                    let link = Link {
+                        from: ledge,
+                        to,
+                        kind: LinkKind::SpeedJump,
+                        cost,
+                    };
+                    let tr = SpeedJumpTraversal {
+                        takeoff: a.origin,
+                        v_req,
+                        airtime,
+                        chained: true,
+                        curl_gain: 0.0,
+                    };
                     if best_chained.is_none_or(|(bv, _, _)| v_req < bv) {
                         best_chained = Some((v_req, link, tr));
                     }
@@ -548,7 +603,12 @@ impl NavGraph {
             certified: certify_curl(bsp, takeoff, target, psi0, v_deliver, &p),
             landings: CURL_GAINS
                 .iter()
-                .map(|&gain| (gain, curl_land_point(bsp, takeoff, target, v_deliver, psi0, gain, &p).unwrap_or(Vec3::ZERO)))
+                .map(|&gain| {
+                    (
+                        gain,
+                        curl_land_point(bsp, takeoff, target, v_deliver, psi0, gain, &p).unwrap_or(Vec3::ZERO),
+                    )
+                })
                 .collect(),
         }
     }
@@ -560,14 +620,29 @@ fn curl_land_point(bsp: &Bsp, takeoff: Vec3, target: Vec3, v0: f32, psi: f32, ga
     let dt = CURL_DT;
     let amax = air_accel_max(p.accel, p.maxspeed, dt);
     let (s0, c0) = psi.to_radians().sin_cos();
-    let mut s = PmState { origin: takeoff, vel: Vec3::new(v0 * c0, v0 * s0, 0.0), on_ground: true, jump_held: false };
+    let mut s = PmState {
+        origin: takeoff,
+        vel: Vec3::new(v0 * c0, v0 * s0, 0.0),
+        on_ground: true,
+        jump_held: false,
+    };
     for tick in 0..CURL_MAX_TICKS {
         let cmd = if tick == 0 {
-            Cmd { view_yaw: psi, forward: MOVE_SPEED, side: 0.0, jump: true }
+            Cmd {
+                view_yaw: psi,
+                forward: MOVE_SPEED,
+                side: 0.0,
+                jump: true,
+            }
         } else {
             let v_xy = s.vel.xy();
             let st = air_correct(v_xy, yaw_of(target.xy() - s.origin.xy()), amax, dt, gain);
-            Cmd { view_yaw: st.view_yaw, forward: st.forward, side: st.side, jump: false }
+            Cmd {
+                view_yaw: st.view_yaw,
+                forward: st.forward,
+                side: st.side,
+                jump: false,
+            }
         };
         pm_step(bsp, &mut s, &cmd, p, dt);
         if tick > 3 && s.on_ground {
@@ -619,7 +694,10 @@ fn certify_curl(bsp: &Bsp, takeoff: Vec3, target: Vec3, psi0: f32, v_deliver: f3
             (early, v, -CURL_PSI_TOL),
         ];
         for &gain in &CURL_GAINS {
-            if corners.iter().all(|&(tk, v0, dp)| curl_lands(bsp, tk, target, v0, psi0 + dp, gain, p)) {
+            if corners
+                .iter()
+                .all(|&(tk, v0, dp)| curl_lands(bsp, tk, target, v0, psi0 + dp, gain, p))
+            {
                 return Some((v, gain)); // v* — the runtime holds this
             }
         }
@@ -636,11 +714,21 @@ fn curl_lands(bsp: &Bsp, takeoff: Vec3, target: Vec3, v0: f32, psi: f32, gain: f
     let dt = CURL_DT;
     let amax = air_accel_max(p.accel, p.maxspeed, dt);
     let (s0, c0) = psi.to_radians().sin_cos();
-    let mut s = PmState { origin: takeoff, vel: Vec3::new(v0 * c0, v0 * s0, 0.0), on_ground: true, jump_held: false };
+    let mut s = PmState {
+        origin: takeoff,
+        vel: Vec3::new(v0 * c0, v0 * s0, 0.0),
+        on_ground: true,
+        jump_held: false,
+    };
     let mut prev_sign = 0.0f32;
     for tick in 0..CURL_MAX_TICKS {
         let cmd = if tick == 0 {
-            Cmd { view_yaw: psi, forward: MOVE_SPEED, side: 0.0, jump: true }
+            Cmd {
+                view_yaw: psi,
+                forward: MOVE_SPEED,
+                side: 0.0,
+                jump: true,
+            }
         } else {
             let v_xy = s.vel.xy();
             let bearing = yaw_of(target.xy() - s.origin.xy());
@@ -654,14 +742,20 @@ fn curl_lands(bsp: &Bsp, takeoff: Vec3, target: Vec3, v0: f32, psi: f32, gain: f
             }
             prev_sign = err.signum();
             let st = air_correct(v_xy, bearing, amax, dt, gain);
-            Cmd { view_yaw: st.view_yaw, forward: st.forward, side: st.side, jump: false }
+            Cmd {
+                view_yaw: st.view_yaw,
+                forward: st.forward,
+                side: st.side,
+                jump: false,
+            }
         };
         pm_step(bsp, &mut s, &cmd, p, dt);
         if s.vel.z < 0.0 && s.origin.z < target.z - 100.0 {
             return false; // fell past the target's level — undershoot
         }
         if tick > 3 && s.on_ground {
-            return (s.origin.xy() - target.xy()).length() <= CURL_MISS_TOL && (s.origin.z - target.z).abs() <= CURL_Z_TOL;
+            return (s.origin.xy() - target.xy()).length() <= CURL_MISS_TOL
+                && (s.origin.z - target.z).abs() <= CURL_Z_TOL;
         }
     }
     false

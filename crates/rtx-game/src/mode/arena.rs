@@ -432,7 +432,9 @@ impl Arena {
         while fighters < FIGHTER_SLOTS {
             let next = players(g)
                 .into_iter()
-                .filter(|&e| g.entities[e].mode_p.arena.role == ArenaRole::Audience && g.entities[e].mode_p.arena.queue != 0)
+                .filter(|&e| {
+                    g.entities[e].mode_p.arena.role == ArenaRole::Audience && g.entities[e].mode_p.arena.queue != 0
+                })
                 .min_by_key(|&e| g.entities[e].mode_p.arena.queue);
             let Some(e) = next else { break }; // not enough players to fill the arena
             g.entities[e].mode_p.arena.role = ArenaRole::Fighter;
@@ -530,7 +532,9 @@ impl Arena {
         // Keep the held fighter if it's still a live target, still in sight, and the hold is unexpired.
         let held_ok = held != 0
             && now < watch_time
-            && fighters.iter().any(|&(f, feye)| f.0 == held && Self::sees(g, eye, f, feye));
+            && fighters
+                .iter()
+                .any(|&(f, feye)| f.0 == held && Self::sees(g, eye, f, feye));
         if held_ok {
             return Some(EntId(held));
         }
@@ -649,9 +653,9 @@ fn spread_spawn(g: &mut GameState, spawning: EntId, origin: Vec3) -> Vec3 {
 
 /// Any live player other than `who` within [`SPREAD_MIN`] of point `p`.
 fn origin_crowded(g: &GameState, p: Vec3, who: EntId) -> bool {
-    players(g).into_iter().any(|e| {
-        e != who && g.entities[e].is_alive() && (g.entities[e].v.origin - p).length() < SPREAD_MIN
-    })
+    players(g)
+        .into_iter()
+        .any(|e| e != who && g.entities[e].is_alive() && (g.entities[e].v.origin - p).length() < SPREAD_MIN)
 }
 
 /// The spawn-point classname `select_spawn` will actually draw from for `e` — the single source of
@@ -695,7 +699,9 @@ fn live_fighters(g: &GameState) -> Vec<EntId> {
 /// last-man-standing round, no teams).
 fn nearest_enemy(g: &GameState, bot: EntId) -> Option<EntId> {
     let origin = g.entities[bot].v.origin;
-    nearest_player_where(g, origin, bot, |g, e| g.entities[e].mode_p.arena.role == ArenaRole::Fighter)
+    nearest_player_where(g, origin, bot, |g, e| {
+        g.entities[e].mode_p.arena.role == ArenaRole::Fighter
+    })
 }
 
 #[cfg(test)]
@@ -719,10 +725,18 @@ mod tests {
     #[test]
     fn vantage_returns_first_visible_from_offset() {
         // Spots 0 and 2 have a clear view; from start=1 the scan hits spot 2 first.
-        let spots = [Vec3::new(0.0, 0.0, 0.0), Vec3::new(100.0, 0.0, 0.0), Vec3::new(200.0, 0.0, 0.0)];
+        let spots = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(100.0, 0.0, 0.0),
+            Vec3::new(200.0, 0.0, 0.0),
+        ];
         let sees = |eye: Vec3| eye.x < 50.0 || eye.x > 150.0;
         let pick = pick_vantage(&spots, 1, VANTAGE_TRIES, sees);
-        assert_eq!(pick, Some(spots[2]), "wraps from the offset and takes the first visible");
+        assert_eq!(
+            pick,
+            Some(spots[2]),
+            "wraps from the offset and takes the first visible"
+        );
         // The eye offset is applied, not the raw origin.
         let mut seen_eye = Vec3::ZERO;
         pick_vantage(&spots, 0, 1, |eye| {
@@ -735,11 +749,23 @@ mod tests {
     #[test]
     fn vantage_none_when_all_blind_and_respects_try_budget() {
         let spots = [Vec3::ZERO, Vec3::new(100.0, 0.0, 0.0), Vec3::new(200.0, 0.0, 0.0)];
-        assert_eq!(pick_vantage(&spots, 0, VANTAGE_TRIES, |_| false), None, "no view anywhere → None");
+        assert_eq!(
+            pick_vantage(&spots, 0, VANTAGE_TRIES, |_| false),
+            None,
+            "no view anywhere → None"
+        );
         // Only spot 2 is visible; a 2-try budget from start 0 never reaches it.
         let sees = |eye: Vec3| eye.x > 150.0;
-        assert_eq!(pick_vantage(&spots, 0, 2, sees), None, "try budget caps the scan window");
-        assert_eq!(pick_vantage(&spots, 0, 3, sees), Some(spots[2]), "a wider budget finds it");
+        assert_eq!(
+            pick_vantage(&spots, 0, 2, sees),
+            None,
+            "try budget caps the scan window"
+        );
+        assert_eq!(
+            pick_vantage(&spots, 0, 3, sees),
+            Some(spots[2]),
+            "a wider budget finds it"
+        );
         assert_eq!(pick_vantage(&[], 0, VANTAGE_TRIES, |_| true), None, "no spots → None");
     }
 
@@ -750,8 +776,16 @@ mod tests {
         let c = EntId(5);
         // b is nearer than a but hidden; a (visible, farther) wins over the hidden nearer one.
         let cands = [(a, 300.0, true), (b, 100.0, false), (c, 500.0, true)];
-        assert_eq!(pick_watch(&cands), Some(a), "nearest *visible*, skipping the hidden nearer fighter");
-        assert_eq!(pick_watch(&[(a, 100.0, false), (b, 200.0, false)]), None, "all hidden → drop the watch");
+        assert_eq!(
+            pick_watch(&cands),
+            Some(a),
+            "nearest *visible*, skipping the hidden nearer fighter"
+        );
+        assert_eq!(
+            pick_watch(&[(a, 100.0, false), (b, 200.0, false)]),
+            None,
+            "all hidden → drop the watch"
+        );
         assert_eq!(pick_watch(&[]), None, "no fighters → None");
     }
 }

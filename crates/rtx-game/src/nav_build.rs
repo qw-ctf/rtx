@@ -128,8 +128,7 @@ impl GameState {
         // The BSP was parsed once at map load (`load_map_bsp`); share it (`Arc`) into the worker.
         // A missing parse means the map couldn't be read — bots simply stay disabled.
         let Some(bsp) = self.nav.bsp.clone() else {
-            self.host
-                .dprint(c"rtx: navmesh: map BSP not parsed; bots disabled\n");
+            self.host.dprint(c"rtx: navmesh: map BSP not parsed; bots disabled\n");
             return;
         };
         // Gather the entity-derived inputs on the main thread (they read the spawned entities),
@@ -295,7 +294,9 @@ impl GameState {
                 // beneath it forever. Fall back to the plain nearest when no cell is close enough
                 // (better an imperfect goal than a silently dropped item; the runtime `gdz` telemetry
                 // surfaces any residual aliasing).
-                let cell = graph.nearest_collectable(ent.v.origin).or_else(|| graph.nearest(ent.v.origin))?;
+                let cell = graph
+                    .nearest_collectable(ent.v.origin)
+                    .or_else(|| graph.nearest(ent.v.origin))?;
                 Some((i as u32, cell))
             })
             .collect()

@@ -158,7 +158,12 @@ impl GameMode for Race {
         let Some(target) = self.next_node_origin(g, bot) else {
             // No routes on this map: wander the DM spawns so the bot doesn't freeze in place
             // (a frozen bot trips the stuck-jumper).
-            return Some(BotIntent::Move(super::wander_point(g, bot, "info_player_deathmatch", |_| None)));
+            return Some(BotIntent::Move(super::wander_point(
+                g,
+                bot,
+                "info_player_deathmatch",
+                |_| None,
+            )));
         };
         Some(BotIntent::Move(target))
     }
@@ -293,7 +298,10 @@ impl Race {
                 let name = g.netname_of(e);
                 g.broadcast(
                     PrintLevel::High,
-                    &format!("{name} timed out on leg {next} of \"{}\" ({:.0}s)\n", route.name, route.timeout),
+                    &format!(
+                        "{name} timed out on leg {next} of \"{}\" ({:.0}s)\n",
+                        route.name, route.timeout
+                    ),
                 );
                 reset_run(g, e);
                 g.put_client_in_server(e);
@@ -333,10 +341,19 @@ impl Race {
             let mut carry = BAND_FLOOR[0];
             let mut verdict: Option<String> = None; // None = passing so far
             for (i, pair) in route.nodes.windows(2).enumerate() {
-                let leg = format!("leg {} ({} -> {})", i + 1, node_label(&pair[0], i), node_label(&pair[1], i + 1));
+                let leg = format!(
+                    "leg {} ({} -> {})",
+                    i + 1,
+                    node_label(&pair[0], i),
+                    node_label(&pair[1], i + 1)
+                );
                 let ends: Vec<_> = pair
                     .iter()
-                    .map(|n| graph.nearest(n.origin).filter(|&c| (graph.cell_origin(c) - n.origin).length() <= OFF_MESH))
+                    .map(|n| {
+                        graph
+                            .nearest(n.origin)
+                            .filter(|&c| (graph.cell_origin(c) - n.origin).length() <= OFF_MESH)
+                    })
                     .collect();
                 let (Some(a), Some(b)) = (ends[0], ends[1]) else {
                     verdict = Some(format!("FAIL at {leg}: node off the navmesh"));
@@ -348,11 +365,12 @@ impl Race {
                     verdict = Some(format!("FAIL at {leg}: no path"));
                     break;
                 };
-                if route
-                    .links
-                    .iter()
-                    .any(|&li| matches!(graph.link_kind(li), LinkKind::Hook | LinkKind::RocketJump | LinkKind::DoubleJump))
-                {
+                if route.links.iter().any(|&li| {
+                    matches!(
+                        graph.link_kind(li),
+                        LinkKind::Hook | LinkKind::RocketJump | LinkKind::DoubleJump
+                    )
+                }) {
                     verdict = Some(format!(
                         "FAIL at {leg}: path needs a non-race move — restart the map to rebuild the navmesh for race"
                     ));
@@ -368,7 +386,10 @@ impl Race {
                     } else {
                         String::new()
                     };
-                    format!("rtx: race: {label}: PASS ({} legs, est {est:.1}s{slow})\n", route.nodes.len() - 1)
+                    format!(
+                        "rtx: race: {label}: PASS ({} legs, est {est:.1}s{slow})\n",
+                        route.nodes.len() - 1
+                    )
                 }
                 Some(v) => format!("rtx: race: {label}: {v}\n"),
             };
@@ -421,7 +442,9 @@ impl Race {
             let mut ok = !route.nodes.is_empty();
             for pair in route.nodes.windows(2) {
                 let snap = |n: &RaceRouteNode| {
-                    graph.nearest(n.origin).filter(|&c| (graph.cell_origin(c) - n.origin).length() <= 80.0)
+                    graph
+                        .nearest(n.origin)
+                        .filter(|&c| (graph.cell_origin(c) - n.origin).length() <= 80.0)
                 };
                 let (Some(a), Some(b)) = (snap(&pair[0]), snap(&pair[1])) else {
                     ok = false;
@@ -467,7 +490,10 @@ impl Race {
                 Some(bsp) => jobs
                     .iter()
                     .map(|(ri, poly, nodes, timeout, seed)| {
-                        (*ri, raceline::optimize_route(&bsp, poly, nodes, &pm, *timeout, *seed, iters))
+                        (
+                            *ri,
+                            raceline::optimize_route(&bsp, poly, nodes, &pm, *timeout, *seed, iters),
+                        )
                     })
                     .collect(),
                 None => Vec::new(),
@@ -475,8 +501,9 @@ impl Race {
             let _ = tx.send(lines);
         });
         g.race.opt_pending = Some(rx);
-        g.host
-            .dprint(&cstring(&format!("rtx: race: optimizing {njobs} racing line(s) in background...\n")));
+        g.host.dprint(&cstring(&format!(
+            "rtx: race: optimizing {njobs} racing line(s) in background...\n"
+        )));
     }
 }
 

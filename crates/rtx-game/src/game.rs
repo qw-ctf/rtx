@@ -791,7 +791,6 @@ impl GameState {
         more.then(|| token.to_owned())
     }
 
-
     /// `ExtFieldSetAlpha` (ktx) — set an entity's transparency via the engine's `alpha`
     /// map-extension field: `0` = invisible, `1` = fully opaque. No-op if the server lacks the
     /// extension (older engines). The 0..1 bound is alpha's own rule, so it lives here.

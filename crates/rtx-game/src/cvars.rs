@@ -36,8 +36,12 @@ impl CvarValue for CvarSeed {
 /// leap and fall in. So the server **advertises** these in serverinfo (like KTX's `pm_*` keys) and a
 /// client mirrors them; a client on any other server forces them off. Grapple isn't here — the client
 /// forces it off unconditionally, because the hook's *state* isn't on the wire to mirror at all.
-pub(crate) const RTX_MOVE_CVARS: &[&str] =
-    &["rtx_doublejump", "rtx_walljump", "rtx_elevator_jump", "rtx_shootable_grenades"];
+pub(crate) const RTX_MOVE_CVARS: &[&str] = &[
+    "rtx_doublejump",
+    "rtx_walljump",
+    "rtx_elevator_jump",
+    "rtx_shootable_grenades",
+];
 
 /// The rtx tunables and their first-run defaults, registered in [`GameState::init`](crate::game).
 /// `cvar_default` only seeds a cvar that's unset, so a value from `server.cfg` (or a `set` before
@@ -255,5 +259,8 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
 /// command buffer (see [`GameState::rtx_cvar_bool`](crate::game::GameState::rtx_cvar_bool)). A small
 /// linear scan over the table — only called during a navmesh build, not per frame.
 pub(crate) fn default_of(name: &str) -> Option<CvarSeed> {
-    RTX_CVAR_DEFAULTS.iter().find(|(n, _)| *n == name).map(|&(_, seed)| seed)
+    RTX_CVAR_DEFAULTS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|&(_, seed)| seed)
 }

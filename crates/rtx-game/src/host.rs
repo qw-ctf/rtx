@@ -219,7 +219,17 @@ pub(crate) trait ClientHost {
     fn precache_sound(&self, name: &CStr);
     /// Take a bot's usercmd for this frame — the client turns it into a `clc_move`.
     #[allow(clippy::too_many_arguments)]
-    fn set_bot_cmd(&self, client: i32, msec: i32, angles: Vec3, forward: i32, side: i32, up: i32, buttons: i32, impulse: i32);
+    fn set_bot_cmd(
+        &self,
+        client: i32,
+        msec: i32,
+        angles: Vec3,
+        forward: i32,
+        side: i32,
+        up: i32,
+        buttons: i32,
+        impulse: i32,
+    );
     /// Queue a console command.
     fn localcmd(&self, cmd: &str);
     /// Print a line.
@@ -254,13 +264,19 @@ pub struct HostApi {
 #[allow(dead_code)]
 impl HostApi {
     pub fn new(syscall: SyscallFn, ents: *const Entity) -> Self {
-        Self { backend: Backend::Pr2(syscall), ents }
+        Self {
+            backend: Backend::Pr2(syscall),
+            ents,
+        }
     }
 
     /// A handle over a [`ClientHost`], for the brain running inside a network client.
     #[cfg(feature = "netclient")]
     pub(crate) fn new_client(host: &'static dyn ClientHost, ents: *const Entity) -> Self {
-        Self { backend: Backend::Client(host), ents }
+        Self {
+            backend: Backend::Client(host),
+            ents,
+        }
     }
 
     /// An inline submodel's bounds, client-side. See [`ClientHost::submodel_bounds`].

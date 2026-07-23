@@ -134,7 +134,12 @@ pub fn parse(data: &[u8]) -> Option<Oob> {
                     _ => {}
                 }
             }
-            Some(Oob::Challenge { challenge, fte, fte2, mvd1 })
+            Some(Oob::Challenge {
+                challenge,
+                fte,
+                fte2,
+                mvd1,
+            })
         }
         s2c::CONNECTION => Some(Oob::Accepted),
         s2c::PRINT if rest.starts_with(b"\\chunk") => {
@@ -145,7 +150,11 @@ pub fn parse(data: &[u8]) -> Option<Oob> {
             }
             let chunk = r.u32().ok()?;
             let data: [u8; DOWNLOAD_CHUNK_SIZE] = r.bytes(DOWNLOAD_CHUNK_SIZE).ok()?.try_into().ok()?;
-            Some(Oob::DownloadChunk { cookie, chunk, data: Box::new(data) })
+            Some(Oob::DownloadChunk {
+                cookie,
+                chunk,
+                data: Box::new(data),
+            })
         }
         s2c::PRINT => Some(Oob::Print(Reader::new(rest).string().ok()?)),
         s2c::PING => Some(Oob::Ping),
@@ -251,13 +260,15 @@ mod tests {
     /// text. A reader that stops at the NUL would silently negotiate nothing.
     #[test]
     fn parses_challenge_with_extension_masks() {
-        let pkt = challenge_reply(
-            1234567,
-            &[(magic::FTE, 0xdead), (magic::FTE2, 0x2), (magic::MVD1, 0x3)],
-        );
+        let pkt = challenge_reply(1234567, &[(magic::FTE, 0xdead), (magic::FTE2, 0x2), (magic::MVD1, 0x3)]);
         assert_eq!(
             parse(&pkt),
-            Some(Oob::Challenge { challenge: 1234567, fte: 0xdead, fte2: 0x2, mvd1: 0x3 })
+            Some(Oob::Challenge {
+                challenge: 1234567,
+                fte: 0xdead,
+                fte2: 0x2,
+                mvd1: 0x3
+            })
         );
     }
 
@@ -267,17 +278,32 @@ mod tests {
     fn parses_challenge_without_or_with_unknown_extensions() {
         assert_eq!(
             parse(&challenge_reply(42, &[])),
-            Some(Oob::Challenge { challenge: 42, fte: 0, fte2: 0, mvd1: 0 })
+            Some(Oob::Challenge {
+                challenge: 42,
+                fte: 0,
+                fte2: 0,
+                mvd1: 0
+            })
         );
 
         // "FRAG" and "DTLS" sit between the families we care about; both must be skipped cleanly.
         let pkt = challenge_reply(
             7,
-            &[(magic::FRAG, 1400), (magic::FTE, 0x8), (magic::DTLS, 1), (magic::MVD1, 0x3)],
+            &[
+                (magic::FRAG, 1400),
+                (magic::FTE, 0x8),
+                (magic::DTLS, 1),
+                (magic::MVD1, 0x3),
+            ],
         );
         assert_eq!(
             parse(&pkt),
-            Some(Oob::Challenge { challenge: 7, fte: 0x8, fte2: 0, mvd1: 0x3 })
+            Some(Oob::Challenge {
+                challenge: 7,
+                fte: 0x8,
+                fte2: 0,
+                mvd1: 0x3
+            })
         );
     }
 
@@ -294,7 +320,12 @@ mod tests {
         pkt.extend_from_slice(&magic::MVD1.to_le_bytes()); // magic with no mask behind it
         assert_eq!(
             parse(&pkt),
-            Some(Oob::Challenge { challenge: 5, fte: 0x8, fte2: 0, mvd1: 0 })
+            Some(Oob::Challenge {
+                challenge: 5,
+                fte: 0x8,
+                fte2: 0,
+                mvd1: 0
+            })
         );
     }
 
@@ -303,10 +334,16 @@ mod tests {
     #[test]
     fn parses_other_oob_packets() {
         assert_eq!(parse(&wrap(b"j")), Some(Oob::Accepted));
-        assert_eq!(parse(&wrap(b"nserver is full\0")), Some(Oob::Print("server is full".into())));
+        assert_eq!(
+            parse(&wrap(b"nserver is full\0")),
+            Some(Oob::Print("server is full".into()))
+        );
         assert_eq!(parse(&wrap(b"k")), Some(Oob::Ping));
         assert_eq!(parse(&wrap(b"l")), Some(Oob::Ack));
-        assert_eq!(parse(&wrap(b"Bcmd pext\0")), Some(Oob::ClientCommand("cmd pext".into())));
+        assert_eq!(
+            parse(&wrap(b"Bcmd pext\0")),
+            Some(Oob::ClientCommand("cmd pext".into()))
+        );
         assert_eq!(parse(&wrap(b"?")), Some(Oob::Unknown(b'?')));
     }
 
@@ -340,7 +377,14 @@ mod tests {
     fn negotiation_intersects_and_never_widens() {
         // A server offering everything gets exactly our advertised set back.
         let n = Negotiated::intersect(u32::MAX, u32::MAX, u32::MAX);
-        assert_eq!(n, Negotiated { fte: protocol::FTE, fte2: protocol::FTE2, mvd1: protocol::MVD1 });
+        assert_eq!(
+            n,
+            Negotiated {
+                fte: protocol::FTE,
+                fte2: protocol::FTE2,
+                mvd1: protocol::MVD1
+            }
+        );
 
         // Chunked downloads are now part of the promise; unrelated unimplemented bits stay out.
         assert_ne!(n.fte & protocol::fte::CHUNKEDDOWNLOADS, 0);
@@ -349,7 +393,14 @@ mod tests {
         assert_eq!(n.mvd1 & protocol::mvd1::SIMPLEPROJECTILE, 0);
 
         // A server offering nothing yields nothing.
-        assert_eq!(Negotiated::intersect(0, 0, 0), Negotiated { fte: 0, fte2: 0, mvd1: 0 });
+        assert_eq!(
+            Negotiated::intersect(0, 0, 0),
+            Negotiated {
+                fte: 0,
+                fte2: 0,
+                mvd1: 0
+            }
+        );
 
         // And a plain vanilla server offering one bit we know yields just that bit.
         let n = Negotiated::intersect(protocol::fte::FLOATCOORDS, 0, 0);
@@ -360,7 +411,11 @@ mod tests {
     /// the field order, the quotes around userinfo and the trailing newline all matter.
     #[test]
     fn builds_connect_packet() {
-        let n = Negotiated { fte: 0x8, fte2: 0, mvd1: 0x3 };
+        let n = Negotiated {
+            fte: 0x8,
+            fte2: 0,
+            mvd1: 0x3,
+        };
         let pkt = connect(0x1234, 999, "\\name\\bot", &n);
 
         assert_eq!(&pkt[..4], &protocol::CONNECTIONLESS);
@@ -375,7 +430,16 @@ mod tests {
     /// some servers treat as a malformed offer.
     #[test]
     fn connect_omits_empty_extension_families() {
-        let pkt = connect(1, 2, "\\name\\bot", &Negotiated { fte: 0, fte2: 0, mvd1: 0 });
+        let pkt = connect(
+            1,
+            2,
+            "\\name\\bot",
+            &Negotiated {
+                fte: 0,
+                fte2: 0,
+                mvd1: 0,
+            },
+        );
         let text = std::str::from_utf8(&pkt[4..]).unwrap();
         assert_eq!(text, "connect 28 1 2 \"\\name\\bot\"\n");
         assert!(!text.contains("0x0"));
@@ -388,7 +452,13 @@ mod tests {
         let offer = protocol::FTE | protocol::fte::CHUNKEDDOWNLOADS | protocol::fte::CSQC;
         let reply = challenge_reply(31337, &[(magic::FTE, offer), (magic::MVD1, 0x1ff)]);
 
-        let Some(Oob::Challenge { challenge, fte, fte2, mvd1 }) = parse(&reply) else {
+        let Some(Oob::Challenge {
+            challenge,
+            fte,
+            fte2,
+            mvd1,
+        }) = parse(&reply)
+        else {
             panic!("expected a challenge");
         };
         let n = Negotiated::intersect(fte, fte2, mvd1);
@@ -408,7 +478,16 @@ mod tests {
     #[test]
     fn connect_encodes_coloured_name_as_latin1() {
         let name = "\u{e2}\u{ef}\u{f4}\u{85}Grunt";
-        let pkt = connect(1, 2, &format!("\\name\\{name}"), &Negotiated { fte: 0, fte2: 0, mvd1: 0 });
+        let pkt = connect(
+            1,
+            2,
+            &format!("\\name\\{name}"),
+            &Negotiated {
+                fte: 0,
+                fte2: 0,
+                mvd1: 0,
+            },
+        );
 
         // The coloured `bot`, the dot, and `Grunt` are each one byte on the wire.
         let needle = [0xe2, 0xef, 0xf4, 0x85, b'G', b'r', b'u', b'n', b't'];

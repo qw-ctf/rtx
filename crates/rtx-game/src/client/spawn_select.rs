@@ -40,7 +40,11 @@ impl GameState {
             return EntId::WORLD;
         }
         let mode = self.mode;
-        let rules = if mode.spawn_rules_live(self) { SpawnRules::Live } else { SpawnRules::Warmup };
+        let rules = if mode.spawn_rules_live(self) {
+            SpawnRules::Live
+        } else {
+            SpawnRules::Warmup
+        };
         let blocked: Vec<bool> = spots.iter().map(|&s| self.spot_occupied(s, who, rules)).collect();
         // The previous spawn as an index into this classname's spots; a stale or foreign
         // `last_spot` simply doesn't match and costs nothing.
@@ -111,7 +115,6 @@ pub(crate) enum SpawnRules {
     Live,
     Warmup,
 }
-
 
 /// Does one nearby live non-self player fence a spawn spot? Outside live play always (the stock
 /// rule — dead/self/radius are filtered by the caller); during live play only while inside their

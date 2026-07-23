@@ -8,8 +8,8 @@ use glam::Vec3;
 
 use super::team;
 use super::{
-    CAPTURE_BONUS, EF_FLAG1, EF_FLAG2, FLAG_RETURN_TIME, FRAG_CARRIER_ASSIST, FRAG_CARRIER_ASSIST_BONUS,
-    RETURN_ASSIST, RETURN_ASSIST_BONUS, RETURN_BONUS, TEAM_CAPTURE_BONUS,
+    CAPTURE_BONUS, EF_FLAG1, EF_FLAG2, FLAG_RETURN_TIME, FRAG_CARRIER_ASSIST, FRAG_CARRIER_ASSIST_BONUS, RETURN_ASSIST,
+    RETURN_ASSIST_BONUS, RETURN_BONUS, TEAM_CAPTURE_BONUS,
 };
 use crate::assets::{Model, Sound};
 use crate::defs::{Attenuation, Channel, MoveType, PrintLevel, Solid};
@@ -44,8 +44,7 @@ impl GameState {
             ent.v.solid = Solid::Trigger;
         }
         self.set_model(e, Model::PROGS_FLAG);
-        self
-            .set_size(e, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 74.0));
+        self.set_size(e, Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 74.0));
         // Settle to the floor (best effort) and remember the base position for returns.
         self.entities[e].v.origin.z += 6.0;
         let _ = self.droptofloor(e);
@@ -268,7 +267,12 @@ impl GameState {
         let team = self.entities[flag].flag.team;
         self.clear_carrier(flag);
         let time = self.time();
-        self.place_flag(flag, FlagPhase::Dropped, origin - Vec3::new(0.0, 0.0, 24.0), Vec3::new(0.0, 0.0, 300.0));
+        self.place_flag(
+            flag,
+            FlagPhase::Dropped,
+            origin - Vec3::new(0.0, 0.0, 24.0),
+            Vec3::new(0.0, 0.0, 300.0),
+        );
         self.entities[flag].flag.return_at = time + FLAG_RETURN_TIME;
         let (tname, _) = team::team_identity(team);
         self.broadcast(PrintLevel::High, &format!("The {tname} flag was dropped!\n"));

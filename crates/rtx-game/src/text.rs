@@ -35,7 +35,10 @@ pub(crate) fn coloured(s: &str) -> String {
 /// here because that crate isn't on the default build — used to turn a built name into the bytes a
 /// `CString` carries to the engine.
 pub(crate) fn latin1_bytes(s: &str) -> Vec<u8> {
-    s.chars().filter(|&c| (c as u32) < 256 && c != '\0').map(|c| c as u8).collect()
+    s.chars()
+        .filter(|&c| (c as u32) < 256 && c != '\0')
+        .map(|c| c as u8)
+        .collect()
 }
 
 /// Decode raw QW text bytes as latin-1 — each byte becomes one `char` in U+0000..=U+00FF. The exact
@@ -66,7 +69,13 @@ pub(crate) fn conchar_cstring(s: &str) -> CString {
 #[cfg(feature = "netclient")]
 pub(crate) fn readable(s: &str) -> String {
     s.chars()
-        .map(|c| if (c as u32) < 256 { READABLE[(c as u8 & 0x7f) as usize] } else { c })
+        .map(|c| {
+            if (c as u32) < 256 {
+                READABLE[(c as u8 & 0x7f) as usize]
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -150,7 +159,10 @@ mod tests {
     #[test]
     fn latin1_single_bytes_the_high_half() {
         let name = Conchars::default().coloured("bot").ch(DOT).plain("Grunt").build();
-        assert_eq!(latin1_bytes(&name), vec![0xe2, 0xef, 0xf4, 0x85, b'G', b'r', b'u', b'n', b't']);
+        assert_eq!(
+            latin1_bytes(&name),
+            vec![0xe2, 0xef, 0xf4, 0x85, b'G', b'r', b'u', b'n', b't']
+        );
         // A char past the Latin-1 range is dropped, not mangled into UTF-8 bytes.
         assert_eq!(latin1_bytes("a\u{2022}b\0c"), vec![b'a', b'b', b'c']);
     }
@@ -164,7 +176,10 @@ mod tests {
         assert_eq!(from_latin1(&latin1_bytes(&name)), name);
         // The raw conchar bytes of `bot•G` are not valid UTF-8 (`0xe2` starts a 3-byte sequence that
         // `0xef` doesn't continue), so a strict decode would drop them to ""; latin-1 keeps each byte.
-        assert_eq!(from_latin1(&[0xe2, 0xef, 0xf4, 0x85, b'G']), "\u{e2}\u{ef}\u{f4}\u{85}G");
+        assert_eq!(
+            from_latin1(&[0xe2, 0xef, 0xf4, 0x85, b'G']),
+            "\u{e2}\u{ef}\u{f4}\u{85}G"
+        );
     }
 
     /// `conchar_cstring` single-bytes the high half (so the wire carries one glyph per conchar),
@@ -172,7 +187,10 @@ mod tests {
     #[test]
     fn conchar_cstring_is_latin1_not_utf8() {
         let name = Conchars::default().coloured("bot").ch(DOT).plain("Grunt").build();
-        assert_eq!(conchar_cstring(&name).as_bytes(), &[0xe2, 0xef, 0xf4, 0x85, b'G', b'r', b'u', b'n', b't']);
+        assert_eq!(
+            conchar_cstring(&name).as_bytes(),
+            &[0xe2, 0xef, 0xf4, 0x85, b'G', b'r', b'u', b'n', b't']
+        );
     }
 
     /// Logging normalizes conchars for readability: colour is stripped, the separator dot reads as
