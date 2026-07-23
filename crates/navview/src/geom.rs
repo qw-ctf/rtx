@@ -620,8 +620,10 @@ pub fn nav_surface(graph: &NavGraph, bsp: &Bsp) -> Vec<LineVertex> {
 
 /// Bright red for the bot's current path.
 const PATH_COLOR: [f32; 3] = [1.0, 0.15, 0.12];
-/// Yellow bounding-box cube for the live bot.
-const BOT_COLOR: [f32; 3] = [1.0, 0.85, 0.10];
+/// Yellow opaque faces for the live bot cube.
+const BOT_COLOR: [f32; 3] = [0.95, 0.78, 0.08];
+/// Dark outline for the bot cube's wireframe edges (contrast against the yellow faces).
+const BOT_EDGE: [f32; 3] = [0.12, 0.08, 0.0];
 
 /// Filled red tiles marking the bot's current route — one 32u quad per route cell, straight from the
 /// game's leg origins, lifted 3u so they sit just over the green walkable surface (which is at +1).
@@ -677,19 +679,50 @@ pub fn path_arcs(legs: &[(Vec3, Vec3)]) -> Vec<LineVertex> {
     out
 }
 
-/// The live bot as a wireframe box the size of the QW player hull (`mins -16,-16,-24` /
-/// `maxs 16,16,32`), centred on `origin`. 12 edges as `LineList` pairs.
-pub fn bot_box(origin: Vec3) -> Vec<LineVertex> {
+/// The 8 corners of the QW player hull (`mins -16,-16,-24` / `maxs 16,16,32`) centred on `origin`,
+/// indexed by bit 0=x, 1=y, 2=z picking lo/hi per axis.
+fn bot_corners(origin: Vec3) -> [Vec3; 8] {
     let lo = origin + Vec3::new(-16.0, -16.0, -24.0);
     let hi = origin + Vec3::new(16.0, 16.0, 32.0);
-    // 8 corners: bit 0=x, bit 1=y, bit 2=z picks lo/hi per axis.
-    let corner = |i: usize| {
+    let c = |i: usize| {
         Vec3::new(
             if i & 1 == 0 { lo.x } else { hi.x },
             if i & 2 == 0 { lo.y } else { hi.y },
             if i & 4 == 0 { lo.z } else { hi.z },
         )
     };
+    [c(0), c(1), c(2), c(3), c(4), c(5), c(6), c(7)]
+}
+
+/// The live bot as an **opaque** box the size of the QW player hull, centred on `origin` — 6 faces × 2
+/// triangles, solid yellow. Pair with [`bot_box`] for the wireframe edges over it. `TriangleList`.
+pub fn bot_faces(origin: Vec3) -> Vec<LineVertex> {
+    let v = bot_corners(origin);
+    // Each face is 4 corner indices in ring order; drawn double-sided so winding doesn't matter.
+    const FACES: [[usize; 4]; 6] = [
+        [0, 1, 3, 2], // z-lo
+        [4, 6, 7, 5], // z-hi
+        [0, 4, 5, 1], // y-lo
+        [2, 3, 7, 6], // y-hi
+        [0, 2, 6, 4], // x-lo
+        [1, 5, 7, 3], // x-hi
+    ];
+    let mut out = Vec::with_capacity(36);
+    for f in FACES {
+        let q = [v[f[0]], v[f[1]], v[f[2]], v[f[3]]];
+        for idx in [0, 1, 2, 0, 2, 3] {
+            out.push(LineVertex {
+                pos: q[idx].to_array(),
+                color: BOT_COLOR,
+            });
+        }
+    }
+    out
+}
+
+/// The live bot's 12 wireframe edges (dark, drawn over the opaque [`bot_faces`]). `LineList` pairs.
+pub fn bot_box(origin: Vec3) -> Vec<LineVertex> {
+    let v = bot_corners(origin);
     const EDGES: [(usize, usize); 12] = [
         (0, 1),
         (1, 3),
@@ -706,10 +739,41 @@ pub fn bot_box(origin: Vec3) -> Vec<LineVertex> {
     ];
     let mut out = Vec::with_capacity(24);
     for (i, j) in EDGES {
-        for p in [corner(i), corner(j)] {
+        for p in [v[i], v[j]] {
             out.push(LineVertex {
                 pos: p.to_array(),
-                color: BOT_COLOR,
+                color: BOT_EDGE,
+            });
+        }
+    }
+    out
+}
+
+/// A wireframe outline of every navmesh cell — the 32u tile border under each cell, just over the
+/// filled walkable surface — so the individual cells read as a grid on top of the flat fill. `LineList`
+/// pairs, dim grey-green.
+pub fn nav_cell_wire(graph: &NavGraph) -> Vec<LineVertex> {
+    const WIRE: [f32; 3] = [0.10, 0.30, 0.12];
+    let hs = GRID * 0.5;
+    let mut out = Vec::with_capacity(graph.cells.len() * 8);
+    for cell in &graph.cells {
+        let o = cell.origin;
+        let z = o.z - FEET_DROP + 2.0; // just above the filled surface (which sits at +1)
+        let corner = |dx: f32, dy: f32| Vec3::new(o.x + dx * hs, o.y + dy * hs, z);
+        let ring = [
+            corner(-1.0, -1.0),
+            corner(1.0, -1.0),
+            corner(1.0, 1.0),
+            corner(-1.0, 1.0),
+        ];
+        for k in 0..4 {
+            out.push(LineVertex {
+                pos: ring[k].to_array(),
+                color: WIRE,
+            });
+            out.push(LineVertex {
+                pos: ring[(k + 1) % 4].to_array(),
+                color: WIRE,
             });
         }
     }

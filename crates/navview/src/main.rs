@@ -100,6 +100,8 @@ struct App {
     visible: [bool; NUM_LINK_KINDS],
     /// Tint the walkable surface by LOD cluster instead of the flat walk color — the hierarchy overlay.
     clusters: bool,
+    /// Draw the per-cell wireframe grid over the filled walkable surface.
+    cells: bool,
     /// Whether the `--live` poller was started (so the panel shows a connection status).
     live_mode: bool,
     /// Whether the live control-channel poller is currently connected to a running game.
@@ -131,6 +133,7 @@ impl App {
             nav: None,
             visible: [true; NUM_LINK_KINDS],
             clusters: false,
+            cells: true,
             live_mode: false,
             live_connected: false,
             egui_ctx: egui::Context::default(),
@@ -152,6 +155,11 @@ impl App {
             gpu.set_surface(&geom::nav_surface(graph, bsp));
         }
         gpu.set_lines(&geom::nav_lines(graph, &self.visible));
+        if self.cells {
+            gpu.set_cellwire(&geom::nav_cell_wire(graph));
+        } else {
+            gpu.set_cellwire(&[]);
+        }
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -174,9 +182,11 @@ impl App {
             .filter(|l| l.kind == "rocketjump" || l.kind == "speedjump")
             .map(|l| (Vec3::from_array(l.src), Vec3::from_array(l.tgt)))
             .collect();
+        let origin = Vec3::from_array(route.origin);
         gpu.set_path(&geom::path_tiles(&origins));
         gpu.set_arcs(&geom::path_arcs(&arcs));
-        gpu.set_bot(&geom::bot_box(Vec3::from_array(route.origin)));
+        gpu.set_bot_faces(&geom::bot_faces(origin));
+        gpu.set_bot(&geom::bot_box(origin));
     }
 
     /// Run one egui frame and render the scene + UI. egui is cheap; a toggle change regenerates the
@@ -191,16 +201,20 @@ impl App {
         let ctx = self.egui_ctx.clone();
         let mut visible = self.visible;
         let mut clusters = self.clusters;
+        let mut cells = self.cells;
         let live = self.live_mode.then_some(self.live_connected);
-        let full = ctx.run_ui(raw_input, |ui| build_panel(ui, &mut visible, &mut clusters, live));
+        let full = ctx.run_ui(raw_input, |ui| {
+            build_panel(ui, &mut visible, &mut clusters, &mut cells, live)
+        });
         self.egui_state
             .as_mut()
             .unwrap()
             .handle_platform_output(&window, full.platform_output);
 
-        if visible != self.visible || clusters != self.clusters {
+        if visible != self.visible || clusters != self.clusters || cells != self.cells {
             self.visible = visible;
             self.clusters = clusters;
+            self.cells = cells;
             self.rebuild_overlay();
         }
 
@@ -455,7 +469,13 @@ impl ApplicationHandler<UserEvent> for App {
 
 /// The path-type toggle panel: a checkbox per `LinkKind`, labelled and swatched in that kind's
 /// overlay color. `Walk` toggles the filled walkable surface; the rest toggle their colored lines.
-fn build_panel(ui: &mut egui::Ui, visible: &mut [bool; NUM_LINK_KINDS], clusters: &mut bool, live: Option<bool>) {
+fn build_panel(
+    ui: &mut egui::Ui,
+    visible: &mut [bool; NUM_LINK_KINDS],
+    clusters: &mut bool,
+    cells: &mut bool,
+    live: Option<bool>,
+) {
     egui::Window::new("Path types")
         .default_pos([12.0, 12.0])
         .resizable(false)
@@ -470,6 +490,7 @@ fn build_panel(ui: &mut egui::Ui, visible: &mut [bool; NUM_LINK_KINDS], clusters
             }
             ui.separator();
             ui.checkbox(clusters, "LOD clusters");
+            ui.checkbox(cells, "Cell grid");
             // Live overlay status (only when started with `--live`): the current route is drawn as
             // red cells, ballistic legs as thick red arcs, and the bot as a yellow bounding box.
             if let Some(connected) = live {

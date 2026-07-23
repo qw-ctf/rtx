@@ -15,6 +15,9 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::UserEvent;
 
+/// Reconnect interval after a dropped connection or a failed connect attempt.
+const RECONNECT: Duration = Duration::from_secs(5);
+
 /// Spawn the poller thread. `port` is the game's `rtx_control_port` (default 27950).
 pub fn spawn(proxy: EventLoopProxy<UserEvent>, port: u16) {
     std::thread::spawn(move || run(&proxy, port));
@@ -23,16 +26,21 @@ pub fn spawn(proxy: EventLoopProxy<UserEvent>, port: u16) {
 fn run(proxy: &EventLoopProxy<UserEvent>, port: u16) {
     let mut next_id: i64 = 1;
     loop {
-        let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
-            std::thread::sleep(Duration::from_millis(750));
-            continue;
-        };
-        let _ = stream.set_nodelay(true);
-        let _ = proxy.send_event(UserEvent::LiveConnected(true));
-        // Poll until any I/O error, then drop out to reconnect.
-        let _ = session(proxy, &mut stream, &mut next_id);
-        let _ = proxy.send_event(UserEvent::LiveConnected(false));
-        std::thread::sleep(Duration::from_millis(500));
+        if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
+            let _ = stream.set_nodelay(true);
+            // `send_event` errors only once the event loop (the app) has shut down — stop the poller.
+            if proxy.send_event(UserEvent::LiveConnected(true)).is_err() {
+                return;
+            }
+            // Poll until any I/O error (the game closed / was restarted), then drop out to reconnect.
+            let _ = session(proxy, &mut stream, &mut next_id);
+            if proxy.send_event(UserEvent::LiveConnected(false)).is_err() {
+                return;
+            }
+        }
+        // Retry every RECONNECT until we reconnect or the app terminates (the thread dies with the
+        // process, and the send_event guards above stop it as soon as the loop is gone).
+        std::thread::sleep(RECONNECT);
     }
 }
 

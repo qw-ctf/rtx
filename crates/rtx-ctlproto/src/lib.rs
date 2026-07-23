@@ -39,7 +39,13 @@ pub fn to_frame<T: Serialize>(v: &T) -> Vec<u8> {
     frame
 }
 
-/// Read one length-prefixed frame's payload bytes, or `Ok(None)` at a clean end of stream.
+/// Largest frame payload we will allocate for. A guard against a corrupted or garbage length prefix
+/// (a peer that died mid-frame, a desynced stream) blowing up into a multi-gigabyte allocation and
+/// crashing the reader. Real frames — even a full status or a long trajectory — are far under this.
+pub const MAX_FRAME: usize = 64 * 1024 * 1024;
+
+/// Read one length-prefixed frame's payload bytes, or `Ok(None)` at a clean end of stream. A length
+/// past [`MAX_FRAME`] is treated as a protocol error (so the caller reconnects) rather than allocated.
 pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
     let mut len = [0u8; 4];
     match r.read_exact(&mut len) {
@@ -48,6 +54,12 @@ pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
         Err(e) => return Err(e),
     }
     let n = u32::from_le_bytes(len) as usize;
+    if n > MAX_FRAME {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "control frame length too large",
+        ));
+    }
     let mut body = vec![0u8; n];
     r.read_exact(&mut body)?;
     Ok(Some(body))
