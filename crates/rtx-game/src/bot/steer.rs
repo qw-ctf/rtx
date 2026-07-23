@@ -976,53 +976,60 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         && !bhop_veto
         && matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
         && ledge_soon(graph, &bot.route, bot.route_pos, bot_cell);
-    if !hop_mode {
-        bot.hop = None;
-    } else if on_ground {
-        bot.hop = bsp.and_then(|bsp| {
-            let cvf = |name: &std::ffi::CStr, d: f32| {
-                let v = host.cvar(name);
-                if v > 0.0 {
-                    v
-                } else {
-                    d
-                }
-            };
-            let pm = crate::pmove_sim::PmParams {
-                gravity: cvf(c"sv_gravity", 800.0),
-                accel: cvf(c"sv_accelerate", 10.0),
-                friction: cvf(c"sv_friction", 4.0),
-                stopspeed: 100.0,
-                maxspeed: cvf(c"sv_maxspeed", 320.0),
-            };
-            // Route polyline from the bot outward, so plan arc-distances measure from here.
-            let route_pts: Vec<Vec3> = std::iter::once(origin)
-                .chain(
-                    bot.route
-                        .get(bot.route_pos..)
-                        .unwrap_or_default()
-                        .iter()
-                        .take(12)
-                        .map(|&l| graph.cell_origin(graph.link_target(l))),
-                )
-                .collect();
-            let st = crate::pmove_sim::PmState {
-                origin,
-                vel: Vec3::new(v_xy.x, v_xy.y, 0.0),
-                on_ground: true,
-                jump_held: false,
-            };
-            let has_haz = graph.has_hazards();
-            let is_hazard = |p: Vec3| {
-                has_haz && {
-                    let c = bsp.pointcontents(p);
-                    c == crate::bsp::CONTENTS_LAVA || c == crate::bsp::CONTENTS_SLIME
-                }
-            };
-            hopsim::plan_hop(bsp, &is_hazard, &route_pts, st, &pm)
-        });
+    // Plan only on a grounded frame moving fast enough to actually hop — the rollout fan traces the
+    // live BSP hull many times, so planning every crawling walk frame would blow the frame budget.
+    // Mid-air the plan stays *latched* for the whole flight: the rollout committed to this landing, so
+    // a leg-kind or ledge-flag flip as the route advances mid-hop must not strip the guidance and drop
+    // the bot out of the air (which aborted the jump mid-arc and fell).
+    if on_ground {
+        bot.hop = if hop_mode && speed > 60.0 {
+            bsp.and_then(|bsp| {
+                let cvf = |name: &std::ffi::CStr, d: f32| {
+                    let v = host.cvar(name);
+                    if v > 0.0 {
+                        v
+                    } else {
+                        d
+                    }
+                };
+                let pm = crate::pmove_sim::PmParams {
+                    gravity: cvf(c"sv_gravity", 800.0),
+                    accel: cvf(c"sv_accelerate", 10.0),
+                    friction: cvf(c"sv_friction", 4.0),
+                    stopspeed: 100.0,
+                    maxspeed: cvf(c"sv_maxspeed", 320.0),
+                };
+                // Route polyline from the bot outward, so plan arc-distances measure from here.
+                let route_pts: Vec<Vec3> = std::iter::once(origin)
+                    .chain(
+                        bot.route
+                            .get(bot.route_pos..)
+                            .unwrap_or_default()
+                            .iter()
+                            .take(12)
+                            .map(|&l| graph.cell_origin(graph.link_target(l))),
+                    )
+                    .collect();
+                let st = crate::pmove_sim::PmState {
+                    origin,
+                    vel: Vec3::new(v_xy.x, v_xy.y, 0.0),
+                    on_ground: true,
+                    jump_held: false,
+                };
+                let has_haz = graph.has_hazards();
+                let is_hazard = |p: Vec3| {
+                    has_haz && {
+                        let c = bsp.pointcontents(p);
+                        c == crate::bsp::CONTENTS_LAVA || c == crate::bsp::CONTENTS_SLIME
+                    }
+                };
+                hopsim::plan_hop(bsp, &is_hazard, &route_pts, st, &pm)
+            })
+        } else {
+            None
+        };
     }
-    // else airborne: keep the plan latched at takeoff.
+    // Airborne frames leave `bot.hop` untouched — the plan stays latched for the whole flight.
     let hop_plan = bot.hop;
     let hop_bearing = hop_plan.map(|pl| yaw_of(pl.aim.xy() - origin.xy()));
     let hop_guide = hop_plan.map_or(0.0, |pl| pl.gain);

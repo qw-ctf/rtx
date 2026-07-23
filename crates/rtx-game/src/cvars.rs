@@ -84,10 +84,8 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // Predictive hop planning on ledge corridors (a spiral staircase's inner edge): roll the pmove
         // a hop ahead and take only hops whose predicted landing stays on the route, so the bot bhops a
         // curved walkway at speed instead of edge-braking or carrying off it. Gated to ledge-flagged
-        // cells, so open play is untouched. Off by default while the aim fan / gains / land tolerances
-        // are tuned against real spirals (it climbs past the old ceiling but doesn't yet converge to a
-        // high goal); flip on once tuned. See `bot::hopsim`.
-        ("rtx_bot_hopplan", Bool(false)),
+        // cells, so open play is untouched. See `bot::hopsim`.
+        ("rtx_bot_hopplan", Bool(true)),
         // A bot's health weights how willing it is to shortcut through lava/slime: hurt bots detour,
         // healthy (or armored, or biosuited) ones clip the corner. `0` prices every bot as a bare
         // spawn — hazards still cost, but the same to everyone. See `bot::bot_hazard_strength`.

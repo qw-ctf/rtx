@@ -24,12 +24,13 @@ use rtx_nav::strafe::{air_accel_max, air_correct, Cmd, MOVE_SPEED};
 
 /// Rollout tick length (77 Hz, matching the offline certifier).
 const DT: f32 = 1.0 / 77.0;
-/// Tick budget for one hop rollout (~1.5 s — well past any single hop's airtime).
-const MAX_TICKS: usize = 120;
+/// Tick budget for one hop rollout (~1 s — a hop's airtime is ~0.68 s; this leaves margin without
+/// paying for a runaway). Kept tight because a rollout traces the live BSP hull several times a tick.
+const MAX_TICKS: usize = 80;
 /// A descent past this below the takeoff height is a fall off an edge, not a step/hop down.
 const MAX_FALL: f32 = 64.0;
 /// Air-strafe pursuit gains tried, gentlest first (a gentle arc is preferred when it suffices).
-const GAINS: [f32; 3] = [6.0, 10.0, 16.0];
+const GAINS: [f32; 2] = [8.0, 14.0];
 /// A landing must fall within this perpendicular distance of the route polyline to count as on-route.
 const LAND_LATERAL_TOL: f32 = 40.0;
 /// …and within this height of the nearest-in-z route segment (keeps stacked spiral levels distinct).
@@ -143,14 +144,14 @@ pub fn plan_hop(
     }
     let speed = st.vel.xy().length().max(1.0);
     let hop = speed * (2.0 * rtx_nav::qphys::JUMP_VZ / p.gravity); // ~a hop's flat reach
-    for &frac in &[1.1, 0.9, 0.7, 0.5] {
+    for &frac in &[1.0, 0.8, 0.6] {
         let d = hop * frac;
         let base = point_on(route_pts, d);
         let perp = {
             let dir = (point_on(route_pts, d + 16.0).xy() - base.xy()).normalize_or_zero();
             Vec2::new(-dir.y, dir.x)
         };
-        for &off in &[0.0, 32.0, -32.0, 16.0, -16.0] {
+        for &off in &[0.0, 32.0, -32.0] {
             let aim = base + Vec3::new(perp.x * off, perp.y * off, 0.0);
             for &gain in &GAINS {
                 let HopRollout::Landed { origin, .. } = roll_hop(hull, st, aim, gain, p) else {
