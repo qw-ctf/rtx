@@ -104,6 +104,29 @@ fn nearfield_gates<'a>(graph: &'a NavGraph, gate_closed: &'a [bool], origin: Vec
 /// against the step face; beyond it the run-up gate applies.
 const JUMP_NOW_DIST: f32 = 40.0;
 
+/// A fast Walk/Step can cross a 32u waypoint between frames while its bhop lobe is laterally offset.
+/// Treat crossing the waypoint's forward plane as progress while still inside this corridor. Without
+/// this, missing the old 64u radial gate leaves the route pointing behind the bot and the controller
+/// can make a destructive U-turn toward a stale cell.
+const FAST_WAYPOINT_CORRIDOR: f32 = 96.0;
+
+fn ground_waypoint_arrived(origin: Vec2, source: Vec2, target: Vec2, speed: f32, frametime: f32) -> bool {
+    let to = target - origin;
+    let arrive_r = ARRIVE_RADIUS.max(2.0 * speed * frametime);
+    if to.length() <= arrive_r {
+        return true;
+    }
+    if speed <= 0.0 {
+        return false;
+    }
+    let along = (target - source).normalize_or_zero();
+    if along == Vec2::ZERO || (origin - target).dot(along) < 0.0 {
+        return false;
+    }
+    let lateral = (origin - target) - along * (origin - target).dot(along);
+    lateral.length() <= FAST_WAYPOINT_CORRIDOR
+}
+
 /// Whether a plain jump leg (`JumpGap`/`DoubleJump`) may fire its takeoff jump this frame. Applying
 /// forward *after* the leap barely helps in QW air physics, so the speed must already be carried
 /// *toward the waypoint* before jumping — gate on the velocity component along `to_wp` reaching
@@ -437,8 +460,10 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
     // Advance past route legs we've already reached. A plat leg completes when we've *risen*
     // to the exit height (Z), not on XY arrival — we're standing still on the lift while it
     // carries us up, so XY barely changes.
-    // A bunnyhopping bot covers ground fast enough to orbit a 24u waypoint, so widen the arrival gate
-    // with speed and also advance once a waypoint slips *behind* the velocity.
+    // A bunnyhopping bot covers ground fast enough to orbit a 24u waypoint, so widen the arrival gate.
+    // Walk/Step additionally advances on a bounded crossing of the target plane: at 700+ ups a wide
+    // lobe can pass a cell outside the old 64u radial fallback in one tick. Leaving that cell current
+    // points the corridor behind the bot and turns an otherwise healthy slalom into a U-turn.
     let arrive_r = if bot.bhop.phase != bhop::Phase::Off || bot.sj.is_some() {
         ARRIVE_RADIUS.max(2.0 * speed * frametime)
     } else {
@@ -459,6 +484,10 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
             LinkKind::Hook => false,
             // Same for a rocket jump — its driver advances on landing, not on passing the target XY.
             LinkKind::RocketJump => false,
+            LinkKind::Walk | LinkKind::Step if bot.bhop.phase != bhop::Phase::Off || bot.sj.is_some() => {
+                let source = graph.cell_origin(graph.link_source(leg));
+                ground_waypoint_arrived(origin.xy(), source.xy(), target.xy(), speed, frametime)
+            }
             _ => {
                 let to = target.xy() - origin.xy();
                 let fast = bot.bhop.phase != bhop::Phase::Off || bot.sj.is_some();
@@ -1584,6 +1613,40 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fast_ground_waypoint_advances_across_its_forward_plane() {
+        let source = Vec2::new(224.0, 1440.0);
+        let target = Vec2::new(224.0, 1472.0);
+
+        // A fast slalom may pass the 32u cell by more than the old 64u radial fallback. It is still
+        // inside the directed corridor and must advance instead of steering back to the stale cell.
+        assert!(ground_waypoint_arrived(
+            Vec2::new(258.0, 1540.0),
+            source,
+            target,
+            700.0,
+            1.0 / 77.0,
+        ));
+
+        // Crossing the plane far outside the corridor is not progress along this path.
+        assert!(!ground_waypoint_arrived(
+            Vec2::new(400.0, 1540.0),
+            source,
+            target,
+            700.0,
+            1.0 / 77.0,
+        ));
+
+        // Being laterally close while still before the target does not skip it.
+        assert!(!ground_waypoint_arrived(
+            Vec2::new(250.0, 1460.0),
+            source,
+            target,
+            700.0,
+            1.0 / 77.0,
+        ));
+    }
 
     #[test]
     fn jump_runup_gate_wants_speed_toward_the_waypoint() {
