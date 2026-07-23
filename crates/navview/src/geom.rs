@@ -616,6 +616,106 @@ pub fn nav_surface(graph: &NavGraph, bsp: &Bsp) -> Vec<LineVertex> {
     out
 }
 
+// --- live overlay (the running game's current route + bot, via the control channel) ------------
+
+/// Bright red for the bot's current path.
+const PATH_COLOR: [f32; 3] = [1.0, 0.15, 0.12];
+/// Yellow bounding-box cube for the live bot.
+const BOT_COLOR: [f32; 3] = [1.0, 0.85, 0.10];
+
+/// Filled red tiles marking the bot's current route — one 32u quad per route cell, straight from the
+/// game's leg origins, lifted 3u so they sit just over the green walkable surface (which is at +1).
+pub fn path_tiles(origins: &[Vec3]) -> Vec<LineVertex> {
+    let hs = GRID * 0.5;
+    let mut out = Vec::with_capacity(origins.len() * 6);
+    for o in origins {
+        let z = o.z - FEET_DROP + 3.0;
+        let corner = |dx: f32, dy: f32| LineVertex {
+            pos: [o.x + dx * hs, o.y + dy * hs, z],
+            color: PATH_COLOR,
+        };
+        let (a, b, c, d) = (
+            corner(-1.0, -1.0),
+            corner(1.0, -1.0),
+            corner(1.0, 1.0),
+            corner(-1.0, 1.0),
+        );
+        out.extend_from_slice(&[a, b, c, a, c, d]);
+    }
+    out
+}
+
+/// Thick red ballistic arcs for the route's rocket-/speed-jump legs — an approximate parabola from
+/// takeoff to landing (the game reports only endpoints), drawn as several offset polylines so it reads
+/// as a fat line, since wgpu can't widen a `LineList`.
+pub fn path_arcs(legs: &[(Vec3, Vec3)]) -> Vec<LineVertex> {
+    let mut out = Vec::new();
+    for &(a, b) in legs {
+        let apex = a.z.max(b.z) + JUMP_APEX; // a plausible leap height above the higher endpoint
+        let arc = arc_pts(a, b, apex);
+        // A "plus" cross-section of offset copies — center plus ±3u in x/y and +3u up — to fake width.
+        for off in [
+            Vec3::ZERO,
+            Vec3::new(3.0, 0.0, 0.0),
+            Vec3::new(-3.0, 0.0, 0.0),
+            Vec3::new(0.0, 3.0, 0.0),
+            Vec3::new(0.0, -3.0, 0.0),
+            Vec3::new(0.0, 0.0, 3.0),
+        ] {
+            for w in arc.windows(2) {
+                out.push(LineVertex {
+                    pos: (w[0] + off).to_array(),
+                    color: PATH_COLOR,
+                });
+                out.push(LineVertex {
+                    pos: (w[1] + off).to_array(),
+                    color: PATH_COLOR,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The live bot as a wireframe box the size of the QW player hull (`mins -16,-16,-24` /
+/// `maxs 16,16,32`), centred on `origin`. 12 edges as `LineList` pairs.
+pub fn bot_box(origin: Vec3) -> Vec<LineVertex> {
+    let lo = origin + Vec3::new(-16.0, -16.0, -24.0);
+    let hi = origin + Vec3::new(16.0, 16.0, 32.0);
+    // 8 corners: bit 0=x, bit 1=y, bit 2=z picks lo/hi per axis.
+    let corner = |i: usize| {
+        Vec3::new(
+            if i & 1 == 0 { lo.x } else { hi.x },
+            if i & 2 == 0 { lo.y } else { hi.y },
+            if i & 4 == 0 { lo.z } else { hi.z },
+        )
+    };
+    const EDGES: [(usize, usize); 12] = [
+        (0, 1),
+        (1, 3),
+        (3, 2),
+        (2, 0), // bottom
+        (4, 5),
+        (5, 7),
+        (7, 6),
+        (6, 4), // top
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7), // verticals
+    ];
+    let mut out = Vec::with_capacity(24);
+    for (i, j) in EDGES {
+        for p in [corner(i), corner(j)] {
+            out.push(LineVertex {
+                pos: p.to_array(),
+                color: BOT_COLOR,
+            });
+        }
+    }
+    out
+}
+
 /// A distinct-ish color per LOD cluster id (a hash to RGB, floored so every cluster stays visible),
 /// so adjacent clusters read as different tiles in the [`nav_clusters`] overlay.
 fn cluster_color(id: u32) -> [f32; 3] {

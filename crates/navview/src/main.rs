@@ -8,6 +8,7 @@
 
 mod geom;
 mod gpu;
+mod live;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,10 @@ enum UserEvent {
         bsp: Arc<Bsp>,
         graph: NavGraph,
     },
+    /// A live route poll from a running game: the bot's origin plus its current route legs.
+    Live(Box<rtx_ctlproto::RouteResp>),
+    /// The live control-channel connection came up (`true`) or dropped (`false`).
+    LiveConnected(bool),
 }
 
 /// A noclip fly camera: a position plus yaw/pitch look angles (Quake Z-up, right-handed).
@@ -95,6 +100,10 @@ struct App {
     visible: [bool; NUM_LINK_KINDS],
     /// Tint the walkable surface by LOD cluster instead of the flat walk color — the hierarchy overlay.
     clusters: bool,
+    /// Whether the `--live` poller was started (so the panel shows a connection status).
+    live_mode: bool,
+    /// Whether the live control-channel poller is currently connected to a running game.
+    live_connected: bool,
     egui_ctx: egui::Context,
     /// egui's winit input translator; created with the window in `resumed`.
     egui_state: Option<egui_winit::State>,
@@ -122,6 +131,8 @@ impl App {
             nav: None,
             visible: [true; NUM_LINK_KINDS],
             clusters: false,
+            live_mode: false,
+            live_connected: false,
             egui_ctx: egui::Context::default(),
             egui_state: None,
         }
@@ -146,6 +157,28 @@ impl App {
         }
     }
 
+    /// Rebuild the live overlay (route tiles + rocket/speed-jump arcs + bot cube) from one route poll.
+    /// The cells and arcs come straight from the game's leg world coordinates, so they align with the
+    /// map regardless of whether navview's own navmesh build matches the game's exactly.
+    fn apply_live(&mut self, route: &rtx_ctlproto::RouteResp) {
+        let Some(gpu) = self.gpu.as_mut() else { return };
+        // Path cells: each leg's source cell, plus the final leg's target.
+        let mut origins: Vec<Vec3> = route.legs.iter().map(|l| Vec3::from_array(l.src)).collect();
+        if let Some(last) = route.legs.last() {
+            origins.push(Vec3::from_array(last.tgt));
+        }
+        // Only the ballistic legs get the thick red arc.
+        let arcs: Vec<(Vec3, Vec3)> = route
+            .legs
+            .iter()
+            .filter(|l| l.kind == "rocketjump" || l.kind == "speedjump")
+            .map(|l| (Vec3::from_array(l.src), Vec3::from_array(l.tgt)))
+            .collect();
+        gpu.set_path(&geom::path_tiles(&origins));
+        gpu.set_arcs(&geom::path_arcs(&arcs));
+        gpu.set_bot(&geom::bot_box(Vec3::from_array(route.origin)));
+    }
+
     /// Run one egui frame and render the scene + UI. egui is cheap; a toggle change regenerates the
     /// overlay buffers before the draw so the change shows this frame.
     fn draw(&mut self) {
@@ -158,7 +191,8 @@ impl App {
         let ctx = self.egui_ctx.clone();
         let mut visible = self.visible;
         let mut clusters = self.clusters;
-        let full = ctx.run_ui(raw_input, |ui| build_panel(ui, &mut visible, &mut clusters));
+        let live = self.live_mode.then_some(self.live_connected);
+        let full = ctx.run_ui(raw_input, |ui| build_panel(ui, &mut visible, &mut clusters, live));
         self.egui_state
             .as_mut()
             .unwrap()
@@ -372,17 +406,29 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn user_event(&mut self, _el: &ActiveEventLoop, event: UserEvent) {
-        let UserEvent::NavBuilt { generation, bsp, graph } = event;
-        if generation != self.generation {
-            return; // a newer map was dropped while this build ran — discard the stale result
+        match event {
+            UserEvent::NavBuilt { generation, bsp, graph } => {
+                if generation != self.generation {
+                    return; // a newer map was dropped while this build ran — discard the stale result
+                }
+                self.set_title(&format!(
+                    "navview — {} cells, {} links",
+                    graph.cells.len(),
+                    graph.links.len()
+                ));
+                self.nav = Some((bsp, graph));
+                self.rebuild_overlay();
+            }
+            UserEvent::Live(route) => self.apply_live(&route),
+            UserEvent::LiveConnected(up) => {
+                self.live_connected = up;
+                if !up {
+                    if let Some(gpu) = self.gpu.as_mut() {
+                        gpu.clear_live();
+                    }
+                }
+            }
         }
-        self.set_title(&format!(
-            "navview — {} cells, {} links",
-            graph.cells.len(),
-            graph.links.len()
-        ));
-        self.nav = Some((bsp, graph));
-        self.rebuild_overlay();
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -409,7 +455,7 @@ impl ApplicationHandler<UserEvent> for App {
 
 /// The path-type toggle panel: a checkbox per `LinkKind`, labelled and swatched in that kind's
 /// overlay color. `Walk` toggles the filled walkable surface; the rest toggle their colored lines.
-fn build_panel(ui: &mut egui::Ui, visible: &mut [bool; NUM_LINK_KINDS], clusters: &mut bool) {
+fn build_panel(ui: &mut egui::Ui, visible: &mut [bool; NUM_LINK_KINDS], clusters: &mut bool, live: Option<bool>) {
     egui::Window::new("Path types")
         .default_pos([12.0, 12.0])
         .resizable(false)
@@ -424,6 +470,17 @@ fn build_panel(ui: &mut egui::Ui, visible: &mut [bool; NUM_LINK_KINDS], clusters
             }
             ui.separator();
             ui.checkbox(clusters, "LOD clusters");
+            // Live overlay status (only when started with `--live`): the current route is drawn as
+            // red cells, ballistic legs as thick red arcs, and the bot as a yellow bounding box.
+            if let Some(connected) = live {
+                ui.separator();
+                let (col, txt) = if connected {
+                    (egui::Color32::from_rgb(255, 60, 40), "live: connected")
+                } else {
+                    (egui::Color32::GRAY, "live: waiting for game…")
+                };
+                ui.colored_label(col, txt);
+            }
         });
 }
 
@@ -431,7 +488,30 @@ fn main() {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
-    let pending_path = std::env::args().nth(1).map(PathBuf::from);
-    let mut app = App::new(proxy, pending_path);
+
+    // Args: an optional positional `.bsp` path, and `--live [port]` (or `--connect [port]`) to attach
+    // the live overlay to a running game's control channel (default `rtx_control_port` = 27950).
+    let mut pending_path = None;
+    let mut live_port: Option<u16> = None;
+    let mut args = std::env::args().skip(1).peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--live" | "--connect" => {
+                let port = args.peek().and_then(|s| s.parse::<u16>().ok());
+                if port.is_some() {
+                    args.next();
+                }
+                live_port = Some(port.unwrap_or(27950));
+            }
+            _ if pending_path.is_none() => pending_path = Some(PathBuf::from(arg)),
+            _ => {}
+        }
+    }
+
+    let mut app = App::new(proxy.clone(), pending_path);
+    if let Some(port) = live_port {
+        app.live_mode = true;
+        live::spawn(proxy, port);
+    }
     event_loop.run_app(&mut app).expect("run app");
 }

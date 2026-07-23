@@ -1713,6 +1713,7 @@ dependencies = [
  "egui-winit",
  "glam",
  "pollster",
+ "rtx-ctlproto",
  "rtx-nav",
  "wgpu",
  "winit",

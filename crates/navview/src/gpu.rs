@@ -30,6 +30,12 @@ pub struct Gpu {
     water_vbuf: Option<(wgpu::Buffer, u32)>,
     surf_vbuf: Option<(wgpu::Buffer, u32)>,
     line_vbuf: Option<(wgpu::Buffer, u32)>,
+    /// Live overlay from a running game: red route tiles (drawn with the surface pipeline), and thick
+    /// red rocket-/speed-jump arcs plus the bot's bounding-box cube (both the line pipeline). `None`
+    /// until a live route arrives / after disconnect.
+    path_vbuf: Option<(wgpu::Buffer, u32)>,
+    arc_vbuf: Option<(wgpu::Buffer, u32)>,
+    bot_vbuf: Option<(wgpu::Buffer, u32)>,
     /// egui's wgpu backend, drawn in a second pass over the 3D scene each frame.
     egui_renderer: egui_wgpu::Renderer,
 }
@@ -192,6 +198,9 @@ impl Gpu {
             water_vbuf: None,
             surf_vbuf: None,
             line_vbuf: None,
+            path_vbuf: None,
+            arc_vbuf: None,
+            bot_vbuf: None,
             egui_renderer,
         }
     }
@@ -234,6 +243,28 @@ impl Gpu {
     pub fn clear_overlay(&mut self) {
         self.line_vbuf = None;
         self.surf_vbuf = None;
+    }
+
+    /// Replace the live route-tile buffer (red filled quads).
+    pub fn set_path(&mut self, verts: &[LineVertex]) {
+        self.path_vbuf = self.upload(bytemuck::cast_slice(verts), verts.len() as u32, "path");
+    }
+
+    /// Replace the live rocket-/speed-jump arc buffer (thick red lines).
+    pub fn set_arcs(&mut self, verts: &[LineVertex]) {
+        self.arc_vbuf = self.upload(bytemuck::cast_slice(verts), verts.len() as u32, "arcs");
+    }
+
+    /// Replace the live bot bounding-box cube buffer.
+    pub fn set_bot(&mut self, verts: &[LineVertex]) {
+        self.bot_vbuf = self.upload(bytemuck::cast_slice(verts), verts.len() as u32, "bot");
+    }
+
+    /// Drop the live overlay (route tiles + arcs + bot cube) — on disconnect from the game.
+    pub fn clear_live(&mut self) {
+        self.path_vbuf = None;
+        self.arc_vbuf = None;
+        self.bot_vbuf = None;
     }
 
     fn upload(&self, data: &[u8], count: u32, label: &str) -> Option<(wgpu::Buffer, u32)> {
@@ -331,7 +362,24 @@ impl Gpu {
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..*count, 0..1);
             }
+            // The live route tiles ride the same translucent surface pipeline, drawn after (so red
+            // sits over green), then the opaque lines: nav links, then the live arcs and bot cube.
+            if let Some((buf, count)) = &self.path_vbuf {
+                pass.set_pipeline(&self.surf_pipeline);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..*count, 0..1);
+            }
             if let Some((buf, count)) = &self.line_vbuf {
+                pass.set_pipeline(&self.line_pipeline);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..*count, 0..1);
+            }
+            if let Some((buf, count)) = &self.arc_vbuf {
+                pass.set_pipeline(&self.line_pipeline);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..*count, 0..1);
+            }
+            if let Some((buf, count)) = &self.bot_vbuf {
                 pass.set_pipeline(&self.line_pipeline);
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..*count, 0..1);
