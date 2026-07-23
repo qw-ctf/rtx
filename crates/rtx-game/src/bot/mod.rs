@@ -20,6 +20,7 @@ mod combat;
 pub(crate) mod goals;
 mod grenade;
 mod hook;
+pub(crate) mod hopsim;
 pub(crate) mod human_profile;
 pub(crate) mod model;
 pub(crate) mod oracle;
@@ -2446,7 +2447,10 @@ mod tests {
             xy_rose |= xy > prev_xy + 1.0; // the XY metric is non-monotonic on the way up
             prev_xy = xy;
         }
-        assert!(xy_rose, "the XY-to-goal distance should rise somewhere on a helix (why arc-length wins)");
+        assert!(
+            xy_rose,
+            "the XY-to-goal distance should rise somewhere on a helix (why arc-length wins)"
+        );
     }
 
     #[test]

@@ -226,9 +226,165 @@ fn ground_move(hull: &impl Hull, origin: Vec3, velocity: Vec3, dt: f32) -> (Vec3
     }
 }
 
+/// A synthetic player-clip [`Hull`] for rollout tests: a height field. `floor(x, y)` gives the
+/// walkable surface height at a column, or `None` for a bottomless void (a spiral's open core). A
+/// standing origin is inside solid iff it sits *below* the surface there and rests *on* it. Traces
+/// march the segment for first contact and estimate the normal from the local solid gradient — enough
+/// to roll hop arcs, climb ramps/stairs, and fall through voids without a compiled map. Not a general
+/// BSP: it models the walkable-surface worlds the movement tests need. Exposed (doc-hidden) so
+/// dependent crates' tests can build worlds from an `is_solid`-style closure, the codebase idiom.
+#[doc(hidden)]
+pub struct HeightHull<F: Fn(f32, f32) -> Option<f32>> {
+    pub floor: F,
+}
+
+impl<F: Fn(f32, f32) -> Option<f32>> HeightHull<F> {
+    fn solid(&self, p: Vec3) -> bool {
+        (self.floor)(p.x, p.y).is_some_and(|fz| p.z < fz)
+    }
+
+    /// Surface normal at `c`, from a 6-neighbour solid gradient pointing to the empty side: a flat
+    /// floor gives `+z`, a ramp a tilted normal, a vertical riser a horizontal one.
+    fn normal(&self, c: Vec3) -> Vec3 {
+        let e = 1.0;
+        let mut n = Vec3::ZERO;
+        for d in [Vec3::X, Vec3::Y, Vec3::Z] {
+            n += d * (i32::from(self.solid(c - d * e)) - i32::from(self.solid(c + d * e))) as f32;
+        }
+        n.normalize_or_zero()
+    }
+}
+
+impl<F: Fn(f32, f32) -> Option<f32>> Hull for HeightHull<F> {
+    fn trace(&self, a: Vec3, b: Vec3) -> HullTrace {
+        let clear = HullTrace {
+            fraction: 1.0,
+            endpos: b,
+            plane_normal: Vec3::ZERO,
+            plane_dist: 0.0,
+            start_solid: false,
+            all_solid: false,
+            in_open: true,
+            in_water: false,
+        };
+        if self.solid(a) {
+            return HullTrace {
+                endpos: a,
+                start_solid: true,
+                all_solid: true,
+                in_open: false,
+                ..clear
+            };
+        }
+        let len = (b - a).length();
+        if len < 1e-6 {
+            return clear;
+        }
+        let steps = len.ceil() as i32; // ~1u march
+        let mut prev = a;
+        for i in 1..=steps {
+            let p = a.lerp(b, (i as f32 / steps as f32).min(1.0));
+            if self.solid(p) {
+                // Bisect [prev (empty), p (solid)] for the contact just outside the surface.
+                let (mut lo, mut hi) = (prev, p);
+                for _ in 0..8 {
+                    let mid = (lo + hi) * 0.5;
+                    if self.solid(mid) {
+                        hi = mid;
+                    } else {
+                        lo = mid;
+                    }
+                }
+                return HullTrace {
+                    fraction: ((lo - a).length() / len).clamp(0.0, 1.0),
+                    endpos: lo,
+                    plane_normal: self.normal(lo),
+                    ..clear
+                };
+            }
+            prev = p;
+        }
+        clear
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A flat-floor hop from a standstill-ish run reaches the analytic apex and lands after the
+    /// analytic airtime — validating that `HeightHull` traces a rollout faithfully enough to plan on.
+    #[test]
+    fn height_hull_rolls_a_faithful_hop_arc() {
+        use crate::strafe::MOVE_SPEED;
+        let hull = HeightHull {
+            floor: |_, _| Some(0.0),
+        };
+        let p = PmParams::default();
+        let dt = 1.0 / 77.0;
+        let mut s = PmState {
+            origin: Vec3::new(0.0, 0.0, 0.0),
+            vel: Vec3::new(320.0, 0.0, 0.0),
+            on_ground: true,
+            jump_held: false,
+        };
+        let mut max_z = 0.0f32;
+        let mut airtime = 0.0;
+        let mut landed = false;
+        for tick in 0..200 {
+            let cmd = Cmd {
+                view_yaw: 0.0,
+                forward: MOVE_SPEED,
+                side: 0.0,
+                jump: tick == 0,
+            };
+            pm_step(&hull, &mut s, &cmd, &p, dt);
+            max_z = max_z.max(s.origin.z);
+            if tick > 3 && s.on_ground {
+                airtime = tick as f32 * dt;
+                landed = true;
+                break;
+            }
+        }
+        assert!(landed, "the hop must land back on the floor");
+        // Analytic: apex JUMP_VZ^2 / 2g = 270^2/1600 ≈ 45.6u, airtime 2·270/800 ≈ 0.675s.
+        assert!((max_z - 45.6).abs() < 4.0, "apex off: {max_z}");
+        assert!((airtime - 0.675).abs() < 0.05, "airtime off: {airtime}");
+        assert!(
+            (s.origin.z).abs() < 1.0,
+            "should rest back on the floor: {}",
+            s.origin.z
+        );
+    }
+
+    /// A void column (`floor` returns `None`) is fallen through, not stood on — the spiral-core case.
+    #[test]
+    fn height_hull_falls_through_a_void() {
+        let hull = HeightHull {
+            floor: |x, _| (x < 32.0).then_some(0.0), // floor only for x < 32, void beyond
+        };
+        let p = PmParams::default();
+        let dt = 1.0 / 77.0;
+        let mut s = PmState {
+            origin: Vec3::new(0.0, 0.0, 0.0),
+            vel: Vec3::new(600.0, 0.0, 0.0), // fast enough to clear the floor edge into the void
+            on_ground: true,
+            jump_held: false,
+        };
+        for tick in 0..200 {
+            let cmd = Cmd {
+                view_yaw: 0.0,
+                forward: 800.0,
+                side: 0.0,
+                jump: tick == 0,
+            };
+            pm_step(&hull, &mut s, &cmd, &p, dt);
+            if s.origin.z < -200.0 {
+                return; // fell into the void, as expected
+            }
+        }
+        panic!("should have fallen into the void past the floor edge, z={}", s.origin.z);
+    }
 
     /// Moving into a +z floor: the downward component is removed, horizontal preserved.
     #[test]
