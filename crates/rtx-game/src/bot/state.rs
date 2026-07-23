@@ -97,6 +97,10 @@ pub struct BotState {
     /// The bunnyhop controller (see [`crate::bot::bhop`]): the hop-cycle phase machine, sticky
     /// strafe sign, engage hysteresis, and telemetry.
     pub bhop: crate::bot::bhop::Bhop,
+    /// The predictive hop plan (see [`crate::bot::hopsim`]) being flown on a ledge corridor: the aim
+    /// point and gain whose rolled-out landing stays on the route. Planned on a grounded frame, held
+    /// across the hop's flight, and cleared on landing. `None` off ledge corridors or when boxed.
+    pub hop: Option<crate::bot::hopsim::HopPlan>,
     /// A committed [`LinkKind::SpeedJump`](crate::navmesh::LinkKind::SpeedJump) leg (a bhop run-up +
     /// leap) being flown. `None` = not on a speed jump. See [`Commit`].
     pub sj: Option<Commit>,

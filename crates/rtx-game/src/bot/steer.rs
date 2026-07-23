@@ -966,6 +966,67 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         }
     }
 
+    // Predictive hop planning (see `hopsim`). On a ledge corridor (a wall-hugging walkway over a drop
+    // — a spiral staircase's inner edge) a bhop's chord sags over the void by more than the walkway is
+    // wide, so no reactive edge test both keeps speed and stays on. Instead roll the pmove a hop ahead
+    // under the guided policy the controller flies and take only hops whose *predicted* landing stays
+    // on the route. Planned on a grounded frame from the live state, held across the flight, re-planned
+    // each landing; `None` off ledge corridors or when boxed. Gated by `rtx_bot_hopplan`.
+    let hop_mode = host.cvar_bool(c"rtx_bot_hopplan")
+        && !bhop_veto
+        && matches!(kind, Some(LinkKind::Walk | LinkKind::Step))
+        && ledge_soon(graph, &bot.route, bot.route_pos, bot_cell);
+    if !hop_mode {
+        bot.hop = None;
+    } else if on_ground {
+        bot.hop = bsp.and_then(|bsp| {
+            let cvf = |name: &std::ffi::CStr, d: f32| {
+                let v = host.cvar(name);
+                if v > 0.0 {
+                    v
+                } else {
+                    d
+                }
+            };
+            let pm = crate::pmove_sim::PmParams {
+                gravity: cvf(c"sv_gravity", 800.0),
+                accel: cvf(c"sv_accelerate", 10.0),
+                friction: cvf(c"sv_friction", 4.0),
+                stopspeed: 100.0,
+                maxspeed: cvf(c"sv_maxspeed", 320.0),
+            };
+            // Route polyline from the bot outward, so plan arc-distances measure from here.
+            let route_pts: Vec<Vec3> = std::iter::once(origin)
+                .chain(
+                    bot.route
+                        .get(bot.route_pos..)
+                        .unwrap_or_default()
+                        .iter()
+                        .take(12)
+                        .map(|&l| graph.cell_origin(graph.link_target(l))),
+                )
+                .collect();
+            let st = crate::pmove_sim::PmState {
+                origin,
+                vel: Vec3::new(v_xy.x, v_xy.y, 0.0),
+                on_ground: true,
+                jump_held: false,
+            };
+            let has_haz = graph.has_hazards();
+            let is_hazard = |p: Vec3| {
+                has_haz && {
+                    let c = bsp.pointcontents(p);
+                    c == crate::bsp::CONTENTS_LAVA || c == crate::bsp::CONTENTS_SLIME
+                }
+            };
+            hopsim::plan_hop(bsp, &is_hazard, &route_pts, st, &pm)
+        });
+    }
+    // else airborne: keep the plan latched at takeoff.
+    let hop_plan = bot.hop;
+    let hop_bearing = hop_plan.map(|pl| yaw_of(pl.aim.xy() - origin.xy()));
+    let hop_guide = hop_plan.map_or(0.0, |pl| pl.gain);
+
     // Drive the hop-cycle controller (see `bhop::Bhop`). On a speed jump the runway is the
     // run-up to the takeoff edge and the bearing aims straight at the landing so the leap goes
     // across the gap; otherwise steer toward the look-ahead corridor point (smoother than the 32u
@@ -1041,23 +1102,28 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
         // straight off the edge toward the raw xy goal. `nf_active` already excludes committed jumps,
         // and a speed jump takes the `sj_active` branch above (so a gap leap still commits to its
         // landing). Inert on open ground, where the near-field push is zero.
-        let dir = match bot
-            .near
-            .as_ref()
-            .filter(|_| nf_active)
-            .and_then(|nf| nf.steer_push(origin))
-        {
-            Some(push) => {
-                let bent = dir.normalize_or_zero() + push.xy() * NEARFIELD_BHOP_WEIGHT;
-                if bent.length() > 1e-3 {
-                    bent * dir.length()
-                } else {
-                    dir
+        let dir = if hop_bearing.is_some() {
+            dir // guided: the hop plan owns the bearing (set below); skip the reactive near-field bend
+        } else {
+            match bot
+                .near
+                .as_ref()
+                .filter(|_| nf_active)
+                .and_then(|nf| nf.steer_push(origin))
+            {
+                Some(push) => {
+                    let bent = dir.normalize_or_zero() + push.xy() * NEARFIELD_BHOP_WEIGHT;
+                    if bent.length() > 1e-3 {
+                        bent * dir.length()
+                    } else {
+                        dir
+                    }
                 }
+                None => dir,
             }
-            None => dir,
         };
-        let bearing = yaw_of(dir);
+        // A live hop plan supplies the bearing straight to its aim — the rollout certified that line.
+        let bearing = hop_bearing.unwrap_or(yaw_of(dir));
         let bhop_runway = match (sj_takeoff, sj_progress) {
             // Curl: signed along-corridor distance to the takeoff (past-lip goes negative → leap).
             (_, Some(p)) => p,
@@ -1075,15 +1141,20 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 let end = origin + (v_xy.normalize_or_zero() * d).extend(0.0);
                 let wall = bsp.hull1_trace(origin, end).fraction * d;
                 // The hull trace sees only walls: a bot flying at the open centre of a wall-hugging
-                // walkway (a spiral staircase's inner edge) traces clear and hops over the void. The
-                // near-field sees the drop — cap `clear` at the lip so the controller carves/brakes on
-                // the ground at the edge (turning far faster than in the air) instead of leaping off it.
-                let edge = bot
-                    .near
-                    .as_ref()
-                    .filter(|_| nf_active)
-                    .map_or(d, |nf| nf.edge_ahead(origin, v_xy.extend(0.0), d));
-                wall.min(edge)
+                // walkway (a spiral staircase's inner edge) traces clear and hops over the void. With a
+                // live hop plan that leap is *intended* — the rollout certified its landing — so keep
+                // the raw wall reach. Otherwise the near-field caps `clear` at the drop lip so the
+                // controller carves/brakes on the ground at the edge rather than leaping off it.
+                if hop_plan.is_some() {
+                    wall
+                } else {
+                    let edge = bot
+                        .near
+                        .as_ref()
+                        .filter(|_| nf_active)
+                        .map_or(d, |nf| nf.edge_ahead(origin, v_xy.extend(0.0), d));
+                    wall.min(edge)
+                }
             }
             _ => f32::INFINITY,
         };
@@ -1096,10 +1167,13 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 runway: bhop_runway,
                 eligible: bhop_entry,
                 zigzag: zigzag_ok,
-                sustain: bhop_sustain,
+                // A live hop plan *is* the proof the chain belongs here — it certified a landing on the
+                // route — so it keeps the chain alive across the ledge where `ascent_ahead`/`runway`
+                // would otherwise drop to a walk.
+                sustain: bhop_sustain || hop_plan.is_some(),
                 veto: bhop_veto,
                 committed: sj_active,
-                carry,
+                carry: carry || hop_plan.is_some(),
                 hold_jump: sj_hold,
                 // The takeoff regime (hold ground prestrafe to the lip, leap once) is only for *curl*
                 // jumps, which need a run-up the ground circle-strafe builds. A straight speed jump keeps
@@ -1121,7 +1195,7 @@ pub(super) fn steer(graph: &NavGraph, bot: &mut BotState, ctx: SteerCtx) -> Stee
                 } else {
                     0.0
                 },
-                guide_gain: 0.0, // set by the predictive hop planner once ledge-mode is wired (next stage)
+                guide_gain: hop_guide, // the live predictive hop plan's pursuit gain (0 = no plan)
                 clear,
                 now,
             },

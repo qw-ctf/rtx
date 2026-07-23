@@ -16,11 +16,6 @@
 //! (`navmesh::jumps::curl_land_point`) lifted to runtime, per hop. `None` means no hop from here lands
 //! on-route — the *predicted* boxed state, and the one case a fallback brake is for.
 
-// The planner is built and unit-tested here; the live bhop controller and steering consume it in the
-// following stage (the guided-hop input + ledge-mode integration). Until then its `pub(crate)` items
-// have no in-crate caller, so silence the staging dead-code noise rather than scatter per-item allows.
-#![allow(dead_code)]
-
 use glam::{Vec2, Vec3, Vec3Swizzles};
 
 use crate::math::yaw_of;
@@ -43,8 +38,8 @@ const LAND_Z_TOL: f32 = 40.0;
 /// What a single guided hop does when rolled forward from a takeoff state.
 #[derive(Clone, Copy, Debug)]
 pub enum HopRollout {
-    /// Settled back on the ground: where, with what velocity, after how long.
-    Landed { origin: Vec3, vel: Vec3, airtime: f32 },
+    /// Settled back on the ground at this origin.
+    Landed { origin: Vec3 },
     /// Dropped more than [`MAX_FALL`] below the takeoff — carried off an edge.
     Fell,
     /// Never settled within the tick budget (should not happen on a sane arc).
@@ -84,21 +79,15 @@ pub fn roll_hop(hull: &impl Hull, mut st: PmState, aim: Vec3, gain: f32, p: &PmP
             return HopRollout::Fell;
         }
         if tick > 3 && st.on_ground {
-            return HopRollout::Landed {
-                origin: st.origin,
-                vel: st.vel,
-                airtime: tick as f32 * DT,
-            };
+            return HopRollout::Landed { origin: st.origin };
         }
     }
     HopRollout::Overran
 }
 
-/// Where a point projects onto a route polyline.
+/// How closely a point sits on a route polyline segment.
 #[derive(Clone, Copy, Debug)]
 pub struct Projection {
-    /// Arc-distance from the polyline start to the projection foot.
-    pub arc: f32,
     /// Height of the point above (`+`) or below (`-`) the matched segment.
     pub dz: f32,
     /// Perpendicular XY distance from the point to the polyline.
@@ -107,11 +96,9 @@ pub struct Projection {
 
 /// Project `p` onto polyline `pts`, choosing the segment that best matches in **3D** — lateral offset
 /// plus a doubled height penalty — so two stacked spiral flights that overlap in XY stay distinct.
-/// Reports the arc-distance to the foot (route progress) and the lateral/vertical offsets. `None` for
-/// a degenerate polyline.
+/// Reports the lateral and vertical offsets of the best match. `None` for a degenerate polyline.
 pub fn route_project(pts: &[Vec3], p: Vec3) -> Option<Projection> {
     let mut best: Option<(f32, Projection)> = None;
-    let mut arc0 = 0.0;
     for w in pts.windows(2) {
         let (a, b) = (w[0], w[1]);
         let seg = b - a;
@@ -119,7 +106,6 @@ pub fn route_project(pts: &[Vec3], p: Vec3) -> Option<Projection> {
         let t = ((p.xy() - a.xy()).dot(seg.xy()) / (seg_len * seg_len)).clamp(0.0, 1.0);
         let foot = a.lerp(b, t);
         let proj = Projection {
-            arc: arc0 + seg_len * t,
             dz: p.z - foot.z,
             lateral: (p.xy() - foot.xy()).length(),
         };
@@ -127,19 +113,16 @@ pub fn route_project(pts: &[Vec3], p: Vec3) -> Option<Projection> {
         if best.as_ref().is_none_or(|(bs, _)| score < *bs) {
             best = Some((score, proj));
         }
-        arc0 += seg_len;
     }
     best.map(|(_, pr)| pr)
 }
 
-/// A certified hop: the aim point to pursue, the predicted landing, the gain that lands it, and the
-/// route arc-distance the landing reaches (for progress).
+/// A certified hop: the aim point the controller pursues, and the air-strafe gain that rolls its
+/// landing onto the route.
 #[derive(Clone, Copy, Debug)]
 pub struct HopPlan {
     pub aim: Vec3,
-    pub landing: Vec3,
     pub gain: f32,
-    pub progress: f32,
 }
 
 /// Plan the next hop from `st` (a grounded frame) so its predicted landing stays on `route_pts` — the
@@ -177,12 +160,7 @@ pub fn plan_hop(
                     continue;
                 };
                 if proj.lateral <= LAND_LATERAL_TOL && proj.dz.abs() <= LAND_Z_TOL && !is_hazard(origin) {
-                    return Some(HopPlan {
-                        aim,
-                        landing: origin,
-                        gain,
-                        progress: proj.arc,
-                    });
+                    return Some(HopPlan { aim, gain });
                 }
             }
         }
@@ -228,8 +206,14 @@ mod tests {
         let pr = route_project(&pts, on_upper).unwrap();
         assert!(pr.dz.abs() < 1.0, "should match the upper flight in z, dz={}", pr.dz);
         assert!(pr.lateral < 1.0, "and sit on it laterally, lateral={}", pr.lateral);
-        // Arc-distance is past the whole lower flight (200) plus the 100u riser.
-        assert!(pr.arc > 300.0, "arc should be on the upper leg: {}", pr.arc);
+        // Against the naive nearest-XY match it would snap to the lower flight (dz≈100); the z-gate
+        // keeps the levels distinct.
+        let ambiguous = route_project(&pts, Vec3::new(100.0, 0.0, 100.0)).unwrap();
+        assert!(
+            ambiguous.dz.abs() < 50.0,
+            "z-gate must not snap to the far level: dz={}",
+            ambiguous.dz
+        );
     }
 
     /// On a flat annular walkway, a straight tangent hop would sag into the core; `plan_hop` finds an
@@ -260,7 +244,11 @@ mod tests {
             })
             .collect();
         let plan = plan_hop(&hull, &no_hazard, &route, st, &p).expect("a hop should land on the ring");
-        let land_rho = plan.landing.xy().length();
+        // Flying the returned plan lands back on the ring (not sagged off the inner edge into the core).
+        let HopRollout::Landed { origin } = roll_hop(&hull, st, plan.aim, plan.gain, &p) else {
+            panic!("the planned hop should land");
+        };
+        let land_rho = origin.xy().length();
         assert!(
             (r_i..=r_o).contains(&land_rho),
             "planned landing must be on the ring: rho={land_rho}"

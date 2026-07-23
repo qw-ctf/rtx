@@ -2207,6 +2207,20 @@ fn route_remaining(graph: &NavGraph, route: &[u32], route_pos: usize, origin: Ve
     )
 }
 
+/// Whether the bot is on, or about to reach, a ledge-flagged cell — the gate for predictive hop
+/// planning ([`hopsim`](crate::bot::hopsim)). Checks the current cell and the next few legs' targets;
+/// the flags are precomputed per cell, so unlike the near-field they stay valid mid-air, and arming a
+/// step before the drop lets the planner take over while the bot is still on solid ground.
+fn ledge_soon(graph: &NavGraph, route: &[u32], route_pos: usize, bot_cell: CellId) -> bool {
+    graph.is_ledge(bot_cell)
+        || route
+            .get(route_pos..)
+            .unwrap_or_default()
+            .iter()
+            .take(4)
+            .any(|&leg| graph.is_ledge(graph.link_target(leg)))
+}
+
 /// A wander destination for an idle bot with nothing to chase: a random reachable navmesh cell,
 /// refreshed on arrival or every few seconds. Keeps bots moving on a human-less server instead of
 /// freezing on the spawn (the "bots stand still with no human" case).
