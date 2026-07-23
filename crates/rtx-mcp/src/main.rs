@@ -240,8 +240,9 @@ impl RtxMcp {
         Ok(json!({ "stopped": killed }))
     }
 
-    async fn op_start(&self, map: String, port: u16, skill: f32) -> Result<Value, String> {
-        let _ = self.op_stop().await; // idempotent: replace any running server
+    async fn op_start(&self, map: String, port: u16, skill: f32, install: bool) -> Result<Value, String> {
+        let _ = self.op_stop().await; // idempotent: replace any running server (and free its file lock)
+        let staged = install_module(&self.inner.repo, install)?;
         write_config(&self.inner.repo, &map, port, skill)?;
         let bin = self.inner.repo.join("playground/mvdsv");
         let mut child = Command::new(&bin)
@@ -295,7 +296,12 @@ impl RtxMcp {
                         .as_u64()
                         .ok_or_else(|| "ready status had no bot ent".to_string())? as u32;
                     self.req(&format!("hold {bot}"), SHORT).await?;
-                    return self.req("status", SHORT).await;
+                    let mut status = self.req("status", SHORT).await?;
+                    // Report which build is live, so a caller who just rebuilt can confirm it took.
+                    if let (Some(obj), Some(from)) = (status.as_object_mut(), &staged) {
+                        obj.insert("module".into(), json!(from));
+                    }
+                    return Ok(status);
                 }
             }
             if Instant::now() >= deadline {
@@ -525,6 +531,52 @@ fn corridor_metrics(ev: &Value, start: [f32; 3], end: [f32; 3]) -> Result<Value,
     }))
 }
 
+/// The cdylib's build output name and the `qwprogs` name mvdsv loads it as, for this OS — mirrors
+/// the `built`/`artifact` pairing in `.github/workflows/build.yml`.
+fn module_names() -> (&'static str, &'static str) {
+    if cfg!(target_os = "windows") {
+        ("rtx.dll", "qwprogs.dll")
+    } else if cfg!(target_os = "macos") {
+        ("librtx.dylib", "qwprogs.dylib")
+    } else {
+        ("librtx.so", "qwprogs.so")
+    }
+}
+
+/// Stage the game module into `playground/qw/` so mvdsv can load it. Returns the repo-relative path
+/// it was staged from, or `None` if an already-staged module was used as-is.
+///
+/// With `install`, the more recently built of `target/{release,debug}` is copied over whatever is
+/// there — so it tests whichever profile you last built, and rebuilding `rtx-game` then re-running
+/// is a one-step loop with no manual copy. Without it (or when nothing is built locally yet) an
+/// already-staged module is left untouched. A genuinely absent module is reported here, rather than
+/// left to surface later as an opaque connection-refused once mvdsv can't bind its listener. The
+/// copy is safe against the last server's file lock because `op_start` kills and waits it first.
+fn install_module(repo: &std::path::Path, install: bool) -> Result<Option<String>, String> {
+    let (built, staged) = module_names();
+    let dest = repo.join("playground/qw").join(staged);
+
+    let freshest = ["release", "debug"]
+        .into_iter()
+        .map(|profile| (profile, repo.join("target").join(profile).join(built)))
+        .filter(|(_, src)| src.is_file())
+        .max_by_key(|(_, src)| src.metadata().and_then(|m| m.modified()).ok());
+
+    if let (true, Some((profile, src))) = (install, freshest) {
+        std::fs::copy(&src, &dest).map_err(|e| format!("copy {} -> {}: {e}", src.display(), dest.display()))?;
+        return Ok(Some(format!("target/{profile}/{built}")));
+    }
+    if dest.is_file() {
+        Ok(None)
+    } else {
+        Err(format!(
+            "no game module staged at {} and none built under target/release or target/debug — \
+             run `cargo build --release -p rtx-game` first",
+            dest.display()
+        ))
+    }
+}
+
 /// Write the self-contained harness config into `playground/qw/rjtest.cfg`. Self-contained (server
 /// cvars + rtx cvars + `map`) so it works whether or not mvdsv auto-execs `server.cfg` first — the
 /// last `set`/`map` wins either way. One bot, alone, pacifist, the control port open, dm/no-match so
@@ -596,6 +648,10 @@ struct StartArgs {
     port: Option<u16>,
     /// Bot skill 0–7 (default 7). Drives the aim-spring stiffness, itself a tuning variable.
     skill: Option<f32>,
+    /// Stage the freshest local build (`target/release` or `target/debug`, whichever is newer) as
+    /// playground/qw's game module before launching (default true). Set false to launch against
+    /// whatever module is already staged there, without overwriting it.
+    install_module: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -753,13 +809,16 @@ impl RtxMcp {
 
     #[tool(
         description = "Launch mvdsv with the harness config (1 bot, control port open), wait until \
-        the navmesh is built and a bot has spawned, and return the server status."
+        the navmesh is built and a bot has spawned, and return the server status. By default also \
+        stages the freshest local build as playground/qw's qwprogs module first — pass \
+        install_module=false to launch against whatever module is already staged there instead."
     )]
     async fn server_start(&self, Parameters(a): Parameters<StartArgs>) -> Result<CallToolResult, McpError> {
         let map = a.map.unwrap_or_else(|| "aerowalk".to_string());
         let port = a.port.unwrap_or(DEFAULT_PORT);
         let skill = a.skill.unwrap_or(7.0);
-        finish(self.op_start(map, port, skill).await)
+        let install = a.install_module.unwrap_or(true);
+        finish(self.op_start(map, port, skill, install).await)
     }
 
     #[tool(description = "Stop the managed mvdsv process and close the control connection.")]
@@ -767,12 +826,16 @@ impl RtxMcp {
         finish(self.op_stop().await)
     }
 
-    #[tool(description = "Restart the server (fresh navmesh — link ids are NOT stable across restarts).")]
+    #[tool(
+        description = "Restart the server (fresh navmesh — link ids are NOT stable across restarts). \
+        Also re-stages the qwprogs module by default; see server_start's install_module."
+    )]
     async fn server_restart(&self, Parameters(a): Parameters<StartArgs>) -> Result<CallToolResult, McpError> {
         let map = a.map.unwrap_or_else(|| "aerowalk".to_string());
         let port = a.port.unwrap_or(DEFAULT_PORT);
         let skill = a.skill.unwrap_or(7.0);
-        finish(self.op_start(map, port, skill).await)
+        let install = a.install_module.unwrap_or(true);
+        finish(self.op_start(map, port, skill, install).await)
     }
 
     #[tool(

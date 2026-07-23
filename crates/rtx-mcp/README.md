@@ -23,6 +23,22 @@ flowchart LR
   untouched server is unchanged.
 - **This bridge** (`crates/rtx-mcp`): manages mvdsv, connects to the control port, exposes MCP tools.
 
+## `playground/` prerequisites
+
+`server_start` / `server_restart` run mvdsv out of `playground/` (gitignored, not checked in).
+That directory needs `mvdsv` / `mvdsv.exe` and `id1/pak0.pak` + `id1/PAK1.PAK` present already —
+everything else (test `.bsp`s under `qw/maps/`, the `qwprogs` module, `qw/rjtest.cfg`) is either
+fetched separately or staged automatically by this bridge.
+
+In particular, the `qwprogs` module (`qw/qwprogs.dll` / `.so` / `.dylib` — the `rtx` cdylib mvdsv
+loads as its game logic) does not need copying in by hand. Before every launch,
+`server_start`/`server_restart` copy the newer of `target/release` and `target/debug` over
+whatever is staged, so a fresh `cargo build -p rtx-game` is what gets tested — the returned status
+names the build under `module`. Pass `install_module=false` to skip the copy and reuse the staged
+module as-is. With nothing built and nothing staged, the call fails telling you to
+`cargo build --release -p rtx-game` first, rather than dropping mvdsv into a doomed
+connection-refused loop.
+
 ## Use
 
 Registered in the repo-root `.mcp.json` as `rtx-mcp`. After a Claude Code session restart (or
