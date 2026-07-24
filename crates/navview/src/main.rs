@@ -38,6 +38,9 @@ enum UserEvent {
     },
     /// A live route poll from a running game: the bot's origin plus its current route legs.
     Live(Box<rtx_ctlproto::RouteResp>),
+    /// The map BSP fetched over the control channel — so `--live` needn't be given a local `.bsp`
+    /// (and works for maps that live only inside a `.pak`, which the game reads via the engine FS).
+    Bsp(Box<rtx_ctlproto::BspResp>),
     /// The live control-channel connection came up (`true`) or dropped (`false`).
     LiveConnected(bool),
 }
@@ -102,6 +105,12 @@ struct App {
     clusters: bool,
     /// Draw the per-cell wireframe grid over the filled walkable surface.
     cells: bool,
+    /// Mapname (no extension) of the currently loaded BSP, so a repeated control-channel BSP fetch
+    /// (e.g. after a reconnect) skips rebuilding the navmesh for a map we already have.
+    loaded_map: Option<String>,
+    /// A BSP fetched over the control channel before the window/GPU existed; loaded once `resumed`
+    /// brings the renderer up.
+    pending_bsp: Option<Box<rtx_ctlproto::BspResp>>,
     /// Whether the `--live` poller was started (so the panel shows a connection status).
     live_mode: bool,
     /// Whether the live control-channel poller is currently connected to a running game.
@@ -134,6 +143,8 @@ impl App {
             visible: [true; NUM_LINK_KINDS],
             clusters: false,
             cells: true,
+            loaded_map: None,
+            pending_bsp: None,
             live_mode: false,
             live_connected: false,
             egui_ctx: egui::Context::default(),
@@ -230,14 +241,12 @@ impl App {
         }
     }
 
-    /// Load a BSP: show its grey geometry immediately, then build the navmesh on a worker thread.
+    /// Load a BSP from disk: show its grey geometry immediately, then build the navmesh off-thread.
     fn load(&mut self, path: &Path) {
-        let Some(gpu) = self.gpu.as_mut() else { return };
         let name = path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
             Err(e) => {
@@ -245,7 +254,15 @@ impl App {
                 return;
             }
         };
-        let Some(mesh) = geom::parse_render_mesh(&bytes) else {
+        self.load_bytes(&bytes, &name);
+    }
+
+    /// Load a BSP already in memory (from disk, or fetched over the control channel). Uploads the
+    /// grey geometry immediately and builds the navmesh on a worker thread. `name` may carry a
+    /// `.bsp` suffix or not; the stem is remembered in [`Self::loaded_map`] to dedupe refetches.
+    fn load_bytes(&mut self, bytes: &[u8], name: &str) {
+        let Some(gpu) = self.gpu.as_mut() else { return };
+        let Some(mesh) = geom::parse_render_mesh(bytes) else {
             self.set_title(&format!("navview — {name}: not a supported BSP"));
             return;
         };
@@ -259,10 +276,11 @@ impl App {
         if let Some(w) = &self.window {
             w.request_redraw();
         }
+        self.loaded_map = Some(name.strip_suffix(".bsp").unwrap_or(name).to_string());
 
         // Parse the BSP once on the main thread; the worker shares it (`Arc`) to build, and it rides
         // back with the graph for the overlay's liquid/hull queries.
-        let Some(bsp) = Bsp::parse(&bytes).map(Arc::new) else {
+        let Some(bsp) = Bsp::parse(bytes).map(Arc::new) else {
             self.set_title(&format!("navview — {name}: BSP parse failed"));
             return;
         };
@@ -357,6 +375,10 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some(path) = self.pending_path.take() {
             self.load(&path);
         }
+        // A BSP that arrived over the control channel before the GPU existed: load it now.
+        if let Some(bsp) = self.pending_bsp.take() {
+            self.load_bytes(&bsp.bytes, &bsp.map);
+        }
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -434,6 +456,16 @@ impl ApplicationHandler<UserEvent> for App {
                 self.rebuild_overlay();
             }
             UserEvent::Live(route) => self.apply_live(&route),
+            UserEvent::Bsp(bsp) => {
+                // Skip if we already have this map (e.g. a refetch after a reconnect); otherwise load
+                // now, or stash it for `resumed` if the renderer isn't up yet.
+                if self.loaded_map.as_deref() == Some(bsp.map.as_str()) {
+                } else if self.gpu.is_some() {
+                    self.load_bytes(&bsp.bytes, &bsp.map);
+                } else {
+                    self.pending_bsp = Some(bsp);
+                }
+            }
             UserEvent::LiveConnected(up) => {
                 self.live_connected = up;
                 if !up {

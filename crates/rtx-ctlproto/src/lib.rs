@@ -120,6 +120,8 @@ pub enum Cmd {
     Audit { bot: u32, lines: u32 },
     /// List generated curl links.
     Curls,
+    /// Fetch the current map's raw BSP file, so a viewer can render the world without a local copy.
+    Bsp,
     /// Probe the build-time curl certifier.
     Probe {
         takeoff: Vec3,
@@ -200,6 +202,17 @@ pub enum Resp {
     Probe(ProbeResp),
     Curl(CurlResp),
     PlanLink(PlanLinkResp),
+    Bsp(Box<BspResp>),
+}
+
+/// The current map's raw BSP file plus its name, so a viewer can parse the render lumps and draw the
+/// world without needing a local copy of the map. `bytes` travels as a msgpack `bin` (not an int
+/// array) via `serde_bytes`, so a multi-MB map stays compact on the wire.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BspResp {
+    pub map: String,
+    #[serde(with = "serde_bytes")]
+    pub bytes: Vec<u8>,
 }
 
 // --- status -----------------------------------------------------------------------------------------
@@ -688,6 +701,19 @@ mod tests {
         };
         let back = roundtrip(&msg);
         assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn bsp_reply_roundtrips_bytes() {
+        // The BSP payload rides as raw `serde_bytes` — verify a non-UTF-8 blob survives intact.
+        let msg = Msg::Reply {
+            id: 8,
+            result: Ok(Resp::Bsp(Box::new(BspResp {
+                map: "dm3".to_string(),
+                bytes: vec![0x1d, 0x00, 0xff, 0x80, 0x01, 0x02, 0x03],
+            }))),
+        };
+        assert_eq!(roundtrip(&msg), msg);
     }
 
     #[test]

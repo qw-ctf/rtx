@@ -313,6 +313,7 @@ fn exec_request(game: &mut GameState, conn: u64, req: Request) {
         Cmd::Route { bot } => route_resp(game, bot).map(Resp::Route),
         Cmd::Audit { bot, lines } => audit_resp(game, bot, lines as usize).map(Resp::Audit),
         Cmd::Curls => curls_resp(game).map(Resp::Curls),
+        Cmd::Bsp => bsp_resp(game).map(|b| Resp::Bsp(Box::new(b))),
         Cmd::Probe {
             takeoff,
             tgt,
@@ -1108,6 +1109,17 @@ fn probe_resp(game: &GameState, takeoff: Vec3, tgt: Vec3, psi0: f32, runway: f32
         v_deliver: probe.v_deliver,
         certified,
         gains,
+    })
+}
+
+/// The current map's raw BSP file, re-read on demand so a viewer can render the world without a local
+/// copy of the map. Mirrors `load_map_bsp`'s read path.
+fn bsp_resp(game: &GameState) -> Result<proto::BspResp, String> {
+    let path = cstring(&format!("maps/{}.bsp", game.level.mapname));
+    let bytes = game.host.read_file(&path).ok_or("could not read map BSP")?;
+    Ok(proto::BspResp {
+        map: game.level.mapname.clone(),
+        bytes,
     })
 }
 

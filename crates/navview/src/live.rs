@@ -47,6 +47,12 @@ fn run(proxy: &EventLoopProxy<UserEvent>, port: u16) {
 /// Poll one connection: resolve the first bot from `status`, then stream its `route` until an I/O
 /// error ends the session (a bad-bot reply just re-resolves — the bot may have died/respawned).
 fn session(proxy: &EventLoopProxy<UserEvent>, stream: &mut TcpStream, next_id: &mut i64) -> io::Result<()> {
+    // Fetch the map BSP once up front so the viewer renders the exact map the game is running —
+    // no local `.bsp` needed, and it works even for maps that live only inside a `.pak` (the game
+    // serves it through the engine filesystem). A game-side error just leaves the viewer mapless.
+    if let Ok(Resp::Bsp(b)) = request(stream, next_id, Cmd::Bsp)? {
+        let _ = proxy.send_event(UserEvent::Bsp(b));
+    }
     let mut bot: Option<u32> = None;
     loop {
         if bot.is_none() {
