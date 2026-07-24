@@ -166,8 +166,8 @@ rollouts); they sum to less than the frame total, the remainder being sensing an
 
 ## Contributing notes
 
-The source is hand-wrapped narrower than rustfmt's `max_width` — please don't run `cargo fmt`;
-it would churn the whole crate. Match the surrounding style instead.
+Run `cargo fmt` before committing — the tree is rustfmt-clean, with `rustfmt.toml` pinning
+`max_width = 120`.
 
 ---
 
