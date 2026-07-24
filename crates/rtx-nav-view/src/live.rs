@@ -87,7 +87,10 @@ fn request(stream: &mut TcpStream, next_id: &mut i64, cmd: Cmd) -> io::Result<Re
             return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
         };
         match proto::decode::<Msg>(&frame).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))? {
-            Msg::Reply { id: rid, result } if rid == id => return Ok(result),
+            // Our reply — or a bad-frame error the game couldn't attribute to a request, which it
+            // sends with id 0 (e.g. an older module that doesn't know `Cmd::Bsp`). Since we keep only
+            // one request in flight, that unattributed error is ours: surface it rather than spin.
+            Msg::Reply { id: rid, result } if rid == id || rid == 0 => return Ok(result),
             _ => continue, // an event, or a reply we're not waiting on — keep reading
         }
     }
