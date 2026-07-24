@@ -13,7 +13,7 @@ Part of the [rtx manual](../README.md)
 | `rtx-nav` | The pure navigation core: collision-hull BSP reader, navmesh builder and query, movement constants. No engine or game state — deterministic math, shared by the game and the viewer. |
 | `rtx-proto` | The QuakeWorld wire protocol as a pure codec — sizebuf, info strings, checksums, netchan, the out-of-band handshake, svc parser and clc builder — with an `nq/` sibling doing the same for NetQuake. No IO, no threads. |
 | `rtx-client` | The [network client](netclient.md) front door: parses argv and hands off to `rtx-game`'s `netclient` module (built with the `netclient` feature). |
-| `navview` | A minimal wgpu/winit viewer for the navmesh: renders the BSP world plus the colored nav links. Load a `.bsp` via argv or drag-and-drop. |
+| `rtx-nav-view` | A minimal wgpu/winit viewer for the navmesh: renders the BSP world plus the colored nav links. Load a `.bsp` via argv or drag-and-drop. |
 | `rtx-mcp` | An MCP (stdio) server bridging Claude Code to the game's TCP control channel, managing a local server process for live bot control and rocket-jump tuning. See [its README](../crates/rtx-mcp/README.md). |
 
 `cargo build` builds the default members — `rtx-nav`, `rtx-proto`, `rtx-game`. The viewer, the
@@ -38,7 +38,7 @@ The rest, each on demand:
 
 ```sh
 cargo build --release -p rtx-client    # the network client
-cargo run -p navview -- <map.bsp>      # the navmesh viewer
+cargo run -p rtx-nav-view -- <map.bsp> # the navmesh viewer
 cargo run -p rtx-mcp --quiet           # the MCP bridge (normally launched via .mcp.json)
 ```
 

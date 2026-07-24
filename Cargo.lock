@@ -1703,23 +1703,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "navview"
-version = "0.1.0"
-dependencies = [
- "binrw",
- "bytemuck",
- "egui",
- "egui-wgpu",
- "egui-winit",
- "glam",
- "pollster",
- "rtx-ctlproto",
- "rtx-nav",
- "wgpu",
- "winit",
-]
-
-[[package]]
 name = "ndk"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2723,6 +2706,23 @@ dependencies = [
  "binrw",
  "glam",
  "rayon",
+]
+
+[[package]]
+name = "rtx-nav-view"
+version = "0.1.0"
+dependencies = [
+ "binrw",
+ "bytemuck",
+ "egui",
+ "egui-wgpu",
+ "egui-winit",
+ "glam",
+ "pollster",
+ "rtx-ctlproto",
+ "rtx-nav",
+ "wgpu",
+ "winit",
 ]
 
 [[package]]

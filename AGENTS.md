@@ -59,7 +59,7 @@ the same way.
 ## Build / test
 
 - Default `cargo build` / `cargo test` cover only the game module, its nav core, and the wire
-  codec. Build the MCP, viewer, and client explicitly: `-p rtx-mcp` / `-p navview` /
+  codec. Build the MCP, viewer, and client explicitly: `-p rtx-mcp` / `-p rtx-nav-view` /
   `-p rtx-client`.
 - Run `cargo fmt` before committing — the tree is rustfmt-clean, with `rustfmt.toml` pinning
   `max_width = 120`.

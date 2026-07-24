@@ -57,7 +57,7 @@ flowchart LR
 | `crates/rtx-nav/` | The pure navigation core — BSP clip-hull reader, navmesh build & query, movement physics. No engine or game state; deterministic math that unit-tests without a host. |
 | `crates/rtx-proto/` | QuakeWorld + NetQuake wire protocols as pure codecs. |
 | `crates/rtx-client/` | The thin front-door binary that parses argv and calls `netclient::run`. |
-| `crates/navview/` | A wgpu/winit 3D viewer for the generated navmesh. |
+| `crates/rtx-nav-view/` | A wgpu/winit 3D viewer for the generated navmesh. |
 | `crates/rtx-mcp/` | An MCP bridge onto the control channel, for live bot control and rocket-jump tuning. |
 
 The split between `rtx-game` and `rtx-nav` is the load-bearing one. `rtx-nav` sees only the parsed

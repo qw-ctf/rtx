@@ -1,6 +1,6 @@
 # The rocket-jump tuning harness bridge: an MCP (stdio) server that puppets rtx bots through the
 # game module's TCP control channel and manages the local mvdsv process. Kept out of the workspace
-# default build (like navview) so plain `cargo build`/CI never pull the rmcp/tokio tree.
+# default build (like rtx-nav-view) so plain `cargo build`/CI never pull the rmcp/tokio tree.
 [package]
 name = "rtx-mcp"
 version = "0.1.0"
