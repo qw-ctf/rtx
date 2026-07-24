@@ -1,0 +1,23 @@
+# Line endings: store every text file as LF in git and check it out as LF on all
+# platforms, independent of each machine's core.autocrlf. `text=auto` still lets git
+# detect binaries; the explicit rules below make the intent unmistakable for the asset
+# types this project handles.
+* text=auto eol=lf
+
+# Binary assets — never normalize line endings or attempt a line diff.
+*.pak   binary
+*.bsp   binary
+*.wad   binary
+*.lmp   binary
+*.dat   binary
+*.qwd   binary
+*.dem   binary
+*.mvd   binary
+*.dll   binary
+*.so    binary
+*.dylib binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
