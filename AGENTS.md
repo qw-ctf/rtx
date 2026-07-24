@@ -56,6 +56,23 @@ bridge lives in `crates/rtx-mcp/`; see its [README](crates/rtx-mcp/README.md).
 `aerowalk` and `bravado` aren't mapped yet; derive a corridor with `inspect_cell` around a spawn,
 the same way.
 
+## Navmesh coverage vs. KTX waypoints — `rtx-waypoint-check`
+
+`cargo run --release -p rtx-waypoint-check -- dm3 dm4 …` (no map named ⇒ every `waypoints/*.bot`
+whose BSP resolves) parses KTX's hand-authored `.bot` waypoint files, rebuilds our navmesh offline
+from the map's BSP, and reports — per authored rocket-jump / curl-jump path — whether our mesh
+reproduces it (`MATCHED`), crosses the gap another way (`JUMP`), merely routes around it (`ROUTE`),
+or can't connect the endpoints at all (`UNREACH` / `UNSNAP` — the blind spots worth chasing). Runs
+fully offline over `playground/` (no server); exit 1 when any endpoint is unreachable/off-mesh.
+
+- KTX marker ids include the map's *entity* markers (items, doors, triggers) claimed in lump order
+  before the file's `CreateMarker`s, so the tool walks the entity lump to resolve them and prints a
+  `K ok` / `K MISMATCH` cross-check per map.
+- Plats aren't spliced into the offline mesh (the per-map `func_plat` count flags where a lift-riding
+  path may read as `ROUTE`/`UNREACH`); teleporters *are* wired. `--radius` tunes endpoint matching.
+- `waypoints/` is gitignored — drop KTX's `.bot` files there. Spot-check an `UNREACH` finding live
+  with the `rtx-mcp` `list_rj_links` / `list_curl_links` / `teleport` tools.
+
 ## Build / test
 
 - Default `cargo build` / `cargo test` cover only the game module, its nav core, and the wire

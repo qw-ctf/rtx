@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[package]
+name = "rtx-waypoint-check"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rtx-waypoint-check"
+path = "src/main.rs"
+
+[dependencies]
+# The whole tool is offline geometry: parse the KTX `.bot` file, build the navmesh the same way the
+# game and viewer do, and compare. `rtx-nav` is the navmesh; `glam` is its Vec3 across the API.
+rtx-nav.workspace = true
+glam.workspace = true

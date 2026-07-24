@@ -1,12 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/rtx-nav", "crates/rtx-proto", "crates/rtx-auditlog", "crates/rtx-ctlproto", "crates/rtx-game", "crates/rtx-client", "crates/rtx-nav-view", "crates/rtx-mcp", "crates/rtx-demo-tool"]
-# Plain `cargo build` / `cargo test` build only the game module, its nav core, the wire codec, and
-# the demo tool that rides on it — the viewer (and its wgpu/winit tree), the rtx-mcp harness bridge
-# (its rmcp/tokio tree) and the network client stay out of the default build and out of CI. Build
-# them explicitly with `-p rtx-nav-view` / `-p rtx-mcp` / `-p rtx-client`. `rtx-proto` and `rtx-demo-tool`
-# are pure and fast to test, so unlike the client that consumes it, they ride along by default.
-default-members = ["crates/rtx-nav", "crates/rtx-proto", "crates/rtx-auditlog", "crates/rtx-ctlproto", "crates/rtx-game", "crates/rtx-demo-tool"]
+members = ["crates/rtx-nav", "crates/rtx-proto", "crates/rtx-auditlog", "crates/rtx-ctlproto", "crates/rtx-game", "crates/rtx-client", "crates/rtx-nav-view", "crates/rtx-mcp", "crates/rtx-demo-tool", "crates/rtx-waypoint-check"]
+# Plain `cargo build` / `cargo test` build only the game module, its nav core, the wire codec, the
+# demo tool that rides on it, and the waypoint checker (pure `rtx-nav`, fast to test) — the viewer
+# (and its wgpu/winit tree), the rtx-mcp harness bridge (its rmcp/tokio tree) and the network client
+# stay out of the default build and out of CI. Build them explicitly with `-p rtx-nav-view` /
+# `-p rtx-mcp` / `-p rtx-client`. `rtx-proto`, `rtx-demo-tool` and `rtx-waypoint-check` are pure and
+# fast to test, so unlike the client that consumes it, they ride along by default.
+default-members = ["crates/rtx-nav", "crates/rtx-proto", "crates/rtx-auditlog", "crates/rtx-ctlproto", "crates/rtx-game", "crates/rtx-demo-tool", "crates/rtx-waypoint-check"]
 
 [workspace.package]
 version = "0.1.0"

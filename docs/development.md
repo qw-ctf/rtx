@@ -17,6 +17,7 @@ Part of the [rtx manual](../README.md)
 | `rtx-ctlproto` | The typed control-channel schema shared by the game and its clients (`rtx-mcp`, `rtx-nav-view`): the request / reply / event enums plus the length-framed msgpack codec. Pure, no IO. |
 | `rtx-auditlog` | A once-allocated per-bot ring buffer of compact `AuditFrame` sensor snapshots (speed, bhop/hook/rj phase, posture, commit, tags), replacing per-frame console spam; the MCP's `audit` tool decodes it. |
 | `rtx-mcp` | An MCP (stdio) server bridging Claude Code to the game's TCP control channel, managing a local server process for live bot control and rocket-jump tuning. See [its README](../crates/rtx-mcp/README.md). |
+| `rtx-waypoint-check` | An offline checker that parses KTX's hand-authored `.bot` waypoint files, rebuilds the navmesh from the map's BSP, and reports which human rocket-jump / curl-jump connections our generated mesh reproduces, routes around, or misses — surfacing blind spots in link generation. Pure `rtx-nav`; see below. |
 
 `cargo build` builds the default members — `rtx-nav`, `rtx-proto`, `rtx-game`. The viewer, the
 MCP bridge, and the network client are deliberately excluded and built explicitly with `-p`.
@@ -71,6 +72,43 @@ One workflow, `.github/workflows/build.yml`:
   human QuakeWorld demos (dm3/dm4) to check the pmove simulation's fidelity and that the bhop
   bot matches or beats the human line.
 - **Navmesh** — unit and integration tests in `crates/rtx-nav`.
+
+## Navmesh coverage vs. hand-authored waypoints
+
+Our navmesh is generated from the BSP; KTX's `.bot` waypoint files are hand-authored by humans, and
+their rocket-jump and curl (air-control) jump paths are distilled from recorded human play. Where a
+human wired a connection our generator didn't, we have a blind spot worth chasing.
+`rtx-waypoint-check` finds them offline — no server, no network:
+
+```sh
+cargo run --release -p rtx-waypoint-check -- dm3 dm4 dm6 e1m2 bravado
+cargo run --release -p rtx-waypoint-check            # every waypoints/*.bot whose BSP resolves
+cargo run --release -p rtx-waypoint-check -- --radius 128 dm3   # loosen endpoint matching
+```
+
+For each map it parses the `.bot` file, rebuilds the navmesh with the viewer's stock-DM recipe (plus
+teleporters wired from the entity lump), and classifies every authored rocket-jump / curl-jump path
+in descending strength: **MATCHED** (a same-kind link bridges the endpoints), **JUMP** (a different
+airborne link does), **ROUTE** (no matching link but a route exists), **UNREACH** / **UNSNAP** (the
+endpoints don't connect, or one is off the mesh — the blind spots). Exit code is `1` when any path is
+unreachable/off-mesh, `0` when all are at least route-connected.
+
+Two things to know when reading the output:
+
+- **Marker numbering.** KTX assigns the low marker ids to the map's *entity* markers — items, doors,
+  triggers, spawns — claimed in entity-lump order *before* the file's own `CreateMarker`s. The tool
+  reproduces that entity walk to resolve path references, and prints a `K ok` / `K MISMATCH`
+  cross-check (`walk` vs. file-implied). A mismatch means the `.bot` file was authored against a
+  different entity set (an alternate `.ent`, a map variant) and the entity-marker positions are
+  unreliable for that map.
+- **Plats aren't spliced offline** (their traversal needs the live mover), so a path that rides a
+  lift can read as `ROUTE`/`UNREACH`; the per-map `func_plat` count flags where that applies.
+  Teleporters *are* wired. Brush-entity endpoints (doors, triggers) use a submodel-bounds
+  approximation and are shown with a `~`.
+
+`waypoints/` is gitignored — drop KTX's `.bot` files there (base install lives in `playground/`).
+Spot-check an `UNREACH` finding on a live server with the `rtx-mcp` `list_rj_links` /
+`list_curl_links` / `teleport` tools.
 
 ## The control channel
 
