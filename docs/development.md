@@ -13,7 +13,9 @@ Part of the [rtx manual](../README.md)
 | `rtx-nav` | The pure navigation core: collision-hull BSP reader, navmesh builder and query, movement constants. No engine or game state — deterministic math, shared by the game and the viewer. |
 | `rtx-proto` | The QuakeWorld wire protocol as a pure codec — sizebuf, info strings, checksums, netchan, the out-of-band handshake, svc parser and clc builder — with an `nq/` sibling doing the same for NetQuake. No IO, no threads. |
 | `rtx-client` | The [network client](netclient.md) front door: parses argv and hands off to `rtx-game`'s `netclient` module (built with the `netclient` feature). |
-| `rtx-nav-view` | A minimal wgpu/winit viewer for the navmesh: renders the BSP world plus the colored nav links. Load a `.bsp` via argv or drag-and-drop. |
+| `rtx-nav-view` | A minimal wgpu/winit viewer for the navmesh: renders the BSP world plus the colored nav links. Load a `.bsp` via argv or drag-and-drop, or attach to a running game with `--live [port]` to fetch its map BSP over the control channel and overlay the live bot and its route. |
+| `rtx-ctlproto` | The typed control-channel schema shared by the game and its clients (`rtx-mcp`, `rtx-nav-view`): the request / reply / event enums plus the length-framed msgpack codec. Pure, no IO. |
+| `rtx-auditlog` | A once-allocated per-bot ring buffer of compact `AuditFrame` sensor snapshots (speed, bhop/hook/rj phase, posture, commit, tags), replacing per-frame console spam; the MCP's `audit` tool decodes it. |
 | `rtx-mcp` | An MCP (stdio) server bridging Claude Code to the game's TCP control channel, managing a local server process for live bot control and rocket-jump tuning. See [its README](../crates/rtx-mcp/README.md). |
 
 `cargo build` builds the default members — `rtx-nav`, `rtx-proto`, `rtx-game`. The viewer, the
@@ -39,6 +41,7 @@ The rest, each on demand:
 ```sh
 cargo build --release -p rtx-client    # the network client
 cargo run -p rtx-nav-view -- <map.bsp> # the navmesh viewer
+cargo run -p rtx-nav-view -- --live    # ... attached to a running game (BSP + live route)
 cargo run -p rtx-mcp --quiet           # the MCP bridge (normally launched via .mcp.json)
 ```
 
@@ -73,9 +76,11 @@ One workflow, `.github/workflows/build.yml`:
 
 Setting `rtx_control_port <port>` (or `--control-port` on the client) binds a localhost TCP
 channel for scripted bot puppetry: teleport a bot, send it somewhere (`goto`), fly a specific
-link, read back cells, links, and telemetry — line-oriented commands in, JSON out. It exists so
-a harness can drive precise, repeatable bot situations against a live server. `0` (the default)
-binds nothing. Implementation: `crates/rtx-game/src/control.rs`.
+link, read back cells, links, and telemetry. The wire is length-framed msgpack of the typed
+[`rtx-ctlproto`](../crates/rtx-ctlproto) schema; several clients can attach at once (replies route
+to the requester, events broadcast to all), so the `rtx-nav-view` viewer can watch the same match
+the MCP bridge is driving. It exists so a harness can drive precise, repeatable bot situations
+against a live server. `0` (the default) binds nothing. Implementation: `crates/rtx-game/src/control.rs`.
 
 The rocket-jump tuning loop built on top of it — an MCP server that Claude Code drives, plus the
 `rtx_rj_*` knobs it turns — is documented in [`crates/rtx-mcp/README.md`](../crates/rtx-mcp/README.md).

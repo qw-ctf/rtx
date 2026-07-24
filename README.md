@@ -79,7 +79,9 @@ cargo build --release -p rtx-client
 | `rtx-nav` | navmesh building and query over the BSP collision hull |
 | `rtx-proto` | the QuakeWorld and NetQuake wire protocols as pure codecs |
 | `rtx-client` | the bots as standalone network clients |
-| `rtx-nav-view` | a 3D viewer for the generated navmesh |
+| `rtx-nav-view` | a 3D viewer for the generated navmesh (live overlay via `--live`) |
+| `rtx-ctlproto` | typed msgpack schema for the game↔tools control channel |
+| `rtx-auditlog` | per-bot ring buffer of compact sensor frames |
 | `rtx-mcp` | an MCP bridge for driving live bot-tuning sessions |
 
 ## License

@@ -2,9 +2,9 @@
 
 //! Background poller for the live overlay: connect to a running game's control channel (framed
 //! msgpack of the [`rtx_ctlproto`] schema), resolve the first live bot, and stream its route to the
-//! viewer's event loop ~10×/s. It reconnects forever, so it can be started before the server is up —
-//! and note the control server is single-client (a new connection supersedes the last), so attaching
-//! navview takes the channel over from any other client (e.g. the MCP bridge).
+//! viewer's event loop ~10×/s. It reconnects forever, so it can be started before the server is up.
+//! The control server is multi-client, so this attaches alongside any other client (e.g. the MCP
+//! bridge) rather than displacing it.
 
 use std::io::{self, Write};
 use std::net::TcpStream;

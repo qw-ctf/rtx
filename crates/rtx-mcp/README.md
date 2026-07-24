@@ -14,9 +14,12 @@ flowchart LR
 ## Pieces
 
 - **Game side** (`crates/rtx-game/src/control.rs`): a cvar-gated (`rtx_control_port`) localhost TCP
-  server. Inbound is line text `<id> <verb> args…`; outbound is one JSON line per reply/event. It
-  puppets a bot: teleport it, order it to a position (`goto`) or to fly a specific rocket-jump link
-  (`rj`), and emit per-attempt telemetry (`rj_result`) and reachability (`arrived`/`goto_stall`).
+  server speaking the typed [`rtx-ctlproto`](../rtx-ctlproto) schema as length-framed msgpack
+  (`[u32-LE len][payload]`) — one request per `{id, Cmd}`, replies routed back by id, events
+  broadcast to every connected client, so this bridge and the `rtx-nav-view` viewer can attach at
+  once. It puppets a bot: teleport it, order it to a position (`goto`) or to fly a specific
+  rocket-jump link (`rj`), and emit per-attempt telemetry (`rj_result`) and reachability
+  (`arrived`/`goto_stall`). Audit frames ride the same wire as compact `rtx-auditlog` snapshots.
 - **Runtime knobs** (`rtx_rj_*` cvars, read live): `stance`, `aim_tol`, `stance_timeout`,
   `liftoff_timeout`, `ballistic_slack`, and the two solve biases `delay_bias` (added to the fire
   delay) and `pitch_bias` (added to the fire pitch). Defaults mirror the driver constants, so an
@@ -89,6 +92,7 @@ that acts on a bot takes an optional `bot` (defaulting to the first live one).
 | `status()` | Map/navmesh, match format/phase/scores/roster, and each bot's team, stack, inventory, posture, perceived enemy, item plan, and route head. |
 | `items()` | The map's bot-goal items (armor, health, weapons, ammo, powerups): each with its entity origin, whether it's currently available, and the nearest navmesh cell — the standable `goto` target. |
 | `bot_route(bot?)` | Dump a bot's full planned route as link ids, kinds, and source/target positions. |
+| `audit(bot?, lines?)` | Dump the bot's `rtx_bot_debug` audit ring — the last N per-frame goal/gate/bhop/hop-phase snapshots, captured full-rate in memory (no console spam). Set `rtx_bot_debug 1` first; ring size is `rtx_bot_auditlog` MB (default 10). |
 | `inspect_cell(x, y, z)` | The navmesh cell nearest a point: incoming/outgoing link kinds, costs, and hazards. |
 | `list_rj_links()` | Every rocket-jump link: id, source/target, solved fire pitch/yaw, delay, airtime, self-damage. |
 | `list_curl_links()` | Generated curl-jump links: run-up, takeoff, target, required speed, and gain. |
