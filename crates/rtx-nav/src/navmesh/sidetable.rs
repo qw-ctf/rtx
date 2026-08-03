@@ -15,6 +15,7 @@
 
 /// A payload column keyed by link index. `idx[li] == -1` marks an untagged link; a link index past
 /// the end of `idx` also reads as untagged (the column need not extend to the full link count).
+#[derive(Clone)]
 pub(super) struct SideTable<T> {
     idx: Vec<i32>,
     items: Vec<T>,

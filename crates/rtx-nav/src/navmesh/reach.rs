@@ -23,6 +23,7 @@ use super::{CellId, NavGraph};
 /// Precomputed strongly-connected components plus the forward reachability closure over their
 /// condensation DAG. Built once at the end of the navmesh build (all link splices done); immutable
 /// thereafter, so it is safe to share `&Reach` across threads.
+#[derive(Clone)]
 pub(super) struct Reach {
     /// The SCC id of each cell (parallel to `cells`), in `0..count`.
     scc: Vec<u32>,

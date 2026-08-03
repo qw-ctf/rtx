@@ -42,6 +42,7 @@ pub struct TeleportInfo {
 /// obstructing entity (to read its current position), where it sits while blocking
 /// (`closed_origin` — it's "open" once moved from here), where the bot operates the button from
 /// (`button_cell`), the button centre to face/touch/shoot (`aim`), and whether it's shot.
+#[derive(Clone)]
 pub struct Gate {
     pub obstruction: u32,
     pub closed_origin: Vec3,
@@ -63,6 +64,7 @@ pub struct Gate {
 /// travel height, so a live player standing on the ground *under* a raised plat is inside it and
 /// keeps resetting its lower-timer — hence the bot must hold a standoff outside this box until the
 /// lift is down (see the plat-hold logic in `bot::run_bot`).
+#[derive(Clone)]
 pub struct Plat {
     pub entity: u32,
     pub fp_min: Vec2,

@@ -68,6 +68,7 @@ impl Ord for MinNode {
 
 /// An abstract-graph node: a cell where a link crosses a cluster boundary — where a coarse route
 /// leaves one cluster or enters the next.
+#[derive(Clone)]
 struct Portal {
     cell: CellId,
     cluster: u32,
@@ -78,6 +79,7 @@ struct Portal {
 /// *including* the water tax (the liquid columns are flagged on the worker before this table is
 /// built, so it bakes in at build time); the rest of the dynamic terms are priced per query from the
 /// metadata, never baked, so live door state and per-bot hazard nerve stay honest.
+#[derive(Clone)]
 struct AbsEdge {
     to: u32,
     base: f32,
@@ -98,6 +100,7 @@ struct AbsEdge {
 
 /// Reaching a cell from one of the entry portals of its cluster: the final coarse hop. Same metadata
 /// as an [`AbsEdge`], priced the same way.
+#[derive(Clone)]
 struct PortalReach {
     portal: u32,
     dist: f32,
@@ -108,6 +111,7 @@ struct PortalReach {
 }
 
 /// The level-of-detail tables: cluster assignment plus the abstract portal graph over it.
+#[derive(Clone)]
 pub(super) struct Lod {
     /// Cluster id of each cell, parallel to `cells`, dense in `0..cluster_count`.
     cluster_of: Vec<u32>,

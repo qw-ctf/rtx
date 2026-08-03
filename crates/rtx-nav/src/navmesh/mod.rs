@@ -229,6 +229,12 @@ pub struct Link {
 
 /// The built navigation graph: cells, directed links, per-cell adjacency (indices into
 /// `links`), and an XY spatial index for `nearest`/neighbor queries.
+///
+/// `Clone` exists for transactional post-build mutation (`nav_patch` in `rtx-game`): mutate a
+/// clone, publish it only if every step validated — a failed patch then leaves the original graph
+/// untouched, derived tables included. The graph is a few MB of `Vec`s; cloning it once at map
+/// load is noise next to the build itself.
+#[derive(Clone)]
 pub struct NavGraph {
     pub cells: Vec<Cell>,
     pub links: Vec<Link>,
@@ -3924,7 +3930,11 @@ mod tests {
 
         // `chain_entry_exclusions` flags exactly that link at true standstill…
         let excluded: Vec<u32> = g.chain_entry_exclusions(0, 0.0).collect();
-        assert_eq!(excluded, vec![0], "the chained link should be flagged at true standstill");
+        assert_eq!(
+            excluded,
+            vec![0],
+            "the chained link should be flagged at true standstill"
+        );
 
         // …and surcharging it (same finite-penalty mechanism the stuck-link watchdog already uses)
         // diverts the identical standstill query onto the walk-around.
@@ -3933,7 +3943,9 @@ mod tests {
             penalties: &penalties,
             ..LinkCosts::default()
         };
-        let guarded = g.find_path_banded(0, 1, 0.0, &costs).expect("the walk-around still exists");
+        let guarded = g
+            .find_path_banded(0, 1, 0.0, &costs)
+            .expect("the walk-around still exists");
         assert_eq!(guarded.links, vec![1, 2], "the gate should divert onto the walk-around");
 
         // A bot already carrying (near) v_req toward the ledge is genuine pass-through traffic and

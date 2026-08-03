@@ -227,7 +227,7 @@ impl GameState {
         let Some(rx) = self.nav.pending.as_ref() else {
             return;
         };
-        let graph = match rx.try_recv() {
+        let mut graph = match rx.try_recv() {
             Ok(graph) => graph,
             Err(std::sync::mpsc::TryRecvError::Empty) => return, // still building
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -236,6 +236,28 @@ impl GameState {
             }
         };
         self.nav.pending = None;
+        // Map-pinned navmesh patches (see `nav_patch`): applied while the graph is still owned,
+        // before the summary below counts it and before anything routes over it. Every patch
+        // reports one console line — `applied`, `skipped (...)` or `failed (...)` — so a run's
+        // log always says which graph the bots actually played on.
+        if self.rtx_cvar_bool("rtx_nav_patch") {
+            if let Some(bsp) = self.nav.bsp.clone() {
+                for (name, outcome) in crate::nav_patch::apply_for_map(&self.level.mapname, &bsp, &mut graph) {
+                    let line = match outcome {
+                        crate::nav_patch::Outcome::Applied { cells, drops } => {
+                            format!("rtx: navpatch {name}: applied ({cells} cells, {drops} drops)\n")
+                        }
+                        crate::nav_patch::Outcome::AlreadyMeshed => {
+                            format!("rtx: navpatch {name}: skipped (already meshed)\n")
+                        }
+                        crate::nav_patch::Outcome::Failed(why) => {
+                            format!("rtx: navpatch {name}: failed ({why})\n")
+                        }
+                    };
+                    self.host.dprint(&cstring(&line));
+                }
+            }
+        }
         let counts = graph.summary();
         let goals = self.collect_goals(&graph);
         let (lclusters, lportals, ledges, lreach) = graph.lod_stats();

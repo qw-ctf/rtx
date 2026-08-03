@@ -74,6 +74,11 @@ pub(crate) const RTX_CVAR_DEFAULTS: &[(&str, CvarSeed)] = {
         // Require the curl too-slow abort to run on grounded frames only. On by default; `0` restores
         // the legacy speed-only abort on airborne frames too.
         ("rtx_bot_sj_abort_grounded", Bool(true)),
+        // Apply the map-pinned navmesh patches (`nav_patch::PATCHES`) when a build finishes: hand-
+        // verified cells + drops for standable surfaces the column carve cannot see (dm3's west
+        // shelf being the worked example — bots climb onto it in pairs and wedge for minutes).
+        // Fail-closed per patch with an `applied`/`skipped`/`failed` console line. 0 → build only.
+        ("rtx_nav_patch", Bool(true)),
         // Fan a goal pick's independent navmesh floods out across a persistent worker pool (see
         // `bot::par`) — on by default; the result is bit-identical to serial. 0 → run them inline on
         // the main thread (the live A/B switch, and the fallback if the pool can't be built).
