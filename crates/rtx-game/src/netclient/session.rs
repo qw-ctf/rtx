@@ -742,17 +742,12 @@ impl Session {
         }
     }
 
-    /// Append a chunk of a resource list at `start`.
+    /// Append a resource-list chunk after the last index sent, `start`.
     fn extend(&mut self, sounds: bool, start: usize, names: &[String]) {
         let list = if sounds { &mut self.sounds } else { &mut self.models };
-        // Index 0 of each list is a placeholder the server never sends, so the first chunk starts
-        // at 1 and the vector has to be padded to match — an off-by-one here would misname every
-        // sound and model.
-        if list.is_empty() {
-            list.push(String::new());
-        }
-        list.resize(list.len().max(start.max(1)), String::new());
-        list.truncate(start.max(1));
+        // Index 0 is a placeholder. The wire cursor names the last entry already sent, so the
+        // chunk begins at start + 1; repeating a chunk only replaces that chunk's suffix.
+        list.resize(start + 1, String::new());
         list.extend_from_slice(names);
     }
 
@@ -762,7 +757,8 @@ impl Session {
     /// re-attaches the high bits from its own count. Without this, a long model list loops forever
     /// on entry 256.
     fn continuation(&self, have: usize, next: u8) -> usize {
-        (have & 0xff00) + next as usize
+        // `have` includes the unused entry 0. The page belongs to the last actual index.
+        (have.saturating_sub(1) & 0xff00) + next as usize
     }
 
     /// Ask to spawn, proving we have the same map the server does.
@@ -1260,7 +1256,7 @@ mod tests {
         assert_eq!(s.sounds, vec!["", "a.wav", "b.wav"]);
 
         // A continuation chunk appends where the last left off.
-        s.extend(true, 3, &["c.wav".to_string()]);
+        s.extend(true, 2, &["c.wav".to_string()]);
         assert_eq!(s.sounds, vec!["", "a.wav", "b.wav", "c.wav"]);
     }
 
@@ -1304,6 +1300,49 @@ mod tests {
         assert_eq!(s.continuation(100, 100), 100);
         assert_eq!(s.continuation(300, 44), 256 + 44);
         assert_eq!(s.continuation(600, 90), 512 + 90);
+    }
+
+    /// The wire cursor is the last sent index, not the next vector position. In particular,
+    /// index 255 leaves 256 vector entries including the placeholder, but still belongs to page 0.
+    #[test]
+    fn resource_chunks_preserve_names_and_request_the_last_sent_index() {
+        let h = host();
+        for sounds in [true, false] {
+            for end in [255, 256, 511, 512, 4094] {
+                let mut s = session();
+                s.signon = Signon::Loading;
+                s.servercount = 42;
+                let names: Vec<_> = (1..=end).map(|i| format!("resource{i}")).collect();
+                let list = svc::ResourceList {
+                    start: 0,
+                    names: names.clone(),
+                    next: (end & 255) as u8,
+                };
+                // Zero is the completion marker; real servers avoid a non-final 256 boundary.
+                if list.next != 0 {
+                    let event = if sounds {
+                        SvcEvent::SoundList(list)
+                    } else {
+                        SvcEvent::ModelList(list)
+                    };
+                    s.handle(&event, &h);
+                    let command = if sounds { "soundlist" } else { "modellist" };
+                    let packet = s.chan.transmit(&[]);
+                    assert_eq!(&packet[10..], clc::write_stringcmd(&format!("{command} 42 {end}")));
+                } else {
+                    s.extend(sounds, 0, &names);
+                }
+                s.extend(sounds, end, &["last".to_string()]);
+                let catalog = if sounds { &s.sounds } else { &s.models };
+                assert_eq!(&catalog[1..=end], &names);
+                assert_eq!(catalog[end + 1], "last");
+                // A duplicated reliable chunk must replace its own suffix, not an earlier entry.
+                s.extend(sounds, end, &["last".to_string()]);
+                let catalog = if sounds { &s.sounds } else { &s.models };
+                assert_eq!(catalog.len(), end + 2);
+                assert_eq!(catalog[end], format!("resource{end}"));
+            }
+        }
     }
 
     /// The signon contract. Each of these is a step the server is waiting on; ignoring any one of

@@ -699,11 +699,11 @@ pub struct ClientData {
 /// A soundlist or modellist chunk. The list is sent in batches because it won't fit one packet.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResourceList {
-    /// Index of the first name in this chunk.
+    /// Index of the last name before this chunk; its first name belongs at `start + 1`.
     pub start: u16,
     /// The names.
     pub names: Vec<String>,
-    /// The next index to ask for, or 0 when the list is complete.
+    /// Low byte of the next cursor to ask for, or 0 when the list is complete.
     pub next: u8,
 }
 
