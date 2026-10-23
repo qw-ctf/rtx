@@ -48,6 +48,8 @@ pub mod fte {
     pub const TRANS: u32 = 0x0000_0008;
     /// Server sends `STAT_TIME`, so game time is exact rather than interpolated.
     pub const ACCURATE_TIMINGS: u32 = 0x0000_0040;
+    /// Extended sound indices and 16-bit soundlist cursors (`svc_fte_soundextended`/`soundlistshort`).
+    pub const SOUNDDBL: u32 = 0x0000_0080;
     /// No wire change — it stops FTE servers complaining that we might not grok a Half-Life BSP.
     pub const HLBSP: u32 = 0x0000_0200;
     /// Model indices above 255: enables `svc_fte_modellistshort`, `U_FTE_MODELDBL`, and the
@@ -134,6 +136,7 @@ pub mod z_ext {
 /// downloads, but excluding CSQC (there is no VM).
 pub const FTE: u32 = fte::TRANS
     | fte::ACCURATE_TIMINGS
+    | fte::SOUNDDBL
     | fte::HLBSP
     | fte::MODELDBL
     | fte::ENTITYDBL
@@ -303,7 +306,7 @@ mod tests {
     /// totals makes adding a bit a deliberate, reviewable act rather than a merge artifact.
     #[test]
     fn advertised_masks_are_what_we_parse() {
-        assert_eq!(FTE, 0x2148_f248);
+        assert_eq!(FTE, 0x2148_f2c8);
         assert_eq!(FTE2, 0);
         assert_eq!(MVD1, 0b11);
         assert_eq!(Z_EXT, 0x1ff);

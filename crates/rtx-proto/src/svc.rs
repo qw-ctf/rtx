@@ -79,6 +79,10 @@ pub mod op {
     pub const SERVERINFO: u8 = 52;
     pub const UPDATEPL: u8 = 53;
     pub const NAILS2: u8 = 54;
+    /// SOUNDDBL sound event with separate FTE/NQ flags.
+    pub const FTE_SOUNDEXTENDED: u8 = 55;
+    /// SOUNDDBL catalog chunk with a 16-bit starting cursor and an 8-bit continuation.
+    pub const FTE_SOUNDLISTSHORT: u8 = 56;
     pub const FTE_MODELLISTSHORT: u8 = 60;
     pub const FTE_SPAWNBASELINE2: u8 = 66;
     pub const QIZMOVOICE: u8 = 83;
@@ -165,6 +169,20 @@ mod u {
 mod snd {
     pub const VOLUME: u16 = 1 << 15;
     pub const ATTENUATION: u16 = 1 << 14;
+}
+
+/// Separate flags for `svc_fte_soundextended` (not QW's packed channel-word flags).
+mod ftesnd {
+    pub const VOLUME: u8 = 1 << 0;
+    pub const ATTENUATION: u8 = 1 << 1;
+    pub const MOREFLAGS: u8 = 1 << 2;
+    pub const LARGEENTITY: u8 = 1 << 3;
+    pub const LARGESOUND: u8 = 1 << 4;
+    pub const SPEED: u8 = 1 << 5;
+    pub const TIMEOFS: u8 = 1 << 6;
+    pub const PITCH: u8 = 1 << 7;
+    /// Bit zero of the additional FTE channel flags carries three velocity shorts.
+    pub const VELOCITY: u64 = 1;
 }
 
 /// Usercmd delta bits (`CM_*`). Shared with [`clc`](crate::clc), which writes them.
@@ -770,7 +788,7 @@ pub enum SvcEvent {
         entity: u16,
         /// Channel 0–7.
         channel: u8,
-        /// Index into the soundlist. 16-bit for NetQuake 666's `SND_LARGESOUND`; QuakeWorld fits 8.
+        /// Index into the soundlist. 16-bit for QW SOUNDDBL and NQ 666's `SND_LARGESOUND`.
         sound: u16,
         /// Volume 0–255.
         volume: u8,
@@ -966,6 +984,7 @@ fn parse_one(proto: &mut ProtoState, r: &mut Reader, svc: u8, offset: usize) -> 
                 channel: (w & 7) as u8,
             }
         }
+        op::FTE_SOUNDEXTENDED => read_sound_extended(r)?,
         op::PRINT => SvcEvent::Print {
             level: r.u8()?,
             text: r.string()?,
@@ -1091,6 +1110,7 @@ fn parse_one(proto: &mut ProtoState, r: &mut Reader, svc: u8, offset: usize) -> 
         op::MODELLIST => SvcEvent::ModelList(read_resource_list(r, false)?),
         op::FTE_MODELLISTSHORT => SvcEvent::ModelList(read_resource_list(r, true)?),
         op::SOUNDLIST => SvcEvent::SoundList(read_resource_list(r, false)?),
+        op::FTE_SOUNDLISTSHORT => SvcEvent::SoundList(read_resource_list(r, true)?),
         op::PACKETENTITIES => SvcEvent::PacketEntities(read_packet_entities(proto, r, false)?),
         op::DELTAPACKETENTITIES => SvcEvent::PacketEntities(read_packet_entities(proto, r, true)?),
         op::MAXSPEED => SvcEvent::MaxSpeed(r.f32()?),
@@ -1286,8 +1306,78 @@ fn read_nails(r: &mut Reader, indexed: bool) -> Result<Vec<Nail>, Underflow> {
     Ok(out)
 }
 
-/// A soundlist/modellist chunk. `short_start` is the `FTE_PEXT_MODELDBL` form, whose index is a
-/// short because there can be more than 255 models.
+/// FTE's leading-one length prefix, followed by big-endian payload bytes (not LEB128).
+/// Used by extended sound channel flags; 0xff introduces a full eight-byte value.
+fn read_fte_uint64(r: &mut Reader) -> Result<u64, Underflow> {
+    let first = r.u8()?;
+    let count = first.leading_ones();
+    let mut value = if count == 8 {
+        0
+    } else {
+        (first & (0xff >> count)) as u64
+    };
+    for _ in 0..count {
+        value = (value << 8) | r.u8()? as u64;
+    }
+    Ok(value)
+}
+
+/// FTE's extended sound layout. Pitch, timing and velocity aren't used by the bot's ears, but
+/// must still be consumed in wire order. Entity/channel and sound IDs are independent widths.
+fn read_sound_extended(r: &mut Reader) -> Result<SvcEvent, Underflow> {
+    let flags = r.u8()?;
+    let extra = if flags & ftesnd::MOREFLAGS != 0 {
+        read_fte_uint64(r)?
+    } else {
+        0
+    };
+    let volume = if flags & ftesnd::VOLUME != 0 {
+        r.u8()?
+    } else {
+        DEFAULT_SOUND_VOLUME
+    };
+    let attenuation = if flags & ftesnd::ATTENUATION != 0 {
+        r.u8()? as f32 / 64.0
+    } else {
+        DEFAULT_SOUND_ATTENUATION
+    };
+    if flags & ftesnd::PITCH != 0 {
+        r.u8()?;
+    }
+    if flags & ftesnd::TIMEOFS != 0 {
+        r.i16()?;
+    }
+    if extra & ftesnd::VELOCITY != 0 {
+        for _ in 0..3 {
+            r.i16()?;
+        }
+    }
+    if flags & ftesnd::SPEED != 0 {
+        r.u16()?;
+    }
+    let (entity, channel) = if flags & ftesnd::LARGEENTITY != 0 {
+        (r.u16()?, r.u8()?)
+    } else {
+        let packed = r.u16()?;
+        (packed >> 3, (packed & 7) as u8)
+    };
+    let sound = if flags & ftesnd::LARGESOUND != 0 {
+        r.u16()?
+    } else {
+        r.u8()? as u16
+    };
+    Ok(SvcEvent::Sound {
+        entity,
+        channel,
+        sound,
+        volume,
+        attenuation,
+        origin: r.coord3()?,
+    })
+}
+
+/// A soundlist/modellist chunk. `short_start` is the SOUNDDBL/MODELDBL form, whose cursor is
+/// a short because a catalog can exceed 255 names; the continuation is still only a byte.
 fn read_resource_list(r: &mut Reader, short_start: bool) -> Result<ResourceList, Underflow> {
     let start = if short_start { r.u16()? } else { r.u8()? as u16 };
     let mut names = Vec::new();
@@ -1757,6 +1847,148 @@ mod tests {
                 origin: Vec3::ZERO,
             }
         );
+    }
+
+    /// FTE uses a separate flags byte, unlike QW's packed channel. Every optional field must be
+    /// consumed even when the bot doesn't use it, or the following svc byte becomes sound data.
+    #[test]
+    fn sounddbl_decodes_fte_sound_shapes_without_losing_alignment() {
+        for wide in [false, true] {
+            for flags in 0u8..=255 {
+                for extra in [&[1u8][..], &[0x80, 0x81][..], &[0xff, 0, 0, 0, 0, 0, 0, 0, 1][..]] {
+                    let mut p = vanilla();
+                    p.apply(0x80 | if wide { fte::FLOATCOORDS } else { 0 }, 0, 0);
+                    let mut w = Writer::new();
+                    w.u8(55); // svc_fte_soundextended
+                    w.u8(flags);
+                    if flags & 4 != 0 {
+                        w.bytes(extra); // FTE leading-one integer encoding; each value has velocity bit 0.
+                    }
+                    if flags & 1 != 0 {
+                        w.u8(127);
+                    }
+                    if flags & 2 != 0 {
+                        w.u8(32);
+                    }
+                    if flags & 128 != 0 {
+                        w.u8(120);
+                    } // pitch
+                    if flags & 64 != 0 {
+                        w.i16(-100);
+                    } // time offset
+                    if flags & 4 != 0 {
+                        // velocity
+                        for value in [8, -16, 24] {
+                            w.i16(value);
+                        }
+                    }
+                    if flags & 32 != 0 {
+                        w.u16(4000);
+                    } // speed
+                    if flags & 8 != 0 {
+                        w.u16(4095);
+                        w.u8(7);
+                    } else {
+                        w.u16((2047 << 3) | 3);
+                    }
+                    if flags & 16 != 0 {
+                        w.u16(4095);
+                    } else {
+                        w.u8(255);
+                    }
+                    for value in [8.0f32, -4.0, 2.0] {
+                        if wide {
+                            w.i32(value.to_bits() as i32);
+                        } else {
+                            w.i16((value * 8.0) as i16);
+                        }
+                    }
+                    w.u8(op::NOP);
+                    assert_eq!(
+                        parse(&mut p, &w.into_vec()).unwrap(),
+                        vec![
+                            SvcEvent::Sound {
+                                entity: if flags & 8 != 0 { 4095 } else { 2047 },
+                                channel: if flags & 8 != 0 { 7 } else { 3 },
+                                sound: if flags & 16 != 0 { 4095 } else { 255 },
+                                volume: if flags & 1 != 0 { 127 } else { 255 },
+                                attenuation: if flags & 2 != 0 { 0.5 } else { 1.0 },
+                                origin: Vec3::new(8.0, -4.0, 2.0),
+                            },
+                            SvcEvent::Nop,
+                        ],
+                        "flags={flags:#x}, wide={wide}, extra={extra:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A truncated extended packet must fail at every optional field, not turn its tail into svc.
+    #[test]
+    fn sounddbl_truncated_sound_and_list_underflow() {
+        let sound = [
+            55, 255, 1, 127, 32, 120, 0, 0, 8, 0, 16, 0, 24, 0, 160, 15, 255, 15, 7, 0, 1, 64, 0, 0, 0, 0, 0,
+        ];
+        let list = [56, 255, 15, b'a', 0, 0, 0];
+        for packet in [&sound[..], &list[..]] {
+            for end in 1..packet.len() {
+                let mut p = vanilla();
+                p.apply(0x80, 0, 0);
+                assert!(
+                    matches!(parse(&mut p, &packet[..end]), Err(ParseError::Underflow(_))),
+                    "end={end}, packet={packet:?}"
+                );
+            }
+            let mut p = vanilla();
+            p.apply(0x80, 0, 0);
+            assert!(parse(&mut p, packet).is_ok());
+        }
+    }
+
+    /// Sound 256 is the first extended ID; 4095 is MVDSV's last slot. Static and ordinary sounds
+    /// retain their legacy layout alongside extended sounds in the same packet.
+    #[test]
+    fn sounddbl_lists_and_sounds_keep_full_indices() {
+        let mut p = vanilla();
+        p.apply(0x80, 0, 0);
+        let mut w = Writer::new();
+        w.u8(56);
+        w.u16(4094);
+        w.string("last.wav");
+        w.u8(0);
+        w.u8(0);
+        for sound in [256, 4095] {
+            w.u8(55);
+            w.u8(16);
+            w.u16(8);
+            w.u16(sound);
+            for _ in 0..3 {
+                w.i16(0);
+            }
+        }
+        w.u8(op::SPAWNSTATICSOUND);
+        for _ in 0..3 {
+            w.i16(0);
+        }
+        w.u8(255);
+        w.u8(128);
+        w.u8(64);
+        w.u8(op::NOP);
+        let events = parse(&mut p, &w.into_vec()).unwrap();
+        assert_eq!(
+            events[0],
+            SvcEvent::SoundList(ResourceList {
+                start: 4094,
+                names: vec!["last.wav".into()],
+                next: 0,
+            })
+        );
+        for (event, sound) in events[1..3].iter().zip([256, 4095]) {
+            assert!(matches!(event, SvcEvent::Sound { sound: index, entity: 1, .. } if *index == sound));
+        }
+        assert!(matches!(events[3], SvcEvent::SpawnStaticSound { sound: 255, .. }));
+        assert_eq!(events[4], SvcEvent::Nop);
     }
 
     /// Each temp-entity kind has its own payload size. A wrong one doesn't fail — it silently eats

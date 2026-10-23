@@ -1540,4 +1540,41 @@ mod tests {
         assert_eq!(h.cvar(c"sv_gravity"), 640.0, "the server's physics are adopted");
         assert!(s.chan.reliable_pending(), "and the soundlist request goes out");
     }
+
+    /// An extended catalog and the next map's small catalog are independent. Decode real chunks
+    /// rather than injecting names, and retain the last sound (including the full-catalog marker).
+    #[test]
+    fn sounddbl_catalog_survives_chunk_boundaries_and_resets_on_map_change() {
+        use rtx_proto::sizebuf::Writer;
+        let mut s = session();
+        let h = host();
+        for count in [255usize, 256, 4095, 2] {
+            s.handle(&SvcEvent::ServerData(Box::default()), &h);
+            assert!(s.sounds.is_empty());
+            let mut start = 0usize;
+            while start < count {
+                let end = (start + 85).min(count);
+                let mut w = Writer::new();
+                w.u8(if start > 255 { 56 } else { 46 });
+                if start > 255 {
+                    w.u16(start as u16);
+                } else {
+                    w.u8(start as u8);
+                }
+                for i in start + 1..=end {
+                    w.string(&format!("s{i}.wav"));
+                }
+                w.u8(0);
+                w.u8(if end == count { 0 } else { (end & 255) as u8 });
+                for event in svc::parse(&mut s.proto, &w.into_vec()).unwrap() {
+                    s.handle(&event, &h);
+                }
+                start = end;
+            }
+            assert_eq!(s.sounds.len(), count + 1);
+            for i in 1..=count {
+                assert_eq!(s.sounds[i], format!("s{i}.wav"));
+            }
+        }
+    }
 }
