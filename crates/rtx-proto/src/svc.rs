@@ -54,6 +54,8 @@ pub mod op {
     pub const KILLEDMONSTER: u8 = 27;
     pub const FOUNDSECRET: u8 = 28;
     pub const SPAWNSTATICSOUND: u8 = 29;
+    /// SOUNDDBL static sound: flags, origin, byte/short index, volume, attenuation.
+    pub const FTE_SPAWNSTATICSOUND2: u8 = 94;
     pub const INTERMISSION: u8 = 30;
     pub const FINALE: u8 = 31;
     pub const CDTRACK: u8 = 32;
@@ -214,6 +216,8 @@ pub enum ParseError {
     },
     /// A message ran off the end of the packet.
     Underflow(Underflow),
+    /// A known message has an unsupported or out-of-range payload.
+    InvalidPayload { offset: usize, reason: &'static str },
     /// `svc_bad` — the server itself signalled a broken stream.
     Bad {
         /// Where it appeared.
@@ -234,6 +238,9 @@ impl std::fmt::Display for ParseError {
                 write!(f, "unknown svc {svc} ({svc:#04x}) at offset {offset}")
             }
             ParseError::Underflow(u) => write!(f, "{u}"),
+            ParseError::InvalidPayload { offset, reason } => {
+                write!(f, "invalid svc payload at offset {offset}: {reason}")
+            }
             ParseError::Bad { offset } => write!(f, "svc_bad at offset {offset}"),
         }
     }
@@ -831,7 +838,7 @@ pub enum SvcEvent {
     /// A looping ambient sound.
     SpawnStaticSound {
         origin: Vec3,
-        /// Index into the soundlist. 16-bit for NetQuake's `svc_spawnstaticsound2`.
+        /// Index into the soundlist; 16-bit under SOUNDDBL and NetQuake's extended form.
         sound: u16,
         volume: u8,
         attenuation: u8,
@@ -1043,6 +1050,30 @@ fn parse_one(proto: &mut ProtoState, r: &mut Reader, svc: u8, offset: usize) -> 
             volume: r.u8()?,
             attenuation: r.u8()?,
         },
+        op::FTE_SPAWNSTATICSOUND2 => {
+            let flags = r.u8()?;
+            // Static LARGEINDEX is bit 0, not dynamic sound's LARGESOUND bit 4.
+            if flags & !1 != 0 {
+                return Err(ParseError::InvalidPayload {
+                    offset,
+                    reason: "unsupported static sound flags",
+                });
+            }
+            let origin = r.coord3()?;
+            let sound = if flags & 1 != 0 { r.u16()? } else { r.u8()? as u16 };
+            if sound >= 4096 {
+                return Err(ParseError::InvalidPayload {
+                    offset,
+                    reason: "static sound index exceeds catalog capacity",
+                });
+            }
+            SvcEvent::SpawnStaticSound {
+                origin,
+                sound,
+                volume: r.u8()?,
+                attenuation: r.u8()?,
+            }
+        }
         op::INTERMISSION => SvcEvent::Intermission {
             origin: r.coord3()?,
             angles: r.angle3()?,
@@ -1989,6 +2020,102 @@ mod tests {
         }
         assert!(matches!(events[3], SvcEvent::SpawnStaticSound { sound: 255, .. }));
         assert_eq!(events[4], SvcEvent::Nop);
+    }
+
+    // Literal wire fixtures deliberately do not use the decoder's opcode/flag constants.
+    fn static_sound_packet(float_coords: bool, flags: u8, sound: u16) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u8(94);
+        w.u8(flags);
+        for coordinate in [1.0_f32, -2.0, 3.0] {
+            if float_coords {
+                w.i32(coordinate.to_bits() as i32);
+            } else {
+                w.i16((coordinate * 8.0) as i16);
+            }
+        }
+        if flags & 1 != 0 {
+            w.u16(sound);
+        } else {
+            w.u8(sound as u8);
+        }
+        w.u8(128);
+        w.u8(64);
+        w.into_vec()
+    }
+
+    #[test]
+    fn sounddbl_static_sound_wire_and_errors() {
+        for bits in [0, 0x80, 0x8000, 0x8080] {
+            let floats = bits & 0x8000 != 0;
+            for (flags, sound) in [(0, 0), (0, 255), (1, 255), (1, 256), (1, 4095)] {
+                let packet = static_sound_packet(floats, flags, sound);
+                for len in 1..packet.len() {
+                    assert!(
+                        matches!(
+                            parse(&mut with(bits, 0, 0), &packet[..len]),
+                            Err(ParseError::Underflow(_))
+                        ),
+                        "prefix {len} of {packet:?}"
+                    );
+                }
+                let mut marked = packet.clone();
+                marked.push(1);
+                let events = parse(&mut with(bits, 0, 0), &marked).unwrap();
+                assert_eq!(
+                    events,
+                    vec![
+                        SvcEvent::SpawnStaticSound {
+                            origin: Vec3::new(1.0, -2.0, 3.0),
+                            sound,
+                            volume: 128,
+                            attenuation: 64,
+                        },
+                        SvcEvent::Nop
+                    ]
+                );
+            }
+            for sound in [4096, 65535] {
+                assert!(parse(&mut with(bits, 0, 0), &static_sound_packet(floats, 1, sound)).is_err());
+            }
+            for flags in [2, 3, 16, 255] {
+                assert!(parse(&mut with(bits, 0, 0), &static_sound_packet(floats, flags, 255)).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn sounddbl_static_sound_serverdata_resets_state() {
+        let mut state = vanilla();
+        for bits in [0x8080, 0, 0x8000, 0x80, 0] {
+            let mut w = Writer::new();
+            w.u8(11);
+            if bits != 0 {
+                w.u32(crate::protocol::magic::FTE);
+                w.u32(bits);
+            }
+            w.u32(28);
+            w.i32(1);
+            w.string("qw");
+            w.u8(0);
+            w.string("map");
+            for _ in 0..10 {
+                w.i32(0);
+            }
+            parse(&mut state, &w.into_vec()).unwrap();
+            let extended = static_sound_packet(bits & 0x8000 != 0, 1, 4095);
+            assert!(matches!(
+                parse(&mut state, &extended).unwrap()[0],
+                SvcEvent::SpawnStaticSound { sound: 4095, .. }
+            ));
+            assert_eq!(state.fte, bits, "the record must not infer extension bits");
+            if bits == 0 {
+                let legacy = [29, 8, 0, 240, 255, 24, 0, 255, 128, 64, 1];
+                let events = parse(&mut state, &legacy).unwrap();
+                assert!(matches!(events[0], SvcEvent::SpawnStaticSound { sound: 255, .. }));
+                assert_eq!(events[1], SvcEvent::Nop);
+            }
+        }
     }
 
     /// Each temp-entity kind has its own payload size. A wrong one doesn't fail — it silently eats
