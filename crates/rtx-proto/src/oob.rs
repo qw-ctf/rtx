@@ -407,6 +407,13 @@ mod tests {
         assert_eq!(n.fte, protocol::fte::FLOATCOORDS);
     }
 
+    /// SOUNDDBL is requested only when offered; vanilla servers keep the original wire layout.
+    #[test]
+    fn sounddbl_is_negotiated_only_with_server_support() {
+        assert_eq!(Negotiated::intersect(0x80, 0, 0).fte, 0x80);
+        assert_eq!(Negotiated::intersect(0, 0, 0).fte, 0);
+    }
+
     /// The `connect` packet's exact text. A server parses this with `sscanf`-grade tolerance, so
     /// the field order, the quotes around userinfo and the trailing newline all matter.
     #[test]

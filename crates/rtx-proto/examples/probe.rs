@@ -225,9 +225,10 @@ fn main() -> std::io::Result<()> {
                         chan.queue_reliable(&clc::write_stringcmd(&format!("soundlist {servercount} 0")));
                     }
                     SvcEvent::SoundList(list) => {
+                        soundlist.resize(list.start as usize, String::new());
                         soundlist.extend(list.names);
-                        let next = list.next;
-                        let cmd = if next != 0 {
+                        let next = (soundlist.len() & 0xff00) + list.next as usize;
+                        let cmd = if list.next != 0 {
                             format!("soundlist {servercount} {next}")
                         } else {
                             eprintln!("probe: {} sounds; asking for models", soundlist.len());
@@ -236,13 +237,13 @@ fn main() -> std::io::Result<()> {
                         chan.queue_reliable(&clc::write_stringcmd(&cmd));
                     }
                     SvcEvent::ModelList(list) => {
-                        let start_idx = list.start as usize;
+                        modellist.resize(list.start as usize, String::new());
                         modellist.extend(list.names);
                         let next = list.next;
                         if next != 0 {
                             // The continuation index carries the high byte of the count — the low
                             // byte is what the server hands back.
-                            let off = (modellist.len() + start_idx.saturating_sub(modellist.len())) & 0xff00;
+                            let off = modellist.len() & 0xff00;
                             chan.queue_reliable(&clc::write_stringcmd(&format!(
                                 "modellist {servercount} {}",
                                 off + next as usize
