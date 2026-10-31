@@ -1471,6 +1471,19 @@ fn read_delta_entity_bits(proto: &ProtoState, r: &mut Reader, word: u32) -> Resu
         }
     }
 
+    if morebits & u::FTE_ENTITYDBL != 0 {
+        d.number += 512;
+    }
+    if morebits & u::FTE_ENTITYDBL2 != 0 {
+        d.number += 1024;
+    }
+    // A removal carries only its entity number and extension headers, never
+    // update fields. MVDSV also leaves high ID bits in the leading word: for
+    // IDs >= 512 they overlap ORIGIN1/ORIGIN2 and must not consume coordinates.
+    if d.remove {
+        return Ok(d);
+    }
+
     if bits & u::MODEL != 0 {
         d.model = Some(r.u8()? as u16 + if morebits & u::FTE_MODELDBL != 0 { 256 } else { 0 });
     } else if morebits & u::FTE_MODELDBL != 0 {
@@ -1518,14 +1531,6 @@ fn read_delta_entity_bits(proto: &ProtoState, r: &mut Reader, word: u32) -> Resu
     }
     if morebits & u::FTE_COLOURMOD != 0 && proto.has_fte(fte::COLOURMOD) {
         d.colourmod = Some([r.u8()?, r.u8()?, r.u8()?]);
-    }
-    // The entity-number extension bits live at the *end*, which is why the packetentities loop has
-    // to peek ahead to learn the real number before it can merge (see `read_packet_entities`).
-    if morebits & u::FTE_ENTITYDBL != 0 {
-        d.number += 512;
-    }
-    if morebits & u::FTE_ENTITYDBL2 != 0 {
-        d.number += 1024;
     }
     Ok(d)
 }
