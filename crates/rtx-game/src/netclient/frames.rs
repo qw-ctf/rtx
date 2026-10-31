@@ -69,9 +69,9 @@ pub(crate) struct EntityState {
     /// Colormap.
     pub colormap: u8,
     /// Skin.
-    pub skin: u8,
+    pub skin: i16,
     /// Effect bits.
-    pub effects: u8,
+    pub effects: u32,
     /// Position.
     pub origin: Vec3,
     /// Orientation.
@@ -86,7 +86,7 @@ impl EntityState {
             model: b.modelindex,
             frame: b.frame,
             colormap: b.colormap,
-            skin: b.skinnum,
+            skin: b.skinnum as i16,
             effects: 0,
             origin: b.origin,
             angles: b.angles,
@@ -106,10 +106,10 @@ impl EntityState {
             self.colormap = v;
         }
         if let Some(v) = d.skin {
-            self.skin = v;
+            self.skin = v as i16;
         }
         if let Some(v) = d.effects {
-            self.effects = v;
+            self.effects = v as u32;
         }
         for i in 0..3 {
             if let Some(v) = d.origin[i] {
@@ -188,7 +188,7 @@ impl Frames {
     }
 
     /// Record a baseline from signon.
-    pub(crate) fn set_baseline(&mut self, number: u16, b: Baseline) {
+    pub(crate) fn set_baseline(&mut self, number: u32, b: Baseline) {
         if let Some(slot) = self.baselines.get_mut(number as usize) {
             *slot = b;
         }
@@ -201,7 +201,7 @@ impl Frames {
     /// message states outright — which is the point of the extension, since most baselines differ
     /// from nothing in three or four fields and paying for all nine per entity is what it exists to
     /// avoid.
-    pub(crate) fn set_baseline_delta(&mut self, number: u16, delta: &rtx_proto::svc::EntityDelta) {
+    pub(crate) fn set_baseline_delta(&mut self, number: u32, delta: &rtx_proto::svc::EntityDelta) {
         let mut b = Baseline::default();
         if let Some(v) = delta.model {
             b.modelindex = v;

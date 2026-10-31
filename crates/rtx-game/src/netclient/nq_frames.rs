@@ -72,7 +72,7 @@ impl NqFrames {
     }
 
     /// Record an entity's baseline. Later updates for it delta from here.
-    pub(crate) fn set_baseline(&mut self, number: u16, b: Baseline) {
+    pub(crate) fn set_baseline(&mut self, number: u32, b: Baseline) {
         if let Some(slot) = self.baselines.get_mut(number as usize) {
             *slot = b;
         }

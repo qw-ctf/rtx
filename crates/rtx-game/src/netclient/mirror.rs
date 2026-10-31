@@ -407,7 +407,9 @@ impl Mirror {
             v.velocity = pi.velocity;
             v.frame = pi.frame as f32;
             v.modelindex = pi.modelindex.unwrap_or(1) as f32;
-            v.effects = pi.effects.unwrap_or(0) as f32;
+            // The game mirror understands the classic effect bits. Project those before the
+            // float conversion: a high RD bit could otherwise round away a low carried-flag bit.
+            v.effects = Effects::from_bits_truncate(pi.effects.unwrap_or(0)).bits() as f32;
             v.movetype = MoveType::Walk;
             v.solid = Solid::SlideBox;
             v.mins = crate::defs::VEC_HULL_MIN;
@@ -861,7 +863,7 @@ fn dropped_powerup_classname(model: &str) -> Option<&'static str> {
 ///
 /// `progs/flag.mdl` is both teams' flag and tells them apart by skin (0 red / 1 blue, `flags.rs`);
 /// KTX's stock keys are one model per team (`w_g_key` gold = team 1, `w_s_key` silver = team 2).
-fn flag_team(model: &str, skin: u8) -> Option<u8> {
+fn flag_team(model: &str, skin: i16) -> Option<u8> {
     match model {
         "progs/w_g_key.mdl" => Some(1),
         "progs/w_s_key.mdl" => Some(2),
@@ -2338,6 +2340,21 @@ mod tests {
     /// A CTF flag's live state is inferred, not sent: a carried flag is invisible and known only by
     /// the effect its carrier wears; a lying flag is an entity, home or dropped by where it is. This
     /// is the whole reason a client can play CTF — every signal the brain needs is one a player has.
+    #[test]
+    fn replacement_high_effect_bits_do_not_erase_a_carried_flag() {
+        let mut g = game();
+        let red = place_flag(&mut g, 20, 1, Vec3::ZERO);
+        let raider = player(&mut g, 3, Vec3::new(400.0, 0.0, 0.0));
+        let mut mirror = Solo::at(0);
+        mirror.world.flags = vec![red];
+        let mut info = playerinfo(2, 0);
+        info.effects = Some(0x8000_0000 | Effects::FLAG1.bits());
+        mirror.apply(&mut g, &SvcEvent::PlayerInfo(info));
+        mirror.world.apply_frame(&mut g, &Squad::default(), &[], &models());
+        assert_eq!(g.entities[raider].mode_p.ctf.carrying, 1);
+        assert_eq!(g.entities[red].flag.carrier, raider);
+    }
+
     #[test]
     fn a_flag_is_read_from_its_carrier_and_where_it_lies() {
         use crate::defs::Effects;

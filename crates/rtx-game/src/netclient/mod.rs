@@ -76,6 +76,7 @@ pub(crate) mod mirror;
 pub(crate) mod modes;
 pub(crate) mod nq_frames;
 pub(crate) mod nq_session;
+pub(crate) mod rd_frames;
 pub(crate) mod senses;
 pub(crate) mod session;
 pub(crate) mod world;
@@ -912,19 +913,25 @@ impl Client {
     /// stops receiving keeps its last snapshot indefinitely, and without a freshness rule its frozen
     /// rockets would hang in the air over every live view of them for the rest of the run.
     fn mirror_entities(&mut self, squad: &Squad) {
-        let mut seen: Vec<(EntityState, Instant)> = Vec::new();
+        let mut seen = std::collections::BTreeMap::<u16, (EntityState, Instant)>::new();
         let playing = || self.bots.iter().filter(|b| b.session.signon() == Signon::Active);
         for b in playing() {
             let at = b.session.frames_at();
             for e in b.session.frames_current() {
-                match seen.iter_mut().find(|(x, _)| x.number == e.number) {
-                    Some(held) if held.1 < at => *held = (*e, at),
-                    Some(_) => {}
-                    None => seen.push((*e, at)),
+                // A full RD view may contain thousands of entities. Key the squad union instead
+                // of linearly searching all prior sightings for each connection and entity.
+                match seen.entry(e.number) {
+                    std::collections::btree_map::Entry::Occupied(mut held) if held.get().1 < at => {
+                        held.insert((*e, at));
+                    }
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        slot.insert((*e, at));
+                    }
+                    _ => {}
                 }
             }
         }
-        let seen: Vec<EntityState> = seen.into_iter().map(|(e, _)| e).collect();
+        let seen: Vec<EntityState> = seen.into_values().map(|(e, _)| e).collect();
 
         // The model list names what each entity is. It's per map and identical across a squad, but
         // it has to come from the same population the frames did: a connection that dropped still
