@@ -21,7 +21,8 @@
 
 use glam::Vec3;
 
-use crate::protocol::{fte, mvd1, z_ext, ProtoState};
+use crate::protocol::{fte, fte2, mvd1, z_ext, ProtoState};
+use crate::rd;
 use crate::sizebuf::{Reader, Underflow};
 
 /// FTE chunked downloads always transfer this many bytes. The final chunk is zero-padded on the
@@ -87,6 +88,7 @@ pub mod op {
     pub const FTE_SOUNDLISTSHORT: u8 = 56;
     pub const FTE_MODELLISTSHORT: u8 = 60;
     pub const FTE_SPAWNBASELINE2: u8 = 66;
+    pub const FTE_UPDATEENTITIES: u8 = 86;
     pub const QIZMOVOICE: u8 = 83;
     pub const FTE_VOICECHAT: u8 = 84;
 }
@@ -397,7 +399,7 @@ pub struct PlayerInfo {
     /// Position.
     pub origin: Vec3,
     /// Animation frame.
-    pub frame: u8,
+    pub frame: u16,
     /// Age of this state in milliseconds, when the server sent one.
     pub msec: Option<u8>,
     /// The player's last usercmd — including **their view angles**.
@@ -407,11 +409,11 @@ pub struct PlayerInfo {
     /// Model index, if overridden (else the default player model).
     pub modelindex: Option<u16>,
     /// Skin number.
-    pub skinnum: Option<u8>,
+    pub skinnum: Option<i16>,
     /// Effect bits (quad/pent glow).
-    pub effects: Option<u8>,
+    pub effects: Option<u32>,
     /// Weapon animation frame — only sent for our own player.
-    pub weaponframe: Option<u8>,
+    pub weaponframe: Option<u16>,
     /// Alpha, under `FTE_PEXT_TRANS`.
     pub alpha: Option<u8>,
     /// Decoded move type, when `Z_EXT_PM_TYPE` is negotiated.
@@ -579,7 +581,7 @@ pub enum TempEntity {
         /// Which beam.
         kind: TempEntityKind,
         /// The entity holding the gun.
-        entity: u16,
+        entity: u32,
         /// Beam start.
         start: Vec3,
         /// Beam end.
@@ -792,7 +794,7 @@ pub enum SvcEvent {
     /// a bot's ears.
     Sound {
         /// The entity making it.
-        entity: u16,
+        entity: u32,
         /// Channel 0–7.
         channel: u8,
         /// Index into the soundlist. 16-bit for QW SOUNDDBL and NQ 666's `SND_LARGESOUND`.
@@ -804,10 +806,16 @@ pub enum SvcEvent {
         /// Where it came from.
         origin: Vec3,
     },
+    /// A persistent FTE replacement-delta frame.
+    ReplacementEntities(rd::Frame),
+    /// An RD baseline, using an ordinary entity reference before its UF payload.
+    SpawnReplacementBaseline { entity: u32, delta: Box<rd::Delta> },
+    /// An RD static: a UF payload with no entity reference.
+    SpawnReplacementStatic(Box<rd::Delta>),
     /// A looping sound stopped.
     StopSound {
         /// The entity.
-        entity: u16,
+        entity: u32,
         /// Channel 0–7.
         channel: u8,
     },
@@ -828,7 +836,7 @@ pub enum SvcEvent {
     /// One key of the serverinfo changed.
     ServerInfo { key: String, value: String },
     /// An entity's baseline — the state deltas are relative to before it's ever updated.
-    SpawnBaseline { entity: u16, baseline: Baseline },
+    SpawnBaseline { entity: u32, baseline: Baseline },
     /// A static entity (torches, scenery): drawn, never updated.
     SpawnStatic(Baseline),
     /// A baseline in entity-delta form, under `FTE_PEXT_SPAWNSTATIC2`.
@@ -846,7 +854,7 @@ pub enum SvcEvent {
     /// A one-shot visual effect.
     TempEntity(TempEntity),
     /// An entity fired something — a muzzle flash.
-    MuzzleFlash { entity: u16 },
+    MuzzleFlash { entity: u32 },
     /// Small view kick (we were lightly hit).
     SmallKick,
     /// Large view kick.
@@ -978,7 +986,7 @@ fn parse_one(proto: &mut ProtoState, r: &mut Reader, svc: u8, offset: usize) -> 
             SvcEvent::Sound {
                 sound: r.u8()? as u16,
                 origin: r.coord3()?,
-                entity: (channel >> 3) & 1023,
+                entity: ((channel >> 3) & 1023) as u32,
                 channel: (channel & 7) as u8,
                 volume,
                 attenuation,
@@ -987,11 +995,11 @@ fn parse_one(proto: &mut ProtoState, r: &mut Reader, svc: u8, offset: usize) -> 
         op::STOPSOUND => {
             let w = r.u16()?;
             SvcEvent::StopSound {
-                entity: w >> 3,
+                entity: (w >> 3) as u32,
                 channel: (w & 7) as u8,
             }
         }
-        op::FTE_SOUNDEXTENDED => read_sound_extended(r)?,
+        op::FTE_SOUNDEXTENDED => read_sound_extended(proto, r)?,
         op::PRINT => SvcEvent::Print {
             level: r.u8()?,
             text: r.string()?,
@@ -1027,11 +1035,37 @@ fn parse_one(proto: &mut ProtoState, r: &mut Reader, svc: u8, offset: usize) -> 
             from: r.coord3()?,
         },
         op::SPAWNSTATIC => SvcEvent::SpawnStatic(read_baseline(r)?),
+        op::FTE_SPAWNSTATIC2 if proto.fte2 & fte2::REPLACEMENTDELTAS != 0 => {
+            SvcEvent::SpawnReplacementStatic(Box::new(rd::read_delta(proto, r)?))
+        }
         op::FTE_SPAWNSTATIC2 => SvcEvent::SpawnStaticDelta(read_delta_entity(proto, r)?),
-        op::SPAWNBASELINE => SvcEvent::SpawnBaseline {
-            entity: r.u16()?,
-            baseline: read_baseline(r)?,
-        },
+        op::SPAWNBASELINE => {
+            let entity = read_entity_ref(proto, r)?;
+            let baseline = read_baseline(r)?;
+            if proto.fte2 & fte2::REPLACEMENTDELTAS != 0
+                && (entity >= rd::MAX_ENTITIES || !baseline.origin.is_finite() || !baseline.angles.is_finite())
+            {
+                return Err(ParseError::InvalidPayload {
+                    offset,
+                    reason: "invalid replacement classic baseline",
+                });
+            }
+            SvcEvent::SpawnBaseline { entity, baseline }
+        }
+        op::FTE_SPAWNBASELINE2 if proto.fte2 & fte2::REPLACEMENTDELTAS != 0 => {
+            let entity = read_entity_ref(proto, r)?;
+            if entity >= rd::MAX_ENTITIES {
+                return Err(ParseError::InvalidPayload {
+                    offset,
+                    reason: "replacement baseline exceeds capacity",
+                });
+            }
+            SvcEvent::SpawnReplacementBaseline {
+                entity,
+                delta: Box::new(rd::read_delta(proto, r)?),
+            }
+        }
+        op::FTE_UPDATEENTITIES => SvcEvent::ReplacementEntities(rd::read_frame(proto, r)?),
         op::FTE_SPAWNBASELINE2 => {
             let delta = read_delta_entity(proto, r)?;
             SvcEvent::SpawnBaselineDelta {
@@ -1039,7 +1073,7 @@ fn parse_one(proto: &mut ProtoState, r: &mut Reader, svc: u8, offset: usize) -> 
                 delta,
             }
         }
-        op::TEMP_ENTITY => SvcEvent::TempEntity(read_temp_entity(r)?),
+        op::TEMP_ENTITY => SvcEvent::TempEntity(read_temp_entity(proto, r)?),
         op::SETPAUSE => SvcEvent::SetPause(r.u8()? != 0),
         op::CENTERPRINT => SvcEvent::CenterPrint(r.string()?),
         op::KILLEDMONSTER => SvcEvent::KilledMonster,
@@ -1091,7 +1125,9 @@ fn parse_one(proto: &mut ProtoState, r: &mut Reader, svc: u8, offset: usize) -> 
             player: r.u8()?,
             secs: r.f32()?,
         },
-        op::MUZZLEFLASH => SvcEvent::MuzzleFlash { entity: r.u16()? },
+        op::MUZZLEFLASH => SvcEvent::MuzzleFlash {
+            entity: read_entity_ref(proto, r)?,
+        },
         op::UPDATEUSERINFO => SvcEvent::UpdateUserinfo {
             player: r.u8()?,
             userid: r.i32()?,
@@ -1260,7 +1296,7 @@ fn read_baseline(r: &mut Reader) -> Result<Baseline, Underflow> {
 
 /// `svc_temp_entity`. The payload shape depends entirely on the kind, and there's no length —
 /// mis-sizing one desyncs the packet.
-fn read_temp_entity(r: &mut Reader) -> Result<TempEntity, ParseError> {
+fn read_temp_entity(proto: &ProtoState, r: &mut Reader) -> Result<TempEntity, ParseError> {
     use TempEntityKind::*;
     let raw = r.u8()?;
     let kind = match raw {
@@ -1288,7 +1324,7 @@ fn read_temp_entity(r: &mut Reader) -> Result<TempEntity, ParseError> {
     Ok(match kind {
         Lightning1 | Lightning2 | Lightning3 => TempEntity::Beam {
             kind,
-            entity: r.u16()?,
+            entity: read_entity_ref(proto, r)?,
             start: r.coord3()?,
             end: r.coord3()?,
         },
@@ -1353,9 +1389,17 @@ fn read_fte_uint64(r: &mut Reader) -> Result<u64, Underflow> {
     Ok(value)
 }
 
+fn read_entity_ref(proto: &ProtoState, r: &mut Reader<'_>) -> Result<u32, Underflow> {
+    if proto.fte2 & fte2::REPLACEMENTDELTAS != 0 {
+        rd::read_entity_ref(r)
+    } else {
+        Ok(r.u16()? as u32)
+    }
+}
+
 /// FTE's extended sound layout. Pitch, timing and velocity aren't used by the bot's ears, but
 /// must still be consumed in wire order. Entity/channel and sound IDs are independent widths.
-fn read_sound_extended(r: &mut Reader) -> Result<SvcEvent, Underflow> {
+fn read_sound_extended(proto: &ProtoState, r: &mut Reader) -> Result<SvcEvent, Underflow> {
     let flags = r.u8()?;
     let extra = if flags & ftesnd::MOREFLAGS != 0 {
         read_fte_uint64(r)?
@@ -1387,10 +1431,10 @@ fn read_sound_extended(r: &mut Reader) -> Result<SvcEvent, Underflow> {
         r.u16()?;
     }
     let (entity, channel) = if flags & ftesnd::LARGEENTITY != 0 {
-        (r.u16()?, r.u8()?)
+        (read_entity_ref(proto, r)?, r.u8()?)
     } else {
         let packed = r.u16()?;
-        (packed >> 3, (packed & 7) as u8)
+        ((packed >> 3) as u32, (packed & 7) as u8)
     };
     let sound = if flags & ftesnd::LARGESOUND != 0 {
         r.u16()?
@@ -1483,7 +1527,7 @@ fn read_playerinfo(proto: &ProtoState, r: &mut Reader) -> Result<PlayerInfo, Und
     } else {
         r.coord3()?
     };
-    let frame = r.u8()?;
+    let frame = r.u8()? as u16;
     let msec = if flags & pf::MSEC != 0 { Some(r.u8()?) } else { None };
     let command = if flags & pf::COMMAND != 0 {
         Some(read_delta_usercmd(r, &Usercmd::default())?)
@@ -1511,13 +1555,17 @@ fn read_playerinfo(proto: &ProtoState, r: &mut Reader) -> Result<PlayerInfo, Und
             modelindex = modelindex.map(|m| m + 256);
             skin -= 1 << 7;
         }
-        Some(skin)
+        Some(skin as i16)
     } else {
         None
     };
-    let effects = if flags & pf::EFFECTS != 0 { Some(r.u8()?) } else { None };
+    let effects = if flags & pf::EFFECTS != 0 {
+        Some(r.u8()? as u32)
+    } else {
+        None
+    };
     let weaponframe = if flags & pf::WEAPONFRAME != 0 {
-        Some(r.u8()?)
+        Some(r.u8()? as u16)
     } else {
         None
     };

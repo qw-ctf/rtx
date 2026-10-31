@@ -219,7 +219,7 @@ fn parse_one(proto: &mut NqProtoState, r: &mut Reader, cmd: u8, offset: usize) -
         op::STOPSOUND => {
             let w = r.u16()?;
             SvcEvent::StopSound {
-                entity: w >> 3,
+                entity: (w >> 3) as u32,
                 channel: (w & 7) as u8,
             }
         }
@@ -245,14 +245,14 @@ fn parse_one(proto: &mut NqProtoState, r: &mut Reader, cmd: u8, offset: usize) -
         },
         op::SPAWNSTATIC => SvcEvent::SpawnStatic(read_baseline(proto, r, 1)?),
         op::SPAWNBASELINE => {
-            let entity = r.u16()?;
+            let entity = r.u16()? as u32;
             SvcEvent::SpawnBaseline {
                 entity,
                 baseline: read_baseline(proto, r, 1)?,
             }
         }
         op::SPAWNBASELINE2 => {
-            let entity = r.u16()?;
+            let entity = r.u16()? as u32;
             SvcEvent::SpawnBaseline {
                 entity,
                 baseline: read_baseline(proto, r, 2)?,
@@ -581,12 +581,12 @@ fn read_sound(proto: &NqProtoState, r: &mut Reader) -> Result<SvcEvent, ParseErr
         DEFAULT_SOUND_ATTENUATION
     };
     let (entity, channel) = if mask & snd::LARGEENTITY != 0 {
-        (r.u16()?, r.u8()?)
+        (r.u16()? as u32, r.u8()?)
     } else {
         // The entity is the top 13 bits — no mask. (QuakeWorld packs extra flag bits here and masks
         // to 10, but NetQuake does not; masking would alias an entity ≥1024 onto a low player slot.)
         let w = r.u16()?;
-        (w >> 3, (w & 7) as u8)
+        ((w >> 3) as u32, (w & 7) as u8)
     };
     let sound = if mask & snd::LARGESOUND != 0 {
         r.u16()?
@@ -650,7 +650,7 @@ fn read_temp_entity(proto: &NqProtoState, r: &mut Reader) -> Result<SvcEvent, Pa
 
 /// A beam temp entity: a short entity number, then start and end coords.
 fn read_beam(proto: &NqProtoState, r: &mut Reader, kind: TempEntityKind) -> Result<TempEntity, ParseError> {
-    let entity = r.u16()?;
+    let entity = r.u16()? as u32;
     let start = proto.coord3(r)?;
     let end = proto.coord3(r)?;
     Ok(TempEntity::Beam {

@@ -78,8 +78,8 @@ pub mod fte {
 pub mod fte2 {
     /// Speex voice chat. **Not advertised** — no audio.
     pub const VOICECHAT: u32 = 0x0000_0002;
-    /// The `svc_fte_updateentities` delta stream. **Not advertised** — qualia doesn't take it
-    /// either, and it replaces the entity encoding wholesale.
+    /// The persistent `svc_fte_updateentities` delta stream. Decoded independently of the
+    /// classic packetentity ring; advertised only after client integration is enabled.
     pub const REPLACEMENTDELTAS: u32 = 0x0000_0008;
 }
 
@@ -147,8 +147,8 @@ pub const FTE: u32 = fte::TRANS
     | fte::PACKETENTITIES_256
     | fte::CHUNKEDDOWNLOADS;
 
-/// The FTE2 extensions this client advertises: none. Both bits in that mask (voice, replacement
-/// deltas) would change what we must parse without giving a bot anything.
+/// The FTE2 extensions advertised by clients. RD decoding also supports recorded streams;
+/// live advertising remains disabled until the client retains and projects RD state.
 pub const FTE2: u32 = 0;
 
 /// The MVDSV extensions this client advertises. `FLOATCOORDS` for origin precision and
