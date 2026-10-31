@@ -18,8 +18,9 @@
 //! roster, `dump` emits CSV, `analyze` prints a movement report.
 //!
 //! What the two formats can and cannot tell you differs, and [`Frame`]'s `Option`s are where that
-//! shows: an MVD carries no velocity (speeds are differenced from positions) and no ground flag,
-//! while a `.qwd` carries both but only for the players its recorder could see.
+//! shows: classic MVD playerinfo carries no velocity or ground flag, while a `.qwd` can carry
+//! both for the players its recorder could see. Replacement-delta MVDs and QWDs retain entity
+//! state across packets and carry prediction velocity, movement, view angles and ground contact.
 
 use std::io::{Cursor, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -83,7 +84,8 @@ const NETCHAN_HEADER: usize = 8;
 pub enum Format {
     /// A single client's recording: absolute timestamps, its own inputs, wire velocities.
     Qwd,
-    /// A server-side multi-view recording: delta timestamps, every player, no velocities.
+    /// A server-side multi-view recording: delta timestamps and every player. Classic playerinfo
+    /// lacks velocity; replacement deltas carry it.
     Mvd,
 }
 
@@ -109,8 +111,8 @@ pub struct DemoCmd {
 ///
 /// A `.qwd` and a `.mvd` say very different things on the wire (see [`mvd`]), and normalising here
 /// is what lets [`analysis`] and the CLI treat them alike. The cost is that a field absent from one
-/// format is `Option` for both: an MVD carries no velocity at all, and a `.qwd` records only the
-/// players its recorder could see.
+/// format is `Option` for both: classic MVD playerinfo carries no velocity, while replacement
+/// deltas carry prediction state in either container. A `.qwd` covers its recorder's visible players.
 #[derive(Clone, Debug)]
 pub struct Frame {
     /// Demo timestamp in seconds from the start of the file.
@@ -118,21 +120,21 @@ pub struct Frame {
     /// Player slot, 0..32. Stable across the file; [`Demo::players`] names it.
     pub player: u8,
     pub origin: Vec3,
-    /// View angles in degrees. An MVD stores pitch pre-multiplied by −3 (a recorder quirk) and
-    /// this undoes it, so pitch means the same thing in both formats.
+    /// View angles in degrees. Classic MVD pitch is decoded from its recorder scaling; RD
+    /// model angles are converted using the prediction basis before publication.
     pub angles: Vec3,
-    /// Velocity **as the wire stated it**. `None` for MVD, which never carries any — derive it
-    /// from successive origins instead ([`analysis::Track`] does).
+    /// Velocity **as the wire stated it**, in game units/s. `None` for classic MVD playerinfo,
+    /// where analysis must derive it from successive origins ([`analysis::Track`] does).
     pub velocity: Option<Vec3>,
     /// The player's own input, when the format carries it: `PF_COMMAND` in a `.qwd`, or a hidden
     /// `usercmd` block in an MVD.
     pub command: Option<Usercmd>,
     /// Whether the recorder marked this player dead this frame.
     pub dead: bool,
-    /// Ground contact, when the protocol carried it (`Z_EXT_PF_ONGROUND`). `None` in an MVD.
+    /// Ground contact, when carried by RD or `Z_EXT_PF_ONGROUND`. Absent in classic MVD playerinfo.
     pub on_ground: Option<bool>,
     /// Animation frame of the player's weapon — a usable proxy for firing.
-    pub weaponframe: Option<u8>,
+    pub weaponframe: Option<u16>,
 }
 
 /// A player's score changing, from `svc_updatefrags`.
@@ -222,7 +224,7 @@ pub struct Demo {
     pub movevars: Option<MoveVars>,
     /// The local player's own `dem_cmd` inputs, in file order (ascending time).
     pub demo_cmds: Vec<DemoCmd>,
-    /// Every `svc_playerinfo` seen, in file order.
+    /// Every player update, in file order. Each accepted RD frame samples all retained players.
     pub frames: Vec<Frame>,
     /// Every `svc_updatefrags`, in file order — the server's own scoreboard as it moved.
     pub frag_updates: Vec<FragUpdate>,
@@ -298,6 +300,8 @@ struct Feed {
     frag_updates: Vec<FragUpdate>,
     prints: Vec<PrintLine>,
     warnings: Vec<String>,
+    /// Persistent RD state, separate from classic per-player MVD deltas.
+    rd: rtx_proto::rd_state::RetainedEntities,
     /// Per-slot absolute state, for resolving MVD deltas. Origin and angles only — those are the
     /// fields the format deltas.
     last: Vec<(Vec3, Vec3)>,
@@ -326,6 +330,7 @@ impl Feed {
             frag_updates: Vec::new(),
             prints: Vec::new(),
             warnings: Vec::new(),
+            rd: rtx_proto::rd_state::RetainedEntities::default(),
             last: vec![(Vec3::ZERO, Vec3::ZERO); 32],
             pending_cmds: vec![None; 32],
         }
@@ -333,38 +338,59 @@ impl Feed {
 
     /// Decode one svc message stream and fold what it says into the demo.
     fn packet(&mut self, time: f32, msg: &[u8], at: usize) {
-        let events = match svc::parse(&mut self.proto, msg) {
+        // A malformed tail rejects the entire recorded packet, including earlier serverdata.
+        let mut proto = self.proto.clone();
+        let events = match svc::parse(&mut proto, msg) {
             Ok(evs) => evs,
             Err(e) => {
+                self.rd.invalidate();
                 self.warnings.push(format!("packet at offset {at}: {e}"));
                 return;
             }
         };
+        let mut replacement = self.proto.fte2 & rtx_proto::protocol::fte2::REPLACEMENTDELTAS != 0;
+        self.proto = proto;
         for ev in events {
             match ev {
-                SvcEvent::PlayerInfo(info) => {
-                    let velocity_present = (0..3).any(|i| info.flags & (svc::pf::VELOCITY1 << i) != 0);
-                    let slot = info.player as usize;
-                    if let Some(p) = self.players.get_mut(slot) {
-                        p.frames += 1;
+                SvcEvent::PlayerInfo(info) => self.push_player(time, *info, false),
+                SvcEvent::SpawnReplacementBaseline { entity, delta } => {
+                    if let Err(reason) = self.rd.set_baseline(entity, delta.apply(None, None)) {
+                        self.rd.invalidate();
+                        self.warnings.push(format!("packet at offset {at}: {reason}"));
                     }
-                    self.frames.push(Frame {
-                        time,
-                        player: info.player,
-                        origin: info.origin,
-                        // A `.qwd` has no angle field of its own — a player's facing rides on the
-                        // usercmd the server echoed back, so it is present exactly when that is.
-                        angles: info.command.map_or(Vec3::ZERO, |c| c.angles),
-                        velocity: velocity_present.then_some(info.velocity),
-                        command: info.command,
-                        dead: info.dead(),
-                        on_ground: self
-                            .proto
-                            .has_z_ext(rtx_proto::protocol::z_ext::PF_ONGROUND)
-                            .then(|| info.on_ground()),
-                        weaponframe: info.weaponframe,
-                    });
                 }
+                SvcEvent::SpawnBaseline { entity, baseline } if replacement => {
+                    let delta = rtx_proto::rd::Delta {
+                        origin: baseline.origin.to_array().map(Some),
+                        angles: baseline.angles.to_array().map(Some),
+                        modelindex: Some(baseline.modelindex),
+                        frame: Some(baseline.frame),
+                        colormap: Some(baseline.colormap),
+                        skinnum: Some(baseline.skinnum as i16),
+                        ..Default::default()
+                    };
+                    if let Err(reason) = self.rd.set_baseline(entity, delta.apply(None, None)) {
+                        self.rd.invalidate();
+                        self.warnings.push(format!("packet at offset {at}: {reason}"));
+                    }
+                }
+                SvcEvent::ReplacementEntities(frame) => match self.rd.apply(&frame) {
+                    Ok(rtx_proto::rd_state::Applied::Published) => {
+                        // Omitted records leave players present. Sample the retained world rather
+                        // than mistaking the sparse wire changes for a full player snapshot.
+                        for entity in 1..=32 {
+                            if let Some(info) = self
+                                .rd
+                                .get(entity)
+                                .and_then(|state| rtx_proto::rd::player_info(entity, state))
+                            {
+                                self.push_player(time, info, true);
+                            }
+                        }
+                    }
+                    Ok(rtx_proto::rd_state::Applied::AwaitingReset) => {}
+                    Err(reason) => self.warnings.push(format!("packet at offset {at}: {reason}")),
+                },
                 SvcEvent::MvdPlayerInfo(info) => {
                     let slot = info.player as usize;
                     if slot >= self.last.len() {
@@ -387,14 +413,18 @@ impl Feed {
                         player: info.player,
                         origin,
                         angles,
-                        velocity: None, // an MVD carries none; differencing is the only source
+                        velocity: None, // classic MVD playerinfo has no velocity
                         command: self.pending_cmds[slot].take(),
                         dead: info.dead(),
                         on_ground: None,
-                        weaponframe: info.weaponframe,
+                        weaponframe: info.weaponframe.map(u16::from),
                     });
                 }
                 SvcEvent::ServerData(sd) => {
+                    replacement = sd.fte2 & rtx_proto::protocol::fte2::REPLACEMENTDELTAS != 0;
+                    self.rd.clear();
+                    self.last.fill((Vec3::ZERO, Vec3::ZERO));
+                    self.pending_cmds.fill(None);
                     if self.format == Format::Qwd {
                         self.local_player = Some(sd.playernum);
                     }
@@ -421,6 +451,25 @@ impl Feed {
                 _ => {}
             }
         }
+    }
+
+    fn push_player(&mut self, time: f32, info: svc::PlayerInfo, replacement: bool) {
+        let velocity_present = (0..3).any(|i| info.flags & (svc::pf::VELOCITY1 << i) != 0);
+        if let Some(player) = self.players.get_mut(info.player as usize) {
+            player.frames += 1;
+        }
+        self.frames.push(Frame {
+            time,
+            player: info.player,
+            origin: info.origin,
+            angles: info.command.map_or(Vec3::ZERO, |command| command.angles),
+            velocity: velocity_present.then_some(info.velocity),
+            command: info.command,
+            dead: info.dead(),
+            on_ground: (replacement || self.proto.has_z_ext(rtx_proto::protocol::z_ext::PF_ONGROUND))
+                .then(|| info.on_ground()),
+            weaponframe: info.weaponframe,
+        });
     }
 
     fn set_userinfo(&mut self, player: u8, userinfo: String) {
@@ -643,5 +692,249 @@ mod tests {
         let err = parse_demo(&path).unwrap_err();
         std::fs::remove_file(&path).ok();
         assert!(matches!(err, Error::UnknownRecord { kind: 9, .. }));
+    }
+}
+
+#[cfg(test)]
+mod replacement_tests {
+    use super::*;
+    use rtx_proto::protocol::fte2;
+    use rtx_proto::svc::op;
+
+    fn flags(mut value: u32) -> Vec<u8> {
+        if value & 0xff00_0000 != 0 {
+            value |= 1 << 23;
+        }
+        if value & 0xffff_0000 != 0 {
+            value |= 1 << 15;
+        }
+        if value & 0xffff_ff00 != 0 {
+            value |= 1 << 7;
+        }
+        let len = if value & (1 << 23) != 0 {
+            4
+        } else if value & (1 << 15) != 0 {
+            3
+        } else if value & (1 << 7) != 0 {
+            2
+        } else {
+            1
+        };
+        value.to_le_bytes()[..len].to_vec()
+    }
+
+    fn frame(time: f32, records: &[u8]) -> Vec<u8> {
+        let mut packet = vec![86];
+        packet.extend(time.to_le_bytes());
+        packet.extend(records);
+        packet.extend([0, 0]);
+        packet
+    }
+
+    fn feed(format: Format) -> Feed {
+        let mut feed = Feed::new(format);
+        feed.proto.apply(0, fte2::REPLACEMENTDELTAS, 0);
+        feed
+    }
+
+    #[test]
+    fn rd_mvd_retains_omitted_players_and_publishes_full_prediction_fields() {
+        let mut feed = feed(Format::Mvd);
+        // Independent pinned-FTE payload includes frame300, weapon200, signedskin, predicted
+        // movement/velocity and angle16. Player32 maps to slot31; entity16383 stays nonplayer.
+        let fixture = include_bytes!("../../rtx-proto/tests/fixtures/replacement_deltas/fte-base-2.bin");
+        let mut records = vec![0, 128, 32, 0];
+        records.extend(fixture);
+        records.extend([255, 63, 0]);
+        feed.packet(1., &frame(10., &records), 0);
+        feed.packet(2., &frame(11., &[]), 100);
+        assert!(feed.warnings.is_empty(), "{:?}", feed.warnings);
+        assert_eq!(feed.frames.len(), 2);
+        assert_eq!(feed.players[31].frames, 2);
+        for frame in &feed.frames {
+            assert_eq!(frame.player, 31);
+            assert_eq!(frame.origin, Vec3::new(1.25, -2.5, 3.75));
+            assert_eq!(frame.weaponframe, Some(200));
+            assert_eq!(frame.velocity, Some(Vec3::new(100., -200., 300.)));
+            assert!((frame.angles.x + 90.).abs() < 0.02);
+            let cmd = frame.command.unwrap();
+            assert_eq!((cmd.forward, cmd.side, cmd.up, cmd.msec), (100, -200, 300, 14));
+            assert_eq!(frame.on_ground, Some(false));
+        }
+        assert_eq!((feed.frames[0].time, feed.frames[1].time), (1., 2.));
+    }
+
+    #[test]
+    fn rd_demo_rejects_malformed_tail_and_waits_for_reset_recovery() {
+        for format in [Format::Mvd, Format::Qwd] {
+            let mut feed = feed(format);
+            feed.packet(1., &frame(10., &[0, 128, 1, 0, 0]), 0);
+            assert_eq!(feed.frames.len(), 1);
+            let mut bad = frame(11., &[1, 128]);
+            bad.push(255);
+            feed.packet(2., &bad, 100);
+            feed.packet(3., &frame(12., &[]), 200);
+            assert_eq!(feed.frames.len(), 1, "failed packet must invalidate retained decoding");
+            assert_eq!(feed.warnings.len(), 1);
+            feed.packet(4., &frame(13., &[0, 128, 2, 0, 0]), 300);
+            assert_eq!(feed.frames.len(), 2);
+            assert_eq!(feed.frames[1].player, 1);
+            assert_eq!(feed.frames[1].time, 4.);
+            feed.packet(5., &frame(14., &[2, 128]), 400);
+            feed.packet(6., &frame(15., &[]), 500);
+            assert_eq!(feed.frames.len(), 2, "removed player must stay removed");
+        }
+    }
+
+    fn serverdata(format: Format, replacement: bool) -> Vec<u8> {
+        let mut packet = vec![op::SERVERDATA];
+        if replacement {
+            packet.extend(rtx_proto::protocol::magic::FTE2.to_le_bytes());
+            packet.extend(fte2::REPLACEMENTDELTAS.to_le_bytes());
+        }
+        packet.extend(rtx_proto::protocol::VERSION.to_le_bytes());
+        packet.extend(2i32.to_le_bytes());
+        packet.extend(b"qw\0");
+        if format == Format::Mvd {
+            packet.extend(0f32.to_le_bytes());
+        } else {
+            packet.push(31);
+        }
+        packet.extend(b"next-map\0");
+        for _ in 0..10 {
+            packet.extend(0f32.to_le_bytes());
+        }
+        packet
+    }
+
+    #[test]
+    fn rd_baselines_survive_world_reset_and_reuse_but_are_cleared_on_map_change() {
+        for format in [Format::Mvd, Format::Qwd] {
+            let mut feed = feed(format);
+            let mut baseline = vec![op::FTE_SPAWNBASELINE2, 1, 0];
+            baseline.extend(flags(
+                (1 << 0) | (1 << 9) | (1 << 10) | (1 << 11) | (1 << 29) | (1 << 5),
+            ));
+            baseline.extend(65535u16.to_le_bytes());
+            baseline.extend(0x1234abcd_u32.to_le_bytes());
+            baseline.extend(511u16.to_le_bytes());
+            baseline.extend((-200i16).to_le_bytes());
+            feed.packet(0., &baseline, 0);
+            let mut records = vec![0, 128, 1, 0];
+            records.extend(flags((1 << 8) | (1 << 6)));
+            records.extend([8 | 128, 3 | 128, 255, 255]); // move ground; weapon32767.
+            records.extend([255, 63, 0]);
+            feed.packet(1., &frame(10., &records), 100);
+            assert_eq!(feed.frames.len(), 1);
+            assert_eq!(feed.frames[0].weaponframe, Some(32767));
+            assert_eq!(feed.frames[0].on_ground, Some(true));
+            let state = feed.rd.get(1).unwrap();
+            assert_eq!(
+                (state.frame, state.modelindex, state.skinnum, state.effects),
+                (65535, 511, -200, 0x1234abcd)
+            );
+            assert!(feed.rd.get(16383).is_some());
+            feed.packet(2., &frame(11., &[1, 128, 255, 191]), 200);
+            assert!(feed.rd.get(1).is_none() && feed.rd.get(16383).is_none());
+            feed.packet(3., &frame(12., &[0, 128, 1, 0, 128, 1]), 300);
+            assert_eq!(feed.rd.get(1).unwrap().frame, 65535);
+            assert_eq!(feed.frames[1].weaponframe, Some(0));
+            feed.packet(4., &serverdata(format, true), 400);
+            feed.packet(5., &frame(13., &[0, 128, 1, 0, 128, 1]), 500);
+            assert_eq!(feed.rd.get(1).unwrap().frame, 0);
+            assert_eq!(feed.frames.len(), 3);
+            assert!(feed.warnings.is_empty(), "{:?}", feed.warnings);
+        }
+    }
+
+    #[test]
+    fn malformed_serverdata_does_not_switch_demo_protocol_or_clear_last_good_world() {
+        let mut feed = feed(Format::Mvd);
+        feed.packet(1., &frame(10., &[0, 128, 1, 0, 0]), 0);
+        let mut malformed = serverdata(Format::Mvd, false);
+        malformed.push(255);
+        feed.packet(2., &malformed, 100);
+        assert_eq!(feed.proto.fte2, fte2::REPLACEMENTDELTAS);
+        assert!(feed.rd.get(1).is_some());
+        assert!(!feed.rd.can_delta());
+        assert_eq!(feed.frames.len(), 1);
+        feed.packet(3., &frame(12., &[0, 128, 2, 0, 0]), 200);
+        assert_eq!(feed.frames.len(), 2);
+        assert_eq!(feed.frames[1].player, 1);
+    }
+
+    #[test]
+    fn classic_mvd_still_carries_player_deltas_without_prediction_fields() {
+        let mut feed = Feed::new(Format::Mvd);
+        let mut first = vec![op::PLAYERINFO, 0];
+        first.extend((svc::df::ORIGIN | svc::df::ANGLES | svc::df::WEAPONFRAME | svc::df::DEAD).to_le_bytes());
+        first.push(2); // classic animation frame
+        first.extend(80i16.to_le_bytes());
+        first.extend(16384i16.to_le_bytes());
+        first.push(255);
+        feed.packet(1., &first, 0);
+        feed.packet(2., &[op::PLAYERINFO, 0, 0, 0, 3], 100);
+        assert_eq!(feed.frames.len(), 2);
+        assert_eq!(feed.frames[0].origin.x, 10.);
+        assert_eq!(feed.frames[1].origin.x, 10.);
+        assert_eq!(feed.frames[0].angles.x, -30.);
+        assert_eq!(feed.frames[1].angles.x, -30.);
+        assert_eq!(feed.frames[0].weaponframe, Some(255));
+        assert_eq!(feed.frames[1].weaponframe, None);
+        assert!(feed.frames[0].dead && !feed.frames[1].dead);
+        for frame in feed.frames {
+            assert!(frame.velocity.is_none() && frame.on_ground.is_none());
+        }
+        assert!(feed.warnings.is_empty(), "{:?}", feed.warnings);
+    }
+
+    #[test]
+    fn both_demo_containers_deliver_rd_frames_through_public_parsers() {
+        for format in [Format::Mvd, Format::Qwd] {
+            let packets = [
+                serverdata(format, true),
+                frame(10., &[0, 128, 1, 0, 0]),
+                frame(11., &[]),
+            ];
+            let mut bytes = Vec::new();
+            for (index, packet) in packets.iter().enumerate() {
+                if format == Format::Mvd {
+                    bytes.extend([100, mvd::dem::ALL]);
+                    bytes.extend((packet.len() as u32).to_le_bytes());
+                } else {
+                    bytes.extend((index as f32 * 0.1).to_le_bytes());
+                    bytes.push(mvd::dem::READ);
+                    bytes.extend(((packet.len() + NETCHAN_HEADER) as u32).to_le_bytes());
+                    bytes.extend((index as u32 + 1).to_le_bytes());
+                    bytes.extend(0u32.to_le_bytes());
+                }
+                bytes.extend(packet);
+            }
+            let path = PathBuf::from("synthetic-rd-demo");
+            let demo = if format == Format::Mvd {
+                parse_mvd_bytes(&bytes, path)
+            } else {
+                parse_qwd_bytes(&bytes, path).unwrap()
+            };
+            assert!(demo.warnings.is_empty(), "{:?}", demo.warnings);
+            assert_eq!(demo.frames.len(), 2);
+            assert_eq!(demo.frames[0].player, 0);
+            assert_eq!(demo.players[0].frames, 2);
+            assert_eq!(demo.local_player, if format == Format::Qwd { Some(31) } else { None });
+        }
+    }
+
+    #[test]
+    fn invalid_rd_classic_baseline_rejects_earlier_frame_in_same_packet() {
+        let mut feed = feed(Format::Mvd);
+        feed.packet(1., &frame(10., &[0, 128, 1, 0, 0]), 0);
+        let mut packet = frame(11., &[1, 128]);
+        packet.extend([op::SPAWNBASELINE, 0, 64]); // legal ordinary ref, exceeds application slots.
+        packet.extend([0; 13]);
+        feed.packet(2., &packet, 100);
+        assert!(feed.rd.get(1).is_some());
+        assert!(!feed.rd.can_delta());
+        assert_eq!(feed.frames.len(), 1);
+        assert_eq!(feed.warnings.len(), 1);
     }
 }
