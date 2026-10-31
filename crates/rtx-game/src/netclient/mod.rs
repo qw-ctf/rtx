@@ -96,6 +96,11 @@ use crate::entity::EntId;
 use crate::game::GameState;
 use host::NetHost;
 
+/// Wire entity IDs are kept separate from the entities spawned for our local map and nails.
+pub(crate) const NETWORK_ENTITY_CAPACITY: usize = rtx_proto::rd::MAX_ENTITIES as usize;
+/// The upper half is local shadow storage; it is never a network entity number.
+pub(crate) const CLIENT_ENTITY_CAPACITY: usize = NETWORK_ENTITY_CAPACITY * 2;
+
 /// The rate to send at before the server has said otherwise. QuakeWorld's traditional server frame
 /// rate; KTX commonly runs 77.
 const DEFAULT_MAXFPS: f32 = 72.0;

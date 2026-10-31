@@ -88,12 +88,9 @@ type MoveVarField = fn(&MoveVars) -> f32;
 
 /// Where the shadow world's entities start, counting down.
 ///
-/// The network hands us entities by *the server's* numbers, and those are small — players are 1..N
-/// and everything else follows. Our own spawned copies of the map's furniture can't collide with
-/// them, so they're allocated from the far end of the array and grow toward the middle. The two
-/// ranges meeting would mean a map with ~2000 entities *and* a server using every slot, which is
-/// louder to detect than it is likely.
-const SHADOW_TOP: i32 = crate::game::MAX_EDICTS as i32 - 1;
+/// The lower range is reserved for every possible wire ID. Local map furniture and synthetic
+/// nails occupy the upper range, so no server entity can replace a shadow entity.
+const SHADOW_TOP: i32 = super::CLIENT_ENTITY_CAPACITY as i32 - 1;
 
 /// The cvars that are the *server's rules*, not ours, and are answered from its serverinfo.
 ///
@@ -395,8 +392,8 @@ impl ClientHost for NetHost {
     fn alloc_ent(&self) -> i32 {
         // Down from the top, away from the server's numbers — see `SHADOW_TOP`.
         let n = self.next_ent.get();
-        if n <= 0 {
-            return 0; // out of slots; the caller gets the world entity, as a full server would give
+        if n < super::NETWORK_ENTITY_CAPACITY as i32 {
+            return 0; // exhausted: never hand out a wire entity slot
         }
         self.next_ent.set(n - 1);
         n
@@ -655,6 +652,27 @@ mod tests {
         // full server gives.
         h.next_ent.set(0);
         assert_eq!(h.alloc_ent(), 0);
+    }
+
+    #[test]
+    fn shadow_allocation_never_enters_the_wire_entity_range() {
+        let h = host();
+        assert_eq!(h.alloc_ent(), 32767);
+        h.next_ent.set(16384);
+        assert_eq!(h.alloc_ent(), 16384);
+        assert_eq!(h.alloc_ent(), 0);
+        assert_eq!(h.alloc_ent(), 0, "exhaustion remains bounded");
+    }
+
+    #[test]
+    fn exhausted_shadow_spawn_preserves_the_world_entity() {
+        let h = Box::leak(Box::new(host()));
+        let mut game = crate::game::GameState::new_client(h);
+        game.entities[EntId::WORLD].v.health = 73.0;
+        h.next_ent.set(0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| game.spawn()));
+        assert!(result.is_err(), "a map spawn must fail explicitly when slots run out");
+        assert_eq!(game.entities[EntId::WORLD].v.health, 73.0);
     }
 
     /// A buffer-filling trap must never overrun the caller's buffer, however long the value.
