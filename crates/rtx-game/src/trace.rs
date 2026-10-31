@@ -97,17 +97,12 @@ impl GameState {
         let pass_size = self.trace_size(passedict);
 
         // 3. Clip to entities, keeping the nearest impact (SV_ClipToLinks).
-        for i in 0..self.entities.len() as u32 {
+        for (touch, te) in self.entities.live() {
             if trace.allsolid {
                 break; // wholly inside solid — nothing nearer can be found
             }
-            let touch = EntId(i);
-            if touch == passedict || touch == EntId::WORLD {
+            if touch == passedict {
                 continue; // never the shooter; the world was clipped in step 1
-            }
-            let te = &self.entities[touch];
-            if !te.in_use {
-                continue;
             }
             // Triggers and non-solids never block a trace (they touch, they don't clip).
             if matches!(te.v.solid, Solid::Not | Solid::Trigger) {
@@ -254,6 +249,40 @@ mod tests {
     }
 
     const HORIZ: Vec3 = Vec3::new(200.0, 0.0, 0.0);
+
+    #[test]
+    fn client_frame_trace_matches_dense_scan_at_high_ids_and_after_removal() {
+        let mut g = game();
+        open_world(&mut g);
+        let ig = shooter(&mut g);
+        let network = box_ent(&mut g, 16383, Vec3::new(100.0, 0.0, 0.0));
+        let shadow = box_ent(&mut g, 32767, Vec3::new(100.0, 0.0, 0.0));
+        let dense = g.sv_trace(Vec3::ZERO, HORIZ, false, ig);
+        assert_eq!(dense.ent, network, "equal hits keep the ascending-ID winner");
+        g.entities.begin_client_frame();
+        let indexed = g.sv_trace(Vec3::ZERO, HORIZ, false, ig);
+        assert_eq!(indexed.ent, dense.ent);
+        assert_eq!(indexed.fraction, dense.fraction);
+        assert_eq!(indexed.endpos, dense.endpos);
+
+        // The list holds IDs, so changes to an entity's bounds/origin and liveness remain visible.
+        g.entities[network].in_use = false;
+        g.entities[shadow].v.origin.x = 150.0;
+        let moved = g.sv_trace(Vec3::ZERO, HORIZ, false, ig);
+        assert_eq!(moved.ent, shadow);
+        assert!(moved.fraction > indexed.fraction);
+        g.entities.end_client_frame();
+        let dense = g.sv_trace(Vec3::ZERO, HORIZ, false, ig);
+        assert_eq!(moved.ent, dense.ent);
+        assert_eq!(moved.fraction, dense.fraction);
+        assert_eq!(moved.endpos, dense.endpos);
+
+        g.entities[network].reset();
+        g.entities[network].v.solid = Solid::Not;
+        g.entities.begin_client_frame();
+        assert_eq!(g.sv_trace(Vec3::ZERO, HORIZ, false, ig).ent, shadow);
+        g.entities.end_client_frame();
+    }
 
     #[test]
     fn clips_a_box_entity_and_names_it() {

@@ -395,10 +395,9 @@ fn grenade_live(game: &GameState, g: EntId) -> bool {
 /// Find the bot's own just-fired grenade — a live grenade it owns, near its origin.
 fn own_live_grenade(game: &GameState, e: EntId, origin: Vec3) -> Option<EntId> {
     game.entities
-        .iter()
-        .enumerate()
-        .filter(|(_, ent)| ent.classname() == Some("grenade") && ent.in_use && ent.combat.voided == 0.0)
-        .map(|(i, _)| EntId(i as u32))
+        .occupied()
+        .filter(|(_, ent)| ent.classname() == Some("grenade") && ent.combat.voided == 0.0)
+        .map(|(id, _)| id)
         .filter(|&g| game.entities[g].owner() == e && (game.entities[g].v.origin - origin).length() < 120.0)
         .min_by(|&a, &b| {
             let d = |g: EntId| (game.entities[g].v.origin - origin).length();

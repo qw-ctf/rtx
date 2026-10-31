@@ -589,13 +589,13 @@ impl GameState {
     /// returning a `Vec` is cleaner and avoids mutating shared state).
     pub(crate) fn find_radius(&self, org: Vec3, rad: f32) -> Vec<EntId> {
         let mut out = Vec::new();
-        for (i, e) in self.entities.iter().enumerate() {
-            if !e.in_use || e.v.solid == defs::Solid::Not {
+        for (id, e) in self.entities.occupied() {
+            if e.v.solid == defs::Solid::Not {
                 continue;
             }
             let center = e.v.origin + (e.v.mins + e.v.maxs) * 0.5;
             if (org - center).length() <= rad {
-                out.push(EntId(i as u32));
+                out.push(id);
             }
         }
         out
@@ -876,11 +876,7 @@ impl GameState {
     /// Live entities satisfying `pred` — the shared body of the `find_by_*` selectors (the QuakeC
     /// `find(...)` scan). `pred` sees only entities already known to be `in_use`.
     pub(crate) fn find_where<'a>(&'a self, pred: impl Fn(&Entity) -> bool + 'a) -> impl Iterator<Item = EntId> + 'a {
-        self.entities
-            .iter()
-            .enumerate()
-            .filter(move |(_, e)| e.in_use && pred(e))
-            .map(|(i, _)| EntId(i as u32))
+        self.entities.occupied().filter(move |(_, e)| pred(e)).map(|(id, _)| id)
     }
 
     /// Live entities whose classname matches `name` (the QuakeC `find(... classname ...)`).

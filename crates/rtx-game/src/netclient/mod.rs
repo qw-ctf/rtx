@@ -591,7 +591,11 @@ impl Client {
         self.game.client_lead = self.latency();
         self.feed_phase();
         crate::control::frame_begin(&mut self.game);
+        // Mirroring and control updates are settled. The brain changes fields and emits commands,
+        // but does not spawn entities; every trace/search can share one occupied-ID list.
+        self.game.entities.begin_client_frame();
         crate::bot::run_bots(&mut self.game);
+        self.game.entities.end_client_frame();
         for b in &mut self.bots {
             b.measure_travel(&self.game);
         }
