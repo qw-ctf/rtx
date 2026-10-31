@@ -170,11 +170,14 @@ impl Mirror {
 
     /// Let go of everything that named the last map.
     ///
-    /// Only the nail pool, which is more than it sounds: those slots were allocated out of the map's
+    /// The nail pool's slots were allocated out of the map's
     /// entity range, and `spawn_shadow_world` has just handed that range back and refilled it with
     /// the new map's furniture. Holding them would have the next volley of nails overwrite a door.
     pub(crate) fn forget_map(&mut self) {
         self.nails.clear();
+        // The map rebuild also cleared our player entity. Even if signon updates embodied it
+        // before that clear, the next own-player or stats update must recreate its AI body.
+        self.embodied = false;
     }
 
     /// A stat, as last sent.
@@ -387,7 +390,8 @@ impl Mirror {
         let e = slot_to_ent(pi.player);
         let own = !self.spectator && pi.player == self.playernum;
         if own && !self.embodied {
-            self.embody(game);
+            // A map clear may have discarded the body without changing any received stats.
+            self.write_own_stats(game);
         }
         // A slot we've heard nothing about — no userinfo yet — isn't a player we should be
         // reasoning about. It'll arrive.
@@ -593,7 +597,7 @@ impl Mirror {
         let e = slot_to_ent(slot);
         let own = !self.spectator && slot == self.playernum;
         if own && !self.embodied {
-            self.embody(game);
+            self.write_own_stats(game);
         }
         // A slot no name has arrived for isn't a player to reason about yet.
         if !own && !is_player_slot(game, e) {
@@ -1892,6 +1896,85 @@ mod tests {
         assert!(g.entities[e].bot.is_bot, "or run_bots would never look at it");
         assert_eq!(g.entities[e].bot.client, 3, "the client number its usercmds carry");
         assert!(g.entities[e].is_alive());
+    }
+
+    /// Map rebuild clears the body even when this mirror already received its first stats.
+    #[test]
+    fn map_clear_reembodies_on_own_stats() {
+        let mut g = game();
+        let mut m = Solo::at(2);
+        m.apply(
+            &mut g,
+            &SvcEvent::UpdateStat {
+                stat: stat::HEALTH,
+                value: 100,
+            },
+        );
+        let e = m.own();
+        assert!(g.entities[e].in_use && g.entities[e].bot.is_bot);
+
+        g.entities[e] = crate::entity::Entity::default();
+        m.mirror.forget_map();
+        m.apply(
+            &mut g,
+            &SvcEvent::UpdateStat {
+                stat: stat::HEALTH,
+                value: 99,
+            },
+        );
+
+        assert!(g.entities[e].in_use && g.entities[e].bot.is_bot);
+        assert!(g.entities[e].is_player());
+        assert_eq!(g.entities[e].bot.client, 3);
+        assert_eq!(g.entities[e].v.health, 99.0);
+    }
+
+    /// Stats need not change: our next per-frame player update must restore the AI body too.
+    #[test]
+    fn map_clear_reembodies_on_own_player_update() {
+        let mut g = game();
+        let mut m = Solo::at(2);
+        for (stat, value) in [(stat::HEALTH, 100), (stat::SHELLS, 20)] {
+            m.apply(&mut g, &SvcEvent::UpdateStat { stat, value });
+        }
+        m.apply(&mut g, &SvcEvent::PlayerInfo(playerinfo(2, 0)));
+        let e = m.own();
+        assert!(g.entities[e].in_use && g.entities[e].bot.is_bot);
+
+        g.entities[e] = crate::entity::Entity::default();
+        m.mirror.forget_map();
+        m.apply(&mut g, &SvcEvent::PlayerInfo(playerinfo(2, 0)));
+
+        assert!(g.entities[e].in_use && g.entities[e].bot.is_bot);
+        assert!(g.entities[e].is_player());
+        assert_eq!(g.entities[e].bot.client, 3);
+        assert_eq!(g.entities[e].v.origin, Vec3::new(10.0, 20.0, 30.0));
+        assert_eq!(g.entities[e].v.health, 100.0);
+        assert_eq!(g.entities[e].v.ammo_shells, 20.0);
+    }
+
+    #[test]
+    fn map_clear_reembodies_on_nq_player_update() {
+        let mut g = game();
+        let mut m = Solo::at(2);
+        for (stat, value) in [(stat::HEALTH, 100), (stat::SHELLS, 20)] {
+            m.apply(&mut g, &SvcEvent::UpdateStat { stat, value });
+        }
+        let e = m.own();
+        g.entities[e] = crate::entity::Entity::default();
+        m.mirror.forget_map();
+        let squad = squad_of(&m.mirror, &g);
+        m.mirror.write_player_nq(
+            &mut g,
+            &mut m.world,
+            &squad,
+            &state(3, 1, Vec3::new(10.0, 20.0, 30.0)),
+            None,
+        );
+
+        assert!(g.entities[e].in_use && g.entities[e].bot.is_bot);
+        assert_eq!(g.entities[e].v.health, 100.0);
+        assert_eq!(g.entities[e].v.ammo_shells, 20.0);
     }
 
     /// Stats are our own condition, and the fields they land in are the ones the brain reads.
