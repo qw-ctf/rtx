@@ -76,6 +76,7 @@ pub(crate) mod mirror;
 pub(crate) mod modes;
 pub(crate) mod nq_frames;
 pub(crate) mod nq_session;
+pub(crate) mod rd_frames;
 pub(crate) mod senses;
 pub(crate) mod session;
 pub(crate) mod world;
@@ -95,6 +96,11 @@ use session::{Session, Signon};
 use crate::entity::EntId;
 use crate::game::GameState;
 use host::NetHost;
+
+/// Wire entity IDs are kept separate from the entities spawned for our local map and nails.
+pub(crate) const NETWORK_ENTITY_CAPACITY: usize = rtx_proto::rd::MAX_ENTITIES as usize;
+/// The upper half is local shadow storage; it is never a network entity number.
+pub(crate) const CLIENT_ENTITY_CAPACITY: usize = NETWORK_ENTITY_CAPACITY * 2;
 
 /// The rate to send at before the server has said otherwise. QuakeWorld's traditional server frame
 /// rate; KTX commonly runs 77.
@@ -585,7 +591,11 @@ impl Client {
         self.game.client_lead = self.latency();
         self.feed_phase();
         crate::control::frame_begin(&mut self.game);
+        // Mirroring and control updates are settled. The brain changes fields and emits commands,
+        // but does not spawn entities; every trace/search can share one occupied-ID list.
+        self.game.entities.begin_client_frame();
         crate::bot::run_bots(&mut self.game);
+        self.game.entities.end_client_frame();
         for b in &mut self.bots {
             b.measure_travel(&self.game);
         }
@@ -907,19 +917,25 @@ impl Client {
     /// stops receiving keeps its last snapshot indefinitely, and without a freshness rule its frozen
     /// rockets would hang in the air over every live view of them for the rest of the run.
     fn mirror_entities(&mut self, squad: &Squad) {
-        let mut seen: Vec<(EntityState, Instant)> = Vec::new();
+        let mut seen = std::collections::BTreeMap::<u16, (EntityState, Instant)>::new();
         let playing = || self.bots.iter().filter(|b| b.session.signon() == Signon::Active);
         for b in playing() {
             let at = b.session.frames_at();
             for e in b.session.frames_current() {
-                match seen.iter_mut().find(|(x, _)| x.number == e.number) {
-                    Some(held) if held.1 < at => *held = (*e, at),
-                    Some(_) => {}
-                    None => seen.push((*e, at)),
+                // A full RD view may contain thousands of entities. Key the squad union instead
+                // of linearly searching all prior sightings for each connection and entity.
+                match seen.entry(e.number) {
+                    std::collections::btree_map::Entry::Occupied(mut held) if held.get().1 < at => {
+                        held.insert((*e, at));
+                    }
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        slot.insert((*e, at));
+                    }
+                    _ => {}
                 }
             }
         }
-        let seen: Vec<EntityState> = seen.into_iter().map(|(e, _)| e).collect();
+        let seen: Vec<EntityState> = seen.into_values().map(|(e, _)| e).collect();
 
         // The model list names what each entity is. It's per map and identical across a squad, but
         // it has to come from the same population the frames did: a connection that dropped still

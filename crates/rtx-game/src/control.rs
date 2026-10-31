@@ -799,7 +799,7 @@ fn pmove_event(game: &GameState, now: f32, maxclients: u32) -> proto::PmoveEvent
             -1
         } else {
             let ground = EntId::from_prog(ent.v.groundentity);
-            if ground.index() < MAX_EDICTS && ground.to_prog() == ent.v.groundentity {
+            if ground.index() < game.entities.len() && ground.to_prog() == ent.v.groundentity {
                 ground.0 as i32
             } else {
                 -1
@@ -1805,6 +1805,20 @@ fn rj_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "netclient")]
+    #[test]
+    fn movement_report_accepts_high_shadow_ground_entities() {
+        let host = Box::leak(Box::new(crate::netclient::host::NetHost::new("/nonexistent".into())));
+        let mut game = GameState::new_client(host);
+        let player = &mut game.entities[EntId(1)];
+        player.in_use = true;
+        player.classname = Some("player".into());
+        player.v.groundentity = EntId(32767).to_prog();
+        assert_eq!(pmove_event(&game, 1.0, 1).players[0].ground_ent, 32767);
+        game.entities[EntId(1)].v.groundentity = EntId(32768).to_prog();
+        assert_eq!(pmove_event(&game, 1.0, 1).players[0].ground_ent, -1);
+    }
 
     #[test]
     fn fast_goto_crossing_stops_inside_bounded_finish_corridor() {

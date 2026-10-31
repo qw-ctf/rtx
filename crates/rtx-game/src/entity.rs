@@ -721,27 +721,75 @@ impl Entity {
 }
 
 /// The entity array, indexable by a typed [`EntId`] handle (`entities[e]`) and transparently
-/// usable as the underlying `[Entity]` slice for iteration, `len`, and the raw base pointer
-/// the engine strides. Zero-cost: a newtype over the heap `Box<[Entity]>`, so the data
-/// pointer the engine receives never moves.
-pub struct Entities(Box<[Entity]>);
+/// usable as the underlying `[Entity]` slice. The boxed storage never moves: the engine strides
+/// its data pointer directly. The network client can also prepare an occupied-ID list for AI.
+pub struct Entities {
+    slots: Box<[Entity]>,
+    /// Reused storage for the network client's AI phase; IDs stay in ascending slot order.
+    #[cfg(feature = "netclient")]
+    frame_live_ids: Vec<EntId>,
+    /// False during map loading, mirroring, and all server-module execution.
+    #[cfg(feature = "netclient")]
+    client_frame: bool,
+}
 
 impl Entities {
     /// Allocate `count` cleared entity slots.
     pub fn new(count: usize) -> Self {
-        Entities((0..count).map(|_| Entity::default()).collect())
+        Self {
+            slots: (0..count).map(|_| Entity::default()).collect(),
+            #[cfg(feature = "netclient")]
+            frame_live_ids: Vec::new(),
+            #[cfg(feature = "netclient")]
+            client_frame: false,
+        }
     }
 
-    /// Iterate the live (`in_use`) entities as `(EntId, &Entity)`, skipping slot 0 (world) and every
-    /// free slot — the shape the many `for i in 1..len { let id = EntId(i); if !in_use { continue } }`
-    /// scans hand-roll.
-    pub fn live(&self) -> impl Iterator<Item = (EntId, &Entity)> {
-        self.0
-            .iter()
-            .enumerate()
-            .skip(1)
+    /// Prepare the occupied IDs once after mirroring/control updates, before client AI.
+    /// Membership must not grow during this phase: AI emits commands, not entity spawns.
+    /// Fields are still read live, including `in_use`, so removals remain immediately visible.
+    #[cfg(feature = "netclient")]
+    pub(crate) fn begin_client_frame(&mut self) {
+        debug_assert!(!self.client_frame);
+        self.frame_live_ids.clear();
+        self.frame_live_ids.extend(
+            self.slots
+                .iter()
+                .enumerate()
+                .filter_map(|(i, e)| e.in_use.then_some(EntId(i as u32))),
+        );
+        self.client_frame = true;
+    }
+
+    /// Restore dense iteration before the next map/mirror update can create entities.
+    #[cfg(feature = "netclient")]
+    pub(crate) fn end_client_frame(&mut self) {
+        self.client_frame = false;
+    }
+
+    /// Occupied entities in ascending ID order, including world. Only the client AI phase uses
+    /// the prepared ID list; all other callers scan current storage, including external engine writes.
+    pub fn occupied(&self) -> impl Iterator<Item = (EntId, &Entity)> {
+        let count = self.slots.len();
+        #[cfg(feature = "netclient")]
+        let count = if self.client_frame {
+            self.frame_live_ids.len()
+        } else {
+            count
+        };
+        (0..count)
+            .map(move |i| {
+                let id = EntId(i as u32);
+                #[cfg(feature = "netclient")]
+                let id = if self.client_frame { self.frame_live_ids[i] } else { id };
+                (id, &self.slots[id.index()])
+            })
             .filter(|(_, e)| e.in_use)
-            .map(|(i, e)| (EntId(i as u32), e))
+    }
+
+    /// Iterate live entities, skipping world and free slots.
+    pub fn live(&self) -> impl Iterator<Item = (EntId, &Entity)> {
+        self.occupied().filter(|(id, _)| *id != EntId::WORLD)
     }
 }
 
@@ -749,14 +797,14 @@ impl core::ops::Deref for Entities {
     type Target = [Entity];
     #[inline]
     fn deref(&self) -> &[Entity] {
-        &self.0
+        &self.slots
     }
 }
 
 impl core::ops::DerefMut for Entities {
     #[inline]
     fn deref_mut(&mut self) -> &mut [Entity] {
-        &mut self.0
+        &mut self.slots
     }
 }
 
@@ -764,14 +812,14 @@ impl core::ops::Index<EntId> for Entities {
     type Output = Entity;
     #[inline]
     fn index(&self, e: EntId) -> &Entity {
-        &self.0[e.index()]
+        &self.slots[e.index()]
     }
 }
 
 impl core::ops::IndexMut<EntId> for Entities {
     #[inline]
     fn index_mut(&mut self, e: EntId) -> &mut Entity {
-        &mut self.0[e.index()]
+        &mut self.slots[e.index()]
     }
 }
 
@@ -781,14 +829,14 @@ impl core::ops::Index<usize> for Entities {
     type Output = Entity;
     #[inline]
     fn index(&self, i: usize) -> &Entity {
-        &self.0[i]
+        &self.slots[i]
     }
 }
 
 impl core::ops::IndexMut<usize> for Entities {
     #[inline]
     fn index_mut(&mut self, i: usize) -> &mut Entity {
-        &mut self.0[i]
+        &mut self.slots[i]
     }
 }
 
@@ -796,6 +844,50 @@ impl core::ops::IndexMut<usize> for Entities {
 mod tests {
     use super::*;
     use crate::defs::Solid;
+
+    #[cfg(feature = "netclient")]
+    #[test]
+    fn client_frame_keeps_high_network_and_shadow_ids_in_order() {
+        let mut entities = Entities::new(32768);
+        for id in [EntId(32767), EntId(16383), EntId::WORLD] {
+            entities[id].reset();
+        }
+        entities.begin_client_frame();
+        assert_eq!(entities.live().map(|(id, _)| id.0).collect::<Vec<_>>(), [16383, 32767]);
+        assert_eq!(
+            entities.occupied().map(|(id, _)| id.0).collect::<Vec<_>>(),
+            [0, 16383, 32767]
+        );
+        entities.end_client_frame();
+    }
+
+    #[cfg(feature = "netclient")]
+    #[test]
+    fn client_frame_reads_current_fields_and_refreshes_after_slot_reuse() {
+        let mut entities = Entities::new(8);
+        entities[EntId(3)].reset();
+        entities.begin_client_frame();
+        entities[EntId(3)].v.origin.x = 42.0;
+        assert_eq!(entities.live().next().unwrap().1.v.origin.x, 42.0);
+        entities[EntId(3)].in_use = false;
+        assert!(entities.live().next().is_none());
+        entities.end_client_frame();
+
+        // Outside AI, newly mirrored/spawned entities are visible without preparing a list.
+        entities[EntId(3)].reset();
+        entities[EntId(5)].reset();
+        assert_eq!(entities.live().map(|(id, _)| id.0).collect::<Vec<_>>(), [3, 5]);
+        entities.begin_client_frame();
+        assert_eq!(entities.live().map(|(id, _)| id.0).collect::<Vec<_>>(), [3, 5]);
+        entities.end_client_frame();
+
+        // A new map can reuse different slots without inheriting the previous frame's members.
+        entities.fill_with(Entity::default);
+        entities[EntId(2)].reset();
+        entities.begin_client_frame();
+        assert_eq!(entities.live().map(|(id, _)| id.0).collect::<Vec<_>>(), [2]);
+        entities.end_client_frame();
+    }
 
     /// A slot cleared with `Entity::default()` — what the map-load `GAME_CLEAR_EDICT` handler now
     /// does — must be inert to every full-array scan gate. Our entity box is process-global, and the

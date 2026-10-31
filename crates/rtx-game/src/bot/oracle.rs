@@ -435,7 +435,7 @@ impl OracleInbox {
         &mut self,
         epoch: OracleEpoch,
         now: f32,
-        evidence_revision: &[f32; MAX_EDICTS],
+        evidence_revision: &[f32],
     ) -> Option<OracleNugget> {
         for index in 0..self.entries.len() {
             let Some(nugget) = self.entries[index] else {
@@ -598,7 +598,7 @@ pub(crate) struct OracleRuntime {
     pending_events: Vec<EvidenceEvent>,
     /// Main-thread truth about when each *honest evidence record* last changed. This is not game
     /// truth: only [`Self::note`] and published perception/model snapshots advance it.
-    evidence_revision: Box<[[f32; MAX_EDICTS]; EVIDENCE_POOLS]>,
+    evidence_revision: [Vec<f32>; EVIDENCE_POOLS],
     last_plan: Option<OraclePlan>,
     evaluation: bool,
     trials: VecDeque<OracleTrial>,
@@ -608,13 +608,19 @@ pub(crate) struct OracleRuntime {
 
 impl Default for OracleRuntime {
     fn default() -> Self {
+        Self::with_entity_capacity(MAX_EDICTS)
+    }
+}
+
+impl OracleRuntime {
+    pub(crate) fn with_entity_capacity(entity_capacity: usize) -> Self {
         Self {
             worker: None,
             epoch: 0,
             next_publish: 0.0,
             next_debug: 0.0,
             pending_events: Vec::new(),
-            evidence_revision: Box::new([[0.0; MAX_EDICTS]; EVIDENCE_POOLS]),
+            evidence_revision: std::array::from_fn(|_| vec![0.0; entity_capacity]),
             last_plan: None,
             evaluation: false,
             trials: VecDeque::new(),
@@ -622,9 +628,7 @@ impl Default for OracleRuntime {
             arms: [None; EVIDENCE_POOLS],
         }
     }
-}
 
-impl OracleRuntime {
     pub(crate) fn ensure(&mut self, wanted: bool) {
         if wanted && self.worker.is_none() {
             let mailbox = Arc::new(Mailbox::default());
@@ -2523,7 +2527,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn set_revision(revisions: &mut [f32; MAX_EDICTS], subject: u32, at: f32) {
+fn set_revision(revisions: &mut [f32], subject: u32, at: f32) {
     if let Some(revision) = revisions.get_mut(subject as usize) {
         *revision = revision.max(at);
     }
@@ -2532,6 +2536,34 @@ fn set_revision(revisions: &mut [f32; MAX_EDICTS], subject: u32, at: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "netclient")]
+    #[test]
+    fn client_shadow_item_evidence_invalidates_advice_above_wire_range() {
+        let host = Box::leak(Box::new(crate::netclient::host::NetHost::new("/nonexistent".into())));
+        let mut game = GameState::new_client(host);
+        let mut inbox = OracleInbox::default();
+        inbox.push(OracleNugget {
+            epoch: 4,
+            generation: 2,
+            team: 1,
+            recipient: 1,
+            kind: NuggetKind::Rearm,
+            target_cell: 9,
+            subject: 32767,
+            confidence: 0.8,
+            decision_at: 20.0,
+            evidence_at: 18.0,
+            expires_at: 24.0,
+        });
+        inbox.mark_applied(inbox.best(20.0).unwrap());
+        set_revision(&mut game.oracle.evidence_revision[1], 32767, 19.0);
+        let cancelled = inbox.retain_live(4, 20.1, &game.oracle.evidence_revision[1]);
+        assert!(cancelled.is_some());
+        assert!(inbox.best(20.1).is_none());
+        game.oracle.bump_epoch();
+        assert_eq!(game.oracle.evidence_revision[1].get(32767), Some(&0.0));
+    }
 
     /// The rebuild call now reads the equipment gap rather than counting heads, and holds its state
     /// across the band so a team hovering at the threshold doesn't issue and withdraw rearm orders

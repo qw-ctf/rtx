@@ -1277,3 +1277,72 @@ fn exit_code(had_error: bool) -> ExitCode {
         ExitCode::SUCCESS
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qwd_input_fallback_is_local_and_preserves_present_zero_input() {
+        let mut demo = rtx_demo_tool::parse_qwd_bytes(&[], PathBuf::from("input.qwd")).unwrap();
+        demo.local_player = Some(0);
+        demo.demo_cmds.push(DemoCmd {
+            time: 1.0,
+            cmd: Usercmd {
+                msec: 14,
+                forward: 100,
+                buttons: 3,
+                impulse: 7,
+                angles: Vec3::new(10.0, 20.0, 0.0),
+                ..Default::default()
+            },
+        });
+        let mut frame = Frame {
+            time: 1.01,
+            player: 0,
+            origin: Vec3::ZERO,
+            angles: Vec3::ZERO,
+            velocity: Some(Vec3::ZERO),
+            command: None,
+            dead: false,
+            on_ground: Some(true),
+            weaponframe: Some(0),
+        };
+        let resolved = command_for_frame(&demo, &frame).expect("local input fallback");
+        assert!(matches!(resolved.source, CmdSource::DemCmd));
+        assert_eq!(resolved.time, 1.0);
+        assert_eq!(resolved.cmd.angles, Vec3::new(10.0, 20.0, 0.0));
+        assert_eq!(
+            (
+                resolved.cmd.msec,
+                resolved.cmd.forward,
+                resolved.cmd.buttons,
+                resolved.cmd.impulse
+            ),
+            (14, 100, 3, 7)
+        );
+
+        frame.player = 1;
+        assert!(
+            command_for_frame(&demo, &frame).is_none(),
+            "local input must not be attributed to remote players"
+        );
+        frame.player = 0;
+        frame.command = Some(Usercmd::default());
+        let resolved = command_for_frame(&demo, &frame).expect("present zero input");
+        assert!(matches!(resolved.source, CmdSource::PlayerInfo));
+        assert_eq!(
+            (
+                resolved.cmd.msec,
+                resolved.cmd.forward,
+                resolved.cmd.buttons,
+                resolved.cmd.impulse
+            ),
+            (0, 0, 0, 0)
+        );
+
+        frame.command = None;
+        demo.demo_cmds.clear();
+        assert!(command_for_frame(&demo, &frame).is_none(), "absent input stays absent");
+    }
+}

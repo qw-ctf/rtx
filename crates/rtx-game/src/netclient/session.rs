@@ -44,6 +44,7 @@ use rtx_proto::{checksum, clc, oob};
 
 use super::frames::{Applied, EntityState, Frames};
 use super::host::NetHost;
+use super::rd_frames::RdFrames;
 use crate::host::ClientHost;
 
 /// How far through connecting we are.
@@ -153,6 +154,8 @@ pub(crate) struct Session {
 
     /// The entity snapshot ring, and the delta chain.
     pub(crate) frames: Frames,
+    /// RD retains one sparse world; it does not use the classic 64-frame ring.
+    rd_frames: RdFrames,
     /// When the snapshot last advanced. A squad merges several views of one world, and this is what
     /// says which of two disagreeing views is the current one — a connection that has gone quiet
     /// still has a perfectly well-formed snapshot of a world that has since moved on.
@@ -233,6 +236,7 @@ impl Session {
             serverinfo: Info::new(),
             playernum: 0,
             frames: Frames::default(),
+            rd_frames: RdFrames::default(),
             frames_at: now,
             cmds: [Usercmd::default(); 3],
             sent_at: vec![now; super::frames::UPDATE_BACKUP],
@@ -310,7 +314,31 @@ impl Session {
     /// The entities of the current frame — the slice the world mirror consumes. An accessor rather
     /// than a public field so [`AnySession`](super::AnySession) can front both protocols uniformly.
     pub(crate) fn frames_current(&self) -> &[EntityState] {
-        self.frames.current()
+        if self.replacement_deltas() {
+            self.rd_frames.current()
+        } else {
+            self.frames.current()
+        }
+    }
+
+    fn replacement_deltas(&self) -> bool {
+        self.proto.fte2 & protocol::fte2::REPLACEMENTDELTAS != 0
+    }
+
+    fn delta_request(&self) -> Option<u8> {
+        if self.replacement_deltas() {
+            self.rd_frames.delta_request()
+        } else {
+            self.frames.delta_sequence(self.chan.outgoing_sequence)
+        }
+    }
+
+    /// Omitted RD players remain visible. The mirror does not extrapolate from sample age;
+    /// retain the protocol's origin, velocity and command rather than inventing a new sample.
+    fn replacement_players(&self) -> Vec<svc::PlayerInfo> {
+        (1..=32)
+            .filter_map(|entity| rtx_proto::rd::player_info(entity, self.rd_frames.retained().get(entity)?))
+            .collect()
     }
 
     /// Frames the server withheld to stay inside our rate.
@@ -558,9 +586,21 @@ impl Session {
             };
             self.measure_rtt();
 
-            let events = match svc::parse(&mut self.proto, payload) {
+            let events = match self.decode_payload(payload, host) {
                 Ok(e) => e,
                 Err(e) => {
+                    // A malformed active RD packet can recover through a world reset. Unknown
+                    // opcodes still fail closed: they may indicate an unsupported wire format.
+                    if self.replacement_deltas()
+                        && self.signon == Signon::Active
+                        && matches!(
+                            e,
+                            svc::ParseError::Underflow(_) | svc::ParseError::InvalidPayload { .. }
+                        )
+                    {
+                        eprintln!("rtx-client: rejected RD packet ({e}); requesting a world reset");
+                        continue;
+                    }
                     // Losing our place in the byte stream is not survivable: everything after the
                     // misread byte is fiction. Say exactly what happened, with the bytes, and drop
                     // the connection rather than play on a hallucinated world.
@@ -573,12 +613,39 @@ impl Session {
                     return Ok(out);
                 }
             };
-            for ev in events {
-                self.handle(&ev, host);
-                out.push(ev);
-            }
+            out.extend(events);
         }
         self.retry_handshake();
+        Ok(out)
+    }
+
+    /// Parse the entire datagram before publishing any events or protocol changes. A truncated
+    /// tail must not acknowledge a partially decoded RD world as a usable delta base.
+    fn decode_payload(&mut self, payload: &[u8], host: &NetHost) -> Result<Vec<SvcEvent>, svc::ParseError> {
+        let mut proto = self.proto;
+        let events = match svc::parse(&mut proto, payload) {
+            Ok(events) => events,
+            Err(error) => {
+                self.rd_frames.invalidate();
+                return Err(error);
+            }
+        };
+        self.proto = proto;
+        let mut out = Vec::new();
+        for event in events {
+            self.handle(&event, host);
+            if matches!(event, SvcEvent::ReplacementEntities(_)) {
+                if !self.rd_frames.retained().can_delta() {
+                    continue;
+                }
+                out.extend(
+                    self.replacement_players()
+                        .into_iter()
+                        .map(|p| SvcEvent::PlayerInfo(Box::new(p))),
+                );
+            }
+            out.push(event);
+        }
         Ok(out)
     }
 
@@ -659,6 +726,7 @@ impl Session {
                 self.sounds.clear();
                 self.models.clear();
                 self.frames.clear();
+                self.rd_frames.clear();
                 self.download = None;
                 self.server_download = None;
                 self.signon = Signon::Loading;
@@ -707,8 +775,35 @@ impl Session {
             SvcEvent::Download(message) if self.signon == Signon::Downloading => {
                 self.handle_server_download(message, host);
             }
-            SvcEvent::SpawnBaseline { entity, baseline } => self.frames.set_baseline(*entity, *baseline),
-            SvcEvent::SpawnBaselineDelta { entity, delta } => self.frames.set_baseline_delta(*entity, delta),
+            SvcEvent::SpawnBaseline { entity, baseline } => {
+                if self.replacement_deltas() {
+                    if let Err(error) = self.rd_frames.set_baseline(*entity, *baseline) {
+                        eprintln!("rtx-client: {error}");
+                        self.rd_frames.invalidate();
+                    }
+                } else {
+                    self.frames.set_baseline(*entity, *baseline);
+                }
+            }
+            SvcEvent::SpawnReplacementBaseline { entity, delta } => {
+                if let Err(error) = self.rd_frames.set_replacement_baseline(*entity, delta) {
+                    eprintln!("rtx-client: {error}");
+                    self.rd_frames.invalidate();
+                }
+            }
+            SvcEvent::ReplacementEntities(frame) => match self.rd_frames.apply(self.chan.incoming_sequence, frame) {
+                Ok(rtx_proto::rd_state::Applied::Published) => {
+                    self.frames_at = Instant::now();
+                    if self.signon == Signon::Loading {
+                        self.signon = Signon::Active;
+                    }
+                }
+                Ok(rtx_proto::rd_state::Applied::AwaitingReset) => {}
+                Err(error) => {
+                    eprintln!("rtx-client: {error}; requesting a world reset");
+                }
+            },
+            SvcEvent::SpawnBaselineDelta { entity, delta } => self.frames.set_baseline_delta(u32::from(*entity), delta),
             SvcEvent::PacketEntities(pe) => {
                 let (seq, outgoing) = (self.chan.incoming_sequence, self.chan.outgoing_sequence);
                 if self.frames.apply(seq, outgoing, pe.delta_from, &pe.updates) == Applied::Stale {
@@ -909,6 +1004,7 @@ impl Session {
                     self.server_download = None;
                     self.signon = Signon::Changing;
                     self.frames.clear();
+                    self.rd_frames.clear();
                 }
                 // Restart the signon on the same connection.
                 "reconnect" => {
@@ -966,7 +1062,7 @@ impl Session {
             // Naming a frame we have lets the server compress the next update against it. After a
             // stale delta — or once the server's own ring would have rolled past our base — we name
             // nothing, which is how a client asks for a full update.
-            self.frames.delta_sequence(sequence),
+            self.delta_request(),
         );
         self.transmit(&payload)
     }
@@ -1386,7 +1482,7 @@ mod tests {
     }
 
     /// The server can ask mid-session which extensions we speak. Unlike `connect`, the reply names
-    /// every family — and reports what was *negotiated*, not what we'd have liked.
+    /// every family. Report negotiated nonzero masks, or our capabilities for a family not yet enabled.
     #[test]
     fn cmd_pext_is_answered_with_all_three_families() {
         let mut s = session();
@@ -1402,9 +1498,10 @@ mod tests {
         assert_eq!(
             sent,
             format!(
-                "pext 0x{:x} 0x8 0x{:x} 0x0 0x{:x} 0x{:x}",
+                "pext 0x{:x} 0x8 0x{:x} 0x{:x} 0x{:x} 0x{:x}",
                 magic::FTE,
                 magic::FTE2,
+                protocol::FTE2,
                 magic::MVD1,
                 protocol::MVD1
             ),
@@ -1576,5 +1673,132 @@ mod tests {
                 assert_eq!(s.sounds[i], format!("s{i}.wav"));
             }
         }
+    }
+
+    #[test]
+    fn replacement_frames_activate_only_after_reset_and_retain_omitted_players() {
+        use rtx_proto::rd::{Delta, Frame, Update};
+        let mut s = session();
+        let h = host();
+        s.proto.fte2 = protocol::fte2::REPLACEMENTDELTAS;
+        s.signon = Signon::Loading;
+        s.handle(
+            &SvcEvent::ReplacementEntities(Frame {
+                time: 1.0,
+                updates: vec![],
+            }),
+            &h,
+        );
+        assert_eq!(s.signon, Signon::Loading);
+        assert_eq!(s.delta_request(), None);
+        let first = Frame {
+            time: 2.0,
+            updates: vec![
+                Update::ResetWorld,
+                Update::Change {
+                    entity: 1,
+                    delta: Delta {
+                        origin: [Some(8.0), None, None],
+                        ..Default::default()
+                    },
+                },
+            ],
+        };
+        s.handle(&SvcEvent::ReplacementEntities(first), &h);
+        assert_eq!(s.signon, Signon::Active);
+        assert_eq!(s.replacement_players()[0].origin.x, 8.0);
+        s.handle(
+            &SvcEvent::ReplacementEntities(Frame {
+                time: 2.1,
+                updates: vec![],
+            }),
+            &h,
+        );
+        assert_eq!(s.replacement_players().len(), 1, "omission is still in PVS");
+        s.handle(
+            &SvcEvent::ReplacementEntities(Frame {
+                time: 2.2,
+                updates: vec![Update::Remove(1)],
+            }),
+            &h,
+        );
+        assert!(s.replacement_players().is_empty());
+        s.handle(&SvcEvent::ServerData(Box::default()), &h);
+        assert_eq!(s.delta_request(), None);
+        assert!(s.replacement_players().is_empty());
+    }
+
+    #[test]
+    fn invalid_classic_baseline_rejects_the_whole_replacement_packet() {
+        use rtx_proto::sizebuf::Writer;
+        let mut s = session();
+        let h = host();
+        s.proto.fte2 = protocol::fte2::REPLACEMENTDELTAS;
+        s.signon = Signon::Loading;
+        let mut w = Writer::new();
+        w.u8(86);
+        w.bytes(&1.0f32.to_le_bytes());
+        w.u16(0x8000); // reset
+        w.u16(1);
+        w.u8(0); // player1, default delta
+        w.u16(0);
+        s.decode_payload(&w.into_vec(), &h).unwrap();
+        assert!(s.rd_frames.retained().get(1).is_some());
+        assert_eq!(s.signon, Signon::Active);
+
+        let mut w = Writer::new();
+        w.u8(86);
+        w.bytes(&2.0f32.to_le_bytes());
+        w.u16(0x8001); // valid removal must not be published before a later bad baseline
+        w.u16(0);
+        w.u8(svc::op::SPAWNBASELINE);
+        w.u16(16384);
+        w.bytes(&[0; 13]);
+        assert!(matches!(
+            s.decode_payload(&w.into_vec(), &h),
+            Err(svc::ParseError::InvalidPayload { offset: 9, .. })
+        ));
+        assert!(s.rd_frames.retained().get(1).is_some());
+        assert_eq!(s.rd_frames.retained().time(), 1.0);
+        assert_eq!(s.delta_request(), None);
+    }
+
+    #[test]
+    fn malformed_replacement_tail_keeps_last_world_and_requests_reset() {
+        use rtx_proto::sizebuf::Writer;
+        let mut s = session();
+        let h = host();
+        s.proto.fte2 = protocol::fte2::REPLACEMENTDELTAS;
+        s.signon = Signon::Loading;
+        let mut w = Writer::new();
+        w.u8(86);
+        w.bytes(&1.0f32.to_le_bytes());
+        w.u16(0x8000);
+        w.u16(0);
+        s.decode_payload(&w.into_vec(), &h).unwrap();
+        assert_eq!(s.signon, Signon::Active);
+        assert!(s.delta_request().is_some());
+        let mut w = Writer::new();
+        w.u8(86);
+        w.bytes(&2.0f32.to_le_bytes());
+        w.u16(0);
+        w.u8(svc::op::PRINT); // valid RD frame followed by incomplete message
+        assert!(s.decode_payload(&w.into_vec(), &h).is_err());
+        assert_eq!(s.rd_frames.retained().time(), 1.0);
+        assert_eq!(s.delta_request(), None);
+        let mut w = Writer::new();
+        w.u8(86);
+        w.bytes(&3.0f32.to_le_bytes());
+        w.u16(0);
+        assert!(s.decode_payload(&w.into_vec(), &h).unwrap().is_empty());
+        assert_eq!(s.rd_frames.retained().time(), 1.0);
+        let mut w = Writer::new();
+        w.u8(86);
+        w.bytes(&4.0f32.to_le_bytes());
+        w.u16(0x8000);
+        w.u16(0);
+        s.decode_payload(&w.into_vec(), &h).unwrap();
+        assert!(s.delta_request().is_some());
+        assert_eq!(s.rd_frames.retained().time(), 4.0);
     }
 }

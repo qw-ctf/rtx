@@ -30,5 +30,7 @@ pub mod netchan;
 pub mod nq;
 pub mod oob;
 pub mod protocol;
+pub mod rd;
+pub mod rd_state;
 pub mod sizebuf;
 pub mod svc;

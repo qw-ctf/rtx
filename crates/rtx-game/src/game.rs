@@ -179,7 +179,7 @@ impl GameState {
     /// The game as a server's module: the engine hands us its syscall, and we hand back
     /// [`game_data`](Self::game_data) so it can write our entity array directly.
     pub fn new(syscall: SyscallFn) -> Self {
-        Self::with_host(|ents| HostApi::new(syscall, ents))
+        Self::with_host(MAX_EDICTS, |ents| HostApi::new(syscall, ents))
     }
 
     /// The game inside a network client: no engine, no syscall — the world arrives over UDP and
@@ -190,11 +190,13 @@ impl GameState {
     /// costs a few pointers and keeps one constructor rather than two that drift.
     #[cfg(feature = "netclient")]
     pub(crate) fn new_client(host: &'static dyn crate::host::ClientHost) -> Self {
-        Self::with_host(|ents| HostApi::new_client(host, ents))
+        Self::with_host(crate::netclient::CLIENT_ENTITY_CAPACITY, |ents| {
+            HostApi::new_client(host, ents)
+        })
     }
 
-    fn with_host(make_host: impl FnOnce(*mut Entity) -> HostApi) -> Self {
-        let mut entities = Entities::new(MAX_EDICTS);
+    fn with_host(entity_capacity: usize, make_host: impl FnOnce(*mut Entity) -> HostApi) -> Self {
+        let mut entities = Entities::new(entity_capacity);
         let host = make_host(entities.as_mut_ptr());
         let mut globals = Box::new(GlobalVars::default());
         // Declare the extended `maxspeed` field so the engine can seed each client's move-speed
@@ -218,7 +220,7 @@ impl GameState {
             global: globals.as_mut() as *mut GlobalVars,
             fields: fields.as_ptr(),
             api_version: GAME_API_VERSION,
-            maxentities: MAX_EDICTS as i32,
+            maxentities: entity_capacity as i32,
         };
 
         GameState {
@@ -249,7 +251,7 @@ impl GameState {
             normal_bot_drive_logged: false,
             bot_prof: bot::prof::BotProf::default(),
             bot_pool: bot::par::BotPool::default(),
-            oracle: bot::oracle::OracleRuntime::default(),
+            oracle: bot::oracle::OracleRuntime::with_entity_capacity(entity_capacity),
             pending_roster: None,
             dyn_assets: DynAssets::default(),
             control: crate::control::ControlState::default(),
@@ -438,6 +440,10 @@ impl GameState {
         let prev = crate::SUPPRESS_CLEAR_EDICT.swap(true, atomic::Ordering::Relaxed);
         let raw = self.host.spawn();
         crate::SUPPRESS_CLEAR_EDICT.store(prev, atomic::Ordering::Relaxed);
+        assert!(
+            raw > 0 && (raw as usize) < self.entities.len(),
+            "entity allocation failed: no free entity slots"
+        );
         let id = EntId(raw as u32);
         self.entities[id].reset();
         self.setup_string_refs(id);
@@ -583,13 +589,13 @@ impl GameState {
     /// returning a `Vec` is cleaner and avoids mutating shared state).
     pub(crate) fn find_radius(&self, org: Vec3, rad: f32) -> Vec<EntId> {
         let mut out = Vec::new();
-        for (i, e) in self.entities.iter().enumerate() {
-            if !e.in_use || e.v.solid == defs::Solid::Not {
+        for (id, e) in self.entities.occupied() {
+            if e.v.solid == defs::Solid::Not {
                 continue;
             }
             let center = e.v.origin + (e.v.mins + e.v.maxs) * 0.5;
             if (org - center).length() <= rad {
-                out.push(EntId(i as u32));
+                out.push(id);
             }
         }
         out
@@ -870,11 +876,7 @@ impl GameState {
     /// Live entities satisfying `pred` — the shared body of the `find_by_*` selectors (the QuakeC
     /// `find(...)` scan). `pred` sees only entities already known to be `in_use`.
     pub(crate) fn find_where<'a>(&'a self, pred: impl Fn(&Entity) -> bool + 'a) -> impl Iterator<Item = EntId> + 'a {
-        self.entities
-            .iter()
-            .enumerate()
-            .filter(move |(_, e)| e.in_use && pred(e))
-            .map(|(i, _)| EntId(i as u32))
+        self.entities.occupied().filter(move |(_, e)| pred(e)).map(|(id, _)| id)
     }
 
     /// Live entities whose classname matches `name` (the QuakeC `find(... classname ...)`).
@@ -887,4 +889,41 @@ impl GameState {
 /// never contain one). Used wherever we pass an owned model/message/sound string.
 pub(crate) fn cstring(s: &str) -> CString {
     CString::new(s.replace('\0', "")).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_entity_handshake_keeps_the_2048_slot_contract() {
+        unsafe extern "C" fn unused_syscall(_: isize) -> isize {
+            unreachable!("construction does not call the engine")
+        }
+        // The constructor only retains this pointer; no variadic call is made in this test.
+        let syscall: SyscallFn =
+            unsafe { core::mem::transmute::<unsafe extern "C" fn(isize) -> isize, SyscallFn>(unused_syscall) };
+        let game = GameState::new(syscall);
+        assert_eq!(game.entities.len(), 2048);
+        assert_eq!(game.game_data.maxentities, 2048);
+        assert_eq!(game.game_data.sizeofent as usize, core::mem::size_of::<Entity>());
+    }
+
+    #[cfg(feature = "netclient")]
+    #[test]
+    fn client_wire_and_shadow_entities_have_disjoint_storage() {
+        let host = Box::leak(Box::new(crate::netclient::host::NetHost::new("/nonexistent".into())));
+        let mut game = GameState::new_client(host);
+        assert_eq!(game.entities.len(), 32768);
+        game.entities[EntId(16383)].v.health = 31.0;
+        let shadow = game.spawn();
+        assert_eq!(shadow, EntId(32767));
+        game.entities[shadow].v.health = 47.0;
+        assert_eq!(game.entities[EntId(16383)].v.health, 31.0);
+        for index in [16383, 16384, 32767] {
+            let id = EntId(index);
+            assert!(id.to_prog() >= 0);
+            assert_eq!(EntId::from_prog(id.to_prog()), id);
+        }
+    }
 }

@@ -78,8 +78,8 @@ pub mod fte {
 pub mod fte2 {
     /// Speex voice chat. **Not advertised** — no audio.
     pub const VOICECHAT: u32 = 0x0000_0002;
-    /// The `svc_fte_updateentities` delta stream. **Not advertised** — qualia doesn't take it
-    /// either, and it replaces the entity encoding wholesale.
+    /// The persistent `svc_fte_updateentities` delta stream. Decoded independently of the
+    /// classic packetentity ring; advertised only after client integration is enabled.
     pub const REPLACEMENTDELTAS: u32 = 0x0000_0008;
 }
 
@@ -147,9 +147,8 @@ pub const FTE: u32 = fte::TRANS
     | fte::PACKETENTITIES_256
     | fte::CHUNKEDDOWNLOADS;
 
-/// The FTE2 extensions this client advertises: none. Both bits in that mask (voice, replacement
-/// deltas) would change what we must parse without giving a bot anything.
-pub const FTE2: u32 = 0;
+/// Base replacement deltas only: no CSQC, VR, or extended prediction/state-size profile.
+pub const FTE2: u32 = fte2::REPLACEMENTDELTAS;
 
 /// The MVDSV extensions this client advertises. `FLOATCOORDS` for origin precision and
 /// `HIGHLAGTELEPORT` so a teleport doesn't send us walking the wrong way for a round-trip; the
@@ -307,14 +306,14 @@ mod tests {
     #[test]
     fn advertised_masks_are_what_we_parse() {
         assert_eq!(FTE, 0x2148_f2c8);
-        assert_eq!(FTE2, 0);
+        assert_eq!(FTE2, fte2::REPLACEMENTDELTAS);
         assert_eq!(MVD1, 0b11);
         assert_eq!(Z_EXT, 0x1ff);
 
         assert_ne!(FTE & fte::CHUNKEDDOWNLOADS, 0);
-        // The two we deliberately don't ask for, because each would change parsing.
+        // RD is supported; unrelated client-side code and prediction extensions stay out.
         assert_eq!(FTE & fte::CSQC, 0);
-        assert_eq!(FTE2 & fte2::REPLACEMENTDELTAS, 0);
+        assert_ne!(FTE2 & fte2::REPLACEMENTDELTAS, 0);
     }
 
     /// `FLOATCOORDS` is the one negotiated bit that re-sizes the reader. Both directions matter:

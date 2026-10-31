@@ -1595,21 +1595,20 @@ pub(crate) fn projectile_dodge(game: &mut GameState, e: EntId, origin: Vec3, now
     let eye = origin + VEC_VIEW_OFS;
     let live: Vec<_> = game
         .entities
-        .iter()
-        .enumerate()
-        .filter_map(|(i, ent)| {
+        .occupied()
+        .filter_map(|(id, ent)| {
             matches!(
                 ent.touch,
                 Touch::Missile | Touch::Grenade | Touch::Spike | Touch::SuperSpike
             )
             .then_some((
-                EntId(i as u32),
+                id,
                 ent.touch,
                 ent.v.origin,
                 ent.v.velocity,
                 ent.owner(),
                 ent.v.nextthink,
-                ent.in_use && ent.combat.voided == 0.0,
+                ent.combat.voided == 0.0,
             ))
         })
         // Own rockets/nails cannot turn back; own grenades can bounce back into their thrower and
@@ -1854,10 +1853,9 @@ pub(crate) fn grenade_tactics(
     }
     let live: Vec<EntId> = game
         .entities
-        .iter()
-        .enumerate()
-        .filter(|(_, ent)| ent.classname() == Some("grenade") && ent.in_use && ent.combat.voided == 0.0)
-        .map(|(i, _)| EntId(i as u32))
+        .occupied()
+        .filter(|(_, ent)| ent.classname() == Some("grenade") && ent.combat.voided == 0.0)
+        .map(|(id, _)| id)
         .collect();
     if live.is_empty() {
         return false;

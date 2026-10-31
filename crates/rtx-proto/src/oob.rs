@@ -389,7 +389,7 @@ mod tests {
         // Chunked downloads are now part of the promise; unrelated unimplemented bits stay out.
         assert_ne!(n.fte & protocol::fte::CHUNKEDDOWNLOADS, 0);
         assert_eq!(n.fte & protocol::fte::CSQC, 0);
-        assert_eq!(n.fte2, 0);
+        assert_eq!(n.fte2, protocol::fte2::REPLACEMENTDELTAS);
         assert_eq!(n.mvd1 & protocol::mvd1::SIMPLEPROJECTILE, 0);
 
         // A server offering nothing yields nothing.
@@ -504,5 +504,11 @@ mod tests {
         );
         // And no UTF-8 lead byte (0xc3) smuggled a two-byte sequence in.
         assert!(!pkt.contains(&0xc3), "name was UTF-8 encoded, not latin-1");
+    }
+    #[test]
+    fn replacement_deltas_does_not_require_sounddbl() {
+        let n = Negotiated::intersect(0, protocol::fte2::REPLACEMENTDELTAS, 0);
+        assert_eq!(n.fte, 0);
+        assert_eq!(n.fte2, protocol::fte2::REPLACEMENTDELTAS);
     }
 }

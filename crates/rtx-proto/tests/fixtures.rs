@@ -160,6 +160,9 @@ fn replays_a_captured_session() {
 fn kind(ev: &SvcEvent) -> String {
     match ev {
         SvcEvent::Nop => "nop",
+        SvcEvent::ReplacementEntities(_) => "replacemententities",
+        SvcEvent::SpawnReplacementBaseline { .. } => "replacementbaseline",
+        SvcEvent::SpawnReplacementStatic(_) => "replacementstatic",
         SvcEvent::Disconnect => "disconnect",
         SvcEvent::Print { .. } => "print",
         SvcEvent::CenterPrint(_) => "centerprint",

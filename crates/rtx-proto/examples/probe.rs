@@ -421,6 +421,9 @@ fn report(
 fn name_of(ev: &SvcEvent) -> &'static str {
     match ev {
         SvcEvent::Nop => "nop",
+        SvcEvent::ReplacementEntities(_) => "replacemententities",
+        SvcEvent::SpawnReplacementBaseline { .. } => "replacementbaseline",
+        SvcEvent::SpawnReplacementStatic(_) => "replacementstatic",
         SvcEvent::Disconnect => "disconnect",
         SvcEvent::Print { .. } => "print",
         SvcEvent::CenterPrint(_) => "centerprint",
