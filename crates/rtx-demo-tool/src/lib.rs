@@ -127,7 +127,7 @@ pub struct Frame {
     /// where analysis must derive it from successive origins ([`analysis::Track`] does).
     pub velocity: Option<Vec3>,
     /// The player's own input, when the format carries it: `PF_COMMAND` in a `.qwd`, or a hidden
-    /// `usercmd` block in an MVD.
+    /// `usercmd` block in an MVD. RD prediction hints alone do not supply a recorded command.
     pub command: Option<Usercmd>,
     /// Whether the recorder marked this player dead this frame.
     pub dead: bool,
@@ -455,6 +455,14 @@ impl Feed {
 
     fn push_player(&mut self, time: f32, info: svc::PlayerInfo, replacement: bool) {
         let velocity_present = (0..3).any(|i| info.flags & (svc::pf::VELOCITY1 << i) != 0);
+        let angles = info.command.map_or(Vec3::ZERO, |command| command.angles);
+        // RD's projected usercmd carries prediction/view state, not recorded buttons/impulse.
+        // MVD supplies real input on its hidden channel; QWD resolves local dem_cmd separately.
+        let command = if replacement {
+            self.pending_cmds[info.player as usize].take()
+        } else {
+            info.command
+        };
         if let Some(player) = self.players.get_mut(info.player as usize) {
             player.frames += 1;
         }
@@ -462,9 +470,9 @@ impl Feed {
             time,
             player: info.player,
             origin: info.origin,
-            angles: info.command.map_or(Vec3::ZERO, |command| command.angles),
+            angles,
             velocity: velocity_present.then_some(info.velocity),
-            command: info.command,
+            command,
             dead: info.dead(),
             on_ground: (replacement || self.proto.has_z_ext(rtx_proto::protocol::z_ext::PF_ONGROUND))
                 .then(|| info.on_ground()),
@@ -738,7 +746,7 @@ mod replacement_tests {
     }
 
     #[test]
-    fn rd_mvd_retains_omitted_players_and_publishes_full_prediction_fields() {
+    fn rd_demo_retains_player_state_without_fabricating_recorded_input() {
         let mut feed = feed(Format::Mvd);
         // Independent pinned-FTE payload includes frame300, weapon200, signedskin, predicted
         // movement/velocity and angle16. Player32 maps to slot31; entity16383 stays nonplayer.
@@ -757,11 +765,75 @@ mod replacement_tests {
             assert_eq!(frame.weaponframe, Some(200));
             assert_eq!(frame.velocity, Some(Vec3::new(100., -200., 300.)));
             assert!((frame.angles.x + 90.).abs() < 0.02);
-            let cmd = frame.command.unwrap();
-            assert_eq!((cmd.forward, cmd.side, cmd.up, cmd.msec), (100, -200, 300, 14));
+            assert!(frame.command.is_none(), "prediction fields are not a recorded usercmd");
             assert_eq!(frame.on_ground, Some(false));
         }
         assert_eq!((feed.frames[0].time, feed.frames[1].time), (1., 2.));
+    }
+
+    /// Append an MVD block; a zero audience mask carries hidden data rather than svc messages.
+    fn mvd_block(bytes: &mut Vec<u8>, elapsed: u8, hidden: bool, body: &[u8]) {
+        bytes.extend([elapsed, if hidden { mvd::dem::MULTIPLE } else { mvd::dem::ALL }]);
+        if hidden {
+            bytes.extend(0u32.to_le_bytes());
+        }
+        bytes.extend((body.len() as u32).to_le_bytes());
+        bytes.extend(body);
+    }
+
+    #[test]
+    fn rd_mvd_uses_recorded_hidden_input_once_including_zero_commands() {
+        let mut bytes = Vec::new();
+        mvd_block(&mut bytes, 0, false, &serverdata(Format::Mvd, true));
+        let mut cmd = vec![31, 0, 23]; // player, dropnum, msec
+        for angle in [10.0f32, 200.0, -15.0] {
+            cmd.extend(angle.to_le_bytes());
+        }
+        for movement in [400i16, -40, 12] {
+            cmd.extend(movement.to_le_bytes());
+        }
+        cmd.extend([3, 7]); // attack+jump, impulse
+        let mut hidden = (cmd.len() as u32).to_le_bytes().to_vec();
+        hidden.extend(mvd::hidden::USERCMD.to_le_bytes());
+        hidden.extend(&cmd);
+        mvd_block(&mut bytes, 0, true, &hidden);
+
+        let fixture = include_bytes!("../../rtx-proto/tests/fixtures/replacement_deltas/fte-base-2.bin");
+        let mut records = vec![0, 128, 32, 0];
+        records.extend(fixture);
+        mvd_block(&mut bytes, 100, false, &frame(10., &records));
+        mvd_block(&mut bytes, 100, false, &frame(11., &[]));
+
+        // An explicitly recorded all-zero command is present input, not an absent command.
+        let mut zero = vec![23, 0, 0, 0, 1, 0, 31]; // hidden length, type, player
+        zero.extend([0; 22]);
+        mvd_block(&mut bytes, 0, true, &zero);
+        mvd_block(&mut bytes, 100, false, &frame(12., &[]));
+        let demo = parse_mvd_bytes(&bytes, PathBuf::from("rd-hidden-input.mvd"));
+        assert!(demo.warnings.is_empty(), "{:?}", demo.warnings);
+        assert_eq!(demo.frames.len(), 3);
+        let first = &demo.frames[0];
+        let cmd = first
+            .command
+            .expect("hidden input must replace the synthetic prediction command");
+        assert_eq!(cmd.msec, 23);
+        assert_eq!(cmd.angles, Vec3::new(10.0, 200.0, -15.0));
+        assert_eq!(
+            (cmd.forward, cmd.side, cmd.up, cmd.buttons, cmd.impulse),
+            (400, -40, 12, 3, 7)
+        );
+        assert!((first.angles.x + 90.0).abs() < 0.02, "state angles still come from RD");
+        assert_eq!(first.velocity, Some(Vec3::new(100.0, -200.0, 300.0)));
+        assert!(
+            demo.frames[1].command.is_none(),
+            "one input must not be replayed on later retained frames"
+        );
+        let zero = demo.frames[2].command.expect("zero input is still present");
+        assert_eq!(
+            (zero.msec, zero.forward, zero.side, zero.up, zero.buttons, zero.impulse),
+            (0, 0, 0, 0, 0, 0)
+        );
+        assert_eq!(zero.angles, Vec3::ZERO);
     }
 
     #[test]
@@ -919,6 +991,7 @@ mod replacement_tests {
             assert!(demo.warnings.is_empty(), "{:?}", demo.warnings);
             assert_eq!(demo.frames.len(), 2);
             assert_eq!(demo.frames[0].player, 0);
+            assert!(demo.frames.iter().all(|frame| frame.command.is_none()));
             assert_eq!(demo.players[0].frames, 2);
             assert_eq!(demo.local_player, if format == Format::Qwd { Some(31) } else { None });
         }
