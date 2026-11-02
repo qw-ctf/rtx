@@ -52,6 +52,8 @@ pub mod fte {
     pub const SOUNDDBL: u32 = 0x0000_0080;
     /// No wire change — it stops FTE servers complaining that we might not grok a Half-Life BSP.
     pub const HLBSP: u32 = 0x0000_0200;
+    /// FTE QuakeWorld temporary effects: bullets, rail trails, beams and NQ-style impacts.
+    pub const TE_BULLET: u32 = 0x0000_0400;
     /// Model indices above 255: enables `svc_fte_modellistshort`, `U_FTE_MODELDBL`, and the
     /// skin-bit-7 model+256 encoding in `svc_playerinfo`.
     pub const MODELDBL: u32 = 0x0000_1000;
@@ -138,6 +140,7 @@ pub const FTE: u32 = fte::TRANS
     | fte::ACCURATE_TIMINGS
     | fte::SOUNDDBL
     | fte::HLBSP
+    | fte::TE_BULLET
     | fte::MODELDBL
     | fte::ENTITYDBL
     | fte::ENTITYDBL2
@@ -305,12 +308,13 @@ mod tests {
     /// totals makes adding a bit a deliberate, reviewable act rather than a merge artifact.
     #[test]
     fn advertised_masks_are_what_we_parse() {
-        assert_eq!(FTE, 0x2148_f2c8);
+        assert_eq!(FTE, 0x2148_f6c8);
         assert_eq!(FTE2, fte2::REPLACEMENTDELTAS);
         assert_eq!(MVD1, 0b11);
         assert_eq!(Z_EXT, 0x1ff);
 
         assert_ne!(FTE & fte::CHUNKEDDOWNLOADS, 0);
+        assert_ne!(FTE & fte::TE_BULLET, 0);
         // RD is supported; unrelated client-side code and prediction extensions stay out.
         assert_eq!(FTE & fte::CSQC, 0);
         assert_ne!(FTE2 & fte2::REPLACEMENTDELTAS, 0);

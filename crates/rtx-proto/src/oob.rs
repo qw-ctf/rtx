@@ -506,6 +506,21 @@ mod tests {
         assert!(!pkt.contains(&0xc3), "name was UTF-8 encoded, not latin-1");
     }
     #[test]
+    fn temp_entity_capability_is_negotiated_independently_of_rd() {
+        let te_bullet = protocol::fte::TE_BULLET;
+        for fte in [0, te_bullet] {
+            for fte2 in [0, protocol::fte2::REPLACEMENTDELTAS] {
+                let n = Negotiated::intersect(fte, fte2, 0);
+                assert_eq!((n.fte, n.fte2), (fte, fte2));
+                let packet = connect(4242, 31337, "\\name\\bot", &n);
+                let text = std::str::from_utf8(&packet[4..]).unwrap();
+                let line = format!("0x{:x} 0x{:x}\n", magic::FTE, te_bullet);
+                assert_eq!(text.contains(&line), fte != 0);
+            }
+        }
+    }
+
+    #[test]
     fn replacement_deltas_does_not_require_sounddbl() {
         let n = Negotiated::intersect(0, protocol::fte2::REPLACEMENTDELTAS, 0);
         assert_eq!(n.fte, 0);
