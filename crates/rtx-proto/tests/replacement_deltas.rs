@@ -633,6 +633,24 @@ fn player_projection_carries_prediction_signed_viewangles_and_full_width_state()
 }
 
 #[test]
+fn player_projection_preserves_server_camera_lock_and_move_flags() {
+    use rtx_proto::rd::{player_info, State};
+    use svc::PmType;
+
+    for flags in [0, 64, 128, 192] {
+        let state = State {
+            pmovetype: 15 | flags,
+            ..State::default()
+        };
+        let player = player_info(1, &state).unwrap();
+        assert_eq!(player.pm_type, Some(PmType::Lock));
+        assert_eq!(player.jump_held, flags & 64 != 0);
+        assert_eq!(player.on_ground(), flags & 128 != 0);
+        assert!(!player.dead());
+    }
+}
+
+#[test]
 fn player_projection_decodes_death_and_move_flags_without_guessing_gibs() {
     use rtx_proto::rd::{player_info, State};
     use svc::PmType;

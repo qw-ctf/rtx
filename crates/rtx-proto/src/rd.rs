@@ -472,6 +472,7 @@ pub fn player_info(entity: u32, state: &State) -> Option<crate::svc::PlayerInfo>
         5 => PmType::Fly,
         6 | 10 => PmType::Dead,
         8 => PmType::Spectator,
+        15 => PmType::Lock, // MVDSV/ezQuake server-controlled camera extension.
         _ => PmType::Normal,
     };
     let mut flags = pf::MSEC
