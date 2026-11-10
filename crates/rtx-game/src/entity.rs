@@ -13,7 +13,7 @@ use glam::Vec3;
 
 use crate::abi::{EntVars, STRING_REF_COUNT};
 use crate::assets::{Model, Sound};
-use crate::bot::state::BotState;
+use crate::bot::state::EntityBotState;
 use crate::mode::ModePlayer;
 
 /// A `Copy` index handle into the entity array. Never a borrow, so holding one across a
@@ -396,7 +396,7 @@ pub struct Entity {
     pub rot: RotState,
     pub bob: BobState,
     pub grapple: GrappleState,
-    pub bot: BotState,
+    pub bot: EntityBotState,
     pub refs: CustomRefs,
     pub combat: CombatState,
     pub item: ItemState,
