@@ -130,7 +130,8 @@ pub(crate) unsafe fn drain_roster(game: *mut GameState) {
                     is_bot: true,
                     client,
                     ..Default::default() // goal_cell None, route empty, etc. — a fresh blackboard
-                };
+                }
+                .into();
             }
         }
         RosterOp::Remove { client, slot } => {

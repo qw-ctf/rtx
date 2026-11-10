@@ -313,7 +313,8 @@ impl Mirror {
             is_bot: true,
             client,
             ..Default::default()
-        };
+        }
+        .into();
         ent.v.flags = ent.v.flags.with(Flags::CLIENT);
         ent.v.movetype = MoveType::Walk;
         ent.v.solid = Solid::SlideBox;

@@ -13,7 +13,7 @@ use glam::Vec3;
 
 use crate::abi::{EntVars, STRING_REF_COUNT};
 use crate::assets::{Model, Sound};
-use crate::bot::state::BotState;
+use crate::bot::state::EntityBotState;
 use crate::mode::ModePlayer;
 
 /// A `Copy` index handle into the entity array. Never a borrow, so holding one across a
@@ -396,7 +396,7 @@ pub struct Entity {
     pub rot: RotState,
     pub bob: BobState,
     pub grapple: GrappleState,
-    pub bot: BotState,
+    pub bot: EntityBotState,
     pub refs: CustomRefs,
     pub combat: CombatState,
     pub item: ItemState,
@@ -749,15 +749,20 @@ impl Entities {
     /// Membership must not grow during this phase: AI emits commands, not entity spawns.
     /// Fields are still read live, including `in_use`, so removals remain immediately visible.
     #[cfg(feature = "netclient")]
-    pub(crate) fn begin_client_frame(&mut self) {
+    pub(crate) fn begin_client_frame(&mut self, network_end: usize, shadow_start: usize) {
         debug_assert!(!self.client_frame);
+        assert!(network_end <= shadow_start && shadow_start <= self.slots.len());
         self.frame_live_ids.clear();
-        self.frame_live_ids.extend(
-            self.slots
-                .iter()
-                .enumerate()
-                .filter_map(|(i, e)| e.in_use.then_some(EntId(i as u32))),
-        );
+        // The network prefix grows with observed IDs; local allocation descends from the top.
+        // The gap between them has never been used in this map epoch.
+        for (start, end) in [(0, network_end), (shadow_start, self.slots.len())] {
+            self.frame_live_ids.extend(
+                self.slots[start..end]
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, e)| e.in_use.then_some(EntId((start + i) as u32))),
+            );
+        }
         self.client_frame = true;
     }
 
@@ -848,15 +853,18 @@ mod tests {
     #[cfg(feature = "netclient")]
     #[test]
     fn client_frame_keeps_high_network_and_shadow_ids_in_order() {
-        let mut entities = Entities::new(32768);
-        for id in [EntId(32767), EntId(16383), EntId::WORLD] {
+        let mut entities = Entities::new(65536);
+        for id in [EntId(65535), EntId(32768), EntId(32767), EntId::WORLD] {
             entities[id].reset();
         }
-        entities.begin_client_frame();
-        assert_eq!(entities.live().map(|(id, _)| id.0).collect::<Vec<_>>(), [16383, 32767]);
+        entities.begin_client_frame(32768, 32768);
+        assert_eq!(
+            entities.live().map(|(id, _)| id.0).collect::<Vec<_>>(),
+            [32767, 32768, 65535]
+        );
         assert_eq!(
             entities.occupied().map(|(id, _)| id.0).collect::<Vec<_>>(),
-            [0, 16383, 32767]
+            [0, 32767, 32768, 65535]
         );
         entities.end_client_frame();
     }
@@ -866,7 +874,7 @@ mod tests {
     fn client_frame_reads_current_fields_and_refreshes_after_slot_reuse() {
         let mut entities = Entities::new(8);
         entities[EntId(3)].reset();
-        entities.begin_client_frame();
+        entities.begin_client_frame(entities.len(), entities.len());
         entities[EntId(3)].v.origin.x = 42.0;
         assert_eq!(entities.live().next().unwrap().1.v.origin.x, 42.0);
         entities[EntId(3)].in_use = false;
@@ -877,15 +885,42 @@ mod tests {
         entities[EntId(3)].reset();
         entities[EntId(5)].reset();
         assert_eq!(entities.live().map(|(id, _)| id.0).collect::<Vec<_>>(), [3, 5]);
-        entities.begin_client_frame();
+        entities.begin_client_frame(entities.len(), entities.len());
         assert_eq!(entities.live().map(|(id, _)| id.0).collect::<Vec<_>>(), [3, 5]);
         entities.end_client_frame();
 
         // A new map can reuse different slots without inheriting the previous frame's members.
         entities.fill_with(Entity::default);
         entities[EntId(2)].reset();
-        entities.begin_client_frame();
+        entities.begin_client_frame(entities.len(), entities.len());
         assert_eq!(entities.live().map(|(id, _)| id.0).collect::<Vec<_>>(), [2]);
+        entities.end_client_frame();
+    }
+
+    #[cfg(feature = "netclient")]
+    #[test]
+    fn client_frame_scans_only_the_network_prefix_and_local_suffix() {
+        let mut entities = Entities::new(12);
+        for id in [0, 2, 5, 9, 11] {
+            entities[EntId(id)].reset();
+        }
+        // Slot 5 represents the unused gap; neither caller-owned range contains it.
+        entities.begin_client_frame(3, 9);
+        assert_eq!(
+            entities.occupied().map(|(id, _)| id.0).collect::<Vec<_>>(),
+            [0, 2, 9, 11]
+        );
+        entities.end_client_frame();
+        assert_eq!(entities.live().map(|(id, _)| id.0).collect::<Vec<_>>(), [2, 5, 9, 11]);
+
+        entities.begin_client_frame(0, 12);
+        assert_eq!(entities.occupied().count(), 0, "both ranges can be empty");
+        entities.end_client_frame();
+        entities.begin_client_frame(5, 5);
+        assert_eq!(
+            entities.occupied().map(|(id, _)| id.0).collect::<Vec<_>>(),
+            [0, 2, 5, 9, 11]
+        );
         entities.end_client_frame();
     }
 

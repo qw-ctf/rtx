@@ -1002,7 +1002,7 @@ mod replacement_tests {
         let mut feed = feed(Format::Mvd);
         feed.packet(1., &frame(10., &[0, 128, 1, 0, 0]), 0);
         let mut packet = frame(11., &[1, 128]);
-        packet.extend([op::SPAWNBASELINE, 0, 64]); // legal ordinary ref, exceeds application slots.
+        packet.extend([op::SPAWNBASELINE, 128, 128, 0]); // Ordinary reference 32768 exceeds application slots.
         packet.extend([0; 13]);
         feed.packet(2., &packet, 100);
         assert!(feed.rd.get(1).is_some());

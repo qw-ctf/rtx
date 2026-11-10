@@ -1085,7 +1085,8 @@ fn feed_forward(game: &mut GameState, e: EntId, now: f32, skill: f32, clean: Vec
     // to frame and the aim visibly shakes — worst airborne, where a duel's angular rates peak.
     // Smoothing over ~0.1s still tracks a strafer's swing while averaging the noise away.
     let t = (LEAD_RATE_SMOOTH * frametime).min(1.0);
-    b.aim.rate += (rate - b.aim.rate) * t;
+    let previous_rate = b.aim.rate;
+    b.aim.rate += (rate - previous_rate) * t;
     b.aim.rate * (2.0 / aim_omega(skill)) * (skill / 7.0)
 }
 

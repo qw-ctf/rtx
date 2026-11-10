@@ -1752,7 +1752,8 @@ mod tests {
         w.u16(0x8001); // valid removal must not be published before a later bad baseline
         w.u16(0);
         w.u8(svc::op::SPAWNBASELINE);
-        w.u16(16384);
+        w.u16(0x8080); // Ordinary extended reference 32768, outside the retained world.
+        w.u8(0);
         w.bytes(&[0; 13]);
         assert!(matches!(
             s.decode_payload(&w.into_vec(), &h),

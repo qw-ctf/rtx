@@ -1379,7 +1379,8 @@ fn resolve_objective(game: &mut GameState, e: EntId, now: f32, origin: Vec3) -> 
     };
     if chasing && game.entities[e].bot.gate.errand.is_none() && now - game.entities[e].bot.goal.since > giveup {
         let b = &mut game.entities[e].bot;
-        b.mark_avoid(b.goal.item, now + GOAL_AVOID_TIME);
+        let avoided_item = b.goal.item;
+        b.mark_avoid(avoided_item, now + GOAL_AVOID_TIME);
         b.goal.item = 0;
         b.goal.next_item = 0;
         b.goal.commit = GoalCommit::None;
@@ -2609,7 +2610,7 @@ fn nearest_human(game: &GameState, bot_e: EntId) -> Option<EntId> {
 /// a slot reused by a future human isn't mistaken for a bot.
 pub fn on_disconnect(ent: &mut Entity) {
     if ent.bot.is_bot {
-        ent.bot = BotState::default();
+        ent.bot = Default::default();
     }
 }
 

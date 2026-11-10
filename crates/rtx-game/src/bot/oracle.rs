@@ -2550,19 +2550,19 @@ mod tests {
             recipient: 1,
             kind: NuggetKind::Rearm,
             target_cell: 9,
-            subject: 32767,
+            subject: 65535,
             confidence: 0.8,
             decision_at: 20.0,
             evidence_at: 18.0,
             expires_at: 24.0,
         });
         inbox.mark_applied(inbox.best(20.0).unwrap());
-        set_revision(&mut game.oracle.evidence_revision[1], 32767, 19.0);
+        set_revision(&mut game.oracle.evidence_revision[1], 65535, 19.0);
         let cancelled = inbox.retain_live(4, 20.1, &game.oracle.evidence_revision[1]);
         assert!(cancelled.is_some());
         assert!(inbox.best(20.1).is_none());
         game.oracle.bump_epoch();
-        assert_eq!(game.oracle.evidence_revision[1].get(32767), Some(&0.0));
+        assert_eq!(game.oracle.evidence_revision[1].get(65535), Some(&0.0));
     }
 
     /// The rebuild call now reads the equipment gap rather than counting heads, and holds its state

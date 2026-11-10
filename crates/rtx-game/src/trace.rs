@@ -255,11 +255,11 @@ mod tests {
         let mut g = game();
         open_world(&mut g);
         let ig = shooter(&mut g);
-        let network = box_ent(&mut g, 16383, Vec3::new(100.0, 0.0, 0.0));
-        let shadow = box_ent(&mut g, 32767, Vec3::new(100.0, 0.0, 0.0));
+        let network = box_ent(&mut g, 32767, Vec3::new(100.0, 0.0, 0.0));
+        let shadow = box_ent(&mut g, 65535, Vec3::new(100.0, 0.0, 0.0));
         let dense = g.sv_trace(Vec3::ZERO, HORIZ, false, ig);
         assert_eq!(dense.ent, network, "equal hits keep the ascending-ID winner");
-        g.entities.begin_client_frame();
+        g.entities.begin_client_frame(32768, 65535);
         let indexed = g.sv_trace(Vec3::ZERO, HORIZ, false, ig);
         assert_eq!(indexed.ent, dense.ent);
         assert_eq!(indexed.fraction, dense.fraction);
@@ -279,7 +279,7 @@ mod tests {
 
         g.entities[network].reset();
         g.entities[network].v.solid = Solid::Not;
-        g.entities.begin_client_frame();
+        g.entities.begin_client_frame(32768, 65535);
         assert_eq!(g.sv_trace(Vec3::ZERO, HORIZ, false, ig).ent, shadow);
         g.entities.end_client_frame();
     }

@@ -41,6 +41,42 @@ pub struct StallRecord {
 /// letting an unobserved server grow a log it will never ship.
 pub const STALL_BUF_CAP: usize = 4;
 
+/// Client entities allocate private AI state on first mutation. Read-only access to unused
+/// slots shares an immutable default; clearing an entity releases its private allocation.
+#[cfg(feature = "netclient")]
+#[derive(Default)]
+pub struct EntityBotState(Option<Box<BotState>>);
+
+/// Server-module entities retain their existing inline AI state and layout.
+#[cfg(not(feature = "netclient"))]
+pub type EntityBotState = BotState;
+
+#[cfg(feature = "netclient")]
+impl From<BotState> for EntityBotState {
+    fn from(state: BotState) -> Self {
+        Self(Some(Box::new(state)))
+    }
+}
+
+#[cfg(feature = "netclient")]
+impl core::ops::Deref for EntityBotState {
+    type Target = BotState;
+
+    fn deref(&self) -> &BotState {
+        static EMPTY: std::sync::OnceLock<BotState> = std::sync::OnceLock::new();
+        self.0
+            .as_deref()
+            .unwrap_or_else(|| EMPTY.get_or_init(BotState::default))
+    }
+}
+
+#[cfg(feature = "netclient")]
+impl core::ops::DerefMut for EntityBotState {
+    fn deref_mut(&mut self) -> &mut BotState {
+        self.0.get_or_insert_with(|| Box::new(BotState::default()))
+    }
+}
+
 /// Per-bot navigation/AI state, on the bot's client edict (`1..=maxclients`). Non-bot edicts
 /// keep this at its `Default` (`is_bot == false`). See [`crate::bot`].
 #[derive(Default)]
@@ -854,6 +890,52 @@ pub enum HookPhase {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "netclient")]
+    #[test]
+    fn lazy_state_shares_only_immutable_defaults() {
+        let mut a = EntityBotState::default();
+        let b = EntityBotState::default();
+        assert!(!a.is_bot);
+        assert!(a.route.is_empty());
+        assert!(a.0.is_none() && b.0.is_none(), "reads must not allocate per entity");
+        assert!(core::ptr::eq(&*a, &*b));
+
+        a.is_bot = true;
+        a.route.push(42);
+        assert!(a.0.is_some());
+        assert!(!b.is_bot && b.route.is_empty());
+        assert!(b.0.is_none());
+        let address = &*a as *const BotState;
+        a.client = 7;
+        assert_eq!(&*a as *const BotState, address, "reuse the allocation on later writes");
+
+        a = EntityBotState::default();
+        assert!(a.0.is_none());
+        assert!(!a.is_bot && a.route.is_empty());
+        assert!(core::ptr::eq(&*a, &*b));
+    }
+
+    #[cfg(feature = "netclient")]
+    #[test]
+    fn explicit_state_survives_lazy_conversion_and_entity_clear() {
+        let mut entity = crate::entity::Entity::default();
+        entity.bot = BotState {
+            is_bot: true,
+            client: 3,
+            route: vec![1, 2],
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(entity.bot.client, 3);
+        assert_eq!(entity.bot.route, [1, 2]);
+        crate::bot::on_disconnect(&mut entity);
+        assert!(entity.bot.0.is_none(), "disconnect releases the private state");
+        entity.bot.route.push(5);
+        entity.reset();
+        assert!(entity.bot.0.is_none(), "entity reset releases state too");
+        assert!(entity.bot.route.is_empty());
+    }
 
     #[test]
     fn taken_goal_promotes_its_continuation_and_avoids_for_the_picker() {

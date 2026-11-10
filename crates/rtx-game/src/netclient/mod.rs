@@ -329,6 +329,8 @@ pub struct Client {
     /// The map the shadow world was built for, and which incarnation of the server built it — so a
     /// level change is noticed, and so is a restart onto the same level.
     world_map: (String, i32),
+    /// Exclusive upper bound of network slots observed in this map; includes all player slots.
+    network_scan_end: usize,
     /// When the seats last reported in — see [`HEARTBEAT_INTERVAL`].
     heartbeat_at: Instant,
 }
@@ -380,6 +382,7 @@ impl Client {
             config,
             last_tick: Instant::now(),
             world_map: (String::new(), 0),
+            network_scan_end: mirror::MAX_CLIENTS + 1,
             heartbeat_at: Instant::now(),
         }
     }
@@ -593,7 +596,9 @@ impl Client {
         crate::control::frame_begin(&mut self.game);
         // Mirroring and control updates are settled. The brain changes fields and emits commands,
         // but does not spawn entities; every trace/search can share one occupied-ID list.
-        self.game.entities.begin_client_frame();
+        self.game
+            .entities
+            .begin_client_frame(self.network_scan_end, self.host.shadow_entity_start());
         crate::bot::run_bots(&mut self.game);
         self.game.entities.end_client_frame();
         for b in &mut self.bots {
@@ -750,6 +755,8 @@ impl Client {
         for i in 0..self.game.entities.len() as u32 {
             self.game.entities[crate::entity::EntId(i)] = crate::entity::Entity::default();
         }
+        self.network_scan_end = mirror::MAX_CLIENTS + 1;
+        self.host.reset_shadow_allocator();
         self.game.spawn_shadow_world();
         // The items are what the world reasons about the *absence* of, so it has to know where they
         // all are before the first frame lands. Everything else it remembered — which shadow entity
@@ -936,6 +943,13 @@ impl Client {
             }
         }
         let seen: Vec<EntityState> = seen.into_values().map(|(e, _)| e).collect();
+        // Retain the bound across missing/removed snapshots until the shared world is cleared.
+        if let Some(last) = seen.last() {
+            self.network_scan_end = self
+                .network_scan_end
+                .max(last.number as usize + 1)
+                .min(NETWORK_ENTITY_CAPACITY);
+        }
 
         // The model list names what each entity is. It's per map and identical across a squad, but
         // it has to come from the same population the frames did: a connection that dropped still
