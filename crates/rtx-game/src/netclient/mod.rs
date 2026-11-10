@@ -750,6 +750,7 @@ impl Client {
         for i in 0..self.game.entities.len() as u32 {
             self.game.entities[crate::entity::EntId(i)] = crate::entity::Entity::default();
         }
+        self.host.reset_shadow_allocator();
         self.game.spawn_shadow_world();
         // The items are what the world reasons about the *absence* of, so it has to know where they
         // all are before the first frame lands. Everything else it remembered — which shadow entity

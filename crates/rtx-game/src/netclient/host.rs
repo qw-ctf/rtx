@@ -217,11 +217,15 @@ impl NetHost {
         };
         let parsed = Bsp::parse(&bytes);
         let ok = parsed.is_some();
-        // A new map is a new entity string, read from the top, and a fresh set of slots.
+        // Each seat restarts map parsing; local slots belong to the shared world.
         *self.entities.borrow_mut() = (parsed.as_ref().map(|b| b.entities.clone()).unwrap_or_default(), 0);
-        self.next_ent.set(SHADOW_TOP);
         *self.bsp.borrow_mut() = parsed;
         ok
+    }
+
+    /// Reset local allocation only after the shared entity table has been cleared.
+    pub(crate) fn reset_shadow_allocator(&self) {
+        self.next_ent.set(SHADOW_TOP);
     }
 
     /// Find a game file, searching as a client does: the server's gamedir first (so a mod's override
@@ -534,6 +538,56 @@ mod tests {
     fn rebind_missing_map_reports_failure() {
         let h = host();
         assert!(!h.rebind("qw", "nosuchmap"), "a missing map must report failure");
+    }
+
+    #[test]
+    fn cleared_world_restarts_local_allocation() {
+        let h = host();
+        let first = h.alloc_ent();
+        assert_eq!(h.alloc_ent(), first - 1);
+        h.reset_shadow_allocator();
+        assert_eq!(h.alloc_ent(), first);
+    }
+
+    /// Another session binding a map must not make existing local entity IDs available again.
+    #[test]
+    fn map_rebind_preserves_local_entity_allocations() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rtx-local-ids-{}-{nonce}", std::process::id()));
+        let maps = root.join("qw/maps");
+        std::fs::create_dir_all(&maps).unwrap();
+
+        // Minimal v29 BSP: an empty lump directory and one zeroed world model.
+        const HEADER: usize = 4 + 15 * 8;
+        let mut bytes = vec![0; HEADER + 64];
+        bytes[..4].copy_from_slice(&29u32.to_le_bytes());
+        for lump in 0..15 {
+            let offset = 4 + lump * 8;
+            bytes[offset..offset + 4].copy_from_slice(&(HEADER as u32).to_le_bytes());
+        }
+        bytes[4 + 14 * 8 + 4..4 + 14 * 8 + 8].copy_from_slice(&64u32.to_le_bytes());
+        std::fs::write(maps.join("first.bsp"), &bytes).unwrap();
+        std::fs::write(maps.join("second.bsp"), &bytes).unwrap();
+        let h = NetHost::new(root.clone());
+
+        assert!(h.rebind("qw", "first"));
+        let first = h.alloc_ent();
+        assert_eq!(h.alloc_ent(), first - 1);
+        assert!(h.rebind("qw", "first"));
+        assert_eq!(h.alloc_ent(), first - 2, "a later seat reused a live local slot");
+        assert!(!h.rebind("qw", "missing"));
+        assert_eq!(h.alloc_ent(), first - 3, "failed map binding rewound allocation");
+        assert!(h.rebind("qw", "second"));
+        assert_eq!(
+            h.alloc_ent(),
+            first - 4,
+            "binding alone does not clear the shared world"
+        );
+        drop(h);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Serverinfo answers `infokey` for the world; per-player userinfo isn't ours to serve, because
