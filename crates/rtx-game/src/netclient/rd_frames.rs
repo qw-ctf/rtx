@@ -121,7 +121,7 @@ mod tests {
                         change(32, Delta::default()),
                         change(33, Delta::default()),
                         change(
-                            16383,
+                            32767,
                             Delta {
                                 modelindex: Some(511),
                                 frame: Some(300),
@@ -139,7 +139,7 @@ mod tests {
         assert_eq!(frames.delta_request(), Some(0x34));
         assert_eq!(
             frames.current().iter().map(|e| e.number).collect::<Vec<_>>(),
-            [33, 16383]
+            [33, 32767]
         );
         let entity = frames.current()[1];
         assert_eq!(entity.model, 511);
@@ -159,7 +159,7 @@ mod tests {
         let mut frames = RdFrames::default();
         frames
             .set_replacement_baseline(
-                16383,
+                32767,
                 &Delta {
                     modelindex: Some(9),
                     ..Default::default()
@@ -174,7 +174,7 @@ mod tests {
                     vec![
                         Update::ResetWorld,
                         change(
-                            16383,
+                            32767,
                             Delta {
                                 reset: true,
                                 ..Default::default()
@@ -186,17 +186,17 @@ mod tests {
             .unwrap();
         frames.apply(2, &frame(2.0, vec![])).unwrap();
         assert_eq!(frames.current()[0].model, 9);
-        assert_eq!(frames.retained().updated_at(16383), Some(1.0));
-        frames.apply(3, &frame(3.0, vec![Update::Remove(16383)])).unwrap();
+        assert_eq!(frames.retained().updated_at(32767), Some(1.0));
+        frames.apply(3, &frame(3.0, vec![Update::Remove(32767)])).unwrap();
         assert!(frames.current().is_empty());
-        assert_eq!(frames.retained().updated_at(16383), None);
+        assert_eq!(frames.retained().updated_at(32767), None);
         frames
             .apply(
                 4,
                 &frame(
                     4.0,
                     vec![change(
-                        16383,
+                        32767,
                         Delta {
                             reset: true,
                             ..Default::default()
@@ -206,7 +206,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(frames.current()[0].model, 9);
-        assert_eq!(frames.retained().updated_at(16383), Some(4.0));
+        assert_eq!(frames.retained().updated_at(32767), Some(4.0));
     }
 
     #[test]
@@ -215,20 +215,20 @@ mod tests {
         frames
             .apply(
                 5,
-                &frame(1.0, vec![Update::ResetWorld, change(16383, Delta::default())]),
+                &frame(1.0, vec![Update::ResetWorld, change(32767, Delta::default())]),
             )
             .unwrap();
         let previous = frames.current().to_vec();
         assert!(frames
             .apply(
                 6,
-                &frame(2.0, vec![Update::ResetWorld, change(16384, Delta::default())])
+                &frame(2.0, vec![Update::ResetWorld, change(32768, Delta::default())])
             )
             .is_err());
         assert_eq!(frames.current(), previous);
         assert_eq!(frames.delta_request(), None);
         assert_eq!(
-            frames.apply(7, &frame(3.0, vec![Update::Remove(16383)])),
+            frames.apply(7, &frame(3.0, vec![Update::Remove(32767)])),
             Ok(Applied::AwaitingReset)
         );
         assert_eq!(frames.current(), previous);
@@ -242,7 +242,7 @@ mod tests {
         let mut frames = RdFrames::default();
         frames
             .set_baseline(
-                16383,
+                32767,
                 Baseline {
                     modelindex: 7,
                     frame: 6,
@@ -259,7 +259,7 @@ mod tests {
                 vec![
                     Update::ResetWorld,
                     change(
-                        16383,
+                        32767,
                         Delta {
                             reset: true,
                             ..Default::default()

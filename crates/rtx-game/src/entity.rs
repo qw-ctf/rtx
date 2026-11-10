@@ -848,15 +848,15 @@ mod tests {
     #[cfg(feature = "netclient")]
     #[test]
     fn client_frame_keeps_high_network_and_shadow_ids_in_order() {
-        let mut entities = Entities::new(32768);
-        for id in [EntId(32767), EntId(16383), EntId::WORLD] {
+        let mut entities = Entities::new(65536);
+        for id in [EntId(65535), EntId(32767), EntId::WORLD] {
             entities[id].reset();
         }
         entities.begin_client_frame();
-        assert_eq!(entities.live().map(|(id, _)| id.0).collect::<Vec<_>>(), [16383, 32767]);
+        assert_eq!(entities.live().map(|(id, _)| id.0).collect::<Vec<_>>(), [32767, 65535]);
         assert_eq!(
             entities.occupied().map(|(id, _)| id.0).collect::<Vec<_>>(),
-            [0, 16383, 32767]
+            [0, 32767, 65535]
         );
         entities.end_client_frame();
     }

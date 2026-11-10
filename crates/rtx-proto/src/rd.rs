@@ -48,7 +48,7 @@ mod uf {
 }
 
 /// Supported network entity slots; slot zero belongs to the world/reset marker.
-pub const MAX_ENTITIES: u32 = 16384;
+pub const MAX_ENTITIES: u32 = 32768;
 
 /// The complete base-RD state. Prediction velocity is retained in wire units (1/8 unit/s).
 #[derive(Clone, Debug, PartialEq)]

@@ -914,13 +914,13 @@ mod tests {
     fn client_wire_and_shadow_entities_have_disjoint_storage() {
         let host = Box::leak(Box::new(crate::netclient::host::NetHost::new("/nonexistent".into())));
         let mut game = GameState::new_client(host);
-        assert_eq!(game.entities.len(), 32768);
-        game.entities[EntId(16383)].v.health = 31.0;
+        assert_eq!(game.entities.len(), 65536);
+        game.entities[EntId(32767)].v.health = 31.0;
         let shadow = game.spawn();
-        assert_eq!(shadow, EntId(32767));
+        assert_eq!(shadow, EntId(65535));
         game.entities[shadow].v.health = 47.0;
-        assert_eq!(game.entities[EntId(16383)].v.health, 31.0);
-        for index in [16383, 16384, 32767] {
+        assert_eq!(game.entities[EntId(32767)].v.health, 31.0);
+        for index in [32767, 32768, 65535] {
             let id = EntId(index);
             assert!(id.to_prog() >= 0);
             assert_eq!(EntId::from_prog(id.to_prog()), id);

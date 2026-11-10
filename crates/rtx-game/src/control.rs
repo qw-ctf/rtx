@@ -1814,9 +1814,9 @@ mod tests {
         let player = &mut game.entities[EntId(1)];
         player.in_use = true;
         player.classname = Some("player".into());
-        player.v.groundentity = EntId(32767).to_prog();
-        assert_eq!(pmove_event(&game, 1.0, 1).players[0].ground_ent, 32767);
-        game.entities[EntId(1)].v.groundentity = EntId(32768).to_prog();
+        player.v.groundentity = EntId(65535).to_prog();
+        assert_eq!(pmove_event(&game, 1.0, 1).players[0].ground_ent, 65535);
+        game.entities[EntId(1)].v.groundentity = EntId(65536).to_prog();
         assert_eq!(pmove_event(&game, 1.0, 1).players[0].ground_ent, -1);
     }
 

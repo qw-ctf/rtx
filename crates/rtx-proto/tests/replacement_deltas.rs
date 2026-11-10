@@ -253,7 +253,7 @@ fn world_frame_rejects_bad_order_repeated_reset_and_out_of_capacity_ids() {
         vec![2, 0, 0, 1, 0, 0],
         vec![0, 128, 0, 128],
         vec![1, 0, 0, 0, 128],
-        vec![0, 64, 1, 0],
+        vec![0, 64, 2, 0],
         vec![255, 255, 255],
     ] {
         assert!(svc::parse(&mut rd(), &frame_packet(&records)).is_err(), "{records:?}");
@@ -270,6 +270,59 @@ fn world_frame_rejects_bad_order_repeated_reset_and_out_of_capacity_ids() {
         frame.updates[2],
         rtx_proto::rd::Update::Change { entity: 16383, .. }
     ));
+}
+
+#[test]
+fn upper_world_slots_survive_wire_retention_removal_and_reuse() {
+    use rtx_proto::rd_state::RetainedEntities;
+    use svc::SvcEvent;
+
+    for (id, header) in [
+        (16383u32, vec![255, 63]),
+        (16384, vec![0, 64, 1]),
+        (32767, vec![255, 127, 1]),
+    ] {
+        let mut proto = rd();
+        // Baseline reference is an ordinary entity reference; frame IDs use the RD header.
+        let mut packet = vec![66];
+        packet.extend((id as u16).to_le_bytes());
+        packet.extend([128, 5, 7]); // UF_RESET | UF_MODEL, model 7.
+        let mut records = vec![0, 128]; // Reset world, then reset the entity from its baseline.
+        records.extend(&header);
+        records.extend([128, 1]);
+        packet.extend(frame_packet(&records));
+        packet.push(1); // Nop verifies exact payload consumption.
+        let events = svc::parse(&mut proto, &packet).unwrap();
+        let [SvcEvent::SpawnReplacementBaseline { entity, delta }, SvcEvent::ReplacementEntities(frame), SvcEvent::Nop] =
+            events.as_slice()
+        else {
+            panic!("unexpected initial events: {events:?}");
+        };
+        assert_eq!(*entity, id);
+        let mut world = RetainedEntities::default();
+        world.set_baseline(*entity, delta.apply(None, None)).unwrap();
+        world.apply(frame).unwrap();
+        assert_eq!(world.get(id).unwrap().modelindex, 7);
+
+        let mut removal = header.clone();
+        removal[1] |= 0x80; // Removal bit in the RD index header, not a UF field.
+        let mut reuse = header.clone();
+        reuse.extend([128, 1]);
+        for (time, records, present) in [(2.0f32, removal, false), (3.0, reuse, true)] {
+            let mut packet = frame_packet(&records);
+            packet[1..5].copy_from_slice(&time.to_le_bytes());
+            packet.push(1);
+            let events = svc::parse(&mut proto, &packet).unwrap();
+            let [SvcEvent::ReplacementEntities(frame), SvcEvent::Nop] = events.as_slice() else {
+                panic!("unexpected update events: {events:?}");
+            };
+            world.apply(frame).unwrap();
+            assert_eq!(world.get(id).is_some(), present, "entity {id} at time {time}");
+            if present {
+                assert_eq!(world.get(id).unwrap().modelindex, 7, "reuse preserves the baseline");
+            }
+        }
+    }
 }
 
 #[test]
@@ -433,8 +486,8 @@ fn ordinary_references_widen_sound_and_muzzle_but_preserve_packed_stopsound() {
 #[test]
 fn classic_rd_baseline_validation_reports_its_real_opcode_offset() {
     use svc::{op, ParseError};
-    for reference in [vec![0, 64], vec![128, 128, 0]] {
-        // 16384 and 32768
+    for reference in [vec![128, 128, 0], vec![128, 128, 1]] {
+        // 32768 and 32769
         let mut packet = vec![op::NOP, op::SPAWNBASELINE];
         packet.extend(reference);
         packet.extend([0; 13]);
@@ -482,7 +535,7 @@ fn classic_baseline_validation_follows_serverdata_protocol_changes_in_the_same_p
     for replacement in [false, true] {
         let mut packet = serverdata_for_classic_baseline_test(replacement);
         let offset = packet.len();
-        packet.extend([svc::op::SPAWNBASELINE, 0, 64]);
+        packet.extend([svc::op::SPAWNBASELINE, 128, 128]);
         packet.extend([0; 13]);
         packet.push(svc::op::NOP);
         let mut proto = if replacement { ProtoState::new() } else { rd() };
@@ -539,7 +592,7 @@ fn replacement_signon_accepts_all_coordinate_profiles_and_rejects_truncation() {
                 );
             }
         }
-        let mut oversized = vec![op::FTE_SPAWNBASELINE2, 0, 64];
+        let mut oversized = vec![op::FTE_SPAWNBASELINE2, 128, 128, 0];
         oversized.extend(fixture);
         assert!(matches!(
             svc::parse(&mut proto, &oversized),

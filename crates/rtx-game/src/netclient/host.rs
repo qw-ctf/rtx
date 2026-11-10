@@ -657,9 +657,9 @@ mod tests {
     #[test]
     fn shadow_allocation_never_enters_the_wire_entity_range() {
         let h = host();
-        assert_eq!(h.alloc_ent(), 32767);
-        h.next_ent.set(16384);
-        assert_eq!(h.alloc_ent(), 16384);
+        assert_eq!(h.alloc_ent(), 65535);
+        h.next_ent.set(32768);
+        assert_eq!(h.alloc_ent(), 32768);
         assert_eq!(h.alloc_ent(), 0);
         assert_eq!(h.alloc_ent(), 0, "exhaustion remains bounded");
     }

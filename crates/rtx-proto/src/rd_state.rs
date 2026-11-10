@@ -197,15 +197,15 @@ mod tests {
             ..Default::default()
         };
         retained
-            .apply(&frame(1.0, vec![Update::ResetWorld, change(16383, delta)]))
+            .apply(&frame(1.0, vec![Update::ResetWorld, change(32767, delta)]))
             .unwrap();
-        let first = retained.get(16383).unwrap().clone();
+        let first = retained.get(32767).unwrap().clone();
         retained.apply(&frame(2.0, vec![])).unwrap();
-        assert_eq!(retained.get(16383), Some(&first));
+        assert_eq!(retained.get(32767), Some(&first));
         retained
-            .apply(&frame(3.0, vec![change(16383, Delta::default())]))
+            .apply(&frame(3.0, vec![change(32767, Delta::default())]))
             .unwrap();
-        let updated = retained.get(16383).unwrap();
+        let updated = retained.get(32767).unwrap();
         assert_eq!(updated.origin, Vec3::new(12.0, 0.0, 0.0));
         assert_eq!(updated.movement, [0; 3]);
         assert_eq!(updated.velocity, [0; 3]);
@@ -217,7 +217,7 @@ mod tests {
         let mut retained = RetainedEntities::default();
         retained
             .set_baseline(
-                16383,
+                32767,
                 State {
                     modelindex: 9,
                     ..Default::default()
@@ -231,7 +231,7 @@ mod tests {
                     Update::ResetWorld,
                     change(1, Delta::default()),
                     change(
-                        16383,
+                        32767,
                         Delta {
                             reset: true,
                             modelindex: Some(12),
@@ -241,16 +241,16 @@ mod tests {
                 ],
             ))
             .unwrap();
-        assert_eq!(retained.current().map(|(id, _)| id).collect::<Vec<_>>(), [1, 16383]);
+        assert_eq!(retained.current().map(|(id, _)| id).collect::<Vec<_>>(), [1, 32767]);
         retained
-            .apply(&frame(2.0, vec![Update::Remove(999), Update::Remove(16383)]))
+            .apply(&frame(2.0, vec![Update::Remove(999), Update::Remove(32767)]))
             .unwrap();
-        assert!(retained.get(16383).is_none());
+        assert!(retained.get(32767).is_none());
         retained
             .apply(&frame(
                 3.0,
                 vec![change(
-                    16383,
+                    32767,
                     Delta {
                         reset: true,
                         ..Default::default()
@@ -258,7 +258,7 @@ mod tests {
                 )],
             ))
             .unwrap();
-        assert_eq!(retained.get(16383).unwrap().modelindex, 9);
+        assert_eq!(retained.get(32767).unwrap().modelindex, 9);
     }
 
     #[test]
@@ -319,7 +319,7 @@ mod tests {
     #[test]
     fn malformed_frame_never_publishes_its_valid_prefix_or_reset() {
         for invalid in [
-            vec![change(2, Delta::default()), Update::Remove(16384)],
+            vec![change(2, Delta::default()), Update::Remove(32768)],
             vec![
                 Update::ResetWorld,
                 change(2, Delta::default()),
@@ -346,7 +346,7 @@ mod tests {
         for updates in [
             vec![change(0, Delta::default())],
             vec![Update::Remove(0)],
-            vec![change(16384, Delta::default())],
+            vec![change(32768, Delta::default())],
             vec![Update::Remove(u32::MAX)],
             vec![change(2, Delta::default()), Update::Remove(2)],
             vec![Update::Remove(3), change(2, Delta::default())],
@@ -397,14 +397,14 @@ mod tests {
         let mut retained = RetainedEntities::default();
         retained
             .set_baseline(
-                16383,
+                32767,
                 State {
                     modelindex: 5,
                     ..Default::default()
                 },
             )
             .unwrap();
-        assert!(retained.set_baseline(16384, State::default()).is_err());
+        assert!(retained.set_baseline(32768, State::default()).is_err());
         for state in [
             State {
                 origin: Vec3::splat(f32::NAN),
@@ -419,7 +419,7 @@ mod tests {
                 ..Default::default()
             },
         ] {
-            assert!(retained.set_baseline(16383, state).is_err());
+            assert!(retained.set_baseline(32767, state).is_err());
         }
         retained
             .apply(&frame(
@@ -427,7 +427,7 @@ mod tests {
                 vec![
                     Update::ResetWorld,
                     change(
-                        16383,
+                        32767,
                         Delta {
                             reset: true,
                             ..Default::default()
@@ -436,14 +436,14 @@ mod tests {
                 ],
             ))
             .unwrap();
-        assert_eq!(retained.get(16383).unwrap().modelindex, 5);
+        assert_eq!(retained.get(32767).unwrap().modelindex, 5);
     }
 
     #[test]
     fn validates_malformed_frames_even_while_awaiting_reset() {
         let mut retained = published();
         retained.invalidate();
-        assert!(retained.apply(&frame(2.0, vec![Update::Remove(16384)])).is_err());
+        assert!(retained.apply(&frame(2.0, vec![Update::Remove(32768)])).is_err());
         assert!(retained.get(1).is_some());
         assert_eq!(retained.time(), 1.0);
         assert!(!retained.can_delta());
