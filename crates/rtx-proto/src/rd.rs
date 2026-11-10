@@ -494,7 +494,7 @@ pub fn player_info(entity: u32, state: &State) -> Option<crate::svc::PlayerInfo>
     if pm_type == PmType::Dead {
         flags |= pf::DEAD;
     }
-    // FTE retains view angles as unsigned shorts. Playerinfo consumers expect the signed
+    // Our retained RD view angles are cyclic. Playerinfo consumers expect the signed
     // representation used by MSG_ReadAngle16, particularly when clamping a player's pitch.
     let angles = state.viewangles.map(|angle| (angle + 180.0).rem_euclid(360.0) - 180.0);
     Some(PlayerInfo {
