@@ -223,6 +223,11 @@ impl NetHost {
         ok
     }
 
+    /// First allocated local slot, or the table capacity if no local slots are allocated.
+    pub(crate) fn shadow_entity_start(&self) -> usize {
+        (self.next_ent.get() + 1).max(super::NETWORK_ENTITY_CAPACITY as i32) as usize
+    }
+
     /// Reset local allocation only after the shared entity table has been cleared.
     pub(crate) fn reset_shadow_allocator(&self) {
         self.next_ent.set(SHADOW_TOP);
@@ -538,6 +543,21 @@ mod tests {
     fn rebind_missing_map_reports_failure() {
         let h = host();
         assert!(!h.rebind("qw", "nosuchmap"), "a missing map must report failure");
+    }
+
+    #[test]
+    fn local_entity_bound_tracks_allocation_and_reset() {
+        let h = host();
+        assert_eq!(h.shadow_entity_start(), super::super::CLIENT_ENTITY_CAPACITY);
+        h.alloc_ent();
+        assert_eq!(h.shadow_entity_start(), SHADOW_TOP as usize);
+        h.next_ent.set(super::super::NETWORK_ENTITY_CAPACITY as i32);
+        h.alloc_ent();
+        assert_eq!(h.shadow_entity_start(), super::super::NETWORK_ENTITY_CAPACITY);
+        assert_eq!(h.alloc_ent(), 0);
+        assert_eq!(h.shadow_entity_start(), super::super::NETWORK_ENTITY_CAPACITY);
+        h.reset_shadow_allocator();
+        assert_eq!(h.shadow_entity_start(), super::super::CLIENT_ENTITY_CAPACITY);
     }
 
     #[test]
